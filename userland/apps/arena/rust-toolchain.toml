@@ -1,0 +1,21 @@
+# MayteraOS USERLAND Rust toolchain pin (#491 Stage 0 - Arena app).
+#
+# WHY THIS FILE EXISTS: the userland app build must be reproducible, exactly
+# like the kernel port (kernel/rust-toolchain.toml). Without a pin, a
+# `rustup update` on the userland build container would silently move
+# the floating `stable` channel and change the bytes of the shipped Arena ELF.
+# This forces the EXACT toolchain the kernel port also pins (1.97.0). The Arena
+# Makefile additionally has a hard version gate that FAILS the build if the
+# active rustc is not this version, so drift can never pass silently.
+#
+# Pinned + reproduced on the userland build container 2026-07-16:
+#   rustc 1.97.0 (2d8144b78 2026-07-07)
+#   target x86_64-unknown-none (precompiled core + alloc from the 1.97.0 rust-std)
+#
+# To reproduce on a fresh userland build container:
+#   rustup toolchain install 1.97.0 --profile minimal
+#   rustup target add --toolchain 1.97.0 x86_64-unknown-none
+[toolchain]
+channel = "1.97.0"
+targets = ["x86_64-unknown-none"]
+profile = "minimal"

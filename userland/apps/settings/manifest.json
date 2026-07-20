@@ -1,0 +1,110 @@
+{
+  "app": "settings",
+  "name": "System Settings",
+  "version": "1.8.0",
+  "description": "Comprehensive system settings with 12 configuration panels",
+  "author": "MayteraOS Team",
+  "icon": "settings.bmp",
+  "category": "System",
+  "panels": [
+    "Appearance",
+    "Display",
+    "Sound",
+    "Network",
+    "Bluetooth",
+    "Keyboard",
+    "Mouse",
+    "Date & Time",
+    "Users",
+    "Privacy",
+    "Storage",
+    "About"
+  ],
+  "capabilities": [
+    {
+      "action": "set_theme",
+      "parameters": {"theme": "string"},
+      "valid_values": ["dark", "light", "classic", "ocean", "nord"],
+      "requires_capability": "system.appearance.write"
+    },
+    {
+      "action": "set_accent_color",
+      "parameters": {"color_index": "int"},
+      "valid_range": [0, 7],
+      "requires_capability": "system.appearance.write"
+    },
+    {
+      "action": "set_volume",
+      "parameters": {"level": "int", "type": "string"},
+      "valid_range": [0, 100],
+      "valid_types": ["master", "input"],
+      "requires_capability": "system.audio.write"
+    },
+    {
+      "action": "set_brightness",
+      "parameters": {"level": "int"},
+      "valid_range": [0, 100],
+      "requires_capability": "system.display.write"
+    },
+    {
+      "action": "set_night_light",
+      "parameters": {"enabled": "bool", "strength": "int"},
+      "requires_capability": "system.display.write"
+    },
+    {
+      "action": "set_resolution",
+      "parameters": {"width": "int", "height": "int"},
+      "requires_capability": "system.display.write"
+    },
+    {
+      "action": "configure_network",
+      "parameters": {"dhcp": "bool", "ip": "string", "gateway": "string"},
+      "requires_capability": "system.network.write"
+    },
+    {
+      "action": "set_timezone",
+      "parameters": {"timezone": "string"},
+      "requires_capability": "system.time.write"
+    },
+    {
+      "action": "set_keyboard_layout",
+      "parameters": {"layout": "string"},
+      "valid_values": ["us", "uk", "de", "fr", "es", "it", "pt", "ru", "jp", "kr"],
+      "requires_capability": "system.input.write"
+    },
+    {
+      "action": "set_pointer_speed",
+      "parameters": {"speed": "int"},
+      "valid_range": [0, 100],
+      "requires_capability": "system.input.write"
+    }
+  ],
+  "state_queries": [
+    {
+      "query": "get_current_theme",
+      "returns": "string",
+      "requires_capability": "system.appearance.read"
+    },
+    {
+      "query": "get_volume_level",
+      "parameters": {"type": "string"},
+      "returns": "int",
+      "requires_capability": "system.audio.read"
+    },
+    {
+      "query": "get_network_status",
+      "returns": "object",
+      "requires_capability": "system.network.read"
+    },
+    {
+      "query": "get_storage_info",
+      "returns": "array",
+      "requires_capability": "system.storage.read"
+    },
+    {
+      "query": "get_system_info",
+      "returns": "object",
+      "requires_capability": "system.info.read"
+    }
+  ]
+}

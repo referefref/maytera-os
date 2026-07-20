@@ -1,0 +1,486 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Mark Nottingham</title>
+  <link rel="alternate" type="text/html" href="https://mnot.net/blog/" />
+  <link rel="self" type="application/atom+xml" href="https://mnot.net/blog/index.atom" />
+  <id>tag:mnot.net,2010-11-11:/blog//1</id>
+  <updated>2026-07-14T06:01:59Z</updated>
+  <subtitle></subtitle>
+
+  <entry>
+    <title>So You Want To Define a Well-Known URI</title>
+    <link rel="alternate" type="text/html" href="https://mnot.net/blog/2026/well_known_uris" />
+    <id>https://mnot.net/blog/2026/well_known_uris</id>
+    <updated>2026-06-19T00:00:00Z</updated>
+    <author>
+        <name>Mark Nottingham</name>
+        <uri>https://mnot.net/personal/</uri>
+    </author>
+    <summary>When to reach for a well-known URI — and the traps that catch most protocol designers.</summary>
+    
+	<category term="Internet and Web" />
+    
+    <content type="html" xml:lang="en" xml:base="https://mnot.net/blog/2026/well_known_uris">
+  	  <![CDATA[<p class="intro">As one of the authors of the <a href="https://www.rfc-editor.org/info/rfc8615/">Well-Known URI specification</a> and current Designated Expert for the <a href="https://www.iana.org/assignments/well-known-uris/well-known-uris.xhtml">registry</a>, I field a lot of questions about how they should be used, and end up coaching a lot of folks on how to best use them. Below, I’ve summarised how I think about them. Note that these aren’t all requirements for registration – just what I consider good practice.</p>
+
+<h3 id="what-well-known-locations-are-good-for">What Well-Known Locations are Good For</h3>
+
+<p>Well-known locations work best when the client – whether it’s a browser, bot, or other software – knows the site<sup id="fnref:1"><a href="#fn:1" class="footnote" rel="footnote" role="doc-noteref">1</a></sup> and needs to discover something about the <em>whole</em> site in an efficient way.</p>
+
+<p><a href="https://www.rfc-editor.org/info/rfc9309/">robots.txt</a> is the perfect example – it pre-dated the RFC so it doesn’t use a well-known location, but was a major part of the reason we reserved a space for them. A crawler needs to know what the access policies for the site are, and putting it in one central place for the site avoids the need to check headers and content on every response (which would defeat many of the purposes of having such a policy).</p>
+
+<p>A well-known location doesn’t have to contain policy, though. Any mechanism where the client already knows the site but needs to learn something about or interact with it as a whole is a candidate for becoming a well-known location. For example, the <code class="language-plaintext highlighter-rouge">change-password</code> well-known location allows clients to change their password for a site.</p>
+
+<h3 id="when-theyre-the-wrong-tool">When They’re the Wrong Tool</h3>
+
+<p>While well-known locations solve real problems for some protocols, in other cases it seems like designers are <strong>specifying a well-known location because it seems like the thing to do</strong>. Some proposals register one expecting it to confer legitimacy, or boost adoption — as though a slot in the registry were a credential. It isn’t. Well-known locations solves a specific problem (the client knows the site, and needs something site-wide); if your protocol doesn’t have that problem, a registration may only create new ones — and won’t bring the adoption you’re hoping for.</p>
+
+<p>Similarly, some proposals for well-known locations are effectively using them as a URL shortener. Instead of conveying a full URL in a protocol, they only need to convey the relevant site – the well-known location fills in the rest.</p>
+
+<p>The problem is that this pattern <strong>locks you into a 1:1 relationship between services and sites</strong>. If a deployment ever needs more than one service, they’ll need to create a different site, and find a way to direct users to the appropriate one.</p>
+
+<p>Using a well-known location is reasonable if your protocol can genuinely only carry a hostname. Often, though, it’s done just for convenience — and maybe to make the protocol feel more “official” — causing unnecessary rigidity in deployments. <strong>If your protocol <em>can</em> use a real URL, don’t bother with a well-known location.</strong></p>
+
+<h3 id="common-pitfalls-and-tradeoffs">Common Pitfalls and Tradeoffs</h3>
+
+<p>Even when well-known locations are the right tool, the assumptions we make about sites don’t always hold true, and can create significant complications. If you’re defining a well-known location for your protocol, you should be aware of the issues below.</p>
+
+<h4 id="discovery-mechanisms">Discovery Mechanisms</h4>
+
+<p>Many protocols try to use a well-known location as a discovery mechanism, with the idea that “the user already knows the site.”</p>
+
+<p>The problem is that the reality is fuzzier than it sounds at first – there may be <strong>a mismatch between the scope of the user’s current interaction and where discovery happens</strong>. For example, if the client starts with “login.example.com”, should they look up the well-known location on that site, or on “example.com”? Should they follow redirects from one to the other? What site(s) should the publisher make a well-known location on available to assure interoperability?</p>
+
+<p>This especially matters in cases where the protocol isn’t really about Web sites, but instead it’s just leveraging HTTP to get something else done. For example, it may be tempting to specify that a well-known location for a registrable domain name be located at the apex, but that can be operationally difficult for some.</p>
+
+<p>If your protocol falls into this category, consider both what’s being discovered and what your users start with, then <strong>work out how they reliably find the right hostname without assuming too much about their architecture</strong>.</p>
+
+<h4 id="content-metadata">Content Metadata</h4>
+
+<p>Some protocols try to use a well-known location as a way to learn about the content on the site. After all, that’s how <code class="language-plaintext highlighter-rouge">/robots.txt</code> works.</p>
+
+<p>While that pattern works for some kinds of metadata, many sites represent multiple publishers (for example, the old <code class="language-plaintext highlighter-rouge">/~username/</code> convention). Putting content metadata in a central location either puts that mechanism off-limits to those users, or requires the administrator to develop complex infrastructure to support and oversee their control of it.</p>
+
+<p>These kinds of deployments surface <strong>a tradeoff between convenience and granularity</strong>, and often necessitate creation of a parallel metadata mechanism – for example, in HTTP response headers or in the content itself – along with the rationalisation of the different metadata attachment mechanisms.</p>
+
+<p>That’s not to say that Well-Known locations can’t be used for content metadata; just that they’re a lot more work than you might think. So if your protocol is using well-known locations for resource metadata, make sure you consider these tradeoffs carefully. Not all sites are like the ones you’re used to – <strong>the Web is a big place</strong>.</p>
+
+<h3 id="other-considerations">Other Considerations</h3>
+
+<p>A few other things regularly come up.</p>
+
+<p>First, some proposals have already defined a fixed location at the root (like <code class="language-plaintext highlighter-rouge">/robots.txt</code> – usually because they only learned about Well-Known locations later). If so, they should have a <strong>transition plan</strong> for existing deployments. Generally, proponents over-focus on their current deployed footprint; with a good transition plan over a reasonable amount of time, moving over to a Well-known location is manageable.</p>
+
+<p>Many proposals assume <code class="language-plaintext highlighter-rouge">http</code> and <code class="language-plaintext highlighter-rouge">https</code> URLs implicitly. Well-known locations apply to other URL schemes too, so the <strong>relevant schemes should be enumerated explicitly</strong>.</p>
+
+<p class="hero">Finally, make sure you <a href="https://github.com/protocol-registries/well-known-uris">register your well-known location</a>. That link contains guidance about when to register and how to choose a name; unlike the advice here, it does affect your chances of successful registration.</p>
+
+<div class="footnotes" role="doc-endnotes">
+  <ol>
+    <li id="fn:1">
+      <p>Technically, what’s referred to as a <em>site</em> here is an <em>origin</em> – the tuple of <code class="language-plaintext highlighter-rouge">(scheme, host, port)</code>. <a href="#fnref:1" class="reversefootnote" role="doc-backlink">&#8617;</a></p>
+    </li>
+  </ol>
+</div>]]>
+    </content>
+  </entry>
+
+  <entry>
+    <title>Web Feeds in 2026: A Survey</title>
+    <link rel="alternate" type="text/html" href="https://mnot.net/blog/2026/feed-survey" />
+    <id>https://mnot.net/blog/2026/feed-survey</id>
+    <updated>2026-05-10T00:00:00Z</updated>
+    <author>
+        <name>Mark Nottingham</name>
+        <uri>https://mnot.net/personal/</uri>
+    </author>
+    <summary>I looked through Common Crawl and found over 500,000 parseable RSS/Atom feeds, confirming that Web feeds are still a major part of the Open Web. But most aren’t high quality, and autodiscovery often points users at stale or abandoned feeds.</summary>
+    
+	<category term="Web Feeds" />
+    
+    <content type="html" xml:lang="en" xml:base="https://mnot.net/blog/2026/feed-survey">
+  	  <![CDATA[<p class="intro">A couple of weeks ago, I made a <a href="https://www.ietf.org/archive/id/draft-nottingham-feed-menu-00.html">straw-man proposal</a> for a new Web feed autodiscovery mechanism. I got some encouragement and some pushback (usual for this sort of thing). One of the issues raised was regarding internationalisation – a few people said that I should support multiple languages in the format, rather than relying on HTTP content negotiation.</p>
+
+<p>I felt my approach was adequate, given the specifics of the use case. However, it bugged me: I didn’t have data to back me up – AFAICT there’s no significant information about how feeds are used on the Web today.</p>
+
+<p>I realised that this didn’t have to be. Two things helped: a friend at Common Crawl, who assured me that they do indeed crawl feeds, and AI. I don’t have nearly enough time to learn the ins and outs of CC dumps, map/reduce, and the assorted data science bits, but I can babysit a couple of agents<sup id="fnref:1"><a href="#fn:1" class="footnote" rel="footnote" role="doc-noteref">1</a></sup> through it while I do other things. So I <a href="https://github.com/mnot/feed-survey">did</a>.</p>
+
+<p>You can peruse the full (inaugural?) <a href="https://projects.mnot.net/feed-survey/2026-05-10/report.html">survey report</a>.  Below are the major takeaways from my perspective.</p>
+
+<p><strong>Update</strong>: <em>The numbers below have been updated to account for sniffed feeds, which were omitted from the last run.</em></p>
+
+<h3 id="web-feeds-are-still-a-thing">Web Feeds are Still a Thing…</h3>
+<p>In the top 500,000 web sites (per <a href="https://tranco-list.eu">Tranco</a>) seen by <a href="https://commoncrawl.org">Common Crawl</a>, the run analyzed 196,598 registrable sites and <strong>found 534,195 parseable feeds</strong>. 35.9% of sites exposed feed autodiscovery, and 19.7% of analyzed HTML responses had feed links.</p>
+
+<p>That’s huge – more than a third of sites advertising a feed is a big statement about the nature of the <a href="https://mnot.net/blog/2026/open_web">Open Web</a>.</p>
+
+<h3 id="-but-a-lot-of-them-are-abandoned">… But a LOT of Them are Abandoned.</h3>
+<p>High-quality feeds are a minority. Using a quality metric that considers feed recency, content, and metadata, <strong>120,832 feeds</strong> scored above 0.5 – only <strong>22.6% of parsed feeds</strong>. Only <strong>203,483</strong> (38.1% of parsed feeds) had any freshness signal within a 365-day cutoff, and only <strong>141,380</strong> were both fresh and had entries – 26.5% of parsed feeds.</p>
+
+<p>So there are a <em>lot</em> of abandoned feeds on the Web.</p>
+
+<p>I suspect a major contributor is the tendency of content management systems to automatically expose feeds, even when publisher customisation means those feeds no longer reflect the useful parts of the site. For example, only 22.1% of feeds that we could fingerprint as being created by WordPress exceeded our quality bar (a measure of recency, content, and metadata) – although autodiscovered feeds on WordPress were a bit better, at 36.5%. Drupal was a bit higher but still very low at 25.1%, and for Blogger, it was an abysmal 5.9%.</p>
+
+<p>On the other hand, some platforms had higher quality, albeit with small sample sizes. Autodiscovered feeds from Substack pages led to 90.0% high-quality feeds; Ghost: 66.7%; Squarespace: 90.0%. I suspect that this could be because many of these platforms either don’t offer much customisation, or don’t create feeds by default.</p>
+
+<p>In other words, when you go to a site hosted by a popular CMS, chances are uncomfortably high that the feed it creates will be stale, empty, or otherwise not very useful. The takeaway here is simple but urgent: <strong>CMS software should not silently create and advertise feeds that publishers never see or maintain; feeds should be visible, testable, and consciously enabled</strong>. Fixing that in the next release of a couple of platforms could dramatically increase the quality of feeds on the Web in a short time.</p>
+
+<h3 id="autodiscovery-is-not-a-quality-signal">Autodiscovery is Not a Quality Signal.</h3>
+<p>17.8% of feeds had HTML <a href="https://www.rssboard.org/rss-autodiscovery">feed autodiscovery</a> pointing at them, but those links don’t necessarily lead to higher-quality feeds. Although there was a slight bump in measured quality for autodiscovered feeds, mean measured quality was still low – <strong>0.246 vs. 0.220</strong> for feeds without.</p>
+
+<p>This compromises autodiscovery as a user-facing affordance; if people experience lots of stale or zero-entry feeds when they use autodiscovery information (and that is my personal experience!), they won’t rely upon it.</p>
+
+<p>That failure is why I made a <a href="https://www.ietf.org/archive/id/draft-nottingham-feed-menu-00.html">proposal for a new feed autodiscovery mechanism</a>, with prototype implementation as an extension for major browsers. The reasoning is straightforward: <strong>if autodiscovery is more deliberate and in a central place on the site, it has a better chance of leading to working, useful feeds.</strong></p>
+
+<p>An aside: autodiscovery overwhelmingly means <code class="language-plaintext highlighter-rouge">rel=alternate</code>. Feed autodiscovery via <code class="language-plaintext highlighter-rouge">rel=alternate</code> appeared on <strong>81.94M pages</strong>; <code class="language-plaintext highlighter-rouge">rel=feed</code> was tiny by comparison at <strong>12,796 pages</strong>. WHATWG should deprecate the <a href="https://blog.whatwg.org/feed-autodiscovery">feed</a> link relation; the cowpath is well and truly paved.</p>
+
+<h3 id="most-feeds-parse">Most Feeds Parse.</h3>
+<p>The run checked <strong>543,577 feed URLs</strong> and parsed <strong>534,195</strong> RSS/Atom feeds, a <strong>98.3% parse success rate</strong>. So broken XML exists, but outright parse failure is not the main quality problem.</p>
+
+<p>This was a major concern in the early RSS and Atom days; XML was still new, it was complex,<sup id="fnref:2"><a href="#fn:2" class="footnote" rel="footnote" role="doc-noteref">2</a></sup> and implementations – both of XML parsers and feed software – weren’t quite baked. From what we see here, this doesn’t seem to be a concern any more.</p>
+
+<p>The biggest problem – over 45% of the errors encountered –  was ‘XML declaration allowed only at the start of the document’. Next at about 12% was ‘EntityRef: expecting ‘;’’ and then ‘CData section not finished’ at about 8%.</p>
+
+<p>So, yes, sites should still use <a href="https://validator.w3.org/feed/">feed validators</a>. As an ecosystem, however, we shouldn’t worry too much about this aspect of feed quality.</p>
+
+<h3 id="rss-and-atom-co-exist">RSS and Atom Co-Exist.</h3>
+<p>Of <strong>534,195 parsed feeds</strong>, about <strong>412k were RSS-family</strong> and <strong>122k were Atom</strong>. RSS 2.0 alone was <strong>378,287 feeds</strong>. There are minimal quality differences between them. So the feed wars rage on more than twenty years later, and RSS still has the upper hand – or, alternatively, no one really cares.</p>
+
+<p>The takeaway for sites is simple: <strong>Don’t over-fixate on choosing a format</strong>. Choose one – either will do – and don’t double up the feeds. Consuming software will support both.</p>
+
+<p>Sites could do a better job using proper <code class="language-plaintext highlighter-rouge">Content-Type</code> headers, though: 232,910 feed URLs were discovered from generic XML/text/plain/octet-stream responses, about 42.9% of all feed URLs checked. Most were RSS: 212,171 RSS vs. 18,253 Atom.</p>
+
+<p>One thing I specifically tried to check for was pages that advertised both Atom and RSS versions of the same feed. From what we can see here, that isn’t happening much; only 127 sampled pages appeared to be doing this, with 113 linking to both RSS and Atom.</p>
+
+<h3 id="feeds-are-monolingual">Feeds are Monolingual.</h3>
+<p>Finally, to the question that sparked this for me – 13.5% of feeds have HTTP <code class="language-plaintext highlighter-rouge">Content-Language</code>, while almost exactly 50% have feed-level language information (e.g., <code class="language-plaintext highlighter-rouge">dc:language</code>, <code class="language-plaintext highlighter-rouge">xml:lang</code>, or a RSS <code class="language-plaintext highlighter-rouge">language</code> tag). However, only 1.1% (5,698 feeds) have entry-level language information and only 5,645 feeds — 1.1% of parsed feeds — showed multiple entry languages.</p>
+
+<p>So, based upon the current Web, <strong>mixing languages in a feed isn’t a widespread practice</strong>.</p>
+
+<h3 id="a-few-words-about-methodology">A Few Words About Methodology</h3>
+<p>Like all statistics, these should be taken with a grain (or three) of salt. The code is AI-written (although guided by me, therefore I get to take the blame). I have not reviewed every line of code; this is a side project. Common Crawl doesn’t see the whole Web (although the open Web nature of feeds means it’s a good match!). I filtered to the Tranco top 500,000 sites to reduce the influence of very low-quality domains. The run completed 43,717 WARCs and skipped/failed 68, so the missing-WARC rate was about 0.16%. I’m sure there are many more caveats, but you get the idea. Take a <a href="https://github.com/mnot/feed-survey">look at the code</a> and file an issue if you see something.</p>
+
+<div class="footnotes" role="doc-endnotes">
+  <ol>
+    <li id="fn:1">
+      <p>First Gemini, then Claude, then Codex. In a decidedly increasing order of effectiveness. <a href="#fnref:1" class="reversefootnote" role="doc-backlink">&#8617;</a></p>
+    </li>
+    <li id="fn:2">
+      <p>Still is. <a href="#fnref:2" class="reversefootnote" role="doc-backlink">&#8617;</a></p>
+    </li>
+  </ol>
+</div>]]>
+    </content>
+  </entry>
+
+  <entry>
+    <title>What&apos;s Missing in the ‘Agentic’ Story</title>
+    <link rel="alternate" type="text/html" href="https://mnot.net/blog/2026/agents_as_collective_bargains" />
+    <id>https://mnot.net/blog/2026/agents_as_collective_bargains</id>
+    <updated>2026-04-24T00:00:00Z</updated>
+    <author>
+        <name>Mark Nottingham</name>
+        <uri>https://mnot.net/personal/</uri>
+    </author>
+    <summary>Every online interaction is a lopsided negotiation. For AI to truly work for us, we need more than just safety -- we need to start building true agency as a form of collective bargaining.</summary>
+    
+	<category term="Internet and Web" />
+    
+    <content type="html" xml:lang="en" xml:base="https://mnot.net/blog/2026/agents_as_collective_bargains">
+  	  <![CDATA[<p class="intro">For much of the history of computing, it was reasonably safe to assume that a machine was doing what you told it to do (and what its creators promised it would do), because its operations were local.</p>
+
+<p>You bought a laptop or desktop with an operating system, and it did what it said on the tin: it ran programs and stored files. You bought a spreadsheet and a word processor, and those programs performed those tasks and didn’t do anything else. Software that didn’t do this was in a separate bucket called ‘malware’ and we had ways of dealing with it.</p>
+
+<p>That assumption has a more general precedent in tools – whether they be staplers, screwdrivers, or telescopes. When you buy a screwdriver, it turns screws; it has no agency of its own. Most everyday tools follow this pattern — my mechanical wristwatch can’t do anything but tell me the time.<sup id="fnref:1"><a href="#fn:1" class="footnote" rel="footnote" role="doc-noteref">1</a></sup></p>
+
+<p>That pattern is perpetuated in most<sup id="fnref:2"><a href="#fn:2" class="footnote" rel="footnote" role="doc-noteref">2</a></sup> depictions of computers in fiction (especially sci-fi), which work for people diligently and always on their behalf, usually with minimal intrusion. They unambiguously act in the interest of their users — an expression of the technological optimism that influenced a generation of nerds who tried to build it.</p>
+
+<p>All of these experiences combine to lead people to trust computers fairly unquestioningly; they don’t give much thought to the other purposes that might be served. When I use my phone, it’s <strong>my</strong> phone, and so it’s working for me, right? This is perpetuated in the press: recently, I saw an article in a major newspaper about how to talk to “your” AI agent.</p>
+
+<p>If you scratch the surface just a bit, however, none of this is <em>true</em> when applied to modern technologies, and these assumptions are not safe.</p>
+
+<h3 id="the-state-of-trust-on-the-internet">The State of Trust on the Internet</h3>
+<p>Every time you use an Internet-connected computer, you’re trusting someone (and most likely, a multitude) to act on your behalf. From an application’s code all the way down to the silicon, software and hardware and the network services they use reliably embed the interests of those that create them – and they may or may not be aligned with yours.</p>
+
+<p>Critically, those layers are usually – but not always – arranged in such a way that the interests of their producers and users are aligned. People creating computer chips are competing with other people creating chips, and so they focus on that; if they try to abuse their position by (say) exfiltrating your passwords in a side channel, the market (and possibly a legal regulator) will punish them.</p>
+
+<p>However, modern businesses have become adept at exploiting the gaps in this arrangement. Now, a ‘smart’ watch tells the time more accurately — and may also be reporting your location, activities, and who knows what else back to its creator, who may pass it along. The same is true of every other app running.</p>
+
+<p>Those abuses aren’t obvious, and it’s very easy for people to look at an Internet-connected device and fail to recognise that even though it’s “theirs” and that the data it processes is also “theirs”, they’re placing an inordinate amount of trust into a galaxy of faceless parties – trust that may not be deserved or protected. For example:</p>
+
+<ul>
+  <li>TVs are widely known to <a href="https://arstechnica.com/tech-policy/2025/12/texas-sues-biggest-tv-makers-alleging-smart-tvs-spy-on-users-without-consent/">spy on their users’ activities without consent</a>.</li>
+  <li>Meta <a href="https://arstechnica.com/tech-policy/2024/03/facebook-secretly-spied-on-snapchat-usage-to-confuse-advertisers-court-docs-say/">decided to decrypt private traffic from ‘research’ users’ phones</a> to competing services and store it on their own servers. Predictably, once the users found out, it <a href="https://storage.courtlistener.com/recap/gov.uscourts.cand.369872/gov.uscourts.cand.369872.736.0.pdf">ended up in court</a>.</li>
+  <li>At the same time, Facebook also <a href="https://arstechnica.com/gadgets/2024/03/netflix-ad-spend-led-to-facebook-dm-access-end-of-facebook-streaming-biz-lawsuit/2/">let Netflix have access to users’ private Direct Messages</a>, creating yet another lawsuit.</li>
+  <li>Microsoft quietly changed the model of their ‘new Outlook’ e-mail client to <a href="https://www.ghacks.net/2024/01/12/proton-mail-says-that-the-new-outlook-app-for-windows-is-microsofts-new-data-collection-service/">surreptitiously send passwords for third-party e-mail servers to their cloud</a>, so that they can share it with more than 700 data brokers and advertisers.</li>
+  <li>Various automakers <a href="https://foundation.mozilla.org/en/blog/privacy-nightmare-on-wheels-every-car-brand-reviewed-by-mozilla-including-ford-volkswagen-and-toyota-flunks-privacy-test/">collect detailed information</a> and share it with other parties, including data brokers and <a href="https://www.nytimes.com/2024/03/11/technology/carmakers-driver-tracking-insurance.html">insurance companies</a> – to the point where it’s difficult to find a car that doesn’t violate your trust.</li>
+  <li>Ring (i.e., Amazon) was so sloppy with their security practices that ‘rogue insiders’ as well as hackers <a href="https://www.theregister.com/2024/04/25/ring_ftc_settlement/">exploited their access to people’s video cameras</a>.</li>
+  <li>Grindr <a href="https://arstechnica.com/tech-policy/2024/04/grindr-users-seek-payouts-after-dating-app-shared-hiv-status-with-vendors/">shared highly sensitive health information</a> with third parties without permission.</li>
+  <li>Photobucket <a href="https://blog.ericgoldman.org/archives/2026/03/photobuckets-attempted-tos-amended-mostly-fails-pierce-v-photobucket.htm">aggressively changed terms of service</a> to allow AI use of people’s photos, but failed in court.</li>
+</ul>
+
+<p>This is just a small selection; there are many more. All of these are stunning violations of trust. And, it’s becoming <em>normal</em>.</p>
+
+<p class="hero">How did we get here? If I were to speculate on the reasons for that, I’d say it’s a combination of the normalisation of <strong>cloud computing</strong> (because everything is now running on or connected to computers you don’t control), the <strong>expectations of higher and higher growth and returns</strong> by investors, putting pressure on companies for new and recurring revenue, and – more than anything – the <strong>weakness of any regulating forces</strong> on these actors.</p>
+
+<h3 id="user-agents-are-a-form-of-collective-bargaining">User Agents are a Form of Collective Bargaining</h3>
+<p>Although it’s difficult to trust anyone on the Internet given the examples above, it could be much, much worse. Imagine if you had to install a program on your computer from every company, government body, and other entity that you interact with, and those programs had full access to do what they like on your system. In other words, every online interaction becomes an opportunity to install malware that can extract your personal information, delete files or hold them ransom, profile and monitor your behaviour, and generally ignore your interests in favour of theirs.</p>
+
+<p>What prevents that on the modern Internet? In many cases, it’s the humble Web browser, which selectively exposes capabilities to Web sites without offering full access to your computer. This is called a <a href="https://www.w3.org/news/2025/group-note-draft-web-user-agents/">User Agent</a> – software that acts on your behalf, representing your interests in your interactions with other parties.</p>
+
+<p>While the browser represents your interests, it’s also balancing them against the sites you visit — <strong>it’s an agent for them too</strong>. Sites want predictable rendering; users want accessibility tools. Users don’t want to be tracked; sites need some signal of how their pages are consumed. These tradeoffs are negotiated in the open, through standards bodies like the W3C and IETF — and because there’s more than one browser, you can pick the agent that best represents you, which creates market pressure to do so.</p>
+
+<p class="hero">Crucially, this gives every user the <em>same deal</em>. Forced to negotiate site-by-site, individuals would lose: sites have far more <em>bargaining power</em> than any one of us, and we’d give up out of exhaustion (cookie banners are the proof). A browser instead negotiates on behalf of users <em>collectively</em>, and embeds what is effectively a global treaty between sites and users.</p>
+
+<p>Browsers aren’t perfect — fights over DRM and tracking show real disagreement about where the balance lies, individual implementations get it wrong (Google <a href="https://www.theregister.com/2024/04/01/google_will_delete_data_incognito/">kept users’ data from Chrome’s private browsing mode</a>), and as I’ve argued before, <a href="https://mnot.net/blog/2026/02/13/no">browsers show a distinct lack of ambition</a> in creating higher-level abstractions.</p>
+
+<p>Despite those shortcomings, Web browsers are a good example of how user agency should be done. There are other platforms that aspire to represent users’ interests – for example, iOS and Android. These, however, are single implementations where all of the decisions are made opaquely by a lone corporation. The checks and balances on their power are very limited and very different to those on Web browsers.</p>
+
+<h3 id="why-ai-needs-user-agency">Why AI Needs User Agency</h3>
+<p>It’s notoriously difficult to predict how Large Language Models are going to change the world in the long term. That said, everyone is excited about the possibility of ‘agentic’ AI, with many breathlessly predicting that it will transform, well, <a href="https://www.mckinsey.com/capabilities/quantumblack/our-insights/seizing-the-agentic-ai-advantage">everything</a>. Briefly, the idea is that an LLM with tool capabilities can act on your behalf – i.e., be your agent.</p>
+
+<p>The models of agency being discussed here are relatively simplistic, when you compare them to Web browsers. That’s largely because there’s no single definition of what an AI agent or chatbot does and does not do – it’s just a concept at this point. As a result, unless you write your own agent (or have AI do it for you), you’re using software that bargains on your behalf without any of the checks, balances, or collective leverage a browser provides. It claims to work for you; you have little assurance it does.<sup id="fnref:3"><a href="#fn:3" class="footnote" rel="footnote" role="doc-noteref">3</a></sup></p>
+
+<p>That lack of trustworthiness cuts both ways. The data and services that the agent consumes have little visibility into how they will be used, because the agent could be doing <em>anything</em> – unlike a Web browser, which puts some rough guide rails around how a Web site’s data is used and creates expectations about capabilities and behaviour.</p>
+
+<p>In other words, <strong>AI today has no well-defined user agent role</strong> — no transparent standards, no checks and balances on either side of the interaction. That gap <strong>makes it harder for a marketplace to form</strong>.</p>
+
+<p>Agentic AI can still find a place without a user agent role. Agents in limited domains with assumed trust – like inside enterprises and with their third-party vendors – will likely thrive, because the contractual relationships between those parties will regulate their behaviour. And of course, we’re already seeing accelerating adoption of AI chatbots for accessing information online, even though they are currently opaque and unconstrained.</p>
+
+<p>Beyond those bounded contexts, though, the absence of a user agent role starts to bite. Using agents written by other people will require a leap of trust similar to that required when using Android or iOS – and it’s not clear whether the companies that will write them will be worthy of that trust, especially if they proliferate. Likewise, online data sources will be reluctant to trust random agents because they don’t know what will happen to the data – the agent could use it for the purpose they say they do and then dispose of it responsibly, or they could store it or republish it.</p>
+
+<p>Some proposals assume that putting agentic code in a TEE or similar ‘jail’ will solve these problems. But sandboxing isn’t bargaining. If every agent can ask for intrusive permissions, we’ll be pestered into granting them; trust will be abused and eroded, and everyone loses.</p>
+
+<p>Another alternative is to have AI experiences locked up in proprietary platforms. Consider, however, what kinds of experiences that will lead to:</p>
+
+<blockquote>
+  <p>It is no accident that Meta is interested in smart glasses. With built-in cameras, lenses that can display WhatsApp messages and speakers that direct sound straight to the ear, the devices only make it easier for users to share what they are up to on social media and follow what others are doing. For Meta, more time spent on its platforms means more ad revenue. Amazon would likewise be delighted to have its Echo speakers in every home and its glasses on every face to gather more data for its growing ad business and make it even easier to buy from its marketplace. And OpenAI would be well served if people ditched their screens and relied instead on a chatbot to handle their interactions with the digital world.</p>
+</blockquote>
+
+<p>– <a href="https://www.economist.com/business/2026/01/25/will-the-smartphone-survive-the-ai-age">The Economist</a></p>
+
+<p>Defining a user agent role for AI agents would also make agents more legible to legal regulation. With such a strong focus on “AI safety” by regulators today, an architecture that assured certain properties could be an important component of a solution in this space, not only creating more competition but also forestalling more onerous legal regulation.</p>
+
+<p>Finally, although allowing AI agents to be <em>anything</em> promises lots of opportunities, placing constraints upon them not only helps users and services build trust in them, it also helps people more easily conceptualise what they do. Simply put, users are confused when technology offers too many choices. It’s understandable that industry doesn’t want to constrain agents this early, but open-endedness has a cost: most people don’t understand what’s happening when they use computers — nor should they have to — and an unconstrained agent gives them nothing to lean on.</p>
+
+<h3 id="what-an-ai-user-agent-might-look-like">What an AI User Agent Might Look Like</h3>
+<p>The problem with developing an AI UA now is that by nature, it has to put constraints on how AI is used, at a time when everyone is still exploring what AI <em>is</em>. Being an agent means carefully considering consequences and balancing the interests, and this is easy to get wrong.</p>
+
+<p>Consider, for example, the Ring camera. Amazon thought it was unambiguously good to allow the police to use a network of cameras to find ‘bad guys’, and that turned out to be not just naive, but disastrously wrong. Allowing people to opt out was not sufficient to balance the interests here – what was lacking was a principled approach to rights in their architecture.</p>
+
+<p>I suspect this is one of the reasons Apple is taking so long to enhance Siri. It’s easy to install OpenClaw and let it wreak havoc on your personal data (promoting what used to be malware into something people install willfully!); it’s a lot harder to build an ecosystem that respects user rights, creates market opportunities, and doesn’t burden the user with an avalanche of choices. If everyone is operating their own isolated and bespoke environment, we lose the collective power of agency – both for users and the market.</p>
+
+<p>It might be that a whole new platform (whether from Apple, OpenClaw, or elsewhere) gets developed, or it might be that AI capabilities are organically added to the Web. Projects like <a href="https://a2ui.org">A2UI</a> also show some small steps in this direction.</p>
+
+<p>In general, though, creating an agent role for AI – with all of the benefits to the user and market that brings – will require constraining the tools that it can call in a fashion that becomes ‘normal’, so that people can depend on how it behaves. That might involve standard tool APIs with appropriate constraints, permission models, sandboxing (TEE or otherwise), and much more.</p>
+
+<p>All of these issues are currently swept up under the carpet of ‘security’ in many AI discussions. We need to start talking about them with more nuance. Security is a defensive posture; agency is a collective bargain.</p>
+
+<p class="hero">But perhaps the most consequential – and hidden – aspect we should be considering is how we get to a common idea of an AI platform – including user agency. Will it be like the major mobile platforms, controlled by private and well-intentioned but self-interested and conflicted actors – with almost inevitable competition and consumer regulation following? Or will it be a publicly accountable (and inevitably messy and laggy) process, like the Web?</p>
+
+<div class="footnotes" role="doc-endnotes">
+  <ol>
+    <li id="fn:1">
+      <p>And date, and perhaps other things, depending on <a href="https://www.hodinkee.com/articles/introducing-vacheron-constantin-les-cabinotiers-solaria">how complicated it is</a>. <a href="#fnref:1" class="reversefootnote" role="doc-backlink">&#8617;</a></p>
+    </li>
+    <li id="fn:2">
+      <p>Notable exceptions include <a href="https://www.youtube.com/watch?v=NqCCubrky00">2001: A Space Odyssey</a>. <a href="#fnref:2" class="reversefootnote" role="doc-backlink">&#8617;</a></p>
+    </li>
+    <li id="fn:3">
+      <p>Beyond that provided by legal protections such as contract and product liability. Comparing that to the regulation provided by architecture is something I’ll address in another post. <a href="#fnref:3" class="reversefootnote" role="doc-backlink">&#8617;</a></p>
+    </li>
+  </ol>
+</div>]]>
+    </content>
+  </entry>
+
+  <entry>
+    <title>Using AI to Evaluate Internet Standards (Part Two)</title>
+    <link rel="alternate" type="text/html" href="https://mnot.net/blog/2026/using_ai" />
+    <id>https://mnot.net/blog/2026/using_ai</id>
+    <updated>2026-03-25T00:00:00Z</updated>
+    <author>
+        <name>Mark Nottingham</name>
+        <uri>https://mnot.net/personal/</uri>
+    </author>
+    <summary>Standards work is notoriously hard to track. Let’s explore if grounding AI in working group records can make that history more accessible.</summary>
+    
+	<category term="Standards" />
+    
+	<category term="Internet and Web" />
+    
+    <content type="html" xml:lang="en" xml:base="https://mnot.net/blog/2026/using_ai">
+  	  <![CDATA[<p class="intro">I’ve previously looked at <a href="https://mnot.net/blog/2025/06/04/using_ai">using AI as a tool to evaluate technical standards efforts</a> – basically, asking commercially available chatbots what they think. However, “AI” is more than off-the-shelf, general-purpose chatbots. Can we do better by grounding the model in a specific context?</p>
+
+<p>I’ve been looking for ways to use <a href="https://notebooklm.google.com">NotebookLM</a> for a while: grounding a chatbot in a specific set of documents allows you to interact with them in a genuinely new way.</p>
+
+<p>The breakthrough question for me was simple: What if those documents were the records of a working group? Thanks to record-keeping requirements, meetings need to keep minutes, document drafts are available, and often groups keep additional information like issue lists and meeting transcripts.</p>
+
+<p>Feed all of that into NotebookLM and you can effectively chat with the history of a standards effort – asking about why a particular choice was made, who participated, what objections came up, and how a specification evolved.</p>
+
+<p class="hero">I suspect this capability could be significant, precisely because the barriers to entry for tracking and understanding standards work are so high. There is simply too much going on — too many emails, issues, and drafts — for most people to follow.</p>
+
+<p>If successful, this technique might help make standards efforts more legible to:</p>
+
+<ul>
+  <li><strong>New or casual participants</strong>, who currently face a “wall of text” when trying to catch up on years of debate.</li>
+  <li><strong>Product managers and developers</strong>, who need to understand the intent behind a specification, not just the syntax.</li>
+  <li><strong>Civil society and policymakers</strong>, for whom the technical archives are often effectively opaque.</li>
+</ul>
+
+<h3 id="ai-preferences">AI Preferences</h3>
+
+<p>My first go at this technique was in a working group I chair, <a href="https://ietf-wg-aipref.github.io">AI Preferences</a>. We needed a way to get new and casual participants up to speed on discussions, so that we didn’t need to keep repeating the same arguments.</p>
+
+<p>Here’s <a href="https://notebooklm.google.com/notebook/37add563-249f-442e-a604-1f8d8c1bc113">the notebook</a> I created.<sup id="fnref:1"><a href="#fn:1" class="footnote" rel="footnote" role="doc-noteref">1</a></sup> I asked it to summarise the arguments against proposals for a <a href="https://github.com/ietf-wg-aipref/drafts/wiki/Use-Proposals">“use” term</a> and a <a href="https://github.com/ietf-wg-aipref/drafts/wiki/Search-Proposals">“search” term</a> in the vocabulary.</p>
+
+<p>Privately, I got feedback from new participants that these were very useful – and, critically, I was able to create them without injecting my own biases.</p>
+
+<h3 id="geopriv">GEOPRIV</h3>
+
+<p>Another test case is the now-finished IETF work on <a href="https://datatracker.ietf.org/wg/geopriv/about/">Geolocation Privacy</a>. I wasn’t involved in this group, but have long heard my IETF colleagues whisper about it in hushed tones; it didn’t succeed, and caused a lot of pain on the way there.</p>
+
+<p>After gathering the relevant documents and dragging them <a href="https://notebooklm.google.com/notebook/083c8968-7322-495d-aeb1-99bf864a2374">into a notebook</a>,<sup id="fnref:1:1"><a href="#fn:1" class="footnote" rel="footnote" role="doc-noteref">1</a></sup> I asked:</p>
+
+<blockquote>
+  <p>Why did GEOPRIV fail?</p>
+</blockquote>
+
+<p>Here’s the <a href="https://docs.google.com/document/d/1TKBwpgC9RnlX2_0ux4k0Lm47o2BgZ3Dr9rh9UlXqMC8/edit?usp=sharing">full response</a>. <a href="https://au.linkedin.com/in/martinthomson">Martin Thomson</a> (who was intimately involved in that work) reviewed that answer and said:</p>
+
+<blockquote>
+  <p>The privacy part is broadly correct.  The whole on-behalf-of arrangement did lead to some fairly bitter fights. […] Fights were common. The part about wars is entirely accurate. I’m not sure about the over-engineering part, though maybe that relates to the privacy aspect, which is fair. The final thing about lack of commercial success is broadly right, modulo successful deployments for emergency services geolocation.</p>
+
+  <p>So I’d say that this is maybe 80%.</p>
+</blockquote>
+
+<h3 id="a-new-tool">A New Tool</h3>
+
+<p>The hard part of all of this is getting all of the documents together in one place to feed into NotebookLM. To make that easier, at least for IETF groups, I<sup id="fnref:2"><a href="#fn:2" class="footnote" rel="footnote" role="doc-noteref">2</a></sup> created a new tool, <a href="https://pypi.org/project/ietf-notebook/">ietf-notebook</a>.</p>
+
+<p>You can install it using <a href="https://pipx.pypa.io/latest/">pipx</a>:</p>
+
+<blockquote>
+  <p>pipx install ietf-notebook</p>
+</blockquote>
+
+<p>Then, use it to gather all of a group’s drafts, RFCs, meeting minutes and transcripts, its charter, and optionally its GitHub issues into a directory, ready for dragging into a new notebook, so you can chat with that group’s history.</p>
+
+<p>It’s still rough, so bug reports, suggestions, and improvements are most welcome. In my experience, it takes less than a minute to gather the documents for most groups, so you can be chatting with a group in almost no time.</p>
+
+<p>If you want to see a demo first, check out the notebooks for <a href="https://notebooklm.google.com/notebook/37add563-249f-442e-a604-1f8d8c1bc113">AIPREF</a>, <a href="https://notebooklm.google.com/notebook/f998edaf-e5c5-4bb6-994e-b439dfa436f5">DIEM</a>, and <a href="https://notebooklm.google.com/notebook/083c8968-7322-495d-aeb1-99bf864a2374">GEOPRIV</a>.<sup id="fnref:1:2"><a href="#fn:1" class="footnote" rel="footnote" role="doc-noteref">1</a></sup></p>
+
+<div class="footnotes" role="doc-endnotes">
+  <ol>
+    <li id="fn:1">
+      <p>You’ll need to be logged into Google to use these notebooks. <a href="#fnref:1" class="reversefootnote" role="doc-backlink">&#8617;</a> <a href="#fnref:1:1" class="reversefootnote" role="doc-backlink">&#8617;<sup>2</sup></a> <a href="#fnref:1:2" class="reversefootnote" role="doc-backlink">&#8617;<sup>3</sup></a></p>
+    </li>
+    <li id="fn:2">
+      <p>OK, Gemini. <a href="#fnref:2" class="reversefootnote" role="doc-backlink">&#8617;</a></p>
+    </li>
+  </ol>
+</div>]]>
+    </content>
+  </entry>
+
+  <entry>
+    <title>The Internet Isn’t Facebook: How Openness Changes Everything</title>
+    <link rel="alternate" type="text/html" href="https://mnot.net/blog/2026/open_systems" />
+    <id>https://mnot.net/blog/2026/open_systems</id>
+    <updated>2026-02-20T00:00:00Z</updated>
+    <author>
+        <name>Mark Nottingham</name>
+        <uri>https://mnot.net/personal/</uri>
+    </author>
+    <summary>Openness makes the Internet harder to govern — but also makes it resilient, innovative, and difficult to capture. Let&apos;s look at how the openness of the Internet both defines it and ensures its success.</summary>
+    
+	<category term="Tech Regulation" />
+    
+	<category term="Internet and Web" />
+    
+    <content type="html" xml:lang="en" xml:base="https://mnot.net/blog/2026/open_systems">
+  	  <![CDATA[<p class="intro">“Open” tends to get thrown around a lot when talking about the Internet: Open Source, <a href="https://mnot.net/blog/2024/07/05/open_internet_standards">Open Standards</a>, Open APIs. However, one of the most important senses of the Internet’s openness doesn’t get discussed as much: its openness <em>as a system</em>. It turns out this has profound effects on both the Internet’s design and how it might be regulated.</p>
+
+<p>This critical aspect of the Internet’s architecture needs to be understood more now than ever. For many, digital sovereignty is top-of-mind in the geopolitics of 2026, but some conceptions of it treat openness as a bug, not a feature. The other hot topic – regulation to address legitimately-perceived harms on the Internet – can put both policy goals and the value we get from the Internet at risk if it’s undertaken in a way that doesn’t account for the openness of the Internet. Properly utilised, though, the power of openness can actually help democracies contribute to the Internet (and other technologies like AI) in a constructive way that reinforces their shared values.</p>
+
+<h3 id="open-and-shut">Open and Shut</h3>
+
+<p>Most often, people think and work within <em>closed systems</em> – those whose boundaries are fixed, where internal processes can be isolated from external forces, and where power is concentrated hierarchically. That single scope can still embed considerable complexity, but the assumptions that its closed nature allows make certain skills, tools, and mindsets advantageous. This simplification helps compartmentalise effects and reduces interactions; it’s easier when you don’t have to deal with things you don’t (and can’t) know, much less control.</p>
+
+<p>Many things we interact with daily are closed – for example, a single company, a project group, or even a legal jurisdiction. The Apple App Store, air traffic control, bank clearing systems, and cable television networks are closed; so are many of the emerging AI ecosystems.</p>
+
+<p>The Internet is not like that.</p>
+
+<p>That’s because it’s not possible to know or control all of the actors and forces that influence and interact with the Internet. New applications and networks appear daily, without administrative hoops; often, this is referred to as “<a href="https://www.internetsociety.org/blog/2014/04/permissionless-innovation-openness-not-anarchy/">permissionless innovation</a>,” which allowed things the Web and real-time video to be built on top of the network without asking telecom operators for approval. New protocols and services are constantly proposed, implemented and deployed – sometimes through an <abbr title="Standards Developing Organisation">SDO</abbr> like the <abbr title="Internet Engineering Task Force">IETF</abbr>, but often without any formal coordination.</p>
+
+<p>This is an open system, and it’s important to understand how that openness constrains the nature of what’s possible on the Internet. What works in a closed system falls apart when you try to apply it to the Internet. Openness as a system makes introducing new participants and services very easy – and that’s a huge benefit – but that open nature makes other aspects of managing the ecosystem very different (and sometimes difficult). Let’s look at a few.</p>
+
+<h3 id="designing-for-openness">Designing for Openness</h3>
+
+<p>Designing an Internet service like an online shop is easy if you assume it’s a closed ecosystem with an authority that ‘runs’ the shop. Yes, you have to deal with accounts, and payments, and abuse, and all of the other aspects, but the issues are known and can be addressed with the right amount of capital and a set of appropriate professionals.</p>
+
+<p>For example, designing an open trading ecosystem where there is no single authority lurking in the background and making sure everything runs well is an entirely different proposition. You need to consider how all of the components will interact and at the same time assure that none is inappropriately dominated by a single actor or even a small set, unless there are appropriate constraints on their power. You need to make sure that the amount of effort needed to join the system is low, while at the same time fighting the abusive behaviours that leverage that low barrier, such as spam.</p>
+
+<p class="callout">This is why regulatory efforts that are focused on reforming currently closed systems – “opening them up” by compelling them to expose APIs and allow competitors access to their systems – are unlikely to be successful, because those platforms are designed with assumptions that you can’t take for granted when building an open system. I’ve <a href="https://mnot.net/blog/2024/11/29/platforms">written previously</a> about Carliss Baldwin’s excellent work in this area, primarily from an economic standpoint. An open system is not just a closed one with a few APIs grafted onto it.</p>
+
+<p>For example, you’re likely to need a reputation system for vendors and users, but it can’t rely on a single authority making judgment calls about how to assign reputation, handle disputes, and so forth. Instead, you’ll want to make it more modular, where different reputation systems can compete. That’s a very different design task, and it is undoubtedly harder to achieve a good outcome.</p>
+
+<p>At the same time, an open system like the Internet needs to be more pessimistic in its assumptions about who is using it. While closed systems can take drastic steps like excluding bad actors from them, this is much more difficult (and problematic) in an open system. For example, a closed shopping site will have a definitive list of all of its users (both buyer and seller) and what they have done, so it can ascertain how trustworthy they are based upon that complete view. In an open system, there is no such luxury – each actor only has a partial view of the system.</p>
+
+<h3 id="introducing-change-in-open-systems">Introducing Change in Open Systems</h3>
+
+<p>An operator of a proprietary, closed service like Amazon, Google, or Facebook has a view of its entire state and is able to deploy changes across it, even if they break assumptions its users have previously relied upon. Their privileged position gives them this ability, and even though these services run on top of the Internet, they don’t inherit its openness.</p>
+
+<p>In contrast, an open system like e-mail, federated messaging, or Internet routing is much harder to evolve, because you can’t create a list of who’s implementing or using a protocol with any certainty; you can’t even know all of the <em>ways</em> it’s being used. This makes introducing changes tricky; as is often said in the <abbr title="Internet Engineering Task Force">IETF</abbr>, <strong>you can’t have a protocol ‘flag day’ where everyone changes how they behave at the same time</strong>.  Instead, mechanisms for gradual evolution (extensibility and versioning) need to be carefully built into the protocols themselves.</p>
+
+<p>The Web is another example of an open system.<sup id="fnref:1"><a href="#fn:1" class="footnote" rel="footnote" role="doc-noteref">1</a></sup> No one can enumerate all of the Web servers in the world – there are just too many, some hidden behind firewalls and logins. There are whole social networks and commerce sites that you’ve never heard of in other parts of the world. While search engines make us feel like we see the whole Web (and have every incentive to make us believe that), it’s a small fraction of the real thing that misses the so-called ‘deep’ Web. This vastness is why browsers have to be so conservative in introducing changes, and why we have to be so careful when we update the HTTP protocol.</p>
+
+<h3 id="governing-open-systems">Governing Open Systems</h3>
+
+<p>Openness also has significant implications for governance. Command-and-control techniques that work well when governing closed systems are ineffective on an open one, and can often be counterproductive.</p>
+
+<p>At the most basic level, this is because there is no single party to assign responsibility to in an open system – its governance structure is polycentric (i.e., has multiple and often diffuse centres of power). Compounding that effect is the fact that large open systems like the Internet span multiple jurisdictions, so a single jurisdiction is always going to be playing “whack-a-mole” if it tries to enforce compliance on one party. As a result, decisions in open systems tend to take much more time and effort than anticipated if you’re used to dealing with closed, hierarchical systems.</p>
+
+<p>On the Internet, another impact of openness is seen in the tendency to create “building block” technology components that focus on enabling communication, not limiting it. That means that they are designed to support broad requirements from many kinds of users, not constrain them, and that they’re composed into layers which are distinct and separate. So trying to use open protocols to regulate behaviour of Internet users is often like trying to pin spaghetti to the wall.</p>
+
+<p>Consider, for example, the UK’s attempts to regulate user behaviour by regulating lower-layer general-purpose technologies like <abbr title="Domain Name System">DNS</abbr> resolvers. Yes, they can make it more difficult for those using common technology to do certain things, but actually stopping such behaviour is very hard, due to the flexible, layered nature of the Internet; determined people can do the work and use alternative <abbr title="Domain Name System">DNS</abbr> servers, encrypted <abbr title="Domain Name System">DNS</abbr>, <abbr title="Virtual Private Networks">VPNs</abbr>, and other technologies to work around filters. This is considered a feature of a global communications architecture, not a bug.</p>
+
+<p>That’s not to say that all Internet regulation is a fools’ errand. The EU’s Digital Markets Act is targeting a few well-identified entities who have (very successfully) built closed ecosystems on top of the open Internet. At least from the perspective of Internet openness, that isn’t problematic (and indeed might result in more openness).</p>
+
+<p>On the other hand, the Australian eSafety Regulator’s effort to improve online safety – itself a goal not at odds with Internet openness – falls on its face by <a href="https://mnot.net/blog/2022/09/11/esafety-industry-codes">applying its regulatory mechanisms to <em>all</em> actors on the Internet</a>, not just a targeted few. This is an extension of the “Facebook is the Internet” mindset – acting as if the entire Internet is defined by a handful of big tech companies. Not only does that create significant injustice and extensive collateral damage, it also creates the conditions for making that outcome more likely (surely a competition concern). While these closed systems might be the most legible part of the Internet to regulators, they shouldn’t be mistaken for the Internet itself.</p>
+
+<p>Similarly, blanket requirements to expose encrypted messages have the effect of ‘chasing’ criminals to alternative services, making their activity even less legible to authorities and severely impacting the security and rights of law-abiding citizens in the process. That’s because there is no magical list of all of the applications that use encryption on the Internet: instead, regulators end up playing whack-a-mole. Cryptography relies on mathematical concepts realised in open protocols; treating encryption as a switch that companies can simply turn off misses the point.</p>
+
+<p>None of this is new or unique to the Internet; cross-border institutions are by nature open systems, and these issues come up often in discussions of global public goods (whether it is oceans, the climate, or the Internet). They thrive under governance that focuses on collaboration, diversity, and collective decision-making. For those that are used to top-down, hierarchical styles of governance, this can be jarring, but it produces systems that are far more resilient and less vulnerable to capture.</p>
+
+<h3 id="why-the-internet-must-stay-open">Why the Internet Must Stay Open</h3>
+
+<p>If you’ve read this far, you might wonder why we bother: if openness brings so many complications, why not just change the Internet so that it’s a simpler, closed system that is easier to design and manage?  Certainly, it’s <em>possible</em> for large, world-spanning systems to be closed. For example, both the international postal and telephony systems are effectively closed (although the latter has opened up a bit). They are reliable and successful (for some definition of success).</p>
+
+<p>I’d argue that those examples are both highly constrained and well-defined; the services they provide don’t change much, and for the most part new participants are introduced only on one ‘side’ – new end users. Keeping these networks going requires considerable overhead and resources from governments around the world, both internally and at the international coordination layer.</p>
+
+<p>The Internet (in a broader definition) is not nearly so constrained, and the bulk of its value is defined by the ability to introduce new participants of all kinds (not just users) <em>without</em> permission or overhead. This isn’t just a philosophical preference; it’s embedded in the architecture itself via the <a href="https://en.wikipedia.org/wiki/End-to-end_principle">end-to-end principle</a>. Governing major aspects of the Internet by international treaty is simply unworkable, and if the outcome of that agreement is to limit the ability of new services or participants to be introduced (e.g., “no new search engines without permission”), it’s going to have a material effect on the benefits that humanity has come to expect from the Internet. In many ways, it’s just another pathway to <a href="https://www.rfc-editor.org/info/rfc9518/">centralization</a>.</p>
+
+<p>Again, all of this is not to say that closed systems on <em>top</em> of the Internet shouldn’t be regulated – just that it needs to be done in a way that’s mindful of the open nature of the Internet itself. The guiding principle is clear: regulate the endpoints (applications, hosts, and specific commercial entities), not the transit mechanisms (the protocols and infrastructure). From what’s happened so far, it looks like many governments understand that, but some are still learning.</p>
+
+<p>Likewise, the many harms associated with the Internet need both technical and regulatory solutions; botnets, <abbr title="Distributed Denial of Service Attack">DDoS</abbr>, online abuse, “cybercrime” and much more can’t be ignored. However, solutions to these issues must respect the open nature of the Internet; even though their impact on society is heavy, the collective benefits of openness – both social and economic – <em>still</em> outweigh them; low barriers to entry ensure global market access, drive innovation, and prevent infrastructure monopolies from stifling competition.</p>
+
+<p>Those points acknowledged, I and many others are concerned that regulating ‘big tech’ companies may have the unintended side effect of ossifying their power – that is, blessing their place in the ecosystem and making it harder for more open systems to displace them. This concentration of power isn’t an accident; commercial entities have a strong economic incentive to build proprietary walled gardens on top of open protocols to extract rent. For example, we’d much rather see global commerce based upon open protocols, well-thought-out legal protections, and cooperation, rather than overseen (and exploited) by the Amazon/eBay/Temu/etc. gang.</p>
+
+<p>Of course, some jurisdictions can and will try to force certain aspects of the Internet to be closed, from their perspective. They may succeed in achieving their local goals, but such systems won’t offer the same properties as the Internet. Closed systems can be bought, coerced, lobbied into compliance, or simply fail: their hierarchical nature makes them vulnerable to failures of leadership. The Internet’s openness makes it harder to maintain and govern, but also makes it far more resilient and resistant to capture.</p>
+
+<p>Openness is what makes the Internet the Internet. It needs to be actively pursued if we want the Internet to continue providing the value that society has come to depend upon from it.</p>
+
+<p><em>Thanks to <a href="https://www.komaitis.org">Konstantinos Komaitis</a> for his suggestions.</em></p>
+
+<div class="footnotes" role="doc-endnotes">
+  <ol>
+    <li id="fn:1">
+      <p>Albeit one that is the foundation for a number of very large closed systems. <a href="#fnref:1" class="reversefootnote" role="doc-backlink">&#8617;</a></p>
+    </li>
+  </ol>
+</div>]]>
+    </content>
+  </entry>
+
+</feed>

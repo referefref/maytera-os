@@ -1,0 +1,40 @@
+{
+  "name": "Calculator",
+  "version": "1.8.0",
+  "binary": "calc",
+  "icon": "calculator.bmp",
+  "category": "Tools",
+  "description": "Basic calculator with arithmetic operations",
+  "capabilities": {
+    "actions": [
+      {
+        "name": "calculate",
+        "description": "Perform a calculation",
+        "params": ["expression"],
+        "returns": "number",
+        "requires": null
+      },
+      {
+        "name": "clear",
+        "description": "Clear the calculator display",
+        "params": [],
+        "returns": "void",
+        "requires": null
+      }
+    ],
+    "queries": [
+      {
+        "name": "get_result",
+        "description": "Get current display value",
+        "returns": "number",
+        "requires": null
+      }
+    ]
+  },
+  "window": {
+    "default_width": 200,
+    "default_height": 230,
+    "resizable": false
+  },
+  "ipc_channels": []
+}

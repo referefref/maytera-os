@@ -1,0 +1,36 @@
+# Build artifacts
+*.o
+*.a
+*.elf
+*.bin
+obj/
+kernel/kernel.elf
+**/target/
+
+# Disk images (published separately with releases, never committed)
+*.img
+*.iso
+
+# Editor / snapshot backups
+*.bak
+*.bak-*
+*.pre-*
+*.orig
+*.rej
+*.tmp
+*~
+
+# Secrets - never commit
+*.key
+*.pem
+id_rsa
+id_*
+apitoken
+**/KIMI.KEY
+**/SSH*.CFG
+**/SSHHOST.KEY
+**/AUTHKEYS
+**/EXTSVC.CFG
+**/PASSWD
+**/SHADOW
+secret.conf

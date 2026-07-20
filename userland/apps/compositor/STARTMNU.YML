@@ -1,0 +1,11 @@
+# MayteraOS Start menu - extra app groups (data-driven, #454).
+# The built-in categories (Internet, Media, Accessories, Games, System) are
+# defined in the compositor. This file lets you add EXTRA collapsible groups of
+# native apps without recompiling: each `category:` line opens a new group and
+# each `item:` line adds an entry. New groups appear after the built-ins.
+#
+#   category: My Tools
+#   item: Something | /APPS/SOMETHING | window
+#
+# icon names: window (default), clock, calculator, image, network, cog, task, log
+# Lines starting with '#' and blank lines are ignored. Empty by default.

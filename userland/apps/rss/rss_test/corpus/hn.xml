@@ -1,0 +1,130 @@
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:atom="http://www.w3.org/2005/Atom"><channel><title>Hacker News: Front Page</title><link>https://news.ycombinator.com/</link><description>Hacker News RSS</description><docs>https://hnrss.org/</docs><generator>hnrss v2.1.1</generator><lastBuildDate>Thu, 16 Jul 2026 09:03:48 +0000</lastBuildDate><atom:link href="https://hnrss.org/frontpage" rel="self" type="application/rss+xml"></atom:link><item><title><![CDATA[Netstrings (1997)]]></title><description><![CDATA[
+<p>Article URL: <a href="https://cr.yp.to/proto/netstrings.txt">https://cr.yp.to/proto/netstrings.txt</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48930713">https://news.ycombinator.com/item?id=48930713</a></p>
+<p>Points: 18</p>
+<p># Comments: 7</p>
+]]></description><pubDate>Thu, 16 Jul 2026 05:33:50 +0000</pubDate><link>https://cr.yp.to/proto/netstrings.txt</link><dc:creator>signa11</dc:creator><comments>https://news.ycombinator.com/item?id=48930713</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48930713</guid></item><item><title><![CDATA[The lost joy of music piracy]]></title><description><![CDATA[
+<p>Article URL: <a href="https://www.pigeonsandplanes.com/read/music-piracy-what-cd-oink-nine-inch-nails-streaming">https://www.pigeonsandplanes.com/read/music-piracy-what-cd-oink-nine-inch-nails-streaming</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48930454">https://news.ycombinator.com/item?id=48930454</a></p>
+<p>Points: 271</p>
+<p># Comments: 135</p>
+]]></description><pubDate>Thu, 16 Jul 2026 04:46:21 +0000</pubDate><link>https://www.pigeonsandplanes.com/read/music-piracy-what-cd-oink-nine-inch-nails-streaming</link><dc:creator>mcgin</dc:creator><comments>https://news.ycombinator.com/item?id=48930454</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48930454</guid></item><item><title><![CDATA[Reynard: A real Firefox web browser for iOS 13 or later]]></title><description><![CDATA[
+<p>Article URL: <a href="https://github.com/minh-ton/reynard-browser">https://github.com/minh-ton/reynard-browser</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48930397">https://news.ycombinator.com/item?id=48930397</a></p>
+<p>Points: 33</p>
+<p># Comments: 9</p>
+]]></description><pubDate>Thu, 16 Jul 2026 04:36:07 +0000</pubDate><link>https://github.com/minh-ton/reynard-browser</link><dc:creator>AbuAssar</dc:creator><comments>https://news.ycombinator.com/item?id=48930397</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48930397</guid></item><item><title><![CDATA[If you want to create a button from scratch, you must first create the universe]]></title><description><![CDATA[
+<p>Article URL: <a href="https://madcampos.dev/blog/2026/07/accessibility-from-scratch/">https://madcampos.dev/blog/2026/07/accessibility-from-scratch/</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48930136">https://news.ycombinator.com/item?id=48930136</a></p>
+<p>Points: 110</p>
+<p># Comments: 51</p>
+]]></description><pubDate>Thu, 16 Jul 2026 03:48:43 +0000</pubDate><link>https://madcampos.dev/blog/2026/07/accessibility-from-scratch/</link><dc:creator>treve</dc:creator><comments>https://news.ycombinator.com/item?id=48930136</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48930136</guid></item><item><title><![CDATA[Making 768 servers look like 1]]></title><description><![CDATA[
+<p>Article URL: <a href="https://planetscale.com/blog/making-768-servers-look-like-1">https://planetscale.com/blog/making-768-servers-look-like-1</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48930075">https://news.ycombinator.com/item?id=48930075</a></p>
+<p>Points: 76</p>
+<p># Comments: 10</p>
+]]></description><pubDate>Thu, 16 Jul 2026 03:36:42 +0000</pubDate><link>https://planetscale.com/blog/making-768-servers-look-like-1</link><dc:creator>hisamafahri</dc:creator><comments>https://news.ycombinator.com/item?id=48930075</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48930075</guid></item><item><title><![CDATA[1,300 Beautiful Wildlife Illustrations from the 19th Century Now Restored]]></title><description><![CDATA[
+<p>Article URL: <a href="https://www.openculture.com/2026/07/explore-1300-beautiful-wildlife-illustrations-from-the-19th-century.html">https://www.openculture.com/2026/07/explore-1300-beautiful-wildlife-illustrations-from-the-19th-century.html</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48929945">https://news.ycombinator.com/item?id=48929945</a></p>
+<p>Points: 82</p>
+<p># Comments: 11</p>
+]]></description><pubDate>Thu, 16 Jul 2026 03:12:47 +0000</pubDate><link>https://www.openculture.com/2026/07/explore-1300-beautiful-wildlife-illustrations-from-the-19th-century.html</link><dc:creator>gslin</dc:creator><comments>https://news.ycombinator.com/item?id=48929945</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48929945</guid></item><item><title><![CDATA[Can LLMs Perform Deep Technical Comprehension of Computer Architecture Papers]]></title><description><![CDATA[
+<p>Article URL: <a href="https://arxiv.org/abs/2607.11859">https://arxiv.org/abs/2607.11859</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48929660">https://news.ycombinator.com/item?id=48929660</a></p>
+<p>Points: 48</p>
+<p># Comments: 11</p>
+]]></description><pubDate>Thu, 16 Jul 2026 02:17:31 +0000</pubDate><link>https://arxiv.org/abs/2607.11859</link><dc:creator>Jimmc414</dc:creator><comments>https://news.ycombinator.com/item?id=48929660</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48929660</guid></item><item><title><![CDATA[The Tokio/Rayon Trap and Why Async/Await Fails Concurrency]]></title><description><![CDATA[
+<p>Article URL: <a href="https://pmbanugo.me/blog/why-async-await-complect-concurrency">https://pmbanugo.me/blog/why-async-await-complect-concurrency</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48929587">https://news.ycombinator.com/item?id=48929587</a></p>
+<p>Points: 60</p>
+<p># Comments: 38</p>
+]]></description><pubDate>Thu, 16 Jul 2026 02:06:36 +0000</pubDate><link>https://pmbanugo.me/blog/why-async-await-complect-concurrency</link><dc:creator>LAC-Tech</dc:creator><comments>https://news.ycombinator.com/item?id=48929587</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48929587</guid></item><item><title><![CDATA[Bluesky Trademarks ATProto]]></title><description><![CDATA[
+<p>Article URL: <a href="https://atproto.com/blog/at-protocol-trademark">https://atproto.com/blog/at-protocol-trademark</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48929351">https://news.ycombinator.com/item?id=48929351</a></p>
+<p>Points: 95</p>
+<p># Comments: 37</p>
+]]></description><pubDate>Thu, 16 Jul 2026 01:21:04 +0000</pubDate><link>https://atproto.com/blog/at-protocol-trademark</link><dc:creator>chaosharmonic</dc:creator><comments>https://news.ycombinator.com/item?id=48929351</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48929351</guid></item><item><title><![CDATA[Metal-Organic Frameworks, Chemistry's New Miracle Materials (2018)]]></title><description><![CDATA[
+<p>Article URL: <a href="https://chemistry.berkeley.edu/news/meet-metal-organic-frameworks-chemistry%E2%80%99s-new-miracle-materials">https://chemistry.berkeley.edu/news/meet-metal-organic-frameworks-chemistry%E2%80%99s-new-miracle-materials</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48928313">https://news.ycombinator.com/item?id=48928313</a></p>
+<p>Points: 54</p>
+<p># Comments: 12</p>
+]]></description><pubDate>Wed, 15 Jul 2026 23:00:31 +0000</pubDate><link>https://chemistry.berkeley.edu/news/meet-metal-organic-frameworks-chemistry%E2%80%99s-new-miracle-materials</link><dc:creator>andsoitis</dc:creator><comments>https://news.ycombinator.com/item?id=48928313</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48928313</guid></item><item><title><![CDATA[SQLite should have (Rust-style) editions]]></title><description><![CDATA[
+<p>Article URL: <a href="https://mort.coffee/home/sqlite-editions/">https://mort.coffee/home/sqlite-editions/</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48928135">https://news.ycombinator.com/item?id=48928135</a></p>
+<p>Points: 260</p>
+<p># Comments: 103</p>
+]]></description><pubDate>Wed, 15 Jul 2026 22:42:58 +0000</pubDate><link>https://mort.coffee/home/sqlite-editions/</link><dc:creator>gnyeki</dc:creator><comments>https://news.ycombinator.com/item?id=48928135</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48928135</guid></item><item><title><![CDATA[LLM Networking with MikroTik]]></title><description><![CDATA[
+<p>Article URL: <a href="https://blog.greg.technology/2026/07/14/llm-networking-with-mikrotik.html">https://blog.greg.technology/2026/07/14/llm-networking-with-mikrotik.html</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48927915">https://news.ycombinator.com/item?id=48927915</a></p>
+<p>Points: 87</p>
+<p># Comments: 38</p>
+]]></description><pubDate>Wed, 15 Jul 2026 22:23:27 +0000</pubDate><link>https://blog.greg.technology/2026/07/14/llm-networking-with-mikrotik.html</link><dc:creator>gregsadetsky</dc:creator><comments>https://news.ycombinator.com/item?id=48927915</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48927915</guid></item><item><title><![CDATA[Governments, companies, nonprofits should invest in free, open source AI [pdf]]]></title><description><![CDATA[
+<p>Article URL: <a href="https://www.siegelendowment.org/wp-content/uploads/2026/07/fortune-david-siegel-open-source-ai.pdf">https://www.siegelendowment.org/wp-content/uploads/2026/07/fortune-david-siegel-open-source-ai.pdf</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48927095">https://news.ycombinator.com/item?id=48927095</a></p>
+<p>Points: 186</p>
+<p># Comments: 67</p>
+]]></description><pubDate>Wed, 15 Jul 2026 21:16:36 +0000</pubDate><link>https://www.siegelendowment.org/wp-content/uploads/2026/07/fortune-david-siegel-open-source-ai.pdf</link><dc:creator>bilsbie</dc:creator><comments>https://news.ycombinator.com/item?id=48927095</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48927095</guid></item><item><title><![CDATA[Show HN: Firefox in WebAssembly]]></title><description><![CDATA[
+<p>This is the entire Firefox browser rendering to a <canvas> element. Gecko, all UI components, and the Spidermonkey JS engine are all compiled and running in WebAssembly.<p>Here are a few things you might find interesting:<p>- This is fully end to end encrypted! We use the WISP protocol for TCP-over-websockets.<p>- There is a novel WASM->JS JIT for experimental site speedup<p>- This port cost over 25k in opus/fable tokens for debugging and JIT research<p>This was just a fun experiment to push the boundaries of WebAssembly. For a more usable "browser in browser" experience, we also built <a href="https://github.com/HeyPuter/browser.js" rel="nofollow">https://github.com/HeyPuter/browser.js</a> that eats a bit less RAM.</p>
+<hr>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48926939">https://news.ycombinator.com/item?id=48926939</a></p>
+<p>Points: 197</p>
+<p># Comments: 98</p>
+]]></description><pubDate>Wed, 15 Jul 2026 21:00:17 +0000</pubDate><link>https://developer.puter.com/labs/firefox-wasm/</link><dc:creator>coolelectronics</dc:creator><comments>https://news.ycombinator.com/item?id=48926939</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48926939</guid></item><item><title><![CDATA[Grok Build is open source]]></title><description><![CDATA[
+<p>Article URL: <a href="https://github.com/xai-org/grok-build">https://github.com/xai-org/grok-build</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48926590">https://news.ycombinator.com/item?id=48926590</a></p>
+<p>Points: 435</p>
+<p># Comments: 466</p>
+]]></description><pubDate>Wed, 15 Jul 2026 20:24:58 +0000</pubDate><link>https://github.com/xai-org/grok-build</link><dc:creator>skp1995</dc:creator><comments>https://news.ycombinator.com/item?id=48926590</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48926590</guid></item><item><title><![CDATA[Duskers, the scary command line game, is getting a sequel]]></title><description><![CDATA[
+<p>Article URL: <a href="https://elbowgreasegames.substack.com/p/misfits-attic-announces-duskers-20">https://elbowgreasegames.substack.com/p/misfits-attic-announces-duskers-20</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48925888">https://news.ycombinator.com/item?id=48925888</a></p>
+<p>Points: 124</p>
+<p># Comments: 39</p>
+]]></description><pubDate>Wed, 15 Jul 2026 19:27:59 +0000</pubDate><link>https://elbowgreasegames.substack.com/p/misfits-attic-announces-duskers-20</link><dc:creator>spacemarine1</dc:creator><comments>https://news.ycombinator.com/item?id=48925888</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48925888</guid></item><item><title><![CDATA[Inkling: Our Open-Weights Model]]></title><description><![CDATA[
+<p>Article URL: <a href="https://thinkingmachines.ai/news/introducing-inkling/">https://thinkingmachines.ai/news/introducing-inkling/</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48924912">https://news.ycombinator.com/item?id=48924912</a></p>
+<p>Points: 955</p>
+<p># Comments: 236</p>
+]]></description><pubDate>Wed, 15 Jul 2026 18:12:45 +0000</pubDate><link>https://thinkingmachines.ai/news/introducing-inkling/</link><dc:creator>vimarsh6739</dc:creator><comments>https://news.ycombinator.com/item?id=48924912</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48924912</guid></item><item><title><![CDATA[Artie (YC S23) Is Hiring Software Engineers]]></title><description><![CDATA[
+<p>Article URL: <a href="https://jobs.ashbyhq.com/artie">https://jobs.ashbyhq.com/artie</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48923833">https://news.ycombinator.com/item?id=48923833</a></p>
+<p>Points: 0</p>
+<p># Comments: 0</p>
+]]></description><pubDate>Wed, 15 Jul 2026 17:01:02 +0000</pubDate><link>https://jobs.ashbyhq.com/artie</link><dc:creator>tang8330</dc:creator><comments>https://news.ycombinator.com/item?id=48923833</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48923833</guid></item><item><title><![CDATA[Collection of Digital Clock Designs]]></title><description><![CDATA[
+<p>Article URL: <a href="https://clocks.dev">https://clocks.dev</a></p>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48923380">https://news.ycombinator.com/item?id=48923380</a></p>
+<p>Points: 238</p>
+<p># Comments: 45</p>
+]]></description><pubDate>Wed, 15 Jul 2026 16:33:15 +0000</pubDate><link>https://clocks.dev</link><dc:creator>levmiseri</dc:creator><comments>https://news.ycombinator.com/item?id=48923380</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48923380</guid></item><item><title><![CDATA[Launch HN: Coasty (YC S26) – An API for computer-use agents]]></title><description><![CDATA[
+<p>Hey HN, we’re Nitish and Prateek, the founders of Coasty (<a href="https://coasty.ai/computer-use">https://coasty.ai/computer-use</a>). We’re building computer-use agents that can complete workflows inside legacy desktop software and web applications without usable APIs.<p>Developers send Coasty a natural-language task either through our consumer app or through our API, select a machine or browser environment, and any relevant credentials or files. The agent then operates the interface through screenshots, mouse, and keyboard input, verifies the result, and returns a structured run record with screenshots, actions, outputs, and errors.<p>Here is a raw demo of an agent completing a workflow in a legacy application(It’s a mockup): <a href="https://drive.google.com/file/d/1ZghU_3vsAYhHVz1bsvE0pkvZYk7OUnb1/view?usp=sharing" rel="nofollow">https://drive.google.com/file/d/1ZghU_3vsAYhHVz1bsvE0pkvZYk7...</a><p>A lot of important software is still difficult to automate. Healthcare teams submit prior authorizations through payer portals, accounting teams enter data into desktop applications, and operations teams move information between internal systems, spreadsheets, and remote desktops. Many of these applications have no API, incomplete APIs, or integrations that take months to build.<p>The usual alternative is RPA, record a sequence of clicks and replay it. That works when the interface and workflow are predictable, but it often breaks when a button moves, a pop-up appears, a page loads slowly, or the application enters an unexpected state.<p>Coasty takes a different approach. The agent observes the current screen, decides what action to take, executes it, and then observes the resulting state before continuing. It does not require DOM access, an accessibility tree, selectors, or an application-specific integration, so the same API can operate browsers, remote desktops, and older Windows applications.<p>A simplified request looks roughly like this:<p><pre><code>  run = coasty.runs.create(
+      environment="vm_123",
+      task="""
+      Open the patient record in the billing portal.
+      Enter the attached authorization data.
+      Do not submit if the member ID or procedure code does not match.
+      Return the confirmation number.
+      """,
+      files=["authorization.pdf"],
+      approval_required=["final_submission"]
+  )
+</code></pre>
+The response includes the final status, extracted outputs, a replay URL, and a timestamped event log:<p><pre><code>  {
+    "status": "completed",
+    "output": {
+      "confirmation_number": "PA-184392"
+    },
+    "replay_url": "...",
+    "events": [
+      {
+        "type": "verification",
+        "field": "member_id",
+        "result": "matched"
+      }
+    ]
+  }
+</code></pre>
+The API can also pause a run for human approval, retry from a checkpoint, or return control to the developer when it encounters a condition the workflow did not anticipate.<p>We started working on this last summer, because we saw that models were getting better at vision but kept seeing a gap between computer-use demos and the reliability needed for production workflows. Getting an agent to complete a task once is fairly straightforward. Getting it to repeat that task, recover from unexpected states, avoid silently entering incorrect data, and produce evidence of what it did is much harder.<p>We built several layers around the underlying computer-use model. The system tracks the expected state of the workflow, detects when the application has diverged from that state, and can re-plan instead of continuing blindly. Developers can define invariants such as “the patient name must match the source document” or “never submit without approval,” and the agent checks those conditions during the run.<p>Each run happens in an isolated virtual machine. We expose APIs for provisioning environments, uploading files, starting tasks, streaming events, inserting human approvals, and retrieving the full replay and audit trail. Environments can be kept alive across runs when the application has a long login flow or persistent local state.<p>One problem we are still working through is the tradeoff between speed and reliability. The agent can move faster by taking fewer observations and verification steps, but that becomes risky in workflows involving patient records, payments, or regulatory filings. We currently bias toward slower execution with more checks and let developers configure approval points and verification policies.<p>We are initially working with healthcare operations teams because their workflows combine many of the hardest conditions: payer portals, EHRs, PDFs, spreadsheets, remote desktops, and actions where quiet mistakes are expensive. We also expose the same infrastructure through the developer API for teams building their own agents and vertical automation products.<p>We currently charge based on agent runtime and workflow volume, with separate pricing for dedicated environments and enterprise deployments.<p>We’d especially appreciate feedback from people who have built and/or used browser agents, RPA systems, desktop automation, or agent infrastructure. We’re curious which parts of the API you would want direct control over, where you would prefer higher-level abstractions, and which failure modes have been hardest in your own automation systems.<p>If you've hit weird failure modes automating software like this, we want to hear about them. We'll be here all day answering questions and taking notes!</p>
+<hr>
+<p>Comments URL: <a href="https://news.ycombinator.com/item?id=48922706">https://news.ycombinator.com/item?id=48922706</a></p>
+<p>Points: 35</p>
+<p># Comments: 10</p>
+]]></description><pubDate>Wed, 15 Jul 2026 15:51:20 +0000</pubDate><link>https://coasty.ai/docs</link><dc:creator>nkov47</dc:creator><comments>https://news.ycombinator.com/item?id=48922706</comments><guid isPermaLink="false">https://news.ycombinator.com/item?id=48922706</guid></item></channel></rss>

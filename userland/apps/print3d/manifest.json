@@ -1,0 +1,41 @@
+{
+  "app": "print3d",
+  "version": "1.1.0",
+  "description": "3D Print - slice-ready g-code sender for the M3D Micro (M33-Fio preprocessing, phase 1: virtual printer). Bundles a sliced 3DBenchy + 20mm cube test print.",
+  "icon": "print3d.bmp",
+  "category": "Utilities",
+  "capabilities": [
+    {
+      "action": "load_gcode",
+      "parameters": {"path": "string"},
+      "description": "Load a .gcode file and show print info",
+      "requires_capability": "fs.read"
+    },
+    {
+      "action": "print",
+      "parameters": {},
+      "description": "Preprocess the loaded g-code (M3D pipeline) and send the M3D command stream to the transport",
+      "requires_capability": "fs.write"
+    },
+    {
+      "action": "manual_command",
+      "parameters": {"command": "string"},
+      "description": "Send a single M3D command (Home/Preheat/Extrude/Retract/Pause/Cancel)",
+      "requires_capability": "fs.write"
+    },
+    {
+      "action": "set_target_temperature",
+      "parameters": {"celsius": "int"},
+      "valid_range": [0, 315],
+      "requires_capability": "fs.write"
+    }
+  ],
+  "state_queries": [
+    {
+      "query": "get_print_info",
+      "returns": {"layers": "int", "lines": "int", "filament_mm": "float", "in_bounds": "bool", "centered": "bool"},
+      "requires_capability": "fs.read"
+    }
+  ],
+  "notes": "Phase 1 transport is a virtual printer that logs the produced M3D stream to /M3DOUT.TXT. Phase 2 will add a USB CDC-ACM backend with no app change."
+}

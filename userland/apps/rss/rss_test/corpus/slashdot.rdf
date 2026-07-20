@@ -1,0 +1,376 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+
+<rdf:RDF
+ xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+ xmlns="http://purl.org/rss/1.0/"
+ xmlns:admin="http://webns.net/mvcb/"
+ xmlns:content="http://purl.org/rss/1.0/modules/content/"
+ xmlns:dc="http://purl.org/dc/elements/1.1/"
+ xmlns:slash="http://purl.org/rss/1.0/modules/slash/"
+ xmlns:syn="http://purl.org/rss/1.0/modules/syndication/"
+ xmlns:taxo="http://purl.org/rss/1.0/modules/taxonomy/"
+>
+
+<channel rdf:about="https://slashdot.org/">
+<title>Slashdot</title>
+<link>https://slashdot.org/</link>
+<description>News for nerds, stuff that matters</description>
+<dc:language>en-us</dc:language>
+<dc:rights>Copyright Slashdot Media. All Rights Reserved.</dc:rights>
+<dc:date>2026-07-16T09:10:22+00:00</dc:date>
+<dc:publisher>Slashdot Media</dc:publisher>
+<dc:creator>feedback@slashdot.org</dc:creator>
+<dc:subject>Technology</dc:subject>
+<syn:updateBase>1970-01-01T00:00+00:00</syn:updateBase>
+<syn:updateFrequency>1</syn:updateFrequency>
+<syn:updatePeriod>hourly</syn:updatePeriod>
+<items>
+ <rdf:Seq>
+  <rdf:li rdf:resource="https://science.slashdot.org/story/26/07/16/0421206/physicists-create-first-room-temperature-quantum-material?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed" />
+  <rdf:li rdf:resource="https://hardware.slashdot.org/story/26/07/15/2123238/us-suffered-a-major-power-outage-every-month-of-2026?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed" />
+  <rdf:li rdf:resource="https://yro.slashdot.org/story/26/07/15/2113245/book-publishers-sue-google-for-copyright-infringement-over-gemini-ai-training?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed" />
+  <rdf:li rdf:resource="https://entertainment.slashdot.org/story/26/07/15/2026236/spotify-is-now-an-ai-chatbot-too?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed" />
+  <rdf:li rdf:resource="https://news.slashdot.org/story/26/07/15/2010250/hack-reveals-suno-ai-music-generator-scraped-youtube-deezer-and-genius?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed" />
+  <rdf:li rdf:resource="https://entertainment.slashdot.org/story/26/07/15/1953229/fcc-plans-to-repeal-39-tv-ownership-cap?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed" />
+  <rdf:li rdf:resource="https://yro.slashdot.org/story/26/07/15/1738217/google-and-epic-cancel-settlement-third-party-app-stores-coming-to-google-play?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed" />
+  <rdf:li rdf:resource="https://bsd.slashdot.org/story/26/07/15/1727252/freebsd-16-retires-the-last-of-its-gpl-code?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed" />
+  <rdf:li rdf:resource="https://hardware.slashdot.org/story/26/07/15/1659217/openai-launches-a-keypad-for-ai-agents?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed" />
+  <rdf:li rdf:resource="https://news.slashdot.org/story/26/07/15/047200/stripe-advent-offer-to-buy-paypal-for-more-than-53-billion?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed" />
+  <rdf:li rdf:resource="https://tech.slashdot.org/story/26/07/15/042220/microsoft-patches-a-record-570-security-flaws?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed" />
+  <rdf:li rdf:resource="https://science.slashdot.org/story/26/07/15/0354223/astronauts-take-first-x-rays-in-space?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed" />
+  <rdf:li rdf:resource="https://yro.slashdot.org/story/26/07/15/0346241/house-votes-for-permanent-daylight-saving-time?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed" />
+  <rdf:li rdf:resource="https://tech.slashdot.org/story/26/07/14/2121249/iran-abused-mobile-networks-vulnerabilities-to-locate-us-military-in-middle-east?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed" />
+  <rdf:li rdf:resource="https://hardware.slashdot.org/story/26/07/14/2116245/openais-first-device-will-be-moveable-screenless-speaker-built-as-ai-companion?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed" />
+ </rdf:Seq>
+</items>
+<image rdf:resource="https://a.fsdn.com/sd/topics/topicslashdot.gif" />
+<textinput rdf:resource="https://slashdot.org/search.pl" />
+</channel>
+<image rdf:about="https://a.fsdn.com/sd/topics/topicslashdot.gif">
+<title>Slashdot</title>
+<url>https://a.fsdn.com/sd/topics/topicslashdot.gif</url>
+<link>https://slashdot.org/</link>
+</image>
+<item rdf:about="https://science.slashdot.org/story/26/07/16/0421206/physicists-create-first-room-temperature-quantum-material?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed">
+<title>Physicists Create First Room-Temperature Quantum Material</title>
+<link>https://science.slashdot.org/story/26/07/16/0421206/physicists-create-first-room-temperature-quantum-material?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed</link>
+<description>alternative_right shares a report from Phys.org: In a study published in Nature, LSU physicists have developed the first room-temperature quantum material capable of distinguishing and transporting different quantum states of light, overcoming one of the biggest challenges in quantum materials research. Led by Associate Professor of Physics Omar S. Magana-Loaiza, the work establishes a general design principle for engineering an entirely new class of quantum materials, opening new possibilities for quantum computing, secure communications, sensing technologies and advanced energy systems.&lt;p&gt;&lt;div class="share_submission" style="position:relative;"&gt;
+&lt;a class="slashpop" href="http://twitter.com/home?status=Physicists+Create+First+Room-Temperature+Quantum+Material%3A+https%3A%2F%2Fscience.slashdot.org%2Fstory%2F26%2F07%2F16%2F0421206%2F%3Futm_source%3Dtwitter%26utm_medium%3Dtwitter"&gt;&lt;img src="https://a.fsdn.com/sd/twitter_icon_large.png"&gt;&lt;/a&gt;
+&lt;a class="slashpop" href="http://www.facebook.com/sharer.php?u=https%3A%2F%2Fscience.slashdot.org%2Fstory%2F26%2F07%2F16%2F0421206%2Fphysicists-create-first-room-temperature-quantum-material%3Futm_source%3Dslashdot%26utm_medium%3Dfacebook"&gt;&lt;img src="https://a.fsdn.com/sd/facebook_icon_large.png"&gt;&lt;/a&gt;
+
+
+
+&lt;/div&gt;&lt;/p&gt;&lt;p&gt;&lt;a href="https://science.slashdot.org/story/26/07/16/0421206/physicists-create-first-room-temperature-quantum-material?utm_source=rss1.0moreanon&amp;amp;utm_medium=feed"&gt;Read more of this story&lt;/a&gt; at Slashdot.&lt;/p&gt;&lt;iframe src="https://slashdot.org/slashdot-it.pl?op=discuss&amp;amp;id=24044542&amp;amp;smallembed=1" style="height: 300px; width: 100%; border: none;"&gt;&lt;/iframe&gt;</description>
+<dc:creator>BeauHD</dc:creator>
+<dc:date>2026-07-16T07:00:00+00:00</dc:date>
+<dc:subject>medicine</dc:subject>
+<slash:department>plasmonic-metacrystal-magic</slash:department>
+<slash:section>science</slash:section>
+<slash:comments>8</slash:comments>
+<slash:hit_parade>8,8,6,6,2,0,0</slash:hit_parade>
+</item>
+<item rdf:about="https://hardware.slashdot.org/story/26/07/15/2123238/us-suffered-a-major-power-outage-every-month-of-2026?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed">
+<title>US Suffered a Major Power Outage Every Month of 2026</title>
+<link>https://hardware.slashdot.org/story/26/07/15/2123238/us-suffered-a-major-power-outage-every-month-of-2026?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed</link>
+<description>An anonymous reader quotes a report from Electrek: A Reddit post making the rounds this week claims the U.S. has experienced at least one major power outage every month of 2026 -- but is it true? I dug into several outages, the extreme weather behind them, and what we can do to help keep the lights on. [...] The claim that hundreds of thousands of Americans were without power over extended periods at least once per month, every month of 2026 surprised be in two ways. First, because I had no idea if it was true -- and, second, because it felt true. We try to do better than writing about things that feel true around here, however, so I did a bit of research (translation: I Googled power outages by month) and came up with the following examples in about sixty seconds
+ 
+January: More than 296,000 customers still without power as winter storm freezes much of the US 
+February: More than 380,000 customers without power as winter storm hits US Northeast 
+March: Storms Cut Power to Over 1 Million Customers in U.S. Midwest, Mid-Atlantic; Ohio Hardest Hit 
+April: At least 29 tornadoes touched down in Central Illinois on April 17th 
+May: Energy Secretary Issues Emergency Order to Deploy Backup Generation in the Mid-Atlantic Amid Heatwave 
+June: More than 373,000 U.S. customers without power due to extreme weather
+ ... and that list is far from comprehensive, and how you feel about it might depend on what you consider a "major" outage, of course -- but consider that there are tens of thousands of Americans without power right now, and that's not making the news. [...] The lesson here is that weather-related grid outages -- whether they're caused by wildfires, mudslides, derechos, tornadoes, ice storms, hurricanes, heat waves, or some other disaster I'm lucky enough to have forgotten about -- read like statistics when they're happening over there, but get personal real quick when they're happening to you.&lt;p&gt;&lt;div class="share_submission" style="position:relative;"&gt;
+&lt;a class="slashpop" href="http://twitter.com/home?status=US+Suffered+a+Major+Power+Outage+Every+Month+of+2026%3A+https%3A%2F%2Fhardware.slashdot.org%2Fstory%2F26%2F07%2F15%2F2123238%2F%3Futm_source%3Dtwitter%26utm_medium%3Dtwitter"&gt;&lt;img src="https://a.fsdn.com/sd/twitter_icon_large.png"&gt;&lt;/a&gt;
+&lt;a class="slashpop" href="http://www.facebook.com/sharer.php?u=https%3A%2F%2Fhardware.slashdot.org%2Fstory%2F26%2F07%2F15%2F2123238%2Fus-suffered-a-major-power-outage-every-month-of-2026%3Futm_source%3Dslashdot%26utm_medium%3Dfacebook"&gt;&lt;img src="https://a.fsdn.com/sd/facebook_icon_large.png"&gt;&lt;/a&gt;
+
+
+
+&lt;/div&gt;&lt;/p&gt;&lt;p&gt;&lt;a href="https://hardware.slashdot.org/story/26/07/15/2123238/us-suffered-a-major-power-outage-every-month-of-2026?utm_source=rss1.0moreanon&amp;amp;utm_medium=feed"&gt;Read more of this story&lt;/a&gt; at Slashdot.&lt;/p&gt;&lt;iframe src="https://slashdot.org/slashdot-it.pl?op=discuss&amp;amp;id=24044264&amp;amp;smallembed=1" style="height: 300px; width: 100%; border: none;"&gt;&lt;/iframe&gt;</description>
+<dc:creator>BeauHD</dc:creator>
+<dc:date>2026-07-16T03:30:00+00:00</dc:date>
+<dc:subject>power</dc:subject>
+<slash:department>would-you-look-at-that</slash:department>
+<slash:section>hardware</slash:section>
+<slash:comments>37</slash:comments>
+<slash:hit_parade>37,37,28,25,7,3,1</slash:hit_parade>
+</item>
+<item rdf:about="https://yro.slashdot.org/story/26/07/15/2113245/book-publishers-sue-google-for-copyright-infringement-over-gemini-ai-training?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed">
+<title>Book Publishers Sue Google For Copyright Infringement Over Gemini AI Training</title>
+<link>https://yro.slashdot.org/story/26/07/15/2113245/book-publishers-sue-google-for-copyright-infringement-over-gemini-ai-training?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed</link>
+<description>Major publishers Hachette, Cengage, Elsevier, and author Scott Turow have sued Google, accusing it of using millions of copyrighted books to train Gemini without permission or payment, in "one of the most prolific infringements of copyrighted materials in history." The Guardian reports: The publishers argue that Google repurposed books that had been supplied for limited services such as Google Books, Google Play Books and Google Scholar. Those services allowed Google to use the works in specific ways -- for example, to display searchable snippets or sell ebooks -- but not, the lawsuit claims, to copy them for training commercial AI products. "Desperate to maintain its online dominance, Google abandoned its early motto of 'Don't be evil' and engaged in one of the most prolific infringements of copyrighted materials in history," the suit states (PDF).
+ 
+According to the complaint, the tech company made copies of copyrighted books to train Gemini without permission or payment, despite internal discussions acknowledging the legal risks. The filing claims Google flagged internally that it could face "$10Bs-$100Bs in potential fines" for using texts provided by publishers for Google Play Books. The publishers say Google's actions are harming authors and the wider publishing industry, arguing that AI-generated content could negatively impact book sales.
+ 
+It notes that, for example, Gemini could generate "a 100-page murder mystery set in a quiet seaside town filled with secrets, that substitutes for an original copyrighted murder mystery on which Gemini trained" in 20 minutes for 39 cents. "No publisher or author can compete with that." The lawsuit names a number of specific books that the publishers allege were among the copyrighted works used without permission, including NK Jemisin's The Fifth Season, and Lemony Snicket's Who Could That Be at This Hour?&lt;p&gt;&lt;div class="share_submission" style="position:relative;"&gt;
+&lt;a class="slashpop" href="http://twitter.com/home?status=Book+Publishers+Sue+Google+For+Copyright+Infringement+Over+Gemini+AI+Training%3A+https%3A%2F%2Fyro.slashdot.org%2Fstory%2F26%2F07%2F15%2F2113245%2F%3Futm_source%3Dtwitter%26utm_medium%3Dtwitter"&gt;&lt;img src="https://a.fsdn.com/sd/twitter_icon_large.png"&gt;&lt;/a&gt;
+&lt;a class="slashpop" href="http://www.facebook.com/sharer.php?u=https%3A%2F%2Fyro.slashdot.org%2Fstory%2F26%2F07%2F15%2F2113245%2Fbook-publishers-sue-google-for-copyright-infringement-over-gemini-ai-training%3Futm_source%3Dslashdot%26utm_medium%3Dfacebook"&gt;&lt;img src="https://a.fsdn.com/sd/facebook_icon_large.png"&gt;&lt;/a&gt;
+
+
+
+&lt;/div&gt;&lt;/p&gt;&lt;p&gt;&lt;a href="https://yro.slashdot.org/story/26/07/15/2113245/book-publishers-sue-google-for-copyright-infringement-over-gemini-ai-training?utm_source=rss1.0moreanon&amp;amp;utm_medium=feed"&gt;Read more of this story&lt;/a&gt; at Slashdot.&lt;/p&gt;&lt;iframe src="https://slashdot.org/slashdot-it.pl?op=discuss&amp;amp;id=24044260&amp;amp;smallembed=1" style="height: 300px; width: 100%; border: none;"&gt;&lt;/iframe&gt;</description>
+<dc:creator>BeauHD</dc:creator>
+<dc:date>2026-07-15T23:00:00+00:00</dc:date>
+<dc:subject>court</dc:subject>
+<slash:department>authors-vs-AI</slash:department>
+<slash:section>yro</slash:section>
+<slash:comments>48</slash:comments>
+<slash:hit_parade>48,45,35,27,4,1,1</slash:hit_parade>
+</item>
+<item rdf:about="https://entertainment.slashdot.org/story/26/07/15/2026236/spotify-is-now-an-ai-chatbot-too?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed">
+<title>Spotify Is Now an AI Chatbot, Too</title>
+<link>https://entertainment.slashdot.org/story/26/07/15/2026236/spotify-is-now-an-ai-chatbot-too?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed</link>
+<description>Spotify is testing a new "Talk to Spotify" AI feature for Premium subscribers that will let them chat with an AI assistant to explore music, podcasts, and audiobooks. The feature can answer questions about what users are listening to, adjust playback through follow-up prompts, and offer more personalized recommendations. The Verge reports: Amazon Music introduced a similar feature last year when it integrated Alexa Plus into the service. Spotify's chatbot goes a step beyond providing AI-powered recommendations and general trivia, however, because it references your playlists, favorite artists, repeat listens, and listening data when responding to requests. That means you can ask questions about your own listening history to check when you first heard a specific song, or see what genres you've been into lately if you can't hold out for the annual Wrapped insights.
+ 
+The updated AI capabilities are more conversational than older features like Prompted Playlist, which automatically builds playlists based on descriptions. Now, you can ask the Spotify chatbot to "play some songs I haven't heard before," and control what's being played with further instructions like requesting specific artists or asking to make it "more upbeat." Spotify says the new conversational experience aims to make the platform "more personal and useful for every listener," making this one of several ways that the company is trying to address complaints about its algorithm.
+ 
+You can also ask the Spotify AI general questions about whatever you're listening to, making the feature feel similar to using chatbot services like Google's Gemini or OpenAI's ChatGPT. That includes asking for when a song was released, exploring other titles an author has written when listening to one of their audiobooks, or checking if a podcast guest has appeared on other audio shows.&lt;p&gt;&lt;div class="share_submission" style="position:relative;"&gt;
+&lt;a class="slashpop" href="http://twitter.com/home?status=Spotify+Is+Now+an+AI+Chatbot%2C+Too%3A+https%3A%2F%2Fentertainment.slashdot.org%2Fstory%2F26%2F07%2F15%2F2026236%2F%3Futm_source%3Dtwitter%26utm_medium%3Dtwitter"&gt;&lt;img src="https://a.fsdn.com/sd/twitter_icon_large.png"&gt;&lt;/a&gt;
+&lt;a class="slashpop" href="http://www.facebook.com/sharer.php?u=https%3A%2F%2Fentertainment.slashdot.org%2Fstory%2F26%2F07%2F15%2F2026236%2Fspotify-is-now-an-ai-chatbot-too%3Futm_source%3Dslashdot%26utm_medium%3Dfacebook"&gt;&lt;img src="https://a.fsdn.com/sd/facebook_icon_large.png"&gt;&lt;/a&gt;
+
+
+
+&lt;/div&gt;&lt;/p&gt;&lt;p&gt;&lt;a href="https://entertainment.slashdot.org/story/26/07/15/2026236/spotify-is-now-an-ai-chatbot-too?utm_source=rss1.0moreanon&amp;amp;utm_medium=feed"&gt;Read more of this story&lt;/a&gt; at Slashdot.&lt;/p&gt;&lt;iframe src="https://slashdot.org/slashdot-it.pl?op=discuss&amp;amp;id=24044198&amp;amp;smallembed=1" style="height: 300px; width: 100%; border: none;"&gt;&lt;/iframe&gt;</description>
+<dc:creator>BeauHD</dc:creator>
+<dc:date>2026-07-15T22:00:00+00:00</dc:date>
+<dc:subject>music</dc:subject>
+<slash:department>AI-all-the-things</slash:department>
+<slash:section>entertainment</slash:section>
+<slash:comments>13</slash:comments>
+<slash:hit_parade>13,13,11,10,2,2,1</slash:hit_parade>
+</item>
+<item rdf:about="https://news.slashdot.org/story/26/07/15/2010250/hack-reveals-suno-ai-music-generator-scraped-youtube-deezer-and-genius?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed">
+<title>Hack Reveals Suno AI Music Generator Scraped YouTube, Deezer, and Genius</title>
+<link>https://news.slashdot.org/story/26/07/15/2010250/hack-reveals-suno-ai-music-generator-scraped-youtube-deezer-and-genius?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed</link>
+<description>A hacker who breached Suno reportedly revealed source code and training-library details showing the AI music generator scraped millions of songs and lyrics from sources including YouTube Music, Deezer, Genius, Pond5, Jamendo, Freesound, and podcast RSS feeds. "The hacked data is a rare look at exactly how AI models and tools are built," reports 404 Media. "Suno is one of the largest AI music generation tools on the internet, and has been the subject of several major lawsuits from the record industry, which accused the company of training on millions of copyrighted songs." Suno maintains that its models were trained on publicly available music files and metadata as fair use. 404 Media reports: The Recording Industry Association of America accused Suno of ripping songs directly from YouTube; the hacked data seen by 404 Media confirms this. The hacked material includes source code that appears to be from 2023 and 2024 that includes scraping instructions and details about the scope of at least some of the scraping. For example, the comments in one file note that they will pull from "genius_hq, youtube_music, freesound, jamendo, imp, deezer, ytm_tagged," and that "non-music will be filtered out." A file called "youtube_music" notes that at the time the file was last updated, it had ingested "2,013,545 music clips." Another file contains comments about different datasets Suno had created, which included "113,879 hours of youtube_music," "17,615 hours of genius_hq," "410 hours of free sound," "19,514 hours of imslp," "3,726 hours of jamendo," "62,117 hours of pond5_music," "12,287 hours of deezer," "152,162 hours of ytm_tagged," and "103 hours of musescore_lyrics." In total, this is at least decades worth of music.
+ 
+Other code the hacker shared with 404 Media appeared to look specifically for vocals by searching specifically for acapella versions of songs on YouTube. The code also suggested that Suno was using proxies to scrape songs from YouTube through a company called Bright Data, which sells scraping tools, infrastructure, and data services. Additional code shows that with the help of an online tool called PodcastIndex, Suno identified 420,000 different podcasts that had at least five, 30-minute episodes and sought to download roughly 1 million hours of podcasts.
+ 
+[...] The hacker, ellie.191, told 404 Media they breached the company by hacking an individual employee using the Shai-Hulud worm, a supply chain attack that allowed hackers to harvest GitHub and cloud service credentials. They said they also accessed Suno's customer list, which included customers' emails and/or phone numbers and Stripe payment details, depending on what they used to login. The hacker provided a sample of some of the customers, some of whom confirmed to 404 Media they had used their phone number to sign up for Suno and said they were never notified of a breach. The hacker told 404 Media they had no specific motivation for hacking Suno and said "I like to hack anything and everything."&lt;p&gt;&lt;div class="share_submission" style="position:relative;"&gt;
+&lt;a class="slashpop" href="http://twitter.com/home?status=Hack+Reveals+Suno+AI+Music+Generator+Scraped+YouTube%2C+Deezer%2C+and+Genius%3A+https%3A%2F%2Fnews.slashdot.org%2Fstory%2F26%2F07%2F15%2F2010250%2F%3Futm_source%3Dtwitter%26utm_medium%3Dtwitter"&gt;&lt;img src="https://a.fsdn.com/sd/twitter_icon_large.png"&gt;&lt;/a&gt;
+&lt;a class="slashpop" href="http://www.facebook.com/sharer.php?u=https%3A%2F%2Fnews.slashdot.org%2Fstory%2F26%2F07%2F15%2F2010250%2Fhack-reveals-suno-ai-music-generator-scraped-youtube-deezer-and-genius%3Futm_source%3Dslashdot%26utm_medium%3Dfacebook"&gt;&lt;img src="https://a.fsdn.com/sd/facebook_icon_large.png"&gt;&lt;/a&gt;
+
+
+
+&lt;/div&gt;&lt;/p&gt;&lt;p&gt;&lt;a href="https://news.slashdot.org/story/26/07/15/2010250/hack-reveals-suno-ai-music-generator-scraped-youtube-deezer-and-genius?utm_source=rss1.0moreanon&amp;amp;utm_medium=feed"&gt;Read more of this story&lt;/a&gt; at Slashdot.&lt;/p&gt;&lt;iframe src="https://slashdot.org/slashdot-it.pl?op=discuss&amp;amp;id=24044182&amp;amp;smallembed=1" style="height: 300px; width: 100%; border: none;"&gt;&lt;/iframe&gt;</description>
+<dc:creator>BeauHD</dc:creator>
+<dc:date>2026-07-15T21:00:00+00:00</dc:date>
+<dc:subject>ai</dc:subject>
+<slash:department>behind-the-scenes</slash:department>
+<slash:section>news</slash:section>
+<slash:comments>5</slash:comments>
+<slash:hit_parade>5,5,4,4,1,0,0</slash:hit_parade>
+</item>
+<item rdf:about="https://entertainment.slashdot.org/story/26/07/15/1953229/fcc-plans-to-repeal-39-tv-ownership-cap?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed">
+<title>FCC Plans To Repeal 39% TV Ownership Cap</title>
+<link>https://entertainment.slashdot.org/story/26/07/15/1953229/fcc-plans-to-repeal-39-tv-ownership-cap?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed</link>
+<description>The FCC plans to vote on repealing local TV ownership limits, including the 39% national audience cap that currently restricts how much of the U.S. market a single broadcast group can reach. Engadget reports: On August 6, commissioners will hold a ballot to repeal Section 303 of the Communications Act, and with it the 39 percent rule. In essence, the rule limits the reach of a local TV network to no more than 39 percent of the U.S.' total audience market. In its place, the FCC would move to a system whereby it would personally approve or reject TV ownership deals on a case-by-case basis.
+ 
+It's not clear if the FCC even has the authority to reject Section 303 without the explicit consent of the legislature. As Lawrence J. Spiwak wrote in the Yale Journal on Regulation back in January, Section 10 of the Communications Act expressly forbids the FCC from bending the rules around Section 303. "Americans no longer trust the legacy national media to report the news fairly or accurately," wrote FCC Chairman Brendan Carr in an op-ed published on Breitbart. "In fact, only eight percent of Americans have a great deal of trust in mass media. That figure is even lower among Republicans -- sitting at a mere three percent."
+ 
+"... Many local broadcast TV stations are getting hollowed out as a result and turning into little more than mouthpieces for programming produced in New York and Hollywood," he alleged. "That is not what Congress or the FCC intended."&lt;p&gt;&lt;div class="share_submission" style="position:relative;"&gt;
+&lt;a class="slashpop" href="http://twitter.com/home?status=FCC+Plans+To+Repeal+39%25+TV+Ownership+Cap%3A+https%3A%2F%2Fentertainment.slashdot.org%2Fstory%2F26%2F07%2F15%2F1953229%2F%3Futm_source%3Dtwitter%26utm_medium%3Dtwitter"&gt;&lt;img src="https://a.fsdn.com/sd/twitter_icon_large.png"&gt;&lt;/a&gt;
+&lt;a class="slashpop" href="http://www.facebook.com/sharer.php?u=https%3A%2F%2Fentertainment.slashdot.org%2Fstory%2F26%2F07%2F15%2F1953229%2Ffcc-plans-to-repeal-39-tv-ownership-cap%3Futm_source%3Dslashdot%26utm_medium%3Dfacebook"&gt;&lt;img src="https://a.fsdn.com/sd/facebook_icon_large.png"&gt;&lt;/a&gt;
+
+
+
+&lt;/div&gt;&lt;/p&gt;&lt;p&gt;&lt;a href="https://entertainment.slashdot.org/story/26/07/15/1953229/fcc-plans-to-repeal-39-tv-ownership-cap?utm_source=rss1.0moreanon&amp;amp;utm_medium=feed"&gt;Read more of this story&lt;/a&gt; at Slashdot.&lt;/p&gt;&lt;iframe src="https://slashdot.org/slashdot-it.pl?op=discuss&amp;amp;id=24044176&amp;amp;smallembed=1" style="height: 300px; width: 100%; border: none;"&gt;&lt;/iframe&gt;</description>
+<dc:creator>BeauHD</dc:creator>
+<dc:date>2026-07-15T20:00:00+00:00</dc:date>
+<dc:subject>tv</dc:subject>
+<slash:department>what-to-expect</slash:department>
+<slash:section>entertainment</slash:section>
+<slash:comments>58</slash:comments>
+<slash:hit_parade>58,54,48,48,20,10,5</slash:hit_parade>
+</item>
+<item rdf:about="https://yro.slashdot.org/story/26/07/15/1738217/google-and-epic-cancel-settlement-third-party-app-stores-coming-to-google-play?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed">
+<title>Google and Epic Cancel Settlement; Third-Party App Stores Coming To Google Play</title>
+<link>https://yro.slashdot.org/story/26/07/15/1738217/google-and-epic-cancel-settlement-third-party-app-stores-coming-to-google-play?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed</link>
+<description>An anonymous reader quotes a report from Ars Technica: Big changes are coming to Android apps, but they're not the changes Google wanted. The settlement between Google and Epic that aimed to put to rest the companies' long-running antitrust battle is being withdrawn, and that means third-party app stores are coming to the Play Store. Google has confirmed that it will begin distributing rival app stores next week, setting the stage for competing platforms to take a bite out of Google's Android revenue stream. [...] Google and Epic were set to return to court on July 16 to argue in favor of the settlement. However, the writing may have been on the wall. In a recent expert analysis provided to the court, MIT economics professor Nancy Rose noted that the settlement was "unlikely to enable Google Play's potential competitors to overcome their long-standing network-effect disadvantage in a timely manner."
+ 
+With settlement approval looking increasingly unlikely, Epic and Google agreed this week to call the whole thing off. Here's how Google Trust and Reputation Communications Lead Dan Jackson explains the company's decision: "We've agreed with Epic to withdraw our motion to modify the US Court's injunction rather than prolonging this process which creates uncertainty for the ecosystem. This allows us to focus on executing our recently announced global business model evolution to deliver greater app store choice, lower prices, and more opportunities for developers and users. We remain committed to maintaining Android's industry-leading security and fostering a competitive ecosystem where every app store and developer has the freedom to compete. In parallel, we continue to comply with the US Court's injunction."
+ 
+In a brief filing (PDF), Google's legal team informs the court that Google is prepared to begin distributing third-party app stores in Google Play on July 22. Under the terms of Judge Donato's original injunction, these stores will have access to the full catalog of Google Play apps by default. Developers will have the option to opt out of distribution in these stores, and Google has a support page explaining how to do so. Google also has documentation on how app stores can get access to the Google Play catalog. It won't be mirroring those apps in any shady storefront that asks. The court has allowed Google to charge reasonable fees to cover its security and compliance review of third-party stores, which will be $5,000 per year.
+ 
+Google will also require approved stores to block malware, respect intellectual property, and include mechanisms to update and uninstall apps. App stores can be removed from the program if more than 1 percent of attempted app installs appear to be malware or unwanted software. It's unclear if there will be separate, possibly more stringent requirements for storefront distribution in the Play Store. However, Google is prohibited from unreasonably blocking third-party store clients uploaded to Google Play. The changes Google has announced under the Epic agreement will proceed for now. That means Registered App Stores will happen globally, but they will probably only appear in the Play Store for US users. Google hasn't specified if there will be any differences in the features available to the stores downloaded from Play versus registered stores.&lt;p&gt;&lt;div class="share_submission" style="position:relative;"&gt;
+&lt;a class="slashpop" href="http://twitter.com/home?status=Google+and+Epic+Cancel+Settlement%3B+Third-Party+App+Stores+Coming+To+Google+Play%3A+https%3A%2F%2Fyro.slashdot.org%2Fstory%2F26%2F07%2F15%2F1738217%2F%3Futm_source%3Dtwitter%26utm_medium%3Dtwitter"&gt;&lt;img src="https://a.fsdn.com/sd/twitter_icon_large.png"&gt;&lt;/a&gt;
+&lt;a class="slashpop" href="http://www.facebook.com/sharer.php?u=https%3A%2F%2Fyro.slashdot.org%2Fstory%2F26%2F07%2F15%2F1738217%2Fgoogle-and-epic-cancel-settlement-third-party-app-stores-coming-to-google-play%3Futm_source%3Dslashdot%26utm_medium%3Dfacebook"&gt;&lt;img src="https://a.fsdn.com/sd/facebook_icon_large.png"&gt;&lt;/a&gt;
+
+
+
+&lt;/div&gt;&lt;/p&gt;&lt;p&gt;&lt;a href="https://yro.slashdot.org/story/26/07/15/1738217/google-and-epic-cancel-settlement-third-party-app-stores-coming-to-google-play?utm_source=rss1.0moreanon&amp;amp;utm_medium=feed"&gt;Read more of this story&lt;/a&gt; at Slashdot.&lt;/p&gt;&lt;iframe src="https://slashdot.org/slashdot-it.pl?op=discuss&amp;amp;id=24044080&amp;amp;smallembed=1" style="height: 300px; width: 100%; border: none;"&gt;&lt;/iframe&gt;</description>
+<dc:creator>BeauHD</dc:creator>
+<dc:date>2026-07-15T19:00:00+00:00</dc:date>
+<dc:subject>android</dc:subject>
+<slash:department>what-to-expect</slash:department>
+<slash:section>yro</slash:section>
+<slash:comments>23</slash:comments>
+<slash:hit_parade>23,23,21,20,6,2,1</slash:hit_parade>
+</item>
+<item rdf:about="https://bsd.slashdot.org/story/26/07/15/1727252/freebsd-16-retires-the-last-of-its-gpl-code?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed">
+<title>FreeBSD 16 Retires the Last of Its GPL Code</title>
+<link>https://bsd.slashdot.org/story/26/07/15/1727252/freebsd-16-retires-the-last-of-its-gpl-code?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed</link>
+<description>FreeBSD 16 has removed the last GPL-licensed code from its base system, retiring the old GNU 'dialog' implementation after the installer moved to 'bsddialog' and the final dependency was disabled. Phoronix reports: This ticket to retire dialog was opened back in February while is now merged to the FreeBSD source tree for what will become FreeBSD 16.0. With dialog removed, the latest FreeBSD code now retires the GNU sub-tree of the FreeBSD base system now that no more GNU code remains. FreeBSD 16.0 is working its way toward release that is expected to happen in December 2027.&lt;p&gt;&lt;div class="share_submission" style="position:relative;"&gt;
+&lt;a class="slashpop" href="http://twitter.com/home?status=FreeBSD+16+Retires+the+Last+of+Its+GPL+Code%3A+https%3A%2F%2Fbsd.slashdot.org%2Fstory%2F26%2F07%2F15%2F1727252%2F%3Futm_source%3Dtwitter%26utm_medium%3Dtwitter"&gt;&lt;img src="https://a.fsdn.com/sd/twitter_icon_large.png"&gt;&lt;/a&gt;
+&lt;a class="slashpop" href="http://www.facebook.com/sharer.php?u=https%3A%2F%2Fbsd.slashdot.org%2Fstory%2F26%2F07%2F15%2F1727252%2Ffreebsd-16-retires-the-last-of-its-gpl-code%3Futm_source%3Dslashdot%26utm_medium%3Dfacebook"&gt;&lt;img src="https://a.fsdn.com/sd/facebook_icon_large.png"&gt;&lt;/a&gt;
+
+
+
+&lt;/div&gt;&lt;/p&gt;&lt;p&gt;&lt;a href="https://bsd.slashdot.org/story/26/07/15/1727252/freebsd-16-retires-the-last-of-its-gpl-code?utm_source=rss1.0moreanon&amp;amp;utm_medium=feed"&gt;Read more of this story&lt;/a&gt; at Slashdot.&lt;/p&gt;&lt;iframe src="https://slashdot.org/slashdot-it.pl?op=discuss&amp;amp;id=24044056&amp;amp;smallembed=1" style="height: 300px; width: 100%; border: none;"&gt;&lt;/iframe&gt;</description>
+<dc:creator>BeauHD</dc:creator>
+<dc:date>2026-07-15T18:00:00+00:00</dc:date>
+<dc:subject>gnu</dc:subject>
+<slash:department>gnu-gone</slash:department>
+<slash:section>bsd</slash:section>
+<slash:comments>86</slash:comments>
+<slash:hit_parade>86,84,76,68,22,8,4</slash:hit_parade>
+</item>
+<item rdf:about="https://hardware.slashdot.org/story/26/07/15/1659217/openai-launches-a-keypad-for-ai-agents?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed">
+<title>OpenAI Launches a Keypad for AI Agents</title>
+<link>https://hardware.slashdot.org/story/26/07/15/1659217/openai-launches-a-keypad-for-ai-agents?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed</link>
+<description>OpenAI's first hardware device is a limited-edition desktop keypad called the Codex Micro that lets users monitor and control AI coding agents. Axios reports: Codex Micro is a collaboration with Work Louder, a boutique hardware company known for customizable mechanical keyboards and shortcut controllers for developers and designers. The small, square macro pad -- with backlit keys, a rotary knob and a tiny joystick -- sits beside your regular keyboard as a physical shortcut box for common Codex actions and shows the status of your agents. The keys are customizable and include a push-to-talk option as well as a dial to adjust your reasoning setting. Codex Micro is a niche device for Codex power users and will only be available until it sells out. It's priced at $230.&lt;p&gt;&lt;div class="share_submission" style="position:relative;"&gt;
+&lt;a class="slashpop" href="http://twitter.com/home?status=OpenAI+Launches+a+Keypad+for+AI+Agents%3A+https%3A%2F%2Fhardware.slashdot.org%2Fstory%2F26%2F07%2F15%2F1659217%2F%3Futm_source%3Dtwitter%26utm_medium%3Dtwitter"&gt;&lt;img src="https://a.fsdn.com/sd/twitter_icon_large.png"&gt;&lt;/a&gt;
+&lt;a class="slashpop" href="http://www.facebook.com/sharer.php?u=https%3A%2F%2Fhardware.slashdot.org%2Fstory%2F26%2F07%2F15%2F1659217%2Fopenai-launches-a-keypad-for-ai-agents%3Futm_source%3Dslashdot%26utm_medium%3Dfacebook"&gt;&lt;img src="https://a.fsdn.com/sd/facebook_icon_large.png"&gt;&lt;/a&gt;
+
+
+
+&lt;/div&gt;&lt;/p&gt;&lt;p&gt;&lt;a href="https://hardware.slashdot.org/story/26/07/15/1659217/openai-launches-a-keypad-for-ai-agents?utm_source=rss1.0moreanon&amp;amp;utm_medium=feed"&gt;Read more of this story&lt;/a&gt; at Slashdot.&lt;/p&gt;&lt;iframe src="https://slashdot.org/slashdot-it.pl?op=discuss&amp;amp;id=24044036&amp;amp;smallembed=1" style="height: 300px; width: 100%; border: none;"&gt;&lt;/iframe&gt;</description>
+<dc:creator>BeauHD</dc:creator>
+<dc:date>2026-07-15T17:00:00+00:00</dc:date>
+<dc:subject>ai</dc:subject>
+<slash:department>AI-future</slash:department>
+<slash:section>hardware</slash:section>
+<slash:comments>21</slash:comments>
+<slash:hit_parade>21,21,19,19,3,3,0</slash:hit_parade>
+</item>
+<item rdf:about="https://news.slashdot.org/story/26/07/15/047200/stripe-advent-offer-to-buy-paypal-for-more-than-53-billion?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed">
+<title>Stripe, Advent Offer to Buy PayPal For More Than $53 Billion</title>
+<link>https://news.slashdot.org/story/26/07/15/047200/stripe-advent-offer-to-buy-paypal-for-more-than-53-billion?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed</link>
+<description>Stripe and private equity firm Advent International have reportedly made a joint $60.50-per-share offer to buy PayPal, valuing the payments company at more than $53 billion. The bid is said to represent a 28% premium to PayPal's latest closing price and is backed by roughly $50 billion in committed bank financing.&lt;p&gt;&lt;div class="share_submission" style="position:relative;"&gt;
+&lt;a class="slashpop" href="http://twitter.com/home?status=Stripe%2C+Advent+Offer+to+Buy+PayPal+For+More+Than+%2453+Billion%3A+https%3A%2F%2Fnews.slashdot.org%2Fstory%2F26%2F07%2F15%2F047200%2F%3Futm_source%3Dtwitter%26utm_medium%3Dtwitter"&gt;&lt;img src="https://a.fsdn.com/sd/twitter_icon_large.png"&gt;&lt;/a&gt;
+&lt;a class="slashpop" href="http://www.facebook.com/sharer.php?u=https%3A%2F%2Fnews.slashdot.org%2Fstory%2F26%2F07%2F15%2F047200%2Fstripe-advent-offer-to-buy-paypal-for-more-than-53-billion%3Futm_source%3Dslashdot%26utm_medium%3Dfacebook"&gt;&lt;img src="https://a.fsdn.com/sd/facebook_icon_large.png"&gt;&lt;/a&gt;
+
+
+
+&lt;/div&gt;&lt;/p&gt;&lt;p&gt;&lt;a href="https://news.slashdot.org/story/26/07/15/047200/stripe-advent-offer-to-buy-paypal-for-more-than-53-billion?utm_source=rss1.0moreanon&amp;amp;utm_medium=feed"&gt;Read more of this story&lt;/a&gt; at Slashdot.&lt;/p&gt;&lt;iframe src="https://slashdot.org/slashdot-it.pl?op=discuss&amp;amp;id=24043576&amp;amp;smallembed=1" style="height: 300px; width: 100%; border: none;"&gt;&lt;/iframe&gt;</description>
+<dc:creator>BeauHD</dc:creator>
+<dc:date>2026-07-15T16:00:00+00:00</dc:date>
+<dc:subject>business</dc:subject>
+<slash:department>mergers-and-acquisitions</slash:department>
+<slash:section>news</slash:section>
+<slash:comments>44</slash:comments>
+<slash:hit_parade>44,44,38,33,9,4,3</slash:hit_parade>
+</item>
+<item rdf:about="https://tech.slashdot.org/story/26/07/15/042220/microsoft-patches-a-record-570-security-flaws?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed">
+<title>Microsoft Patches a Record 570 Security Flaws</title>
+<link>https://tech.slashdot.org/story/26/07/15/042220/microsoft-patches-a-record-570-security-flaws?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed</link>
+<description>An anonymous reader quotes a report from Krebs on Security: Microsoft today released software updates to plug at least 570 security holes in its Windows operating systems and other software, almost triple the number of vulnerabilities the software giant fixed in its record-smashing Patch Tuesday release last month. Microsoft attributed the burgeoning patch counts to vulnerability discoveries aided by artificial intelligence. Nearly 60 of the bugs quashed in July's Patch Tuesday earned a "critical" severity rating, meaning miscreants or malware could use them to seize remote control over a Windows device with little or no help from the user. Microsoft also addressed three zero-day flaws, including two that are already being exploited in the wild.
+ 
+Two of the zero-day weaknesses allow an attacker to elevate their user rights on a Windows system, as do approximately 250 other elevation of privilege flaws fixed this month; they include CVE-2026-56155 - an Active Directory Federation Services bug -- and CVE-2026-56164, a Microsoft Sharepoint vulnerability. CVE-2026-50661 is a security feature bypass in Windows BitLocker that could allow attackers to gain access to encrypted data if they have physical access to the device. Microsoft said this bug has been detailed publicly, but that it is not aware of any active exploitation.
+ 
+In a blog post on July 9, Microsoft Executive Vice President Pavan Davuluri wrote that Windows users will notice "a higher volume of security updates included in each security release" as a result of AI aiding in the discovery of vulnerabilities. "The pace of vulnerability discovery is changing with advances in AI making it possible to find more issues, faster, across more code, with new mechanisms that can accelerate both discovery and analysis," Davuluri wrote.&lt;p&gt;&lt;div class="share_submission" style="position:relative;"&gt;
+&lt;a class="slashpop" href="http://twitter.com/home?status=Microsoft+Patches+a+Record+570+Security+Flaws%3A+https%3A%2F%2Ftech.slashdot.org%2Fstory%2F26%2F07%2F15%2F042220%2F%3Futm_source%3Dtwitter%26utm_medium%3Dtwitter"&gt;&lt;img src="https://a.fsdn.com/sd/twitter_icon_large.png"&gt;&lt;/a&gt;
+&lt;a class="slashpop" href="http://www.facebook.com/sharer.php?u=https%3A%2F%2Ftech.slashdot.org%2Fstory%2F26%2F07%2F15%2F042220%2Fmicrosoft-patches-a-record-570-security-flaws%3Futm_source%3Dslashdot%26utm_medium%3Dfacebook"&gt;&lt;img src="https://a.fsdn.com/sd/facebook_icon_large.png"&gt;&lt;/a&gt;
+
+
+
+&lt;/div&gt;&lt;/p&gt;&lt;p&gt;&lt;a href="https://tech.slashdot.org/story/26/07/15/042220/microsoft-patches-a-record-570-security-flaws?utm_source=rss1.0moreanon&amp;amp;utm_medium=feed"&gt;Read more of this story&lt;/a&gt; at Slashdot.&lt;/p&gt;&lt;iframe src="https://slashdot.org/slashdot-it.pl?op=discuss&amp;amp;id=24043574&amp;amp;smallembed=1" style="height: 300px; width: 100%; border: none;"&gt;&lt;/iframe&gt;</description>
+<dc:creator>BeauHD</dc:creator>
+<dc:date>2026-07-15T15:00:00+00:00</dc:date>
+<dc:subject>windows</dc:subject>
+<slash:department>here-we-go-again</slash:department>
+<slash:section>technology</slash:section>
+<slash:comments>61</slash:comments>
+<slash:hit_parade>61,59,59,57,9,4,3</slash:hit_parade>
+</item>
+<item rdf:about="https://science.slashdot.org/story/26/07/15/0354223/astronauts-take-first-x-rays-in-space?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed">
+<title>Astronauts Take First X-Rays In Space</title>
+<link>https://science.slashdot.org/story/26/07/15/0354223/astronauts-take-first-x-rays-in-space?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed</link>
+<description>Astronauts on SpaceX's Fram2 mission successfully captured diagnostic X-ray images in orbit for the first time. The milestone gives space medicine a second imaging option beyond ultrasound and could help future crews diagnose injuries, inspect equipment, and support longer missions to the moon or beyond. Popular Science reports: Commercial off-the-shelf X-ray machines like the ice cooler-sized MinXray TR90BH now allow users to perform scans on subjects far away from traditional facilities. In 2022, [Mayo Clinic researcher Sheyna Gifford] assisted in preparing a crew to successfully generate digital X-rays while experiencing microgravity during a parabolic flight. Gifford's team then spent years collaborating with SpaceX to plan another feasibility study. This time, they didn't want to operate an X-ray machine aboard an aircraft simulating the conditions in space -- they intended to use the equipment during an orbital mission.
+ 
+The process was detailed in a recently published study in the journal Radiology, and focuses on last year's Fram2 mission. Instead of days of medical training, astronauts spent only four hours learning how to use their portable radiography device. They then took preflight X-rays of a hand, forearm, chest, abdomen, and pelvis ahead of their SpaceX Falcon 9 rocket launch on March 31, 2025. Once in orbit, the team calibrated the system before testing their MinXray on the same body parts as well as a smartwatch.
+ 
+Once the crew returned, a trio of independent radiologists reviewed the orbital X-ray images based on their positioning, spatial and contrast resolutions, and general scan quality. Although positioning scores were slightly decreased for the central body images, every other scan held up to similar examples created on Earth. Meanwhile, the astronauts reported that using the machine was easy despite minimal prior coaching. Looking ahead, researchers hope to conduct further X-ray tests during orbital missions, while continuing to reduce the overall size of equipment.&lt;p&gt;&lt;div class="share_submission" style="position:relative;"&gt;
+&lt;a class="slashpop" href="http://twitter.com/home?status=Astronauts+Take+First+X-Rays+In+Space%3A+https%3A%2F%2Fscience.slashdot.org%2Fstory%2F26%2F07%2F15%2F0354223%2F%3Futm_source%3Dtwitter%26utm_medium%3Dtwitter"&gt;&lt;img src="https://a.fsdn.com/sd/twitter_icon_large.png"&gt;&lt;/a&gt;
+&lt;a class="slashpop" href="http://www.facebook.com/sharer.php?u=https%3A%2F%2Fscience.slashdot.org%2Fstory%2F26%2F07%2F15%2F0354223%2Fastronauts-take-first-x-rays-in-space%3Futm_source%3Dslashdot%26utm_medium%3Dfacebook"&gt;&lt;img src="https://a.fsdn.com/sd/facebook_icon_large.png"&gt;&lt;/a&gt;
+
+
+
+&lt;/div&gt;&lt;/p&gt;&lt;p&gt;&lt;a href="https://science.slashdot.org/story/26/07/15/0354223/astronauts-take-first-x-rays-in-space?utm_source=rss1.0moreanon&amp;amp;utm_medium=feed"&gt;Read more of this story&lt;/a&gt; at Slashdot.&lt;/p&gt;&lt;iframe src="https://slashdot.org/slashdot-it.pl?op=discuss&amp;amp;id=24043570&amp;amp;smallembed=1" style="height: 300px; width: 100%; border: none;"&gt;&lt;/iframe&gt;</description>
+<dc:creator>BeauHD</dc:creator>
+<dc:date>2026-07-15T11:00:00+00:00</dc:date>
+<dc:subject>medicine</dc:subject>
+<slash:department>first-ever</slash:department>
+<slash:section>science</slash:section>
+<slash:comments>21</slash:comments>
+<slash:hit_parade>21,21,20,20,4,3,1</slash:hit_parade>
+</item>
+<item rdf:about="https://yro.slashdot.org/story/26/07/15/0346241/house-votes-for-permanent-daylight-saving-time?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed">
+<title>House Votes For Permanent Daylight Saving Time</title>
+<link>https://yro.slashdot.org/story/26/07/15/0346241/house-votes-for-permanent-daylight-saving-time?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed</link>
+<description>The House voted 308-117 to pass the Sunshine Protection Act, which would make daylight saving time permanent nationwide and end the twice-yearly clock change. The bill faces an uncertain future in the Senate, "where one G.O.P. leader said it was unclear whether it could move ahead and at least one Republican appears inclined to try to block it," reports The New York Times. Some sleep experts oppose permanent daylight saving time, arguing that year-round standard time better aligns with circadian rhythms and winter morning safety. The New York Times reports: President Trump has championed the effort to save an extra hour of daylight before nightfall and make the time zone permanent, describing the ritual of moving clocks forward in the spring and back in the fall a "ridiculous, twice yearly production." "We are going with the far more popular alternative, Saving Daylight, which gives you a longer, brighter Day," Mr. Trump wrote in a social media post in May. "And who can be against that."
+ 
+A sizable bloc of Florida Republicans in Congress is leading the charge on legislation that would do just that, mandating daylight saving time nationwide for the entire year. Representative Vern Buchanan of the Tampa Bay area is backing the bill, and Representative Anna Paulina Luna, another Tampa Bay-area Republican, cosponsored it. House leaders agreed to allow a vote on the measure this week as a sweetener for Ms. Luna in their efforts to persuade her to lift a legislative blockade she had maintained as she sought to force Senate action on a voting restriction bill Mr. Trump has championed.&lt;p&gt;&lt;div class="share_submission" style="position:relative;"&gt;
+&lt;a class="slashpop" href="http://twitter.com/home?status=House+Votes+For+Permanent+Daylight+Saving+Time%3A+https%3A%2F%2Fyro.slashdot.org%2Fstory%2F26%2F07%2F15%2F0346241%2F%3Futm_source%3Dtwitter%26utm_medium%3Dtwitter"&gt;&lt;img src="https://a.fsdn.com/sd/twitter_icon_large.png"&gt;&lt;/a&gt;
+&lt;a class="slashpop" href="http://www.facebook.com/sharer.php?u=https%3A%2F%2Fyro.slashdot.org%2Fstory%2F26%2F07%2F15%2F0346241%2Fhouse-votes-for-permanent-daylight-saving-time%3Futm_source%3Dslashdot%26utm_medium%3Dfacebook"&gt;&lt;img src="https://a.fsdn.com/sd/facebook_icon_large.png"&gt;&lt;/a&gt;
+
+
+
+&lt;/div&gt;&lt;/p&gt;&lt;p&gt;&lt;a href="https://yro.slashdot.org/story/26/07/15/0346241/house-votes-for-permanent-daylight-saving-time?utm_source=rss1.0moreanon&amp;amp;utm_medium=feed"&gt;Read more of this story&lt;/a&gt; at Slashdot.&lt;/p&gt;&lt;iframe src="https://slashdot.org/slashdot-it.pl?op=discuss&amp;amp;id=24043566&amp;amp;smallembed=1" style="height: 300px; width: 100%; border: none;"&gt;&lt;/iframe&gt;</description>
+<dc:creator>BeauHD</dc:creator>
+<dc:date>2026-07-15T07:00:00+00:00</dc:date>
+<dc:subject>government</dc:subject>
+<slash:department>time-for-a-vote</slash:department>
+<slash:section>yro</slash:section>
+<slash:comments>233</slash:comments>
+<slash:hit_parade>233,229,205,186,41,24,16</slash:hit_parade>
+</item>
+<item rdf:about="https://tech.slashdot.org/story/26/07/14/2121249/iran-abused-mobile-networks-vulnerabilities-to-locate-us-military-in-middle-east?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed">
+<title>Iran Abused Mobile Networks' Vulnerabilities To Locate US Military In Middle East</title>
+<link>https://tech.slashdot.org/story/26/07/14/2121249/iran-abused-mobile-networks-vulnerabilities-to-locate-us-military-in-middle-east?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed</link>
+<description>An anonymous reader quotes a report from TechCrunch: The Iranian government abused well-known vulnerabilities in the global telecoms infrastructure to locate U.S. military personnel in the build-up to the Iran War, as well as in the early days of the conflict, according to Financial Times. The Iranian government exploited Signaling System 7, or SS7, a set of protocols for 2G and 3G networks that has long been the backbone of how cellular networks connect to each other to route subscribers' calls and texts around the world, the newspaper reported, citing research by the Mobile Surveillance Monitor, as well as anonymous government officials with knowledge of the spy campaign.
+ 
+Intelligence agencies have long abused SS7 to track cellphones abroad, which is what happened in this campaign. Using this technique, Iran was reportedly able to locate U.S. military forces stationed in military bases as well as hotels in Iraq, Bahrain, and other countries in the Middle East, which allowed the regime to strike them. These attacks resulted in several injuries. Apart from SS7, Iran also abused advertising technology used to serve tailored ads to cellphone users, another well-known surveillance technique that relies on everyday technology.&lt;p&gt;&lt;div class="share_submission" style="position:relative;"&gt;
+&lt;a class="slashpop" href="http://twitter.com/home?status=Iran+Abused+Mobile+Networks'+Vulnerabilities+To+Locate+US+Military+In+Middle+East%3A+https%3A%2F%2Ftech.slashdot.org%2Fstory%2F26%2F07%2F14%2F2121249%2F%3Futm_source%3Dtwitter%26utm_medium%3Dtwitter"&gt;&lt;img src="https://a.fsdn.com/sd/twitter_icon_large.png"&gt;&lt;/a&gt;
+&lt;a class="slashpop" href="http://www.facebook.com/sharer.php?u=https%3A%2F%2Ftech.slashdot.org%2Fstory%2F26%2F07%2F14%2F2121249%2Firan-abused-mobile-networks-vulnerabilities-to-locate-us-military-in-middle-east%3Futm_source%3Dslashdot%26utm_medium%3Dfacebook"&gt;&lt;img src="https://a.fsdn.com/sd/facebook_icon_large.png"&gt;&lt;/a&gt;
+
+
+
+&lt;/div&gt;&lt;/p&gt;&lt;p&gt;&lt;a href="https://tech.slashdot.org/story/26/07/14/2121249/iran-abused-mobile-networks-vulnerabilities-to-locate-us-military-in-middle-east?utm_source=rss1.0moreanon&amp;amp;utm_medium=feed"&gt;Read more of this story&lt;/a&gt; at Slashdot.&lt;/p&gt;&lt;iframe src="https://slashdot.org/slashdot-it.pl?op=discuss&amp;amp;id=24043358&amp;amp;smallembed=1" style="height: 300px; width: 100%; border: none;"&gt;&lt;/iframe&gt;</description>
+<dc:creator>BeauHD</dc:creator>
+<dc:date>2026-07-15T03:30:00+00:00</dc:date>
+<dc:subject>security</dc:subject>
+<slash:department>behind-the-scenes</slash:department>
+<slash:section>technology</slash:section>
+<slash:comments>116</slash:comments>
+<slash:hit_parade>116,113,84,73,22,12,9</slash:hit_parade>
+</item>
+<item rdf:about="https://hardware.slashdot.org/story/26/07/14/2116245/openais-first-device-will-be-moveable-screenless-speaker-built-as-ai-companion?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed">
+<title>OpenAI's First Device Will Be Moveable, Screenless Speaker Built as AI Companion</title>
+<link>https://hardware.slashdot.org/story/26/07/14/2116245/openais-first-device-will-be-moveable-screenless-speaker-built-as-ai-companion?utm_source=rss1.0mainlinkanon&amp;utm_medium=feed</link>
+<description>OpenAI is reportedly developing a screen-free, portable smart speaker meant to act as a personalized home computer and humanlike AI companion. "It will help control smart-home appliances, play media, answer questions, respond to messages and tap into the range of capabilities offered by OpenAI's ChatGPT," reports Bloomberg, citing people familiar with the matter. The device, expected to be unveiled this year and released in 2027, would mark OpenAI's first major hardware push after acquiring Jony Ive's io Products. Bloomberg reports: Apple sued OpenAI last week, accusing the company of stealing trade secrets. But OpenAI believes that the device veers significantly from anything Apple has on the market today and that it's unlikely that it violates trade secrets belonging to the iPhone maker, the people said. OpenAI's success in hardware will hinge on bringing a novel approach to the market -- something it aims to do with the smart speaker. For instance, the device's technology is meant to become increasingly personalized and proactive as it gains a deeper understanding of its owner over time, according to the people.
+ 
+OpenAI envisions the device anticipating needs, surfacing information proactively and serving as an expert on its user, they said. Though the speaker is designed to stay in the home, it will be easy to move around the house. OpenAI believes the product's defining feature will be its personality and ability to connect on a humanlike level with users. The speaker incorporates mechanical elements that can move on their own, creating a sense that it is alive and not just an object responding to commands. The machine also will draw on personal information such as emails to better understand its owner. The goal is for the device to feel like a companion and become a physical manifestation of OpenAI's ChatGPT. Still, the exact plans could change as the company works through the development and legal process.
+ 
+The device's communication abilities will rely on a more advanced version of the ChatGPT Voice Mode -- GPT-Live -- that OpenAI rolled out this month. The new voice mode is designed to act more like a human. It can listen and talk at the same time, adapt more naturally during conversations, and quickly process information. Though the new product resembles a speaker, OpenAI internally describes it as the first of its kind: a computer built for AI to help make busy people more productive. It includes a camera and other sensors that help it understand a user's surroundings and context, as well as advanced AI models beyond those available on conventional smart speakers. Another central difference is that the device includes a rechargeable battery, allowing it to be carried from room to room throughout the day. A user could bring it into the laundry room while doing chores, move it into the kitchen for cooking assistance, and later place it in a living room or bedroom to have it play music. It can also remain plugged into a single room if the customer chooses.&lt;p&gt;&lt;div class="share_submission" style="position:relative;"&gt;
+&lt;a class="slashpop" href="http://twitter.com/home?status=OpenAI's+First+Device+Will+Be+Moveable%2C+Screenless+Speaker+Built+as+AI+Companion%3A+https%3A%2F%2Fhardware.slashdot.org%2Fstory%2F26%2F07%2F14%2F2116245%2F%3Futm_source%3Dtwitter%26utm_medium%3Dtwitter"&gt;&lt;img src="https://a.fsdn.com/sd/twitter_icon_large.png"&gt;&lt;/a&gt;
+&lt;a class="slashpop" href="http://www.facebook.com/sharer.php?u=https%3A%2F%2Fhardware.slashdot.org%2Fstory%2F26%2F07%2F14%2F2116245%2Fopenais-first-device-will-be-moveable-screenless-speaker-built-as-ai-companion%3Futm_source%3Dslashdot%26utm_medium%3Dfacebook"&gt;&lt;img src="https://a.fsdn.com/sd/facebook_icon_large.png"&gt;&lt;/a&gt;
+
+
+
+&lt;/div&gt;&lt;/p&gt;&lt;p&gt;&lt;a href="https://hardware.slashdot.org/story/26/07/14/2116245/openais-first-device-will-be-moveable-screenless-speaker-built-as-ai-companion?utm_source=rss1.0moreanon&amp;amp;utm_medium=feed"&gt;Read more of this story&lt;/a&gt; at Slashdot.&lt;/p&gt;&lt;iframe src="https://slashdot.org/slashdot-it.pl?op=discuss&amp;amp;id=24043352&amp;amp;smallembed=1" style="height: 300px; width: 100%; border: none;"&gt;&lt;/iframe&gt;</description>
+<dc:creator>BeauHD</dc:creator>
+<dc:date>2026-07-14T23:00:00+00:00</dc:date>
+<dc:subject>hardware</dc:subject>
+<slash:department>what-to-expect</slash:department>
+<slash:section>hardware</slash:section>
+<slash:comments>103</slash:comments>
+<slash:hit_parade>103,103,93,85,23,10,9</slash:hit_parade>
+</item>
+<textinput rdf:about="https://slashdot.org/search.pl">
+<title>Search Slashdot</title>
+<description>Search Slashdot stories</description>
+<name>query</name>
+<link>https://slashdot.org/search.pl</link>
+</textinput>
+</rdf:RDF>

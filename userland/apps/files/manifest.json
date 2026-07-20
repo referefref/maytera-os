@@ -1,0 +1,89 @@
+{
+  "name": "Files",
+  "version": "1.8.0",
+  "binary": "files",
+  "icon": "folder.bmp",
+  "category": "System",
+  "description": "File browser for navigating and managing files",
+  "capabilities": {
+    "actions": [
+      {
+        "name": "navigate",
+        "description": "Navigate to a directory",
+        "params": ["path"],
+        "returns": "boolean",
+        "requires": "fs.read"
+      },
+      {
+        "name": "open_file",
+        "description": "Open a file with default application",
+        "params": ["path"],
+        "returns": "boolean",
+        "requires": "fs.read"
+      },
+      {
+        "name": "create_folder",
+        "description": "Create a new folder",
+        "params": ["name"],
+        "returns": "boolean",
+        "requires": "fs.write"
+      },
+      {
+        "name": "delete",
+        "description": "Delete selected file or folder",
+        "params": ["path"],
+        "returns": "boolean",
+        "requires": "fs.write"
+      },
+      {
+        "name": "rename",
+        "description": "Rename file or folder",
+        "params": ["old_name", "new_name"],
+        "returns": "boolean",
+        "requires": "fs.write"
+      },
+      {
+        "name": "copy",
+        "description": "Copy file or folder",
+        "params": ["source", "destination"],
+        "returns": "boolean",
+        "requires": "fs.write"
+      },
+      {
+        "name": "move",
+        "description": "Move file or folder",
+        "params": ["source", "destination"],
+        "returns": "boolean",
+        "requires": "fs.write"
+      }
+    ],
+    "queries": [
+      {
+        "name": "get_current_path",
+        "description": "Get current directory path",
+        "returns": "string",
+        "requires": null
+      },
+      {
+        "name": "list_contents",
+        "description": "List files in current directory",
+        "returns": [{"name": "string", "is_directory": "boolean", "size": "number"}],
+        "requires": "fs.read"
+      },
+      {
+        "name": "get_selected",
+        "description": "Get currently selected item",
+        "returns": "string",
+        "requires": null
+      }
+    ]
+  },
+  "window": {
+    "default_width": 600,
+    "default_height": 450,
+    "resizable": true,
+    "min_width": 400,
+    "min_height": 300
+  },
+  "ipc_channels": []
+}

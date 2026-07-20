@@ -1,0 +1,46 @@
+{
+  "app": "imageviewer",
+  "version": "1.0.0",
+  "description": "View BMP images with zoom and pan",
+  "icon": "imageviewer.bmp",
+  "category": "Graphics",
+  "file_associations": [".bmp"],
+  "capabilities": [
+    {
+      "action": "open_image",
+      "parameters": {"path": "string"},
+      "description": "Open an image file",
+      "requires_capability": "filesystem.read"
+    },
+    {
+      "action": "set_zoom",
+      "parameters": {"percent": "int"},
+      "valid_range": [10, 500],
+      "requires_capability": "app.imageviewer.view.write"
+    },
+    {
+      "action": "fit_to_window",
+      "parameters": {},
+      "description": "Fit image to window size",
+      "requires_capability": "app.imageviewer.view.write"
+    },
+    {
+      "action": "reset_zoom",
+      "parameters": {},
+      "description": "Reset zoom to 100%",
+      "requires_capability": "app.imageviewer.view.write"
+    }
+  ],
+  "state_queries": [
+    {
+      "query": "get_image_info",
+      "returns": {"width": "int", "height": "int", "filename": "string"},
+      "requires_capability": "app.imageviewer.read"
+    },
+    {
+      "query": "get_zoom_level",
+      "returns": "int",
+      "requires_capability": "app.imageviewer.read"
+    }
+  ]
+}

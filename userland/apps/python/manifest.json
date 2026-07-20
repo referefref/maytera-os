@@ -1,0 +1,68 @@
+{
+  "name": "Python",
+  "version": "1.8.0",
+  "binary": "python",
+  "icon": "python.bmp",
+  "category": "Development",
+  "description": "Minimal Python interpreter for MayteraOS",
+  "capabilities": {
+    "actions": [
+      {
+        "name": "execute",
+        "description": "Execute Python code",
+        "params": ["code"],
+        "returns": "string",
+        "requires": "system.exec"
+      },
+      {
+        "name": "run_file",
+        "description": "Run a Python script file",
+        "params": ["path"],
+        "returns": "string",
+        "requires": ["fs.read", "system.exec"]
+      },
+      {
+        "name": "set_variable",
+        "description": "Set a variable value",
+        "params": ["name", "value"],
+        "returns": "boolean",
+        "requires": null
+      }
+    ],
+    "queries": [
+      {
+        "name": "get_variable",
+        "description": "Get a variable value",
+        "params": ["name"],
+        "returns": "any",
+        "requires": null
+      },
+      {
+        "name": "list_variables",
+        "description": "List all defined variables",
+        "returns": "string[]",
+        "requires": null
+      }
+    ]
+  },
+  "supported_features": [
+    "variables",
+    "expressions",
+    "print()",
+    "if/elif/else",
+    "while/for loops",
+    "function definitions",
+    "string operations",
+    "list operations",
+    "file I/O (open, read, write)",
+    "os module",
+    "maytera module (GUI)"
+  ],
+  "window": {
+    "default_width": 640,
+    "default_height": 480,
+    "resizable": true
+  },
+  "file_associations": [".py"],
+  "ipc_channels": []
+}

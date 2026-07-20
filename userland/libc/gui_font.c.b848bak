@@ -1,0 +1,622 @@
+// gui_font.c - MayteraOS shared font picker (the ChooseFont common dialog).
+// See gui_font.h for the contract and the reasoning behind it (#351).
+#include "gui_font.h"
+#include "gui.h"
+#include "gui_style.h"
+#include "gui_scroll.h"
+#include "syscall.h"
+#include "theme.h"
+#include "string.h"
+#include "stdio.h"
+#include "stdlib.h"
+#include "fcntl.h"
+#include "unistd.h"
+
+#define FONTS_DIR    "/FONTS"
+#define UIFONT_CFG   "/CONFIG/UIFONT.CFG"
+
+#define MAX_FACES     64
+#define MAX_FAMILIES  64
+#define MAX_STYLES    16
+
+// ---------------------------------------------------------------------------
+// Registry snapshot: faces grouped into families.
+// ---------------------------------------------------------------------------
+typedef struct {
+    char name[GUI_FONT_NAME_MAX];
+    char style[MAX_STYLES][GUI_FONT_STYLE_MAX];
+    int  face[MAX_STYLES];        // -1 = synthesised, not a real face
+    int  bits[MAX_STYLES];        // FONT_STYLE_* to synthesise on top of face[]
+    int  nstyles;
+} family_t;
+
+static family_t g_fam[MAX_FAMILIES];
+static int      g_nfam = 0;
+
+static const int g_sizes[] = { 8, 9, 10, 11, 12, 14, 16, 18, 20, 22, 24, 28,
+                               32, 36, 40, 48, 56, 64, 72 };
+#define NSIZES ((int)(sizeof(g_sizes) / sizeof(g_sizes[0])))
+
+// Case-insensitive compare; font style names are not consistently cased across
+// foundries ("Oblique" vs "oblique"), so every style match here is insensitive.
+static int ieq(const char *a, const char *b) {
+    while (*a && *b) {
+        char x = *a, y = *b;
+        if (x >= 'A' && x <= 'Z') x += 32;
+        if (y >= 'A' && y <= 'Z') y += 32;
+        if (x != y) return 0;
+        a++; b++;
+    }
+    return *a == 0 && *b == 0;
+}
+
+static int istr(const char *hay, const char *needle) {   // case-insensitive substring
+    for (int i = 0; hay[i]; i++) {
+        int j = 0;
+        while (needle[j]) {
+            char x = hay[i + j], y = needle[j];
+            if (x >= 'A' && x <= 'Z') x += 32;
+            if (y >= 'A' && y <= 'Z') y += 32;
+            if (x != y) break;
+            j++;
+        }
+        if (!needle[j]) return 1;
+    }
+    return 0;
+}
+
+// Map a subfamily name to the synthetic bits it implies, for the case where the
+// family has no real face for it. "Oblique" is a slanted roman and "Italic" a
+// redrawn one; the rasteriser can only fake the former, which is why both map to
+// FONT_STYLE_ITALIC here but a REAL italic face is always preferred over this.
+static int style_to_bits(const char *s) {
+    int b = 0;
+    if (istr(s, "bold")) b |= FONT_STYLE_BOLD;
+    if (istr(s, "italic") || istr(s, "oblique")) b |= FONT_STYLE_ITALIC;
+    return b;
+}
+
+static int fam_find(const char *name) {
+    for (int i = 0; i < g_nfam; i++)
+        if (ieq(g_fam[i].name, name)) return i;
+    return -1;
+}
+
+static void fam_add_style(family_t *f, const char *style, int face, int bits) {
+    if (f->nstyles >= MAX_STYLES) return;
+    for (int i = 0; i < f->nstyles; i++)
+        if (ieq(f->style[i], style)) return;          // already have it
+    strncpy(f->style[f->nstyles], style, GUI_FONT_STYLE_MAX - 1);
+    f->style[f->nstyles][GUI_FONT_STYLE_MAX - 1] = 0;
+    f->face[f->nstyles] = face;
+    f->bits[f->nstyles] = bits;
+    f->nstyles++;
+}
+
+// Build the family table from the live registry. Called on every dialog open and
+// after every install, so a font added while the dialog is closed is picked up.
+static void build_registry(void) {
+    g_nfam = 0;
+    int n = font_count();
+    if (n < 0) n = 0;
+    if (n > MAX_FACES) n = MAX_FACES;
+
+    for (int i = 0; i < n; i++) {
+        char fam[GUI_FONT_NAME_MAX], sty[GUI_FONT_STYLE_MAX];
+        // A zero-length name means an empty or uninstalled slot. Indices are
+        // stable and may contain holes, so skip rather than stop.
+        if (font_name(i, fam, sizeof(fam)) <= 0) continue;
+        if (font_style(i, sty, sizeof(sty)) <= 0)
+            strncpy(sty, "Regular", sizeof(sty) - 1);
+
+        int fi = fam_find(fam);
+        if (fi < 0) {
+            if (g_nfam >= MAX_FAMILIES) continue;
+            fi = g_nfam++;
+            memset(&g_fam[fi], 0, sizeof(g_fam[fi]));
+            strncpy(g_fam[fi].name, fam, GUI_FONT_NAME_MAX - 1);
+        }
+        fam_add_style(&g_fam[fi], sty, i, 0);
+    }
+
+    // Offer the four canonical styles everywhere, synthesising any a family does
+    // not ship. This mirrors the Windows font mapper: a user who wants bold text
+    // should not have to know whether the foundry drew a bold. Real faces added
+    // above always win, because fam_add_style() refuses a duplicate name.
+    static const char *canon[3] = { "Bold", "Italic", "Bold Italic" };
+    for (int i = 0; i < g_nfam; i++) {
+        family_t *f = &g_fam[i];
+        int base = f->face[0];                 // the family's first real face
+        for (int k = 0; k < 3; k++)
+            fam_add_style(f, canon[k], base, style_to_bits(canon[k]));
+    }
+}
+
+int gui_font_resolve(const char *family, const char *style, int *face, int *style_bits) {
+    if (face) *face = 0;
+    if (style_bits) *style_bits = 0;
+    build_registry();
+    if (!family || !family[0]) return 0;
+
+    int fi = fam_find(family);
+    if (fi < 0) return -1;                     // unknown family: caller draws default
+    family_t *f = &g_fam[fi];
+
+    for (int i = 0; i < f->nstyles; i++) {
+        if (style && style[0] && !ieq(f->style[i], style)) continue;
+        if (!style || !style[0]) { if (!ieq(f->style[i], "Regular")) continue; }
+        if (face) *face = f->face[i] < 0 ? 0 : f->face[i];
+        if (style_bits) *style_bits = f->bits[i];
+        return 0;
+    }
+    // Family known but that style is not listed: use its first face and fake it.
+    if (face) *face = f->face[0] < 0 ? 0 : f->face[0];
+    if (style_bits) *style_bits = style ? style_to_bits(style) : 0;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// System UI font persistence
+// ---------------------------------------------------------------------------
+void gui_font_sel_default(gui_font_sel_t *sel) {
+    if (!sel) return;
+    memset(sel, 0, sizeof(*sel));
+    sel->size = 14;
+
+    int fd = open(UIFONT_CFG, O_RDONLY);
+    if (fd >= 0) {
+        char buf[160];
+        int n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n > 0) {
+            buf[n] = 0;
+            // "family|style|size"
+            char *p = buf, *bar1 = 0, *bar2 = 0;
+            for (char *q = buf; *q; q++) {
+                if (*q == '\n' || *q == '\r') { *q = 0; break; }
+                if (*q == '|') { if (!bar1) bar1 = q; else if (!bar2) bar2 = q; }
+            }
+            if (bar1 && bar2) {
+                *bar1 = 0; *bar2 = 0;
+                strncpy(sel->family, p, GUI_FONT_NAME_MAX - 1);
+                strncpy(sel->style, bar1 + 1, GUI_FONT_STYLE_MAX - 1);
+                int sz = atoi(bar2 + 1);
+                if (sz >= 6 && sz <= 128) sel->size = sz;
+            }
+        }
+    }
+    if (!sel->style[0]) strncpy(sel->style, "Regular", GUI_FONT_STYLE_MAX - 1);
+    gui_font_resolve(sel->family, sel->style, &sel->face, &sel->style_bits);
+}
+
+int gui_font_set_system(const gui_font_sel_t *sel) {
+    if (!sel) return -1;
+    char buf[160];
+    snprintf(buf, sizeof(buf), "%s|%s|%d\n",
+             sel->family[0] ? sel->family : "Default",
+             sel->style[0] ? sel->style : "Regular",
+             sel->size > 0 ? sel->size : 14);
+
+    int fd = open(UIFONT_CFG, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) return -1;
+    int n = (int)strlen(buf);
+    int w = write(fd, buf, n);
+    close(fd);
+
+    // Apply live. Every legacy text path draws with the active face, so this
+    // restyles the running desktop without a reboot; the file above only makes
+    // it survive one.
+    int face = 0, bits = 0;
+    gui_font_resolve(sel->family, sel->style, &face, &bits);
+    font_set_ui(face);
+    return (w == n) ? 0 : -1;
+}
+
+// ---------------------------------------------------------------------------
+// Install / uninstall
+// ---------------------------------------------------------------------------
+static int has_font_ext(const char *p) {
+    int n = (int)strlen(p);
+    if (n < 4) return 0;
+    const char *e = p + n - 4;
+    return e[0] == '.' && (istr(e, ".ttf") || istr(e, ".otf"));
+}
+
+// Basename after the last '/'.
+static const char *base_name(const char *p) {
+    const char *b = p;
+    for (const char *q = p; *q; q++) if (*q == '/') b = q + 1;
+    return b;
+}
+
+int gui_font_install(const char *src_path) {
+    if (!src_path || !src_path[0]) return -1;
+    if (!has_font_ext(src_path)) return -2;
+
+    int in = open(src_path, O_RDONLY);
+    if (in < 0) return -1;
+
+    // Sniff the outline format before spending a copy on it. 0x00010000 and
+    // 'true' are TrueType (glyf outlines); 'OTTO' is CFF. The kernel rasteriser
+    // is stb_truetype, which handles both, but a WOFF/collection would not load
+    // and would leave a dead file in the store.
+    unsigned char magic[4] = { 0, 0, 0, 0 };
+    if (read(in, magic, 4) != 4) { close(in); return -2; }
+    int ok = (magic[0] == 0x00 && magic[1] == 0x01 && magic[2] == 0x00 && magic[3] == 0x00) ||
+             (magic[0] == 'O' && magic[1] == 'T' && magic[2] == 'T' && magic[3] == 'O') ||
+             (magic[0] == 't' && magic[1] == 'r' && magic[2] == 'u' && magic[3] == 'e');
+    if (!ok) { close(in); return -2; }
+    lseek(in, 0, SEEK_SET);
+
+    mkdir(FONTS_DIR, 0755);                    // harmless if it already exists
+
+    char dst[128];
+    snprintf(dst, sizeof(dst), "%s/%s", FONTS_DIR, base_name(src_path));
+    int out = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out < 0) { close(in); return -3; }
+
+    static char buf[8192];
+    int n, failed = 0;
+    while ((n = read(in, buf, sizeof(buf))) > 0) {
+        if (write(out, buf, n) != n) { failed = 1; break; }
+    }
+    close(in);
+    close(out);
+    if (failed) { unlink(dst); return -3; }
+
+    font_rescan();                             // register live; no reboot
+
+    // Ask the kernel which face this FILE became. Do not infer it from the face
+    // count: rescan is additive and silently skips an already-registered path,
+    // so on a re-install the count does not move. An earlier version fell back
+    // to "first non-empty face" there and cheerfully reported that LATO.TTF had
+    // installed as "DejaVu Sans" (face 0). The path is the only stable key.
+    int face = font_find(dst);
+    if (face < 0) return -4;                   // registry full, or load refused
+    return face;
+}
+
+int gui_font_uninstall(int face) {
+    if (face <= 0) return -1;                  // face 0 is the default UI font
+    if (font_remove(face) != 0) return -1;
+    // Best-effort file removal: the registry entry is already gone, so the font
+    // has left every picker whether or not the unlink lands.
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// The dialog
+// ---------------------------------------------------------------------------
+#define DW        600
+#define DH        440
+#define M          12
+#define LIST_Y     34
+#define LIST_H    192
+#define ROW_H      22
+#define FAM_X      M
+#define FAM_W     252
+#define STY_X     272
+#define STY_W     170
+#define SZ_X      450
+#define SZ_W      138
+#define PRE_Y     240
+#define PRE_H     136
+#define BTN_Y     392
+#define BTN_H      32
+#define BTN_W      90
+
+static const char *DEFAULT_PREVIEW = "The quick brown fox jumps over the lazy dog";
+
+typedef struct {
+    int win;
+    int fam_i, sty_i, sz_i;
+    gui_scroll_t fam_s, sty_s, sz_s;
+    const char *preview;
+} dlg_t;
+
+static void list_frame(int win, int x, int y, int w, int h) {
+    win_draw_rect(win, x, y, w, h, theme_color(THEME_COLOR_TEXTBOX_BG));
+    gui_draw_rect_outline(win, x, y, w, h, theme_color(THEME_COLOR_TEXTBOX_BORDER));
+}
+
+// Draw one scrollable list. `nitems`/`label_of` keep this generic so the three
+// lists share a single implementation instead of three near-copies.
+// Draw the family list. Each row renders in its OWN face, so the list doubles
+// as a preview grid; that is what makes it a font picker rather than a list of
+// strings. The style/size lists have their own drawers because their rows are
+// UI-face text and their contents depend on the family selection.
+static void draw_list(dlg_t *d, gui_scroll_t *s, int x, int y, int w, int h,
+                      int nitems, int sel, const char *(*label_of)(int, char *, int)) {
+    list_frame(d->win, x, y, w, h);
+    gui_scroll_config(s, x + 1, y + 1, w - 2, h - 2, nitems * ROW_H, ROW_H);
+    s->snap = 1;
+
+    int first = gui_scroll_first_item(s);
+    int nvis  = gui_scroll_visible_items(s);
+    int tw    = gui_scroll_needed(s) ? w - 2 - GUI_SCROLL_W : w - 2;
+
+    for (int r = 0; r < nvis; r++) {
+        int i = first + r;
+        if (i >= nitems) break;
+        int ry = y + 1 + r * ROW_H - (s->offset - first * ROW_H);
+        if (ry + ROW_H <= y + 1 || ry >= y + h - 1) continue;
+
+        char tmp[80];
+        const char *lbl = label_of(i, tmp, sizeof(tmp));
+        uint32_t ink = theme_color(THEME_COLOR_TEXTBOX_TEXT);
+        if (i == sel) {
+            win_draw_rect(d->win, x + 1, ry, tw, ROW_H, theme_color(THEME_COLOR_SELECTION));
+            ink = theme_color(THEME_COLOR_SELECTION_TEXT);
+        }
+        int fface = (i < g_nfam && g_fam[i].face[0] >= 0) ? g_fam[i].face[0] : 0;
+        win_draw_text_ttf_ex(d->win, x + 6, ry + 3, lbl, fface, 14, FONT_STYLE_NORMAL, ink);
+    }
+    gui_scroll_draw(d->win, s);
+}
+
+static const char *fam_label(int i, char *buf, int cap) {
+    (void)buf; (void)cap;
+    return (i >= 0 && i < g_nfam) ? g_fam[i].name : "";
+}
+// The style list depends on the selected family, so it gets its own drawer
+// rather than contorting the generic label callback with global state.
+static void draw_style_list(dlg_t *d) {
+    family_t *f = (d->fam_i >= 0 && d->fam_i < g_nfam) ? &g_fam[d->fam_i] : 0;
+    int n = f ? f->nstyles : 0;
+    list_frame(d->win, STY_X, LIST_Y, STY_W, LIST_H);
+    gui_scroll_config(&d->sty_s, STY_X + 1, LIST_Y + 1, STY_W - 2, LIST_H - 2, n * ROW_H, ROW_H);
+    d->sty_s.snap = 1;
+    int first = gui_scroll_first_item(&d->sty_s);
+    int nvis  = gui_scroll_visible_items(&d->sty_s);
+    int tw    = gui_scroll_needed(&d->sty_s) ? STY_W - 2 - GUI_SCROLL_W : STY_W - 2;
+    for (int r = 0; r < nvis; r++) {
+        int i = first + r;
+        if (i >= n) break;
+        int ry = LIST_Y + 1 + r * ROW_H - (d->sty_s.offset - first * ROW_H);
+        uint32_t ink = theme_color(THEME_COLOR_TEXTBOX_TEXT);
+        if (i == d->sty_i) {
+            win_draw_rect(d->win, STY_X + 1, ry, tw, ROW_H, theme_color(THEME_COLOR_SELECTION));
+            ink = theme_color(THEME_COLOR_SELECTION_TEXT);
+        }
+        win_draw_text_ttf(d->win, STY_X + 6, ry + 3, f->style[i], 14, ink);
+    }
+    gui_scroll_draw(d->win, &d->sty_s);
+}
+
+static void draw_size_list(dlg_t *d) {
+    list_frame(d->win, SZ_X, LIST_Y, SZ_W, LIST_H);
+    gui_scroll_config(&d->sz_s, SZ_X + 1, LIST_Y + 1, SZ_W - 2, LIST_H - 2, NSIZES * ROW_H, ROW_H);
+    d->sz_s.snap = 1;
+    int first = gui_scroll_first_item(&d->sz_s);
+    int nvis  = gui_scroll_visible_items(&d->sz_s);
+    int tw    = gui_scroll_needed(&d->sz_s) ? SZ_W - 2 - GUI_SCROLL_W : SZ_W - 2;
+    for (int r = 0; r < nvis; r++) {
+        int i = first + r;
+        if (i >= NSIZES) break;
+        int ry = LIST_Y + 1 + r * ROW_H - (d->sz_s.offset - first * ROW_H);
+        uint32_t ink = theme_color(THEME_COLOR_TEXTBOX_TEXT);
+        if (i == d->sz_i) {
+            win_draw_rect(d->win, SZ_X + 1, ry, tw, ROW_H, theme_color(THEME_COLOR_SELECTION));
+            ink = theme_color(THEME_COLOR_SELECTION_TEXT);
+        }
+        char b[8];
+        snprintf(b, sizeof(b), "%d", g_sizes[i]);
+        win_draw_text_ttf(d->win, SZ_X + 6, ry + 3, b, 14, ink);
+    }
+    gui_scroll_draw(d->win, &d->sz_s);
+}
+
+// Resolve the current selection to something drawable.
+static void cur_face(dlg_t *d, int *face, int *bits) {
+    *face = 0; *bits = 0;
+    if (d->fam_i < 0 || d->fam_i >= g_nfam) return;
+    family_t *f = &g_fam[d->fam_i];
+    if (d->sty_i < 0 || d->sty_i >= f->nstyles) return;
+    *face = f->face[d->sty_i] < 0 ? 0 : f->face[d->sty_i];
+    *bits = f->bits[d->sty_i];
+}
+
+static void draw_preview(dlg_t *d) {
+    win_draw_rect(d->win, M, PRE_Y, DW - 2 * M, PRE_H, theme_color(THEME_COLOR_TEXTBOX_BG));
+    gui_draw_rect_outline(d->win, M, PRE_Y, DW - 2 * M, PRE_H,
+                          theme_color(THEME_COLOR_TEXTBOX_BORDER));
+
+    int face, bits;
+    cur_face(d, &face, &bits);
+    int size = g_sizes[d->sz_i];
+
+    // Clamp the preview so a 72pt sample cannot spill out of the box. The
+    // selection keeps the real size; only the drawing is capped.
+    int draw_sz = size;
+    if (draw_sz > 44) draw_sz = 44;
+
+    win_draw_text_ttf_ex(d->win, M + 10, PRE_Y + 14, d->preview, face, draw_sz, bits,
+                         theme_color(THEME_COLOR_TEXTBOX_TEXT));
+
+    // Name the resolved selection underneath, and say when a style is faked, so
+    // the user can tell a real bold from a synthesised one.
+    char cap[128];
+    const char *fam = (d->fam_i >= 0 && d->fam_i < g_nfam) ? g_fam[d->fam_i].name : "Default";
+    const char *sty = (d->fam_i >= 0 && d->fam_i < g_nfam &&
+                       d->sty_i < g_fam[d->fam_i].nstyles)
+                      ? g_fam[d->fam_i].style[d->sty_i] : "Regular";
+    snprintf(cap, sizeof(cap), "%s  %s  %dpt%s", fam, sty, size,
+             bits ? "   (synthesised style)" : "");
+    win_draw_text_ttf(d->win, M + 10, PRE_Y + PRE_H - 22, cap, 12,
+                      theme_color(THEME_COLOR_LABEL_TEXT));
+}
+
+static void draw_all(dlg_t *d) {
+    win_draw_rect(d->win, 0, 0, DW, DH, theme_color(THEME_COLOR_WINDOW_BG));
+    uint32_t lbl = theme_color(THEME_COLOR_LABEL_TEXT);
+    win_draw_text_ttf(d->win, FAM_X, 12, "Family", 13, lbl);
+    win_draw_text_ttf(d->win, STY_X, 12, "Style",  13, lbl);
+    win_draw_text_ttf(d->win, SZ_X,  12, "Size",   13, lbl);
+
+    draw_list(d, &d->fam_s, FAM_X, LIST_Y, FAM_W, LIST_H, g_nfam, d->fam_i, fam_label);
+    draw_style_list(d);
+    draw_size_list(d);
+    draw_preview(d);
+
+    gui_button(d->win, DW - M - BTN_W, BTN_Y, BTN_W, BTN_H, "OK",
+               GUI_BTN_PRIMARY, GUI_ST_NORMAL);
+    gui_button(d->win, DW - M - BTN_W * 2 - GUI_GAP, BTN_Y, BTN_W, BTN_H, "Cancel",
+               GUI_BTN_SECONDARY, GUI_ST_NORMAL);
+    win_invalidate(d->win);
+}
+
+static int in_rect(int mx, int my, int x, int y, int w, int h) {
+    return mx >= x && mx < x + w && my >= y && my < y + h;
+}
+
+int gui_font_dialog(gui_font_sel_t *sel) {
+    if (!sel) return 0;
+    build_registry();
+    if (g_nfam == 0) return 0;                 // no registry: nothing to choose
+
+    dlg_t d;
+    memset(&d, 0, sizeof(d));
+    d.preview = sel->preview_text ? sel->preview_text : DEFAULT_PREVIEW;
+
+    // Preselect from the incoming selection.
+    d.fam_i = sel->family[0] ? fam_find(sel->family) : 0;
+    if (d.fam_i < 0) d.fam_i = 0;
+    d.sty_i = 0;
+    if (sel->style[0]) {
+        family_t *f = &g_fam[d.fam_i];
+        for (int i = 0; i < f->nstyles; i++)
+            if (ieq(f->style[i], sel->style)) { d.sty_i = i; break; }
+    }
+    d.sz_i = 5;                                // 14pt
+    if (sel->size > 0)
+        for (int i = 0; i < NSIZES; i++)
+            if (g_sizes[i] >= sel->size) { d.sz_i = i; break; }
+
+    d.win = win_create(sel->title ? sel->title : "Font", 140, 90, DW, DH);
+    if (d.win < 0) return 0;
+
+    // Scroll the preselected rows into view so a stored selection is visible on
+    // open rather than requiring the user to hunt for it.
+    gui_scroll_config(&d.fam_s, FAM_X + 1, LIST_Y + 1, FAM_W - 2, LIST_H - 2,
+                      g_nfam * ROW_H, ROW_H);
+    gui_scroll_reveal(&d.fam_s, d.fam_i * ROW_H, ROW_H);
+    gui_scroll_config(&d.sz_s, SZ_X + 1, LIST_Y + 1, SZ_W - 2, LIST_H - 2,
+                      NSIZES * ROW_H, ROW_H);
+    gui_scroll_reveal(&d.sz_s, d.sz_i * ROW_H, ROW_H);
+
+    draw_all(&d);
+
+    int result = 0, running = 1;
+    gui_event_t ev;
+    while (running) {
+        // Blocks on the kernel wait-queue; the dialog burns no CPU while idle.
+        int et = win_get_event(d.win, &ev, -1);
+        if (et == 0) continue;
+
+        switch (ev.type) {
+        case EVENT_REDRAW:
+            draw_all(&d);
+            break;
+
+        case EVENT_WINDOW_CLOSE:
+            running = 0;
+            break;
+
+        case EVENT_KEY_DOWN:
+            if (ev.key_char == 27) { running = 0; break; }          // ESC = cancel
+            if (ev.key_char == '\n' || ev.key_char == '\r') {       // Enter = OK
+                result = 1; running = 0; break;
+            }
+            // The family list owns the arrows: it is the primary list, and the
+            // keyboard must work where the wheel does not (#438, Magic Mouse).
+            if (ev.keycode == GUI_KEY_DOWN && d.fam_i < g_nfam - 1) {
+                d.fam_i++; d.sty_i = 0;
+                gui_scroll_reveal(&d.fam_s, d.fam_i * ROW_H, ROW_H);
+                draw_all(&d);
+            } else if (ev.keycode == GUI_KEY_UP && d.fam_i > 0) {
+                d.fam_i--; d.sty_i = 0;
+                gui_scroll_reveal(&d.fam_s, d.fam_i * ROW_H, ROW_H);
+                draw_all(&d);
+            }
+            break;
+
+        case EVENT_MOUSE_SCROLL: {
+            // Route the wheel to whichever list is under the pointer, so all
+            // three scroll. gui_scroll_wheel() owns the direction convention.
+            int mx = ev.mouse_x, my = ev.mouse_y, ch = 0;
+            if (in_rect(mx, my, FAM_X, LIST_Y, FAM_W, LIST_H))
+                ch = gui_scroll_wheel(&d.fam_s, ev.scroll_delta);
+            else if (in_rect(mx, my, STY_X, LIST_Y, STY_W, LIST_H))
+                ch = gui_scroll_wheel(&d.sty_s, ev.scroll_delta);
+            else if (in_rect(mx, my, SZ_X, LIST_Y, SZ_W, LIST_H))
+                ch = gui_scroll_wheel(&d.sz_s, ev.scroll_delta);
+            if (ch) draw_all(&d);
+            break;
+        }
+
+        case EVENT_MOUSE_MOVE:
+            if (gui_scroll_motion(&d.fam_s, ev.mouse_x, ev.mouse_y) ||
+                gui_scroll_motion(&d.sty_s, ev.mouse_x, ev.mouse_y) ||
+                gui_scroll_motion(&d.sz_s,  ev.mouse_x, ev.mouse_y))
+                draw_all(&d);
+            break;
+
+        case EVENT_MOUSE_UP:
+            gui_scroll_release(&d.fam_s);
+            gui_scroll_release(&d.sty_s);
+            gui_scroll_release(&d.sz_s);
+            break;
+
+        case EVENT_MOUSE_DOWN: {
+            if (!(ev.mouse_buttons & MOUSE_BUTTON_LEFT)) break;
+            int mx = ev.mouse_x, my = ev.mouse_y;
+
+            if (in_rect(mx, my, DW - M - BTN_W, BTN_Y, BTN_W, BTN_H)) {
+                result = 1; running = 0; break;
+            }
+            if (in_rect(mx, my, DW - M - BTN_W * 2 - GUI_GAP, BTN_Y, BTN_W, BTN_H)) {
+                running = 0; break;
+            }
+            // Scrollbar gutters first: a press there is a drag, not a pick.
+            if (gui_scroll_press(&d.fam_s, mx, my) ||
+                gui_scroll_press(&d.sty_s, mx, my) ||
+                gui_scroll_press(&d.sz_s,  mx, my)) { draw_all(&d); break; }
+
+            if (in_rect(mx, my, FAM_X, LIST_Y, FAM_W, LIST_H)) {
+                int i = gui_scroll_first_item(&d.fam_s) +
+                        (my - LIST_Y - 1 + (d.fam_s.offset % ROW_H)) / ROW_H;
+                if (i >= 0 && i < g_nfam && i != d.fam_i) {
+                    d.fam_i = i;
+                    d.sty_i = 0;               // styles are per-family
+                    gui_scroll_set(&d.sty_s, 0);
+                    draw_all(&d);
+                }
+            } else if (in_rect(mx, my, STY_X, LIST_Y, STY_W, LIST_H)) {
+                family_t *f = &g_fam[d.fam_i];
+                int i = gui_scroll_first_item(&d.sty_s) +
+                        (my - LIST_Y - 1 + (d.sty_s.offset % ROW_H)) / ROW_H;
+                if (i >= 0 && i < f->nstyles && i != d.sty_i) { d.sty_i = i; draw_all(&d); }
+            } else if (in_rect(mx, my, SZ_X, LIST_Y, SZ_W, LIST_H)) {
+                int i = gui_scroll_first_item(&d.sz_s) +
+                        (my - LIST_Y - 1 + (d.sz_s.offset % ROW_H)) / ROW_H;
+                if (i >= 0 && i < NSIZES && i != d.sz_i) { d.sz_i = i; draw_all(&d); }
+            }
+            break;
+        }
+        default:
+            break;
+        }
+    }
+
+    if (result) {
+        family_t *f = &g_fam[d.fam_i];
+        strncpy(sel->family, f->name, GUI_FONT_NAME_MAX - 1);
+        sel->family[GUI_FONT_NAME_MAX - 1] = 0;
+        strncpy(sel->style, f->style[d.sty_i], GUI_FONT_STYLE_MAX - 1);
+        sel->style[GUI_FONT_STYLE_MAX - 1] = 0;
+        sel->size = g_sizes[d.sz_i];
+        cur_face(&d, &sel->face, &sel->style_bits);
+    }
+    win_destroy(d.win);
+    return result;
+}

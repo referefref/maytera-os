@@ -1,0 +1,67 @@
+{
+  "name": "Terminal",
+  "version": "1.0.0",
+  "binary": "terminal",
+  "icon": "terminal.bmp",
+  "category": "System",
+  "description": "Command line terminal with ANSI color support and shell functionality",
+  "capabilities": ["fs.read", "fs.write", "process.execute"],
+  "llm_actions": [
+    {
+      "action": "execute_command",
+      "description": "Run a shell command in the terminal",
+      "parameters": {"command": "string"},
+      "returns": {"stdout": "string", "exit_code": "int"}
+    },
+    {
+      "action": "change_directory",
+      "description": "Change the current working directory",
+      "parameters": {"path": "string"},
+      "returns": {"success": "boolean", "new_path": "string"}
+    },
+    {
+      "action": "get_file_content",
+      "description": "Read and return file contents",
+      "parameters": {"filepath": "string"},
+      "returns": {"content": "string", "error": "string|null"}
+    },
+    {
+      "action": "list_directory",
+      "description": "List files in a directory",
+      "parameters": {"path": "string"},
+      "returns": {"entries": "string[]", "error": "string|null"}
+    },
+    {
+      "action": "get_history",
+      "description": "Get the command history",
+      "parameters": {},
+      "returns": {"commands": "string[]"}
+    },
+    {
+      "action": "get_environment",
+      "description": "Get environment variables",
+      "parameters": {},
+      "returns": {"variables": "object"}
+    },
+    {
+      "action": "set_environment",
+      "description": "Set an environment variable",
+      "parameters": {"name": "string", "value": "string"},
+      "returns": {"success": "boolean"}
+    }
+  ],
+  "window": {
+    "default_width": 648,
+    "default_height": 410,
+    "resizable": true,
+    "min_width": 320,
+    "min_height": 200
+  },
+  "keyboard_shortcuts": {
+    "ctrl+c": "interrupt",
+    "ctrl+l": "clear",
+    "up": "history_previous",
+    "down": "history_next",
+    "escape": "clear_input"
+  }
+}

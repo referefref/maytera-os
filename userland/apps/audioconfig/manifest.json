@@ -1,0 +1,62 @@
+{
+  "app": "audioconfig",
+  "version": "1.0.0",
+  "description": "Audio settings with equalizer and device selection",
+  "icon": "audioconfig.bmp",
+  "category": "System",
+  "capabilities": [
+    {
+      "action": "set_volume",
+      "parameters": {"level": "int"},
+      "valid_range": [0, 100],
+      "requires_capability": "system.audio.write"
+    },
+    {
+      "action": "set_mute",
+      "parameters": {"muted": "bool"},
+      "requires_capability": "system.audio.write"
+    },
+    {
+      "action": "set_output_device",
+      "parameters": {"device_id": "int"},
+      "description": "Select audio output device",
+      "requires_capability": "system.audio.write"
+    },
+    {
+      "action": "set_eq_band",
+      "parameters": {"band": "int", "value": "int"},
+      "valid_range_band": [0, 7],
+      "valid_range_value": [0, 100],
+      "description": "Set equalizer band value (50 = neutral)",
+      "requires_capability": "system.audio.write"
+    },
+    {
+      "action": "reset_eq",
+      "parameters": {},
+      "description": "Reset all EQ bands to neutral",
+      "requires_capability": "system.audio.write"
+    }
+  ],
+  "state_queries": [
+    {
+      "query": "get_volume",
+      "returns": "int",
+      "requires_capability": "system.audio.read"
+    },
+    {
+      "query": "get_mute_state",
+      "returns": "bool",
+      "requires_capability": "system.audio.read"
+    },
+    {
+      "query": "get_output_devices",
+      "returns": [{"id": "int", "name": "string", "active": "bool"}],
+      "requires_capability": "system.audio.read"
+    },
+    {
+      "query": "get_eq_settings",
+      "returns": [{"band": "int", "frequency": "string", "value": "int"}],
+      "requires_capability": "system.audio.read"
+    }
+  ]
+}

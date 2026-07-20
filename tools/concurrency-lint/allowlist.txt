@@ -1,0 +1,93 @@
+# concurrency-lint allowlist (baseline of the tree at #426).
+# Each line: <fingerprint>  # <path>:<line> <RULE>  <note>
+# Fingerprint = path|rule|sha1(normalized-snippet)[:12]; it is stable
+# across line-number drift. A site listed here is an ACCEPTED legacy
+# hit and does NOT fail the lint. Remove a line once the site is fixed;
+# do NOT add new lines by hand except to knowingly accept a reviewed
+# exception (append a real justification note).
+#
+# Regenerate the baseline with: concurrency-lint --update-allowlist
+
+kernel/apps/open_with_dialog.c|SPIN_BUSYWAIT|1eba24239f47  # kernel/apps/open_with_dialog.c:479 SPIN_BUSYWAIT  baseline
+kernel/desktop.c|SPIN_BUSYWAIT|bd8cc0686b35  # kernel/desktop.c:1349 SPIN_BUSYWAIT  baseline
+kernel/dos/dosexec.c|SLEEP_POLL|7ae26db38d85  # kernel/dos/dosexec.c:1409 SLEEP_POLL  baseline
+kernel/dos/int21.c|SPIN_BUSYWAIT|f147f30e3809  # kernel/dos/int21.c:268 SPIN_BUSYWAIT  baseline
+kernel/drivers/audio.c|SPIN_BUSYWAIT|85248558532e  # kernel/drivers/audio.c:454 SPIN_BUSYWAIT  baseline
+kernel/drivers/audio.c|SLEEP_POLL|99bac3a7abd1  # kernel/drivers/audio.c:822 SLEEP_POLL  baseline
+kernel/drivers/audio.c|SLEEP_POLL|e1846f247b7f  # kernel/drivers/audio.c:826 SLEEP_POLL  baseline
+kernel/drivers/bt/bluetooth.c|SPIN_BUSYWAIT|85248558532e  # kernel/drivers/bt/bluetooth.c:227 SPIN_BUSYWAIT  baseline
+kernel/drivers/bt/bt_hci.c|SPIN_BUSYWAIT|85248558532e  # kernel/drivers/bt/bt_hci.c:89 SPIN_BUSYWAIT  baseline
+kernel/drivers/net/wifi/rtl8812bu.c|SLEEP_POLL|a7d569cb720d  # kernel/drivers/net/wifi/rtl8812bu.c:1248 SLEEP_POLL  baseline
+kernel/drivers/net/wifi/rtl8812bu.c|SLEEP_POLL|4c69d0084e8c  # kernel/drivers/net/wifi/rtl8812bu.c:2494 SLEEP_POLL  baseline
+kernel/drivers/net/wifi/rtl8812bu.c|SLEEP_POLL|6f821e1ee0ee  # kernel/drivers/net/wifi/rtl8812bu.c:2525 SLEEP_POLL  baseline
+kernel/drivers/usb_audio.c|SLEEP_POLL|fd417bc6fee9  # kernel/drivers/usb_audio.c:450 SLEEP_POLL  baseline
+kernel/drivers/usb_audio.c|SLEEP_POLL|42f599e23feb  # kernel/drivers/usb_audio.c:557 SLEEP_POLL  baseline
+kernel/drivers/usb_hid.c|SLEEP_POLL|c837787f6655  # kernel/drivers/usb_hid.c:486 SLEEP_POLL  baseline
+kernel/drivers/usb_msc.c|YIELD_SPIN|847c474c9714  # kernel/drivers/usb_msc.c:173 YIELD_SPIN  baseline
+kernel/drivers/xhci.c|SLEEP_POLL|c837787f6655  # kernel/drivers/xhci.c:1339 SLEEP_POLL  baseline
+kernel/drivers/xhci.c|SLEEP_POLL|c837787f6655  # kernel/drivers/xhci.c:1383 SLEEP_POLL  baseline
+kernel/exec/win16api.c|SLEEP_POLL|9c6f4762b991  # kernel/exec/win16api.c:6185 SLEEP_POLL  baseline
+kernel/fs/blockdev.c|YIELD_SPIN|129422cb0c61  # kernel/fs/blockdev.c:117 YIELD_SPIN  baseline
+kernel/fs/pipe.c|YIELD_SPIN|79aa85b22c4b  # kernel/fs/pipe.c:58 YIELD_SPIN  baseline
+kernel/gui/clock.c|SPIN_BUSYWAIT|1400381f5357  # kernel/gui/clock.c:75 SPIN_BUSYWAIT  baseline
+kernel/gui/clock.c|SPIN_BUSYWAIT|1400381f5357  # kernel/gui/clock.c:104 SPIN_BUSYWAIT  baseline
+kernel/gui/desktop.c|SPIN_BUSYWAIT|bd8cc0686b35  # kernel/gui/desktop.c:2372 SPIN_BUSYWAIT  baseline
+kernel/gui/desktop.c|YIELD_SPIN|8779bc817025  # kernel/gui/desktop.c:4474 YIELD_SPIN  baseline
+kernel/gui/installer.c|SLEEP_POLL|95083efd4741  # kernel/gui/installer.c:982 SLEEP_POLL  baseline
+kernel/gui/login.c|YIELD_SPIN|c5bebca4e25a  # kernel/gui/login.c:631 YIELD_SPIN  baseline
+kernel/gui/properties.c|SPIN_BUSYWAIT|bd8cc0686b35  # kernel/gui/properties.c:944 SPIN_BUSYWAIT  baseline
+kernel/gui/sshterm.c|SLEEP_POLL|f266361ab8ae  # kernel/gui/sshterm.c:272 SLEEP_POLL  baseline
+kernel/gui/terminal.c|SLEEP_POLL|7c5482e8dd79  # kernel/gui/terminal.c:699 SLEEP_POLL  baseline
+kernel/ipc/msg.c|YIELD_SPIN|c5bebca4e25a  # kernel/ipc/msg.c:336 YIELD_SPIN  baseline
+kernel/main.c|SPIN_BUSYWAIT|af51e1f8e908  # kernel/main.c:464 SPIN_BUSYWAIT  baseline
+kernel/net/dns.c|SLEEP_POLL|962bb457e2a9  # kernel/net/dns.c:309 SLEEP_POLL  baseline
+kernel/net/http2.c|SLEEP_POLL|a5d0a21a3bab  # kernel/net/http2.c:434 SLEEP_POLL  baseline
+kernel/net/http2.c|SLEEP_POLL|cf6df1108870  # kernel/net/http2.c:475 SLEEP_POLL  baseline
+kernel/net/https.c|SLEEP_POLL|b757ece8e7a6  # kernel/net/https.c:37 SLEEP_POLL  baseline
+kernel/net/https.c|SLEEP_POLL|90d68969fbf0  # kernel/net/https.c:66 SLEEP_POLL  baseline
+kernel/net/https.c|SLEEP_POLL|8e27225f528f  # kernel/net/https.c:130 SLEEP_POLL  baseline
+kernel/net/https.c|SLEEP_POLL|7f1494374b7b  # kernel/net/https.c:182 SLEEP_POLL  baseline
+kernel/net/https.c|SLEEP_POLL|a0066ad872f8  # kernel/net/https.c:203 SLEEP_POLL  baseline
+kernel/net/https.c|SLEEP_POLL|1f3334d63057  # kernel/net/https.c:633 SLEEP_POLL  baseline
+kernel/net/https.c|SLEEP_POLL|1f3334d63057  # kernel/net/https.c:832 SLEEP_POLL  baseline
+kernel/net/ipp.c|SLEEP_POLL|dc4a54428f94  # kernel/net/ipp.c:149 SLEEP_POLL  baseline
+kernel/net/ipp.c|SLEEP_POLL|cf6df1108870  # kernel/net/ipp.c:168 SLEEP_POLL  baseline
+kernel/net/ipp.c|SLEEP_POLL|433ecacae386  # kernel/net/ipp.c:199 SLEEP_POLL  baseline
+kernel/net/ipp.c|SLEEP_POLL|df96df4c9766  # kernel/net/ipp.c:215 SLEEP_POLL  baseline
+kernel/net/ipp.c|SLEEP_POLL|5d57fd286430  # kernel/net/ipp.c:252 SLEEP_POLL  baseline
+kernel/net/nfs.c|SLEEP_POLL|19af7c3ed938  # kernel/net/nfs.c:1851 SLEEP_POLL  baseline
+kernel/net/nfs.c|SLEEP_POLL|e8656e966b6a  # kernel/net/nfs.c:1966 SLEEP_POLL  baseline
+kernel/net/remote_ctrl.c|SLEEP_POLL|9b8988967a8c  # kernel/net/remote_ctrl.c:146 SLEEP_POLL  baseline
+kernel/net/remote_ctrl.c|SLEEP_POLL|65977738cd95  # kernel/net/remote_ctrl.c:621 SLEEP_POLL  baseline
+kernel/net/remote_ctrl.c|SLEEP_POLL|cdd54cd12f8f  # kernel/net/remote_ctrl.c:624 SLEEP_POLL  baseline
+kernel/net/remote_ctrl.c|SLEEP_POLL|3970629bad2e  # kernel/net/remote_ctrl.c:707 SLEEP_POLL  baseline
+kernel/net/remote_ctrl.c|SLEEP_POLL|2c596a1e2f57  # kernel/net/remote_ctrl.c:712 SLEEP_POLL  baseline
+kernel/net/remote_ctrl.c|SLEEP_POLL|c837787f6655  # kernel/net/remote_ctrl.c:1126 SLEEP_POLL  baseline
+kernel/net/remote_ctrl.c|SLEEP_POLL|43697fdd833e  # kernel/net/remote_ctrl.c:1182 SLEEP_POLL  baseline
+kernel/net/remote_ctrl.c|SLEEP_POLL|7f61a2fcfcc4  # kernel/net/remote_ctrl.c:1428 SLEEP_POLL  baseline
+kernel/net/remote_ctrl.c|SLEEP_POLL|c837787f6655  # kernel/net/remote_ctrl.c:1491 SLEEP_POLL  baseline
+kernel/net/remote_ctrl.c|SLEEP_POLL|c5c5b234d538  # kernel/net/remote_ctrl.c:1523 SLEEP_POLL  baseline
+kernel/net/ssh/ssh2.c|SLEEP_POLL|cf6df1108870  # kernel/net/ssh/ssh2.c:167 SLEEP_POLL  baseline
+kernel/net/ssh/ssh2.c|SLEEP_POLL|c837787f6655  # kernel/net/ssh/ssh2.c:297 SLEEP_POLL  baseline
+kernel/net/ssh/ssh2.c|SLEEP_POLL|c837787f6655  # kernel/net/ssh/ssh2.c:336 SLEEP_POLL  baseline
+kernel/net/ssh/ssh2.c|SLEEP_POLL|22b196b3a3c0  # kernel/net/ssh/ssh2.c:407 SLEEP_POLL  baseline
+kernel/net/ssh/ssh2.c|SLEEP_POLL|c837787f6655  # kernel/net/ssh/ssh2.c:632 SLEEP_POLL  baseline
+kernel/net/ssh/ssh2.c|SLEEP_POLL|b2eb2caab308  # kernel/net/ssh/ssh2.c:869 SLEEP_POLL  baseline
+kernel/net/ssh/ssh2_server.c|SLEEP_POLL|cf6df1108870  # kernel/net/ssh/ssh2_server.c:140 SLEEP_POLL  baseline
+kernel/net/ssh/ssh2_server.c|SLEEP_POLL|c837787f6655  # kernel/net/ssh/ssh2_server.c:210 SLEEP_POLL  baseline
+kernel/net/ssh/ssh2_server.c|SLEEP_POLL|c837787f6655  # kernel/net/ssh/ssh2_server.c:229 SLEEP_POLL  baseline
+kernel/net/ssh/ssh2_server.c|SLEEP_POLL|c837787f6655  # kernel/net/ssh/ssh2_server.c:572 SLEEP_POLL  baseline
+kernel/net/tls/tls.c|SLEEP_POLL|2d8edf7cca8d  # kernel/net/tls/tls.c:93 SLEEP_POLL  baseline
+kernel/net/tls/tls.c|SLEEP_POLL|0af8338b4e43  # kernel/net/tls/tls.c:122 SLEEP_POLL  baseline
+kernel/net/wget.c|SLEEP_POLL|e853b3932ab2  # kernel/net/wget.c:129 SLEEP_POLL  baseline
+kernel/net/wget.c|SLEEP_POLL|4324d2cbd109  # kernel/net/wget.c:913 SLEEP_POLL  baseline
+kernel/proc/signal.c|YIELD_SPIN|0f19237836f2  # kernel/proc/signal.c:437 YIELD_SPIN  baseline
+kernel/proc/syscall.c|SLEEP_POLL|ca71a9ac0109  # kernel/proc/syscall.c:489 SLEEP_POLL  baseline
+kernel/proc/syscall.c|SLEEP_POLL|c837787f6655  # kernel/proc/syscall.c:2178 SLEEP_POLL  baseline
+kernel/proc/syscall.c|YIELD_SPIN|05d2cf3ebfa3  # kernel/proc/syscall.c:3369 YIELD_SPIN  baseline
+kernel/serial.c|SPIN_BUSYWAIT|402bf82c76d3  # kernel/serial.c:59 SPIN_BUSYWAIT  baseline
+kernel/serial.c|SPIN_BUSYWAIT|bd612d27e4bd  # kernel/serial.c:65 SPIN_BUSYWAIT  baseline
+kernel/syscall.c|YIELD_SPIN|05d2cf3ebfa3  # kernel/syscall.c:837 YIELD_SPIN  baseline
+userland/apps/reloctest/main.c|SPIN_BUSYWAIT|c837787f6655  # userland/apps/reloctest/main.c:46 SPIN_BUSYWAIT  baseline
+userland/apps/spindisk/main.c|SPIN_BUSYWAIT|a4154585810d  # userland/apps/spindisk/main.c:15 SPIN_BUSYWAIT  baseline
+userland/test/hello.c|SPIN_BUSYWAIT|965df2723e7e  # userland/test/hello.c:38 SPIN_BUSYWAIT  baseline

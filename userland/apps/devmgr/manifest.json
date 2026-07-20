@@ -1,0 +1,37 @@
+{
+  "app": "devmgr",
+  "version": "1.0.0",
+  "description": "Device Manager: read-only hardware enumeration (System, PCI, USB, IRQs)",
+  "icon": "devmgr.bmp",
+  "category": "System",
+  "capabilities": [
+    {
+      "action": "refresh",
+      "parameters": {},
+      "description": "Re-query the hardware device tree",
+      "requires_capability": "system.device.read"
+    }
+  ],
+  "state_queries": [
+    {
+      "query": "get_system_info",
+      "returns": {"cpu_count": "int", "cpu_brand": "string", "mem_total": "int", "mem_used": "int"},
+      "requires_capability": "system.device.read"
+    },
+    {
+      "query": "get_pci_devices",
+      "returns": [{"name": "string", "vendor": "int", "device": "int", "bus": "int", "slot": "int", "func": "int"}],
+      "requires_capability": "system.device.read"
+    },
+    {
+      "query": "get_usb_devices",
+      "returns": [{"vendor": "int", "product": "int", "class": "int", "speed": "int", "port": "int"}],
+      "requires_capability": "system.device.read"
+    },
+    {
+      "query": "get_irqs",
+      "returns": [{"vector": "int", "irq_line": "int", "has_handler": "bool"}],
+      "requires_capability": "system.device.read"
+    }
+  ]
+}

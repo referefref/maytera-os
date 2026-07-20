@@ -1,0 +1,75 @@
+{
+  "app": "mediaplayer",
+  "version": "1.0.0",
+  "description": "Audio and video media player with playlist support",
+  "icon": "mediaplayer.bmp",
+  "category": "Multimedia",
+  "file_associations": [".wav", ".mp3", ".ogg", ".avi"],
+  "capabilities": [
+    {
+      "action": "play",
+      "parameters": {},
+      "description": "Start or resume playback",
+      "requires_capability": "app.mediaplayer.playback.write"
+    },
+    {
+      "action": "pause",
+      "parameters": {},
+      "description": "Pause playback",
+      "requires_capability": "app.mediaplayer.playback.write"
+    },
+    {
+      "action": "stop",
+      "parameters": {},
+      "description": "Stop playback and reset position",
+      "requires_capability": "app.mediaplayer.playback.write"
+    },
+    {
+      "action": "next_track",
+      "parameters": {},
+      "description": "Skip to next track in playlist",
+      "requires_capability": "app.mediaplayer.playback.write"
+    },
+    {
+      "action": "prev_track",
+      "parameters": {},
+      "description": "Go to previous track",
+      "requires_capability": "app.mediaplayer.playback.write"
+    },
+    {
+      "action": "seek",
+      "parameters": {"seconds": "int"},
+      "description": "Seek to position in current track",
+      "requires_capability": "app.mediaplayer.playback.write"
+    },
+    {
+      "action": "set_volume",
+      "parameters": {"level": "int"},
+      "valid_range": [0, 100],
+      "requires_capability": "system.audio.write"
+    },
+    {
+      "action": "add_to_playlist",
+      "parameters": {"path": "string"},
+      "description": "Add a media file to playlist",
+      "requires_capability": "filesystem.read"
+    }
+  ],
+  "state_queries": [
+    {
+      "query": "get_playback_state",
+      "returns": {"state": "string", "track": "int", "position": "int", "duration": "int"},
+      "requires_capability": "app.mediaplayer.read"
+    },
+    {
+      "query": "get_playlist",
+      "returns": [{"name": "string", "duration": "int"}],
+      "requires_capability": "app.mediaplayer.read"
+    },
+    {
+      "query": "get_volume",
+      "returns": "int",
+      "requires_capability": "system.audio.read"
+    }
+  ]
+}

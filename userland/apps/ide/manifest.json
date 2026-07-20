@@ -1,0 +1,7 @@
+{
+  "name": "Maytera Code Studio",
+  "exec": "/APPS/IDE",
+  "icon": "/APPS/IDE.ICN",
+  "category": "Development",
+  "description": "Coding IDE with multi-file editor, syntax highlighting, file tree and an integrated Python console"
+}

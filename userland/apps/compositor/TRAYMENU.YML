@@ -1,0 +1,17 @@
+sheep:
+  - {type: check, label: Show sheep, bind: sheep_show}
+  - {type: slider, label: Speed, bind: sheep_speed, min: 1, max: 5}
+  - {type: slider, label: Size, bind: sheep_size, min: 1, max: 3}
+  - {type: radio, label: Style, bind: sheep_style, options: Classic|Spotted}
+  - {type: slider, label: Count, bind: sheep_count, min: 1, max: 50}
+  - {type: check, label: Sheepdog, bind: dog_show}
+sound:
+  - {type: slider, label: Volume, bind: volume, min: 0, max: 100}
+  - {type: slider, label: Bass, bind: eq0, min: 0, max: 100}
+  - {type: slider, label: Mid, bind: eq2, min: 0, max: 100}
+  - {type: slider, label: Treble, bind: eq4, min: 0, max: 100}
+widgets:
+  - {type: check, label: Clock, bind: show_clock}
+  - {type: check, label: Calendar, bind: show_calendar}
+  - {type: check, label: Home Assistant, bind: show_ha}
+  - {type: check, label: Sheep, bind: sheep_show}

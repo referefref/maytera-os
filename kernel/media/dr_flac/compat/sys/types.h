@@ -1,0 +1,3 @@
+#ifndef _MAYTERA_DRFLAC_SYS_TYPES_H
+#define _MAYTERA_DRFLAC_SYS_TYPES_H
+#endif

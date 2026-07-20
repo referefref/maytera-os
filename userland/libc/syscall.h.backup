@@ -1,0 +1,273 @@
+// syscall.h - Userland syscall wrappers for MayteraOS
+#ifndef LIBC_SYSCALL_H
+#define LIBC_SYSCALL_H
+
+#include "types.h"
+
+// =============================================================================
+// Syscall Numbers (must match kernel syscall.h)
+// =============================================================================
+
+#define SYS_EXIT            0
+#define SYS_FORK            1
+#define SYS_EXEC            2
+#define SYS_WAIT            3
+#define SYS_GETPID          4
+#define SYS_GETPPID         5
+#define SYS_YIELD           6
+#define SYS_SLEEP           7
+
+#define SYS_OPEN            10
+#define SYS_CLOSE           11
+#define SYS_READ            12
+#define SYS_WRITE           13
+#define SYS_SEEK            14
+#define SYS_STAT            15
+#define SYS_READDIR         19  // Read directory entry
+
+#define SYS_BRK             20
+#define SYS_MMAP            21
+#define SYS_MUNMAP          22
+
+#define SYS_WIN_CREATE      30
+#define SYS_WIN_DESTROY     31
+#define SYS_WIN_DRAW_RECT   32
+#define SYS_WIN_DRAW_TEXT   33
+#define SYS_WIN_DRAW_PIXEL  34
+#define SYS_WIN_BLIT        35
+#define SYS_WIN_GET_EVENT   36
+#define SYS_WIN_INVALIDATE  37
+#define SYS_WIN_GET_POS     38
+#define SYS_WIN_MAXIMIZE    39
+#define SYS_WIN_CAPTURE     90
+
+#define SYS_PUTCHAR         40
+#define SYS_GETCHAR         41
+
+#define SYS_TIME            50
+#define SYS_CLOCK           51
+
+#define SYS_SHM_CREATE      70
+#define SYS_SHM_MAP         71
+#define SYS_SHM_UNMAP       72
+#define SYS_SHM_DESTROY     73
+
+#define SYS_MSG_CREATE      80
+#define SYS_MSG_CONNECT     81
+#define SYS_MSG_SEND        82
+#define SYS_MSG_RECV        83
+#define SYS_MSG_CLOSE       84
+#define SYS_MSG_DESTROY     85
+#define SYS_MSG_ACCEPT      86
+
+// Framebuffer syscalls (compositor specific)
+#define SYS_FB_MAP          200
+#define SYS_FB_INFO         201
+#define SYS_FB_FLIP         202
+
+// Input syscalls
+#define SYS_GET_MOUSE       210
+#define SYS_GET_KEY         211
+
+// =============================================================================
+// Raw Syscall Functions (implemented in syscall.asm)
+// =============================================================================
+
+// These are defined in syscall.asm and use the x86-64 syscall convention:
+//   Syscall number in RAX
+//   Arguments: RDI, RSI, RDX, R10, R8, R9
+//   Return value in RAX
+
+extern long syscall0(long num);
+extern long syscall1(long num, long arg1);
+extern long syscall2(long num, long arg1, long arg2);
+extern long syscall3(long num, long arg1, long arg2, long arg3);
+extern long syscall4(long num, long arg1, long arg2, long arg3, long arg4);
+extern long syscall5(long num, long arg1, long arg2, long arg3, long arg4, long arg5);
+extern long syscall6(long num, long arg1, long arg2, long arg3, long arg4, long arg5, long arg6);
+
+// =============================================================================
+// High-level syscall wrappers
+// =============================================================================
+
+// Process management
+static inline void sys_exit(int code) {
+    syscall1(SYS_EXIT, code);
+    __builtin_unreachable();
+}
+
+static inline int sys_fork(void) {
+    return syscall0(SYS_FORK);
+}
+
+static inline int sys_exec(const char *path) {
+    return syscall1(SYS_EXEC, (long)path);
+}
+
+static inline int sys_wait(int pid, int *status) {
+    return syscall2(SYS_WAIT, (long)pid, (long)status);
+}
+
+static inline int sys_getpid(void) {
+    return syscall0(SYS_GETPID);
+}
+
+static inline void sys_yield(void) {
+    syscall0(SYS_YIELD);
+}
+
+static inline void sys_sleep(uint32_t ms) {
+    syscall1(SYS_SLEEP, ms);
+}
+
+// File I/O
+static inline int sys_open(const char *path, int flags) {
+    return syscall2(SYS_OPEN, (long)path, flags);
+}
+
+static inline int sys_close(int fd) {
+    return syscall1(SYS_CLOSE, fd);
+}
+
+static inline long sys_read(int fd, void *buf, size_t count) {
+    return syscall3(SYS_READ, fd, (long)buf, count);
+}
+
+static inline long sys_write(int fd, const void *buf, size_t count) {
+    return syscall3(SYS_WRITE, fd, (long)buf, count);
+}
+
+// Memory management
+static inline void *sys_mmap(void *addr, size_t len, int prot, int flags) {
+    return (void *)syscall4(SYS_MMAP, (long)addr, len, prot, flags);
+}
+
+static inline int sys_munmap(void *addr, size_t len) {
+    return syscall2(SYS_MUNMAP, (long)addr, len);
+}
+
+// Time
+static inline uint64_t sys_time(void) {
+    return syscall0(SYS_TIME);
+}
+
+static inline uint64_t sys_clock(void) {
+    return syscall0(SYS_CLOCK);
+}
+
+// Shared memory
+static inline int shm_create(size_t size, int flags) {
+    return syscall2(SYS_SHM_CREATE, size, flags);
+}
+
+static inline int shm_map(int id, void **addr) {
+    return syscall2(SYS_SHM_MAP, id, (long)addr);
+}
+
+static inline int shm_unmap(int id) {
+    return syscall1(SYS_SHM_UNMAP, id);
+}
+
+static inline int shm_destroy(int id) {
+    return syscall1(SYS_SHM_DESTROY, id);
+}
+
+// Message passing
+static inline int msg_create_channel(void) {
+    return syscall0(SYS_MSG_CREATE);
+}
+
+static inline int msg_connect(int channel_id) {
+    return syscall1(SYS_MSG_CONNECT, channel_id);
+}
+
+static inline int msg_send(int conn_id, const void *data, size_t len) {
+    return syscall3(SYS_MSG_SEND, conn_id, (long)data, len);
+}
+
+static inline int msg_recv(int conn_id, void *buf, size_t len, int timeout) {
+    return syscall4(SYS_MSG_RECV, conn_id, (long)buf, len, timeout);
+}
+
+static inline int msg_close(int conn_id) {
+    return syscall1(SYS_MSG_CLOSE, conn_id);
+}
+
+static inline int msg_destroy_channel(int channel_id) {
+    return syscall1(SYS_MSG_DESTROY, channel_id);
+}
+
+static inline int msg_accept(int channel_id, int timeout) {
+    return syscall2(SYS_MSG_ACCEPT, channel_id, timeout);
+}
+
+// Input
+static inline int sys_get_mouse(int32_t *x, int32_t *y, uint32_t *buttons) {
+    return syscall3(SYS_GET_MOUSE, (long)x, (long)y, (long)buttons);
+}
+
+static inline int sys_get_key(uint32_t *keycode, uint32_t *scancode, int *pressed, uint32_t *mods) {
+    return syscall4(SYS_GET_KEY, (long)keycode, (long)scancode, 
+                    (long)pressed, (long)mods);
+}
+
+// =============================================================================
+// Window syscall wrappers
+// =============================================================================
+
+static inline int win_create(const char *title, int x, int y, int width, int height) {
+    return syscall5(SYS_WIN_CREATE, (long)title, x, y, width, height);
+}
+
+static inline int win_destroy(int handle) {
+    return syscall1(SYS_WIN_DESTROY, handle);
+}
+
+static inline void win_draw_rect(int handle, int x, int y, int width, int height, uint32_t color) {
+    syscall6(SYS_WIN_DRAW_RECT, handle, x, y, 
+             width, height, color);
+}
+
+static inline void win_draw_text(int handle, int x, int y, const char *text, uint32_t color) {
+    syscall5(SYS_WIN_DRAW_TEXT, handle, x, y, (long)text, color);
+}
+
+static inline void win_draw_pixel(int handle, int x, int y, uint32_t color) {
+    syscall4(SYS_WIN_DRAW_PIXEL, handle, x, y, color);
+}
+
+static inline int win_get_event(int handle, void *event, int timeout) {
+    return syscall3(SYS_WIN_GET_EVENT, handle, (long)event, timeout);
+}
+
+static inline void win_invalidate(int handle) {
+    syscall1(SYS_WIN_INVALIDATE, handle);
+}
+
+static inline int win_get_pos(int handle, int *x, int *y) {
+    return syscall3(SYS_WIN_GET_POS, handle, (long)x, (long)y);
+}
+
+// Directory entry structure
+typedef struct {
+    char name[256];
+    uint32_t size;
+    uint8_t is_directory;
+    uint8_t _padding[3];
+} dirent_t;
+
+static inline int readdir(const char *path, int index, dirent_t *entry) {
+    return syscall3(SYS_READDIR, (long)path, index, (long)entry);
+}
+
+// Maximize a window
+static inline void win_maximize(int handle) {
+    syscall1(SYS_WIN_MAXIMIZE, handle);
+}
+
+// Capture/release mouse to window (1=capture, 0=release)
+static inline void win_capture_mouse(int handle, int capture) {
+    syscall2(SYS_WIN_CAPTURE, handle, capture);
+}
+
+#endif // LIBC_SYSCALL_H

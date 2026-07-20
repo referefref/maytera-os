@@ -1,0 +1,215 @@
+# rust-symbols.manifest - the exported FFI surface of the rustkern crate.
+# Enforced by tools/rust-symbol-gate/rust-symbol-gate, wired into the build via
+# `make rust-symbol-gate` (an order-only prerequisite of kernel.elf, so it runs
+# on EVERY build and a mismatch FAILS THE BUILD).
+#
+# WHAT THIS FILE IS FOR
+# ---------------------
+# Every symbol below is a `#[no_mangle] pub extern "C" fn` that C code links
+# against. Deleting one BUILDS CLEAN unless a caller happens to be compiled in
+# on that build, and most of these sit behind a -DRUST_* strangler flag, so the
+# link is NOT a reliable backstop. This manifest is the backstop.
+#
+# THE RULES
+# ---------
+#  * Adding an export?   Add its line here, under its subsystem, or the build
+#                        fails as UNDECLARED. That is deliberate: it is where
+#                        you record that the symbol exists and who owns it.
+#  * Removing an export?  Remove its line here AND the C `extern` declaration
+#                        AND the C callers, in the same change. If the gate says
+#                        MISSING and you did not intend a removal, someone's work
+#                        has been clobbered: recover it, do not delete the line.
+#  * Renaming an export?  That is a removal plus an addition. Both C and Rust.
+#
+# The `_rs` suffix is the strangler-pattern convention: the C original is kept
+# as `<fn>_c` and the live symbol is routed to one or the other by -DRUST_<NAME>
+# (see RUST_PORT_LEDGER.md and the CFLAGS block in the Makefile).
+#
+# Symbols are grouped by the rustkern/ module that defines them (#404 / #526 split).
+# The section headers are comments; the gate only reads the bare symbol lines.
+# Ordering and grouping are for humans and carry no meaning to the gate.
+
+# ---------------------------------------------------------------------------
+# rustkern.rs (crate root) - Phase A probes. Unreferenced at runtime by design;
+# `-u rust_marker` in LDFLAGS force-retains the translation unit so the Rust
+# object and its #[panic_handler] are genuinely linked into the image.
+# ---------------------------------------------------------------------------
+rust_probe
+rust_marker
+
+# ---------------------------------------------------------------------------
+# rustkern/mono.rs - #525 the shared TSC monotonic clock (API in cpu/mono.h).
+# The strategic fix for the timer_ticks-is-not-a-wall-clock family (#499).
+# net/tls has already adopted it. Do not let these vanish.
+# ---------------------------------------------------------------------------
+mono_init_rs
+mono_ready_rs
+mono_ms_rs
+mono_us_rs
+mono_tsc_khz_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/checksum.rs - #404 Phase B/D: IP + transport checksums.
+# (ip_checksum_rs physically sat inside the #525 mono block before the split;
+# it belongs here.)
+# ---------------------------------------------------------------------------
+ip_checksum_rs
+tcp_checksum_rs
+udp_checksum_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/clipboard.rs - #542 OS-wide system clipboard (kernel-held store).
+# Bounded 64 KiB backing buffer; every copy in/out is length-clamped here.
+# Called from proc/syscall.c (SYS_CLIP_SET/SYS_CLIP_GET) and main.c (boot self-test).
+# ---------------------------------------------------------------------------
+clip_set_rs
+clip_get_rs
+clip_len_rs
+clip_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/ext2.rs - #404 Phase C / #485: ext2 directory-block entry scan.
+# Removed the #476 OOB-read class (unbounded on-disk rec_len/name_len).
+# ---------------------------------------------------------------------------
+ext2_dirblock_find_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/sha256.rs, sha512.rs, md5.rs, md4.rs, aes.rs, chacha20.rs, hmac.rs
+# #404 Phases E-K (#487-#493): crypto cores + the RFC 2104 HMAC construction.
+# ---------------------------------------------------------------------------
+sha256_transform_rs
+sha512_transform_rs
+md5_transform_rs
+md4_transform_rs
+aes_encrypt_block_rs
+aes_decrypt_block_rs
+chacha20_block_rs
+hmac_sha256_rs
+hmac_sha384_rs
+hmac_md5_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/icmp.rs, arp.rs, dns.rs, dhcp.rs, url.rs
+# #404 Phases L-P (#494-#498): untrusted wire-input parsers.
+# ---------------------------------------------------------------------------
+icmp_parse_rs
+arp_parse_rs
+dns_parse_response_rs
+dhcp_parse_rs
+url_parse_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/elf.rs, pe.rs - #404 Phases Q/R (#499): executable pre-map validation.
+# ---------------------------------------------------------------------------
+elf_validate_full_rs
+pe_validate_full_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/fat.rs, exfat.rs - #404 Phases S/T (#501): on-disk directory decode.
+# ---------------------------------------------------------------------------
+fat_dir_step_rs
+exfat_dir_step_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/bmp.rs, png.rs, jpeg.rs, inflate.rs - #404 Phases U-X (#502):
+# untrusted image decode + the reachable DEFLATE core.
+# ---------------------------------------------------------------------------
+bmp_decode_rs
+png_parse_ihdr_rs
+png_defilter_rs
+jpeg_parse_headers_rs
+jpeg_dequant_idct_rs
+inflate_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/tls_parse.rs - #404 Phase Y (#502): TLS record / handshake / certificate
+# walkers (net/tls/tls.h declares these extern).
+# ---------------------------------------------------------------------------
+tls_parse_record_header_rs
+tls_hs_next_rs
+tls_cert_next_rs
+tls13_cert_next_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/certverify.rs - #510 / MAYTERA-SEC-2026-0017: TLS 1.3 CertificateVerify
+# (RFC 8446 4.4.3). Security-load-bearing: proven to abort the handshake on a
+# bit-flipped signature.
+# ---------------------------------------------------------------------------
+tls13_cv_parse_rs
+tls13_cv_content_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/tls12.rs - #502: TLS 1.2 (RFC 5246) client core. NEW code written in
+# Rust, not a port. net/tls/tls.h declares all six extern.
+# ---------------------------------------------------------------------------
+tls12_master_secret_rs
+tls12_key_block_rs
+tls12_finished_rs
+tls12_downgrade_check_rs
+tls12_ske_parse_rs
+emsa_pss_verify_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/http.rs, http2.rs - #404 Phase Y + batch-1: HTTP response length parse
+# (net/https.c + net/wget.c) and HTTP/2 framing (net/http2.c).
+# ---------------------------------------------------------------------------
+https_dechunk_rs
+https_chunk_complete_rs
+http_decode_chunked_rs
+http_find_header_end_rs
+https_content_length_rs
+http_parse_uint_rs
+http2_frame_next_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/mp4.rs, theme.rs, wav.rs, cert_b64.rs, xattr.rs, ed25519.rs
+# #404 Phase Z + batch-1/2/3 parser-tier seams.
+# ---------------------------------------------------------------------------
+mp4_parse_rs
+theme_parse_line_rs
+wav_parse_header_rs
+cert_base64_decode_rs
+xattr_entry_next_rs
+unpack25519_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/xdr.rs - #404 batch-3 (last parser-tier seam): net/rpc.c XDR decode.
+# ---------------------------------------------------------------------------
+xdr_decode_uint32_rs
+xdr_decode_uint64_rs
+xdr_decode_opaque_rs
+xdr_decode_bytes_rs
+xdr_decode_string_rs
+xdr_decode_string_len_rs
+xdr_decode_skip_rs
+xdr_decode_nfs_fh3_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/taskmgr.rs, parttbl.rs, usb_desc.rs - #404 data-core + driver tier.
+# ---------------------------------------------------------------------------
+perf_ring_stats_rs
+taskmgr_sort_rows_rs
+parttbl_gpt_hdr_rs
+parttbl_gpt_sec_scan_rs
+parttbl_mbr_find_rs
+uac_parse_config_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/proc_mem.rs, vfs_path.rs, conn.rs, procinfo.rs
+# #487/#349 Task Manager kernel accessors + Ring-3 introspection builders.
+# ---------------------------------------------------------------------------
+proc_mem_account_rs
+vfs_path_store_rs
+conn_filter_by_pid_rs
+handles_build_rs
+svc_build_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/argtab.rs - #503 / MAYTERA-SEC-2026-0016: THE SYSCALL POINTER CHOKE
+# POINT. The one place every Ring-3 pointer argument is described and validated.
+# tools/syscall-ptr-lint enforces that a syscall taking a pointer has an entry
+# in the table these serve.
+# ---------------------------------------------------------------------------
+syscall_validate_args
+syscall_desc_covers
+syscall_desc_count

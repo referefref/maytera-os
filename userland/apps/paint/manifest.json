@@ -1,0 +1,57 @@
+{
+  "app": "paint",
+  "version": "1.0.0",
+  "description": "Image editor with drawing tools",
+  "icon": "paint.bmp",
+  "category": "Graphics",
+  "capabilities": [
+    {
+      "action": "new_canvas",
+      "parameters": {"width": "int", "height": "int"},
+      "description": "Create a new blank canvas",
+      "requires_capability": "app.paint.canvas.write"
+    },
+    {
+      "action": "set_tool",
+      "parameters": {"tool": "string"},
+      "valid_values": ["brush", "line", "rect", "fill", "eraser"],
+      "requires_capability": "app.paint.tool.write"
+    },
+    {
+      "action": "set_color",
+      "parameters": {"color": "int"},
+      "description": "Set current drawing color (0xRRGGBB)",
+      "requires_capability": "app.paint.color.write"
+    },
+    {
+      "action": "set_brush_size",
+      "parameters": {"size": "int"},
+      "valid_range": [1, 9],
+      "requires_capability": "app.paint.brush.write"
+    },
+    {
+      "action": "clear_canvas",
+      "parameters": {},
+      "description": "Clear canvas to background color",
+      "requires_capability": "app.paint.canvas.write"
+    },
+    {
+      "action": "save_image",
+      "parameters": {"path": "string"},
+      "description": "Save canvas as BMP file",
+      "requires_capability": "filesystem.write"
+    }
+  ],
+  "state_queries": [
+    {
+      "query": "get_current_tool",
+      "returns": "string",
+      "requires_capability": "app.paint.read"
+    },
+    {
+      "query": "get_current_color",
+      "returns": "int",
+      "requires_capability": "app.paint.read"
+    }
+  ]
+}

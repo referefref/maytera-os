@@ -1,0 +1,33 @@
+{
+  "app": "clock",
+  "version": "1.0.0",
+  "description": "Clock display with analog and digital modes",
+  "icon": "clock.bmp",
+  "category": "Utilities",
+  "capabilities": [
+    {
+      "action": "set_display_mode",
+      "parameters": {"mode": "string"},
+      "valid_values": ["analog", "digital", "both"],
+      "requires_capability": "app.clock.settings.write"
+    },
+    {
+      "action": "set_time_format",
+      "parameters": {"format": "string"},
+      "valid_values": ["12h", "24h"],
+      "requires_capability": "app.clock.settings.write"
+    }
+  ],
+  "state_queries": [
+    {
+      "query": "get_current_time",
+      "returns": {"hours": "int", "minutes": "int", "seconds": "int"},
+      "requires_capability": "system.time.read"
+    },
+    {
+      "query": "get_display_mode",
+      "returns": "string",
+      "requires_capability": "app.clock.read"
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+{
+  "name": "Browser",
+  "version": "1.0.0",
+  "description": "Simple web browser for MayteraOS",
+  "author": "MayteraOS Team",
+  "category": "Applications",
+  "icon": "network",
+  "executable": "browser",
+  "permissions": [
+    "network",
+    "gui"
+  ]
+}

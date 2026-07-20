@@ -1,0 +1,44 @@
+MAYTERA ARENA - ART ASSET CREDITS
+=================================================================
+The world/environment graphics overhaul uses freely-licensed art
+from OpenGameArt.org. Every asset below is CC0 (public domain).
+CC0 requires no attribution; credit is given here voluntarily and
+because this repository is public.
+
+-----------------------------------------------------------------
+Zortch World Textures
+  Author:  mutantleg
+  License: CC0 1.0 (public domain)
+  Source:  https://opengameart.org/content/zortch-world-textures
+  Used for the sci-fi/industrial world textures: indoor wall,
+  floor and ceiling sets (/ARENA/TEX/T*.BMP), the material
+  textures CRATE / WOOD / SANDST / SAND (/ARENA/*.BMP) and the
+  hazard-stripe trim on the warning wall.
+  Tiles used: tile01, tile16, tile17, tile91, tile112, tile113,
+  tile126, tile127, tile128, tile160, tile186, tile232, tile336,
+  tile506, bigdoor11, masked_floor, rustmaskfloor, chess, danger.
+
+-----------------------------------------------------------------
+2D Planet Pack 2
+  Author:  Screaming Brain Studios
+  License: CC0 1.0 (public domain)
+  Source:  https://opengameart.org/content/2d-planet-pack-2
+  Used for the outdoor "Dust Storm" planet sky (/ARENA/SKY/SKY5.BMP)
+  and for the drifting planets in the desktop starfield screensaver.
+  Planets used: Terrestrial, Ocean, Magma, Frozen, Cratered,
+  Blue Giant, Orange Giant, Yellow Sun.
+
+-----------------------------------------------------------------
+Do Not Enter Signs
+  Author:  rfc1394
+  License: CC0 1.0 (public domain)
+  Source:  https://opengameart.org/content/do-not-enter-signs
+  The "DANGER - DO NOT ENTER" sign composited onto the industrial
+  warning wall texture (/ARENA/TEX/T1W1.BMP).
+
+-----------------------------------------------------------------
+Pre-existing (unchanged) texture credit:
+  The per-theme baked wall/floor/ceiling fallback textures in
+  textures.c are ambientCG.com photo-scanned materials, CC0 1.0.
+  See the ASSET_CREDITS header in textures.c.
+=================================================================

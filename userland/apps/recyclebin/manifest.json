@@ -1,0 +1,51 @@
+{
+  "app": "recyclebin",
+  "version": "1.0.0",
+  "description": "Manage deleted files with restore and permanent delete",
+  "icon": "recyclebin.bmp",
+  "category": "System",
+  "capabilities": [
+    {
+      "action": "restore",
+      "parameters": {"items": ["string"]},
+      "description": "Restore deleted files to original location",
+      "requires_capability": "filesystem.write"
+    },
+    {
+      "action": "delete_permanently",
+      "parameters": {"items": ["string"]},
+      "description": "Permanently delete files from recycle bin",
+      "requires_capability": "filesystem.delete"
+    },
+    {
+      "action": "empty_bin",
+      "parameters": {},
+      "description": "Permanently delete all files in recycle bin",
+      "requires_capability": "filesystem.delete"
+    },
+    {
+      "action": "select_all",
+      "parameters": {},
+      "description": "Select all items",
+      "requires_capability": "app.recyclebin.write"
+    }
+  ],
+  "state_queries": [
+    {
+      "query": "get_items",
+      "returns": [{"name": "string", "original_path": "string", "size_kb": "int"}],
+      "requires_capability": "app.recyclebin.read"
+    },
+    {
+      "query": "get_total_size",
+      "returns": "int",
+      "description": "Total size of all items in KB",
+      "requires_capability": "app.recyclebin.read"
+    },
+    {
+      "query": "get_item_count",
+      "returns": "int",
+      "requires_capability": "app.recyclebin.read"
+    }
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "name": "Solitaire",
+  "version": "1.8.0",
+  "binary": "solitaire",
+  "icon": "solitaire.bmp",
+  "category": "Games",
+  "description": "Classic Klondike solitaire card game",
+  "capabilities": {
+    "actions": [
+      {
+        "name": "new_game",
+        "description": "Start a new game",
+        "params": [],
+        "returns": "void",
+        "requires": null
+      },
+      {
+        "name": "undo",
+        "description": "Undo last move",
+        "params": [],
+        "returns": "boolean",
+        "requires": null
+      },
+      {
+        "name": "hint",
+        "description": "Show a suggested move",
+        "params": [],
+        "returns": {"from": "string", "to": "string"},
+        "requires": null
+      }
+    ],
+    "queries": [
+      {
+        "name": "get_score",
+        "description": "Get current game score",
+        "returns": "number",
+        "requires": null
+      },
+      {
+        "name": "get_moves",
+        "description": "Get number of moves made",
+        "returns": "number",
+        "requires": null
+      },
+      {
+        "name": "is_game_won",
+        "description": "Check if game is completed",
+        "returns": "boolean",
+        "requires": null
+      }
+    ]
+  },
+  "window": {
+    "default_width": 620,
+    "default_height": 500,
+    "resizable": false
+  },
+  "ipc_channels": []
+}

@@ -1,0 +1,33 @@
+{
+  "app": "taskmanager",
+  "version": "1.0.0",
+  "description": "System process manager with CPU/memory monitoring",
+  "icon": "taskmanager.bmp",
+  "category": "System",
+  "capabilities": [
+    {
+      "action": "kill_process",
+      "parameters": {"pid": "int"},
+      "description": "Terminate a process by PID",
+      "requires_capability": "system.process.kill"
+    },
+    {
+      "action": "refresh",
+      "parameters": {},
+      "description": "Refresh process list",
+      "requires_capability": "system.process.read"
+    }
+  ],
+  "state_queries": [
+    {
+      "query": "get_process_list",
+      "returns": [{"pid": "int", "name": "string", "cpu": "int", "memory": "int", "state": "string"}],
+      "requires_capability": "system.process.read"
+    },
+    {
+      "query": "get_system_stats",
+      "returns": {"cpu_percent": "int", "memory_used_kb": "int", "memory_total_kb": "int"},
+      "requires_capability": "system.stats.read"
+    }
+  ]
+}

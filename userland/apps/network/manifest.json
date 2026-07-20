@@ -1,0 +1,46 @@
+{
+  "app": "network",
+  "version": "1.0.0",
+  "description": "Network interface configuration and status",
+  "icon": "network.bmp",
+  "category": "System",
+  "capabilities": [
+    {
+      "action": "set_dhcp",
+      "parameters": {"interface": "string", "enabled": "bool"},
+      "description": "Enable or disable DHCP on an interface",
+      "requires_capability": "system.network.write"
+    },
+    {
+      "action": "set_static_ip",
+      "parameters": {"interface": "string", "ip": "string", "netmask": "string", "gateway": "string"},
+      "description": "Configure static IP address",
+      "requires_capability": "system.network.write"
+    },
+    {
+      "action": "refresh",
+      "parameters": {},
+      "description": "Refresh interface information",
+      "requires_capability": "system.network.read"
+    }
+  ],
+  "state_queries": [
+    {
+      "query": "get_interfaces",
+      "returns": [{"name": "string", "ip": "string", "mac": "string", "connected": "bool"}],
+      "requires_capability": "system.network.read"
+    },
+    {
+      "query": "get_interface_stats",
+      "parameters": {"interface": "string"},
+      "returns": {"bytes_rx": "int", "bytes_tx": "int", "speed_mbps": "int"},
+      "requires_capability": "system.network.read"
+    },
+    {
+      "query": "get_ip_config",
+      "parameters": {"interface": "string"},
+      "returns": {"dhcp": "bool", "ip": "string", "netmask": "string", "gateway": "string"},
+      "requires_capability": "system.network.read"
+    }
+  ]
+}

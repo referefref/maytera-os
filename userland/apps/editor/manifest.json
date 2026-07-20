@@ -1,0 +1,89 @@
+{
+  "name": "Editor",
+  "version": "1.8.0",
+  "binary": "editor",
+  "icon": "editor.bmp",
+  "category": "Tools",
+  "description": "Text editor with syntax highlighting and file operations",
+  "capabilities": {
+    "actions": [
+      {
+        "name": "open_file",
+        "description": "Open a file for editing",
+        "params": ["path"],
+        "returns": "boolean",
+        "requires": "fs.read"
+      },
+      {
+        "name": "save_file",
+        "description": "Save current file",
+        "params": [],
+        "returns": "boolean",
+        "requires": "fs.write"
+      },
+      {
+        "name": "save_as",
+        "description": "Save file with new name",
+        "params": ["path"],
+        "returns": "boolean",
+        "requires": "fs.write"
+      },
+      {
+        "name": "insert_text",
+        "description": "Insert text at cursor position",
+        "params": ["text"],
+        "returns": "void",
+        "requires": null
+      },
+      {
+        "name": "find",
+        "description": "Find text in document",
+        "params": ["query"],
+        "returns": "number",
+        "requires": null
+      },
+      {
+        "name": "replace",
+        "description": "Replace text in document",
+        "params": ["find", "replace"],
+        "returns": "number",
+        "requires": null
+      }
+    ],
+    "queries": [
+      {
+        "name": "get_content",
+        "description": "Get document content",
+        "returns": "string",
+        "requires": null
+      },
+      {
+        "name": "get_filename",
+        "description": "Get current filename",
+        "returns": "string",
+        "requires": null
+      },
+      {
+        "name": "is_modified",
+        "description": "Check if document has unsaved changes",
+        "returns": "boolean",
+        "requires": null
+      },
+      {
+        "name": "get_cursor_position",
+        "description": "Get cursor line and column",
+        "returns": {"line": "number", "column": "number"},
+        "requires": null
+      }
+    ]
+  },
+  "window": {
+    "default_width": 640,
+    "default_height": 480,
+    "resizable": true,
+    "min_width": 400,
+    "min_height": 300
+  },
+  "file_associations": [".txt", ".c", ".h", ".md", ".cfg", ".ini"],
+  "ipc_channels": []
+}

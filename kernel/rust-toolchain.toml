@@ -1,0 +1,25 @@
+# MayteraOS kernel Rust toolchain pin (#404 / #478 Phase A).
+#
+# WHY THIS FILE EXISTS: the golden kernel build must be reproducible. Without a
+# pin, `rustup update` on the build host would silently move the floating
+# `stable` channel to a newer rustc and change the bytes of the shipped kernel.
+# This file forces the EXACT toolchain regardless of what `stable` points at.
+#
+# When make runs in this directory the rustup shim (/root/.cargo/bin/rustc)
+# reads this file and selects channel 1.97.0, installing it (and the
+# x86_64-unknown-none precompiled `core`) if missing. The Makefile additionally
+# has a hard version gate that FAILS the build if the active rustc is not the
+# pinned version, so drift can never pass silently.
+#
+# Pinned build reproduced on the kernel build container 2026-07-15:
+#   rustc 1.97.0 (2d8144b78 2026-07-07)  LLVM 22.1.6
+#   target x86_64-unknown-none (precompiled core from the 1.97.0 rust-std)
+#
+# To reproduce on a fresh build container:
+#   rustup toolchain install 1.97.0 --profile minimal
+#   rustup target add --toolchain 1.97.0 x86_64-unknown-none
+# (or just build in this directory and let rustup auto-provision from this file).
+[toolchain]
+channel = "1.97.0"
+targets = ["x86_64-unknown-none"]
+profile = "minimal"

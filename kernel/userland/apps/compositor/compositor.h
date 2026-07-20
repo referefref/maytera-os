@@ -1,0 +1,413 @@
+// compositor.h - Shared types and constants for MayteraOS Userland Compositor
+// Phase 3: Complete Desktop Port
+#ifndef COMPOSITOR_H
+#define COMPOSITOR_H
+
+#include <stdint.h>
+
+// ============================================================================
+// Forward declarations for libc (freestanding, no standard headers)
+// ============================================================================
+typedef int bool;
+#define true  1
+#define false 0
+#define NULL ((void *)0)
+
+// String functions (from libc)
+extern void *memset(void *s, int c, unsigned long n);
+extern void *memcpy(void *dest, const void *src, unsigned long n);
+extern int strcmp(const char *s1, const char *s2);
+extern int strncmp(const char *s1, const char *s2, unsigned long n);
+extern char *strncpy(char *dest, const char *src, unsigned long n);
+extern unsigned long strlen(const char *s);
+
+// ============================================================================
+// Screen and framebuffer
+// ============================================================================
+#define MAX_SCREEN_W    1920
+#define MAX_SCREEN_H    1080
+
+extern uint32_t *g_fb;           // Framebuffer pointer
+extern int32_t   g_fb_width;     // Screen width
+extern int32_t   g_fb_height;    // Screen height
+extern int32_t   g_fb_pitch;     // Pixels per row (usually == width)
+
+// ============================================================================
+// Color constants (ARGB format)
+// ============================================================================
+
+// Taskbar
+#define CLR_TASKBAR_BG      0xFF2D2D2D
+#define CLR_TASKBAR_BORDER  0xFF505050
+#define CLR_TASKBAR_HOVER   0xFF4A4A4A
+#define CLR_START_BTN       0xFF2D2D2D
+
+// Gauges
+#define CLR_GAUGE_BG        0xFF1A1A1A
+#define CLR_GAUGE_BORDER    0xFF606060
+#define CLR_GAUGE_CPU       0xFF00AA00
+#define CLR_GAUGE_RAM       0xFF0088CC
+#define CLR_GAUGE_DSK       0xFFCC8800
+#define CLR_GAUGE_NET       0xFF8800CC
+
+// Start menu
+#define CLR_MENU_BG         0xFF2D2D2D
+#define CLR_MENU_SHADOW     0xFF1A1A1A
+#define CLR_MENU_BORDER     0xFF606060
+#define CLR_MENU_ITEM_HOVER 0xFF4A4A4A
+#define CLR_MENU_ITEM_NORM  0xFF383838
+#define CLR_MENU_CAT_BG     0xFF404050
+#define CLR_MENU_TEXT       0xFFE0E0E0
+#define CLR_MENU_SEP        0xFF505050
+
+// Context menu
+#define CLR_CTX_BG          0xFF303030
+#define CLR_CTX_BORDER      0xFF606060
+#define CLR_CTX_HOVER       0xFF505050
+
+// Clock widget
+#define CLR_CLOCK_BG        0xCC222222
+#define CLR_CLOCK_TEXT      0xFFFFFFFF
+
+// Login screen
+#define CLR_LOGIN_BG_TOP    0xFF1A2332
+#define CLR_LOGIN_BG_BOT    0xFF0D1B2A
+#define CLR_LOGIN_PANEL     0xFF2C3E50
+#define CLR_LOGIN_BORDER    0xFF4A6278
+#define CLR_LOGIN_TEXT      0xFFECEFF1
+#define CLR_LOGIN_DIMMED    0xFF90A4AE
+#define CLR_LOGIN_ACCENT    0xFF2196F3
+#define CLR_LOGIN_HOVER     0xFF1E88E5
+#define CLR_LOGIN_INPUT_BG  0xFF263238
+#define CLR_LOGIN_INPUT_BR  0xFF546E7A
+#define CLR_LOGIN_ERROR     0xFFEF5350
+#define CLR_LOGIN_AVATAR    0xFF455A64
+#define CLR_LOGIN_AVATAR_S  0xFF2196F3
+
+// Desktop
+#define CLR_DESKTOP_BG      0xFF2C5AA0
+#define CLR_ICON_LABEL_BG   0x80000000
+#define CLR_ICON_SEL_BG     0x40FFFFFF
+#define CLR_TEXT_WHITE       0xFFFFFFFF
+#define CLR_TEXT_SHADOW      0xFF000000
+#define CLR_VERSION_TEXT     0xFFCCCCCC
+
+// Wallpaper gradient
+#define CLR_WP_GRAD_TOP     0xFF4A90C2
+#define CLR_WP_GRAD_BOT     0xFF1E5A8A
+
+// Wallpaper picker
+#define CLR_PICKER_BG       0xFF2D2D2D
+#define CLR_PICKER_BORDER   0xFF505050
+#define CLR_PICKER_TITLE    0xFF3A3A3A
+#define CLR_PICKER_THUMB    0xFF3A3A3A
+#define CLR_PICKER_SEL      0xFF4080FF
+#define CLR_PICKER_LABEL    0xFFCCCCCC
+
+// Power buttons
+#define CLR_POWER_RED       0xFFE06060
+
+// ============================================================================
+// Layout constants
+// ============================================================================
+
+// Taskbar
+#define TASKBAR_HEIGHT      36
+#define TASKBAR_PADDING     4
+#define TASKBAR_BTN_SIZE    28
+#define TASKBAR_ICON_SPACE  4
+
+// Gauges
+#define GAUGE_WIDTH         80
+#define GAUGE_HEIGHT        22
+#define GAUGE_SPACING       4
+
+// Start menu
+#define START_MENU_WIDTH    300
+#define START_MENU_ITEM_H   26
+#define START_MENU_CAT_H    28
+#define START_MENU_PADDING  8
+#define START_MENU_SEP_H    12
+#define START_MENU_POWER_H  40
+#define START_MENU_MAX_ITEMS 64
+
+// Desktop icons
+#define DESKTOP_ICON_SIZE   48
+#define DESKTOP_ICON_MARGIN_X 20
+#define DESKTOP_ICON_MARGIN_Y 20
+#define DESKTOP_ICON_SPACING_X 100
+#define DESKTOP_ICON_SPACING_Y 90
+#define DESKTOP_ICON_MAX    32
+#define DESKTOP_ICON_NAME_LEN 32
+
+// Context menu
+#define CTX_MENU_WIDTH      160
+#define CTX_MENU_ITEM_H     24
+#define CTX_MENU_SEP_H      8
+#define CTX_MENU_MAX_ITEMS  16
+
+// Clock widget
+#define CLOCK_PADDING_X     12
+#define CLOCK_PADDING_Y     6
+#define CLOCK_MARGIN_RIGHT  16
+#define CLOCK_MARGIN_TOP    10
+#define CLOCK_CORNER_RADIUS 10
+
+// Login screen
+#define LOGIN_PANEL_W       400
+#define LOGIN_PANEL_H       360
+#define LOGIN_AVATAR_SIZE   64
+#define LOGIN_AVATAR_SPACE  20
+#define LOGIN_INPUT_W       280
+#define LOGIN_INPUT_H       32
+#define LOGIN_BUTTON_W      280
+#define LOGIN_BUTTON_H      36
+#define LOGIN_MAX_PASSWORD  64
+#define LOGIN_MAX_USERS     16
+
+// Wallpaper picker
+#define THUMB_WIDTH         64
+#define THUMB_HEIGHT        48
+#define THUMB_PADDING       8
+#define THUMB_COLS          5
+#define THUMB_CELL_W        (THUMB_WIDTH + THUMB_PADDING)
+#define THUMB_CELL_H        (THUMB_HEIGHT + THUMB_PADDING + 16)
+#define PICKER_WIDTH        (THUMB_COLS * THUMB_CELL_W + THUMB_PADDING * 2)
+#define PICKER_HEIGHT       400
+#define PICKER_TITLE_H      24
+#define MAX_WALLPAPERS      64
+
+// Screensaver
+#define SS_MAX_STARS        100
+#define SS_MAX_LINES        20
+#define SS_MAX_BUBBLES      10
+#define SS_DEFAULT_TIMEOUT  120  // seconds
+
+// Font
+#define FONT_CHAR_W         8
+#define FONT_CHAR_H         16
+
+// ============================================================================
+// Icon IDs (must match kernel gui/icons.h)
+// ============================================================================
+typedef enum {
+    ICON_CATEGORIES = 0,
+    ICON_TERMINAL,
+    ICON_HIGHLIGHT,
+    ICON_FOLDER,
+    ICON_CALCULATOR,
+    ICON_COG,
+    ICON_INFO_CIRCLE,
+    ICON_IMAGE,
+    ICON_MUSIC,
+    ICON_WINDOW,
+    ICON_POWER,
+    ICON_REFRESH,
+    ICON_HOME,
+    ICON_FILE,
+    ICON_PALETTE,
+    ICON_PAINT,
+    ICON_CLOCK,
+    ICON_TASK_MANAGER,
+    ICON_LOG_VIEWER,
+    ICON_TRASH,
+    ICON_TRASH_FULL,
+    ICON_GAME,
+    ICON_GAME_DOOM,
+    ICON_GAME_PONG,
+    ICON_GAME_SOLITAIRE,
+    ICON_GAME_LEMMINGS,
+    ICON_COUNT
+} icon_id_t;
+
+// ============================================================================
+// Structures
+// ============================================================================
+
+// Desktop icon
+typedef struct {
+    char name[DESKTOP_ICON_NAME_LEN];
+    char exec_path[128];
+    icon_id_t icon_id;
+    int32_t grid_x, grid_y;
+    bool selected;
+    bool visible;
+} desktop_icon_t;
+
+// Start menu item
+typedef struct {
+    char name[48];
+    char exec_path[128];
+    icon_id_t icon_id;
+    bool is_separator;
+} menu_item_t;
+
+// Start menu category
+typedef struct {
+    char label[24];
+    bool expanded;
+    int item_start;   // index into g_menu_items[]
+    int item_count;
+} menu_category_t;
+
+// Context menu item
+typedef struct {
+    char label[32];
+    bool is_separator;
+    int action_id;
+} ctx_menu_item_t;
+
+// Screensaver types
+typedef enum {
+    SS_NONE = 0,
+    SS_BLANK,
+    SS_STARFIELD,
+    SS_LINES,
+    SS_BUBBLES,
+    SS_MATRIX
+} screensaver_type_t;
+
+// Screensaver star
+typedef struct {
+    int32_t x, y, z;
+} ss_star_t;
+
+// Screensaver line
+typedef struct {
+    int32_t x1, y1, x2, y2;
+    int32_t dx1, dy1, dx2, dy2;
+    uint32_t color;
+} ss_line_t;
+
+// Screensaver bubble
+typedef struct {
+    int32_t x, y;
+    int32_t radius;
+    int32_t max_radius;
+    int32_t dr;
+    uint32_t color;
+} ss_bubble_t;
+
+// Login state
+typedef enum {
+    LOGIN_STATE_SELECT_USER = 0,
+    LOGIN_STATE_PASSWORD,
+    LOGIN_STATE_ERROR,
+    LOGIN_STATE_SUCCESS
+} login_state_t;
+
+// Wallpaper entry
+typedef struct {
+    const char *name;
+    const char *filename;  // NULL for gradient
+} wallpaper_entry_t;
+
+// ============================================================================
+// Global state access (shared across modules)
+// ============================================================================
+
+// Mouse state
+extern int32_t  g_mouse_x, g_mouse_y;
+extern uint32_t g_mouse_buttons;
+extern uint32_t g_mouse_prev_buttons;
+
+// Desktop state
+extern bool g_start_menu_open;
+extern bool g_context_menu_open;
+extern int32_t g_context_menu_x, g_context_menu_y;
+extern bool g_wallpaper_picker_open;
+
+// Login state
+extern bool g_logged_in;
+extern int  g_login_uid;
+extern char g_login_username[64];
+
+// Screensaver state
+extern bool g_screensaver_active;
+extern uint64_t g_idle_ticks;
+
+// Redraw flag
+extern bool g_needs_redraw;
+
+// ============================================================================
+// Module APIs (each module exposes init/render/handle functions)
+// ============================================================================
+
+// draw.c - Drawing primitives
+void draw_fill_rect(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color);
+void draw_hline(int32_t x, int32_t y, int32_t w, uint32_t color);
+void draw_vline(int32_t x, int32_t y, int32_t h, uint32_t color);
+void draw_rect_outline(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t color);
+void draw_rounded_rect(int32_t x, int32_t y, int32_t w, int32_t h, int32_t r, uint32_t color);
+void draw_circle_filled(int32_t cx, int32_t cy, int32_t r, uint32_t color);
+void draw_circle_outline(int32_t cx, int32_t cy, int32_t r, uint32_t color);
+void draw_gradient_v(int32_t x, int32_t y, int32_t w, int32_t h, uint32_t top, uint32_t bot);
+void draw_char(int32_t x, int32_t y, char c, uint32_t color);
+void draw_text(int32_t x, int32_t y, const char *text, uint32_t color);
+void draw_text_centered(int32_t cx, int32_t y, const char *text, uint32_t color);
+void draw_text_shadow(int32_t x, int32_t y, const char *text, uint32_t fg, uint32_t shadow);
+void draw_char_large(int32_t x, int32_t y, char c, uint32_t color, int scale);
+void draw_text_large(int32_t x, int32_t y, const char *text, uint32_t color, int scale);
+int  text_width(const char *text);
+int  text_width_large(const char *text, int scale);
+void draw_putpixel(int32_t x, int32_t y, uint32_t color);
+
+// icons.c - Icon rendering
+void icon_draw(icon_id_t id, int32_t x, int32_t y, uint32_t color);
+void icon_draw_scaled(icon_id_t id, int32_t x, int32_t y, int32_t size, uint32_t color);
+
+// login.c - Login screen
+void login_init(void);
+int  login_run(void);  // Returns 0 on success, blocks until authenticated
+void login_render(void);
+void login_handle_key(int key);
+void login_handle_mouse(int32_t x, int32_t y, bool clicked);
+
+// desktop.c - Desktop surface
+void desktop_init(void);
+void desktop_render(void);
+void desktop_handle_mouse(int32_t x, int32_t y, bool left_click, bool right_click, bool dbl_click);
+void desktop_render_version(void);
+
+// taskbar.c - Taskbar with gauges
+void taskbar_init(void);
+void taskbar_render(void);
+void taskbar_update(void);
+bool taskbar_handle_mouse(int32_t x, int32_t y, bool clicked);
+int32_t taskbar_get_y(void);
+
+// startmenu.c - Start menu
+void startmenu_init(void);
+void startmenu_render(void);
+bool startmenu_handle_mouse(int32_t x, int32_t y, bool clicked);
+void startmenu_toggle(void);
+
+// clock.c - Floating clock
+void clock_render(void);
+
+// contextmenu.c - Right-click menu
+void contextmenu_init(void);
+void contextmenu_render(void);
+bool contextmenu_handle_mouse(int32_t x, int32_t y, bool clicked);
+void contextmenu_open(int32_t x, int32_t y);
+void contextmenu_close(void);
+
+// wallpaper.c - Wallpaper system
+void wallpaper_init(void);
+void wallpaper_render_background(void);
+void wallpaper_load(int index);
+void wallpaper_render_picker(void);
+bool wallpaper_picker_handle_mouse(int32_t x, int32_t y, bool clicked);
+void wallpaper_picker_open(void);
+void wallpaper_picker_close(void);
+
+// screensaver.c - Screensaver
+void screensaver_init(void);
+void screensaver_render(void);
+void screensaver_on_input(void);
+bool screensaver_check_timeout(void);
+
+// cursor drawing
+void cursor_render(void);
+
+#endif // COMPOSITOR_H

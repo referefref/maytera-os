@@ -1,0 +1,349 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom" xmlns:content="http://purl.org/rss/1.0/modules/content/" xmlns:slash="http://purl.org/rss/1.0/modules/slash/">
+  <channel>
+    <language>en</language>
+    <title>W3C - News</title>
+    <description>W3C News</description>
+    <pubDate>Tue, 14 Jul 2026 07:01:49 +0000</pubDate>
+    <generator>Laminas_Feed_Writer 2 (https://getlaminas.org)</generator>
+    <link>https://www.w3.org/news/</link>
+    <atom:link rel="self" type="application/rss+xml" href="https://www.w3.org/news/feed/"/>
+    <item>
+      <title>First Public Working Draft: CSS Linked Parameters Module Level 1</title>
+      <description><![CDATA[This spec introduces a way to pass CSS values into linked resources, such as SVG images, so that they can be used as CSS custom environment variables in the destination resource.]]></description>
+      <pubDate>Tue, 14 Jul 2026 07:01:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/first-public-working-draft-css-linked-parameters-module-level-1/</link>
+      <guid>https://www.w3.org/news/2026/first-public-working-draft-css-linked-parameters-module-level-1/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The <a href="https://www.w3.org/groups/wg/css/">CSS Working Group</a> has published today a First Public Working Draft of <a href="https://www.w3.org/TR/2026/WD-css-link-params-1-20260714/">CSS Linked Parameters Module Level 1</a>. This spec introduces a way to pass CSS values into linked resources, such as SVG images, so that they can be used as CSS <a href="https://drafts.csswg.org/css-env-1/#custom-environment-variable">custom environment variables</a> in the destination resource. This allows easy reuse of "templated" SVG images, which can be adapted to a site’s theme color, etc. easily, without having to modify the source SVG.</p><p><a href="https://www.w3.org/TR/css/">CSS</a> is a language for describing the rendering of structured documents (such as HTML and XML) on screen, on paper, etc.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>Group Note Draft: Linked Web Storage Vocabulary</title>
+      <description><![CDATA[This document describes the Linked Web Storage Vocabulary, i.e., the RDF Schema vocabulary used by the Linked Web Storage Protocol.]]></description>
+      <pubDate>Tue, 14 Jul 2026 06:57:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/group-note-draft-linked-web-storage-vocabulary/</link>
+      <guid>https://www.w3.org/news/2026/group-note-draft-linked-web-storage-vocabulary/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The <a href="https://www.w3.org/groups/wg/lws/">Linked Web Storage Working Group</a> has published the first draft of a Group Note titled <a href="https://www.w3.org/TR/2026/DNOTE-lws10-vocab-20260714/">Linked Web Storage Vocabulary</a>. This document describes the Linked Web Storage Vocabulary, i.e., the RDFS [<a href="https://www.w3.org/TR/rdf-schema/">RDF-SCHEMA</a>] vocabulary used by the Linked Web Storage Protocol [<a href="https://www.w3.org/TR/lws10-core/">lws-core</a>].&nbsp;</p><p>Alternate versions of the vocabulary definition exist in <a href="https://www.w3.org/TR/2026/DNOTE-lws10-vocab-20260714/vocabulary.ttl">Turtle</a> and <a href="https://www.w3.org/TR/2026/DNOTE-lws10-vocab-20260714/vocabulary.jsonld">JSON-LD</a>.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>Group Note Draft: What’s New in RDF 1.2</title>
+      <description><![CDATA[This document provides the reader with a summary of changes to RDF introduced in RDF version 1.2.]]></description>
+      <pubDate>Tue, 14 Jul 2026 06:56:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/group-note-draft-whats-new-in-rdf-1-2/</link>
+      <guid>https://www.w3.org/news/2026/group-note-draft-whats-new-in-rdf-1-2/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The <a href="https://www.w3.org/groups/wg/rdf-star/">RDF &amp; SPARQL Working Group</a> has published the first draft of a Group Note titled <a href="https://www.w3.org/TR/2026/DNOTE-rdf12-new-20260714/">What’s New in RDF 1.2</a>. This document is informative in nature. Its purpose is to provide a summary of differences between RDF versions 1.1 and 1.2 and to introduce new additions in a very brief manner.</p><p>Readers new to RDF should start with the <a href="https://www.w3.org/TR/rdf12-primer/">RDF 1.2 Primer</a> and then move on to the specifications in which they are most interested. This document is meant to serve as a guide for those already familiar with RDF 1.1 who wish to understand changes in version 1.2.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>First Public Working Draft: SHACL 1.2 Profiling</title>
+      <description><![CDATA[SHACL Profiling defines elements of the SHACL Shapes Constraint Language created to allow for profiles of SHACL and profiling with SHACL.]]></description>
+      <pubDate>Thu, 02 Jul 2026 13:33:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/first-public-working-draft-shacl-1-2-profiling/</link>
+      <guid>https://www.w3.org/news/2026/first-public-working-draft-shacl-1-2-profiling/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The <a href="https://www.w3.org/groups/wg/data-shapes/">Data Shapes Working Group</a> has published today a First Public Working Draft of <a href="https://www.w3.org/TR/2026/WD-shacl12-profiling-20260702/">SHACL 1.2 Profiling</a>. SHACL, the Shapes Constraint Language, is a language for describing the structure of RDF graphs. SHACL may be used for a variety of purposes such as validating, inferencing, modeling domains, generating ontologies to inform other agents, building user interfaces, generating code, and integrating data.&nbsp;</p><p>SHACL Profiling defines elements of the SHACL Shapes Constraint Language created to allow for profiles of SHACL and profiling with SHACL. This document's scope is limited to profiling of RDF graphs, including graphs containing SHACL Shapes.&nbsp;</p><p>This specification is part of the SHACL 1.2 family of specifications. See the <a href="https://w3c.github.io/data-shapes/shacl12-overview/">SHACL 1.2 Overview</a> for a more detailed introduction to them.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>Pointer Events Level 3 is now a W3C Recommendation</title>
+      <description><![CDATA[The features in this specification extend or modify those found in Pointer Events, a W3C Recommendation that describes events and related interfaces for handling hardware-agnostic pointer input from devices including a mouse, pen, or touchscreen.]]></description>
+      <pubDate>Tue, 30 Jun 2026 08:43:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/pointer-events-level-3-is-now-a-w3c-recommendation/</link>
+      <guid>https://www.w3.org/news/2026/pointer-events-level-3-is-now-a-w3c-recommendation/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The <a href="https://www.w3.org/groups/wg/pointer-events/">Pointer Events Working Group</a> is pleased to publish <a href="https://www.w3.org/TR/2026/REC-pointerevents3-20260630/">Pointer Events Level 3</a> as a W3C Recommendation. The features in this specification extend or modify those found in Pointer Events, a W3C Recommendation that describes events and related interfaces for handling hardware-agnostic pointer input from devices including a mouse, pen, or touchscreen. For compatibility with existing mouse-based content, this specification also describes a mapping to fire Mouse Events for other pointer device types.&nbsp;</p><p>This revision includes new features: altitudeAngle, azimuthAngle, pointerrawupdate event, associated coalesced events, and built-in predicted events.</p><p>Following the newer Recommendation, <a href="https://www.w3.org/TR/2026/SPSD-pointerevents2-20260630/">Pointer Events Level 2</a> has been marked as a W3C Superseded Recommendation:</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>Group Note Draft: W3C Standards Vulnerability Disclosure &amp; Handling Process and Policy</title>
+      <description><![CDATA[This document defines how to report suspected security vulnerabilities in W3C standards and specifications (technical reports), so that issues can be triaged, confirmed, and resolved through the appropriate W3C processes.]]></description>
+      <pubDate>Tue, 30 Jun 2026 07:57:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/group-note-draft-w3c-standards-vulnerability-disclosure-handling-process-and-policy/</link>
+      <guid>https://www.w3.org/news/2026/group-note-draft-w3c-standards-vulnerability-disclosure-handling-process-and-policy/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The <a href="https://www.w3.org/groups/ig/security">Security Interest Group</a> has published the first draft of a Group Note titled <a href="https://www.w3.org/TR/2026/DNOTE-security-disclosure-20260630/">W3C Standards Vulnerability Disclosure &amp; Handling Process and Policy</a>. This document defines how to report suspected security vulnerabilities in W3C standards and specifications (technical reports), so that issues can be triaged, confirmed, and resolved through the appropriate W3C processes. It is not for reporting vulnerabilities in software implementations or W3C operational infrastructure (see <a href="https://www.w3.org/TR/2026/DNOTE-security-disclosure-20260630/#out-of-scope">Out of scope</a>).</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>First Public Working Draft: Verifiable Credential Forgery Defense v1.0</title>
+      <description><![CDATA[This specification describes a mechanism for issuers of verifiable credentials to publish indexed lists of compact cryptographic witnesses.]]></description>
+      <pubDate>Tue, 30 Jun 2026 07:48:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/first-public-working-draft-verifiable-credential-forgery-defense-v1-0/</link>
+      <guid>https://www.w3.org/news/2026/first-public-working-draft-verifiable-credential-forgery-defense-v1-0/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The <a href="https://www.w3.org/groups/wg/vc">Verifiable Credentials Working Group</a> has published a First Public Working Draft today for the <a href="https://www.w3.org/TR/2026/WD-vc-forgery-defense-1.0-20260630/">Verifiable Credential Forgery Defense v1.0</a> specification. This publication is complementary to the publication of <a href="https://www.w3.org/news/2026/first-public-working-draft-quantum-resistant-cryptosuites-v1-0/">quantum-resistant cryptosuites</a> and is motivated by the same threat. While cryptosuites let issuers secure new proofs with post-quantum signatures, this specification lets an issuer establish post-quantum-backed authenticity for credentials that may have been signed with conventional quantum-vulnerable algorithms and cannot, or is not feasible, to re-issue them. This is achieved by publishing a <i>witness list</i> that is itself the subject of a separate Verifiable Credential that can be signed with a quantum-resistant scheme.</p><p>The Working Group welcomes comments via the <a href="https://github.com/w3c/vc-forgery-defense/issues/">GitHub repository issues</a>.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>W3C opens Inclusion Fund and Invited Expert Fund for TPAC 2026</title>
+      <description><![CDATA[W3C opens applications for travel support for TPAC 2026 to help reduce barriers for participation and increase diversity at TPAC, acknowledging the positive contributions of participants and Invited Experts who have shown commitment through their positive contributions to the work of W3C groups.]]></description>
+      <pubDate>Wed, 24 Jun 2026 12:01:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/w3c-opens-inclusion-fund-and-invited-expert-fund-for-tpac-2026/</link>
+      <guid>https://www.w3.org/news/2026/w3c-opens-inclusion-fund-and-invited-expert-fund-for-tpac-2026/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <figure class="component component--image">
+        <img src="https://www.w3.org/cms-uploads/_580xAUTO_crop_center-center_none/banner1.jpg" extension="jpg"             sizes="100vw"
+            loading="lazy"
+                            alt="TPAC 2026 is from 26 to 30 October, in Dublin, Ireland. Join us in person or online."
+                       />
+    </figure>
+                <div class="component component--text">
+                    <p>As over 70% of the world is now online, we believe the diversity of the whole world needs to be reflected, as more people continue to access the web for which we develop standards for, here together at the Web Consortium. We would like to be a model of supporting diversity. As an international organization, we can see the immense value we gain from having greater gender diversity, and expertise from across multiple countries and cultures.</p><p>We believe that more diversity means better representation, which leads to better and more inclusive design. More diversity also brings higher quality results.</p><p>This week we opened the applications for travel support for TPAC 2026: The <strong>TPAC Inclusion Fund</strong> and the <strong>Invited Experts Support Fund</strong>. They are designed to help reduce barriers for participation and increase diversity at TPAC, acknowledging the positive contributions of participants and Invited Experts who have shown commitment through their positive contributions to the work of W3C groups.</p><p>TPAC, our major event of the year, gathers our community for thought-provoking discussions and coordinated group work to develop open standards that enable a World Wide Web which connects and empowers humanity. TPAC 2026 is in Dublin, Ireland, from 26 to 30 October 2026.&nbsp;</p><p>Applications are open until <strong>31 July 2026</strong>.</p><p><a class="button" href="https://www.surveymonkey.com/r/W3C-Apply" blue="">Submit an application</a></p><h2>Show your support</h2><p>We seek contributors —big and small— who like us would like to see reflected in web standards and web design the diversity of background, gender, experiences, expertise and skills.</p><ul><li>Consider a <a href="https://www.w3.org/donate/">donation</a></li><li>Include a donation to the fund when you process your registration to TPAC (registration will open mid-July)</li><li>Explore the <strong>Triquetra tier</strong> of our <a href="https://www.w3.org/news-events/tpac/2026/sponsorship/#packages">sponsorship package</a></li></ul><p><strong>We encourage you to contribute generously.</strong></p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>First Public Working Draft: Quantum-Resistant Cryptosuites v1.0</title>
+      <description><![CDATA[This specification describes several Data Integrity Cryptosuites for use when generating a digital signature using Post-Quantum digital signature algorithms.]]></description>
+      <pubDate>Tue, 16 Jun 2026 08:03:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/first-public-working-draft-quantum-resistant-cryptosuites-v1-0/</link>
+      <guid>https://www.w3.org/news/2026/first-public-working-draft-quantum-resistant-cryptosuites-v1-0/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The <a href="https://www.w3.org/groups/wg/vc">Verifiable Credentials Working Group</a> has published a First Public Working Draft today for the <a href="https://www.w3.org/TR/2026/WD-vc-di-quantum-resistant-1.0-20260616/">Quantum-Resistant Cryptosuites v1.0</a> specification. This document defines several Data Integrity Cryptosuites for use when generating a digital signature of, for example, <a href="https://www.w3.org/TR/vc-data-model/#credentials">Verifiable Credentials</a> using Quantum-resistant digital signature algorithms.</p><p>Publication of this draft is especially timely, in view of some <a href="https://research.google/blog/safeguarding-cryptocurrency-by-disclosing-quantum-vulnerabilities-responsibly/">recent research results on quantum vulnerabilities</a>. That study led experts to consider that there exists a small but meaningful probability that elliptic curve keys could be broken by the early 2030s. As a result, organizations have already started to convert their authentication services to eventually use quantum-resistant cryptographic algorithms, with deadlines as early as 2029. This new specification will provide such digital signature schemes for verifiable credentials, and other data payloads, using the best stable quantum-resistant algorithms known today.</p><p>The Working Group welcomes comments via the <a href="https://github.com/w3c/vc-di-quantum-resistant/issues/">GitHub repository issues</a>.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>Diversity report 2026</title>
+      <description><![CDATA[W3C released today the 2026 diversity report, as part of our commitment and continued focus on diversity and inclusion since 2018.]]></description>
+      <pubDate>Mon, 15 Jun 2026 18:20:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/diversity-report-2026/</link>
+      <guid>https://www.w3.org/news/2026/diversity-report-2026/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>W3C released today the <a href="https://www.w3.org/about/diversity/diversity-report-2026/">2026 diversity report</a>. As part of our commitment and continued focus on diversity and inclusion, since 2018 we annually report on gender and geographic diversity of W3C's governing bodies.</p><p>We would like to be a model of supporting diversity. As an international organization, we can see the immense value we gain from having greater gender diversity, and expertise from across multiple countries and cultures. The diversity of the whole world needs to be reflected, as over 70% of the world is now online and more people continue to access and use the web we develop standards for, here together at the Web Consortium.</p><p>We believe that more diversity means better representation, which leads to better and more inclusive design. Indeed, more background, more use cases, more edge cases, lead to a better web. More diversity also brings higher quality results.</p><p>This year again, we want to financially help cover <a href="https://www.w3.org/news-events/tpac/2026/">TPAC 2026</a> meeting travel costs for W3C participants from groups under-represented in the web community, who without financial support would not be able to attend TPAC in person.&nbsp;</p><p>We seek contributors —big and small— who like us would like to see reflected in web standards and web design the diversity of background, gender, experiences, expertise and skills.</p><p><a class="button" href="https://www.w3.org/news-events/tpac/2026/sponsorship/#packages">Explore our sponsorship packages</a></p>
+            </div>
+                <figure class="component component--image">
+        <img src="https://www.w3.org/cms-uploads/_580xAUTO_crop_center-center_none/illustration-join.png" extension="png"             sizes="100vw"
+            loading="lazy"
+                            alt=""
+                       />
+    </figure>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>W3C Invites Implementations of HTML Ruby Markup Extensions</title>
+      <description><![CDATA[This specification revises and extends the markup model established by HTML to express ruby.]]></description>
+      <pubDate>Thu, 04 Jun 2026 09:02:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/w3c-invites-implementations-of-html-ruby-markup-extensions/</link>
+      <guid>https://www.w3.org/news/2026/w3c-invites-implementations-of-html-ruby-markup-extensions/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The <a href="https://www.w3.org/groups/wg/i18n-core">Internationalization Working Group</a> has published <a href="https://www.w3.org/TR/2026/CR-html-ruby-extensions-20260604/">HTML Ruby Markup Extensions</a> as a W3C Candidate Recommendation Snapshot. Ruby, a form of interlinear annotation, are short runs of text alongside the base text. They are typically used in East Asian documents to indicate pronunciation or to provide a short annotation. This specification revises and extends the markup model established by HTML to express ruby.</p><p>Comments are welcome via <a href="https://github.com/w3c/html-ruby/issues/">Github issues</a> by <strong>3 July 2026</strong>.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>Upcoming: W3C/GS1 Workshop on E-commerce for Humans and AI Agents</title>
+      <description><![CDATA[This workshop aims to share experience of creating content with AI Agents in mind, with ecommerce as a particular focus.]]></description>
+      <pubDate>Mon, 01 Jun 2026 14:33:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/upcoming-w3c-gs1-workshop-on-e-commerce-for-humans-and-ai-agents/</link>
+      <guid>https://www.w3.org/news/2026/upcoming-w3c-gs1-workshop-on-e-commerce-for-humans-and-ai-agents/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>W3C announced today the <a href="https://www.w3.org/2026/ecommerce-agents/">W3C/GS1 Workshop on E-commerce for Humans and AI Agents</a>, 8-9 September 2026, in Zurich, Switzerland, with remote participation. The event is hosted by Google.</p><p>Web content has historically been designed for humans, even when pages also expose structured data through APIs or embedded JSON-LD using vocabularies such as schema.org and the extension GS1 Web Vocabulary. LLMs and AI Agents are becoming a new intermediary between that content and end users: they summarize search results, follow links, and may support users in online activity before a person ever visits a page directly.&nbsp;</p><p>This workshop aims to share experiences of creating content with AI Agents in mind. What are the practices that are most effective? What are the pitfalls? What shifts do content creators need to make in order to maximize the return on the investment in time, energy, and skill?&nbsp;</p><p>The impetus for the workshop is from e-commerce, which will be a particular focus of the event. However, the discussion is expected to be informed by broader input related to content creation and publication.</p><p>If you wish to participate, please submit either a "Position Statement" or an "Expression of Interest" by <strong>July 10, 2026</strong>. See <a href="https://www.w3.org/2026/ecommerce-agents/participation.html#participate">submission instructions</a>.</p><p>The organizers and the Programme Committee will review submissions and use them to shape the workshop agenda, identify speakers, and ensure a useful range of perspectives across the workshop topics.&nbsp;</p><p>Attendance is free for invited participants and is open to people who can contribute relevant experience, use cases, technical perspectives, implementation experience, research findings, or standardization questions.&nbsp;</p><p>We aim to include diverse participation from relevant communities, including:&nbsp;</p><ul><li>Content creators and curators of all kinds</li><li>LLM and AI Agents providers, including in-browser AI Agents</li><li>Brands making products to sell, and retailers selling them</li><li>Search Engine Optimization practitioners</li><li>Online data providers&nbsp;</li></ul><p>If you have any questions, please contact the Programme Committee at <a href="mailto:group-ecommerce-agents-pc@w3.org">group-ecommerce-agents-pc@w3.org</a>.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>W3C initiates leadership transition</title>
+      <description><![CDATA[The W3C Board of Directors has appointed Dominique Hazaël-Massieux Interim CEO with immediate effect as the World Wide Web Consortium is undergoing a leadership transition.]]></description>
+      <pubDate>Thu, 28 May 2026 13:59:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/w3c-initiates-leadership-transition/</link>
+      <guid>https://www.w3.org/news/2026/w3c-initiates-leadership-transition/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p><a href="https://www.w3.org/press-releases/2026/w3c-leadership-transition/">W3C leadership transition</a>W3C has announced a leadership transition. Dominique Hazaël-Massieux has been appointed Interim CEO with immediate effect.</p><p>Please read more in our <a href="https://www.w3.org/press-releases/2026/w3c-leadership-transition/">Press Release</a>.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>Proposed Advancement of Pointer Events Level 3 to W3C Recommendation</title>
+      <description><![CDATA[The features in this specification extend or modify those found in Pointer Events, a W3C Recommendation that describes events and related interfaces for handling hardware-agnostic pointer input from devices including a mouse, pen, or touchscreen.]]></description>
+      <pubDate>Wed, 27 May 2026 04:02:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/proposed-advancement-of-pointer-events-level-3-to-w3c-recommendation/</link>
+      <guid>https://www.w3.org/news/2026/proposed-advancement-of-pointer-events-level-3-to-w3c-recommendation/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>Today, the W3C Team proposed advancing <a href="https://www.w3.org/TR/2026/CRD-pointerevents3-20260522/">Pointer Events Level 3</a> to W3C Recommendation. This specification was published by the <a href="https://www.w3.org/groups/wg/pointer-events/">Pointer Events Working Group</a> as a Candidate Recommendation Draft on 22 May 2026. The features in this specification extend or modify those found in Pointer Events, a W3C Recommendation that describes events and related interfaces for handling hardware-agnostic pointer input from devices including a mouse, pen, or touchscreen. For compatibility with existing mouse-based content, this specification also describes a mapping to fire Mouse Events for other pointer device types.</p><p>This revision includes new features: altitudeAngle, azimuthAngle, pointerrawupdate event, associated coalesced events, and built-in predicted events. This revision of Pointer Events is intended to supersede <a href="https://www.w3.org/TR/pointerevents2/">Pointer Events Level 2</a>.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>Updated Candidate Recommendation: Web Authentication: An API for accessing Public Key Credentials Level 3</title>
+      <description><![CDATA[This specification defines an API enabling the creation and use of strong, attested, scoped, public key-based credentials by web applications, for the purpose of strongly authenticating users.]]></description>
+      <pubDate>Tue, 26 May 2026 17:06:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/updated-candidate-recommendation-web-authentication-an-api-for-accessing-public-key-credentials-level-3/</link>
+      <guid>https://www.w3.org/news/2026/updated-candidate-recommendation-web-authentication-an-api-for-accessing-public-key-credentials-level-3/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The <a href="https://www.w3.org/groups/wg/webauthn/">Web Authentication Working Group</a> invites implementations of an updated Candidate Recommendation Snapshot of <a href="https://www.w3.org/TR/2026/CR-webauthn-3-20260526/">Web Authentication: An API for accessing Public Key Credentials Level 3</a>. This specification defines an API enabling the creation and use of strong, attested, scoped, public key-based credentials by web applications, for the purpose of strongly authenticating users. Conceptually, one or more public key credentials, each scoped to a given WebAuthn Relying Party, are created by and bound to authenticators as requested by the web application. The user agent mediates access to authenticators and their public key credentials in order to preserve user privacy. Authenticators are responsible for ensuring that no operation is performed without user consent. Authenticators provide cryptographic proof of their properties to Relying Parties via attestation. This specification also describes the functional model for WebAuthn conformant authenticators, including their signature and attestation functionality.</p><p>Comments are welcome via <a href="https://github.com/w3c/webauthn/issues">Github issues</a> by <strong>23 June 2026</strong>.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>First Public Working Draft: SHACL 1.2 User Interfaces</title>
+      <description><![CDATA[This specification describes Shapes Constraint Language (SHACL) User Interfaces.]]></description>
+      <pubDate>Tue, 26 May 2026 07:50:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/first-public-working-draft-shacl-1-2-user-interfaces/</link>
+      <guid>https://www.w3.org/news/2026/first-public-working-draft-shacl-1-2-user-interfaces/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The <a href="https://www.w3.org/groups/wg/data-shapes/">Data Shapes Working Group</a> has published today a First Public Working Draft of <a href="https://www.w3.org/TR/2026/WD-shacl12-ui-20260526/">SHACL 1.2 User Interfaces</a>. This specification describes Shapes Constraint Language (SHACL) User Interfaces. This specification is part of the SHACL 1.2 family of specifications. See the <a href="https://w3c.github.io/data-shapes/shacl12-overview/">SHACL 1.2 Overview</a> for a more detailed introduction to them.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>Group Note Draft: Threat Model for the Web</title>
+      <description><![CDATA[This document describes the Threat Model for the Web and include the Web Security Model and may include the goals that have not yet been achieved across the whole web platform, but which will still be applied in reviews of new and changed specifications.]]></description>
+      <pubDate>Tue, 26 May 2026 07:44:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/group-note-draft-threat-model-for-the-web/</link>
+      <guid>https://www.w3.org/news/2026/group-note-draft-threat-model-for-the-web/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The <a href="https://www.w3.org/groups/ig/security/">Security Interest Group</a> has published the first draft of a Group Note titled <a href="https://www.w3.org/TR/2026/DNOTE-threat-model-web-20260526/">Threat Model for the Web</a>. This document describes the Threat Model for the Web and include the Web Security Model and may include the goals that have not yet been achieved across the whole web platform, but which will still be applied in reviews of new and changed specifications.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>IMSC Text Profile 1.3 is now a W3C Recommendation</title>
+      <description><![CDATA[This specification defines a text-only profile of ttml2 intended for subtitle and caption delivery applications worldwide.]]></description>
+      <pubDate>Thu, 21 May 2026 08:48:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/imsc-text-profile-1-3-is-now-a-w3c-recommendation/</link>
+      <guid>https://www.w3.org/news/2026/imsc-text-profile-1-3-is-now-a-w3c-recommendation/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The <a href="https://www.w3.org/groups/wg/timed-text/">Timed Text Working Group</a> is thrilled to announce the publication of <a href="https://www.w3.org/TR/2026/REC-ttml-imsc1.3-20260521/">IMSC Text Profile 1.3</a> as a W3C Recommendation.&nbsp;</p><p>IMSC Text Profile 1.3 is the most recent addition to the IMSC family of specifications for the authoring and delivery of subtitles and captions worldwide. The rich styling and structured markup make it an ideal choice for expressive subtitles and AI training sets.&nbsp;</p><p>This maintenance update improves on the IMSC 1.2 Text Profile by adding support for superscript and subscript text, and provides authoring guidelines for the Japanese language. The <a href="https://www.w3.org/TR/imsc-hrm/">IMSC Hypothetical Render Model</a> is also factored out as a separate Recommendation to ease future maintenance.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>First Public Working Draft: Recognized Entities v1.0</title>
+      <description><![CDATA[This specification describes a data model with which one or more recognized entities, such as one or more persons and/or organizations, can be described as known to perform specific actions, such as issuing or verifying a verifiable credential.]]></description>
+      <pubDate>Tue, 12 May 2026 09:15:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/first-public-working-draft-recognized-entities-v1-0/</link>
+      <guid>https://www.w3.org/news/2026/first-public-working-draft-recognized-entities-v1-0/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The <a href="https://www.w3.org/2017/vc/WG/">Verifiable Credentials Working Group</a> has published today a First Public Working Draft of <a href="https://www.w3.org/TR/2026/WD-vc-recognized-entities-1.0-20260512/">Recognized Entities v1.0</a>. This specification describes a data model with which one or more recognized entities, such as one or more persons and/or organizations, can be described as known to perform specific actions, such as issuing or verifying a <a href="https://www.w3.org/TR/vc-data-model-2.0/#dfn-verifiable-credential">verifiable credential</a>. The data model enables the publication or direct sharing of such information, providing a cryptographically-verifiable and privacy-preserving mechanism through which a <a href="https://www.w3.org/TR/vc-data-model-2.0/#dfn-holders">holder</a> can demonstrate that an entity whose credential they are using is recognized within a particular ecosystem.</p><p>The Working Group welcomes comments via the <a href="https://github.com/w3c/vc-recognized-entities/issues">GitHub repository issues</a>, the reference of which is also in the header of the document.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>W3C Advisory Committee Elects Advisory Board</title>
+      <description><![CDATA[The W3C Advisory Committee has elected four individuals to the W3C Advisory Board (AB) .]]></description>
+      <pubDate>Fri, 01 May 2026 13:33:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/w3c-advisory-committee-elects-advisory-board/</link>
+      <guid>https://www.w3.org/news/2026/w3c-advisory-committee-elects-advisory-board/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The W3C Advisory Committee has <a href="https://www.w3.org/2026/04/ab-nominations">elected</a> the following people to fill four seats on the <a href="https://www.w3.org/2002/ab/">W3C Advisory Board (AB)</a>, starting 1 July 2026: Daniel Appelquist, Wei Ding, Elena Lape, and Andrew Wafaa. They join continuing AB participants, Theresa O'Connor, Hiroshi Ota, Avneesh Singh, Hidde de Vries, Song Xu, and Brent Zundel.</p><p>Many thanks to the departing participants for their contributions to the AB, Max Gendler and Tatsuya Igarashi, whose terms end at the end of June 2026.</p><p>Created in March 1998, the Advisory Board provides ongoing guidance to the W3C Team on issues of strategy, management, legal matters, process, and conflict resolution. The Advisory Board also serves the W3C Members by tracking issues raised between Advisory Committee meetings, soliciting Member comments on such issues, and proposing actions to resolve these issues. The Advisory Board manages the evolution of the Process Document. As part of a <a href="https://www.w3.org/policies/process/#w3c-council">W3C Council</a>, members of the Advisory Board hear and adjudicate on <a href="https://www.w3.org/policies/process/#SubmissionNo">Submission Appeals</a> and <a href="https://www.w3.org/policies/process/#FormalObjection">Formal Objections</a>. For several years, the AB has conducted its work in a <a href="https://www.w3.org/wiki/AB">public wiki</a>.&nbsp;</p><p>The elected Members of the Advisory Board participate as individual contributors and not representatives of their organizations. Advisory Board participants use their best judgment to find the best solutions for the Web, not just for any particular network, technology, vendor, or user.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>W3C Establishes Representative Office in Shenzhen, China</title>
+      <description><![CDATA[W3C issued a Press Release at the occasion of the launch of our W3C Representative Office in Shenzhen, China in April 2026.]]></description>
+      <pubDate>Thu, 30 Apr 2026 18:58:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/w3c-establishes-representative-office-in-shenzhen-china/</link>
+      <guid>https://www.w3.org/news/2026/w3c-establishes-representative-office-in-shenzhen-china/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>W3C today announced the establishment of a W3C Representative Office in Shenzhen, China. An opening ceremony was held in Shenzhen on 18 April 2026, a few days before the celebration of the 20th anniversary of W3C in China.</p><p>The W3C China Representative Office has a primary role in legal compliance, and will operate as a branch of W3C Inc., working with W3C’s existing Partner Beihang University to maintain a global platform for web technology standard innovation and collaboration.</p><p>The establishment follows unanimous approval by the W3C Board of Directors and represents a significant milestone in the Consortium’s long-standing collaboration with the Chinese web community, a phase that is built on decades of trust, shared innovation, and a mutual commitment to an open, neutral, secure, accessible and truly World Wide Web. Please read more in our <a href="https://www.w3.org/press-releases/2026/w3c-establishes-representative-office-in-shenzhen-reinforcing-commitment-to-open-web-standards-in-china/">Press Release</a>.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>First Public Working Draft: Long Animation Frames API</title>
+      <description><![CDATA[This document defines an API that web page authors can use to detect presence of "long animation frames" that monopolize the UI thread for extended periods of time and block other critical tasks from being executed - e.g. reacting to user input.]]></description>
+      <pubDate>Tue, 28 Apr 2026 05:47:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/first-public-working-draft-long-animation-frames-api/</link>
+      <guid>https://www.w3.org/news/2026/first-public-working-draft-long-animation-frames-api/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The <a href="https://www.w3.org/groups/wg/webperf">Web Performance Working Group</a> published today a First Public Working Draft of <a href="https://www.w3.org/TR/2026/WD-long-animation-frames-20260428/">Long Animation Frames API</a>. This document defines an API that web page authors can use to detect presence of "long animation frames" that monopolize the UI thread for extended periods of time and block other critical tasks from being executed - e.g. reacting to user input.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>First Public Working Draft: CBOR-LD 1.0</title>
+      <description><![CDATA[CBOR is a compact binary data serialization and messaging format. This specification defines CBOR-LD 1.0, a CBOR-based format to serialize Linked Data.]]></description>
+      <pubDate>Tue, 28 Apr 2026 05:44:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/first-public-working-draft-cbor-ld-1-0/</link>
+      <guid>https://www.w3.org/news/2026/first-public-working-draft-cbor-ld-1-0/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The <a href="https://www.w3.org/groups/wg/json-ld">JSON-LD Working Group</a> published today a First Public Working Draft of <a href="https://www.w3.org/TR/2026/WD-cbor-ld-10-20260428/">CBOR-LD 1.0</a>. CBOR is a compact binary data serialization and messaging format. This specification defines CBOR-LD 1.0, a CBOR-based format to serialize Linked Data. The encoding is designed to leverage the existing JSON-LD ecosystem, which is deployed on hundreds of millions of systems today, to provide a compact serialization format for those seeking efficient encoding schemes for Linked Data. By utilizing semantic compression schemes, compression ratios in excess of 60% better than generalized compression schemes are possible. This format is primarily intended to be a way to use Linked Data in storage and bandwidth constrained programming environments, to build interoperable semantic wire-level protocols, and to efficiently store Linked Data in CBOR-based storage engines.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>Upcoming: W3C Workshop on the Future of ODRL</title>
+      <description><![CDATA[A workshop to examine broad and specific aspects since ODRL became a W3C Recommendation in 2018 and gained robust recognition and adoption.]]></description>
+      <pubDate>Mon, 27 Apr 2026 12:22:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/upcoming-w3c-workshop-on-the-future-of-odrl/</link>
+      <guid>https://www.w3.org/news/2026/upcoming-w3c-workshop-on-the-future-of-odrl/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>W3C announced a <a href="https://www.w3.org/2026/ODRLWS/">Workshop on the Future of ODRL</a>, to be held on 22–23 June 2026 in London, UK, and online.</p><p>Since becoming a W3C Recommendation in 2018, ODRL has gained increasing recognition and adoption across:&nbsp;</p><ul><li>Data space governance frameworks</li><li>Industry consortia and international standards</li><li>Digital media and creative content providers</li><li>Financial sectors</li></ul><p>At the same time, important challenges remain:</p><ul><li>Policy interoperability across domains</li><li>Runtime enforcement and compliance verification</li><li>Profile development and extension governance</li><li>Tooling maturity and usability</li><li>Integration with emerging Web standards</li></ul><p>This workshop provides a forum to examine these topics collaboratively and define next steps. Possible topic areas for the workshop may include:&nbsp;</p><ul><li>ODRL Adoption &amp; Industry Experience</li><li>Innovation and Semantics of ODRL</li><li>Interoperability &amp; Architecture</li><li>Roadmap &amp; Community Development</li></ul><p>If you agree to work on the goals above and have experience and/or expertise in the topic areas above, please apply to the workshop. Proposals are either position papers of up to 4 pages or scientific papers with up to 10 pages.</p><p>The workshop will include:&nbsp;</p><ul><li>Presentations (10–15 minutes each)</li><li>Moderated discussion sessions</li><li>Thematic breakout discussions</li><li>Consolidated reporting of outcomes</li></ul><p>Attendance is free for all invited participants and is open to the public, whether or not W3C members.</p><p>Please submit your proposal by sending email to <a href="mailto:odrl-ws-submission@w3.org">odrl-ws-submission@w3.org</a> before <strong>27 May 2026</strong>. The Program Committee will review submissions and shape the final agenda. For any inquiries, you may contact the Chairs directly using the same email address.</p>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+    <item>
+      <title>First Public Working Drafts for the Linked Web Storage (LWS) 1.0 Authentication Suite</title>
+      <description><![CDATA[The Linked Web Storage Working Group has published four First Public Working Drafts for the Linked Web Storage (LWS) 1.0 Authentication Suite.]]></description>
+      <pubDate>Thu, 23 Apr 2026 01:56:00 +0000</pubDate>
+      <link>https://www.w3.org/news/2026/first-public-working-drafts-for-the-linked-web-storage-lws-1-0-authentication-suite/</link>
+      <guid>https://www.w3.org/news/2026/first-public-working-drafts-for-the-linked-web-storage-lws-1-0-authentication-suite/</guid>
+      <category><![CDATA[news]]></category>
+      <content:encoded><![CDATA[            <div class="component component--text">
+                    <p>The <a href="https://www.w3.org/groups/wg/lws">Linked Web Storage Working Group</a> has published the following four First Public Working Drafts:&nbsp;</p><ul><li><a href="https://www.w3.org/TR/2026/WD-lws10-authn-openid-20260423/">LWS 1.0 Authentication Suite: OpenID Connect</a> - This document defines an OpenID Connect-based authentication suite for the Linked Web Storage (LWS) protocol, enabling LWS applications to integrate with OpenID providers.</li><li><a href="https://www.w3.org/TR/2026/WD-lws10-authn-saml-20260423/">LWS 1.0 Authentication Suite: SAML 2.0</a> - This document defines a SAML-based authentication suite for the Linked Web Storage (LWS) protocol, enabling LWS applications to integrate with SAML 2.0 identity providers.</li><li><a href="https://www.w3.org/TR/2026/WD-lws10-authn-ssi-cid-20260423/">LWS 1.0 Authentication Suite: Self-signed Identity using Controlled Identifiers</a> - This document defines an authentication suite for the Linked Web Storage (LWS) protocol, enabling clients that are able to sign their own identity tokens to integrate with LWS.</li><li><a href="https://www.w3.org/TR/2026/WD-lws10-authn-ssi-did-key-20260423/">LWS 1.0 Authentication Suite: Self-signed Identity using did:key</a> - This document defines an authentication suite for the Linked Web Storage (LWS) protocol, enabling clients that are able to sign their own identity tokens to integrate with LWS while using agent identifiers with the <code>did:key</code> method.</li></ul>
+            </div>
+    ]]></content:encoded>
+      <slash:comments>0</slash:comments>
+    </item>
+  </channel>
+</rss>

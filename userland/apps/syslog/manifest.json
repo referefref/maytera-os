@@ -1,0 +1,70 @@
+{
+  "name": "System Log",
+  "version": "1.8.0",
+  "binary": "syslog",
+  "icon": "log.bmp",
+  "category": "System",
+  "description": "View kernel and system log messages",
+  "capabilities": {
+    "actions": [
+      {
+        "name": "refresh",
+        "description": "Reload log from file",
+        "params": [],
+        "returns": "void",
+        "requires": "system.log.read"
+      },
+      {
+        "name": "clear",
+        "description": "Clear log display",
+        "params": [],
+        "returns": "void",
+        "requires": null
+      },
+      {
+        "name": "filter",
+        "description": "Filter log by severity",
+        "params": ["level"],
+        "valid_values": ["all", "info", "warn", "error"],
+        "returns": "void",
+        "requires": null
+      },
+      {
+        "name": "search",
+        "description": "Search log entries",
+        "params": ["query"],
+        "returns": "number",
+        "requires": null
+      }
+    ],
+    "queries": [
+      {
+        "name": "get_line_count",
+        "description": "Get number of log lines",
+        "returns": "number",
+        "requires": null
+      },
+      {
+        "name": "get_errors",
+        "description": "Get all error entries",
+        "returns": "string[]",
+        "requires": "system.log.read"
+      },
+      {
+        "name": "get_warnings",
+        "description": "Get all warning entries",
+        "returns": "string[]",
+        "requires": "system.log.read"
+      }
+    ]
+  },
+  "window": {
+    "default_width": 600,
+    "default_height": 400,
+    "resizable": true,
+    "min_width": 400,
+    "min_height": 200
+  },
+  "log_source": "/LOG.TXT",
+  "ipc_channels": []
+}

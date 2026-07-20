@@ -1,0 +1,284 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:atom="http://www.w3.org/2005/Atom">
+  <channel>
+    <title>Lobsters</title>
+    <link>https://lobste.rs/</link>
+    <atom:link href="https://lobste.rs/rss/" rel="self"/>
+    <description></description>
+    <pubDate>Wed, 15 Jul 2026 14:34:54 -0500</pubDate>
+    <ttl>120</ttl>
+    <item>
+      <title>SQLite should have (Rust-style) editions</title>
+      <link>https://mort.coffee/home/sqlite-editions/</link>
+      <guid>https://lobste.rs/s/2nry82</guid>
+      <author>mort.coffee by mort</author>
+      <pubDate>Wed, 15 Jul 2026 14:34:54 -0500</pubDate>
+      <comments>https://lobste.rs/s/2nry82/sqlite_should_have_rust_style_editions</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/2nry82/sqlite_should_have_rust_style_editions"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>databases</category>
+    </item>
+    <item>
+      <title>Linus Torvalds on LLM usage in kernel development</title>
+      <link>https://lore.kernel.org/linux-media/CAHk-=wi4zC+Ze8e+p3tMv8TtG_80KzsZ1syL9anBtmEh5Z40vg@mail.gmail.com/</link>
+      <guid>https://lobste.rs/s/pb6d8m</guid>
+      <author>lore.kernel.org via thang</author>
+      <pubDate>Wed, 15 Jul 2026 22:19:34 -0500</pubDate>
+      <comments>https://lobste.rs/s/pb6d8m/linus_torvalds_on_llm_usage_kernel</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/pb6d8m/linus_torvalds_on_llm_usage_kernel"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>linux</category>
+      <category>vibecoding</category>
+    </item>
+    <item>
+      <title>Detecting Full Table Scans With SQLite</title>
+      <link>https://tenderlovemaking.com/2026/07/15/detecting-full-table-scans-with-sqlite/</link>
+      <guid>https://lobste.rs/s/eilycs</guid>
+      <author>tenderlovemaking.com via alexpls</author>
+      <pubDate>Wed, 15 Jul 2026 18:57:58 -0500</pubDate>
+      <comments>https://lobste.rs/s/eilycs/detecting_full_table_scans_with_sqlite</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/eilycs/detecting_full_table_scans_with_sqlite"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>ruby</category>
+      <category>databases</category>
+    </item>
+    <item>
+      <title>Abstracting effects with continuations</title>
+      <link>https://crowdhailer.me/2026-07-15/abstracting-effects-with-continuations/</link>
+      <guid>https://lobste.rs/s/rnc3h4</guid>
+      <author>crowdhailer.me by crowdhailer</author>
+      <pubDate>Wed, 15 Jul 2026 17:57:15 -0500</pubDate>
+      <comments>https://lobste.rs/s/rnc3h4/abstracting_effects_with_continuations</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/rnc3h4/abstracting_effects_with_continuations"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>gleam</category>
+    </item>
+    <item>
+      <title>The Tower Keeps Rising</title>
+      <link>https://lucumr.pocoo.org/2026/7/13/the-tower-keeps-rising/</link>
+      <guid>https://lobste.rs/s/latr8d</guid>
+      <author>lucumr.pocoo.org via facundoolano</author>
+      <pubDate>Wed, 15 Jul 2026 07:21:33 -0500</pubDate>
+      <comments>https://lobste.rs/s/latr8d/tower_keeps_rising</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/latr8d/tower_keeps_rising"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>practices</category>
+      <category>vibecoding</category>
+    </item>
+    <item>
+      <title>FreeBSD 16 Retires The Last Of Its GPL Code From Its Base System</title>
+      <link>https://www.phoronix.com/news/FreeBSD-16-Goes-GPL-Free</link>
+      <guid>https://lobste.rs/s/n1cwdh</guid>
+      <author>phoronix.com via thomas0</author>
+      <pubDate>Wed, 15 Jul 2026 07:33:58 -0500</pubDate>
+      <comments>https://lobste.rs/s/n1cwdh/freebsd_16_retires_last_its_gpl_code_from</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/n1cwdh/freebsd_16_retires_last_its_gpl_code_from"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>freebsd</category>
+    </item>
+    <item>
+      <title>Microsoft Confirms Windows GDID Device Identifier That Cannot Be Disabled, Documented in FBI Case Filing</title>
+      <link>https://www.ghacks.net/2026/07/12/microsoft-confirms-windows-gdid-device-identifier-that-cannot-be-disabled-documented-in-fbi-case-filing/</link>
+      <guid>https://lobste.rs/s/agkcmz</guid>
+      <author>ghacks.net via raymii</author>
+      <pubDate>Wed, 15 Jul 2026 10:36:16 -0500</pubDate>
+      <comments>https://lobste.rs/s/agkcmz/microsoft_confirms_windows_gdid_device</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/agkcmz/microsoft_confirms_windows_gdid_device"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>security</category>
+      <category>windows</category>
+    </item>
+    <item>
+      <title>Your AI Is Not a Tool</title>
+      <link>https://theconvivialsociety.substack.com/p/your-ai-is-not-a-tool</link>
+      <guid>https://lobste.rs/s/6vsam1</guid>
+      <author>theconvivialsociety.substack.com via adamcstephens</author>
+      <pubDate>Wed, 15 Jul 2026 11:49:43 -0500</pubDate>
+      <comments>https://lobste.rs/s/6vsam1/your_ai_is_not_tool</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/6vsam1/your_ai_is_not_tool"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>vibecoding</category>
+    </item>
+    <item>
+      <title>The Long Tail of Work Left Until ActivityPub Has E2EE</title>
+      <link>https://soatok.blog/2026/07/15/the-long-tail-of-work-left-until-activitypub-has-e2ee/</link>
+      <guid>https://lobste.rs/s/0ae9j5</guid>
+      <author>soatok.blog via PuercoPop</author>
+      <pubDate>Wed, 15 Jul 2026 20:13:20 -0500</pubDate>
+      <comments>https://lobste.rs/s/0ae9j5/long_tail_work_left_until_activitypub_has</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/0ae9j5/long_tail_work_left_until_activitypub_has"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>web</category>
+      <category>distributed</category>
+      <category>cryptography</category>
+    </item>
+    <item>
+      <title>You should probably check on your smart appliances</title>
+      <link>https://xeiaso.net/notes/2026/check-your-smart-tv/</link>
+      <guid>https://lobste.rs/s/slrak5</guid>
+      <author>xeiaso.net by cadey</author>
+      <pubDate>Tue, 14 Jul 2026 17:02:25 -0500</pubDate>
+      <comments>https://lobste.rs/s/slrak5/you_should_probably_check_on_your_smart</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/slrak5/you_should_probably_check_on_your_smart"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>security</category>
+      <category>web</category>
+    </item>
+    <item>
+      <title>AI Data Centers and the Concentration of Wealth</title>
+      <link>https://www.schneier.com/blog/archives/2026/07/ai-data-centers-and-the-concentration-of-wealth.html</link>
+      <guid>https://lobste.rs/s/iow7ts</guid>
+      <author>schneier.com via brn</author>
+      <pubDate>Wed, 15 Jul 2026 16:06:48 -0500</pubDate>
+      <comments>https://lobste.rs/s/iow7ts/ai_data_centers_concentration_wealth</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/iow7ts/ai_data_centers_concentration_wealth"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>ai</category>
+    </item>
+    <item>
+      <title>Bring modern package management to Meson's native wrap ecosystem</title>
+      <link>https://collider.ee/1.5.1/</link>
+      <guid>https://lobste.rs/s/9b49zd</guid>
+      <author>collider.ee by Mackou</author>
+      <pubDate>Thu, 16 Jul 2026 03:29:26 -0500</pubDate>
+      <comments>https://lobste.rs/s/9b49zd/bring_modern_package_management_meson_s</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/9b49zd/bring_modern_package_management_meson_s"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>python</category>
+      <category>c</category>
+      <category>programming</category>
+      <category>c++</category>
+    </item>
+    <item>
+      <title>i've been thinking about null pointers</title>
+      <link>https://sebsite.pw/w/20260715-null.html</link>
+      <guid>https://lobste.rs/s/tnlxmc</guid>
+      <author>sebsite.pw via runxiyu</author>
+      <pubDate>Wed, 15 Jul 2026 07:23:36 -0500</pubDate>
+      <comments>https://lobste.rs/s/tnlxmc/i_ve_been_thinking_about_null_pointers</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/tnlxmc/i_ve_been_thinking_about_null_pointers"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>plt</category>
+    </item>
+    <item>
+      <title>a bunch of stuff i used to not know about K&amp;R C</title>
+      <link>https://sebsite.pw/w/20260712-kandr.html</link>
+      <guid>https://lobste.rs/s/qrtxzl</guid>
+      <author>sebsite.pw via runxiyu</author>
+      <pubDate>Wed, 15 Jul 2026 07:28:27 -0500</pubDate>
+      <comments>https://lobste.rs/s/qrtxzl/bunch_stuff_i_used_not_know_about_k_r_c</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/qrtxzl/bunch_stuff_i_used_not_know_about_k_r_c"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>c</category>
+      <category>historical</category>
+    </item>
+    <item>
+      <title>C Strings: A 50-Year Mistake</title>
+      <link>https://longtran2904.substack.com/p/c-strings-a-50-year-mistake</link>
+      <guid>https://lobste.rs/s/upgpyq</guid>
+      <author>longtran2904.substack.com via abhin4v</author>
+      <pubDate>Wed, 15 Jul 2026 00:04:57 -0500</pubDate>
+      <comments>https://lobste.rs/s/upgpyq/c_strings_50_year_mistake</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/upgpyq/c_strings_50_year_mistake"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>c</category>
+    </item>
+    <item>
+      <title>The Shape of Apps</title>
+      <link>https://parakeet.co/blog/the-shape-of-apps/</link>
+      <guid>https://lobste.rs/s/47h4yu</guid>
+      <author>parakeet.co via outervale</author>
+      <pubDate>Wed, 15 Jul 2026 21:55:49 -0500</pubDate>
+      <comments>https://lobste.rs/s/47h4yu/shape_apps</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/47h4yu/shape_apps"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>design</category>
+      <category>mac</category>
+    </item>
+    <item>
+      <title>A Filtering engine and DB for unpropagated kernel security patches</title>
+      <link>https://patchless.natey.sh</link>
+      <guid>https://lobste.rs/s/pfz6dj</guid>
+      <author>patchless.natey.sh by dropalltables</author>
+      <pubDate>Thu, 16 Jul 2026 00:21:50 -0500</pubDate>
+      <comments>https://lobste.rs/s/pfz6dj/filtering_engine_db_for_unpropagated</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/pfz6dj/filtering_engine_db_for_unpropagated"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>security</category>
+      <category>linux</category>
+      <category>release</category>
+    </item>
+    <item>
+      <title>The dailyprog puzzle safety net</title>
+      <link>https://blog.lvmbdv.dev/posts/the-puzzle-safety-net/</link>
+      <guid>https://lobste.rs/s/etvwzv</guid>
+      <author>blog.lvmbdv.dev by lvmbdv</author>
+      <pubDate>Wed, 15 Jul 2026 21:21:03 -0500</pubDate>
+      <comments>https://lobste.rs/s/etvwzv/dailyprog_puzzle_safety_net</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/etvwzv/dailyprog_puzzle_safety_net"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>devops</category>
+      <category>programming</category>
+      <category>vibecoding</category>
+    </item>
+    <item>
+      <title>elfuse: Run Arm64/x86-64 Linux ELF binaries on macOS Apple Silicon</title>
+      <link>https://github.com/sysprog21/elfuse</link>
+      <guid>https://lobste.rs/s/1mwfrn</guid>
+      <author>github.com via jeanthomas</author>
+      <pubDate>Wed, 15 Jul 2026 14:33:11 -0500</pubDate>
+      <comments>https://lobste.rs/s/1mwfrn/elfuse_run_arm64_x86_64_linux_elf_binaries</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/1mwfrn/elfuse_run_arm64_x86_64_linux_elf_binaries"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>linux</category>
+      <category>mac</category>
+    </item>
+    <item>
+      <title>Third-party app stores coming to Google Play next week as Epic settlement withdrawn</title>
+      <link>https://arstechnica.com/gadgets/2026/07/third-party-app-stores-coming-to-google-play-next-week-as-epic-settlement-withdrawn/</link>
+      <guid>https://lobste.rs/s/bvvwkf</guid>
+      <author>arstechnica.com via seb</author>
+      <pubDate>Wed, 15 Jul 2026 15:05:53 -0500</pubDate>
+      <comments>https://lobste.rs/s/bvvwkf/third_party_app_stores_coming_google_play</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/bvvwkf/third_party_app_stores_coming_google_play"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>android</category>
+      <category>law</category>
+    </item>
+    <item>
+      <title>Inventing ELIZA - How the First Chatbot Shaped the Future of AI</title>
+      <link>https://mitpress.mit.edu/9780262052481/inventing-eliza/</link>
+      <guid>https://lobste.rs/s/hquwey</guid>
+      <author>mitpress.mit.edu via adamo</author>
+      <pubDate>Wed, 15 Jul 2026 09:12:05 -0500</pubDate>
+      <comments>https://lobste.rs/s/hquwey/inventing_eliza_how_first_chatbot_shaped</comments>
+      <description>&lt;p&gt;The book "Inventing ELIZA - How the First Chatbot Shaped the Future of AI".  It is Open Access so the link to the PDF is &lt;a href="https://direct.mit.edu/books/book-pdf/2615293/book_9780262052504.pdf" rel="ugc"&gt;here&lt;/a&gt;&lt;/p&gt;
+&lt;p&gt;The book has a companion &lt;a href="findingeliza.org" rel="ugc"&gt;site&lt;/a&gt; - I was monitoring this since I first heard the &lt;a href="https://corecursive.com/eliza-with-jeff-shrager/" rel="ugc"&gt;episode&lt;/a&gt; on CoRecursive.&lt;/p&gt;
+&lt;p&gt;&lt;a href="https://lobste.rs/s/hquwey/inventing_eliza_how_first_chatbot_shaped"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>pdf</category>
+      <category>book</category>
+      <category>ai</category>
+    </item>
+    <item>
+      <title>TLS Certificate Validation on Linux</title>
+      <link>https://www.tomica.net/blog/2026/07/tls-certificate-validation-on-linux/</link>
+      <guid>https://lobste.rs/s/v6ukog</guid>
+      <author>tomica.net via jummo</author>
+      <pubDate>Wed, 15 Jul 2026 16:09:33 -0500</pubDate>
+      <comments>https://lobste.rs/s/v6ukog/tls_certificate_validation_on_linux</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/v6ukog/tls_certificate_validation_on_linux"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>linux</category>
+    </item>
+    <item>
+      <title>How to unionize your tech workplace</title>
+      <link>https://www.computerworld.com/article/4192438/how-to-unionize-your-tech-workplace.html</link>
+      <guid>https://lobste.rs/s/50s8qx</guid>
+      <author>computerworld.com via chobeat</author>
+      <pubDate>Wed, 15 Jul 2026 09:46:41 -0500</pubDate>
+      <comments>https://lobste.rs/s/50s8qx/how_unionize_your_tech_workplace</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/50s8qx/how_unionize_your_tech_workplace"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>practices</category>
+    </item>
+    <item>
+      <title>How C++20 improved the for-loop syntax</title>
+      <link>https://lzon.ca/posts/tips/cpp-for-range-init/</link>
+      <guid>https://lobste.rs/s/knrrsr</guid>
+      <author>lzon.ca via raymii</author>
+      <pubDate>Wed, 15 Jul 2026 01:03:23 -0500</pubDate>
+      <comments>https://lobste.rs/s/knrrsr/how_c_20_improved_for_loop_syntax</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/knrrsr/how_c_20_improved_for_loop_syntax"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>c++</category>
+    </item>
+    <item>
+      <title>Empathy and delight mean nothing when the software is disrespectful</title>
+      <link>https://productpicnic.beehiiv.com/p/empathy-and-delight-mean-nothing-when-the-software-is-disrespectful</link>
+      <guid>https://lobste.rs/s/s4qbwh</guid>
+      <author>productpicnic.beehiiv.com via drmorr</author>
+      <pubDate>Tue, 14 Jul 2026 23:30:14 -0500</pubDate>
+      <comments>https://lobste.rs/s/s4qbwh/empathy_delight_mean_nothing_when</comments>
+      <description>&lt;p&gt;&lt;a href="https://lobste.rs/s/s4qbwh/empathy_delight_mean_nothing_when"&gt;Comments&lt;/a&gt;&lt;/p&gt;</description>
+      <category>design</category>
+      <category>programming</category>
+    </item>
+  </channel>
+</rss>

@@ -1,0 +1,45 @@
+// Add this at the top after includes:
+static int debug_counter = 0;
+
+// Replace handle_key function with debug version:
+static void handle_key(gui_event_t *event) {
+    debug_counter++;
+    
+    // Debug output via sys_write to console
+    char debug_msg[100];
+    debug_msg[0] = '[';
+    debug_msg[1] = 'B';
+    debug_msg[2] = 'R';
+    debug_msg[3] = 'W';
+    debug_msg[4] = ']';
+    debug_msg[5] = ' ';
+    debug_msg[6] = 'k';
+    debug_msg[7] = 'e';
+    debug_msg[8] = 'y';
+    debug_msg[9] = ':';
+    debug_msg[10] = ' ';
+    debug_msg[11] = '0' + (event->keycode / 16);
+    debug_msg[12] = 'x';
+    debug_msg[13] = '0' + (event->keycode % 16);
+    debug_msg[14] = '\n';
+    debug_msg[15] = '\0';
+    
+    char c = event->key_char;
+    
+    if (c >= 32 && c < 127) {
+        // Printable character
+        if (url_cursor < MAX_URL_LEN - 1) {
+            url_buffer[url_cursor++] = c;
+            url_buffer[url_cursor] = '\0';
+            draw_url_bar();
+        }
+    } else if (event->keycode == 0x0E) {  // Backspace
+        if (url_cursor > 0) {
+            url_cursor--;
+            url_buffer[url_cursor] = '\0';
+            // Don't call draw_url_bar() yet - debug first
+        }
+    } else if (event->keycode == 0x1C) {  // Enter
+        fetch_url();
+    }
+}
