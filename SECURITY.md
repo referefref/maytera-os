@@ -78,5 +78,4 @@ If you spot any of these leaking into a commit, please open an issue immediately
 
 ## Code intentionally excluded from this distribution
 
-- **Rogue** (the BSD `rogue` 5.4.x source, historically developed in `userland/apps/rogue/`) has been omitted from this repository. Every file in that tree references "See the file LICENSE.TXT for full copyright and licensing information", but `LICENSE.TXT` is not present in the upstream source tree we imported. Rather than distribute code whose license text we cannot vouch for, Rogue has been excluded. If you want to run Rogue on MayteraOS, fetch a complete and properly licensed Rogue source tree from an authoritative upstream and drop it into `userland/apps/rogue/` yourself.
 - **DOOM WAD files.** Only the GPLv2 DOOM source is included (in `userland/apps/doom/`). You must supply your own WAD. The shareware `DOOM1.WAD` is legal to download; commercial WADs require a licensed copy of the game.

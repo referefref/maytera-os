@@ -66,6 +66,7 @@ license text in its source subdirectory (e.g. `COPYING`, `LICENSE`, `AUTHORS`):
 | Mozilla CA bundle | `kernel/fs/CERTS/ca-bundle.crt` | MPL 2.0 | in-file note |
 | Realtek 88x2bu register tables | `kernel/drivers/net/wifi` | GPL (register facts) | in-file note |
 | Nova prompt-injection ruleset | `kernel/security/nova.c` | MIT | in-file note |
+| Rogue 5.4 (the game) | `userland/apps/rogue` | BSD-3-Clause | `LICENSE.TXT` |
 
 The AI layer's LLM prompt-injection protection uses the **Nova** open ruleset by
 **Thomas Roccia** ([@fr0gger_](https://github.com/fr0gger/nova-framework)),
@@ -86,6 +87,17 @@ archiver (`userland/libarchive`) are original MayteraOS code.
 > **separate license, not the GPL**, and permits non-commercial redistribution
 > under id's terms. See `kernel/games/doom/DOOMLICENSE.md`. It is carved out of
 > this repository's blanket GPLv2-or-later; MayteraOS's own code remains GPL.
+
+> **Rogue (Toy, Arnold and Wichman):** `userland/apps/rogue` is the original
+> BSD Rogue 5.4 source, not a reimplementation. `LICENSE.TXT` in that directory
+> carries three BSD-3-Clause grants covering everything shipped there: the game
+> itself, (c) 1980-1983, 1985, 1999 Michael Toy, Ken Arnold and Glenn Wichman;
+> `state.c`, (c) 1999, 2000, 2005 Nicholas J. Kisseberth; and `xcrypt.c`
+> (FreeSec), (c) 1994 David Burren. Clause 2 requires that binary
+> redistributions reproduce those notices in the accompanying materials, so
+> `LICENSE.TXT` must travel with any build. The MayteraOS platform layer around
+> it (`maytera_mdport.c`, `rogue_stdio.c`, `compat/`, `config.h`, `Makefile`) is
+> original MayteraOS code.
 
 ## Photography (boot splash / wallpapers)
 
