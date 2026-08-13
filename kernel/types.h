@@ -2,6 +2,33 @@
 #ifndef TYPES_H
 #define TYPES_H
 
+// ---------------------------------------------------------------------------
+// #693: a persistence result that is thrown away makes a FAILED write
+// indistinguishable from a successful one.
+//
+// MUST_CHECK marks a function whose return value states whether bytes reached
+// persistent storage. Combined with the kernel's -Werror this is a
+// COMPILER-ENFORCED control, not a lint. That choice is deliberate: #514 found
+// the concurrency lint had silently not run for months because it was not a
+// prerequisite of anything. An attribute cannot drift, cannot be forgotten in a
+// Makefile, and cannot be left out of a source tarball.
+//
+// MEASURED on gcc 12.2.0, and the reason IGNORE_RESULT has to exist: a plain
+// `(void)` cast does NOT silence warn_unused_result. gcc rejects `(void)f();`
+// with exactly the same error as `f();`. Assigning to an unused variable is the
+// only form gcc accepts. That is turned into a feature here: IGNORE_RESULT
+// takes a REASON string, so a deliberately-dropped persistence result carries
+// its justification at the call site, in the same file, where the next reader is
+// already looking - not in a separate allowlist that rots (again, #514).
+#define MUST_CHECK __attribute__((warn_unused_result))
+
+#define IGNORE_RESULT(reason, expr)                                          \
+    do {                                                                       \
+        __attribute__((unused)) const char *_pi_why = (reason);                \
+        __attribute__((unused)) long long   _pi_rc  = (long long)(expr);       \
+    } while (0)
+
+
 // Standard integer types
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;

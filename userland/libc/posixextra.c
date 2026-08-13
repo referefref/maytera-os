@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // posixextra.c - #359 Phase 2 filesystem/time/misc libc functions that the
 // CPython filesystem stdlib (and other POSIX-y userland) needs. Honest, small
 // implementations over the existing MayteraOS syscalls; where the kernel has no

@@ -108,7 +108,18 @@ static int ptym_poll(file_t *f, int events) {
     return r;
 }
 
-static void ptym_release(file_t *f);
+static int ptym_release(file_t *f);
+
+// #745 (local 82): the queue a poll(2) waiter parks on. The MASTER reads
+// what the slave wrote, so its readiness is published on output_wq; the
+// SLAVE reads what the master wrote, so its readiness is on input_wq. Both
+// are woken by the existing tty paths, so no new wake source is needed.
+static struct wait_queue_head *ptym_poll_wq(file_t *f, int events) {
+    pty_pair_t *p = (pty_pair_t *)f->priv;
+    (void)events;
+    if (!p) return NULL;
+    return &p->tty.output_wq;
+}
 
 static const file_ops_t s_ptym_fops = {
     .read    = ptym_read,
@@ -117,6 +128,7 @@ static const file_ops_t s_ptym_fops = {
     .ioctl   = ptym_ioctl,
     .release = ptym_release,
     .poll    = ptym_poll,
+    .poll_wq = ptym_poll_wq,
 };
 
 // --- slave fops --------------------------------------------------------------
@@ -159,19 +171,21 @@ static void pty_free_if_dead(pty_pair_t *p) {
     }
 }
 
-static void ptym_release(file_t *f) {
+// #695: a PTY holds no persistent state, so both releases report 0.
+static int ptym_release(file_t *f) {
     pty_pair_t *p = (pty_pair_t *)f->priv;
-    if (!p) return;
+    if (!p) return 0;
     p->master_refs = 0;
     // Wake slave readers so they see EOF.
     tty_hangup(&p->tty);
     pty_free_if_dead(p);
     f->priv = NULL;
+    return 0;
 }
 
-static void ptys_release(file_t *f) {
+static int ptys_release(file_t *f) {
     pty_pair_t *p = (pty_pair_t *)f->priv;
-    if (!p) return;
+    if (!p) return 0;
     if (p->slave_refs > 0) p->slave_refs--;
     if (p->slave_refs == 0) {
         // Wake master reader so it sees EOF.
@@ -179,6 +193,14 @@ static void ptys_release(file_t *f) {
     }
     pty_free_if_dead(p);
     f->priv = NULL;
+    return 0;
+}
+
+static struct wait_queue_head *ptys_poll_wq(file_t *f, int events) {
+    pty_pair_t *p = (pty_pair_t *)f->priv;
+    (void)events;
+    if (!p) return NULL;
+    return &p->tty.input_wq;
 }
 
 static const file_ops_t s_ptys_fops = {
@@ -188,6 +210,7 @@ static const file_ops_t s_ptys_fops = {
     .ioctl   = ptys_ioctl,
     .release = ptys_release,
     .poll    = ptys_poll,
+    .poll_wq = ptys_poll_wq,
 };
 
 // --- ptmx open factory -------------------------------------------------------

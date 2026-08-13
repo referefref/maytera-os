@@ -374,14 +374,69 @@ unsigned long long strtoull(const char *nptr, char **endptr, int base) {
 }
 
 // Formatted output: vsnprintf
-int vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap) {
-    size_t written = 0;
-
-    if (size == 0) return 0;
-
-    while (*fmt && written < size - 1) {
+// ===========================================================================
+// #672 THE ONE FORMAT PARSER
+// ===========================================================================
+// There were FIVE hand-rolled printf parsers in this kernel and no delegation
+// between them: vsnprintf (here), kprintf and serial_printf (serial.c),
+// console_printf (video/console.c) and shell_printf (main.c). Four of the five
+// were strictly weaker than this one, and the weakness was not cosmetic.
+//
+// A parser that does not RECOGNISE a specifier still has to decide what to do
+// with the corresponding argument, and all four decided to consume NOTHING.
+// That does not misprint one field, it SHIFTS EVERY LATER ARGUMENT IN THE LINE:
+//
+//   kprintf("[SECURITY] SMAP pre-flight: %-13s va=0x%016lx eff=0x%lx U/S=%s\n",
+//           probes[i].what, probes[i].va, fl, user ? "USER" : "supervisor");
+//
+// kprintf parsed '0'-pad and a numeric width but NOT the '-' flag, so "%-13s"
+// fell to `default:`, printed itself literally, and consumed no argument. Every
+// later conversion then took the previous conversion's argument: va= printed
+// the LABEL POINTER, eff= printed the address, and, worst of all, "U/S=%s" was
+// handed `fl`, a page-table flags integer, AND DEREFERENCED IT AS A char*.
+// A format-string defect had become an arbitrary-address read in Ring 0 whose
+// address is whatever integer happened to be next in the argument list. It
+// printed empty because the byte at that address happened to be zero; a
+// different layout is a kernel page fault in a diagnostic.
+//
+// shell_printf was worse still: it parsed no flags and no width at all, so the
+// 1353 "%04x" call sites in this tree would print "04x" and consume nothing.
+//
+// So the fix is not "add '-' to kprintf". It is to delete the four private
+// parsers and route every one of them through THIS function, which already
+// handled flags, width, precision and the length modifiers correctly. That is
+// the CLAUDE.md rule (improve the shared primitive, never fork a private copy)
+// applied to the exact bug class that rule exists to prevent.
+//
+// WHY THIS IS A SINK CALLBACK AND NOT "everyone calls vsnprintf". kprintf is
+// called from ISRs and from the panic path, and it currently formats straight
+// out of the UART with NO intermediate buffer and therefore no line-length
+// limit. Making it call vsnprintf would put a multi-hundred-byte buffer on a
+// kernel stack that an interrupt may already be nested on, and would silently
+// truncate the long diagnostic lines this kernel actually prints. Splitting the
+// PARSER from the DESTINATION keeps one definition of the format language while
+// letting kprintf keep emitting a byte at a time.
+//
+// WHY C AND NOT RUST (the standing Rust-first policy requires a reason): this
+// function's entire job is to walk a va_list. Rust's variadic support
+// (core::ffi::VaList, the c_variadic feature) is unstable and cannot be used on
+// the pinned 1.97.0 toolchain, and the argument-consumption rules ARE the bug
+// being fixed, so they cannot be left on the C side of a split without leaving
+// the defect there too. This is also a modification of an existing C function
+// with 5,000+ call sites rather than a new subsystem.
+//
+// NEVER-DESYNC RULE: an unrecognised conversion now CONSUMES an int argument
+// rather than consuming nothing. It cannot be correct (the true width is
+// unknowable), but it is the choice that keeps the REST of the line addressing
+// the right arguments, and it turns "every later field is garbage plus a wild
+// pointer read" into "one field is wrong". The recognised set was widened
+// first, so reaching this case is now unlikely: the tree's own usage was
+// surveyed and 'o', 'hh', 'j', 't' and '*' were added for exactly that reason.
+void kvformat(kfmt_sink_t sink, void *ctx, const char *fmt, __builtin_va_list ap) {
+    if (!sink || !fmt) return;
+    while (*fmt) {
         if (*fmt != '%') {
-            buf[written++] = *fmt++;
+            sink(ctx, *fmt++);
             continue;
         }
 
@@ -401,23 +456,38 @@ int vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap) {
             fmt++;
         }
 
-        // Parse width
-        while (isdigit(*fmt)) {
-            width = width * 10 + (*fmt - '0');
+        // Parse width. '*' takes the width from the argument list, so it MUST
+        // consume one here or everything after it shifts (the #672 bug class).
+        if (*fmt == '*') {
+            width = __builtin_va_arg(ap, int);
+            if (width < 0) { left_justify = 1; width = -width; }
             fmt++;
-        }
-
-        // Parse precision
-        if (*fmt == '.') {
-            fmt++;
-            precision = 0;
+        } else {
             while (isdigit(*fmt)) {
-                precision = precision * 10 + (*fmt - '0');
+                width = width * 10 + (*fmt - '0');
                 fmt++;
             }
         }
 
-        // Parse length modifier
+        // Parse precision ('.*' likewise consumes an argument).
+        if (*fmt == '.') {
+            fmt++;
+            precision = 0;
+            if (*fmt == '*') {
+                precision = __builtin_va_arg(ap, int);
+                if (precision < 0) precision = -1;   // negative precision = absent
+                fmt++;
+            } else {
+                while (isdigit(*fmt)) {
+                    precision = precision * 10 + (*fmt - '0');
+                    fmt++;
+                }
+            }
+        }
+
+        // Parse length modifier. 'hh', 'j' and 't' are accepted (not merely
+        // ignored) because an unaccepted modifier would fall through to the
+        // conversion switch, hit `default:`, and desync the line.
         if (*fmt == 'l') {
             fmt++;
             if (*fmt == 'l') {
@@ -427,9 +497,12 @@ int vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap) {
                 length_mod = 'l'; // long
             }
         } else if (*fmt == 'h') {
-            length_mod = 'h';
             fmt++;
-        } else if (*fmt == 'z') {
+            length_mod = 'h';
+            if (*fmt == 'h') fmt++;   // 'hh': still promoted to int in varargs
+        } else if (*fmt == 'z' || *fmt == 't' || *fmt == 'j') {
+            // size_t / ptrdiff_t / intmax_t are all 64-bit here; 'z' is the
+            // existing spelling the rest of this function switches on.
             length_mod = 'z';
             fmt++;
         }
@@ -444,7 +517,7 @@ int vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap) {
             case 'i': {
                 long long val;
                 if (length_mod == 'L') val = __builtin_va_arg(ap, long long);
-                else if (length_mod == 'l') val = __builtin_va_arg(ap, long);
+                else if (length_mod == 'l' || length_mod == 'z') val = __builtin_va_arg(ap, long);
                 else val = __builtin_va_arg(ap, int);
 
                 int neg = val < 0;
@@ -467,6 +540,20 @@ int vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap) {
                 char *p = tmp + sizeof(tmp) - 1;
                 *p = '\0';
                 do { *--p = '0' + (val % 10); val /= 10; } while (val > 0);
+                str = p;
+                slen = strlen(str);
+                break;
+            }
+
+            case 'o': {
+                unsigned long long val;
+                if (length_mod == 'L') val = __builtin_va_arg(ap, unsigned long long);
+                else if (length_mod == 'l' || length_mod == 'z') val = __builtin_va_arg(ap, unsigned long);
+                else val = __builtin_va_arg(ap, unsigned int);
+
+                char *p = tmp + sizeof(tmp) - 1;
+                *p = '\0';
+                do { *--p = '0' + (char)(val & 7); val >>= 3; } while (val > 0);
                 str = p;
                 slen = strlen(str);
                 break;
@@ -521,14 +608,20 @@ int vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap) {
             }
 
             case '%':
-                buf[written++] = '%';
+                sink(ctx, '%');
                 fmt++;
                 continue;
 
             default:
-                buf[written++] = '%';
-                if (written < size - 1) buf[written++] = *fmt;
-                fmt++;
+                // #672 NEVER-DESYNC: consume an argument for the unrecognised
+                // conversion. The width is a guess (int is the common case and
+                // the only safe one without knowing the specifier), but the
+                // alternative, consuming nothing, corrupts every field after
+                // this one and can hand a raw integer to a %s dereference.
+                (void)__builtin_va_arg(ap, int);
+                sink(ctx, '%');
+                if (*fmt) sink(ctx, *fmt);
+                if (*fmt) fmt++;
                 continue;
         }
 
@@ -539,29 +632,151 @@ int vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap) {
         char pad_char = (zero_pad && !left_justify) ? '0' : ' ';
 
         if (!left_justify) {
-            while (pad > 0 && written < size - 1) {
-                buf[written++] = pad_char;
-                pad--;
-            }
+            while (pad > 0) { sink(ctx, pad_char); pad--; }
         }
 
-        // Copy string
-        while (slen > 0 && written < size - 1) {
-            buf[written++] = *str++;
-            slen--;
-        }
+        while (slen > 0) { sink(ctx, *str++); slen--; }
 
-        // Right padding
         if (left_justify) {
-            while (pad > 0 && written < size - 1) {
-                buf[written++] = ' ';
-                pad--;
-            }
+            while (pad > 0) { sink(ctx, ' '); pad--; }
         }
     }
+}
 
-    buf[written] = '\0';
-    return (int)written;
+// ---------------------------------------------------------------------------
+// The buffer sink, and vsnprintf as a thin wrapper over the shared parser.
+// The sink drops output once the buffer is full but the PARSER KEEPS RUNNING,
+// so a truncated line still consumes its remaining arguments. Visible output is
+// identical to the pre-#672 behaviour (which stopped the loop outright); the
+// difference is that truncation can no longer leave the va_list half-consumed.
+// ---------------------------------------------------------------------------
+typedef struct {
+    char   *buf;
+    size_t  size;     // full buffer size, including the terminator slot
+    size_t  written;
+} kfmt_buf_ctx_t;
+
+static void kfmt_buf_sink(void *vctx, char c) {
+    kfmt_buf_ctx_t *b = (kfmt_buf_ctx_t *)vctx;
+    if (b->written < b->size - 1) b->buf[b->written++] = c;
+}
+
+int vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap) {
+    if (size == 0) return 0;
+    kfmt_buf_ctx_t ctx;
+    ctx.buf = buf;
+    ctx.size = size;
+    ctx.written = 0;
+    kvformat(kfmt_buf_sink, &ctx, fmt, ap);
+    buf[ctx.written] = '\0';
+    return (int)ctx.written;
+}
+
+// ===========================================================================
+// #672 BOOT SELF-TEST
+// ===========================================================================
+// Formats known vectors and COMPARES against the expected bytes. It tests the
+// shared parser through snprintf, which since #672 is the same kvformat() that
+// kprintf, serial_printf, console_printf and shell_printf all run, so a pass
+// here is a pass for the serial console too.
+//
+// The vectors are not decorative. Each one is a specifier that EXISTED IN THIS
+// TREE and was mishandled by at least one of the five parsers, and the last one
+// is the literal format string from security.c's SMAP pre-flight, whose
+// argument shift was the reported symptom of #672. The pre-flight itself is
+// gated off by -DCONFIG_NO_SMAP and does not run on the shipping build, so
+// asserting on its format string here is the way to prove that specific line is
+// fixed without un-holding the #645 SMAP interlock to make it print.
+// Declared here rather than by including serial.h: string.c is the lowest
+// layer and must not acquire a dependency on the console for a self-test.
+extern void kprintf(const char *fmt, ...);
+
+static int kfmt_st_fail;
+
+static void kfmt_expect(const char *got, const char *want, const char *what) {
+    if (strcmp(got, want) != 0) {
+        kprintf("[KFMT-SELFTEST] FAIL %s\n", what);
+        kprintf("[KFMT-SELFTEST]   got  [%s]\n", got);
+        kprintf("[KFMT-SELFTEST]   want [%s]\n", want);
+        kfmt_st_fail++;
+    }
+}
+
+void kformat_selftest(void) {
+    char b[256];
+    kfmt_st_fail = 0;
+
+    // Width and the left-justify flag on %s: the exact defect. kprintf's old
+    // parser printed "%-13s" literally and consumed no argument.
+    snprintf(b, sizeof(b), "[%-13s]", "abc");
+    kfmt_expect(b, "[abc          ]", "%-13s left-justified width");
+    snprintf(b, sizeof(b), "[%13s]", "abc");
+    kfmt_expect(b, "[          abc]", "%13s right-justified width");
+
+    // Width on integers, and zero padding. shell_printf's old parser printed
+    // "04x" literally for every one of the 1353 %04x call sites in this tree.
+    snprintf(b, sizeof(b), "[%04x]", 0x2f);
+    kfmt_expect(b, "[002f]", "%04x zero-padded hex");
+    snprintf(b, sizeof(b), "[%-6d|]", 42);
+    kfmt_expect(b, "[42    |]", "%-6d left-justified int");
+
+    // Precision on %s, live in fs/graphfs/blob.c and media/webp.c.
+    snprintf(b, sizeof(b), "[%.4s]", "0123456789");
+    kfmt_expect(b, "[0123]", "%.4s precision truncates");
+
+    // Length modifiers. %zu is live in graphfs, syscall.c and virtio_gpu.c.
+    snprintf(b, sizeof(b), "[%zu]", (size_t)4096);
+    kfmt_expect(b, "[4096]", "%zu size_t");
+    snprintf(b, sizeof(b), "[%llu]", (unsigned long long)12345678901ULL);
+    kfmt_expect(b, "[12345678901]", "%llu long long");
+
+    // Octal: previously fell to `default:` and desynced the rest of the line.
+    snprintf(b, sizeof(b), "[%o]", 0755);
+    kfmt_expect(b, "[755]", "%o octal");
+
+    // THE NEVER-DESYNC PROPERTY. This is the property that matters more than
+    // any single conversion being pretty: an unrecognised specifier must still
+    // consume its argument, so the arguments AFTER it stay aligned. Before
+    // #672 the trailing 99 would have been printed by the %d and the line
+    // would have ended one argument short.
+    snprintf(b, sizeof(b), "[%q|%d]", 7, 99);
+    kfmt_expect(b, "[%q|99]", "unknown specifier consumes its argument");
+
+    // Star width, which takes its width from the argument list.
+    snprintf(b, sizeof(b), "[%*d]", 5, 42);
+    kfmt_expect(b, "[   42]", "%*d star width");
+
+    // THE REPORTED SYMPTOM, verbatim. security.c:220. With the old kprintf this
+    // rendered as "%-13s va=0x<pointer to the label> eff=0x<the va> U/S=" and
+    // the %s was handed the flags INTEGER and dereferenced it as a char *.
+    snprintf(b, sizeof(b), "[SECURITY] SMAP pre-flight: %-13s va=0x%016lx eff=0x%lx U/S=%s",
+             "kernel .data", (unsigned long)0x2003090UL, (unsigned long)0x8000000000000023UL,
+             "supervisor");
+    kfmt_expect(b,
+        "[SECURITY] SMAP pre-flight: kernel .data  va=0x0000000002003090 "
+        "eff=0x8000000000000023 U/S=supervisor",
+        "security.c:220 SMAP pre-flight line");
+
+    // END-TO-END, THROUGH KPRINTF ITSELF. Everything above goes through
+    // snprintf, whose parser ALREADY handled '-' correctly before #672; the
+    // parser that was broken was kprintf's own private copy. Since #672 they
+    // are the same parser, but that is the claim under test, so this line
+    // exercises the serial path directly with the verbatim security.c:220
+    // format string. The third argument is deliberately 0: on the PRE-#672
+    // kernel the argument shift hands it to the trailing "%s", and 0 is the one
+    // value the old code null-checked, so this probe demonstrates the shift
+    // without dereferencing a wild pointer in Ring 0. Any other value there
+    // would have been a real #GP.
+    kprintf("[KFMT-SELFTEST] kprintf path: SMAP pre-flight: %-13s va=0x%016lx eff=0x%lx U/S=%s\n",
+            "kernel .data", (unsigned long)0x2003090UL, (unsigned long)0UL, "supervisor");
+
+    if (kfmt_st_fail == 0) {
+        kprintf("[KFMT-SELFTEST] #672 PASS: one shared parser, width/flags/precision "
+                "correct, unknown specifiers cannot desynchronise a line\n");
+    } else {
+        kprintf("[KFMT-SELFTEST] #672 *** %d FAILURE(S) *** kernel diagnostic output "
+                "is misreporting its own arguments\n", kfmt_st_fail);
+    }
 }
 
 // Formatted output: snprintf

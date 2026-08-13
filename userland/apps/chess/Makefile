@@ -4,12 +4,12 @@ LD = ld
 LIBC_DIR  = ../../libc
 LIBGL_DIR = ../../libgl
 
-CFLAGS = -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone -msse -msse2 \
-         -nostdlib -nostdinc -fno-builtin -O2 -g -mcmodel=large -fno-pie \
+CFLAGS = -fPIE -ffreestanding -fstack-protector-strong -mstack-protector-guard=global -mno-red-zone -msse -msse2 \
+         -nostdlib -nostdinc -fno-builtin -O2 -g \
          -I. -I$(LIBC_DIR) -I$(LIBGL_DIR)/include \
          -isystem /usr/lib/gcc/x86_64-linux-gnu/12/include
 
-LDFLAGS = -nostdlib -z max-page-size=0x1000 -T ../../user.ld
+LDFLAGS = -pie --no-dynamic-linker -z notext -nostdlib -z max-page-size=0x1000 -T ../../user-pie.ld
 
 TARGET = CHESS
 SRCS = $(wildcard *.c)

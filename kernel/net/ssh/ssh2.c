@@ -11,6 +11,16 @@
 #include "../../mm/heap.h"
 #include "../../serial.h"
 #include "../../fs/fat.h"
+#include "../../proc/process.h"  // #700 B6: caller identity for the known_hosts pin
+// #693: the private `extern` declarations of the VFS file ops that used to
+// sit in this file are GONE. They were not just duplicates: a redeclaration
+// in a TU that never includes fs/vfs.h silently strips the header's
+// MUST_CHECK (warn_unused_result), so a discarded persistence result here
+// compiled clean while the identical mistake elsewhere failed the build. That
+// is a compiler-enforced gate defeated by a forked declaration, which is the
+// same class of bug #695 found when three of them lied about the return TYPE.
+#include "../../fs/vfs.h"
+#include "../../cpu/mono.h"   // #499: sched_now_ms() - THE shared real-elapsed-ms clock
 
 extern void net_poll(void);
 extern void tcp_timer(void);
@@ -22,6 +32,28 @@ extern fat_fs_t g_fat_fs;
 // known_hosts (TOFU pinning): /CONFIG/KNOWN_HOSTS holds "host sha256hex" lines.
 // Returns 0 if the host key is new (added) or matches a stored one; -1 if it
 // CHANGED from a stored value (possible MITM -> caller rejects).
+//
+// #700 B6: THE APPEND IS NOW ROOT-ONLY. /CONFIG/KNOWN_HOSTS is root:root 0600
+// (perms_system_seed[]) and this function is reached from SYS_SSH_CLIENT, which
+// any Ring-3 process can call at any uid. It ran in Ring 0, so perms_check()
+// never applied, and an unprivileged caller could APPEND a line to it.
+//
+// That is not a file-tidiness problem, it is trust-store poisoning and it runs
+// FORWARDS IN TIME: a uid-1000 process connects to a host it controls (or to an
+// attacker's address for a name root will later use), the attacker's key is
+// pinned as first-seen, and the NEXT connection, root's, finds a stored
+// fingerprint that matches and reports the host as known. TOFU's whole security
+// argument is that the first sight is trustworthy; letting an unprivileged
+// process choose what "first" means removes it.
+//
+// A non-root caller keeps the READ (the pins are public key fingerprints, and
+// checking against them is exactly the MITM detection this exists for) and
+// still gets the CHANGED verdict that makes the caller abort. What it loses is
+// the ability to write the system's mind. Being explicit about the honest
+// limit: for a non-root caller, an unknown host is now unpinned-and-accepted
+// rather than pinned-and-accepted, which is the pre-existing TOFU behaviour on
+// first sight and no worse; a per-user known_hosts under the caller's home
+// would give them pinning back and is not done here.
 static int ssh2_known_hosts(const char *host, const uint8_t *ks, int ks_len) {
     uint8_t fp[32]; sha256(ks, ks_len, fp);
     static const char *HX = "0123456789abcdef";
@@ -45,15 +77,28 @@ static int ssh2_known_hosts(const char *host, const uint8_t *ks, int ks_len) {
             }
         } else line[li++]=c;
     }
-    // not found -> TOFU: append "host hex\n"
+    // not found -> TOFU: append "host hex\n", but only for root (#700 B6).
     uint32_t newsz = dsz + hlen + 1 + 64 + 1;
+    {
+        extern process_t *proc_current(void);
+        process_t *p = proc_current();
+        if (p && p->privilege == PRIV_USER && p->euid != 0) {
+            kprintf("[SSH] host '%s' unknown: NOT pinning (uid=%u is not root; "
+                    "/CONFIG/KNOWN_HOSTS is the system trust store)\n",
+                    host, p->euid);
+            if (f) kfree(f);
+            return 0;
+        }
+    }
     char *nb = (char *)kmalloc(newsz + 1);
     if (nb) {
         if (dsz) memcpy(nb, data, dsz);
         int o = dsz;
         memcpy(nb+o, host, hlen); o+=hlen; nb[o++]=' ';
         memcpy(nb+o, hex, 64); o+=64; nb[o++]='\n';
-        fat_write_file(&g_fat_fs, "/CONFIG/KNOWN_HOSTS", nb, o);
+        if (fat_write_file(&g_fat_fs, "/CONFIG/KNOWN_HOSTS", nb, o) != 0)
+                        kprintf("[SSH] FAILED to persist /CONFIG/KNOWN_HOSTS: the host key "
+                                "is NOT pinned and this host will not be recognised next time\n");
         kfree(nb);
     }
     if (f) kfree(f);
@@ -162,14 +207,13 @@ static void ctr_xor(const aes_ctx_t *a, uint8_t ctr[16], uint8_t *data, int len)
 // ---------------------------------------------------------------------------
 static int sock_send_all(int sock, const uint8_t *d, int len) {
     int sent = 0;
-    uint64_t hz = g_timer_hz ? g_timer_hz : 250;
-    uint64_t start = timer_ticks;
+    uint64_t start = sched_now_ms();
     while (sent < len) {
         int r = tcp_send(sock, d + sent, (uint16_t)(len - sent > 4096 ? 4096 : len - sent));
-        if (r > 0) { sent += r; net_poll(); tcp_timer(); start = timer_ticks; continue; }
+        if (r > 0) { sent += r; net_poll(); tcp_timer(); start = sched_now_ms(); continue; }
         if (r == TCP_ERR_WOULD_BLOCK) {
             net_poll(); tcp_timer(); proc_sleep(1);
-            if (timer_ticks - start > hz * 10) return -1;
+            if (sched_now_ms() - start > 10000) return -1;
             continue;
         }
         return -1;
@@ -292,8 +336,7 @@ static int ssh2_extract(ssh2_client_t *cli, int *plen) {
 // Block until a packet of type `want` arrives (handling transport noise), or
 // timeout. Leaves payload in cli->inbuf, length in *plen. Returns 0 / <0.
 static int ssh2_expect(ssh2_client_t *cli, int want, int *plen) {
-    uint64_t hz = g_timer_hz ? g_timer_hz : 250;
-    uint64_t start = timer_ticks;
+    uint64_t start = sched_now_ms();
     for (;;) {
         int r = ssh2_extract(cli, plen);
         if (r < 0) return -1;
@@ -325,14 +368,13 @@ static int ssh2_expect(ssh2_client_t *cli, int want, int *plen) {
         int ing = ssh2_ingest(cli);
         if (ing < 0) { snprintf(cli->err, sizeof(cli->err), "connection closed"); return -1; }
         net_poll(); tcp_timer(); proc_sleep(2);
-        if (timer_ticks - start > hz * 12) { snprintf(cli->err, sizeof(cli->err), "timeout waiting for %d", want); return -1; }
+        if (sched_now_ms() - start > 12000) { snprintf(cli->err, sizeof(cli->err), "timeout waiting for %d", want); return -1; }
     }
 }
 
 // read the server identification line ("SSH-2.0-...") into cli->v_s
 static int ssh2_read_version(ssh2_client_t *cli) {
-    uint64_t hz = g_timer_hz ? g_timer_hz : 250;
-    uint64_t start = timer_ticks;
+    uint64_t start = sched_now_ms();
     for (;;) {
         // find a newline-terminated line
         for (int i = 0; i < cli->rlen; i++) {
@@ -358,7 +400,7 @@ static int ssh2_read_version(ssh2_client_t *cli) {
         int ing = ssh2_ingest(cli);
         if (ing < 0) { snprintf(cli->err, sizeof(cli->err), "closed during version"); return -1; }
         net_poll(); tcp_timer(); proc_sleep(2);
-        if (timer_ticks - start > hz * 10) { snprintf(cli->err, sizeof(cli->err), "version timeout"); return -1; }
+        if (sched_now_ms() - start > 10000) { snprintf(cli->err, sizeof(cli->err), "version timeout"); return -1; }
     }
 }
 
@@ -395,7 +437,6 @@ int ssh2_connect(ssh2_client_t *cli, uint32_t ip, uint16_t port,
              (int)((ip >> 24) & 0xff), (int)((ip >> 16) & 0xff),
              (int)((ip >> 8) & 0xff), (int)(ip & 0xff));
 
-    uint64_t hz = g_timer_hz ? g_timer_hz : 250;
 
     // ---- TCP connect ----
     cli->sock = tcp_socket();
@@ -403,12 +444,12 @@ int ssh2_connect(ssh2_client_t *cli, uint32_t ip, uint16_t port,
     if (tcp_connect(cli->sock, ip, port) < 0 && tcp_get_error(cli->sock) != TCP_ERR_IN_PROGRESS) {
         // some stacks return IN_PROGRESS; tolerate
     }
-    uint64_t start = timer_ticks;
+    uint64_t start = sched_now_ms();
     while (!tcp_is_connected(cli->sock)) {
         net_poll(); tcp_timer(); proc_sleep(2);
         tcp_state_t st = tcp_get_state(cli->sock);
         if (st == TCP_STATE_CLOSED) { snprintf(cli->err, sizeof(cli->err), "connect refused"); goto fail; }
-        if (timer_ticks - start > hz * 10) { snprintf(cli->err, sizeof(cli->err), "connect timeout"); goto fail; }
+        if (sched_now_ms() - start > 10000) { snprintf(cli->err, sizeof(cli->err), "connect timeout"); goto fail; }
     }
     SDBG("[SSH] TCP connected\n");
 
@@ -628,7 +669,7 @@ int ssh2_connect(ssh2_client_t *cli, uint32_t ip, uint16_t port,
         if (w.len > w.cap) { snprintf(cli->err, sizeof(cli->err), "auth too big"); goto fail; }
         if (ssh2_send(cli, buf, w.len) < 0) { snprintf(cli->err, sizeof(cli->err), "send auth"); goto fail; }
         // read until SUCCESS or FAILURE (banners interleaved)
-        uint64_t hz2 = g_timer_hz ? g_timer_hz : 250; uint64_t st2 = timer_ticks; int plen;
+        uint64_t st2 = sched_now_ms(); int plen;
         for (;;) {
             int r = ssh2_extract(cli, &plen);
             if (r < 0) goto fail;
@@ -642,7 +683,7 @@ int ssh2_connect(ssh2_client_t *cli, uint32_t ip, uint16_t port,
             }
             if (ssh2_ingest(cli) < 0) { snprintf(cli->err, sizeof(cli->err), "closed during auth"); goto fail; }
             net_poll(); tcp_timer(); proc_sleep(2);
-            if (timer_ticks - st2 > hz2 * 12) { snprintf(cli->err, sizeof(cli->err), "auth timeout"); goto fail; }
+            if (sched_now_ms() - st2 > 12000) { snprintf(cli->err, sizeof(cli->err), "auth timeout"); goto fail; }
         }
         cli->authed = 1;
     }
@@ -841,12 +882,10 @@ void ssh2_close(ssh2_client_t *cli) {
 // session closes. file ops are declared here as void* to avoid pulling the VFS
 // headers into this net module (symbols resolve at link time).
 // ---------------------------------------------------------------------------
-extern long file_read(void *f, void *buf, unsigned long count);
-extern long file_write(void *f, const void *buf, unsigned long count);
-extern int  file_poll(void *f, int events);
 
 static void ssh_fd_on_data(void *ctx, const uint8_t *data, int len) {
-    if (ctx && len > 0) file_write(ctx, data, len);
+    if (ctx && len > 0 && file_write(ctx, data, len) != (int64_t)len)
+            kprintf("[SSH] short write to output fd: server output dropped\n");
 }
 
 int ssh2_run_on_fds(uint32_t ip, uint16_t port, const char *user, const char *pass,
@@ -859,9 +898,12 @@ int ssh2_run_on_fds(uint32_t ip, uint16_t port, const char *user, const char *pa
                           ssh_fd_on_data, fout);
     if (rc != 0) {
         const char *e = cli->err[0] ? cli->err : "connection failed";
-        file_write(fout, "ssh: ", 5);
-        file_write(fout, e, strlen(e));
-        file_write(fout, "\r\n", 2);
+        IGNORE_RESULT("best-effort error banner; already returning -1",
+                          file_write(fout, "ssh: ", 5));
+        IGNORE_RESULT("best-effort error banner; already returning -1",
+                          file_write(fout, e, strlen(e)));
+        IGNORE_RESULT("best-effort error banner to the caller's output fd; the "
+                          "function is already returning -1", file_write(fout, "\r\n", 2));
         kfree(cli);
         return -1;
     }

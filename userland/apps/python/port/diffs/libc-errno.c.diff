@@ -1,0 +1,22 @@
+--- /root/cpython-p2-backup/errno.c.orig	2026-07-07 16:27:23.217523651 +0000
++++ <workspace>	2026-07-07 16:36:18.308157175 +0000
+@@ -45,6 +45,19 @@
+     [38]  = "Function not implemented",
+     [39]  = "Directory not empty",
+     [40]  = "Too many symbolic links",
++    [33]  = "Numerical argument out of domain",
++    [35]  = "Resource deadlock avoided",
++    [37]  = "No locks available",
++    [42]  = "No message of desired type",
++    [43]  = "Identifier removed",
++    [75]  = "Value too large for data type",
++    [84]  = "Invalid or incomplete multibyte or wide character",
++    [95]  = "Operation not supported",
++    [98]  = "Address already in use",
++    [103] = "Software caused connection abort",
++    [110] = "Connection timed out",
++    [114] = "Operation already in progress",
++    [115] = "Operation now in progress",
+ };
+ 
+ char *strerror(int err) {

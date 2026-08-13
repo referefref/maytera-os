@@ -1,0 +1,8 @@
+# UEFI bootloader build outputs - never commit these
+BOOTX64.EFI
+hello.efi
+*.o
+*.so
+*.fd
+*.img
+*.log

@@ -16,6 +16,7 @@
 #define STUDIO_H
 
 #include "../../libc/maytera.h"
+#include "../../libc/gui_font.h"   // #530: the shared ChooseFont dialog (gui_font_dialog)
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -64,6 +65,18 @@ typedef struct {
     int       mask_active;        // 1 = paint/filters target the mask, not pixels
     int       lock_alpha;         // 1 = preserve existing alpha when painting
     int       group;              // group id, or -1 for none
+    // #530 per-layer font memory: the Text tool remembers, PER LAYER, which
+    // font was last stamped onto it, so re-selecting a layer that already has
+    // text on it brings back its own family/style/size instead of whatever
+    // the tool happened to have last. Zeroed on a fresh layer (memset in
+    // doc.c), copied whole-struct on duplicate/undo (see blame.md #530),
+    // so this needs no doc.c changes to behave correctly.
+    int       has_text_font;              // 0 = never stamped text on this layer yet
+    char      text_family[GUI_FONT_NAME_MAX];
+    char      text_style[GUI_FONT_STYLE_MAX];
+    int       text_face;                  // resolved face index for win_draw_text_ttf_ex
+    int       text_bold, text_italic;     // synthetic style bits actually needed
+    int       text_size;
 } layer_t;
 
 typedef struct {
@@ -149,11 +162,17 @@ typedef struct {
     int       feather;            // selection feather radius (px)
     int       grad_blend;         // blend_t for the gradient tool (default BLEND_NORMAL)
     char      text[64];           // TL_TEXT string
-    // TL_TEXT typography (TrueType via the OS font registry)
+    // TL_TEXT typography (TrueType via the OS font registry). face/bold/italic
+    // are what text_commit() actually draws with; family/style are the shared
+    // ChooseFont dialog's own strings, kept alongside so the dialog can be
+    // reopened pre-selected on the current choice (#530) and so a stamp can
+    // save a human-readable font identity onto its layer, not just raw ids.
     int       text_font;          // installed face index (0 = default UI font)
-    int       text_bold;          // 0/1
-    int       text_italic;        // 0/1
-    int       text_underline;     // 0/1
+    int       text_bold;          // 0/1 - synthetic bold needed on top of text_font
+    int       text_italic;        // 0/1 - synthetic italic needed on top of text_font
+    int       text_underline;     // 0/1 - Studio-only, not part of the shared dialog
+    char      text_family[GUI_FONT_NAME_MAX];
+    char      text_style[GUI_FONT_STYLE_MAX];
 } toolstate_t;
 
 extern toolstate_t g_tool;
@@ -224,10 +243,13 @@ int ai_palette(const char *prompt, uint32_t *out, int max_colors); // ret count
 // UI (ui.c): menubar (File/Edit/Image/Layer/Select/Filter/AI/Help), left tool
 // strip, top options bar, right dock (Layers + History + Color), canvas view
 // with zoom (25..800%, integer scaling) + pan, status bar, AI command bar.
-// Follows the MayteraOS UI style guide via the shared style engine like Settings.
+// Follows docs/UI_STYLE_GUIDE.md via the shared style engine like Settings.
 // ---------------------------------------------------------------------------
-void ui_splash(int win_handle, int win_w, int win_h);
+// #472: runs the splash AND the real startup work (doc_new + studio_register_all)
+// interleaved with it (see ui.c). Returns 0 on success, -1 if doc_new failed.
+int  ui_splash(int win_handle, int win_w, int win_h);
 void ui_init(int win_handle, int win_w, int win_h);
+void ui_open_path(const char *path);   // pre-existing implicit-decl fix (main.c calls this)
 void ui_full_redraw(void);
 // ev is a pointer to the libc gui event struct (see libc gui.h); returns 0
 // when the app should exit.
@@ -304,7 +326,7 @@ static inline int px_g(uint32_t p) { return (int)(p >> 8) & 255; }
 static inline int px_b(uint32_t p) { return (int)p & 255; }
 
 // ===========================================================================
-// GIMP 3 PARITY EXPANSION (see the internal Studio GIMP 3 parity notes)
+// GIMP 3 PARITY EXPANSION (see docs/STUDIO_GIMP3_PARITY.md)
 // ===========================================================================
 
 // --- Op registry -----------------------------------------------------------

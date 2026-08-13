@@ -14,8 +14,26 @@
 #define CHAR_H  16
 #define SCRCOLS 80
 #define SCRLINES 24
-#define WIN_W   (SCRCOLS  * CHAR_W)   /* 640 */
-#define WIN_H   (SCRLINES * CHAR_H)   /* 384 */
+#define WIN_W   (SCRCOLS  * CHAR_W)   /* 640, the CONTENT area width  */
+#define WIN_H   (SCRLINES * CHAR_H)   /* 384, the CONTENT area height */
+
+/* MayteraOS port note: SYS_WIN_CREATE's width/height are the window's
+ * OUTER size; the compositor subtracts its own chrome to get the content
+ * area actually available for drawing (kernel/gui/window.h:
+ * TITLEBAR_HEIGHT=20, BORDER_WIDTH=2; kernel/gui/window.c
+ * window_get_content_bounds(): content = outer - 2*BORDER_WIDTH wide,
+ * outer - TITLEBAR_HEIGHT - 2*BORDER_WIDTH tall). Requesting WIN_W x
+ * WIN_H directly (as this file used to) silently clipped the bottom 24px
+ * of the content area, which is exactly row 23 - Rogue's status line
+ * (Hp/Str/Gold/Exp, io.c's status(), upstream, unmodified) - so it never
+ * appeared. Pad the CREATE request by the same chrome the compositor
+ * subtracts; every draw call still uses WIN_W/WIN_H untouched, since
+ * SYS_WIN_DRAW_RECT/TEXT coordinates are already content-relative. This
+ * is the same idiom userland/apps/terminal/main.c already uses
+ * (TERM_WIDTH/TERM_HEIGHT: "+4 for padding" / "+24 for title bar
+ * adjustment"), not a new convention. */
+#define WIN_CREATE_W (WIN_W + 4)
+#define WIN_CREATE_H (WIN_H + 24)
 
 /* ── Colours ──────────────────────────────────────────────────────── */
 #define COL_BG      0x00000000u   /* black background */
@@ -149,18 +167,22 @@ static void win_putch(WINDOW *w, chtype ch) {
 
 /* ── Public API ───────────────────────────────────────────────────── */
 
+static int _ended = 0;   /* MayteraOS port: tracks isendwin() state */
+
 WINDOW *initscr(void) {
     screen_init();
-    win_handle = _win_create("Rogue", 50, 50, WIN_W, WIN_H);
+    win_handle = _win_create("Rogue", 50, 50, WIN_CREATE_W, WIN_CREATE_H);
     /* paint black background immediately */
     if (win_handle >= 0) {
         _win_draw_rect(win_handle, 0, 0, WIN_W, WIN_H, COL_BG);
         _win_invalidate(win_handle);
     }
+    _ended = 0;
     return stdscr;
 }
 
-int endwin(void) { return 0; }
+int endwin(void) { _ended = 1; return 0; }
+int isendwin(void) { return _ended; }
 
 int noecho(void)    { return 0; }
 int cbreak(void)    { return 0; }
@@ -183,6 +205,21 @@ WINDOW *newwin(int nlines, int ncols, int begy, int begx) {
     return w;
 }
 int delwin(WINDOW *w) { if (w && w != stdscr && w != curscr) free(w); return 0; }
+
+/* MayteraOS port note: subwin()/mvwin() were missing (needed by things.c's
+ * inventory popup, upstream, unmodified). Every WINDOW here already
+ * addresses the one shared `screen` grid via absolute begy/begx (see
+ * cell_at()), which is exactly how traditional curses subwin() coordinates
+ * work (screen-absolute, not parent-relative), so a subwindow is just a
+ * second WINDOW over the same cells: reuse newwin(). */
+WINDOW *subwin(WINDOW *orig, int nlines, int ncols, int begy, int begx) {
+    (void)orig;
+    return newwin(nlines, ncols, begy, begx);
+}
+int mvwin(WINDOW *w, int y, int x) { w->begy = y; w->begx = x; return 0; }
+
+int getmaxx(WINDOW *w) { return w->maxx; }
+int getmaxy(WINDOW *w) { return w->maxy; }
 int touchwin(WINDOW *w) {
     for (int r = 0; r < w->maxy; r++)
         for (int c = 0; c < w->maxx; c++) {
@@ -298,13 +335,47 @@ int standend(void)  { return wstandend(stdscr); }
 int wattron(WINDOW *w, chtype a)  { w->attr |=  a; return 0; }
 int wattroff(WINDOW *w, chtype a) { w->attr &= ~a; return 0; }
 
+/* MayteraOS port note: winch()/inch() family, needed by chase.c/fight.c/
+ * misc.c/monsters.c/potions.c/rooms.c (upstream, unmodified) to read back
+ * whatever glyph is already on the screen at the cursor. Re-encode the
+ * cell's reverse-video state into the returned chtype's A_REVERSE bit so a
+ * round trip through waddch(win, winch(other_win)) (things.c's inventory
+ * popup) preserves highlighting. */
+chtype winch(WINDOW *w) {
+    cell_t *c = cell_at(w, w->cury, w->curx);
+    if (!c) return (chtype)' ';
+    chtype ch = (unsigned char)c->ch;
+    if (c->fg == COL_REV_FG && c->bg == COL_REV_BG) ch |= A_REVERSE;
+    return ch;
+}
+chtype inch(void) { return winch(stdscr); }
+chtype mvwinch(WINDOW *w, int y, int x) { wmove(w, y, x); return winch(w); }
+chtype mvinch(int y, int x) { return mvwinch(stdscr, y, x); }
+
+/* MayteraOS port note: unctrl(), needed by command.c/options.c/pack.c
+ * (upstream, unmodified) to print a readable "^X" form of a control
+ * character in messages/help text. */
+char *unctrl(chtype ch) {
+    static char buf[3];
+    unsigned char c = (unsigned char)(ch & A_CHARTEXT);
+    if (c == 0x7F) { buf[0] = '^'; buf[1] = '?'; buf[2] = '\0'; }
+    else if (c < 0x20) { buf[0] = '^'; buf[1] = (char)(c + '@'); buf[2] = '\0'; }
+    else { buf[0] = (char)c; buf[1] = '\0'; }
+    return buf;
+}
+
 /* ── Key mapping ─────────────────────────────────────────────────── */
 static int map_keycode(unsigned int kc) {
-    /* Arrow keys from MayteraOS kernel */
-    if (kc == 128) return KEY_UP;
-    if (kc == 129) return KEY_DOWN;
-    if (kc == 130) return KEY_LEFT;
-    if (kc == 131) return KEY_RIGHT;
+    /* Arrow keys from the MayteraOS kernel.
+     * Upstream Rogue 5.4 has no KEY_UP/KEY_DOWN/KEY_LEFT/KEY_RIGHT handling at
+     * all: its command loop only understands the vi movement keys. Returning
+     * the KEY_* codes here meant the arrows arrived as values the game silently
+     * ignored, so arrow keys did nothing while hjkl worked. Translate to the vi
+     * keys in this port layer rather than patching upstream game logic. */
+    if (kc == 128) return (int)'k';   /* up    */
+    if (kc == 129) return (int)'j';   /* down  */
+    if (kc == 130) return (int)'h';   /* left  */
+    if (kc == 131) return (int)'l';   /* right */
     if (kc == 0x0D || kc == 0x0A) return '\n';
     if (kc == 0x7F || kc == 0x08) return KEY_BACKSPACE;
     if (kc == 0x1B) return 0x1B;  /* ESC */
@@ -351,6 +422,60 @@ int wgetstr(WINDOW *w, char *str) {
 }
 int getstr(char *s) { return wgetstr(stdscr, s); }
 int mvgetstr(int y, int x, char *s) { move(y, x); return getstr(s); }
+
+/* MayteraOS port note: wgetnstr(), needed by rip.c's score() (upstream,
+ * unmodified) for the name prompt on the high-score screen; same as
+ * wgetstr() above but bounded to n-1 characters. */
+int wgetnstr(WINDOW *w, char *str, int n) {
+    int i = 0;
+    for (;;) {
+        int c = wgetch(w);
+        if (c == '\n' || c == '\r') { str[i] = '\0'; return 0; }
+        if ((c == KEY_BACKSPACE || c == '\b' || c == 0x7F) && i > 0) {
+            i--;
+            w->curx--;
+            win_putch(w, ' ');
+            w->curx--;
+            wrefresh(w);
+            continue;
+        }
+        if (c >= 32 && c < 127 && i < n - 1) {
+            str[i++] = (char)c;
+            win_putch(w, (chtype)c);
+            wrefresh(w);
+        }
+    }
+}
+
+/* MayteraOS port note: flushinp(), needed by mach_dep.c's flush_type()
+ * (upstream, unmodified). There is no typeahead buffer here (each
+ * wgetch() call fetches a fresh compositor key event), so just drain any
+ * already-queued events with a non-blocking (timeout 0), bounded poll;
+ * it is a drain, not a wait, so it does not need the kernel wait-queue. */
+int flushinp(void) {
+    if (win_handle < 0) return 0;
+    win_ev_t ev;
+    for (int i = 0; i < 64; i++) {
+        if (_win_get_event(win_handle, &ev, 0) <= 0) break;
+    }
+    return 0;
+}
+
+/* MayteraOS port note: mvcur()/baudrate(), needed by main.c/save.c
+ * (upstream, unmodified) for low-level cursor placement (tstp(), leave())
+ * and an output-pacing heuristic. There is no real terminal here; move the
+ * logical cursor and report a fast, always-buffered link. */
+int mvcur(int oldrow, int oldcol, int newrow, int newcol) {
+    (void)oldrow; (void)oldcol;
+    return wmove(stdscr, newrow, newcol);
+}
+int baudrate(void) { return 38400; }
+
+/* MayteraOS port note: erasechar()/killchar(), needed by options.c
+ * (upstream, unmodified). Values must match md_erasechar()/md_killchar()
+ * in maytera_mdport.c. */
+int erasechar(void) { return '\b'; }
+int killchar(void)  { return 'U' & 0x1F; }
 
 int beep(void)  { return 0; }
 int flash(void) { return 0; }

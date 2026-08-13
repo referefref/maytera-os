@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // scanf.c - formatted input for MayteraOS userland (#422 / CPython #359).
 // Full sscanf/vsscanf; scanf/fscanf are line-oriented wrappers over vsscanf.
 // Supports %d %i %u %o %x %f/%e/%g %c %s %[...] %n %%, field width, '*'
@@ -175,6 +179,19 @@ int vsscanf(const char *str, const char *fmt, va_list ap) {
 }
 
 int sscanf(const char *str, const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    int r = vsscanf(str, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+// AssaultCube port phase 3 (docs/ASSAULTCUBE_PORT_PLAN.md): modern glibc's
+// own <stdio.h> (the HOST header this port's C++ TUs compile against, per
+// the curaslice precedent) redirects sscanf() call sites to the symbol-
+// versioned __isoc99_sscanf at the ABI level for source built against it,
+// so a real link needs that exact symbol name to exist, not just plain
+// sscanf(). Same implementation, real alias, not a stub.
+int __isoc99_sscanf(const char *str, const char *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     int r = vsscanf(str, fmt, ap);
     va_end(ap);

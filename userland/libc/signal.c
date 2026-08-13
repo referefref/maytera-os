@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // signal.c - POSIX signal wrappers for MayteraOS userland
 #include "signal.h"
 #include "syscall.h"

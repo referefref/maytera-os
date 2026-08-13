@@ -62,7 +62,7 @@ typedef struct futex_waiter {
     uint32_t *addr;             // Futex address being waited on
     struct process *proc;       // Waiting task (process_t sharing an addr space)
     uint32_t bitset;            // Bitmask for selective wake
-    uint64_t timeout;           // Absolute timeout in ticks (0 = infinite)
+    uint64_t timeout_ms;        // #499: absolute deadline in REAL ms (sched_now_ms), 0 = infinite
     bool timed_out;             // Set if wait timed out
     volatile int done;          // Set by wake/timeout to release the waiter
     volatile int on_bucket;     // 1 while linked into a bucket

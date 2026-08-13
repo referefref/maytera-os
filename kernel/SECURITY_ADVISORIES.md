@@ -20,7 +20,7 @@ Scope + rules:
   **golden fold** that shipped it to the live image users boot.
 - When a new reachable defect is found: assign the next `MAYTERA-SEC-2026-NNNN`, append a row here
   AND to RUST_PORT_LEDGER.md, update the public security page on maytera.net, and keep this file
-  md5-identical on both trees (local + the kernel build container).
+  md5-identical on both trees (local + the build container).
 
 Product line for all builds below: **MayteraOS v1.95.x**. The meaningful version identifier is the
 **build number** (shown as "v1.95.0 (build NNN)" on the desktop).

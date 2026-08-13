@@ -3,6 +3,7 @@
 
 #include "md5.h"
 #include "../string.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // MD5 auxiliary functions
 #define F(x, y, z) (((x) & (y)) | ((~x) & (z)))
@@ -289,7 +290,6 @@ static inline uint64_t md5_tsc_serialized(void) {
 
 void md5_rust_selftest(void) {
     extern int kprintf(const char *fmt, ...);
-    extern void bootlog_write(const char *fmt, ...);
 
     uint32_t vectors = 0;
     uint32_t mismatches = 0;

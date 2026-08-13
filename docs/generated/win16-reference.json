@@ -1,0 +1,9829 @@
+{
+  "generated_at": "2026-08-06 14:45 UTC",
+  "commit": "fe20ed6a20d4168400b7e74aded6ec800fd51590",
+  "source_file": "kernel/exec/win16api.c",
+  "stats_by_module": {
+    "GDI": {
+      "implemented": 115,
+      "implemented_ordinal_and_name": 115,
+      "implemented_ordinal_only": 0,
+      "implemented_name_only": 0,
+      "implemented_unmatched": 0,
+      "stubbed": 295
+    },
+    "KERNEL": {
+      "implemented": 85,
+      "implemented_ordinal_and_name": 84,
+      "implemented_ordinal_only": 0,
+      "implemented_name_only": 1,
+      "implemented_unmatched": 0,
+      "stubbed": 364
+    },
+    "KEYBOARD": {
+      "implemented": 5,
+      "implemented_ordinal_and_name": 5,
+      "implemented_ordinal_only": 0,
+      "implemented_name_only": 0,
+      "implemented_unmatched": 0,
+      "stubbed": 0
+    },
+    "LZEXPAND": {
+      "implemented": 3,
+      "implemented_ordinal_and_name": 3,
+      "implemented_ordinal_only": 0,
+      "implemented_name_only": 0,
+      "implemented_unmatched": 0,
+      "stubbed": 0
+    },
+    "MMSYSTEM": {
+      "implemented": 3,
+      "implemented_ordinal_and_name": 3,
+      "implemented_ordinal_only": 0,
+      "implemented_name_only": 0,
+      "implemented_unmatched": 0,
+      "stubbed": 0
+    },
+    "OLESVR": {
+      "implemented": 9,
+      "implemented_ordinal_and_name": 9,
+      "implemented_ordinal_only": 0,
+      "implemented_name_only": 0,
+      "implemented_unmatched": 0,
+      "stubbed": 0
+    },
+    "PRNDRV": {
+      "implemented": 4,
+      "implemented_ordinal_and_name": 0,
+      "implemented_ordinal_only": 0,
+      "implemented_name_only": 4,
+      "implemented_unmatched": 0,
+      "stubbed": 0
+    },
+    "SHELL": {
+      "implemented": 19,
+      "implemented_ordinal_and_name": 11,
+      "implemented_ordinal_only": 0,
+      "implemented_name_only": 8,
+      "implemented_unmatched": 0,
+      "stubbed": 0
+    },
+    "USER": {
+      "implemented": 181,
+      "implemented_ordinal_and_name": 181,
+      "implemented_ordinal_only": 0,
+      "implemented_name_only": 0,
+      "implemented_unmatched": 0,
+      "stubbed": 359
+    },
+    "WEP4UTIL": {
+      "implemented": 1,
+      "implemented_ordinal_and_name": 0,
+      "implemented_ordinal_only": 1,
+      "implemented_name_only": 0,
+      "implemented_unmatched": 0,
+      "stubbed": 0
+    },
+    "WEPUTIL": {
+      "implemented": 1,
+      "implemented_ordinal_and_name": 0,
+      "implemented_ordinal_only": 1,
+      "implemented_name_only": 0,
+      "implemented_unmatched": 0,
+      "stubbed": 0
+    },
+    "WIN87EM": {
+      "implemented": 1,
+      "implemented_ordinal_and_name": 0,
+      "implemented_ordinal_only": 1,
+      "implemented_name_only": 0,
+      "implemented_unmatched": 0,
+      "stubbed": 0
+    },
+    "WINMM": {
+      "implemented": 2,
+      "implemented_ordinal_and_name": 1,
+      "implemented_ordinal_only": 0,
+      "implemented_name_only": 1,
+      "implemented_unmatched": 0,
+      "stubbed": 0
+    }
+  },
+  "collisions": [
+    [
+      "GDI",
+      38
+    ],
+    [
+      "USER",
+      61
+    ],
+    [
+      "USER",
+      319
+    ]
+  ],
+  "implemented": [
+    {
+      "module": "KERNEL",
+      "ordinal": 91,
+      "name": "INITTASK",
+      "handler_fn": "k_inittask"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 1,
+      "name": "REGOPENKEY",
+      "handler_fn": "sh_regopenkey"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 2,
+      "name": "REGCREATEKEY",
+      "handler_fn": "sh_regcreatekey"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 3,
+      "name": "REGCLOSEKEY",
+      "handler_fn": "sh_regclosekey"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 4,
+      "name": "REGDELETEKEY",
+      "handler_fn": "sh_regdeletekey"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 5,
+      "name": "REGSETVALUE",
+      "handler_fn": "sh_regsetvalue"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 6,
+      "name": "REGQUERYVALUE",
+      "handler_fn": "sh_regqueryvalue"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 7,
+      "name": "REGENUMKEY",
+      "handler_fn": "sh_regenumkey"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 9,
+      "name": "DRAGACCEPTFILES",
+      "handler_fn": "sh_dragacceptfiles"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 11,
+      "name": "DRAGQUERYFILE",
+      "handler_fn": "sh_dragqueryfile"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 12,
+      "name": "DRAGFINISH",
+      "handler_fn": "sh_dragfinish"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 13,
+      "name": "DRAGQUERYPOINT",
+      "handler_fn": "sh_dragquerypoint"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 30,
+      "name": "WAITEVENT",
+      "handler_fn": "k_waitevent"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 3,
+      "name": "GETVERSION",
+      "handler_fn": "k_getversion"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 4,
+      "name": "LOCALINIT",
+      "handler_fn": "k_localinit"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 57,
+      "name": "GETPROFILEINT",
+      "handler_fn": "k_getprofileint"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 58,
+      "name": "GETPROFILESTRING",
+      "handler_fn": "k_getprofilestr"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 59,
+      "name": "WRITEPROFILESTRING",
+      "handler_fn": "k_writeprofilestr"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 47,
+      "name": "GETMODULEHANDLE",
+      "handler_fn": "k_getmodulehandle"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 49,
+      "name": "GETMODULEFILENAME",
+      "handler_fn": "k_getmodulefilename"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 48,
+      "name": "GETMODULEUSAGE",
+      "handler_fn": "k_getmoduleusage"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 23,
+      "name": "LOCKSEGMENT",
+      "handler_fn": "k_locksegment"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 24,
+      "name": "UNLOCKSEGMENT",
+      "handler_fn": "k_locksegment"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 15,
+      "name": "GLOBALALLOC",
+      "handler_fn": "k_globalalloc"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 60,
+      "name": "FINDRESOURCE",
+      "handler_fn": "k_findresource"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 61,
+      "name": "LOADRESOURCE",
+      "handler_fn": "k_loadresource"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 64,
+      "name": "ACCESSRESOURCE",
+      "handler_fn": "k_accessresource"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 62,
+      "name": "LOCKRESOURCE",
+      "handler_fn": "k_lockresource"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 63,
+      "name": "FREERESOURCE",
+      "handler_fn": "k_freeresource"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 65,
+      "name": "SIZEOFRESOURCE",
+      "handler_fn": "k_sizeofresource"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 18,
+      "name": "GLOBALLOCK",
+      "handler_fn": "k_globallock"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 29,
+      "name": "GLOBALMASTERHANDLE",
+      "handler_fn": "k_globalmasterhandle"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 199,
+      "name": "SELECTORACCESSRIGHTS",
+      "handler_fn": "k_selectoraccessrights"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 19,
+      "name": "GLOBALUNLOCK",
+      "handler_fn": "k_globalunlock"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 17,
+      "name": "GLOBALFREE",
+      "handler_fn": "k_globalfree"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 25,
+      "name": "GLOBALCOMPACT",
+      "handler_fn": "k_globalcompact"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 169,
+      "name": "GETFREESPACE",
+      "handler_fn": "k_getfreespace"
+    },
+    {
+      "module": "USER",
+      "ordinal": 284,
+      "name": "GETFREESYSTEMRESOURCES",
+      "handler_fn": "u_getfreesystemresources"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 13,
+      "name": "LOCALCOMPACT",
+      "handler_fn": "k_localcompact"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 132,
+      "name": "GETWINFLAGS",
+      "handler_fn": "k_getwinflags"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 20,
+      "name": "GLOBALSIZE",
+      "handler_fn": "k_globalsize"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 166,
+      "name": "WINEXEC",
+      "handler_fn": "k_winexec"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 5,
+      "name": "LOCALALLOC",
+      "handler_fn": "k_localalloc"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 6,
+      "name": "LOCALREALLOC",
+      "handler_fn": "k_localrealloc"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 7,
+      "name": "LOCALFREE",
+      "handler_fn": "k_localfree"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 8,
+      "name": "LOCALLOCK",
+      "handler_fn": "k_locallock"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 9,
+      "name": "LOCALUNLOCK",
+      "handler_fn": "k_localunlock"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 10,
+      "name": "LOCALSIZE",
+      "handler_fn": "k_localsize"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 16,
+      "name": "GLOBALREALLOC",
+      "handler_fn": "k_globalrealloc"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 1,
+      "name": "FATALEXIT",
+      "handler_fn": "k_word1_ok"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 21,
+      "name": "GLOBALHANDLE",
+      "handler_fn": "k_globalhandle"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 334,
+      "name": "GETSELECTORLIMIT",
+      "handler_fn": "k_getselectorlimit"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 350,
+      "name": "_HWRITE",
+      "handler_fn": "k_kernel350"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 349,
+      "name": "_HREAD",
+      "handler_fn": "k_hread"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 346,
+      "name": "KERNEL346",
+      "handler_fn": "k_kernel346"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 347,
+      "name": "KERNEL347",
+      "handler_fn": "k_kernel347"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 337,
+      "name": "SETSELECTORLIMIT",
+      "handler_fn": "k_setselectorlimit"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 51,
+      "name": "MAKEPROCINSTANCE",
+      "handler_fn": "k_makeprocinstance"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 52,
+      "name": "FREEPROCINSTANCE",
+      "handler_fn": "k_freeprocinstance"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 74,
+      "name": "OPENFILE",
+      "handler_fn": "k_openfile"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 36,
+      "name": "GETCURRENTTASK",
+      "handler_fn": "k_getcurrenttask"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 0,
+      "name": "GETCURRENTTASK",
+      "handler_fn": "k_getcurrenttask"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 81,
+      "name": "_LCLOSE",
+      "handler_fn": "k_lclose"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 82,
+      "name": "_LREAD",
+      "handler_fn": "k_lread"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 83,
+      "name": "_LCREAT",
+      "handler_fn": "k_lcreat"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 84,
+      "name": "_LLSEEK",
+      "handler_fn": "k_llseek"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 85,
+      "name": "_LOPEN",
+      "handler_fn": "k_lopen"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 86,
+      "name": "_LWRITE",
+      "handler_fn": "k_lwrite"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 88,
+      "name": "LSTRCPY",
+      "handler_fn": "k_lstrcpy"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 89,
+      "name": "LSTRCAT",
+      "handler_fn": "k_lstrcat"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 90,
+      "name": "LSTRLEN",
+      "handler_fn": "k_lstrlen"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 94,
+      "name": "LSTRCMP",
+      "handler_fn": "k_lstrcmp"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 95,
+      "name": "LOADLIBRARY",
+      "handler_fn": "k_loadlibrary"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 96,
+      "name": "FREELIBRARY",
+      "handler_fn": "k_freelibrary"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 50,
+      "name": "GETPROCADDRESS",
+      "handler_fn": "k_getprocaddress"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 102,
+      "name": "DOS3CALL",
+      "handler_fn": "k_dos3call"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 107,
+      "name": "SETERRORMODE",
+      "handler_fn": "k_seterrormode"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 115,
+      "name": "OUTPUTDEBUGSTRING",
+      "handler_fn": "k_outputdebugstr"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 127,
+      "name": "GETPRIVATEPROFILEINT",
+      "handler_fn": "k_getprivprofileint"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 128,
+      "name": "GETPRIVATEPROFILESTRING",
+      "handler_fn": "k_getprivprofilestr"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 129,
+      "name": "WRITEPRIVATEPROFILESTRING",
+      "handler_fn": "k_writeprivprofile"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 131,
+      "name": "GETDOSENVIRONMENT",
+      "handler_fn": "k_getdosenv"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 37,
+      "name": "GETCURRENTPDB",
+      "handler_fn": "k_getcurrentpdb"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 134,
+      "name": "GETWINDOWSDIRECTORY",
+      "handler_fn": "k_getwindir"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 135,
+      "name": "GETSYSTEMDIRECTORY",
+      "handler_fn": "k_getsysdir"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 136,
+      "name": "GETDRIVETYPE",
+      "handler_fn": "k_getdrivetype"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 137,
+      "name": "FATALAPPEXIT",
+      "handler_fn": "k_fatalappexit"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 170,
+      "name": "ALLOCCSTODSALIAS",
+      "handler_fn": "k_alloc_alias"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 171,
+      "name": "ALLOCDSTOCSALIAS",
+      "handler_fn": "k_alloc_alias"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 172,
+      "name": "ALLOCSELECTOR",
+      "handler_fn": "k_alloc_alias"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 176,
+      "name": "FREESELECTOR",
+      "handler_fn": "k_freeselector"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 177,
+      "name": "PRESTOCHANGOSELECTOR",
+      "handler_fn": "k_prestochango"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 335,
+      "name": "GETSELECTORBASE",
+      "handler_fn": "k_getselectorbase"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 336,
+      "name": "SETSELECTORBASE",
+      "handler_fn": "k_setselectorbase"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 55,
+      "name": "CATCH",
+      "handler_fn": "k_far1_zero"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 56,
+      "name": "THROW",
+      "handler_fn": "k_throw"
+    },
+    {
+      "module": "WIN87EM",
+      "ordinal": 1,
+      "name": null,
+      "handler_fn": "k_win87em_init"
+    },
+    {
+      "module": "WEP4UTIL",
+      "ordinal": 2,
+      "name": null,
+      "handler_fn": "k_wep_ok"
+    },
+    {
+      "module": "WEPUTIL",
+      "ordinal": 2,
+      "name": null,
+      "handler_fn": "k_wep_ok"
+    },
+    {
+      "module": "USER",
+      "ordinal": 1,
+      "name": "MESSAGEBOX",
+      "handler_fn": "u_messagebox"
+    },
+    {
+      "module": "USER",
+      "ordinal": 87,
+      "name": "DIALOGBOX",
+      "handler_fn": "u_dialogbox"
+    },
+    {
+      "module": "USER",
+      "ordinal": 88,
+      "name": "ENDDIALOG",
+      "handler_fn": "u_enddialog"
+    },
+    {
+      "module": "USER",
+      "ordinal": 89,
+      "name": "CREATEDIALOG",
+      "handler_fn": "u_createdialog"
+    },
+    {
+      "module": "USER",
+      "ordinal": 90,
+      "name": "ISDIALOGMESSAGE",
+      "handler_fn": "u_isdialogmessage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 91,
+      "name": "GETDLGITEM",
+      "handler_fn": "u_getdlgitem"
+    },
+    {
+      "module": "USER",
+      "ordinal": 92,
+      "name": "SETDLGITEMTEXT",
+      "handler_fn": "u_setdlgitemtext"
+    },
+    {
+      "module": "USER",
+      "ordinal": 93,
+      "name": "GETDLGITEMTEXT",
+      "handler_fn": "u_getdlgitemtext"
+    },
+    {
+      "module": "USER",
+      "ordinal": 94,
+      "name": "SETDLGITEMINT",
+      "handler_fn": "u_setdlgitemint"
+    },
+    {
+      "module": "USER",
+      "ordinal": 95,
+      "name": "GETDLGITEMINT",
+      "handler_fn": "u_getdlgitemint"
+    },
+    {
+      "module": "USER",
+      "ordinal": 101,
+      "name": "SENDDLGITEMMESSAGE",
+      "handler_fn": "u_senddlgitemmessage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 96,
+      "name": "CHECKRADIOBUTTON",
+      "handler_fn": "u_checkradiobutton"
+    },
+    {
+      "module": "USER",
+      "ordinal": 97,
+      "name": "CHECKDLGBUTTON",
+      "handler_fn": "u_checkdlgbutton"
+    },
+    {
+      "module": "USER",
+      "ordinal": 98,
+      "name": "ISDLGBUTTONCHECKED",
+      "handler_fn": "u_isdlgbuttonchecked"
+    },
+    {
+      "module": "USER",
+      "ordinal": 103,
+      "name": "MAPDIALOGRECT",
+      "handler_fn": "u_mapdialogrect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 277,
+      "name": "GETDLGCTRLID",
+      "handler_fn": "u_getdlgctrlid"
+    },
+    {
+      "module": "USER",
+      "ordinal": 308,
+      "name": "DEFDLGPROC",
+      "handler_fn": "u_defdlgproc"
+    },
+    {
+      "module": "USER",
+      "ordinal": 239,
+      "name": "DIALOGBOXPARAM",
+      "handler_fn": "u_dialogboxparam"
+    },
+    {
+      "module": "USER",
+      "ordinal": 240,
+      "name": "DIALOGBOXINDIRECTPARAM",
+      "handler_fn": "u_dialogboxindirectparam"
+    },
+    {
+      "module": "USER",
+      "ordinal": 218,
+      "name": "DIALOGBOXINDIRECT",
+      "handler_fn": "u_dialogboxindirect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 241,
+      "name": "CREATEDIALOGPARAM",
+      "handler_fn": "u_createdialogparam"
+    },
+    {
+      "module": "USER",
+      "ordinal": 242,
+      "name": "CREATEDIALOGINDIRECTPARAM",
+      "handler_fn": "u_dialogboxindirectparam"
+    },
+    {
+      "module": "USER",
+      "ordinal": 219,
+      "name": "CREATEDIALOGINDIRECT",
+      "handler_fn": "u_dialogboxindirect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 5,
+      "name": "INITAPP",
+      "handler_fn": "u_initapp"
+    },
+    {
+      "module": "USER",
+      "ordinal": 6,
+      "name": "POSTQUITMESSAGE",
+      "handler_fn": "u_postquit"
+    },
+    {
+      "module": "USER",
+      "ordinal": 10,
+      "name": "SETTIMER",
+      "handler_fn": "u_settimer"
+    },
+    {
+      "module": "USER",
+      "ordinal": 12,
+      "name": "KILLTIMER",
+      "handler_fn": "u_killtimer"
+    },
+    {
+      "module": "USER",
+      "ordinal": 22,
+      "name": "SETFOCUS",
+      "handler_fn": "u_word1"
+    },
+    {
+      "module": "USER",
+      "ordinal": 23,
+      "name": "GETFOCUS",
+      "handler_fn": "u_getfocus"
+    },
+    {
+      "module": "USER",
+      "ordinal": 60,
+      "name": "GETACTIVEWINDOW",
+      "handler_fn": "u_getfocus"
+    },
+    {
+      "module": "USER",
+      "ordinal": 32,
+      "name": "GETWINDOWRECT",
+      "handler_fn": "u_getwindowrect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 33,
+      "name": "GETCLIENTRECT",
+      "handler_fn": "u_getclientrect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 39,
+      "name": "BEGINPAINT",
+      "handler_fn": "u_beginpaint"
+    },
+    {
+      "module": "USER",
+      "ordinal": 40,
+      "name": "ENDPAINT",
+      "handler_fn": "u_endpaint"
+    },
+    {
+      "module": "USER",
+      "ordinal": 41,
+      "name": "CREATEWINDOW",
+      "handler_fn": "u_createwindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 452,
+      "name": "CREATEWINDOWEX",
+      "handler_fn": "u_createwindowex"
+    },
+    {
+      "module": "USER",
+      "ordinal": 102,
+      "name": "ADJUSTWINDOWRECT",
+      "handler_fn": "u_adjustwindowrect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 454,
+      "name": "ADJUSTWINDOWRECTEX",
+      "handler_fn": "u_adjustwindowrectex"
+    },
+    {
+      "module": "USER",
+      "ordinal": 42,
+      "name": "SHOWWINDOW",
+      "handler_fn": "u_showwindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 36,
+      "name": "GETWINDOWTEXT",
+      "handler_fn": "u_getwindowtext"
+    },
+    {
+      "module": "USER",
+      "ordinal": 53,
+      "name": "DESTROYWINDOW",
+      "handler_fn": "u_destroywindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 56,
+      "name": "MOVEWINDOW",
+      "handler_fn": "u_movewindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 57,
+      "name": "REGISTERCLASS",
+      "handler_fn": "u_registerclass"
+    },
+    {
+      "module": "USER",
+      "ordinal": 110,
+      "name": "POSTMESSAGE",
+      "handler_fn": "u_postmessage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 154,
+      "name": "CHECKMENUITEM",
+      "handler_fn": "u_menuitem3"
+    },
+    {
+      "module": "USER",
+      "ordinal": 155,
+      "name": "ENABLEMENUITEM",
+      "handler_fn": "u_menuitem3"
+    },
+    {
+      "module": "USER",
+      "ordinal": 157,
+      "name": "GETMENU",
+      "handler_fn": "u_getmenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 158,
+      "name": "SETMENU",
+      "handler_fn": "u_setmenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 177,
+      "name": "LOADACCELERATORS",
+      "handler_fn": "u_loadaccel"
+    },
+    {
+      "module": "USER",
+      "ordinal": 178,
+      "name": "TRANSLATEACCELERATOR",
+      "handler_fn": "u_translateaccel"
+    },
+    {
+      "module": "USER",
+      "ordinal": 232,
+      "name": "SETWINDOWPOS",
+      "handler_fn": "u_setwindowpos"
+    },
+    {
+      "module": "USER",
+      "ordinal": 66,
+      "name": "GETDC",
+      "handler_fn": "u_getdc"
+    },
+    {
+      "module": "USER",
+      "ordinal": 68,
+      "name": "RELEASEDC",
+      "handler_fn": "u_releasedc"
+    },
+    {
+      "module": "USER",
+      "ordinal": 69,
+      "name": "SETCURSOR",
+      "handler_fn": "u_setcursor"
+    },
+    {
+      "module": "USER",
+      "ordinal": 81,
+      "name": "FILLRECT",
+      "handler_fn": "u_fillrect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 61,
+      "name": "SCROLLWINDOW",
+      "handler_fn": "u_scrollwindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 319,
+      "name": "SCROLLWINDOWEX",
+      "handler_fn": "u_scrollwindowex"
+    },
+    {
+      "module": "USER",
+      "ordinal": 221,
+      "name": "SCROLLDC",
+      "handler_fn": "u_scrolldc"
+    },
+    {
+      "module": "USER",
+      "ordinal": 62,
+      "name": "SETSCROLLPOS",
+      "handler_fn": "u_setscrollpos"
+    },
+    {
+      "module": "USER",
+      "ordinal": 63,
+      "name": "GETSCROLLPOS",
+      "handler_fn": "u_getscrollpos"
+    },
+    {
+      "module": "USER",
+      "ordinal": 64,
+      "name": "SETSCROLLRANGE",
+      "handler_fn": "u_setscrollrange"
+    },
+    {
+      "module": "USER",
+      "ordinal": 65,
+      "name": "GETSCROLLRANGE",
+      "handler_fn": "u_getscrollrange"
+    },
+    {
+      "module": "USER",
+      "ordinal": 107,
+      "name": "DEFWINDOWPROC",
+      "handler_fn": "u_defwindowproc"
+    },
+    {
+      "module": "USER",
+      "ordinal": 108,
+      "name": "GETMESSAGE",
+      "handler_fn": "u_getmessage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 109,
+      "name": "PEEKMESSAGE",
+      "handler_fn": "u_peekmessage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 112,
+      "name": "WAITMESSAGE",
+      "handler_fn": "u_waitmessage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 113,
+      "name": "TRANSLATEMESSAGE",
+      "handler_fn": "u_translatemessage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 114,
+      "name": "DISPATCHMESSAGE",
+      "handler_fn": "u_dispatchmessage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 124,
+      "name": "UPDATEWINDOW",
+      "handler_fn": "u_updatewindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 125,
+      "name": "INVALIDATERECT",
+      "handler_fn": "u_invalidaterect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 173,
+      "name": "LOADCURSOR",
+      "handler_fn": "u_loadcursor"
+    },
+    {
+      "module": "USER",
+      "ordinal": 174,
+      "name": "LOADICON",
+      "handler_fn": "u_loadicon"
+    },
+    {
+      "module": "USER",
+      "ordinal": 84,
+      "name": "DRAWICON",
+      "handler_fn": "u_drawicon"
+    },
+    {
+      "module": "USER",
+      "ordinal": 175,
+      "name": "LOADBITMAP",
+      "handler_fn": "u_loadbitmap"
+    },
+    {
+      "module": "USER",
+      "ordinal": 179,
+      "name": "GETSYSTEMMETRICS",
+      "handler_fn": "u_getsystemmetrics"
+    },
+    {
+      "module": "USER",
+      "ordinal": 13,
+      "name": "GETTICKCOUNT",
+      "handler_fn": "u_gettickcount"
+    },
+    {
+      "module": "USER",
+      "ordinal": 15,
+      "name": "GETCURRENTTIME",
+      "handler_fn": "u_gettickcount"
+    },
+    {
+      "module": "USER",
+      "ordinal": 71,
+      "name": "SHOWCURSOR",
+      "handler_fn": "u_showcursor"
+    },
+    {
+      "module": "USER",
+      "ordinal": 78,
+      "name": "INFLATERECT",
+      "handler_fn": "u_inflaterect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 85,
+      "name": "DRAWTEXT",
+      "handler_fn": "u_drawtext"
+    },
+    {
+      "module": "USER",
+      "ordinal": 133,
+      "name": "GETWINDOWWORD",
+      "handler_fn": "u_getwindowword"
+    },
+    {
+      "module": "USER",
+      "ordinal": 134,
+      "name": "SETWINDOWWORD",
+      "handler_fn": "u_setwindowword"
+    },
+    {
+      "module": "USER",
+      "ordinal": 135,
+      "name": "GETWINDOWLONG",
+      "handler_fn": "u_getwindowlong"
+    },
+    {
+      "module": "USER",
+      "ordinal": 136,
+      "name": "SETWINDOWLONG",
+      "handler_fn": "u_setwindowlong"
+    },
+    {
+      "module": "USER",
+      "ordinal": 122,
+      "name": "CALLWINDOWPROC",
+      "handler_fn": "u_callwindowproc"
+    },
+    {
+      "module": "USER",
+      "ordinal": 180,
+      "name": "GETSYSCOLOR",
+      "handler_fn": "u_getsyscolor"
+    },
+    {
+      "module": "USER",
+      "ordinal": 18,
+      "name": "SETCAPTURE",
+      "handler_fn": "u_setcapture"
+    },
+    {
+      "module": "USER",
+      "ordinal": 19,
+      "name": "RELEASECAPTURE",
+      "handler_fn": "u_releasecapture"
+    },
+    {
+      "module": "USER",
+      "ordinal": 37,
+      "name": "SETWINDOWTEXT",
+      "handler_fn": "u_setwindowtext"
+    },
+    {
+      "module": "USER",
+      "ordinal": 46,
+      "name": "GETPARENT",
+      "handler_fn": "u_getparent"
+    },
+    {
+      "module": "USER",
+      "ordinal": 47,
+      "name": "ISWINDOW",
+      "handler_fn": "u_iswindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 50,
+      "name": "FINDWINDOW",
+      "handler_fn": "u_findwindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 83,
+      "name": "FRAMERECT",
+      "handler_fn": "u_framerect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 106,
+      "name": "GETKEYSTATE",
+      "handler_fn": "u_getkeystate"
+    },
+    {
+      "module": "USER",
+      "ordinal": 249,
+      "name": "GETASYNCKEYSTATE",
+      "handler_fn": "u_getasynckeystate"
+    },
+    {
+      "module": "USER",
+      "ordinal": 111,
+      "name": "SENDMESSAGE",
+      "handler_fn": "u_sendmessage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 150,
+      "name": "LOADMENU",
+      "handler_fn": "u_loadmenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 176,
+      "name": "LOADSTRING",
+      "handler_fn": "u_loadstring"
+    },
+    {
+      "module": "USER",
+      "ordinal": 420,
+      "name": "WSPRINTF",
+      "handler_fn": "u_wsprintf"
+    },
+    {
+      "module": "USER",
+      "ordinal": 421,
+      "name": "WVSPRINTF",
+      "handler_fn": "u_wvsprintf"
+    },
+    {
+      "module": "USER",
+      "ordinal": 282,
+      "name": "SELECTPALETTE",
+      "handler_fn": "u_selectpalette"
+    },
+    {
+      "module": "USER",
+      "ordinal": 283,
+      "name": "REALIZEPALETTE",
+      "handler_fn": "u_realizepalette"
+    },
+    {
+      "module": "USER",
+      "ordinal": 286,
+      "name": "GETDESKTOPWINDOW",
+      "handler_fn": "u_getdesktopwindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 31,
+      "name": "ISICONIC",
+      "handler_fn": "u_isiconic"
+    },
+    {
+      "module": "USER",
+      "ordinal": 104,
+      "name": "MESSAGEBEEP",
+      "handler_fn": "u_messagebeep"
+    },
+    {
+      "module": "USER",
+      "ordinal": 67,
+      "name": "GETWINDOWDC",
+      "handler_fn": "u_getwindowdc"
+    },
+    {
+      "module": "USER",
+      "ordinal": 160,
+      "name": "DRAWMENUBAR",
+      "handler_fn": "u_drawmenubar"
+    },
+    {
+      "module": "USER",
+      "ordinal": 151,
+      "name": "CREATEMENU",
+      "handler_fn": "u_createmenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 415,
+      "name": "CREATEPOPUPMENU",
+      "handler_fn": "u_createpopupmenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 152,
+      "name": "DESTROYMENU",
+      "handler_fn": "u_destroymenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 411,
+      "name": "APPENDMENU",
+      "handler_fn": "u_appendmenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 410,
+      "name": "INSERTMENU",
+      "handler_fn": "u_insertmenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 414,
+      "name": "MODIFYMENU",
+      "handler_fn": "u_modifymenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 413,
+      "name": "DELETEMENU",
+      "handler_fn": "u_deletemenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 412,
+      "name": "REMOVEMENU",
+      "handler_fn": "u_removemenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 159,
+      "name": "GETSUBMENU",
+      "handler_fn": "u_getsubmenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 263,
+      "name": "GETMENUITEMCOUNT",
+      "handler_fn": "u_getmenuitemcount"
+    },
+    {
+      "module": "USER",
+      "ordinal": 264,
+      "name": "GETMENUITEMID",
+      "handler_fn": "u_getmenuitemid"
+    },
+    {
+      "module": "USER",
+      "ordinal": 161,
+      "name": "GETMENUSTRING",
+      "handler_fn": "u_getmenustring"
+    },
+    {
+      "module": "USER",
+      "ordinal": 266,
+      "name": "SETMESSAGEQUEUE",
+      "handler_fn": "u_setmessagequeue"
+    },
+    {
+      "module": "USER",
+      "ordinal": 145,
+      "name": "REGISTERCLIPBOARDFORMAT",
+      "handler_fn": "u_registerclipboardformat"
+    },
+    {
+      "module": "USER",
+      "ordinal": 250,
+      "name": "GETMENUSTATE",
+      "handler_fn": "u_getmenustate"
+    },
+    {
+      "module": "USER",
+      "ordinal": 358,
+      "name": "ISMENU",
+      "handler_fn": "u_ismenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 162,
+      "name": "HILITEMENUITEM",
+      "handler_fn": "u_hilitemenuitem"
+    },
+    {
+      "module": "USER",
+      "ordinal": 156,
+      "name": "GETSYSTEMMENU",
+      "handler_fn": "u_getsystemmenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 416,
+      "name": "TRACKPOPUPMENU",
+      "handler_fn": "u_trackpopupmenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 116,
+      "name": "POSTAPPMESSAGE",
+      "handler_fn": "u_postappmessage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 118,
+      "name": "REGISTERWINDOWMESSAGE",
+      "handler_fn": "u_registerwindowmessage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 119,
+      "name": "GETMESSAGEPOS",
+      "handler_fn": "u_getmessagepos"
+    },
+    {
+      "module": "USER",
+      "ordinal": 120,
+      "name": "GETMESSAGETIME",
+      "handler_fn": "u_getmessagetime"
+    },
+    {
+      "module": "USER",
+      "ordinal": 334,
+      "name": "GETQUEUESTATUS",
+      "handler_fn": "u_getqueuestatus"
+    },
+    {
+      "module": "USER",
+      "ordinal": 335,
+      "name": "GETINPUTSTATE",
+      "handler_fn": "u_getinputstate"
+    },
+    {
+      "module": "USER",
+      "ordinal": 115,
+      "name": "REPLYMESSAGE",
+      "handler_fn": "u_replymessage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 163,
+      "name": "CREATECARET",
+      "handler_fn": "u_createcaret"
+    },
+    {
+      "module": "USER",
+      "ordinal": 164,
+      "name": "DESTROYCARET",
+      "handler_fn": "u_destroycaret"
+    },
+    {
+      "module": "USER",
+      "ordinal": 165,
+      "name": "SETCARETPOS",
+      "handler_fn": "u_setcaretpos"
+    },
+    {
+      "module": "USER",
+      "ordinal": 166,
+      "name": "HIDECARET",
+      "handler_fn": "u_hidecaret"
+    },
+    {
+      "module": "USER",
+      "ordinal": 167,
+      "name": "SHOWCARET",
+      "handler_fn": "u_showcaret"
+    },
+    {
+      "module": "USER",
+      "ordinal": 168,
+      "name": "SETCARETBLINKTIME",
+      "handler_fn": "u_setcaretblink"
+    },
+    {
+      "module": "USER",
+      "ordinal": 169,
+      "name": "GETCARETBLINKTIME",
+      "handler_fn": "u_getcaretblink"
+    },
+    {
+      "module": "USER",
+      "ordinal": 190,
+      "name": "GETSYSMODALWINDOW",
+      "handler_fn": "u_user190_word6"
+    },
+    {
+      "module": "USER",
+      "ordinal": 192,
+      "name": "INSENDMESSAGE",
+      "handler_fn": "u_insendmessage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 288,
+      "name": "GETMESSAGEEXTRAINFO",
+      "handler_fn": "u_getmessageextrainfo"
+    },
+    {
+      "module": "USER",
+      "ordinal": 171,
+      "name": "WINHELP",
+      "handler_fn": "u_winhelp"
+    },
+    {
+      "module": "USER",
+      "ordinal": 243,
+      "name": "GETDIALOGBASEUNITS",
+      "handler_fn": "u_getdialogbaseunits"
+    },
+    {
+      "module": "USER",
+      "ordinal": 403,
+      "name": "UNREGISTERCLASS",
+      "handler_fn": "u_unregisterclass"
+    },
+    {
+      "module": "USER",
+      "ordinal": 404,
+      "name": "GETCLASSINFO",
+      "handler_fn": "u_getclassinfo"
+    },
+    {
+      "module": "USER",
+      "ordinal": 72,
+      "name": "SETRECT",
+      "handler_fn": "u_setrect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 73,
+      "name": "SETRECTEMPTY",
+      "handler_fn": "u_setrectempty"
+    },
+    {
+      "module": "USER",
+      "ordinal": 74,
+      "name": "COPYRECT",
+      "handler_fn": "u_copyrect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 75,
+      "name": "ISRECTEMPTY",
+      "handler_fn": "u_isrectempty"
+    },
+    {
+      "module": "USER",
+      "ordinal": 76,
+      "name": "PTINRECT",
+      "handler_fn": "u_ptinrect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 77,
+      "name": "OFFSETRECT",
+      "handler_fn": "u_offsetrect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 79,
+      "name": "INTERSECTRECT",
+      "handler_fn": "u_intersectrect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 472,
+      "name": "ANSINEXT",
+      "handler_fn": "u_ansinext"
+    },
+    {
+      "module": "USER",
+      "ordinal": 473,
+      "name": "ANSIPREV",
+      "handler_fn": "u_ansiprev"
+    },
+    {
+      "module": "USER",
+      "ordinal": 431,
+      "name": "ANSIUPPER",
+      "handler_fn": "u_ansiupper"
+    },
+    {
+      "module": "USER",
+      "ordinal": 435,
+      "name": "ISCHARUPPER",
+      "handler_fn": "u_ischarupper"
+    },
+    {
+      "module": "USER",
+      "ordinal": 436,
+      "name": "ISCHARLOWER",
+      "handler_fn": "u_ischarlower"
+    },
+    {
+      "module": "USER",
+      "ordinal": 471,
+      "name": "LSTRCMPI",
+      "handler_fn": "u_lstrcmpi"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 1,
+      "name": "SETBKCOLOR",
+      "handler_fn": "g_setbkcolor"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 2,
+      "name": "SETBKMODE",
+      "handler_fn": "g_setbkmode"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 9,
+      "name": "SETTEXTCOLOR",
+      "handler_fn": "g_settextcolor"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 19,
+      "name": "LINETO",
+      "handler_fn": "g_lineto"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 20,
+      "name": "MOVETO",
+      "handler_fn": "g_moveto"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 11,
+      "name": "SETWINDOWORG",
+      "handler_fn": "g_setwindoworg"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 12,
+      "name": "SETWINDOWEXT",
+      "handler_fn": "g_setwindowext"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 13,
+      "name": "SETVIEWPORTORG",
+      "handler_fn": "g_setvieworg"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 14,
+      "name": "SETVIEWPORTEXT",
+      "handler_fn": "g_setviewext"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 36,
+      "name": "POLYGON",
+      "handler_fn": "g_polygon"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 37,
+      "name": "POLYLINE",
+      "handler_fn": "g_polyline"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 21,
+      "name": "EXCLUDECLIPRECT",
+      "handler_fn": "g_excludecliprect"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 22,
+      "name": "INTERSECTCLIPRECT",
+      "handler_fn": "g_intersectcliprect"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 44,
+      "name": "SELECTCLIPRGN",
+      "handler_fn": "g_selectcliprgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 27,
+      "name": "RECTANGLE",
+      "handler_fn": "g_rectangle"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 31,
+      "name": "SETPIXEL",
+      "handler_fn": "g_setpixel"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 29,
+      "name": "PATBLT",
+      "handler_fn": "g_patblt"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 33,
+      "name": "TEXTOUT",
+      "handler_fn": "g_textout"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 351,
+      "name": "EXTTEXTOUT",
+      "handler_fn": "g_exttextout"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 3,
+      "name": "SETMAPMODE",
+      "handler_fn": "g_setmapmode"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 90,
+      "name": "GETTEXTCOLOR",
+      "handler_fn": "g_gettextcolor"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 92,
+      "name": "GETTEXTFACE",
+      "handler_fn": "g_gettextface"
+    },
+    {
+      "module": "USER",
+      "ordinal": 2,
+      "name": "OLDEXITWINDOWS",
+      "handler_fn": "u_oldexitwindows"
+    },
+    {
+      "module": "USER",
+      "ordinal": 28,
+      "name": "CLIENTTOSCREEN",
+      "handler_fn": "u_clienttoscreen"
+    },
+    {
+      "module": "USER",
+      "ordinal": 29,
+      "name": "SCREENTOCLIENT",
+      "handler_fn": "u_screentoclient"
+    },
+    {
+      "module": "USER",
+      "ordinal": 34,
+      "name": "ENABLEWINDOW",
+      "handler_fn": "u_enablewindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 35,
+      "name": "ISWINDOWENABLED",
+      "handler_fn": "u_iswindowenabled"
+    },
+    {
+      "module": "USER",
+      "ordinal": 49,
+      "name": "ISWINDOWVISIBLE",
+      "handler_fn": "u_iswindowvisible"
+    },
+    {
+      "module": "USER",
+      "ordinal": 131,
+      "name": "GETCLASSLONG",
+      "handler_fn": "u_getclasslong"
+    },
+    {
+      "module": "USER",
+      "ordinal": 153,
+      "name": "CHANGEMENU",
+      "handler_fn": "u_changemenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 262,
+      "name": "GETWINDOW",
+      "handler_fn": "u_getwindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 127,
+      "name": "VALIDATERECT",
+      "handler_fn": "u_validaterect"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 45,
+      "name": "SELECTOBJECT",
+      "handler_fn": "g_selectobject"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 61,
+      "name": "CREATEPEN",
+      "handler_fn": "g_createpen"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 66,
+      "name": "CREATESOLIDBRUSH",
+      "handler_fn": "g_createsolidbrush"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 69,
+      "name": "DELETEOBJECT",
+      "handler_fn": "g_deleteobject"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 80,
+      "name": "GETDEVICECAPS",
+      "handler_fn": "g_getdevicecaps"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 82,
+      "name": "GETOBJECT",
+      "handler_fn": "g_getobject"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 83,
+      "name": "GETPIXEL",
+      "handler_fn": "g_getpixel"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 77,
+      "name": "GETCLIPBOX",
+      "handler_fn": "g_getclipbox"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 104,
+      "name": "RECTVISIBLE",
+      "handler_fn": "g_rectvisible"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 87,
+      "name": "GETSTOCKOBJECT",
+      "handler_fn": "g_getstockobject"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 24,
+      "name": "ELLIPSE",
+      "handler_fn": "g_ellipse"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 28,
+      "name": "ROUNDRECT",
+      "handler_fn": "g_roundrect"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 34,
+      "name": "BITBLT",
+      "handler_fn": "g_bitblt"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 35,
+      "name": "STRETCHBLT",
+      "handler_fn": "g_stretchblt"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 50,
+      "name": "CREATEBRUSHINDIRECT",
+      "handler_fn": "g_createbrushindirect"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 60,
+      "name": "CREATEPATTERNBRUSH",
+      "handler_fn": "g_createpatternbrush"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 62,
+      "name": "CREATEPENINDIRECT",
+      "handler_fn": "g_createpenindirect"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 63,
+      "name": "CREATEPOLYGONRGN",
+      "handler_fn": "g_createpolygonrgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 64,
+      "name": "CREATERECTRGN",
+      "handler_fn": "g_createrectrgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 65,
+      "name": "CREATERECTRGNINDIRECT",
+      "handler_fn": "g_createrectrgnindirect"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 48,
+      "name": "CREATEBITMAP",
+      "handler_fn": "g_createbitmap"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 106,
+      "name": "SETBITMAPBITS",
+      "handler_fn": "g_setbitmapbits"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 51,
+      "name": "CREATECOMPATIBLEBITMAP",
+      "handler_fn": "g_createcompatiblebitmap"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 56,
+      "name": "CREATEFONT",
+      "handler_fn": "g_createfont"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 57,
+      "name": "CREATEFONTINDIRECT",
+      "handler_fn": "g_createfontindirect"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 68,
+      "name": "DELETEDC",
+      "handler_fn": "g_deletedc"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 91,
+      "name": "GETTEXTEXTENT",
+      "handler_fn": "g_gettextextent"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 471,
+      "name": "GETTEXTEXTENTPOINT",
+      "handler_fn": "g_gettextextentpoint"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 52,
+      "name": "CREATECOMPATIBLEDC",
+      "handler_fn": "g_createcompatibledc"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 53,
+      "name": "CREATEDC",
+      "handler_fn": "g_createdc"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 38,
+      "name": "ESCAPE",
+      "handler_fn": "g_escape"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 153,
+      "name": "CREATEIC",
+      "handler_fn": "g_createic"
+    },
+    {
+      "module": "PRNDRV",
+      "ordinal": 0,
+      "name": "DEVICEMODE",
+      "handler_fn": "prn_devicemode"
+    },
+    {
+      "module": "PRNDRV",
+      "ordinal": 0,
+      "name": "EXTDEVICEMODE",
+      "handler_fn": "prn_extdevicemode"
+    },
+    {
+      "module": "PRNDRV",
+      "ordinal": 0,
+      "name": "DEVICECAPABILITIES",
+      "handler_fn": "prn_devcaps"
+    },
+    {
+      "module": "PRNDRV",
+      "ordinal": 0,
+      "name": "GENERIC",
+      "handler_fn": "prn_generic"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 154,
+      "name": "GETNEARESTCOLOR",
+      "handler_fn": "g_getnearestcolor"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 93,
+      "name": "GETTEXTMETRICS",
+      "handler_fn": "g_gettextmetrics"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 128,
+      "name": "MULDIV",
+      "handler_fn": "g_muldiv"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 4,
+      "name": "SETROP2",
+      "handler_fn": "g_setrop2"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 85,
+      "name": "GETROP2",
+      "handler_fn": "g_getrop2"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 6,
+      "name": "SETPOLYFILLMODE",
+      "handler_fn": "g_setpolyfill"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 84,
+      "name": "GETPOLYFILLMODE",
+      "handler_fn": "g_getpolyfill"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 7,
+      "name": "SETSTRETCHBLTMODE",
+      "handler_fn": "g_setstretchmode"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 88,
+      "name": "GETSTRETCHBLTMODE",
+      "handler_fn": "g_getstretchmode"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 349,
+      "name": "SETMAPPERFLAGS",
+      "handler_fn": "g_setmapperflags"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 78,
+      "name": "GETCURRENTPOSITION",
+      "handler_fn": "g_getcurrentpos"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 194,
+      "name": "GETBOUNDSRECT",
+      "handler_fn": "g_getboundsrect"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 193,
+      "name": "SETBOUNDSRECT",
+      "handler_fn": "g_setboundsrect"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 400,
+      "name": "FASTWINDOWFRAME",
+      "handler_fn": "g_fastwindowframe"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 100,
+      "name": "LINEDDA",
+      "handler_fn": "g_linedda"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 443,
+      "name": "SETDIBITSTODEVICE",
+      "handler_fn": "g_setdibitstodevice"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 346,
+      "name": "SETTEXTALIGN",
+      "handler_fn": "g_settextalign"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 360,
+      "name": "CREATEPALETTE",
+      "handler_fn": "g_createpalette"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 350,
+      "name": "GETCHARWIDTH",
+      "handler_fn": "g_getcharwidth"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 70,
+      "name": "ENUMFONTS",
+      "handler_fn": "g_enumfonts"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 442,
+      "name": "CREATEDIBITMAP",
+      "handler_fn": "g_createdibitmap"
+    },
+    {
+      "module": "KEYBOARD",
+      "ordinal": 5,
+      "name": "ANSITOOEM",
+      "handler_fn": "kbd_xlate_copy"
+    },
+    {
+      "module": "KEYBOARD",
+      "ordinal": 6,
+      "name": "OEMTOANSI",
+      "handler_fn": "kbd_xlate_copy"
+    },
+    {
+      "module": "KEYBOARD",
+      "ordinal": 129,
+      "name": "VKKEYSCAN",
+      "handler_fn": "kbd_vkkeyscan"
+    },
+    {
+      "module": "KEYBOARD",
+      "ordinal": 131,
+      "name": "MAPVIRTUALKEY",
+      "handler_fn": "kbd_mapvirtualkey"
+    },
+    {
+      "module": "KEYBOARD",
+      "ordinal": 133,
+      "name": "GETKEYNAMETEXT",
+      "handler_fn": "kbd_getkeynametext"
+    },
+    {
+      "module": "USER",
+      "ordinal": 58,
+      "name": "GETCLASSNAME",
+      "handler_fn": "u_getclassname"
+    },
+    {
+      "module": "USER",
+      "ordinal": 70,
+      "name": "SETCURSORPOS",
+      "handler_fn": "u_setcursorpos"
+    },
+    {
+      "module": "USER",
+      "ordinal": 121,
+      "name": "SETWINDOWSHOOK",
+      "handler_fn": "u_setwindowshook"
+    },
+    {
+      "module": "USER",
+      "ordinal": 225,
+      "name": "ENUMTASKWINDOWS",
+      "handler_fn": "u_enumtaskwindows"
+    },
+    {
+      "module": "USER",
+      "ordinal": 268,
+      "name": "GLOBALADDATOM",
+      "handler_fn": "u_globaladdatom"
+    },
+    {
+      "module": "USER",
+      "ordinal": 457,
+      "name": "DESTROYICON",
+      "handler_fn": "u_destroyicon"
+    },
+    {
+      "module": "USER",
+      "ordinal": 512,
+      "name": "WNETGETCONNECTION",
+      "handler_fn": "u_wnetgetconnection"
+    },
+    {
+      "module": "USER",
+      "ordinal": 513,
+      "name": "WNETGETCAPS",
+      "handler_fn": "u_wnetgetcaps"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 136,
+      "name": "REMOVEFONTRESOURCE",
+      "handler_fn": "g_removefontresource"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 348,
+      "name": "HMEMCPY",
+      "handler_fn": "k_hmemcpy"
+    },
+    {
+      "module": "LZEXPAND",
+      "ordinal": 1,
+      "name": "LZCOPY",
+      "handler_fn": "lz_copy"
+    },
+    {
+      "module": "LZEXPAND",
+      "ordinal": 2,
+      "name": "LZOPENFILE",
+      "handler_fn": "lz_openfile"
+    },
+    {
+      "module": "LZEXPAND",
+      "ordinal": 6,
+      "name": "LZCLOSE",
+      "handler_fn": "lz_close"
+    },
+    {
+      "module": "MMSYSTEM",
+      "ordinal": 2,
+      "name": "SNDPLAYSOUND",
+      "handler_fn": "mm_sndplaysound"
+    },
+    {
+      "module": "MMSYSTEM",
+      "ordinal": 3,
+      "name": "PLAYSOUND",
+      "handler_fn": "mm_playsound"
+    },
+    {
+      "module": "MMSYSTEM",
+      "ordinal": 5,
+      "name": "MMSYSTEMGETVERSION",
+      "handler_fn": "mm_getversion"
+    },
+    {
+      "module": "WINMM",
+      "ordinal": 2,
+      "name": "SNDPLAYSOUND",
+      "handler_fn": "mm_sndplaysound"
+    },
+    {
+      "module": "WINMM",
+      "ordinal": 0,
+      "name": "PLAYSOUNDA",
+      "handler_fn": "mm_playsound"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 30,
+      "name": "SAVEDC",
+      "handler_fn": "g_savedc"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 39,
+      "name": "RESTOREDC",
+      "handler_fn": "g_restoredc"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 75,
+      "name": "GETBKCOLOR",
+      "handler_fn": "g_getbkcolor"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 76,
+      "name": "GETBKMODE",
+      "handler_fn": "g_getbkmode"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 81,
+      "name": "GETMAPMODE",
+      "handler_fn": "g_getmapmode"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 345,
+      "name": "GETTEXTALIGN",
+      "handler_fn": "g_gettextalign_r"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 94,
+      "name": "GETVIEWPORTEXT",
+      "handler_fn": "g_getviewportext"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 95,
+      "name": "GETVIEWPORTORG",
+      "handler_fn": "g_getviewportorg"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 96,
+      "name": "GETWINDOWEXT",
+      "handler_fn": "g_getwindowext"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 97,
+      "name": "GETWINDOWORG",
+      "handler_fn": "g_getwindoworg"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 470,
+      "name": "GETCURRENTPOSITIONEX",
+      "handler_fn": "g_getcurposex"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 472,
+      "name": "GETVIEWPORTEXTEX",
+      "handler_fn": "g_getviewportextex"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 473,
+      "name": "GETVIEWPORTORGEX",
+      "handler_fn": "g_getviewportorgex"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 474,
+      "name": "GETWINDOWEXTEX",
+      "handler_fn": "g_getwindowextex"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 475,
+      "name": "GETWINDOWORGEX",
+      "handler_fn": "g_getwindoworgex"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 483,
+      "name": "MOVETOEX",
+      "handler_fn": "g_movetoex"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 479,
+      "name": "SETVIEWPORTEXTEX",
+      "handler_fn": "g_setviewportextex"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 480,
+      "name": "SETVIEWPORTORGEX",
+      "handler_fn": "g_setviewportorgex"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 481,
+      "name": "SETWINDOWEXTEX",
+      "handler_fn": "g_setwindowextex"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 482,
+      "name": "SETWINDOWORGEX",
+      "handler_fn": "g_setwindoworgex"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 15,
+      "name": "OFFSETWINDOWORG",
+      "handler_fn": "g_offsetwindoworg"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 17,
+      "name": "OFFSETVIEWPORTORG",
+      "handler_fn": "g_offsetvieworg"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 16,
+      "name": "SCALEWINDOWEXT",
+      "handler_fn": "g_scalewindowext"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 18,
+      "name": "SCALEVIEWPORTEXT",
+      "handler_fn": "g_scaleviewext"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 99,
+      "name": "LPTODP",
+      "handler_fn": "g_lptodp"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 67,
+      "name": "DPTOLP",
+      "handler_fn": "g_dptolp"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 134,
+      "name": "GETRGNBOX",
+      "handler_fn": "g_getrgnbox"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 58,
+      "name": "CREATEHATCHBRUSH",
+      "handler_fn": "g_createhatchbrush"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 445,
+      "name": "CREATEDIBPATTERNBRUSH",
+      "handler_fn": "g_createdibpatternbrush"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 49,
+      "name": "CREATEBITMAPINDIRECT",
+      "handler_fn": "g_createbitmapindirect"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 156,
+      "name": "CREATEDISCARDABLEBITMAP",
+      "handler_fn": "g_creatdiscardablebmp"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 54,
+      "name": "CREATEELLIPTICRGN",
+      "handler_fn": "g_createregion8"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 55,
+      "name": "CREATEELLIPTICRGNINDIRECT",
+      "handler_fn": "g_createregion4"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 444,
+      "name": "CREATEROUNDRECTRGN",
+      "handler_fn": "g_createroundrectrgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 23,
+      "name": "ARC",
+      "handler_fn": "g_arc"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 26,
+      "name": "PIE",
+      "handler_fn": "g_pie"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 348,
+      "name": "CHORD",
+      "handler_fn": "g_pie"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 450,
+      "name": "POLYPOLYGON",
+      "handler_fn": "g_polypolygon"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 439,
+      "name": "STRETCHDIBITS",
+      "handler_fn": "g_stretchdibits"
+    },
+    {
+      "module": "USER",
+      "ordinal": 272,
+      "name": "ISZOOMED",
+      "handler_fn": "u_iszoomed"
+    },
+    {
+      "module": "USER",
+      "ordinal": 82,
+      "name": "INVERTRECT",
+      "handler_fn": "u_invertrect"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 0,
+      "name": "SHELLEXECUTE",
+      "handler_fn": "sh_shellexecute"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 0,
+      "name": "FINDEXECUTABLE",
+      "handler_fn": "sh_findexecutable"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 0,
+      "name": "DRAGACCEPTFILES",
+      "handler_fn": "sh_dragacceptfiles"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 0,
+      "name": "DRAGQUERYFILE",
+      "handler_fn": "sh_dragqueryfile"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 0,
+      "name": "DRAGFINISH",
+      "handler_fn": "sh_dragfinish"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 0,
+      "name": "DRAGQUERYPOINT",
+      "handler_fn": "sh_dragquerypoint"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 0,
+      "name": "EXTRACTICON",
+      "handler_fn": "sh_extracticon"
+    },
+    {
+      "module": "SHELL",
+      "ordinal": 0,
+      "name": "SHELLABOUT",
+      "handler_fn": "sh_shellabout"
+    },
+    {
+      "module": "OLESVR",
+      "ordinal": 2,
+      "name": "OLEREGISTERSERVER",
+      "handler_fn": "os_registerserver"
+    },
+    {
+      "module": "OLESVR",
+      "ordinal": 3,
+      "name": "OLEREVOKESERVER",
+      "handler_fn": "os_revokeserver"
+    },
+    {
+      "module": "OLESVR",
+      "ordinal": 4,
+      "name": "OLEBLOCKSERVER",
+      "handler_fn": "os_blockserver"
+    },
+    {
+      "module": "OLESVR",
+      "ordinal": 5,
+      "name": "OLEUNBLOCKSERVER",
+      "handler_fn": "os_unblockserver"
+    },
+    {
+      "module": "OLESVR",
+      "ordinal": 6,
+      "name": "OLEREGISTERSERVERDOC",
+      "handler_fn": "os_registerserverdoc"
+    },
+    {
+      "module": "OLESVR",
+      "ordinal": 7,
+      "name": "OLEREVOKESERVERDOC",
+      "handler_fn": "os_revokeserverdoc"
+    },
+    {
+      "module": "OLESVR",
+      "ordinal": 8,
+      "name": "OLERENAMESERVERDOC",
+      "handler_fn": "os_renameserverdoc"
+    },
+    {
+      "module": "OLESVR",
+      "ordinal": 9,
+      "name": "OLEREVERTSERVERDOC",
+      "handler_fn": "os_revertserverdoc"
+    },
+    {
+      "module": "OLESVR",
+      "ordinal": 10,
+      "name": "OLESAVEDSERVERDOC",
+      "handler_fn": "os_savedserverdoc"
+    }
+  ],
+  "stubbed": [
+    {
+      "module": "GDI",
+      "ordinal": 5,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetRelAbs"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 8,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetTextCharacterExtra"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 10,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "SetTextJustification"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 25,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "FloodFill"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 32,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "OffsetClipRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 38,
+      "argbytes": 14,
+      "retval": 0,
+      "name": "Escape"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 40,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "FillRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 41,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "FrameRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 42,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "InvertRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 43,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "PaintRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 46,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BITMAPBITS"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 47,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "CombineRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 71,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "EnumObjects"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 72,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "EqualRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 73,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "ExcludeVisRect"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 74,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "GetBitmapBits"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 79,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetDCOrg"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 86,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetRelAbs"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 89,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetTextCharacterExtra"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 98,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "IntersectVisRect"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 101,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "OffsetRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 102,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "OffsetVisRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 103,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "PtVisible"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 105,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "SelectVisRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 117,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "SetDCOrg"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 118,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "InternalCreateDC"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 119,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "AddFontResource"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 120,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetContinuingTextExtent"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 121,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "Death"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 122,
+      "argbytes": 14,
+      "retval": 1,
+      "name": "Resurrection"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 123,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "PlayMetaFile"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 124,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetMetaFile"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 125,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "CreateMetaFile"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 126,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "CloseMetaFile"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 127,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "DeleteMetaFile"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 129,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "SaveVisRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 130,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "RestoreVisRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 131,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "InquireVisRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 132,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "SetEnvironment"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 133,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "GetEnvironment"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 137,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "GSV"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 138,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DPXlate"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 139,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SetWinViewExt"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 140,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ScaleExt"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 141,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WordSet"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 142,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "RectStuff"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 143,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "OffsetOrg"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 144,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "LockDC"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 145,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "UnlockDC"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 146,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "LockUnlock"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 147,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "GDI_FarFrame"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 148,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "SetBrushOrg"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 149,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetBrushOrg"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 150,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "UnrealizeObject"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 151,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "CopyMetaFile"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 152,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "GDIInitApp"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 155,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "QueryAbort"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 157,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "CompatibleBitmap"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 158,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "EnumCallback"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 159,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetMetaFileBits"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 160,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "SetMetaFileBits"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 161,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "PtInRegion"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 162,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetBitmapDimension"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 163,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "SetBitmapDimension"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 164,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "PixToLine"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 169,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "IsDCDirty"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 170,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SetDCStatus"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 171,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "LVBUNION"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 172,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "SetRectRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 173,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetClipRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 174,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BLOAT"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 175,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "EnumMetaFile"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 176,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "PlayMetaFileRecord"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 177,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "RCOS"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 178,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "RSIN"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 179,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetDCState"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 180,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetDCState"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 181,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "RectInRegionOld"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 182,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "REQUESTSEM"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 183,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "CLEARSEM"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 184,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "STUFFVISIBLE"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 185,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "STUFFINREGION"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 186,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DELETEABOVELINEFONTS"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 188,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetTextExtentEx"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 190,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "SetDCHook"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 191,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetDCHook"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 192,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetHookFlags"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 195,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "SelectBitmap"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 196,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "SetMetaFileBitsBetter"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 201,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DMBITBLT"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 202,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DMCOLORINFO"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 206,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "dmEnumDFonts"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 207,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DMENUMOBJ"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 208,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DMOUTPUT"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 209,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DMPIXEL"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 210,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "dmRealizeObject"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 211,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DMSTRBLT"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 212,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DMSCANLR"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 213,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BRUTE"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 214,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DMEXTTEXTOUT"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 215,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DMGETCHARWIDTH"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 216,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DMSTRETCHBLT"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 217,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DMDIBBITS"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 218,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DMSTRETCHDIBITS"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 219,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DMSETDIBTODEV"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 220,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DMTRANSPOSE"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 230,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "CreatePQ"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 231,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "MinPQ"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 232,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "ExtractPQ"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 233,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "InsertPQ"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 234,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SizePQ"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 235,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "DeletePQ"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 240,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "OpenJob"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 241,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "WriteSpool"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 242,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "WriteDialog"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 243,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "CloseJob"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 244,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "DeleteJob"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 245,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetSpoolJob"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 246,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "StartSpoolPage"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 247,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "EndSpoolPage"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 248,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "QueryJob"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 250,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "Copy"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 253,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DeleteSpoolPage"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 254,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SpoolFile"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 267,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "StartDocPrintEra"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 268,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "StartPagePrinter"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 269,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WritePrinter"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 270,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "EndPagePrinter"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 271,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "AbortPrinter"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 272,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "EndDocPrinter"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 274,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ClosePrinter"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 280,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetRealDriverInfo"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 281,
+      "argbytes": 20,
+      "retval": 0,
+      "name": "DrvSetPrinterData"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 282,
+      "argbytes": 24,
+      "retval": 0,
+      "name": "DrvGetPrinterData"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 299,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ENGINEGETCHARWIDTHEX"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 300,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "EngineEnumerateFont"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 301,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "EngineDeleteFont"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 302,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "EngineRealizeFont"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 303,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "EngineGetCharWidth"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 304,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "EngineSetFontContext"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 305,
+      "argbytes": 22,
+      "retval": 1,
+      "name": "EngineGetGlyphBMP"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 306,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "EngineMakeFontDir"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 307,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "GetCharABCWidths"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 308,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "GetOutlineTextMetrics"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 309,
+      "argbytes": 22,
+      "retval": 0,
+      "name": "GetGlyphOutline"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 310,
+      "argbytes": 14,
+      "retval": 0,
+      "name": "CreateScalableFontResource"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 311,
+      "argbytes": 18,
+      "retval": 0,
+      "name": "GetFontData"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 312,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ConvertOutLineFontFile"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 313,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetRasterizerCaps"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 314,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "EngineExtTextOut"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 315,
+      "argbytes": 16,
+      "retval": 0,
+      "name": "EngineRealizeFontExt"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 316,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "EngineGetCharWidthStr"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 317,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "EngineGetGlyphBmpExt"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 330,
+      "argbytes": 14,
+      "retval": 0,
+      "name": "EnumFontFamilies"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 332,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "GetKerningPairs"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 347,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "MFDRAWTEXT"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 352,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetPhysicalFontHandle"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 353,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetAspectRatioFilter"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 354,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ShrinkGDIHeap"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 355,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "FTrapping0"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 361,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "GDISelectPalette"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 362,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "GDIRealizePalette"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 363,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "GetPaletteEntries"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 364,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "SetPaletteEntries"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 365,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "RealizeDefaultPalette"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 366,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "UpdateColors"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 367,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "AnimatePalette"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 368,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "ResizePalette"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 370,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetNearestPaletteIndex"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 372,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "ExtFloodFill"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 373,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetSystemPaletteUse"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 374,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetSystemPaletteUse"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 375,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "GetSystemPaletteEntries"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 376,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "ResetDC"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 377,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "StartDoc"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 378,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "EndDoc"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 379,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "StartPage"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 380,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "EndPage"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 381,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "SetAbortProc"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 382,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "AbortDoc"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 401,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "GDIMOVEBITMAP"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 402,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "GDIGETBITSGLOBAL"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 403,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "GdiInit2"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 404,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetTTGlyphIndexMap"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 405,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "FinalGdiInit"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 406,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "CREATEREALBITMAPINDIRECT"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 407,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "CreateUserBitmap"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 408,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "CREATEREALBITMAP"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 409,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "CreateUserDiscardableBitmap"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 410,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "IsValidMetaFile"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 411,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetCurLogFont"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 412,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "IsDCCurrentPalette"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 440,
+      "argbytes": 18,
+      "retval": 1,
+      "name": "SetDIBits"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 441,
+      "argbytes": 18,
+      "retval": 0,
+      "name": "GetDIBits"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 449,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DEVICECOLORMATCH"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 451,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "CreatePolyPolygonRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 452,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "GdiSeeGdiDo"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 460,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "GDITASKTERMINATION"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 461,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetObjectOwner"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 462,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "IsGDIObject"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 463,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "MakeObjectPrivate"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 464,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "FIXUPBOGUSPUBLISHERMETAFILE"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 465,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "RectVisible"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 466,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "RectInRegion"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 467,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "UNICODETOANSI"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 468,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetBitmapDimensionEx"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 469,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetBrushOrgEx"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 476,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "OffsetViewportOrgEx"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 477,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "OffsetWindowOrgEx"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 478,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "SetBitmapDimensionEx"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 484,
+      "argbytes": 14,
+      "retval": 1,
+      "name": "ScaleViewportExtEx"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 485,
+      "argbytes": 14,
+      "retval": 1,
+      "name": "ScaleWindowExtEx"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 486,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetAspectRatioFilterEx"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 489,
+      "argbytes": 20,
+      "retval": 0,
+      "name": "CreateDIBSection"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 490,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "CloseEnhMetafile"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 491,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "CopyEnhMetafile"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 492,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "CreateEnhMetafile"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 493,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DeleteEnhMetafile"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 495,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "GDIComment"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 496,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetEnhMetafile"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 497,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetEnhMetafileBits"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 498,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetEnhMetafileDescription"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 499,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetEnhMetafileHeader"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 501,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetEnhMetafilePaletteEntries"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 502,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "PolyBezier"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 503,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "PolyBezierTo"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 504,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "PlayEnhMetafileRecord"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 505,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SetEnhMetafileBits"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 506,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SetMetaRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 508,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "ExtSelectClipRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 511,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "AbortPath"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 512,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "BeginPath"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 513,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "CloseFigure"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 514,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "EndPath"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 515,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "FillPath"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 516,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "FlattenPath"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 517,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "GetPath"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 518,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "PathToRegion"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 519,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "SelectClipPath"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 520,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "StrokeAndFillPath"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 521,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "StrokePath"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 522,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "WidenPath"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 523,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ExtCreatePen"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 524,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetArcDirection"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 525,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetArcDirection"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 526,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetMiterLimit"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 527,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SetMiterLimit"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 528,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "GDIParametersInfo"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 529,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "CreateHalftonePalette"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 530,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "RawTextOut"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 531,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "RawExtTextOut"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 532,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "RawGetTextExtent"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 536,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BiDiLayout"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 538,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BiDiCreateTabString"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 540,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BiDiGlyphOut"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 543,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BiDiGetStringExtent"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 555,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BiDiDeleteString"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 556,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BiDiSetDefaults"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 558,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BiDiGetDefaults"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 560,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BiDiShape"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 561,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BiDiFontComplement"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 564,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BiDiSetKashida"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 565,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BiDiKExtTextOut"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 566,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BiDiShapeEx"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 569,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BiDiCreateStringEx"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 571,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetTextExtentRtoL"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 572,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetHDCCharSet"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 573,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BiDiLayoutEx"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 602,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "SetDIBColorTable"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 603,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "GetDIBColorTable"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 604,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "SetSolidBrush"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 605,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "SysDeleteObject"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 606,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "SetMagicColors"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 607,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "GetRegionData"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 608,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ExtCreateRegion"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 609,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "GdiFreeResources"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 610,
+      "argbytes": 14,
+      "retval": 1,
+      "name": "GdiSignalProc32"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 611,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetRandomRgn"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 612,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetTextCharset"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 613,
+      "argbytes": 18,
+      "retval": 0,
+      "name": "EnumFontFamiliesEx"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 614,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "AddLpkToGDI"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 615,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetCharacterPlacement"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 616,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetFontLanguageInfo"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 650,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BuildInverseTableDIB"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 701,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "GDITHKCONNECTIONDATALS"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 702,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "FT_GDIFTHKTHKCONNECTIONDATA"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 703,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "FDTHKCONNECTIONDATASL"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 704,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ICMTHKCONNECTIONDATASL"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 820,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ICMCreateTransform"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 821,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ICMDeleteTransform"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 822,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ICMTranslateRGB"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 823,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ICMTranslateRGBs"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 824,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ICMCheckColorsInGamut"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 1000,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "SetLayout"
+    },
+    {
+      "module": "GDI",
+      "ordinal": 1001,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetLayout"
+    },
+    {
+      "module": "USER",
+      "ordinal": 3,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "EnableOEMLayer"
+    },
+    {
+      "module": "USER",
+      "ordinal": 4,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DisableOEMLayer"
+    },
+    {
+      "module": "USER",
+      "ordinal": 7,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "ExitWindows"
+    },
+    {
+      "module": "USER",
+      "ordinal": 11,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "SetSystemTimer"
+    },
+    {
+      "module": "USER",
+      "ordinal": 14,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetTimerResolution"
+    },
+    {
+      "module": "USER",
+      "ordinal": 16,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "ClipCursor"
+    },
+    {
+      "module": "USER",
+      "ordinal": 17,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetCursorPos"
+    },
+    {
+      "module": "USER",
+      "ordinal": 20,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "SetDoubleClickTime"
+    },
+    {
+      "module": "USER",
+      "ordinal": 21,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetDoubleClickTime"
+    },
+    {
+      "module": "USER",
+      "ordinal": 24,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "RemoveProp"
+    },
+    {
+      "module": "USER",
+      "ordinal": 25,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetProp"
+    },
+    {
+      "module": "USER",
+      "ordinal": 26,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "SetProp"
+    },
+    {
+      "module": "USER",
+      "ordinal": 27,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "EnumProps"
+    },
+    {
+      "module": "USER",
+      "ordinal": 30,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "WindowFromPoint"
+    },
+    {
+      "module": "USER",
+      "ordinal": 38,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetWindowTextLength"
+    },
+    {
+      "module": "USER",
+      "ordinal": 43,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "CloseWindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 44,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "OpenIcon"
+    },
+    {
+      "module": "USER",
+      "ordinal": 45,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "BringWindowToTop"
+    },
+    {
+      "module": "USER",
+      "ordinal": 48,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "IsChild"
+    },
+    {
+      "module": "USER",
+      "ordinal": 51,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BEAR51"
+    },
+    {
+      "module": "USER",
+      "ordinal": 52,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "AnyPopup"
+    },
+    {
+      "module": "USER",
+      "ordinal": 54,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "EnumWindows"
+    },
+    {
+      "module": "USER",
+      "ordinal": 55,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "EnumChildWindows"
+    },
+    {
+      "module": "USER",
+      "ordinal": 59,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "SetActiveWindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 61,
+      "argbytes": 14,
+      "retval": 1,
+      "name": "ScrollWindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 80,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "UnionRect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 86,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "IconSize"
+    },
+    {
+      "module": "USER",
+      "ordinal": 99,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "DlgDirSelect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 100,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "DlgDirList"
+    },
+    {
+      "module": "USER",
+      "ordinal": 105,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "FlashWindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 117,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "WindowFromDC"
+    },
+    {
+      "module": "USER",
+      "ordinal": 123,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "CallMsgFilter"
+    },
+    {
+      "module": "USER",
+      "ordinal": 126,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "InvalidateRgn"
+    },
+    {
+      "module": "USER",
+      "ordinal": 128,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "ValidateRgn"
+    },
+    {
+      "module": "USER",
+      "ordinal": 129,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetClassWord"
+    },
+    {
+      "module": "USER",
+      "ordinal": 130,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "SetClassWord"
+    },
+    {
+      "module": "USER",
+      "ordinal": 132,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "SetClassLong"
+    },
+    {
+      "module": "USER",
+      "ordinal": 137,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "OpenClipboard"
+    },
+    {
+      "module": "USER",
+      "ordinal": 138,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "CloseClipboard"
+    },
+    {
+      "module": "USER",
+      "ordinal": 139,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "EmptyClipboard"
+    },
+    {
+      "module": "USER",
+      "ordinal": 140,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetClipboardOwner"
+    },
+    {
+      "module": "USER",
+      "ordinal": 141,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetClipboardData"
+    },
+    {
+      "module": "USER",
+      "ordinal": 142,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetClipboardData"
+    },
+    {
+      "module": "USER",
+      "ordinal": 143,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "CountClipboardFormats"
+    },
+    {
+      "module": "USER",
+      "ordinal": 144,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "EnumClipboardFormats"
+    },
+    {
+      "module": "USER",
+      "ordinal": 146,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "GetClipboardFormatName"
+    },
+    {
+      "module": "USER",
+      "ordinal": 147,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "SetClipboardViewer"
+    },
+    {
+      "module": "USER",
+      "ordinal": 148,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetClipboardViewer"
+    },
+    {
+      "module": "USER",
+      "ordinal": 149,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "ChangeClipboardChain"
+    },
+    {
+      "module": "USER",
+      "ordinal": 170,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "ArrangeIconicWindows"
+    },
+    {
+      "module": "USER",
+      "ordinal": 172,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SwitchToThisWindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 181,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "SetSysColors"
+    },
+    {
+      "module": "USER",
+      "ordinal": 182,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "KillSystemTimer"
+    },
+    {
+      "module": "USER",
+      "ordinal": 183,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetCaretPos"
+    },
+    {
+      "module": "USER",
+      "ordinal": 184,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "QuerySendMessage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 185,
+      "argbytes": 22,
+      "retval": 1,
+      "name": "GrayString"
+    },
+    {
+      "module": "USER",
+      "ordinal": 186,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "SwapMouseButton"
+    },
+    {
+      "module": "USER",
+      "ordinal": 187,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "EndMenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 188,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "SetSysModalWindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 189,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetSysModalWindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 191,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "ChildWindowFromPoint"
+    },
+    {
+      "module": "USER",
+      "ordinal": 193,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "IsClipboardFormatAvailable"
+    },
+    {
+      "module": "USER",
+      "ordinal": 194,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "DlgDirSelectComboBox"
+    },
+    {
+      "module": "USER",
+      "ordinal": 195,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "DlgDirListComboBox"
+    },
+    {
+      "module": "USER",
+      "ordinal": 196,
+      "argbytes": 20,
+      "retval": 0,
+      "name": "TabbedTextOut"
+    },
+    {
+      "module": "USER",
+      "ordinal": 197,
+      "argbytes": 14,
+      "retval": 0,
+      "name": "GetTabbedTextExtent"
+    },
+    {
+      "module": "USER",
+      "ordinal": 198,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "CascadeChildWindows"
+    },
+    {
+      "module": "USER",
+      "ordinal": 199,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "TileChildWindows"
+    },
+    {
+      "module": "USER",
+      "ordinal": 200,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "OpenComm"
+    },
+    {
+      "module": "USER",
+      "ordinal": 201,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetCommState"
+    },
+    {
+      "module": "USER",
+      "ordinal": 202,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetCommState"
+    },
+    {
+      "module": "USER",
+      "ordinal": 203,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetCommError"
+    },
+    {
+      "module": "USER",
+      "ordinal": 204,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "ReadComm"
+    },
+    {
+      "module": "USER",
+      "ordinal": 205,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "WriteComm"
+    },
+    {
+      "module": "USER",
+      "ordinal": 206,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "TransmitCommChar"
+    },
+    {
+      "module": "USER",
+      "ordinal": 207,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "CloseComm"
+    },
+    {
+      "module": "USER",
+      "ordinal": 208,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "SetCommEventMask"
+    },
+    {
+      "module": "USER",
+      "ordinal": 209,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetCommEventMask"
+    },
+    {
+      "module": "USER",
+      "ordinal": 210,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "SetCommBreak"
+    },
+    {
+      "module": "USER",
+      "ordinal": 211,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "ClearCommBreak"
+    },
+    {
+      "module": "USER",
+      "ordinal": 212,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "UngetCommChar"
+    },
+    {
+      "module": "USER",
+      "ordinal": 213,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "BuildCommDCB"
+    },
+    {
+      "module": "USER",
+      "ordinal": 214,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "EscapeCommFunction"
+    },
+    {
+      "module": "USER",
+      "ordinal": 215,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "FlushComm"
+    },
+    {
+      "module": "USER",
+      "ordinal": 216,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "UserSeeUserDo"
+    },
+    {
+      "module": "USER",
+      "ordinal": 217,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "LookupMenuHandle"
+    },
+    {
+      "module": "USER",
+      "ordinal": 220,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "LoadMenuIndirect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 222,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetKeyboardState"
+    },
+    {
+      "module": "USER",
+      "ordinal": 223,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetKeyboardState"
+    },
+    {
+      "module": "USER",
+      "ordinal": 224,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetWindowTask"
+    },
+    {
+      "module": "USER",
+      "ordinal": 226,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "LockInput"
+    },
+    {
+      "module": "USER",
+      "ordinal": 227,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetNextDlgGroupItem"
+    },
+    {
+      "module": "USER",
+      "ordinal": 228,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetNextDlgTabItem"
+    },
+    {
+      "module": "USER",
+      "ordinal": 229,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetTopWindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 230,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetNextWindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 231,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetSystemDebugState"
+    },
+    {
+      "module": "USER",
+      "ordinal": 233,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetParent"
+    },
+    {
+      "module": "USER",
+      "ordinal": 234,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "UnhookWindowsHook"
+    },
+    {
+      "module": "USER",
+      "ordinal": 235,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "DefHookProc"
+    },
+    {
+      "module": "USER",
+      "ordinal": 236,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetCapture"
+    },
+    {
+      "module": "USER",
+      "ordinal": 237,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetUpdateRgn"
+    },
+    {
+      "module": "USER",
+      "ordinal": 238,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "ExcludeUpdateRgn"
+    },
+    {
+      "module": "USER",
+      "ordinal": 244,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "EqualRect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 245,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "EnableCommNotification"
+    },
+    {
+      "module": "USER",
+      "ordinal": 246,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "ExitWindowsExec"
+    },
+    {
+      "module": "USER",
+      "ordinal": 247,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetCursor"
+    },
+    {
+      "module": "USER",
+      "ordinal": 248,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetOpenClipboardWindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 251,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "SendDriverMessage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 252,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "OpenDriver"
+    },
+    {
+      "module": "USER",
+      "ordinal": 253,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "CloseDriver"
+    },
+    {
+      "module": "USER",
+      "ordinal": 254,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetDriverModuleHandle"
+    },
+    {
+      "module": "USER",
+      "ordinal": 255,
+      "argbytes": 16,
+      "retval": 0,
+      "name": "DefDriverProc"
+    },
+    {
+      "module": "USER",
+      "ordinal": 256,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetDriverInfo"
+    },
+    {
+      "module": "USER",
+      "ordinal": 257,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetNextDriver"
+    },
+    {
+      "module": "USER",
+      "ordinal": 258,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "MapWindowPoints"
+    },
+    {
+      "module": "USER",
+      "ordinal": 259,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "BeginDeferWindowPos"
+    },
+    {
+      "module": "USER",
+      "ordinal": 260,
+      "argbytes": 16,
+      "retval": 1,
+      "name": "DeferWindowPos"
+    },
+    {
+      "module": "USER",
+      "ordinal": 261,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "EndDeferWindowPos"
+    },
+    {
+      "module": "USER",
+      "ordinal": 265,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "ShowOwnedPopups"
+    },
+    {
+      "module": "USER",
+      "ordinal": 267,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "ShowScrollBar"
+    },
+    {
+      "module": "USER",
+      "ordinal": 269,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "GlobalDeleteAtom"
+    },
+    {
+      "module": "USER",
+      "ordinal": 270,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "GlobalFindAtom"
+    },
+    {
+      "module": "USER",
+      "ordinal": 271,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "GlobalGetAtomName"
+    },
+    {
+      "module": "USER",
+      "ordinal": 273,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "ControlPanelInfo"
+    },
+    {
+      "module": "USER",
+      "ordinal": 274,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetNextQueueWindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 275,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "RepaintScreen"
+    },
+    {
+      "module": "USER",
+      "ordinal": 276,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "LockMyTask"
+    },
+    {
+      "module": "USER",
+      "ordinal": 278,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetDesktopHwnd"
+    },
+    {
+      "module": "USER",
+      "ordinal": 279,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "OldSetDeskPattern"
+    },
+    {
+      "module": "USER",
+      "ordinal": 280,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetSystemMenu"
+    },
+    {
+      "module": "USER",
+      "ordinal": 281,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetSysColorBrush"
+    },
+    {
+      "module": "USER",
+      "ordinal": 285,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetDeskWallpaper"
+    },
+    {
+      "module": "USER",
+      "ordinal": 287,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetLastActivePopup"
+    },
+    {
+      "module": "USER",
+      "ordinal": 289,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "keybd_event"
+    },
+    {
+      "module": "USER",
+      "ordinal": 290,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "RedrawWindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 291,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "SetWindowsHookEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 292,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "UnhookWindowsHookEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 293,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "CallNextHookEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 294,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "LockWindowUpdate"
+    },
+    {
+      "module": "USER",
+      "ordinal": 299,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "mouse_event"
+    },
+    {
+      "module": "USER",
+      "ordinal": 300,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "UnloadInstalledDrivers"
+    },
+    {
+      "module": "USER",
+      "ordinal": 301,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "EDITWNDPROC"
+    },
+    {
+      "module": "USER",
+      "ordinal": 302,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "STATICWNDPROC"
+    },
+    {
+      "module": "USER",
+      "ordinal": 303,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BUTTONWNDPROC"
+    },
+    {
+      "module": "USER",
+      "ordinal": 304,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SBWNDPROC"
+    },
+    {
+      "module": "USER",
+      "ordinal": 305,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DESKTOPWNDPROC"
+    },
+    {
+      "module": "USER",
+      "ordinal": 306,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "MENUWNDPROC"
+    },
+    {
+      "module": "USER",
+      "ordinal": 307,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "LBOXCTLWNDPROC"
+    },
+    {
+      "module": "USER",
+      "ordinal": 309,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetClipCursor"
+    },
+    {
+      "module": "USER",
+      "ordinal": 314,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "SignalProc"
+    },
+    {
+      "module": "USER",
+      "ordinal": 319,
+      "argbytes": 22,
+      "retval": 1,
+      "name": "ScrollWindowEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 320,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SysErrorBox"
+    },
+    {
+      "module": "USER",
+      "ordinal": 321,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "SetEventHook"
+    },
+    {
+      "module": "USER",
+      "ordinal": 322,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WinOldAppHackOMatic"
+    },
+    {
+      "module": "USER",
+      "ordinal": 323,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetMessage2"
+    },
+    {
+      "module": "USER",
+      "ordinal": 324,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "FillWindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 325,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "PaintRect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 326,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetControlBrush"
+    },
+    {
+      "module": "USER",
+      "ordinal": 331,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "EnableHardwareInput"
+    },
+    {
+      "module": "USER",
+      "ordinal": 332,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "UserYield"
+    },
+    {
+      "module": "USER",
+      "ordinal": 333,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "IsUserIdle"
+    },
+    {
+      "module": "USER",
+      "ordinal": 336,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "LoadCursorIconHandler"
+    },
+    {
+      "module": "USER",
+      "ordinal": 337,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetMouseEventProc"
+    },
+    {
+      "module": "USER",
+      "ordinal": 338,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ECGETDS"
+    },
+    {
+      "module": "USER",
+      "ordinal": 343,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetFilePortName"
+    },
+    {
+      "module": "USER",
+      "ordinal": 344,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "COMBOBOXCTLWNDPROC"
+    },
+    {
+      "module": "USER",
+      "ordinal": 345,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BEAR345"
+    },
+    {
+      "module": "USER",
+      "ordinal": 356,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "LoadDIBCursorHandler"
+    },
+    {
+      "module": "USER",
+      "ordinal": 357,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "LoadDIBIconHandler"
+    },
+    {
+      "module": "USER",
+      "ordinal": 359,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "GetDCEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 362,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "DCHook"
+    },
+    {
+      "module": "USER",
+      "ordinal": 364,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "LookupIconIdFromDirectoryEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 368,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "CopyIcon"
+    },
+    {
+      "module": "USER",
+      "ordinal": 369,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "CopyCursor"
+    },
+    {
+      "module": "USER",
+      "ordinal": 370,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetWindowPlacement"
+    },
+    {
+      "module": "USER",
+      "ordinal": 371,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "SetWindowPlacement"
+    },
+    {
+      "module": "USER",
+      "ordinal": 372,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetInternalIconHeader"
+    },
+    {
+      "module": "USER",
+      "ordinal": 373,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "SubtractRect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 374,
+      "argbytes": 16,
+      "retval": 1,
+      "name": "DllEntryPoint"
+    },
+    {
+      "module": "USER",
+      "ordinal": 375,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DrawTextEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 376,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SetMessageExtraInfo"
+    },
+    {
+      "module": "USER",
+      "ordinal": 378,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SetPropEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 379,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetPropEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 380,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "RemovePropEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 382,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SetWindowContextHelpID"
+    },
+    {
+      "module": "USER",
+      "ordinal": 383,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetWindowContextHelpID"
+    },
+    {
+      "module": "USER",
+      "ordinal": 384,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetMenuContextHelpId"
+    },
+    {
+      "module": "USER",
+      "ordinal": 385,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetMenuContextHelpId"
+    },
+    {
+      "module": "USER",
+      "ordinal": 389,
+      "argbytes": 14,
+      "retval": 0,
+      "name": "LoadImage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 390,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "CopyImage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 391,
+      "argbytes": 14,
+      "retval": 1,
+      "name": "SignalProc32"
+    },
+    {
+      "module": "USER",
+      "ordinal": 394,
+      "argbytes": 18,
+      "retval": 1,
+      "name": "DrawIconEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 395,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetIconInfo"
+    },
+    {
+      "module": "USER",
+      "ordinal": 397,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "RegisterClassEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 398,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "GetClassInfoEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 399,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "ChildWindowFromPointEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 400,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "FinalUserInit"
+    },
+    {
+      "module": "USER",
+      "ordinal": 402,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetPriorityClipboardFormat"
+    },
+    {
+      "module": "USER",
+      "ordinal": 406,
+      "argbytes": 18,
+      "retval": 0,
+      "name": "CreateCursor"
+    },
+    {
+      "module": "USER",
+      "ordinal": 407,
+      "argbytes": 18,
+      "retval": 0,
+      "name": "CreateIcon"
+    },
+    {
+      "module": "USER",
+      "ordinal": 408,
+      "argbytes": 14,
+      "retval": 0,
+      "name": "CreateCursorIconIndirect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 409,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "InitThreadInput"
+    },
+    {
+      "module": "USER",
+      "ordinal": 417,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetMenuCheckMarkDimensions"
+    },
+    {
+      "module": "USER",
+      "ordinal": 418,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "SetMenuItemBitmaps"
+    },
+    {
+      "module": "USER",
+      "ordinal": 422,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "DlgDirSelectEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 423,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "DlgDirSelectComboBoxEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 427,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "FindWindowEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 428,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "TileWindows"
+    },
+    {
+      "module": "USER",
+      "ordinal": 429,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "CascadeWindows"
+    },
+    {
+      "module": "USER",
+      "ordinal": 430,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "lstrcmp"
+    },
+    {
+      "module": "USER",
+      "ordinal": 432,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "AnsiLower"
+    },
+    {
+      "module": "USER",
+      "ordinal": 433,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "IsCharAlpha"
+    },
+    {
+      "module": "USER",
+      "ordinal": 434,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "IsCharAlphaNumeric"
+    },
+    {
+      "module": "USER",
+      "ordinal": 437,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "AnsiUpperBuff"
+    },
+    {
+      "module": "USER",
+      "ordinal": 438,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "AnsiLowerBuff"
+    },
+    {
+      "module": "USER",
+      "ordinal": 441,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "InsertMenuItem"
+    },
+    {
+      "module": "USER",
+      "ordinal": 443,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetMenuItemInfo"
+    },
+    {
+      "module": "USER",
+      "ordinal": 445,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "DefFrameProc"
+    },
+    {
+      "module": "USER",
+      "ordinal": 446,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SetMenuItemInfo"
+    },
+    {
+      "module": "USER",
+      "ordinal": 447,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "DefMDIChildProc"
+    },
+    {
+      "module": "USER",
+      "ordinal": 448,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "DrawAnimatedRects"
+    },
+    {
+      "module": "USER",
+      "ordinal": 449,
+      "argbytes": 24,
+      "retval": 1,
+      "name": "DrawState"
+    },
+    {
+      "module": "USER",
+      "ordinal": 450,
+      "argbytes": 20,
+      "retval": 0,
+      "name": "CreateIconFromResourceEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 451,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "TranslateMDISysAccel"
+    },
+    {
+      "module": "USER",
+      "ordinal": 455,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetIconID"
+    },
+    {
+      "module": "USER",
+      "ordinal": 456,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "LoadIconHandler"
+    },
+    {
+      "module": "USER",
+      "ordinal": 458,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "DestroyCursor"
+    },
+    {
+      "module": "USER",
+      "ordinal": 459,
+      "argbytes": 16,
+      "retval": 0,
+      "name": "DumpIcon"
+    },
+    {
+      "module": "USER",
+      "ordinal": 460,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "GetInternalWindowPos"
+    },
+    {
+      "module": "USER",
+      "ordinal": 461,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "SetInternalWindowPos"
+    },
+    {
+      "module": "USER",
+      "ordinal": 462,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "CalcChildScroll"
+    },
+    {
+      "module": "USER",
+      "ordinal": 463,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "ScrollChildren"
+    },
+    {
+      "module": "USER",
+      "ordinal": 464,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "DragObject"
+    },
+    {
+      "module": "USER",
+      "ordinal": 465,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "DragDetect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 466,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "DrawFocusRect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 470,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "StringFunc"
+    },
+    {
+      "module": "USER",
+      "ordinal": 475,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "SetScrollInfo"
+    },
+    {
+      "module": "USER",
+      "ordinal": 476,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "GetScrollInfo"
+    },
+    {
+      "module": "USER",
+      "ordinal": 477,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetKeyboardLayoutName"
+    },
+    {
+      "module": "USER",
+      "ordinal": 478,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "LoadKeyboardLayout"
+    },
+    {
+      "module": "USER",
+      "ordinal": 479,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "MenuItemFromPoint"
+    },
+    {
+      "module": "USER",
+      "ordinal": 480,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetUserLocalObjType"
+    },
+    {
+      "module": "USER",
+      "ordinal": 482,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "EnableScrollBar"
+    },
+    {
+      "module": "USER",
+      "ordinal": 483,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "SystemParametersInfo"
+    },
+    {
+      "module": "USER",
+      "ordinal": 489,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "USER_489"
+    },
+    {
+      "module": "USER",
+      "ordinal": 490,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "USER_490"
+    },
+    {
+      "module": "USER",
+      "ordinal": 492,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "USER_492"
+    },
+    {
+      "module": "USER",
+      "ordinal": 496,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "USER_496"
+    },
+    {
+      "module": "USER",
+      "ordinal": 498,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BEAR498"
+    },
+    {
+      "module": "USER",
+      "ordinal": 499,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "WNetErrorText"
+    },
+    {
+      "module": "USER",
+      "ordinal": 500,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "FARCALLNETDRIVER"
+    },
+    {
+      "module": "USER",
+      "ordinal": 501,
+      "argbytes": 14,
+      "retval": 1,
+      "name": "WNetOpenJob"
+    },
+    {
+      "module": "USER",
+      "ordinal": 502,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "WNetCloseJob"
+    },
+    {
+      "module": "USER",
+      "ordinal": 503,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "WNetAbortJob"
+    },
+    {
+      "module": "USER",
+      "ordinal": 504,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "WNetHoldJob"
+    },
+    {
+      "module": "USER",
+      "ordinal": 505,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "WNetReleaseJob"
+    },
+    {
+      "module": "USER",
+      "ordinal": 506,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "WNetCancelJob"
+    },
+    {
+      "module": "USER",
+      "ordinal": 507,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "WNetSetJobCopies"
+    },
+    {
+      "module": "USER",
+      "ordinal": 508,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "WNetWatchQueue"
+    },
+    {
+      "module": "USER",
+      "ordinal": 509,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "WNetUnwatchQueue"
+    },
+    {
+      "module": "USER",
+      "ordinal": 510,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "WNetLockQueueData"
+    },
+    {
+      "module": "USER",
+      "ordinal": 511,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "WNetUnlockQueueData"
+    },
+    {
+      "module": "USER",
+      "ordinal": 514,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "WNetDeviceMode"
+    },
+    {
+      "module": "USER",
+      "ordinal": 515,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "WNetBrowseDialog"
+    },
+    {
+      "module": "USER",
+      "ordinal": 516,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "WNetGetUser"
+    },
+    {
+      "module": "USER",
+      "ordinal": 517,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "WNetAddConnection"
+    },
+    {
+      "module": "USER",
+      "ordinal": 518,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "WNetCancelConnection"
+    },
+    {
+      "module": "USER",
+      "ordinal": 519,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "WNetGetError"
+    },
+    {
+      "module": "USER",
+      "ordinal": 520,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "WNetGetErrorText"
+    },
+    {
+      "module": "USER",
+      "ordinal": 521,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WNetEnable"
+    },
+    {
+      "module": "USER",
+      "ordinal": 522,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WNetDisable"
+    },
+    {
+      "module": "USER",
+      "ordinal": 523,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "WNetRestoreConnection"
+    },
+    {
+      "module": "USER",
+      "ordinal": 524,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "WNetWriteJob"
+    },
+    {
+      "module": "USER",
+      "ordinal": 525,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "WNetConnectDialog"
+    },
+    {
+      "module": "USER",
+      "ordinal": 526,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "WNetDisconnectDialog"
+    },
+    {
+      "module": "USER",
+      "ordinal": 527,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "WNetConnectionDialog"
+    },
+    {
+      "module": "USER",
+      "ordinal": 528,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "WNetViewQueueDialog"
+    },
+    {
+      "module": "USER",
+      "ordinal": 529,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "WNetPropertyDialog"
+    },
+    {
+      "module": "USER",
+      "ordinal": 530,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "WNetGetDirectoryType"
+    },
+    {
+      "module": "USER",
+      "ordinal": 531,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "WNetDirectoryNotify"
+    },
+    {
+      "module": "USER",
+      "ordinal": 532,
+      "argbytes": 16,
+      "retval": 1,
+      "name": "WNetGetPropertyText"
+    },
+    {
+      "module": "USER",
+      "ordinal": 533,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WNetInitialize"
+    },
+    {
+      "module": "USER",
+      "ordinal": 534,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WNetLogon"
+    },
+    {
+      "module": "USER",
+      "ordinal": 535,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOWWORDBREAKPROC"
+    },
+    {
+      "module": "USER",
+      "ordinal": 537,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "MOUSEEVENT"
+    },
+    {
+      "module": "USER",
+      "ordinal": 538,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "KEYBDEVENT"
+    },
+    {
+      "module": "USER",
+      "ordinal": 595,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "OLDEXITWINDOWS"
+    },
+    {
+      "module": "USER",
+      "ordinal": 600,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetShellWindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 601,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DoHotkeyStuff"
+    },
+    {
+      "module": "USER",
+      "ordinal": 602,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SetCheckCursorTimer"
+    },
+    {
+      "module": "USER",
+      "ordinal": 604,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BroadcastSystemMessage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 605,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "HackTaskMonitor"
+    },
+    {
+      "module": "USER",
+      "ordinal": 606,
+      "argbytes": 22,
+      "retval": 1,
+      "name": "FormatMessage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 608,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetForegroundWindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 609,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "SetForegroundWindow"
+    },
+    {
+      "module": "USER",
+      "ordinal": 610,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "DestroyIcon32"
+    },
+    {
+      "module": "USER",
+      "ordinal": 620,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "ChangeDisplaySettings"
+    },
+    {
+      "module": "USER",
+      "ordinal": 621,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "EnumDisplaySettings"
+    },
+    {
+      "module": "USER",
+      "ordinal": 640,
+      "argbytes": 20,
+      "retval": 0,
+      "name": "MsgWaitForMultipleObjects"
+    },
+    {
+      "module": "USER",
+      "ordinal": 650,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ActivateKeyboardLayout"
+    },
+    {
+      "module": "USER",
+      "ordinal": 651,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetKeyboardLayout"
+    },
+    {
+      "module": "USER",
+      "ordinal": 652,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetKeyboardLayoutList"
+    },
+    {
+      "module": "USER",
+      "ordinal": 654,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "UnloadKeyboardLayout"
+    },
+    {
+      "module": "USER",
+      "ordinal": 655,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "PostPostedMessages"
+    },
+    {
+      "module": "USER",
+      "ordinal": 656,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "DrawFrameControl"
+    },
+    {
+      "module": "USER",
+      "ordinal": 657,
+      "argbytes": 18,
+      "retval": 1,
+      "name": "DrawCaptionTemp"
+    },
+    {
+      "module": "USER",
+      "ordinal": 658,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DispatchInput"
+    },
+    {
+      "module": "USER",
+      "ordinal": 659,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "DrawEdge"
+    },
+    {
+      "module": "USER",
+      "ordinal": 660,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "DrawCaption"
+    },
+    {
+      "module": "USER",
+      "ordinal": 661,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SetSysColorsTemp"
+    },
+    {
+      "module": "USER",
+      "ordinal": 662,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DrawMenubarTemp"
+    },
+    {
+      "module": "USER",
+      "ordinal": 663,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetMenuDefaultItem"
+    },
+    {
+      "module": "USER",
+      "ordinal": 664,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SetMenuDefaultItem"
+    },
+    {
+      "module": "USER",
+      "ordinal": 665,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "GetMenuItemRect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 666,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "CheckMenuRadioItem"
+    },
+    {
+      "module": "USER",
+      "ordinal": 667,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "TrackPopupMenuEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 668,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "SetWindowRgn"
+    },
+    {
+      "module": "USER",
+      "ordinal": 669,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetWindowRgn"
+    },
+    {
+      "module": "USER",
+      "ordinal": 800,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "CHOOSEFONT_CALLBACK16"
+    },
+    {
+      "module": "USER",
+      "ordinal": 801,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "FINDREPLACE_CALLBACK16"
+    },
+    {
+      "module": "USER",
+      "ordinal": 802,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "OPENFILENAME_CALLBACK16"
+    },
+    {
+      "module": "USER",
+      "ordinal": 803,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "PRINTDLG_CALLBACK16"
+    },
+    {
+      "module": "USER",
+      "ordinal": 804,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "CHOOSECOLOR_CALLBACK16"
+    },
+    {
+      "module": "USER",
+      "ordinal": 819,
+      "argbytes": 14,
+      "retval": 1,
+      "name": "PeekMessage32"
+    },
+    {
+      "module": "USER",
+      "ordinal": 820,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "GetMessage32"
+    },
+    {
+      "module": "USER",
+      "ordinal": 821,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "TranslateMessage32"
+    },
+    {
+      "module": "USER",
+      "ordinal": 822,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "DispatchMessage32"
+    },
+    {
+      "module": "USER",
+      "ordinal": 823,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "CallMsgFilter32"
+    },
+    {
+      "module": "USER",
+      "ordinal": 825,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "PostMessage32"
+    },
+    {
+      "module": "USER",
+      "ordinal": 826,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "PostThreadMessage32"
+    },
+    {
+      "module": "USER",
+      "ordinal": 827,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "MessageBoxIndirect"
+    },
+    {
+      "module": "USER",
+      "ordinal": 851,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "MsgThkConnectionDataLS"
+    },
+    {
+      "module": "USER",
+      "ordinal": 853,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "FT_USRFTHKTHKCONNECTIONDATA"
+    },
+    {
+      "module": "USER",
+      "ordinal": 854,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "FT__USRF2THKTHKCONNECTIONDATA"
+    },
+    {
+      "module": "USER",
+      "ordinal": 855,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "Usr32ThkConnectionDataSL"
+    },
+    {
+      "module": "USER",
+      "ordinal": 890,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "InstallIMT"
+    },
+    {
+      "module": "USER",
+      "ordinal": 891,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "UninstallIMT"
+    },
+    {
+      "module": "USER",
+      "ordinal": 902,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "LoadSystemLanguageString"
+    },
+    {
+      "module": "USER",
+      "ordinal": 905,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ChangeDialogTemplate"
+    },
+    {
+      "module": "USER",
+      "ordinal": 906,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetNumLanguages"
+    },
+    {
+      "module": "USER",
+      "ordinal": 907,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "GetLanguageName"
+    },
+    {
+      "module": "USER",
+      "ordinal": 909,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "SetWindowTextEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 910,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BiDiMessageBoxEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 911,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "SetDlgItemTextEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 912,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "ChangeKeyboardLanguage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 913,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetCodePageSystemFont"
+    },
+    {
+      "module": "USER",
+      "ordinal": 914,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "QueryCodePage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 915,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetAppCodePage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 916,
+      "argbytes": 26,
+      "retval": 0,
+      "name": "CreateDialogIndirectParamML"
+    },
+    {
+      "module": "USER",
+      "ordinal": 918,
+      "argbytes": 24,
+      "retval": 1,
+      "name": "DialogBoxIndirectParamML"
+    },
+    {
+      "module": "USER",
+      "ordinal": 919,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "LoadLanguageString"
+    },
+    {
+      "module": "USER",
+      "ordinal": 920,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "SetAppCodePage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 922,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetBaseCodePage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 923,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "FindLanguageResource"
+    },
+    {
+      "module": "USER",
+      "ordinal": 924,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "ChangeKeyboardCodePage"
+    },
+    {
+      "module": "USER",
+      "ordinal": 930,
+      "argbytes": 14,
+      "retval": 1,
+      "name": "MessageBoxEx"
+    },
+    {
+      "module": "USER",
+      "ordinal": 1000,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetProcessDefaultLayout"
+    },
+    {
+      "module": "USER",
+      "ordinal": 1001,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetProcessDefaultLayout"
+    },
+    {
+      "module": "USER",
+      "ordinal": 1010,
+      "argbytes": 14,
+      "retval": 0,
+      "name": "__wine_call_wndproc"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 2,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ExitKernel"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 11,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "LocalHandle"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 12,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "LocalFlags"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 14,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "LocalNotify"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 22,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "GlobalFlags"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 26,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "GlobalFreeAll"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 27,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "GetModuleName"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 28,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GlobalMasterHandle"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 31,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "PostEvent"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 32,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetPriority"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 33,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "LockCurrentTask"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 34,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetTaskQueue"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 35,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetTaskQueue"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 38,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "SetTaskSignalProc"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 39,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SetTaskSwitchProc"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 40,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SetTaskInterchange"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 41,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "EnableDos"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 42,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DisableDos"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 43,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "IsScreenGrab"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 44,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BuildPDB"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 45,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "LoadModule"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 46,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "FreeModule"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 53,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "CallProcInstance"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 54,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetInstanceData"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 66,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "AllocResource"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 67,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "SetResourceHandler"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 68,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "InitAtomTable"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 69,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "FindAtom"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 70,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "AddAtom"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 71,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "DeleteAtom"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 72,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "GetAtomName"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 73,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetAtomHandle"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 75,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "OpenPathName"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 76,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DeletePathName"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 77,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "Reserved1"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 78,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "Reserved2"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 79,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "Reserved3"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 80,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "Reserved4"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 87,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "Reserved5"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 92,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetTempDrive"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 93,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetCodeHandle"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 97,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "GetTempFileName"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 98,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetLastDiskChange"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 99,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetLPErrMode"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 100,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ValidateCodeSegments"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 101,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "NoHookDosCall"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 103,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "NetBIOSCall"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 104,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "GetCodeInfo"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 105,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetExeVersion"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 106,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "SetSwapAreaSize"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 108,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "SwitchStackTo"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 109,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "SwitchStackBack"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 110,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "PatchCodeHandle"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 111,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GlobalWire"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 112,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "GlobalUnWire"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 116,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "InitLib"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 117,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "OldYield"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 118,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetTaskQueueDS"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 119,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetTaskQueueES"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 120,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "UndefDynLink"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 121,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "LocalShrink"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 122,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "IsTaskLocked"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 123,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "KbdRst"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 124,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "EnableKernel"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 125,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DisableKernel"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 126,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "MemoryFreed"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 130,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "FileCDR"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 133,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetExePtr"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 138,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetHeapSpaces"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 139,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DoSignal"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 140,
+      "argbytes": 16,
+      "retval": 1,
+      "name": "SetSigHandler"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 141,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "InitTask1"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 142,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetProfileSectionNames"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 143,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "GetPrivateProfileSectionNames"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 144,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "CreateDirectory"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 145,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "RemoveDirectory"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 146,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "DeleteFile"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 147,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetLastError"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 148,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetLastError"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 149,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetVersionEx"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 150,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "DirectedYield"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 151,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WinOldApCall"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 152,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetNumTasks"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 154,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "GlobalNotify"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 155,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetTaskDS"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 156,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "LimitEMSPages"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 157,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetCurPID"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 158,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "IsWinOldApTask"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 159,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GlobalHandleNoRIP"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 160,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "EMSCopy"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 161,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "LocalCountFree"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 162,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "LocalHeapSize"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 163,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "GlobalLRUOldest"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 164,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "GlobalLRUNewest"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 165,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "A20Proc"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 167,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetExpWinVer"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 168,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "DirectResAlloc"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 175,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "AllocSelector"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 180,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "LongPtrAdd"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 184,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GlobalDOSAlloc"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 185,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "GlobalDOSFree"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 186,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetSelectorBase"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 187,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "SetSelectorBase"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 188,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetSelectorLimit"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 189,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "SetSelectorLimit"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 191,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "GlobalPageLock"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 192,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "GlobalPageUnlock"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 196,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "SelectorAccessRights"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 197,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "GlobalFix"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 198,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "GlobalUnfix"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 200,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ValidateFreeSpaces"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 201,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ReplaceInst"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 202,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "RegisterPtrace"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 203,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "DebugBreak"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 204,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SwapRecording"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 205,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "CVWBreak"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 206,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "AllocSelectorArray"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 207,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "IsDBCSLeadByte"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 208,
+      "argbytes": 14,
+      "retval": 0,
+      "name": "K208"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 209,
+      "argbytes": 14,
+      "retval": 0,
+      "name": "K209"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 210,
+      "argbytes": 18,
+      "retval": 0,
+      "name": "K210"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 211,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "K211"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 213,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "K213"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 214,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "K214"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 215,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "K215"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 216,
+      "argbytes": 16,
+      "retval": 0,
+      "name": "RegEnumKey"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 217,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "RegOpenKey"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 218,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "RegCreateKey"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 219,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "RegDeleteKey"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 220,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "RegCloseKey"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 221,
+      "argbytes": 20,
+      "retval": 0,
+      "name": "RegSetValue"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 222,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "RegDeleteValue"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 223,
+      "argbytes": 32,
+      "retval": 0,
+      "name": "RegEnumValue"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 224,
+      "argbytes": 16,
+      "retval": 0,
+      "name": "RegQueryValue"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 225,
+      "argbytes": 24,
+      "retval": 0,
+      "name": "RegQueryValueEx"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 226,
+      "argbytes": 24,
+      "retval": 0,
+      "name": "RegSetValueEx"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 227,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "RegFlushKey"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 228,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "K228"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 229,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "K229"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 230,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GlobalSmartPageLock"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 231,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GlobalSmartPageUnlock"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 232,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "RegLoadKey"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 233,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "RegUnloadKey"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 234,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "RegSaveKey"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 235,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "InvalidateNlsCache"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 236,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetProductName"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 237,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "K237"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 262,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOWWaitForMsgAndEvent"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 263,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOWMsgBox"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 273,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "K273"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 274,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "GetShortPathName"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 310,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "LocalHandleDelta"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 311,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetSetKernelDOSProc"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 314,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DebugDefineSegment"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 315,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WriteOutProfiles"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 316,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetFreeMemInfo"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 318,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "FatalExitHook"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 319,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "FlushCachedFileHandle"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 320,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "IsTask"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 323,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "IsRomModule"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 324,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "LogError"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 325,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "LogParamError"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 326,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "IsRomFile"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 327,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "K327"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 328,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "_DebugOutput"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 329,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "K329"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 338,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "HasGPHandler"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 339,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "DiagQuery"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 340,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "DiagOutput"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 341,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "ToolHelpHook"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 343,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "RegisterWinOldApHook"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 344,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetWinOldApHooks"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 345,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "IsSharedSelector"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 351,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "BUNNY_351"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 352,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "lstrcatn"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 353,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "lstrcpyn"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 354,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "GetAppCompatFlags"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 355,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetWinDebugInfo"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 356,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetWinDebugInfo"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 357,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "MapSL"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 358,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "MapLS"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 359,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "UnMapLS"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 360,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "OpenFileEx"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 361,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "PIGLET_361"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 362,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ThunkTerminateProcess"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 365,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GlobalChangeLockCount"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 403,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "FarSetOwner"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 404,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "FarGetOwner"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 406,
+      "argbytes": 18,
+      "retval": 1,
+      "name": "WritePrivateProfileStruct"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 407,
+      "argbytes": 18,
+      "retval": 0,
+      "name": "GetPrivateProfileStruct"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 408,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "KERNEL_408"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 409,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "KERNEL_409"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 410,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "CreateProcessFromWinExec"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 411,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "GetCurrentDirectory"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 412,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "SetCurrentDirectory"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 413,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "FindFirstFile"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 414,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "FindNextFile"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 415,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "FindClose"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 416,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "WritePrivateProfileSection"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 417,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "WriteProfileSection"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 418,
+      "argbytes": 14,
+      "retval": 0,
+      "name": "GetPrivateProfileSection"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 419,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "GetProfileSection"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 420,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetFileAttributes"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 421,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "SetFileAttributes"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 422,
+      "argbytes": 20,
+      "retval": 0,
+      "name": "GetDiskFreeSpace"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 423,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "LogApiThk"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 431,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "IsPeFormat"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 432,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "FileTimeToLocalFileTime"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 434,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "UnicodeToAnsi"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 435,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetTaskFlags"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 436,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "_ConfirmSysLevel"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 437,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "_CheckNotSysLevel"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 438,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "_CreateSysLevel"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 439,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "_EnterSysLevel"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 440,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "_LeaveSysLevel"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 441,
+      "argbytes": 24,
+      "retval": 0,
+      "name": "CreateThread16"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 442,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "VWin32_EventCreate"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 443,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "VWin32_EventDestroy"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 444,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "Local32Info"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 445,
+      "argbytes": 6,
+      "retval": 1,
+      "name": "Local32First"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 446,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "Local32Next"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 447,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WIN32_OldYield"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 448,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "KERNEL_448"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 449,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetpWin16Lock"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 450,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "VWin32_EventWait"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 451,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "VWin32_EventSet"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 452,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "LoadLibrary32"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 453,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "GetProcAddress32"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 456,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "DefResourceHandler"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 457,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "CreateW32Event"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 458,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "SetW32Event"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 459,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "ResetW32Event"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 460,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "WaitForSingleObject"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 461,
+      "argbytes": 16,
+      "retval": 0,
+      "name": "WaitForMultipleObjects"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 462,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetCurrentThreadId"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 463,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "SetThreadQueue"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 464,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetThreadQueue"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 465,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "NukeProcess"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 466,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "ExitProcess"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 467,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOACreateConsole"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 468,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOASpawnConApp"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 469,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOAGimmeTitle"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 470,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOADestroyConsole"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 471,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetCurrentProcessId"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 472,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "MapHInstLS"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 473,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "MapHInstSL"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 474,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "CloseW32Handle"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 475,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetTEBSelectorFS"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 476,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "ConvertToGlobalHandle"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 477,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOAFullScreen"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 478,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOATerminateProcess"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 479,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "KERNEL_479"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 480,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "_EnterWin16Lock"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 481,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "_LeaveWin16Lock"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 482,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "LoadSystemLibrary32"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 483,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "MapProcessHandle"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 484,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "SetProcessDword"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 485,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetProcessDword"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 486,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "FreeLibrary32"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 487,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "GetModuleFileName32"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 488,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetModuleHandle32"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 489,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "KERNEL_489"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 490,
+      "argbytes": 2,
+      "retval": 1,
+      "name": "KERNEL_490"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 491,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "RegisterServiceProcess"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 492,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOAAbort"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 493,
+      "argbytes": 16,
+      "retval": 1,
+      "name": "UTInit"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 494,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "KERNEL_494"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 495,
+      "argbytes": 20,
+      "retval": 0,
+      "name": "WaitForMultipleObjectsEx"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 500,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "WOW16Call"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 501,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "KDDBGOUT"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 502,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOWGETNEXTVDMCOMMAND"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 503,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOWREGISTERSHELLWINDOWHANDLE"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 504,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOWLOADMODULE"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 505,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOWQUERYPERFORMANCECOUNTER"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 506,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOWCURSORICONOP"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 507,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOWFAILEDEXEC"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 508,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOWCLOSECOMPORT"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 511,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOWKILLREMOTETASK"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 512,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOWQUERYDEBUG"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 513,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "LoadLibraryEx32W"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 514,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "FreeLibrary32W"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 515,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "GetProcAddress32W"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 516,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "GetVDMPointer32W"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 517,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "CallProc32W"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 518,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "_CallProcEx32W"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 519,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "EXITKERNELTHUNK"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 533,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ConvertDDEHandleLS"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 534,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ConvertDDEHandleSL"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 535,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "VWin32_BoostThreadGroup"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 536,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "VWin32_BoostThreadStatic"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 537,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "KERNEL_537"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 538,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "ThunkTheTemplateHandle"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 540,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "KERNEL_540"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 541,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOWSETEXITONLASTAPP"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 542,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "KERNEL_542"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 543,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "KERNEL_543"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 544,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "WOWSETCOMPATHANDLE"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 560,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "SetThunkletCallbackGlue"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 561,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "AllocLSThunkletCallback"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 562,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "AllocSLThunkletCallback"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 563,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "FindLSThunkletCallback"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 564,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "FindSLThunkletCallback"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 566,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "KERNEL_566"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 567,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "AllocLSThunkletCallbackEx"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 568,
+      "argbytes": 10,
+      "retval": 0,
+      "name": "AllocSLThunkletCallbackEx"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 600,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "AllocCodeAlias"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 601,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "FreeCodeAlias"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 602,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetDummyModuleHandleDS"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 603,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "KERNEL_603"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 604,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "CBClientGlueSL"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 605,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "AllocSLThunkletCallback_dup"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 606,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "AllocLSThunkletCallback_dup"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 607,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "AllocLSThunkletSysthunk"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 608,
+      "argbytes": 12,
+      "retval": 0,
+      "name": "AllocSLThunkletSysthunk"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 609,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "FindLSThunkletCallback_dup"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 610,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "FindSLThunkletCallback_dup"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 611,
+      "argbytes": 8,
+      "retval": 1,
+      "name": "FreeThunklet"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 612,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "IsSLThunklet"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 613,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "HugeMapLS"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 614,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "HugeUnMapLS"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 615,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "ConvertDialog32To16"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 616,
+      "argbytes": 12,
+      "retval": 1,
+      "name": "ConvertMenu32To16"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 617,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetMenu32Size"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 618,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "GetDialog32Size"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 619,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "RegisterCBClient"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 620,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "CBClientThunkSL"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 621,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "CBClientThunkSLEx"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 622,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "UnRegisterCBClient"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 623,
+      "argbytes": 4,
+      "retval": 1,
+      "name": "InitCBClient"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 624,
+      "argbytes": 8,
+      "retval": 0,
+      "name": "SetFastQueue"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 625,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "GetFastQueue"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 626,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SmashEnvironment"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 627,
+      "argbytes": 10,
+      "retval": 1,
+      "name": "IsBadFlatReadWritePtr"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 630,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "C16ThkSL"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 631,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "C16ThkSL01"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 651,
+      "argbytes": 24,
+      "retval": 0,
+      "name": "ThunkConnect16"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 652,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "IsThreadId"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 653,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "OkWithKernelToChangeUsers"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 666,
+      "argbytes": 16,
+      "retval": 0,
+      "name": "UTGlue16"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 667,
+      "argbytes": 4,
+      "retval": 0,
+      "name": "EntryAddrProc"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 668,
+      "argbytes": 6,
+      "retval": 0,
+      "name": "MyAlloc"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 669,
+      "argbytes": 16,
+      "retval": 1,
+      "name": "DllEntryPoint"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 700,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "SSInit"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 701,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SSOnBigStack"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 702,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "SSCall"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 703,
+      "argbytes": 0,
+      "retval": 1,
+      "name": "CallProc32WFix"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 704,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "SSConfirmSmallStack"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 901,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "__wine_vxd_vmm"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 905,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "__wine_vxd_timer"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 909,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "__wine_vxd_reboot"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 910,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "__wine_vxd_vdd"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 912,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "__wine_vxd_vmd"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 914,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "__wine_vxd_comm"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 923,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "__wine_vxd_shell"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 933,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "__wine_vxd_pagefile"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 938,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "__wine_vxd_apm"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 939,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "__wine_vxd_vxdloader"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 945,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "__wine_vxd_win32s"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 951,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "__wine_vxd_configmg"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 955,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "__wine_vxd_enable"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 1990,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "__wine_vxd_timerapi"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 2000,
+      "argbytes": 2,
+      "retval": 0,
+      "name": "__wine_call_int_handler"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 2001,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "__wine_snoop_entry"
+    },
+    {
+      "module": "KERNEL",
+      "ordinal": 2002,
+      "argbytes": 0,
+      "retval": 0,
+      "name": "__wine_snoop_return"
+    }
+  ]
+}

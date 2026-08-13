@@ -31,6 +31,7 @@
 #include "../serial.h"
 
 #include "faad2/neaacdec.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 #define AAC_MAX_CHANNELS   8
 // AAC-LC frame is 1024 samples/channel; allow headroom (e.g. 960/1024).
@@ -544,7 +545,6 @@ const audio_codec_ops_t aac_codec_ops = {
 // pre-flight. One [RUST-DIFF] mp4, one [RUST-SEC] mp4, one [RUST-PERF] mp4 line.
 #include "mp4_test_build.h"
 
-extern void bootlog_write(const char *fmt, ...);
 
 static inline uint64_t mp4_tsc(void) {
     uint32_t lo, hi;

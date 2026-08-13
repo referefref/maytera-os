@@ -7,6 +7,7 @@
 #include "../../libc/syscall.h"
 #include "gldemo.h"   // #319 TinyGL demo render cores (reconciled #336)
 #include "planet_art.h"  // real CC0 planet sprites (2D Planet Pack 2, SBS)
+#include "screensaver_gfx.h"  // psychedelic redesign shared pipeline (docs/SCREENSAVER_PSYCHEDELIC_DESIGN.md)
 
 // ============================================================================
 // Static state
@@ -16,6 +17,11 @@ static screensaver_type_t g_ss_type    = SS_PLASMA;   // default Plasma (UIPROFI
 static int                g_ss_timeout = SS_DEFAULT_TIMEOUT; // seconds
 static uint32_t           g_ss_frame;
 static uint32_t           g_ss_seed    = 12345;
+// #570: uptime_ms() at the moment the screensaver last became active. Used by
+// screensaver_on_input() to ignore wake-on-input for a short grace window
+// right after activation (the click that activates it via Settings "Test"
+// still has its button-UP in flight).
+static uint64_t           g_ss_active_ms = 0;
 
 // Starfield
 static ss_star_t   g_stars[SS_MAX_STARS];
@@ -82,6 +88,33 @@ static uint32_t ss_hue(int h) {
     }
     return 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
 }
+
+// ============================================================================
+// Perf logging for the psychedelic effects (MEASURE, don't guess - see
+// docs/SCREENSAVER_PSYCHEDELIC_DESIGN.md §9). There is no userland syscall
+// for writing straight to the serial console, so this follows the same
+// established file-log convention main.c already uses for screensaver debug
+// (the /SSDEBUG.TXT frame-counter pattern): one fd opened once and kept open
+// (so repeated writes append via the advancing file offset, no O_APPEND
+// dance needed), a small per-call decimal formatter, and a hard cap on
+// total writes so an hours-long unattended run never grows this file
+// without bound.
+// ============================================================================
+// #650: ss_perf_log() DELETED. It opened /SSPERF.TXT and wrote one line per
+// rendered frame, from inside the screensaver render loop. It had NEVER
+// emitted a single line: the sys_open() failed (no such file), the function
+// latched fd = -1, and it disabled itself permanently for the life of the
+// process. Verified by running the saver to completion on a throwaway VM and
+// then mounting the ext2 root: no /SSPERF.TXT exists.
+//
+// That is the same zero-readers class as blk_stale_skips() and
+// g_msc_noblock_spins - an instrument everyone assumes is watching and which
+// has never produced data. Here it was strictly worse than useless, because
+// the version that DID open the file would have put a synchronous per-frame
+// disk write in the hot render path. Deleted rather than repaired: a
+// per-frame file write is not the right shape for this measurement, and the
+// numbers it was meant to produce are obtainable from the [HB] top= and
+// [FLIPPROF] cpy= fields that already exist and already work.
 
 // ============================================================================
 // Helpers
@@ -292,6 +325,11 @@ static void ss_blit_planet(int img, int cx, int cy, int sz) {
 void screensaver_init(void) {
     int32_t i;
 
+    // Psychedelic redesign shared pipeline (palettes etc.) - idempotent, so
+    // safe to call every time this runs (screensaver_set_type() calls
+    // screensaver_init() on every effect switch, not just once at boot).
+    ss_gfx_init();
+
     // Starfield: spread stars across the virtual 3-D volume.
     for (i = 0; i < SS_MAX_STARS; i++) {
         g_stars[i].x = (int32_t)(ss_rand() % (uint32_t)g_fb_width);
@@ -374,6 +412,13 @@ static void ss_gl_teardown(void) {
         gldemo_shutdown();
         g_gl_mode = -1;
     }
+}
+
+// #560: true for every GL-backed screensaver type (the original two GLCUBE/
+// GLMATRIX plus the ten added in #560). Relies on the enum block in
+// compositor.h staying contiguous from SS_GLCUBE through SS_GLLAVA.
+static int ss_is_gl_type(int t) {
+    return t >= SS_GLCUBE && t <= SS_GLLAVA;
 }
 
 // ============================================================================
@@ -627,19 +672,37 @@ void screensaver_render(void) {
 
     // -----------------------------------------------------------------------
     case SS_PLASMA: {
-        // Smooth animated plasma field (#282): summed sine waves -> hue.
-        int t = (int)g_ss_frame;
-        const int step = 4;
-        for (int y = 0; y < g_fb_height; y += step) {
-            for (int x = 0; x < g_fb_width; x += step) {
-                int v = SS_SIN(x / 6 + t)
-                      + SS_SIN(y / 8 - t)
-                      + SS_SIN((x + y) / 10 + t)
-                      + SS_SIN((x - y) / 14 - t / 2);
-                int hue = ((v >> 7) + t) & 0xFF;
-                draw_fill_rect(x, y, step, step, ss_hue(hue));
+        // "Plasma Reborn" (psychedelic redesign §4.3): direct upgrade of the
+        // classic plasma - same shared-sine family the old code already
+        // used, now rendered into the low-res HI buffer and bilinearly
+        // upscaled (smooth, not the old blocky step=4 squares), indexed
+        // through a curated palette LUT instead of the raw HSV wheel, with
+        // an added radial term for organic curvature, shared bloom, and
+        // slow palette cycling. This slot is a strict superset of the old
+        // SS_PLASMA, replaced in place (design doc §11 Q2).
+        uint32_t *buf = ss_lores_buf(SS_LORES_HI_W, SS_LORES_HI_H);
+        if (!buf) break;   // never dereference NULL; just skip this frame
+
+        int t  = (int)g_ss_frame;
+        int cx = SS_LORES_HI_W / 2, cy = SS_LORES_HI_H / 2;
+        for (int y = 0; y < SS_LORES_HI_H; y++) {
+            uint32_t *row = &buf[y * SS_LORES_HI_W];
+            int dy = y - cy;
+            for (int x = 0; x < SS_LORES_HI_W; x++) {
+                int dx   = x - cx;
+                int dist = ss_isqrt((uint32_t)(dx * dx + dy * dy));
+                int v = SS_SIN(x / 5 + t)
+                      + SS_SIN(y / 7 - t)
+                      + SS_SIN((x + y) / 9 + t)
+                      + SS_SIN((x - y) / 13 - t / 2)
+                      + SS_SIN(dist * 3 / 2 - t * 2);   // radial term: organic curvature
+                int idx = ((v >> 7) + t / 3 + ss_palette_phase) & 0xFF;
+                row[x] = ss_pal(SS_PAL_ACID, idx);
             }
         }
+        ss_palette_tick();
+        ss_lores_bloom(buf, SS_LORES_HI_W, SS_LORES_HI_H, 3, 45);
+        ss_lores_upscale_to_fb(buf, SS_LORES_HI_W, SS_LORES_HI_H);
         break;
     }
 
@@ -652,6 +715,237 @@ void screensaver_render(void) {
     case SS_GLMATRIX:  // #319 TinyGL 3D matrix code rain (reconciled #336)
         ss_gl_render(GLDEMO_MATRIX);
         break;
+
+    // -----------------------------------------------------------------------
+    // #560: ten psychedelic/geometric TinyGL screensavers.
+    case SS_GLTUNNEL:     ss_gl_render(GLDEMO_TUNNEL);     break;
+    case SS_GLKALEIDO:    ss_gl_render(GLDEMO_KALEIDO);    break;
+    case SS_GLPLATONIC:   ss_gl_render(GLDEMO_PLATONIC);   break;
+    case SS_GLLORENZ:     ss_gl_render(GLDEMO_LORENZ);     break;
+    case SS_GLMOBIUS:     ss_gl_render(GLDEMO_MOBIUS);     break;
+    case SS_GLWAVEMESH:   ss_gl_render(GLDEMO_WAVEMESH);   break;
+    case SS_GLSPIROGRAPH: ss_gl_render(GLDEMO_SPIROGRAPH); break;
+    case SS_GLHYPERCUBE:  ss_gl_render(GLDEMO_HYPERCUBE);  break;
+    case SS_GLVORTEX:     ss_gl_render(GLDEMO_VORTEX);     break;
+    case SS_GLLAVA:       ss_gl_render(GLDEMO_LAVA);       break;
+
+    // -----------------------------------------------------------------------
+    // Psychedelic redesign lead trio (docs/SCREENSAVER_PSYCHEDELIC_DESIGN.md).
+    // New IDs (>= 20, direct-pixel, NOT TinyGL - design doc principle 7).
+    // -----------------------------------------------------------------------
+
+    case SS_FLAME: {
+        // Fractal Flame "Bloom Garden" (design doc §4.1): IFS chaos-game
+        // point plot accumulated into a histogram over many frames (the
+        // "long exposure" look), tone-mapped through an isqrt gamma into
+        // the Ultraviolet palette, then bloomed. Detail BUILDS UP over
+        // time by design; a subtle ambient backdrop (also Ultraviolet,
+        // low brightness) keeps the buffer full-screen color from frame
+        // one rather than looking sparse before the histogram fills in.
+        uint16_t *density; uint8_t *hue;
+        if (!ss_flame_hist(&density, &hue)) break;
+
+        int t = (int)g_ss_frame;   // used by the ambient backdrop drift below
+
+        static int      s_fl_init     = 0;
+        static int32_t  s_fx, s_fy;        // chaos-game point, Q12 fixed point (-4096..4096)
+        static uint32_t s_fl_reset_at = 0;
+
+        // Five contractive affine transforms in Q12 fixed point (|coeff| <
+        // 4096 = 1.0, so the linear part alone is already contractive),
+        // each tagged with a hue (0..255) so "which transform last painted
+        // this cell" gives free, cheap per-region coloring. Blended 50/50
+        // below with a sinusoidal variation bounded to +-4096 by SS_SIN's
+        // own amplitude, so the point can never leave the [-4096,4096]
+        // square - no per-step clamp needed for stability.
+        static const int32_t xf[5][6] = {
+            /*  a,     b,     c,    d,     e,     f */
+            {  2048,     0,     0,     0,  2048,     0 },
+            {  2048,     0,  2048,     0,  2048,     0 },
+            {  2048,     0,  1024,     0,  2048,  2048 },
+            {  1229, -1229,   819,  1229,  1229,  -819 },
+            { -1229,  1229,  -819, -1229, -1229,   819 },
+        };
+        static const uint8_t xf_hue[5]    = { 0, 51, 102, 153, 204 };
+        static const int     xf_weight[5] = { 25, 25, 20, 15, 15 };   // sums to 100
+
+        if (!s_fl_init) {
+            s_fx = 0; s_fy = 0;
+            for (int i = 0; i < SS_FLAME_W * SS_FLAME_H; i++) { density[i] = 0; hue[i] = 0; }
+            s_fl_init = 1;
+            s_fl_reset_at = g_ss_frame + 9000;   // rare full reset (~5 min at 30Hz)
+        }
+        if (g_ss_frame >= s_fl_reset_at) {
+            for (int i = 0; i < SS_FLAME_W * SS_FLAME_H; i++) { density[i] = 0; hue[i] = 0; }
+            s_fx = 0; s_fy = 0;
+            s_fl_reset_at = g_ss_frame + 9000;
+        }
+
+        // Decay (~253/256, design doc §4.1) so the flame stays a living,
+        // slowly evolving structure rather than monotonically saturating.
+        for (int i = 0; i < SS_FLAME_W * SS_FLAME_H; i++) {
+            density[i] = (uint16_t)(((uint32_t)density[i] * 253) >> 8);
+        }
+
+        // Chaos-game point plot: bounded iteration count (design principle
+        // 6 - never an unbounded per-frame loop). NOT per-pixel.
+        {
+            const int ITERS = 5000;
+            for (int it = 0; it < ITERS; it++) {
+                int r = (int)(ss_rand() % 100);
+                int pick = 4, acc = 0;
+                for (int k = 0; k < 5; k++) { acc += xf_weight[k]; if (r < acc) { pick = k; break; } }
+                const int32_t *c = xf[pick];
+                int32_t nx = ((c[0] * s_fx + c[1] * s_fy) >> 12) + c[2];
+                int32_t ny = ((c[3] * s_fx + c[4] * s_fy) >> 12) + c[5];
+                int32_t vx = SS_SIN((nx * 128) / 4096);
+                int32_t vy = SS_SIN((ny * 128) / 4096);
+                nx = (nx + vx) / 2;
+                ny = (ny + vy) / 2;
+                s_fx = nx; s_fy = ny;
+
+                if (it < 20) continue;   // discard the IFS settle-in
+
+                int32_t px = SS_FLAME_W / 2 + (s_fx * (SS_FLAME_W / 2 - 4)) / 4096;
+                int32_t py = SS_FLAME_H / 2 + (s_fy * (SS_FLAME_H / 2 - 4)) / 4096;
+                if (px < 0 || px >= SS_FLAME_W || py < 0 || py >= SS_FLAME_H) continue;
+                int32_t cell = py * SS_FLAME_W + px;
+                if (density[cell] < 65535) density[cell]++;
+                hue[cell] = xf_hue[pick];
+            }
+        }
+
+        // Tone-map + ambient backdrop + composite into the shared HI color
+        // buffer (bounded 320x200 = 64000 cells, same cost class as
+        // Plasma's per-cell work).
+        uint32_t *buf = ss_lores_buf(SS_LORES_HI_W, SS_LORES_HI_H);
+        if (buf) {
+            for (int y = 0; y < SS_FLAME_H; y++) {
+                for (int x = 0; x < SS_FLAME_W; x++) {
+                    int i = y * SS_FLAME_W + x;
+
+                    // MEASURED FIX (the build host VM 2410 live screendump): the first
+                    // cut of this ambient term used x*2/y*3 (a MULTIPLY, not
+                    // the divide every other low-res effect in this file
+                    // uses), which wraps the 256-entry SS_SIN table 2-3
+                    // times across the 320x200 buffer and reads as a small
+                    // repeating tiled-oval pattern, not one smooth wash -
+                    // plus a 40/255 (~16%) brightness scale that stayed too
+                    // close to the palette's near-black low end, so the
+                    // whole buffer looked mostly dark with sparse dots (the
+                    // literal "lines on black" failure this redesign exists
+                    // to fix). Low frequency (divide, under one full cycle
+                    // across the buffer - the same idiom Plasma Reborn
+                    // already uses) plus a +128 index offset (stays in
+                    // Ultraviolet's violet/hot-pink/white range, away from
+                    // its dark indigo end) plus a much stronger brightness
+                    // scale fixes both at once.
+                    int av   = SS_SIN(x / 40 + t / 3) + SS_SIN(y / 30 - t / 4);
+                    int aidx = (128 + (av >> 5) + t / 5 + ss_palette_phase) & 0xFF;
+                    uint32_t ac = ss_pal(SS_PAL_ULTRAVIOLET, aidx);
+                    int ar = (int)((ac >> 16) & 0xFF) * 150 / 255;
+                    int ag = (int)((ac >> 8) & 0xFF) * 150 / 255;
+                    int ab = (int)(ac & 0xFF) * 150 / 255;
+
+                    // Gain bumped 64 -> 220: MEASURED live, the classic
+                    // 3-vertex-contraction transforms below (T0-T2) are
+                    // structurally a Sierpinski-triangle-family IFS, which
+                    // is a genuinely thin/low-area fractal (Hausdorff dim
+                    // ~1.58) even after millions of accumulated points, so
+                    // per-cell density stays low; a bigger gain makes that
+                    // real (not sparse-by-bug) filament actually visible as
+                    // a bright accent on top of the ambient wash above,
+                    // instead of reading as near-invisible pixel dust.
+                    int bright = ss_isqrt((uint32_t)density[i] * 220u);
+                    if (bright > 255) bright = 255;
+                    uint32_t base = ss_pal(SS_PAL_ULTRAVIOLET, hue[i]);
+                    int br = (int)((base >> 16) & 0xFF) * bright / 255;
+                    int bg = (int)((base >> 8) & 0xFF) * bright / 255;
+                    int bb = (int)(base & 0xFF) * bright / 255;
+
+                    int r = ar + br; if (r > 255) r = 255;
+                    int g = ag + bg; if (g > 255) g = 255;
+                    int b = ab + bb; if (b > 255) b = 255;
+                    buf[i] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+                }
+            }
+            ss_palette_tick();
+            ss_lores_bloom(buf, SS_LORES_HI_W, SS_LORES_HI_H, 4, 90);
+            ss_lores_upscale_to_fb(buf, SS_LORES_HI_W, SS_LORES_HI_H);
+        }
+        break;
+    }
+
+    case SS_STAINEDGLASS: {
+        // Stained-Glass Warp (design doc §4.6): N drifting feature points,
+        // a brute-force nearest/second-nearest Voronoi scan per low-res
+        // cell. Hard ink-black edges near cell boundaries; smooth per-cell
+        // radial gradient interiors elsewhere - the literal "smooth
+        // gradients AND hard dark-edged shapes in the same frame" brief.
+        uint32_t *buf = ss_lores_buf(SS_LORES_LO_W, SS_LORES_LO_H);
+        if (!buf) break;
+
+        #define SG_N 10
+        typedef struct { int32_t x, y, vx, vy; uint8_t hue; } sg_pt_t;
+        static sg_pt_t s_sg[SG_N];
+        static int     s_sg_init = 0;
+        if (!s_sg_init) {
+            for (int i = 0; i < SG_N; i++) {
+                s_sg[i].x = (int32_t)(ss_rand() % (uint32_t)SS_LORES_LO_W);
+                s_sg[i].y = (int32_t)(ss_rand() % (uint32_t)SS_LORES_LO_H);
+                int32_t vx = (int32_t)(ss_rand() % 3) - 1; if (vx == 0) vx = 1;
+                int32_t vy = (int32_t)(ss_rand() % 3) - 1; if (vy == 0) vy = 1;
+                s_sg[i].vx  = vx;
+                s_sg[i].vy  = vy;
+                s_sg[i].hue = (uint8_t)((255 * i) / SG_N);
+            }
+            s_sg_init = 1;
+        }
+        for (int i = 0; i < SG_N; i++) {
+            s_sg[i].x += s_sg[i].vx;
+            s_sg[i].y += s_sg[i].vy;
+            if (s_sg[i].x < 0 || s_sg[i].x >= SS_LORES_LO_W) { s_sg[i].vx = -s_sg[i].vx; s_sg[i].x += s_sg[i].vx * 2; }
+            if (s_sg[i].y < 0 || s_sg[i].y >= SS_LORES_LO_H) { s_sg[i].vy = -s_sg[i].vy; s_sg[i].y += s_sg[i].vy * 2; }
+        }
+
+        for (int y = 0; y < SS_LORES_LO_H; y++) {
+            uint32_t *row = &buf[y * SS_LORES_LO_W];
+            for (int x = 0; x < SS_LORES_LO_W; x++) {
+                int32_t d1 = 0x7FFFFFFF, d2 = 0x7FFFFFFF;
+                int best = 0;
+                for (int i = 0; i < SG_N; i++) {
+                    int32_t ddx = x - s_sg[i].x, ddy = y - s_sg[i].y;
+                    int32_t ds  = ddx * ddx + ddy * ddy;
+                    if (ds < d1) { d2 = d1; d1 = ds; best = i; }
+                    else if (ds < d2) { d2 = ds; }
+                }
+                int dist1 = ss_isqrt((uint32_t)d1);
+                int dist2 = ss_isqrt((uint32_t)d2);
+                int edge  = dist2 - dist1;
+                if (edge < 3) {
+                    // Hard ink-black boundary.
+                    int e2 = edge < 0 ? 0 : edge;
+                    int shade = e2 * 60 / 3;   // ramps 0..~60 as the boundary widens to the threshold
+                    row[x] = 0xFF000000u | ((uint32_t)shade << 16) | ((uint32_t)shade << 8) | (uint32_t)shade;
+                } else {
+                    // Smooth radial gradient interior, own hue per pane.
+                    uint32_t base = ss_pal(SS_PAL_DEEPSEA, s_sg[best].hue + ss_palette_phase);
+                    int bright = 255 - dist1 * 5;
+                    if (bright < 60) bright = 60;
+                    if (bright > 255) bright = 255;
+                    int r = (int)((base >> 16) & 0xFF) * bright / 255;
+                    int g = (int)((base >> 8) & 0xFF) * bright / 255;
+                    int b = (int)(base & 0xFF) * bright / 255;
+                    row[x] = 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+                }
+            }
+        }
+        ss_palette_tick();
+        ss_lores_bloom(buf, SS_LORES_LO_W, SS_LORES_LO_H, 1, 18);
+        ss_lores_upscale_to_fb(buf, SS_LORES_LO_W, SS_LORES_LO_H);
+        #undef SG_N
+        break;
+    }
     }
 
     g_ss_frame++;
@@ -665,11 +959,36 @@ void screensaver_on_input(void) {
     // Reset the idle timer to the current monotonic millisecond.
     g_idle_ms = uptime_ms();
 
-    // Dismiss an active screensaver on any user input.
+    // Dismiss an active screensaver on any user input, except for a brief
+    // grace window right after activation (#570). Without this, the very
+    // click that activates the saver (Settings "Test", or a stray motion
+    // from that same click's button-UP) instantly wakes it again, so it
+    // flashes for a frame and vanishes before anyone (or a screenshot) can
+    // see it. uptime_ms() is the same monotonic kernel clock used for the
+    // idle timeout below, so this needs no extra polling or busy-wait.
     if (g_screensaver_active) {
+        uint64_t now = uptime_ms();
+        if (now - g_ss_active_ms < SS_ACTIVATE_GRACE_MS) {
+            return;   // still within the activation grace window: ignore
+        }
         g_screensaver_active = false;
         g_needs_redraw       = true;
     }
+}
+
+// Record the activation timestamp. Called from every place that flips
+// g_screensaver_active to true: the idle timeout below, the Settings "Test"
+// one-shot trigger, and the TESTHOOK SAVER command (main.c / testhook.c).
+void screensaver_note_activated(void) {
+    g_ss_active_ms = uptime_ms();
+}
+
+// #652: expose the last-activation timestamp so main.c's render_frame() can
+// tell how long the screensaver has been running CONTINUOUSLY (as opposed to
+// g_idle_ms, which tracks idle time BEFORE activation and keeps advancing
+// only on input). Used to gate the blank-after stage (SS_BLANK_AFTER_MS).
+uint64_t screensaver_active_since_ms(void) {
+    return g_ss_active_ms;
 }
 
 // ============================================================================
@@ -687,6 +1006,23 @@ bool screensaver_check_timeout(void) {
         return false;
     }
 
+    // #596: fullscreen presenting-app exemption. "Idle" used to mean "no
+    // keyboard/mouse INPUT", which is wrong for a fullscreen game or GL app in
+    // a no-input phase: it is rendering every frame, yet after the timeout the
+    // screensaver activated and fully occluded it until real input arrived.
+    // That also broke every headless verification run (plasma on screen was
+    // mistaken for the desktop while an app was actually running underneath).
+    // main.c stamps g_fs_present_ms whenever a TRUE-FULLSCREEN window presents
+    // a frame; while that stamp is fresh, treat it as activity: hold the idle
+    // timer at "now" and never activate. When the app stops presenting (or is
+    // closed) the stamp goes stale and the full idle timeout starts from that
+    // moment, so plain idle-desktop behavior is completely unchanged.
+    if (g_fs_present_ms != 0 &&
+        (uptime_ms() - g_fs_present_ms) < SS_FS_PRESENT_GRACE_MS) {
+        g_idle_ms = uptime_ms();
+        return false;
+    }
+
     // Activation delay is read live from the kernel (#115) so a Settings
     // change applies without restarting the compositor; guard with default.
     int delay = get_ss_delay();
@@ -699,6 +1035,7 @@ bool screensaver_check_timeout(void) {
 
     if (elapsed_ms >= (uint64_t)g_ss_timeout * 1000ULL) {
         g_screensaver_active = true;
+        screensaver_note_activated();
         return true;
     }
 
@@ -708,10 +1045,46 @@ bool screensaver_check_timeout(void) {
 
 // Change the active screensaver effect at runtime (Settings selection).
 void screensaver_set_type(int t) {
-    if (t < 0 || t > SS_GLMATRIX) return;   // #319 allow GL saver ids (reconciled #336)
+    // #319 allow GL saver ids, extended #560; extended again for the
+    // psychedelic redesign's two new direct-pixel IDs (SS_FLAME,
+    // SS_STAINEDGLASS, both >= 20, both NOT TinyGL).
+    if (t < 0 || t > SS_STAINEDGLASS) return;
+    // #560/#571 GATE REMOVED (was: `if (t >= SS_GLTUNNEL && t <= SS_GLLAVA)
+    // return;`). History: GLTUNNEL was measured to crash COMPOSIT (page
+    // fault in gl_M4_Mul, zmath.c:65) from a GL_LINE_LOOP vertex-cache
+    // overflow; fixed in f5ee702 (GL_LINE_STRIP + a defensive clamp in
+    // vertex.c's glopVertex()). GLKALEIDO/GLPLATONIC separately rendered
+    // BLACK from the same GL_LINE_LOOP-is-a-no-op issue; fixed in 69072be.
+    // A later re-verification session (2026-07-21, see CHANGELOG) found a
+    // THIRD, different-looking defect after those two fixes landed: all ten
+    // effects rendered as a full-screen soft rainbow gradient instead of
+    // their geometry, gate was put back on (this block) pending root-cause.
+    //
+    // #571 (this session): reproduced the original gradient screenshots
+    // first (confirmed the historical report was real), then bisected on a
+    // throwaway TESTHOOK build (compositor.h gate bypassed there only,
+    // never in this tree): disabling all glVertex/glBegin/glEnd emission in
+    // gldemo.c's draw_hypercube() left the correct solid glClearColor with
+    // no gradient, proving the fault was in primitive rendering, not
+    // glClear/ZB_open/the framebuffer copy. Progressively restoring real
+    // geometry (fixed color -> per-line alternating hard colors -> the real
+    // 256-entry hue LUT with no time offset -> the byte-for-byte unmodified
+    // shipped file) rendered CORRECTLY at every step, including the last
+    // (stock, unmodified) one. MEASURED: all ten effects (GLTUNNEL,
+    // GLKALEIDO, GLPLATONIC, GLLORENZ, GLMOBIUS, GLWAVEMESH, GLSPIROGRAPH,
+    // GLHYPERCUBE, GLVORTEX, GLLAVA) were boot-tested via testhook.c's
+    // `SAVER <id>` on VM 2410 against this exact commit, two screendumps
+    // (~4s apart, differing md5 proving live animation) per effect, all
+    // rendering their intended geometry with no gradient, no crash, no
+    // hang, and returning cleanly to the desktop on dismiss. INFERRED: the
+    // gradient bug itself was most likely fixed incidentally by 69072be or
+    // 93af69e (shared TinyGL bounds-check work) between the 07-21 session
+    // and now; the exact commit was not bisected since current HEAD is
+    // what matters for shipping. The gate was leftover from before that
+    // fix, reintroduced by ff3ca5f's merge of an older base. See blame.md.
     if ((screensaver_type_t)t == g_ss_type) return;
     // Free the TinyGL context when switching to a non-GL effect.
-    if (t != SS_GLCUBE && t != SS_GLMATRIX)
+    if (!ss_is_gl_type(t))
         ss_gl_teardown();
     g_ss_type = (screensaver_type_t)t;
     screensaver_init();   // re-seed state for the new effect

@@ -1,13 +1,25 @@
 // gldemo.h - shared 3D demo render cores (spinning textured cube + 3D matrix
-// rain) built on TinyGL. Used by the glcube/glmatrix userland apps AND by the
-// compositor GL screensavers. One TinyGL context per process (gl_ctx is global),
-// so only one gldemo can be active at a time. (#319)
+// rain, plus ten psychedelic/geometric screensaver cores added in #560) built
+// on TinyGL. Used by the glcube/glmatrix userland apps AND by the compositor
+// GL screensavers. One TinyGL context per process (gl_ctx is global), so only
+// one gldemo can be active at a time. (#319, extended #560)
 #ifndef _GLDEMO_H
 #define _GLDEMO_H
 #include <stdint.h>
 
-#define GLDEMO_CUBE   0
-#define GLDEMO_MATRIX 1
+#define GLDEMO_CUBE        0
+#define GLDEMO_MATRIX      1
+// --- #560: ten psychedelic/geometric screensaver cores ---
+#define GLDEMO_TUNNEL      2   // rainbow ring tunnel flythrough
+#define GLDEMO_KALEIDO     3   // mirrored rotating kaleidoscope, 8-fold symmetry
+#define GLDEMO_PLATONIC    4   // tetra/cube/octa/icosahedron morph cycle
+#define GLDEMO_LORENZ      5   // Lorenz strange attractor, rainbow trail
+#define GLDEMO_MOBIUS      6   // twisting Mobius strip, hue along its length
+#define GLDEMO_WAVEMESH    7   // grid deformed by interfering sine waves
+#define GLDEMO_SPIROGRAPH  8   // 3D harmonograph / epitrochoid sweep
+#define GLDEMO_HYPERCUBE   9   // rotating tesseract (4D->3D->2D projection)
+#define GLDEMO_VORTEX      10  // swirling particle vortex, point sprites
+#define GLDEMO_LAVA        11  // drifting alpha-blended low-poly lava blobs
 
 // (Re)initialize the GL context and the chosen demo at size w x h.
 // Returns 1 on success, 0 on failure. Safe to call repeatedly (it tears down

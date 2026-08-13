@@ -393,3 +393,249 @@ pub extern "C" fn http_parse_uint_rs(s: *const u8, len: usize) -> usize {
     }
     val
 }
+
+// ============================================================================
+// #608 (NEW kernel logic, written in Rust per the Rust-first mandate): HTTP
+// byte-range response framing, for the App Store's chunked package download.
+//
+// The App Store downloads a >100MB package as a sequence of 256KB `Range:`
+// requests streamed to disk and hashed incrementally (#570). Nothing in the
+// kernel ever checked that a 206 Partial Content response actually carries the
+// range that was asked for. A server (or a caching proxy, or a MITM on plain
+// http) that answers a DIFFERENT range with 206 makes the client write the
+// wrong bytes at the wrong file offset. The signed-manifest sha256 still
+// catches that and refuses the install (fail-closed, unchanged), but only
+// after ~100MB has been transferred, and it is reported as a hash mismatch
+// rather than as the framing error it is.
+//
+// These parse REMOTE, attacker-influenced header bytes, which is exactly the
+// Tier-2 untrusted-wire-input category the ledger puts in Rust. Both are pure,
+// bounded to the caller's slice, allocation-free, and take no locks. NEW code,
+// so there is no `_c` reference twin to keep and no -DRUST_* strangler flag:
+// the strangler pattern applies where Rust REPLACES existing C.
+//
+// FAIL-OPEN BY DESIGN on anything unparseable. http_range_check_rs returns
+// ACCEPT unless BOTH sides parsed AND provably disagree, and a server that
+// returns a SHORTER range than requested is accepted (RFC 7233 lets a server
+// satisfy less than was asked; the client loop advances by the bytes it got).
+// Only a wrong START offset or an OVERSHOOT past the requested end is
+// rejected. A new check that starts refusing responses no previous build
+// refused is itself a regression risk; this one can only reject a definite,
+// provable mismatch.
+// ============================================================================
+
+/// Case-insensitively locate a header whose name is `name` (which must include
+/// the trailing ':') at the START OF A LINE within `b`, returning the offset of
+/// the first byte after the colon. Anchoring to a line start is what keeps
+/// "Access-Control-Expose-Headers: Content-Range" from being mistaken for the
+/// Content-Range header itself.
+fn hdr_line_value(b: &[u8], name: &[u8]) -> Option<usize> {
+    let n = b.len();
+    let nl = name.len();
+    if nl == 0 || n < nl {
+        return None;
+    }
+    let mut i: usize = 0;
+    while i + nl <= n {
+        let at_line_start = i == 0 || b[i - 1] == b'\n';
+        if at_line_start {
+            let mut k = 0usize;
+            while k < nl {
+                let mut ca = b[i + k];
+                if ca.is_ascii_uppercase() {
+                    ca += 32;
+                }
+                let mut cb = name[k];
+                if cb.is_ascii_uppercase() {
+                    cb += 32;
+                }
+                if ca != cb {
+                    break;
+                }
+                k += 1;
+            }
+            if k == nl {
+                return Some(i + nl);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse decimal digits at b[i..], returning (value, next_index, saw_digit).
+/// Saturating so a pathological digit run can never wrap into a small value.
+fn parse_u64(b: &[u8], mut i: usize) -> (u64, usize, bool) {
+    let n = b.len();
+    let mut v: u64 = 0;
+    let mut any = false;
+    while i < n && b[i].is_ascii_digit() {
+        v = v.saturating_mul(10).saturating_add((b[i] - b'0') as u64);
+        i += 1;
+        any = true;
+    }
+    (v, i, any)
+}
+
+fn skip_ws(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    i
+}
+
+/// Parse the REQUEST header block for a single `Range: bytes=FIRST-LAST`.
+/// Returns 1 and writes *first/*last on success; 0 otherwise (absent header,
+/// multi-range, suffix range "-N", or open-ended "N-", none of which this
+/// kernel ever emits and none of which can be checked against a response).
+/// # Safety: `hdr` must point to >= `len` readable bytes; may be null.
+#[no_mangle]
+pub extern "C" fn http_range_req_parse_rs(hdr: *const u8, len: u32,
+                                          first: *mut u64, last: *mut u64) -> i32 {
+    if hdr.is_null() {
+        return 0;
+    }
+    let n = len as usize;
+    // SAFETY: caller guarantees `hdr` spans >= `len` readable bytes; the slice
+    // covers exactly `len` and every index below is bounds-checked against it.
+    let b: &[u8] = unsafe { core::slice::from_raw_parts(hdr, n) };
+    let Some(v) = hdr_line_value(b, b"range:") else { return 0; };
+    let i = skip_ws(b, v);
+    // require the "bytes=" unit
+    let unit = b"bytes=";
+    if i + unit.len() > n {
+        return 0;
+    }
+    let mut k = 0usize;
+    while k < unit.len() {
+        let mut ca = b[i + k];
+        if ca.is_ascii_uppercase() {
+            ca += 32;
+        }
+        if ca != unit[k] {
+            return 0;
+        }
+        k += 1;
+    }
+    let (f, i2, any_f) = parse_u64(b, i + unit.len());
+    if !any_f || i2 >= n || b[i2] != b'-' {
+        return 0;
+    }
+    let (l, i3, any_l) = parse_u64(b, i2 + 1);
+    if !any_l || l < f {
+        return 0;
+    }
+    // A comma here means a multi-range request: not checkable, decline.
+    if i3 < n && b[i3] == b',' {
+        return 0;
+    }
+    // SAFETY: out pointers are null-checked before each write.
+    unsafe {
+        if !first.is_null() {
+            *first = f;
+        }
+        if !last.is_null() {
+            *last = l;
+        }
+    }
+    1
+}
+
+/// Parse a RESPONSE header block for `Content-Range: bytes FIRST-LAST/TOTAL`.
+/// Returns 1 and writes *first/*last/*total on success; 0 otherwise. An
+/// unknown total ("*") is reported as u64::MAX. An unsatisfied-range form
+/// ("bytes */NNN") has no first/last and is declined (0).
+/// # Safety: `hdr` must point to >= `len` readable bytes; may be null.
+#[no_mangle]
+pub extern "C" fn http_content_range_parse_rs(hdr: *const u8, len: u32, first: *mut u64,
+                                              last: *mut u64, total: *mut u64) -> i32 {
+    if hdr.is_null() {
+        return 0;
+    }
+    let n = len as usize;
+    // SAFETY: caller guarantees `hdr` spans >= `len` readable bytes; the slice
+    // covers exactly `len` and every index below is bounds-checked against it.
+    let b: &[u8] = unsafe { core::slice::from_raw_parts(hdr, n) };
+    let Some(v) = hdr_line_value(b, b"content-range:") else { return 0; };
+    let mut i = skip_ws(b, v);
+    // optional "bytes" unit followed by whitespace
+    let unit = b"bytes";
+    if i + unit.len() <= n {
+        let mut k = 0usize;
+        while k < unit.len() {
+            let mut ca = b[i + k];
+            if ca.is_ascii_uppercase() {
+                ca += 32;
+            }
+            if ca != unit[k] {
+                break;
+            }
+            k += 1;
+        }
+        if k == unit.len() {
+            i = skip_ws(b, i + unit.len());
+        }
+    }
+    let (f, i2, any_f) = parse_u64(b, i);
+    if !any_f || i2 >= n || b[i2] != b'-' {
+        return 0;
+    }
+    let (l, i3, any_l) = parse_u64(b, i2 + 1);
+    if !any_l || l < f {
+        return 0;
+    }
+    let mut t: u64 = u64::MAX;
+    if i3 < n && b[i3] == b'/' {
+        if i3 + 1 < n && b[i3 + 1] == b'*' {
+            t = u64::MAX;
+        } else {
+            let (tv, _, any_t) = parse_u64(b, i3 + 1);
+            if any_t {
+                t = tv;
+            }
+        }
+    }
+    // SAFETY: out pointers are null-checked before each write.
+    unsafe {
+        if !first.is_null() {
+            *first = f;
+        }
+        if !last.is_null() {
+            *last = l;
+        }
+        if !total.is_null() {
+            *total = t;
+        }
+    }
+    1
+}
+
+/// Gate a 206 Partial Content response against the Range that was requested.
+/// Returns 1 = ACCEPT, 0 = REJECT. Rejects only a provable mismatch: a wrong
+/// start offset, or a last byte past the end that was asked for. Everything
+/// else (either header absent or unparseable, a shorter-than-requested range)
+/// is accepted so this can never turn a previously working fetch into a
+/// failure.
+/// # Safety: both pointers must span their stated lengths; either may be null.
+#[no_mangle]
+pub extern "C" fn http_range_check_rs(req_hdr: *const u8, req_len: u32,
+                                      resp_hdr: *const u8, resp_len: u32) -> i32 {
+    let mut qf: u64 = 0;
+    let mut ql: u64 = 0;
+    if http_range_req_parse_rs(req_hdr, req_len, &mut qf, &mut ql) != 1 {
+        return 1;
+    }
+    let mut rf: u64 = 0;
+    let mut rl: u64 = 0;
+    let mut rt: u64 = 0;
+    if http_content_range_parse_rs(resp_hdr, resp_len, &mut rf, &mut rl, &mut rt) != 1 {
+        return 1;
+    }
+    if rf != qf {
+        return 0;
+    }
+    if rl > ql {
+        return 0;
+    }
+    1
+}

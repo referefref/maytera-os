@@ -5,6 +5,14 @@
 #include "../types.h"
 #include "framebuffer.h"
 
+// Block-mosaic a rectangular region of the active draw buffer in place: sample
+// one pixel per BLOCKxBLOCK cell and fill the cell with it. A cheap, integer,
+// SSE-free "frosted glass" approximation of a blur (see the login/lock screens,
+// #567). Operates through fb_get_pixel/fb_put_pixel so it is correct in both
+// double- and single-buffered modes. Intended for one-shot backdrop prep, not
+// per-frame work.
+void gfx_mosaic_region(int32_t x, int32_t y, int32_t w, int32_t h, int32_t block);
+
 // Draw a filled circle
 void gfx_fill_circle(int32_t cx, int32_t cy, int32_t radius, uint32_t color);
 
@@ -25,6 +33,15 @@ uint32_t gfx_blend(uint32_t color1, uint32_t color2, uint8_t alpha);
 // Draw a simple test pattern
 void gfx_test_pattern(void);
 
+// #569: boot-splash framebuffer ownership. The splash-drawing calls below
+// (progress/status/log/spinner/refresh) only touch the framebuffer while the
+// splash OWNS the display. login_init()/desktop_run() release it so late
+// background logging (e.g. the periodic xHCI rescan worker) can never repaint
+// the boot log over a live UI; an explicit splash call re-acquires it.
+void gfx_boot_acquire_display(void);
+void gfx_boot_release_display(void);
+bool gfx_boot_owns_display(void);
+
 // Boot splash screen
 void gfx_boot_splash(void);
 void gfx_boot_progress(int percent);
@@ -32,6 +49,8 @@ void gfx_boot_status(const char *status);
 
 // Boot log (scrolling dmesg-style output below loading bar)
 void gfx_boot_log(const char *message);
+// #610: rewrite the LAST boot-log line in place (live progress readouts).
+void gfx_boot_log_replace(const char *message);
 void gfx_boot_log_clear(void);
 
 // Draw boot image (centered, scaled) - uses BOOT.BMP if loaded, gradient otherwise

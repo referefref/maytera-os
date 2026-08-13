@@ -11,7 +11,7 @@
  *      lives in a malloc'd buffer of EXACTLY the mutated length, so ASan's
  *      redzones catch any read past the end. Assert it never crashes.
  *
- * Build (on the userland build container, pinned rustc 1.97.0):
+ * Build (on the build container, pinned rustc 1.97.0):
  *   rustc --edition 2021 --crate-type staticlib --target x86_64-unknown-linux-gnu \
  *         -C opt-level=2 -C panic=abort -o librss_rs_host.a ../rss_rs.rs
  *   cc -g -O1 -fsanitize=address,undefined harness.c librss_rs_host.a -o harness

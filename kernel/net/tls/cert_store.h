@@ -77,15 +77,22 @@ typedef enum {
     SAN_EMAIL
 } san_type_t;
 
-// Subject Alternative Name entry
+// Subject Alternative Name entry.
+//
+// LENGTH-DELIMITED, DELIBERATELY. The previous layout was a NUL-terminated
+// `char dns_name[256]` inside a union, which meant the only way to read a
+// dNSName was with str* functions, which meant "evil.example\0good.example"
+// was truncated at the NUL and matched as "evil.example". That was not a bug
+// in the matcher; it was a bug in the TYPE. `len` is authoritative here and
+// there is no terminator, so the truncation cannot be expressed.
+//
+// Layout is mirrored by CertSan in rustkern/certname.rs and locked with a
+// _Static_assert in cert_store.c. `type` is uint32_t rather than the enum so
+// the ABI is fixed regardless of how a compiler sizes enums.
 typedef struct {
-    san_type_t type;
-    union {
-        char dns_name[CERT_MAX_CN_LENGTH];
-        uint8_t ip_addr[16];  // IPv4 or IPv6
-        char email[CERT_MAX_CN_LENGTH];
-    } value;
-    int ip_len;  // 4 for IPv4, 16 for IPv6
+    uint32_t type;                    // san_type_t value
+    uint32_t len;                     // BYTE length of val; no NUL terminator
+    uint8_t  val[CERT_MAX_CN_LENGTH]; // dNSName / iPAddress / rfc822Name bytes
 } cert_san_t;
 
 // Certificate validity period
@@ -159,8 +166,20 @@ typedef struct cert_x509 {
     // Extensions
     int is_ca;
     int path_length;  // -1 if not set
-    int key_usage;
-    int ext_key_usage;
+    int key_usage;      // KU_* bitmask (rustkern/certname.rs)
+    int ext_key_usage;  // EKU_* bitmask (rustkern/certname.rs)
+    // RFC 5280: an ABSENT keyUsage/extendedKeyUsage imposes NO restriction,
+    // which is not the same as a mask of zero. Before this change both fields
+    // were left at 0 by kzalloc forever and read by nobody, so the distinction
+    // never came up; now that they are enforced, conflating "absent" with
+    // "permits nothing" would reject every certificate that omits them.
+    int ku_present;
+    int eku_present;
+    // Set when the certificate carried ANY dNSName SAN, including one that was
+    // then dropped as malformed. Suppresses the CN fallback per RFC 6125 even
+    // when the SAN list ends up empty, so an attacker cannot restore the
+    // fallback by making its own SAN unparseable.
+    int san_dns_present;
     
     // Subject Alternative Names
     cert_san_t san[CERT_MAX_SAN_ENTRIES];

@@ -598,6 +598,19 @@ enum {
 	GL_EXTENSIONS			= 0x1F03,
 	GL_LICENSE			= 0x1F04,
 
+	/* AssaultCube port phase 2: multitexture unit enums. glActiveTexture /
+	   glClientActiveTexture are stubs (stubs_ac.c) but AC's source
+	   references these constants directly, so they must exist even though
+	   they have no real per-unit effect yet. Real OpenGL 1.3 values. */
+	GL_TEXTURE0			= 0x84C0,
+	GL_TEXTURE1			= 0x84C1,
+	GL_TEXTURE2			= 0x84C2,
+	GL_TEXTURE3			= 0x84C3,
+	GL_TEXTURE4			= 0x84C4,
+	GL_TEXTURE5			= 0x84C5,
+	GL_TEXTURE6			= 0x84C6,
+	GL_TEXTURE7			= 0x84C7,
+
 	/* Errors */
 	GL_NO_ERROR				= 0x0,
 	GL_INVALID_VALUE		= 0x0501,
@@ -727,6 +740,7 @@ typedef unsigned int	GLuint;		/* 4-byte unsigned */
 typedef float		GLfloat;	/* single precision float */
 typedef double		GLdouble;	/* double precision float */
 typedef GLint 		GLsizei; /* Same as GLint */
+typedef GLfloat		GLclampf; /* AssaultCube port phase 2: glAlphaFunc's ref param */
 
 
 #if COMPILETIME_TINYGL_COMPAT_TEST == 1
@@ -855,6 +869,45 @@ void glScalef(GLfloat x,GLfloat y,GLfloat z);
 void glViewport(GLint x,GLint y,GLint width,GLint height);
 void glFrustum(GLdouble left,GLdouble right,GLdouble bottom,GLdouble top,
                GLdouble near,GLdouble far);
+/* AssaultCube port phase 2 (see docs/ASSAULTCUBE_PORT_PLAN.md,
+   userland/apps/assaultcube/PORT-STATUS.md for what's real vs stubbed) */
+void glOrtho(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top,
+             GLdouble near, GLdouble far);       /* real: matrix.c */
+void glDepthFunc(GLenum func);                    /* real: state_ext.c + ztriangle.c */
+void glAlphaFunc(GLenum func, GLclampf ref);      /* real but primitive-granularity: state_ext.c + clip.c */
+void glScissor(GLint x, GLint y, GLsizei width, GLsizei height); /* real but bbox-granularity: state_ext.c + clip.c */
+const GLubyte* glGetString(GLenum name);          /* real: state_ext.c */
+void glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
+                      GLsizei width, GLsizei height, GLenum format, GLenum type,
+                      const GLvoid *pixels);       /* real: texture.c */
+void glCopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset,
+                          GLint x, GLint y, GLsizei width, GLsizei height); /* STUB: stubs_ac.c */
+void glClipPlane(GLenum plane, const GLdouble *equation);   /* STUB: stubs_ac.c */
+void glStencilFunc(GLenum func, GLint ref, GLuint mask);     /* STUB: stubs_ac.c */
+void glStencilOp(GLenum sfail, GLenum zfail, GLenum zpass);  /* STUB: stubs_ac.c */
+void glActiveTexture(GLenum texture);              /* STUB: stubs_ac.c */
+void glClientActiveTexture(GLenum texture);        /* STUB: stubs_ac.c */
+void glMultiTexCoord2f(GLenum target, GLfloat s, GLfloat t); /* STUB: stubs_ac.c */
+void glMultiTexCoord2fv(GLenum target, const GLfloat *v);    /* STUB: stubs_ac.c */
+void glFogf(GLenum pname, GLfloat param);          /* STUB: stubs_ac.c */
+void glFogi(GLenum pname, GLint param);            /* STUB: stubs_ac.c */
+void glFogfv(GLenum pname, const GLfloat *params);  /* STUB: stubs_ac.c */
+
+/* AssaultCube port phase 3 (docs/ASSAULTCUBE_PORT_PLAN.md,
+   userland/apps/assaultcube/PORT-STATUS.md): more gaps found compiling the
+   real graphical client (main.cpp/rendergl.cpp/rendermodel.cpp/etc), not
+   just the dedicated-server subset phase 1/2 reached. */
+void glColor3ub(GLubyte r, GLubyte g, GLubyte b);              /* real: api.c, calls glColor4f */
+void glColor4ub(GLubyte r, GLubyte g, GLubyte b, GLubyte a);   /* real: api.c, calls glColor4f */
+void glColor4ubv(const GLubyte *v);                             /* real: api.c, calls glColor4ub */
+void glTexCoord2i(GLint s, GLint t);                             /* real: api.c, calls glTexCoord2f */
+void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices); /* real: arrays.c, same glBegin/glArrayElement/glEnd pattern as glDrawArrays */
+void glLineWidth(GLfloat width);      /* real but rasterizer-inert: state_ext.c tracks the value; ztriangle.c's line rasterizer is always 1px, see that file's own perf-sensitivity warning (also noted for glScissor) */
+void glColorMask(GLboolean r, GLboolean g, GLboolean b, GLboolean a); /* real but rasterizer-inert: state_ext.c tracks the mask; PUT_PIXEL always writes all channels */
+void glClearStencil(GLint s);          /* STUB: stubs_ac.c (no stencil buffer, same as glStencilFunc/Op) */
+void glPixelStorei(GLenum pname, GLint param); /* STUB: stubs_ac.c (TinyGL textures/glReadPixels are always tightly packed, no row padding to configure) */
+void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid *pixels); /* STUB: stubs_ac.c, zero-fills (see stub for the honest limit: AC's in-game "mapshot" minimap capture will be blank) */
+void glTexEnvfv(GLenum target, GLenum pname, const GLfloat *params); /* STUB: stubs_ac.c (texture-combiner env color; single-pass modulate texturing does not need it) */
 
 /* lists */
 GLuint glGenLists(GLint range);

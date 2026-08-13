@@ -7,6 +7,7 @@
 #include "../fs/fat.h"
 #include "../video/framebuffer.h"
 #include "../video/font.h"
+#include "../security/validate.h"  // #19/#645: copy_to_user for the Ring-3 name out-param
 
 // External filesystem reference
 extern fat_fs_t g_fat_fs;
@@ -878,32 +879,34 @@ static void theme_notify_change(int new_index) {
     }
 }
 
-// Save the current theme selection to config file
+// #683b RESOLVED (#711): the second /CONFIG/THEME.CFG WRITER IS GONE.
+//
+// This engine (the dead [Section]-INI theme engine, reachable only if
+// /APPS/COMPOSIT fails to launch) used to write "theme=<name>\nindex=<n>\n"
+// to the SAME path that userland's gui_theme.c writes "active=<slug>\n" to.
+// Two writers, two schemas, one filename - documented in gui_theme.c as
+// "KNOWN, DEFERRED to #683b", latent only because this arm never runs in the
+// live golden. It also wrote through fat_write_file() to the FAT ESP, while
+// the live golden's /CONFIG is on the ext2 ROOT.
+//
+// #711 adds metric/decor/type fields to the theme format, which is exactly the
+// change the in-code warning said would make the collision bite. So the dead
+// writer is DELETED rather than extended: /CONFIG/THEME.CFG now has exactly
+// ONE writer (userland gui_theme.c, "active=<slug>") and one schema. This stub
+// keeps the symbol so the (also dead) callers still link, and it is now a
+// no-op that can never corrupt the file.
 int theme_save_config(void) {
-    if (!g_initialized) return -1;
-
-    theme_t *t = theme_get_active();
-    if (!t) return -1;
-
-    char config_data[256];
-    int len = snprintf(config_data, sizeof(config_data),
-        "# MayteraOS Theme Configuration\n"
-        "theme=%s\n"
-        "index=%d\n",
-        t->name, g_active_theme);
-
-    int result = fat_write_file(&g_fat_fs, THEME_CONFIG_PATH,
-                                (const uint8_t *)config_data, len);
-    if (result < 0) {
-        kprintf("[Theme] Warning: could not save config to %s\n", THEME_CONFIG_PATH);
-        return -1;
-    }
-
-    kprintf("[Theme] Saved theme config: %s (index=%d)\n", t->name, g_active_theme);
+    // Intentionally does nothing. Persisting the active theme is userland's
+    // job (libc/gui_theme.c -> /CONFIG/THEME.CFG "active=<slug>"), by design;
+    // see gui_theme.h. Do not reinstate a kernel-side writer here.
     return 0;
 }
 
-// Load theme selection from config file
+// Load theme selection from config file.
+// #711: reads the LEGACY "theme=/index=" schema only, which nothing writes any
+// more. Kept so an ancient pre-#565 image still boots into its saved theme on
+// the dead fallback path; the authoritative pointer file is the userland
+// "active=<slug>" schema, read by gui_theme_get_active_slug().
 int theme_load_config(void) {
     if (!g_initialized) return -1;
 
@@ -1697,8 +1700,13 @@ int64_t sys_theme_get_name(uint64_t index, char *buf, uint64_t buf_size) {
 
     size_t name_len = strlen(t->name);
     if (name_len >= buf_size) name_len = buf_size - 1;
-    memcpy(buf, t->name, name_len);
-    buf[name_len] = '\0';
+    // #19/#645: `buf` is shaped as a Ring-3 out-param (sys_ prefix, caller-
+    // supplied cap). It has NO dispatcher case today, so it is not reachable
+    // from Ring 3 at all right now; converting it anyway costs nothing and
+    // means the day somebody wires the case up, the site is already correct.
+    if (copy_to_user(buf, t->name, name_len) != 0) return -1;
+    {   char __nul = '\0';
+        if (copy_to_user(buf + name_len, &__nul, 1) != 0) return -1; }
 
     return name_len;
 }

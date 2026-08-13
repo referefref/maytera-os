@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // syscall.h - System call numbers and prototypes for MayteraOS user space
 #ifndef _SYSCALL_H
 #define _SYSCALL_H
@@ -17,6 +21,11 @@
 // File I/O
 #define SYS_OPEN            10  // Open file
 #define SYS_CLOSE           11  // Close file
+// #695. Defined HERE, next to SYS_CLOSE, and not down with the high numbers:
+// sys_fsync()'s inline wrapper is ~100 lines above that block, and a #define
+// that appears after its only use is an "undeclared" error, not a style issue.
+#define SYS_FSYNC           358 // (#695) fsync(fd): commit this fd's buffered
+                                // bytes to the medium WITHOUT consuming the fd
 #define SYS_READ            12  // Read from file
 #define SYS_WRITE           13  // Write to file
 #define SYS_SEEK            14  // Seek in file
@@ -84,6 +93,12 @@
 
 #define SYS_FCNTL           93  // File control
 #define SYS_IOCTL           94  // Device control
+// #745 (local 82): IMPLEMENTED in the kernel (proc/syscall.c glue, policy in
+// rustkern/pgrp.rs). Before that these four were declared here, called by
+// real wrappers in unistd.c, and defined NOWHERE in the kernel, so every one
+// hit the dispatcher default and returned -1: setpgid() reported EPERM and
+// getpgid() reported failure, which is why nothing in this tree has job
+// control.
 #define SYS_SETSID          95  // Create new session
 #define SYS_SETPGID         96  // Set process group
 #define SYS_GETPGID         97  // Get process group
@@ -91,11 +106,27 @@
 #define SYS_WAITPID         98  // Wait for specific child
 #define SYS_GETCWD          99  // Get current working directory
 #define SYS_CHDIR           100 // Change directory
-#define SYS_FSTAT           101 // Get file status by fd
-#define SYS_GETDENTS        102 // Get directory entries
+// 101 SYS_FSTAT: DELETED, NOT MISSING (#745 local 82). fstat() has always
+// been implemented in sys/stat.c on top of SYS_SEEK (SEEK_CUR, SEEK_END,
+// restore). Adding a kernel fstat would have been a SECOND implementation of
+// a working function, and the number itself was a trap: anything that had
+// called it would have got a flat -1 from the dispatcher's default case. If
+// fstat ever needs to report a real st_mode/st_dev for a directory or a
+// device (the SEEK-based version always reports S_IFREG), the right change
+// is a kernel fstat that sys/stat.c calls INSTEAD of the seek trick, not a
+// second path alongside it.
+// 102 SYS_GETDENTS: DELETED, NOT MISSING (#745 local 82). Directory reads go
+// through SYS_OPEN + SYS_READDIR (19), which is what dirent.c's opendir/
+// readdir/closedir already use and what the kernel already implements.
 #define SYS_EXECVE          103 // Execute with argv and envp
+// #745 (local 82): IMPLEMENTED in the kernel (rustkern/pollsys.rs), over the
+// same file_poll() readiness primitive select() uses. See libc poll.h.
 #define SYS_POLL            104 // Poll file descriptors
-#define SYS_NANOSLEEP       105 // Sleep with nanosecond precision
+// 105 SYS_NANOSLEEP: DELETED, NOT MISSING (#745 local 82). nanosleep() is
+// implemented in posixextra.c on top of SYS_SLEEP, at that syscall's real
+// millisecond resolution. A kernel SYS_NANOSLEEP would not have been more
+// precise: the scheduler's wake sweep is tick-granular (4ms at 250Hz), so
+// sub-millisecond sleeps are not deliverable by anything below it either.
 
 // User identity
 #define SYS_GETUID          120 // Get real user ID
@@ -126,7 +157,8 @@
 #define SYS_SET_RTC_TIME    144 // Set RTC time: packed (hour<<16)|(min<<8)|sec
 #define SYS_SET_RTC_DATE    145 // Set RTC date: packed (year<<16)|(month<<8)|day
 #define SYS_GET_NET_INFO    146 // Get network info into net_info_t buffer
-#define SYS_NTP_SYNC        147 // Sync time from NTP server; returns 0=ok -1=fail
+#define SYS_NTP_SYNC        147 // Sync time from NTP (default server); 0=ok -1=fail
+#define SYS_NTP_SYNC_SERVER 367 // #797 Sync from a CALLER-NAMED NTP server; 0=ok, else -SNTP_E_*
 #define SYS_SET_CURSOR_THEME 148 // Set cursor theme: 0=Retro, 1=Light, 2=Dark
 #define SYS_GET_CURSOR_THEME 149 // Get current cursor theme
 #define SYS_WIN_GET_POS     150 // Get window screen position
@@ -199,6 +231,13 @@ static inline int sys_open(const char *path, int flags) {
 
 static inline int sys_close(int fd) {
     return (int)syscall1(SYS_CLOSE, fd);
+}
+
+// #695: fsync, not close, is the call that lets a program protect data. close()
+// consumes the fd whether or not it reports an error, so a program that only
+// checks close() has no handle left to retry with. See fsync() in stdlib.h.
+static inline int sys_fsync(int fd) {
+    return (int)syscall1(SYS_FSYNC, fd);
 }
 
 static inline long sys_read(int fd, void *buf, unsigned long count) {
@@ -301,6 +340,108 @@ static inline int win_draw_text_ttf(int handle, int x, int y, const char *text, 
 #define SYS_CLIP_SET        330
 #define SYS_CLIP_GET        331
 #define SYS_CLIP_LEN        332
+// #554: filesystem-aware permission/attribute info. See kernel proc/syscall.h
+// and rustkern/fsperm.rs. Backs the Files Properties permissions tab and the
+// details-view attribute columns/filtering, and (indirectly, via chmod()/
+// chown()) the terminal chmod/chown commands.
+#define SYS_FS_PERM_INFO    333
+// #565: file-based theme loader. Parse a /THEMES/*.mtheme file and add/update
+// it in the live theme table (no reboot needed). See kernel proc/syscall.h
+// and userland/libc/gui_theme.h.
+// NOTE: 334 is reserved by userland/libc/pkgsig.c's SYS_APP_VERIFY_SIG
+// (#563 app/kernel signing-key split) - do not reuse 334 for anything else.
+#define SYS_THEME_LOAD_FILE 335
+#define SYS_THEME_METRIC    357 // (#711) mtheme v2 integer metric getter
+// (themes ticket, 2026-08-07) how many fg/bg pairs the runtime contrast floor
+// had to force-correct the last time this theme index was parsed. See
+// kernel proc/syscall.h and userland/libc/gui_theme.c.
+#define SYS_THEME_CONTRAST_CORRECTIONS 364
+#define SYS_INST_ENUM                  365
+#define SYS_INST_INSTALL               366
+#define SYS_WM_FORCE_REDRAW_ALL 359 // (#704) () -> count; compositor-only, arms redraw_pending on every open app window on a theme change
+// #566 secure session lock + autologin
+// #745 lock REASONS; must match proc/syscall.h and rustkern/sessionid.rs.
+// 0 is IDLE so a caller that passes nothing keeps the pre-#745 behaviour.
+#define SESSION_LOCK_IDLE      0    // idle timer fired; autologin declines it
+#define SESSION_LOCK_EXPLICIT  1    // the user asked; always honoured if unlockable
+#define SYS_SESSION_LOCK       336  // (int reason) -> 0 locked / -1 declined
+#define SYS_SESSION_UNLOCK     337  // (const char *user, const char *pass) -> 0 ok / -1 bad / -2 locked
+#define SYS_SESSION_IS_LOCKED  338  // () -> 1 locked / 0 unlocked (display cache read)
+#define SYS_USER_CREATE_PW     362  // (#745) (user, pass, uid, gid, home) -> uid / <0
+#define SYS_SET_AUTOLOGIN      339  // (const char *user, const char *pass, int enable) -> 0/-1
+#define SYS_GET_AUTOLOGIN      340  // (char *buf, int cap) -> len of configured user (0 = disabled)
+#define SYS_AUTH_LOCKOUT       341  // (const char *user) -> seconds of lockout remaining (0 = none)
+// #745 sign-in screen mode, the SECOND key of /CONFIG/LOGIN.CFG. That file
+// is 0600 root:root (kernel/fs/perms.c), so a non-root process CANNOT read
+// it - not because the parse is hard but because open() fails. That is the
+// whole reason this is a syscall pair and not a file the lock screen opens.
+// MIRRORED from kernel/proc/syscall.h; the same numbers appear in the kernel
+// dispatch table and (for 373's two string arguments) in rustkern/argtab.rs.
+#define SYS_SET_LOGIN_MODE     374  // (int mode, const char *user, const char *pass) -> 0/-1
+#define SYS_GET_LOGIN_MODE     375  // () -> 0 list / 1 typed / <0 error
+
+// ===========================================================================
+// #745 ELEVATION (kernel/proc/elevate.h). System-wide package installs.
+//
+// WHAT AN APP CAN DO WITH THIS, in full: ask (378), and read the verdict (379).
+// It cannot draw the prompt, cannot see a keystroke while it is up, and cannot
+// see the password, ever. 380 and 381 are the COMPOSITOR's half and are
+// rejected for every other process by the framebuffer latch in the kernel.
+//
+// 382 answers one boolean about the CALLER's own account, so an app can show
+// the "only an administrator can install for all users" state up front instead
+// of letting the user start something that will be refused.
+// ===========================================================================
+#define SYS_ELEV_REQUEST   378
+#define SYS_ELEV_STATUS    379
+#define SYS_ELEV_VIEW      380
+#define SYS_ELEV_RESOLVE   381
+#define SYS_ELEV_MAY       382
+
+#define ELEV_ST_IDLE     0
+#define ELEV_ST_OPEN     1
+#define ELEV_ST_GRANTED  2
+#define ELEV_ST_DENIED   3
+
+#define ELEV_EARG      (-1)
+#define ELEV_EBUSY     (-2)   /* a prompt is already open: REFUSED, not queued */
+#define ELEV_ESTALE    (-3)
+#define ELEV_EPERM     (-4)   /* not in the admin set */
+#define ELEV_EROOT     (-5)   /* uid 0: root is never prompted, just install */
+#define ELEV_EATTEMPTS (-6)
+#define ELEV_ELOCKED   (-7)
+#define ELEV_ENOINPUT  (-8)   /* not raised in response to recent input */
+
+#define ELEV_ACT_CANCEL   0
+#define ELEV_ACT_SUBMIT   1
+#define ELEV_ACT_LOCKSECS 2
+
+/* App-supplied DISPLAY text. The kernel sanitises every field (control bytes
+ * and non-ASCII dropped, truncated to 40 glyphs) and supplies the destination
+ * itself, so nothing here decides where the privilege applies. */
+typedef struct {
+    char name[64];
+    char version[32];
+    char source[64];
+} elev_request_t;
+
+static inline long sys_elev_request(const elev_request_t *r) {
+    return syscall1(SYS_ELEV_REQUEST, (long)r); }
+static inline long sys_elev_status(unsigned long long seq) {
+    return syscall1(SYS_ELEV_STATUS, (long)seq); }
+static inline long sys_elev_view(void *out) {
+    return syscall1(SYS_ELEV_VIEW, (long)out); }
+static inline long sys_elev_resolve(unsigned long long seq, int action, const char *pw) {
+    return syscall3(SYS_ELEV_RESOLVE, (long)seq, (long)action, (long)pw); }
+static inline long sys_elev_may(void) {
+    return syscall0(SYS_ELEV_MAY); }
+// Mode encoding, mirrored from kernel/proc/syscall.h (locked there by
+// _Static_assert) and from rustkern/loginmode.rs (locked there by the boot
+// self-test). ANY error is treated as TYPED by every caller: showing every
+// account name is a disclosure and must follow a recorded decision.
+#define LOGIN_MODE_LIST        0
+#define LOGIN_MODE_TYPED       1
+#define SYS_WM_APPS_DIRTY      342  // () -> 1 if any KWM window changed (move/resize/focus/create/close/win_invalidate) since the last SYS_COMPOSITOR_RENDER_WINDOWS composite, else 0. #564 idle-CPU render gate.
 
 #define FONT_STYLE_NORMAL 0
 #define FONT_STYLE_BOLD   1
@@ -392,6 +533,76 @@ static inline int clipboard_get_text(char *buf, int cap) {
     buf[n] = 0;
     return n;
 }
+
+// ---------------------------------------------------------------------------
+// #554: filesystem-aware permission/attribute info (see docs/UI_STYLE_GUIDE.md
+// / CHANGELOG #554 for the ext2-vs-FAT design decision). Byte-for-byte mirror
+// of k_fsperm_info_t (kernel proc/syscall.c, private to that TU) and FsPermInfo
+// (rustkern/fsperm.rs) - kept as an independent copy on purpose, the same
+// convention the kernel already uses for k_stat_t / dirent_t vs their kernel
+// twins (no shared header crosses the Ring 3/Ring 0 boundary in this tree).
+// ---------------------------------------------------------------------------
+#define FSPERM_TYPE_POSIX 0   // ext2/root path: uid/gid/mode via perms.c
+#define FSPERM_TYPE_FAT    1   // genuine FAT (ESP: /boot, /EFI): fat_attr only
+#define FSPERM_TYPE_OTHER  2   // SMB/NFS: no local permission model
+// FAT attribute bits (mirrors kernel fs/fat.h FAT_ATTR_*).
+#define FSPERM_FAT_READONLY  0x01
+#define FSPERM_FAT_HIDDEN    0x02
+#define FSPERM_FAT_SYSTEM    0x04
+#define FSPERM_FAT_VOLUME_ID 0x08
+#define FSPERM_FAT_DIRECTORY 0x10
+#define FSPERM_FAT_ARCHIVE   0x20
+typedef struct {
+    unsigned char  fs_type;        // FSPERM_TYPE_*
+    unsigned char  is_dir;
+    unsigned char  has_perm_entry; // fs_type==POSIX only
+    unsigned char  fat_attr;       // fs_type==FAT only
+    unsigned short mode;           // fs_type==POSIX only: rwxrwxrwx bits
+    unsigned short _reserved;
+    unsigned int   uid;            // fs_type==POSIX only
+    unsigned int   gid;            // fs_type==POSIX only
+} fsperm_info_t;
+static inline int sys_fs_perm_info(const char *path, fsperm_info_t *out) {
+    return (int)syscall3(SYS_FS_PERM_INFO, (long)path, 0, (long)out);
+}
+// #565: parse a /THEMES/*.mtheme file and add/update it in the kernel's live
+// theme table. Returns the resulting theme index (>=0), or -1 on failure.
+static inline int theme_load_file(const char *path) {
+    return (int)syscall1(SYS_THEME_LOAD_FILE, (long)path);
+}
+// (themes ticket) 0 = the theme parsed clean; >0 = this many fg/bg pairs
+// needed forcing to black/white for readability. theme_id<0 = current theme.
+static inline int theme_contrast_corrections(int theme_id) {
+    return (int)syscall1(SYS_THEME_CONTRAST_CORRECTIONS, (long)theme_id);
+}
+
+// (#306) Install-to-disk. Mirrors kernel/gui/installer.h inst_target_t; the
+// kernel-side _Static_assert locks the layout, and sys_inst_enum() rejects a
+// mismatched size at runtime so a stale userland build cannot misread it.
+#define INST_KIND_ATA   0
+#define INST_KIND_AHCI  1
+#define INST_KIND_USB   2
+#define INST_MAX_TARGETS 16
+typedef struct {
+    unsigned char  kind;
+    unsigned char  index;
+    unsigned char  is_boot;
+    unsigned char  _pad;
+    unsigned long long sectors;
+} inst_target_t;
+
+// Fills out[] with up to max targets. Returns the count, or negative on error.
+static inline int inst_enum(inst_target_t *out, int max) {
+    return (int)syscall3(SYS_INST_ENUM, (long)out, (long)max, (long)sizeof(inst_target_t));
+}
+
+// DESTRUCTIVE: repartitions and overwrites the target disk. Root only.
+// Identifies the disk by (kind,index) ONLY - the kernel re-enumerates and
+// supplies capacity and boot-disk status itself, so this cannot be aimed at
+// the running system by forging a descriptor. Blocks until the clone finishes.
+static inline int inst_install(int kind, int index) {
+    return (int)syscall2(SYS_INST_INSTALL, (long)kind, (long)index);
+}
 // Face-aware antialiased TTF into a window (face + style + real point size).
 static inline int win_draw_text_ttf_ex(int handle, int x, int y, const char *text,
                                        int face, int size, int style, unsigned int color) {
@@ -419,6 +630,15 @@ static inline int win_get_event(int handle, void *event_buf, int timeout) {
 // Invalidate window (request redraw)
 static inline int win_invalidate(int handle) {
     return (int)syscall1(SYS_WIN_INVALIDATE, handle);
+}
+
+// (#704) Compositor-only: force every open app window to repaint its content
+// on the next event loop tick (not just recomposite stale pixels). Call this
+// once, edge-triggered, when a theme change is detected (index switch or a
+// live .mtheme file reload) - see sys_wm_force_redraw_all() in the kernel
+// for why this is needed and why it is safe to call repeatedly.
+static inline int wm_force_redraw_all(void) {
+    return (int)syscall0(SYS_WM_FORCE_REDRAW_ALL);
 }
 
 // Get window content dimensions (for resize handling)
@@ -598,6 +818,7 @@ static inline int futex(volatile unsigned int *addr, int op, unsigned int val,
 #define SYS_HTTP_FETCH_POLL     256
 #define SYS_HTTP_FETCH_READ     257
 #define SYS_HTTP_FETCH_CANCEL   258
+#define SYS_HTTP_FETCH_PROGRESS 368  // (#25)
 #define SYS_SET_SETTINGS_TAB 229
 #define SYS_GET_SETTINGS_TAB 230
 #endif
@@ -766,6 +987,27 @@ static inline int tcp_recv(int sock, void *buf, int len) {
 static inline int tcp_close(int sock) {
     return (int)syscall1(SYS_TCP_CLOSE, sock);
 }
+
+// --- TCP connection states (#640) -------------------------------------------
+// MUST MATCH kernel/net/tcp.h tcp_state_t EXACTLY. tcp_get_state() returns one
+// of these. Userland previously had the syscall and the wrapper but no names
+// for the return values, so callers referenced kernel-only identifiers and did
+// not compile. Kept as an enum (not #defines) so the compiler type-checks it.
+#define MAYTERA_TCP_STATES 1
+typedef enum {
+    TCP_STATE_CLOSED = 0,
+    TCP_STATE_LISTEN,
+    TCP_STATE_SYN_SENT,
+    TCP_STATE_SYN_RECEIVED,
+    TCP_STATE_ESTABLISHED,
+    TCP_STATE_FIN_WAIT_1,
+    TCP_STATE_FIN_WAIT_2,
+    TCP_STATE_CLOSE_WAIT,
+    TCP_STATE_CLOSING,
+    TCP_STATE_LAST_ACK,
+    TCP_STATE_TIME_WAIT
+} tcp_state_t;
+
 static inline int tcp_get_state(int sock) {
     return (int)syscall1(SYS_TCP_STATE, sock);
 }
@@ -786,9 +1028,27 @@ static inline int sys_ping(unsigned int dest_ip, int timeout_ms) {
     return (int)syscall2(SYS_PING, dest_ip, timeout_ms);
 }
 
-// NTP sync: returns 0 on success, -1 on failure
+// NTP sync against the built-in default server: 0 on success, -1 on failure.
 static inline long ntp_sync(void) {
     return syscall0(SYS_NTP_SYNC);
+}
+
+// #797 NTP sync against a CALLER-NAMED server (the first-boot wizard's
+// "NTP server" field, and Settings). `server` may be a hostname or a
+// dotted-quad; NULL or "" uses the default. `timeout_ms` of 0 uses the
+// default 5s budget; it is capped in-kernel at 30s.
+//
+// Returns 0 on success. On failure it returns the NEGATIVE reason rather
+// than a flat -1, so a caller can say something useful:
+//   -20 no carrier      -21 no IP        -22 name did not resolve
+//   -23 bind failed     -24 send failed  -25 no reply (timeout)
+//   -26 busy            -27 self-test failed
+//   -3..-9 the server answered but the reply FAILED VALIDATION
+//          (-3 unsynchronised, -5 not a server reply, -6 bad stratum /
+//           kiss-o'-death, -7 did not echo our request, -8 zero timestamp,
+//           -9 date outside the sanity window)
+static inline long ntp_sync_server(const char *server, unsigned int timeout_ms) {
+    return syscall2(SYS_NTP_SYNC_SERVER, (long)server, (long)timeout_ms);
 }
 static inline long set_cursor_theme(int theme) {
     return syscall1(SYS_SET_CURSOR_THEME, (long)theme);
@@ -859,7 +1119,31 @@ typedef struct {
     int  id, x, y, width, height, visible;
     int  minimized, focused;
     char title[64];
+    // #745: APPENDED, never reordered. Mirrors kernel/gui/window.h, which pins
+    // the same size with the same assert. sys_wm_get_windows() writes
+    // sizeof(wm_window_info_t) per entry into THIS array, so a one-sided edit
+    // is a buffer overrun, not a cosmetic mismatch. Non-zero = this window
+    // asked for the compositor drop shadow (WINDOW_FLAG_SHADOW).
+    int  shadow;
+    // #41 (2026-08-12): stable app identity, the BINARY BASENAME the kernel
+    // spawned this window's owning process from (e.g. "/APPS/PAINT" ->
+    // "PAINT"), resolved kernel-side from window_t.owner_pid. NOT the
+    // window's own title string. Empty ("") means no identity is available
+    // (kernel-desktop-fallback window, or the owning process already
+    // exited) - callers MUST fall back to another heuristic in that case,
+    // never treat an empty app_id as a match.
+    char app_id[32];
+    // #44 (2026-08-12): APPENDED, never reordered - mirrors kernel/gui/window.h.
+    // Non-zero = WINDOW_FLAG_MAXIMIZED. Lets a caller (taskbar.c's dock
+    // context menu) label "Maximize" vs "Restore" correctly: the kernel's
+    // SYS_WM_MAXIMIZE_WINDOW is a TOGGLE (wm_toggle_maximize_focused()), so
+    // calling it on an already-maximized window restores it - without this
+    // bit a menu could not tell which way the toggle was about to go.
+    int  maximized;
 } wm_window_info_t;
+_Static_assert(sizeof(wm_window_info_t) == 136,
+               "#745/#41/#44: wm_window_info_t layout is duplicated in kernel/gui/window.h; "
+               "change both or neither");
 
 static inline int wm_get_windows(wm_window_info_t *buf, int n) {
     return (int)syscall2(SYS_WM_GET_WINDOWS, (long)buf, (long)n);
@@ -913,6 +1197,10 @@ static inline int      sys_inject_mouse(int x, int y, int type, int button) {
     return (int)syscall4(SYS_INJECT_MOUSE, x, y, type, button); }
 static inline int      compositor_render_windows(void) {
     return (int)syscall0(SYS_COMPOSITOR_RENDER_WINDOWS); }
+// #564: peek-only "did anything in the kernel WM change" for the compositor's
+// render gate - see kernel/gui/window.h sys_wm_apps_dirty() for the rationale.
+static inline int      wm_apps_dirty(void) {
+    return (int)syscall0(SYS_WM_APPS_DIRTY); }
 
 // ============================================================================
 // IPC: Message Passing Wrappers
@@ -985,6 +1273,57 @@ static inline int sys_list_users(void *buf, int max_count) {
     return (int)syscall2(SYS_LIST_USERS, (long)buf, max_count); }
 static inline int sys_authenticate(const char *username, const char *password) {
     return (int)syscall2(SYS_AUTHENTICATE, (long)username, (long)password); }
+
+// #566 secure session lock + autologin (compositor lock overlay, Settings
+// Users & Accounts panel). The kernel is the sole authority for lock state:
+// these are thin syscall wrappers only, never a place to cache a decision.
+// #745: takes a REASON. Returns 0 when the session is now locked, -1 when the
+// kernel declined (autologin idle lock, or a session user with no usable
+// password). The kernel is the authority either way: read sys_session_is_locked()
+// for the truth, never assume this returning 0 means the overlay should show.
+static inline int sys_session_lock(int reason) {
+    return (int)syscall1(SYS_SESSION_LOCK, reason); }
+// #745: create an account AND set its password in one call, or create nothing.
+// Root only. `uid` 0 means "kernel allocates the next free human uid" and is
+// what every caller should pass: computing a uid in userland is how Settings
+// ended up colliding with an existing account. Returns the new uid, or <0.
+static inline int sys_user_create_pw(const char *username, const char *password,
+                                     int uid, int gid, const char *home) {
+    return (int)syscall5(SYS_USER_CREATE_PW, (long)username, (long)password,
+                         uid, gid, (long)home); }
+
+// #745: pass "" as `user` to mean THE SESSION USER, which is what the lock
+// screen should always do. The kernel already knows who the session is; a
+// caller-supplied name can only agree with it or break unlocking, and passing a
+// hardcoded "root" is exactly how the lock screen became unopenable at uid 1000.
+static inline int sys_session_unlock(const char *user, const char *pass) {
+    return (int)syscall2(SYS_SESSION_UNLOCK, (long)user, (long)pass); }
+static inline int sys_session_is_locked(void) {
+    return (int)syscall0(SYS_SESSION_IS_LOCKED); }
+static inline int sys_set_autologin(const char *user, const char *pass, int enable) {
+    return (int)syscall3(SYS_SET_AUTOLOGIN, (long)user, (long)pass, enable); }
+static inline int sys_get_autologin(char *buf, int cap) {
+    return (int)syscall2(SYS_GET_AUTOLOGIN, (long)buf, cap); }
+static inline int sys_auth_lockout(const char *user) {
+    return (int)syscall1(SYS_AUTH_LOCKOUT, (long)user); }
+// #745. set: authorization is IDENTICAL to sys_set_autologin (root for
+// anyone; non-root only for its own uid and only with that account's
+// password). get: ungated, and it returns a MODE, never a list of names.
+static inline int sys_set_login_mode(int mode, const char *user, const char *pass) {
+    return (int)syscall3(SYS_SET_LOGIN_MODE, mode, (long)user, (long)pass); }
+// Any negative return is folded to TYPED right here, so no caller has to
+// remember to do it and none can get the safe direction wrong.
+static inline int sys_get_login_mode(void) {
+    int r = (int)syscall0(SYS_GET_LOGIN_MODE);
+    return r == LOGIN_MODE_LIST ? LOGIN_MODE_LIST : LOGIN_MODE_TYPED; }
+
+// #120 was defined but never wrapped (no callers anywhere in userland before
+// #566): the Settings autologin UI needs to know whether the current process
+// is root (root may set autologin for any account with no password; a
+// non-root caller may only set it for their own account and must supply
+// their password, per the kernel ABI comment on SYS_SET_AUTOLOGIN above).
+static inline int sys_getuid(void) {
+    return (int)syscall0(SYS_GETUID); }
 
 #define SYS_DELETE_USER     159
 static inline int delete_user(const char *username) {
@@ -1098,9 +1437,25 @@ static inline int sys_spawn(const char *path) {
 
 #define SYS_WM_MAXIMIZE_WINDOW 260
 static inline int sys_wm_maximize_focused(void) { return (int)syscall0(SYS_WM_MAXIMIZE_WINDOW); }
+
+// (#745) Publish the desktop work area: px reserved at each screen edge by the
+// ACTIVE dock style. Compositor-only (returns -1 for anyone else). The kernel
+// window manager then uses ONE definition of the reachable area for initial
+// placement, maximize, restore-from-minimize and the title-bar drag, so a
+// window's header can never end up under a panel. Derive the arguments with
+// taskbar_{left,top,right,bottom}_inset(); never pass literals.
+#define SYS_WM_SET_WORK_AREA 373
+static inline int sys_wm_set_work_area(int left, int top, int right, int bottom) {
+    return (int)syscall4(SYS_WM_SET_WORK_AREA, (long)left, (long)top,
+                         (long)right, (long)bottom);
+}
 // #185: borderless panel + OS-wide mouse wheel
 #define SYS_WIN_SET_NOCHROME 262
 static inline int win_set_nochrome(int handle) { return (int)syscall1(SYS_WIN_SET_NOCHROME, (long)handle); }
+// #745: opt in to the compositor-drawn soft drop shadow around this window.
+// One-way; see kernel/gui/window.h WINDOW_FLAG_SHADOW for why it is opt-in.
+#define SYS_WIN_SET_SHADOW   376
+static inline int win_set_shadow(int handle) { return (int)syscall1(SYS_WIN_SET_SHADOW, (long)handle); }
 #define SYS_GET_MOUSE_SCROLL 263
 static inline int get_mouse_scroll(void) { return (int)syscall0(SYS_GET_MOUSE_SCROLL); }
 #define SYS_GET_GLOBAL_MOUSE 264  // #185: read-only global cursor for any process
@@ -1206,6 +1561,81 @@ static inline int sys_net_is_up(void) {
     return (int)syscall0(SYS_NET_IS_UP);
 }
 
+// ============================================================================
+// (#745) STRUCTURED network status + non-blocking probe.
+//
+// WHY THIS AND NOT SYS_NET_INFO (243): 243 returns a VERBOSE HUMAN REPORT
+// ("  Netmask:       255.255.255.0\n"). Recovering addresses from it means an
+// app string-matches kernel prose, which breaks SILENTLY the first time a
+// label is reworded: the parse yields nothing, the app renders a page that
+// looks fine and says nothing, and no compiler or linker notices. A struct of
+// integers cannot fail that way - the _Static_assert below goes RED at build
+// time if the layout ever drifts.
+//
+// WHY NOT SYS_GET_NET_INFO (146): every field there is a pre-formatted string
+// and it carries no link state, no DHCP state and no fault flag, so it cannot
+// tell "no address yet" from "address but no route". Widening it was rejected
+// as an ABI break for a published layout with live consumers.
+//
+// ALL ADDRESS FIELDS ARE HOST BYTE ORDER: (a<<24)|(b<<16)|(c<<8)|d for
+// a.b.c.d. Nothing here byte-swaps. 0 means NOT CONFIGURED, which is a real
+// state to render honestly, never a blank.
+// ============================================================================
+#define SYS_NET_STATUS 371
+#define SYS_NET_PROBE  372
+
+// Mirror of net_status_t in kernel/proc/syscall.h and NetStatus in
+// kernel/rustkern/netstat.rs. Keep all three in step.
+typedef struct {
+    unsigned int ip;             // live source address; 0 = none
+    unsigned int netmask;
+    unsigned int gateway;        // 0 = no default route
+    unsigned int dns_active;     // resolver the stack WILL query
+    unsigned int dns_dhcp;       // what DHCP offered; 0 = it offered none
+    unsigned int dhcp_ip;        // leased address (0 while a DORA is in flight)
+    unsigned int link_up;        // carrier, 0/1
+    unsigned int dhcp_state;     // 0 idle 1 discovering 2 requesting 3 bound
+    unsigned int config_static;  // config came from /CONFIG/NETIP.CFG
+    unsigned int faulty;         // #549 persistently unreachable
+    unsigned int driver;         // 0 = NO NIC AT ALL (distinct from no carrier)
+    unsigned int prefix_len;     // popcount(netmask)
+} net_status_t;
+_Static_assert(sizeof(net_status_t) == 48,
+               "net_status_t sizeof lock: must match kernel/proc/syscall.h and "
+               "SZ_NET_STATUS in kernel/rustkern/argtab.rs");
+
+// DHCP state values (kernel/net/dhcp.h), mirrored so a caller can name them.
+#define NET_DHCP_IDLE         0
+#define NET_DHCP_DISCOVERING  1
+#define NET_DHCP_REQUESTING   2
+#define NET_DHCP_BOUND        3
+
+// SYS_NET_PROBE ops. Mirrored in kernel/proc/syscall.h and rustkern/netstat.rs.
+#define NET_PROBE_PING_START    0   // arg = destination IPv4, HOST order
+#define NET_PROBE_PING_POLL     1   // -> rtt ms (>=0), or a NET_PROBE_E* code
+#define NET_PROBE_PING_CANCEL   2
+#define NET_PROBE_DHCP_RESTART  3   // non-blocking dhcp_reset + dhcp_discover
+
+#define NET_PROBE_PENDING      (-1) // no answer yet; poll again
+#define NET_PROBE_EINVAL       (-2)
+#define NET_PROBE_ENOTSTARTED  (-3)
+#define NET_PROBE_ELINK        (-4) // no carrier: instant no-op (#381)
+
+// Returns 0 on success. Never blocks.
+static inline int sys_net_status(net_status_t *out) {
+    return (int)syscall1(SYS_NET_STATUS, (long)out);
+}
+
+// NEVER BLOCKS, by design. Unlike sys_ping() (66), which sleeps the caller for
+// up to timeout_ms in two hand-rolled poll loops, this returns immediately:
+// START puts one echo request on the wire, each POLL drains the RX ring and
+// answers "rtt" or NET_PROBE_PENDING. THE DEADLINE IS THE CALLER'S, which is
+// correct - only the caller knows how long its user will wait - and it means
+// a GUI can run a reachability test from its own event loop without a freeze.
+static inline long sys_net_probe(int op, unsigned long arg) {
+    return (long)syscall2(SYS_NET_PROBE, (long)op, (long)arg);
+}
+
 // #414 Home Assistant: blocking GET with auth headers (e.g. Authorization: Bearer).
 #define SYS_HTTP_FETCH_HDR 302
 static inline int sys_http_fetch_hdr(const char *url, const char *headers, char *buf,
@@ -1220,6 +1650,25 @@ static inline int sys_http_fetch(const char *url, char *buf, unsigned int max_le
                          (long)max_len, (long)bytes_read, (long)http_status);
 }
 
+// #549: start-side refusal code shared by sys_http_fetch_start() and
+// sys_http_post_start(). MIRRORS NET_ERR_FAULTY in kernel/proc/syscall.h.
+// A global failure-streak breaker can latch the interface FAULTY and refuse
+// every fetch BEFORE it reaches the wire; that is reported as this distinct
+// value rather than the generic -1 so a caller can tell "temporarily refused,
+// try again" from "this request is bad". It is RETRYABLE: the breaker clears
+// itself on the first fetch that completes, so treating it as fatal keeps the
+// system in the faulty state forever (see blame.md, "A safety gate that
+// suppresses its own recovery evidence").
+#define NET_ERR_FAULTY (-3)
+
+// #745: a POST REFUSED by the kernel's prompt-injection screen. MIRRORS
+// NET_ERR_AIGUARD in kernel/proc/syscall.h. Distinct from -1 (request failed)
+// and -3 (circuit breaker) on purpose: this one is NOT a network problem and
+// NOT retryable, and reporting it as "network error" would both lie to the user
+// and hide a security event. Call SYS_AI_SCAN (libc/aiguard.h) on the text you
+// were about to send to find out WHICH rule refused it.
+#define NET_ERR_AIGUARD (-4)
+
 // Async (non-blocking) HTTP fetch (#277): start -> poll each frame -> read body.
 static inline int http_fetch_start(const char *url) {
     return (int)syscall1(SYS_HTTP_FETCH_START, (long)url);
@@ -1232,6 +1681,14 @@ static inline int http_fetch_read(int id, char *buf, unsigned int max) {
 }
 static inline int http_fetch_cancel(int id) {
     return (int)syscall1(SYS_HTTP_FETCH_CANCEL, id);
+}
+// #25: real fetch progress (phase + bytes_recv + content_len). Any out
+// pointer may be NULL if the caller does not want that field. Returns 0 on
+// success, -1 if `id` is not a live job.
+static inline int http_fetch_progress(int id, int *phase, unsigned int *bytes_recv,
+                                      unsigned int *content_len) {
+    return (int)syscall4(SYS_HTTP_FETCH_PROGRESS, id, (long)phase,
+                         (long)bytes_recv, (long)content_len);
 }
 
 // HTTPS POST: headers = extra CRLF-terminated header lines (Authorization etc.;
@@ -1248,6 +1705,12 @@ static inline int sys_http_post(const char *url, const char *headers, const char
 // START copies url/headers/body into the kernel and spawns the worker, returning
 // a job id (>=0) or -1. POLL returns 0=running/1=done/2=error (and fills status,
 // len). READ copies the response body out and frees the job. CANCEL aborts.
+// #745 SYS_AI_SCAN. Kept beside the POST numbers on purpose: the enforcement
+// that matters happens inside SYS_HTTP_POST_START, and this is the read-only
+// companion that lets a client NAME what was refused. MIRRORS the kernel
+// header; syscall-number-lint rule 3 checks the two agree.
+#define SYS_AI_SCAN          383
+
 #define SYS_HTTP_POST_START  265
 #define SYS_HTTP_POST_POLL   266
 #define SYS_HTTP_POST_READ   267
@@ -1321,6 +1784,12 @@ static inline int sys_proc_list(proc_info_t *buf, int max) {
 #define PI_KIND_UNKNOWN 4
 #define PI_SVC_STOP   0
 #define PI_SVC_START  1
+// (#785) Enable/disable, which unlike start/stop is DURABLE: it rewrites the
+// service's own config file so the state survives a reboot. svc_enable()
+// returns non-zero when it could not make the change durable, and this verb
+// passes that straight through rather than flattening it to success.
+#define PI_SVC_DISABLE 2
+#define PI_SVC_ENABLE  3
 // Every connection regardless of owner. Not 0: pid 0 is a legitimate query
 // meaning "kernel-internal / unowned".
 #define PI_PID_ALL 0xFFFFFFFFu
@@ -1416,6 +1885,90 @@ static inline int sys_bootlog(const char *msg) {
 #endif
 static inline long sys_hda_dbg(int op, long a, long b, long c) {
     return syscall4(SYS_HDA_DBG, (long)op, a, b, c);
+}
+
+
+// ===========================================================================
+// #739 DISK IMAGES: mount an .iso as a CD-ROM drive or an .img as a floppy,
+// eject, and read back what is on every drive letter.
+//
+// Drive letters are INDICES here, 0 = A: .. 25 = Z:. The kernel decides which
+// letter an image lands on (rustkern/drvmap.rs): A:/B: are floppies, C: is the
+// fixed disk and is never mountable, D: is reserved, E:..Z: are CD-ROMs handed
+// out lowest-free-first. Pass DISKIMG_LETTER_AUTO to let it choose, which is
+// what a UI should normally do; pass a specific letter to SWAP the disc in a
+// drive that is already occupied, which keeps the letter (a swap that moved
+// the disc to another letter would break the program that asked for it).
+// ===========================================================================
+#define SYS_DISKIMG         361
+
+#define DISKIMG_CMD_INFO        0   // (letter) -> *out
+#define DISKIMG_CMD_MOUNT       1   // (path, letter or AUTO) -> letter index
+#define DISKIMG_CMD_EJECT       2   // (letter) -> 0
+#define DISKIMG_CMD_MAX_MOUNTS  3   // () -> how many images may be mounted at once
+
+#define DISKIMG_LETTER_AUTO  (-1)
+
+// Image formats (DISKIMG_FMT_* in kernel/dos/diskimg.h).
+#define DISKIMG_FMT_NONE     0
+#define DISKIMG_FMT_ISO9660  1
+#define DISKIMG_FMT_FAT12    2
+
+// Drive classes (DRV_CLASS_* in kernel/rustkern/drvmap.rs).
+#define DISKIMG_CLASS_NONE   0
+#define DISKIMG_CLASS_FLOPPY 1
+#define DISKIMG_CLASS_FIXED  2
+#define DISKIMG_CLASS_CDROM  3
+
+#define DISKIMG_F_MOUNTED   0x01u
+#define DISKIMG_F_JOLIET    0x02u
+#define DISKIMG_F_READONLY  0x04u
+#define DISKIMG_F_INUSE     0x08u   // a read is in flight on this image right now
+#define DISKIMG_F_MOUNTABLE 0x10u   // an image MAY be mounted on this letter
+
+// Mirrors diskimg_info_t in kernel/dos/diskimg.h. The kernel _Static_asserts
+// its size at 288 against rustkern/argtab.rs; keep the two in step.
+typedef struct {
+    unsigned int   letter;      // 0 = A: .. 25 = Z:
+    unsigned int   cls;         // DISKIMG_CLASS_*
+    unsigned int   fmt;         // DISKIMG_FMT_*
+    unsigned int   flags;       // DISKIMG_F_*
+    unsigned int   gen;         // mount generation, bumped on every mount/eject
+    unsigned int   readers;     // in-flight reads
+    unsigned long long size;    // image bytes, 0 if nothing mounted
+    char           name[64];    // image basename, "" if nothing mounted
+    char           path[192];   // full image path, "" if nothing mounted
+} diskimg_info_t;
+
+// Read one drive letter's state. Succeeds for an EMPTY letter too: a UI has to
+// show the drives that have no disc in them. Returns 0, or negative.
+static inline int sys_diskimg_info(int letter, diskimg_info_t *out) {
+    return (int)syscall4(SYS_DISKIMG, DISKIMG_CMD_INFO, 0, (long)out, letter);
+}
+
+// Mount `path` on `letter` (or DISKIMG_LETTER_AUTO). Returns the letter index
+// used (>= 0), or a negative error:
+//   -1 bad arguments        -2 not an ISO and not a FAT12 floppy
+//   -3 that letter cannot hold that kind of image
+//   -4 no free letter of that class      -5 too many images already mounted
+//   -6 the path was refused (not absolute, contains "..", or has bad characters)
+//  -10 cannot open the file  -11 unrecognised format  -12 too large for a floppy
+//  -13 out of memory         -13 (EACCES is -13 in errno terms; the kernel
+//      returns -MOS_EACCES for "you may not read that file")
+static inline int sys_diskimg_mount(const char *path, int letter) {
+    return (int)syscall4(SYS_DISKIMG, DISKIMG_CMD_MOUNT, (long)path, 0, letter);
+}
+
+// Eject whatever is on `letter`. Always succeeds if something was mounted.
+// Handles a guest still holds are INVALIDATED, not redirected: the next read on
+// one fails rather than returning bytes off whatever disc is mounted next.
+static inline int sys_diskimg_eject(int letter) {
+    return (int)syscall4(SYS_DISKIMG, DISKIMG_CMD_EJECT, 0, 0, letter);
+}
+
+// How many images may be mounted at once (each pins a 256 KiB cache).
+static inline int sys_diskimg_max_mounts(void) {
+    return (int)syscall4(SYS_DISKIMG, DISKIMG_CMD_MAX_MOUNTS, 0, 0, 0);
 }
 
 #endif // _SYSCALL_H

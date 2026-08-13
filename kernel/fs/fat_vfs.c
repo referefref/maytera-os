@@ -13,6 +13,7 @@
 #include "fat.h"
 #include "../mm/heap.h"
 #include "../serial.h"
+#include "../security/uaccess_smap.h"  // #19/#645: AC bracket on the caller-buffer copy
 
 extern fat_fs_t g_fat_fs;
 
@@ -25,6 +26,11 @@ extern fat_fs_t g_fat_fs;
 static uint8_t g_wbuf[FAT_WBUF_MAX];        // BSS
 static file_t *g_wbuf_owner = NULL;          // owning struct file, or NULL
 static uint32_t g_wbuf_len = 0;              // bytes currently buffered
+static int g_wbuf_dirty = 0;                 // #695: buffered bytes not yet on
+                                             // the medium. Distinct from
+                                             // g_wbuf_len, which stays non-zero
+                                             // after a flush because SEEK_END
+                                             // reports it as the file size.
 static char g_wbuf_path[256];                // path to flush to on release
 
 // --------------------------------------------------------------------------
@@ -46,8 +52,12 @@ static int64_t fat_file_write(file_t *f, const void *buf, size_t count) {
         uint32_t n = (count < avail) ? (uint32_t)count : avail;
         if (n > 0) {
             const uint8_t *src = (const uint8_t *)buf;
-            for (uint32_t i = 0; i < n; i++) g_wbuf[g_wbuf_len + i] = src[i];
+            // #19/#645: `src` is the caller's buffer (Ring-3 via sys_write).
+            {   uaccess_ac_t __ac = uaccess_begin();
+                for (uint32_t i = 0; i < n; i++) g_wbuf[g_wbuf_len + i] = src[i];
+                uaccess_end(__ac); }
             g_wbuf_len += n;
+            g_wbuf_dirty = 1;      // #695: new bytes are not on the medium yet
         }
         return (int64_t)n;
     }
@@ -74,16 +84,37 @@ static int64_t fat_file_seek(file_t *f, int64_t offset, int whence) {
     return fat_seek(fp, pos);
 }
 
-static void fat_file_release(file_t *f) {
+// #695 Phase 1: THE FAT flush, and the only one. An fd that does NOT own the
+// write buffer went straight to fat_write() -> blk_write(), which is
+// write-through, so there is genuinely nothing pending for it and 0 is the
+// truth rather than a stub.
+//
+// Idempotent: a successful commit clears g_wbuf_dirty, so a second fsync and
+// the eventual release do nothing. g_wbuf_len is deliberately NOT cleared,
+// because fat_file_seek() reports it as the file's virtual size to userland.
+static int fat_file_flush(file_t *f) {
+    if (f != g_wbuf_owner) return 0;
+    if (!g_wbuf_dirty || g_wbuf_len == 0) return 0;
+    // fat_write_file() DELETES the existing file before rewriting it, so on
+    // failure the destination may be ABSENT or short and is never the previous
+    // contents. See the sys_fsync() contract in proc/syscall.c.
+    if (fat_write_file(&g_fat_fs, g_wbuf_path, g_wbuf, g_wbuf_len) != 0) return -1;
+    g_wbuf_dirty = 0;
+    return 0;
+}
+
+// #695 Phase 2: release() IS flush() + teardown, so FAT has one flush, not two.
+static int fat_file_release(file_t *f) {
     fat_file_t *fp = (fat_file_t *)f->priv;
 
-    // Flush the write buffer if this file owned it.
+    int rc = fat_file_flush(f);
+
+    // Give the singleton back unconditionally: a failed flush must not strand
+    // the 1 MB buffer on a dead description and lock out every later writer.
     if (f == g_wbuf_owner) {
-        if (g_wbuf_len > 0) {
-            fat_write_file(&g_fat_fs, g_wbuf_path, g_wbuf, g_wbuf_len);
-        }
         g_wbuf_owner = NULL;
         g_wbuf_len = 0;
+        g_wbuf_dirty = 0;
         g_wbuf_path[0] = '\0';
     }
 
@@ -92,6 +123,7 @@ static void fat_file_release(file_t *f) {
         kfree(fp);
     }
     f->priv = NULL;
+    return rc;
 }
 
 static const file_ops_t fat_file_ops = {
@@ -99,6 +131,7 @@ static const file_ops_t fat_file_ops = {
     .write   = fat_file_write,
     .seek    = fat_file_seek,
     .ioctl   = NULL,
+    .flush   = fat_file_flush,
     .release = fat_file_release,
     .poll    = NULL,
 };
@@ -152,6 +185,7 @@ file_t *fat_vfs_open(const char *path, int flags) {
     if (needs_wbuf && g_wbuf_owner == NULL) {
         g_wbuf_owner = f;
         g_wbuf_len = 0;
+        g_wbuf_dirty = 0;   // #695: fat_create() already made the (empty) file
         int n = 0;
         while (path[n] && n < (int)sizeof(g_wbuf_path) - 1) {
             g_wbuf_path[n] = path[n];

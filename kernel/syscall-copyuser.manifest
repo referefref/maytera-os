@@ -1,0 +1,49 @@
+# syscall-copyuser.manifest - the copy-user-lint allowlist (#566, enforcing #509).
+#
+# tools/copy-user-lint/copy-user-lint auto-discovers every syscall handler in
+# proc/syscall.c (dispatcher case body + one level of in-file handler) that
+# DIRECTLY DEREFERENCES a user pointer (`*p`, `p->f`, `p[i]`, or a bare
+# memcpy/memset/... on it) instead of routing that access through the #509
+# TOCTOU-safe copy_*_user primitives. A direct deref after an entry check is a
+# TOCTOU hole: a sibling thread can remap the page between check and use.
+#
+# A handler that direct-derefs must be EITHER adopted (converted to copy_*_user,
+# in which case it needs no entry here) OR listed below. Two sections:
+#
+# [EXEMPT]    The handler is already safe for a documented reason the regex
+#             cannot model (it bounces once through a kernel buffer via a bare
+#             copy, or has legitimate kernel-pointer callers). Permanently
+#             correct, not debt.
+#
+# [KNOWN_GAP] A DEBT LEDGER: a real, still-direct user-pointer deref that #566
+#             surfaced and did NOT convert in this pass. It is TRACKED and
+#             printed LOUDLY on every build (count + each name), but tolerated
+#             (build not wedged) until it is bounced through copy_*_user. This is
+#             the OPPOSITE of a silent exemption. #566 converted the
+#             security-sensitive signature-verify inputs (OTA/APP), the package
+#             write, and the clean fixed-size out-params (version, cpu-per-core,
+#             mem-info, font metrics/glyph, pipe); the remainder below are the
+#             honestly-deferred variable-length / multi-return-point handlers.
+#             CLOSE THESE, then delete the line.
+#
+# First token per line is the SYS_* name (must be a real #define, typo-guarded);
+# the rest is the reason. Wired into the build as an order-only prerequisite of
+# kernel.elf (make copy-user-lint), so a NEW direct-deref handler that is neither
+# adopted nor listed here FAILS the build. The CHANGELOG must say why on add.
+
+[EXEMPT]
+
+[KNOWN_GAP]
+# #567 drained 45 of the original 46 KNOWN_GAP handlers to fault-safe copy_*_user
+# (path/string reads bounced via strncpy_from_user; struct/array out-params filled
+# in a kernel-local then copy_to_user; bulk buffers via copy_from_user/copy_to_user;
+# SYS_OPEN/SYS_READDIR/SYS_HTTP_POST split into a kernel-ptr _k core + a bouncing
+# wrapper for their in-kernel callers). copy-user-lint confirms none direct-deref.
+#
+# One honest holdout remains: SYS_READ hands the user buffer straight to
+# file_read()/fat_read() in fs/ (other TUs, out of this lint scope) AND has
+# in-kernel callers (the #308/#317 boot self-tests exercise the exact fd path with
+# kernel buffers). A correct conversion is a VFS-wide bounce - a large-read kmalloc
+# on the hot, size-sensitive path - plus a _k split; deferred to its own task.
+# #511 correctness for this path is already covered by mm_prefault_range().
+SYS_READ  hands the user buffer to file_read/fat_read (other TU) + has kernel-ptr callers (boot self-tests); needs a VFS-wide bounce + _k split, deferred (#567-followup).

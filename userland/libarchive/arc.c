@@ -809,3 +809,581 @@ void arc_free_entries(arc_entry *ents, int count) {
     for (int i = 0; i < count; i++) if (ents[i].data) ARC_FREE(ents[i].data);
     ARC_FREE(ents);
 }
+
+// ========================================================================
+// STREAMING tar.gz extraction (#613)
+// ------------------------------------------------------------------------
+// The buffer-everything entry points above (arc_targz_extract) allocate the
+// whole decompressed archive AND one heap copy per member, so peak RAM is
+// O(archive size). That ceiling is what made a 103,563,185-byte package
+// un-installable on a 512MB userland heap and, well before that, slow: the
+// App Store measured a 44 s write-buffer flush plus a 92 s read-back/unpack
+// on that package.
+//
+// This path holds a FIXED working set instead, independent of archive size:
+//   32768 B  LZ77 sliding window (the DEFLATE format's own maximum distance)
+//    8192 B  compressed input slice
+//      512 B tar header block
+//   + a few hundred bytes of decoder state
+// Members are handed to the caller as (header, data chunks, end) so the
+// caller can open a destination file, append, and close it, never holding
+// more than one chunk.
+//
+// SECURITY: this is now the code that decides what path bytes land on, so it
+// validates member names and types itself and fails CLOSED (arc_path_is_safe
+// below). Note the gzip CRC32/ISIZE trailer can only be checked after the
+// last byte has been emitted - that is inherent to streaming. It is an
+// integrity check, NOT the trust boundary: the caller must have verified the
+// whole archive (e.g. a signed sha256) BEFORE calling this. See the App
+// Store's install_pkg(), which verifies the on-disk digest first and only
+// then streams from the verified file.
+// ========================================================================
+
+#define ARC_IN_BUF    8192
+#define ARC_WIN_SIZE  32768
+#define ARC_WIN_MASK  (ARC_WIN_SIZE - 1)
+
+// ---- pull-side bit reader ------------------------------------------------
+typedef struct {
+    arc_read_fn rd;
+    void       *rdctx;
+    uint8_t     in[ARC_IN_BUF];
+    size_t      inlen, inpos;
+    int         eof, err;
+    uint32_t    bitbuf;      // holds `bitcnt` unread bits, LSB first
+    int         bitcnt;
+} arc_bitin;
+
+// One raw byte from the input stream. Refills from the caller's reader in
+// bounded ARC_IN_BUF slices; -1 means EOF or a reader error (distinguished
+// by ->err).
+static int abi_byte(arc_bitin *s) {
+    if (s->inpos >= s->inlen) {
+        if (s->eof || s->err) return -1;
+        int n = s->rd(s->rdctx, s->in, ARC_IN_BUF);
+        if (n < 0) { s->err = 1; return -1; }
+        if (n == 0) { s->eof = 1; return -1; }
+        s->inlen = (size_t)n;
+        s->inpos = 0;
+    }
+    return (int)s->in[s->inpos++];
+}
+
+// Ensure at least n bits are buffered. Returns 0 on success, -1 at EOF.
+// Refilling 8 bits at a time from the already-decoded slice keeps the hot
+// path free of a per-BIT function call (the buffered decoder's getbit() cost
+// one call per bit, which is most of why unpacking a 100MB package took
+// minutes).
+static int abi_fill(arc_bitin *s, int n) {
+    while (s->bitcnt < n) {
+        int b;
+        if (s->inpos < s->inlen) b = (int)s->in[s->inpos++];
+        else { b = abi_byte(s); if (b < 0) return -1; }
+        s->bitbuf |= (uint32_t)b << s->bitcnt;
+        s->bitcnt += 8;
+    }
+    return 0;
+}
+
+static int abi_bits(arc_bitin *s, int n) {
+    if (n == 0) return 0;
+    if (abi_fill(s, n) < 0) return -1;
+    int v = (int)(s->bitbuf & ((1u << n) - 1u));
+    s->bitbuf >>= n;
+    s->bitcnt -= n;
+    return v;
+}
+
+static int abi_bit(arc_bitin *s) {
+    if (s->bitcnt == 0 && abi_fill(s, 1) < 0) return -1;
+    int v = (int)(s->bitbuf & 1u);
+    s->bitbuf >>= 1;
+    s->bitcnt--;
+    return v;
+}
+
+// Canonical-Huffman decode against the same tables build_huff() produces.
+static int abi_sym(arc_bitin *s, const huff_t *h) {
+    int code = 0, first = 0, index = 0;
+    for (int len = 1; len < 16; len++) {
+        if (s->bitcnt == 0 && abi_fill(s, 1) < 0) return -1;
+        int bit = (int)(s->bitbuf & 1u);
+        s->bitbuf >>= 1; s->bitcnt--;
+        code = (code << 1) | bit;
+        int count = h->counts[len];
+        if (code - count < first) return h->symbols[index + (code - first)];
+        index += count;
+        first = (first + count) << 1;
+    }
+    return -1;
+}
+
+// Drop any partial byte so the next abi_byte() is byte-aligned (needed
+// between DEFLATE's stored blocks and before the gzip trailer).
+static void abi_align(arc_bitin *s) { s->bitbuf = 0; s->bitcnt = 0; }
+
+// ---- member path safety --------------------------------------------------
+// Members now go STRAIGHT to a destination path, so an archive can no longer
+// be trusted to name only sane things. Fail closed on anything that could
+// escape the intended directory or is not a plain name.
+int arc_path_is_safe(const char *n) {
+    if (!n || !n[0]) return 0;
+    if (n[0] == '/') return 0;                 // absolute
+    size_t i = 0;
+    for (; n[i]; i++) {
+        unsigned char c = (unsigned char)n[i];
+        if (c < 0x20 || c == 0x7F) return 0;   // control bytes
+        if (c == '\\') return 0;               // no alternate separator games
+        if (c == ':') return 0;                // no drive/volume prefixes
+    }
+    if (i >= ARC_MEMBER_NAME_MAX) return 0;    // bounded name length
+    const char *p = n;
+    for (;;) {                                  // no ".." component anywhere
+        const char *q = p;
+        while (*q && *q != '/') q++;
+        if ((size_t)(q - p) == 2 && p[0] == '.' && p[1] == '.') return 0;
+        if (!*q) break;
+        p = q + 1;
+    }
+    return 1;
+}
+
+// ---- tar push-parser -----------------------------------------------------
+enum { TX_HDR = 0, TX_DATA = 1, TX_SKIP = 2, TX_DONE = 3, TX_LONGNAME = 4 };
+
+typedef struct {
+    const arc_sink *sink;
+    void           *sinkctx;
+    int             state;
+    uint8_t         hdr[512];
+    int             hdrfill;
+    uint64_t        remain;      // payload bytes left in the current record
+    uint64_t        pad;         // 512-alignment padding left after payload
+    uint64_t        delivered;   // payload bytes handed to the sink
+    arc_member      cur;
+    int             open;        // sink currently holds an unfinished member
+    int             zeroblk;
+    int             stopped;     // a callback asked to end the stream early
+    int             err;
+    char            longname[ARC_MEMBER_NAME_MAX];
+    int             longname_len;
+} arc_tarx;
+
+static uint64_t tx_oct(const uint8_t *p, int n) {
+    uint64_t v = 0;
+    int i = 0;
+    while (i < n && (p[i] == ' ' || p[i] == 0)) i++;
+    for (; i < n; i++) {
+        if (p[i] < '0' || p[i] > '7') break;
+        v = (v << 3) | (uint64_t)(p[i] - '0');
+    }
+    return v;
+}
+
+static int tx_chksum_ok(const uint8_t *h) {
+    uint64_t want = tx_oct(h + 148, 8);
+    uint64_t usum = 0;
+    int64_t  ssum = 0;
+    for (int i = 0; i < 512; i++) {
+        int b = (i >= 148 && i < 156) ? ' ' : h[i];
+        usum += (uint64_t)(unsigned)b;
+        ssum += (int64_t)(signed char)b;
+    }
+    return (usum == want) || ((uint64_t)ssum == want);
+}
+
+static void tx_abort(arc_tarx *t, int err) {
+    if (t->err == ARC_OK) t->err = err;
+    if (t->open) {
+        if (t->sink->on_abort) t->sink->on_abort(t->sinkctx);
+        t->open = 0;
+    }
+}
+
+// Consume one complete 512-byte header block.
+static int tx_header(arc_tarx *t) {
+    int allz = 1;
+    for (int i = 0; i < 512; i++) if (t->hdr[i]) { allz = 0; break; }
+    if (allz) {
+        if (++t->zeroblk >= 2) t->state = TX_DONE;
+        return 0;
+    }
+    t->zeroblk = 0;
+    if (!tx_chksum_ok(t->hdr)) { t->err = ARC_E_FORMAT; return -1; }
+    // base-256 sizes (GNU >8GB extension) are not supported; reject rather
+    // than silently mis-parse a size field.
+    if (t->hdr[124] & 0x80) { t->err = ARC_E_FORMAT; return -1; }
+
+    uint64_t size = tx_oct(t->hdr + 124, 12);
+    uint32_t mode = (uint32_t)tx_oct(t->hdr + 100, 8);
+    uint8_t  type = t->hdr[156];
+
+    t->remain = size;
+    t->pad    = (512 - (size % 512)) % 512;
+    t->delivered = 0;
+
+    // GNU long-name record: its payload IS the next member's name.
+    if (type == 'L') {
+        t->longname_len = 0;
+        if (size >= ARC_MEMBER_NAME_MAX) { t->err = ARC_E_UNSAFE; return -1; }
+        t->state = TX_LONGNAME;
+        return 0;
+    }
+    // pax extended headers carry metadata, not file content: skipping them is
+    // safe (the ustar fields below are still used, and any name they yield is
+    // validated like every other).
+    if (type == 'x' || type == 'g' || type == 'X') { t->state = TX_SKIP; return 0; }
+
+    int is_dir = 0;
+    if (type == '5') is_dir = 1;
+    else if (type == '0' || type == 0 || type == '7') is_dir = 0;
+    else {
+        // hard link ('1'), symlink ('2'), char ('3') / block ('4') device,
+        // fifo ('6'), or anything unknown. Members go straight to a
+        // destination path now, so none of these may be honoured.
+        t->err = ARC_E_UNSAFE;
+        return -1;
+    }
+
+    char name[ARC_MEMBER_NAME_MAX];
+    int  nl = 0;
+    if (t->longname_len > 0) {
+        for (int i = 0; i < t->longname_len && nl < ARC_MEMBER_NAME_MAX - 1; i++)
+            name[nl++] = t->longname[i];
+        t->longname_len = 0;
+    } else {
+        int ustar = (t->hdr[257] == 'u' && t->hdr[258] == 's' && t->hdr[259] == 't' &&
+                     t->hdr[260] == 'a' && t->hdr[261] == 'r');
+        if (ustar && t->hdr[345]) {
+            int pl = 0;
+            while (pl < 155 && t->hdr[345 + pl]) pl++;
+            if (pl + 1 >= ARC_MEMBER_NAME_MAX) { t->err = ARC_E_UNSAFE; return -1; }
+            for (int i = 0; i < pl; i++) name[nl++] = (char)t->hdr[345 + i];
+            name[nl++] = '/';
+        }
+        int bl = 0;
+        while (bl < 100 && t->hdr[bl]) bl++;
+        if (nl + bl >= ARC_MEMBER_NAME_MAX) { t->err = ARC_E_UNSAFE; return -1; }
+        for (int i = 0; i < bl; i++) name[nl++] = (char)t->hdr[i];
+    }
+    name[nl] = 0;
+    // a trailing '/' only marks a directory; strip it before validating
+    while (nl > 1 && name[nl - 1] == '/') { name[--nl] = 0; is_dir = 1; }
+    if (!arc_path_is_safe(name)) { t->err = ARC_E_UNSAFE; return -1; }
+
+    for (int i = 0; i <= nl; i++) t->cur.name[i] = name[i];
+    t->cur.size   = is_dir ? 0 : size;
+    t->cur.mode   = mode;
+    t->cur.is_dir = is_dir;
+
+    int want = t->sink->on_member ? t->sink->on_member(t->sinkctx, &t->cur) : 0;
+    if (want < 0) { t->err = ARC_E_SINK; return -1; }
+    if (want == ARC_STOP) { t->stopped = 1; t->state = TX_DONE; return 0; }
+
+    if (is_dir) {
+        if (want == 0 && t->sink->on_end) {
+            int er = t->sink->on_end(t->sinkctx, &t->cur);
+            if (er < 0) { t->err = ARC_E_SINK; return -1; }
+            if (er == ARC_STOP) { t->stopped = 1; t->state = TX_DONE; return 0; }
+        }
+        t->state = TX_SKIP;   // a dir record's size is normally 0 anyway
+    } else if (want == 0) {
+        t->state = TX_DATA; t->open = 1;
+    } else {
+        t->state = TX_SKIP;
+    }
+    // A zero-length record (empty file, directory, empty long-name) has no
+    // payload and no padding, so nothing in tx_push() would ever come back to
+    // close it. Close it here, or the parser can be left parked in a data
+    // state at end-of-stream and report a bogus truncated-archive error.
+    if (t->remain == 0 && t->pad == 0 && t->state != TX_HDR) {
+        if (t->state == TX_DATA) {
+            if (t->sink->on_end) {
+                int er = t->sink->on_end(t->sinkctx, &t->cur);
+                if (er < 0) { t->err = ARC_E_SINK; return -1; }
+                t->open = 0;
+                if (er == ARC_STOP) { t->stopped = 1; t->state = TX_DONE; return 0; }
+            }
+            t->open = 0;
+        }
+        t->state = TX_HDR;
+    }
+    return 0;
+}
+
+// Feed decompressed bytes to the tar parser.
+static int tx_push(arc_tarx *t, const uint8_t *buf, size_t len) {
+    while (len > 0 && t->state != TX_DONE && t->err == ARC_OK) {
+        if (t->state == TX_HDR) {
+            size_t need = (size_t)(512 - t->hdrfill);
+            size_t take = (len < need) ? len : need;
+            for (size_t i = 0; i < take; i++) t->hdr[t->hdrfill + i] = buf[i];
+            t->hdrfill += (int)take;
+            buf += take; len -= take;
+            if (t->hdrfill == 512) {
+                t->hdrfill = 0;
+                if (tx_header(t) < 0) { tx_abort(t, t->err); return -1; }
+            }
+            continue;
+        }
+        if (t->remain > 0) {
+            size_t take = len;
+            if ((uint64_t)take > t->remain) take = (size_t)t->remain;
+            if (t->state == TX_DATA) {
+                if (t->sink->on_data && t->sink->on_data(t->sinkctx, buf, take) < 0) {
+                    tx_abort(t, ARC_E_SINK); return -1;
+                }
+                t->delivered += take;
+            } else if (t->state == TX_LONGNAME) {
+                for (size_t i = 0; i < take; i++) {
+                    if (t->longname_len >= ARC_MEMBER_NAME_MAX - 1) {
+                        tx_abort(t, ARC_E_UNSAFE); return -1;
+                    }
+                    t->longname[t->longname_len++] = (char)buf[i];
+                }
+            }
+            buf += take; len -= take; t->remain -= take;
+        }
+        if (t->remain == 0 && t->pad > 0) {
+            size_t take = len;
+            if ((uint64_t)take > t->pad) take = (size_t)t->pad;
+            buf += take; len -= take; t->pad -= take;
+        }
+        if (t->remain == 0 && t->pad == 0) {
+            if (t->state == TX_DATA) {
+                // the declared size must equal what actually arrived
+                if (t->delivered != t->cur.size) { tx_abort(t, ARC_E_FORMAT); return -1; }
+                if (t->sink->on_end) {
+                    int er = t->sink->on_end(t->sinkctx, &t->cur);
+                    if (er < 0) { tx_abort(t, ARC_E_SINK); return -1; }
+                    t->open = 0;
+                    if (er == ARC_STOP) { t->stopped = 1; t->state = TX_DONE; return 0; }
+                }
+                t->open = 0;
+            } else if (t->state == TX_LONGNAME) {
+                while (t->longname_len > 0 && t->longname[t->longname_len - 1] == 0)
+                    t->longname_len--;
+                t->longname[t->longname_len] = 0;
+            }
+            t->state = TX_HDR;
+        }
+    }
+    return (t->err == ARC_OK) ? 0 : -1;
+}
+
+// ---- the streaming driver ------------------------------------------------
+typedef struct {
+    arc_bitin bi;
+    arc_tarx  tx;
+    uint8_t   win[ARC_WIN_SIZE];
+    size_t    wpos;
+    uint32_t  crc;
+    uint64_t  total;
+    int       check_crc;
+} arc_stream_work;
+
+// Returns 0 to continue, 1 when a sink asked to stop early, -1 on error.
+static int aw_flush(arc_stream_work *w, size_t n) {
+    if (n == 0) return 0;
+    if (w->check_crc) w->crc = arc_crc32(w->crc, w->win, n);
+    w->total += n;
+    if (tx_push(&w->tx, w->win, n) < 0) return -1;
+    return w->tx.stopped ? 1 : 0;
+}
+
+static int arc_gzip_skip_header(arc_bitin *s) {
+    int b0 = abi_byte(s), b1 = abi_byte(s), cm = abi_byte(s), flg = abi_byte(s);
+    if (b0 != 0x1F || b1 != 0x8B || cm != 8 || flg < 0) return ARC_E_FORMAT;
+    for (int i = 0; i < 6; i++) if (abi_byte(s) < 0) return ARC_E_INPUT;   // MTIME/XFL/OS
+    if (flg & 0x04) {                                  // FEXTRA
+        int lo = abi_byte(s), hi = abi_byte(s);
+        if (lo < 0 || hi < 0) return ARC_E_INPUT;
+        int xl = lo | (hi << 8);
+        for (int i = 0; i < xl; i++) if (abi_byte(s) < 0) return ARC_E_INPUT;
+    }
+    if (flg & 0x08) { int c; do { c = abi_byte(s); if (c < 0) return ARC_E_INPUT; } while (c); }
+    if (flg & 0x10) { int c; do { c = abi_byte(s); if (c < 0) return ARC_E_INPUT; } while (c); }
+    if (flg & 0x02) { if (abi_byte(s) < 0 || abi_byte(s) < 0) return ARC_E_INPUT; }
+    return ARC_OK;
+}
+
+int arc_targz_extract_stream(arc_read_fn rd, void *rdctx,
+                             const arc_sink *sink, void *sinkctx, int verify_crc) {
+    if (!rd || !sink) return ARC_E_FORMAT;
+    arc_stream_work *w = (arc_stream_work *)ARC_MALLOC(sizeof(arc_stream_work));
+    if (!w) return ARC_E_NOMEM;
+    memset(w, 0, sizeof(*w));
+    w->bi.rd = rd; w->bi.rdctx = rdctx;
+    w->tx.sink = sink; w->tx.sinkctx = sinkctx;
+    w->tx.state = TX_HDR;
+    w->check_crc = verify_crc ? 1 : 0;
+
+    int rc = arc_gzip_skip_header(&w->bi);
+    if (rc != ARC_OK) { ARC_FREE(w); return rc; }
+
+    rc = ARC_OK;
+    int bfinal = 0;
+    do {
+        bfinal = abi_bit(&w->bi);
+        if (bfinal < 0) { rc = ARC_E_INPUT; break; }
+        int btype = abi_bits(&w->bi, 2);
+        if (btype < 0) { rc = ARC_E_INPUT; break; }
+
+        if (btype == 0) {
+            abi_align(&w->bi);
+            int l0 = abi_byte(&w->bi), l1 = abi_byte(&w->bi);
+            if (l0 < 0 || l1 < 0 || abi_byte(&w->bi) < 0 || abi_byte(&w->bi) < 0) { rc = ARC_E_INPUT; break; }
+            int len = l0 | (l1 << 8);
+            for (int i = 0; i < len; i++) {
+                int c = abi_byte(&w->bi);
+                if (c < 0) { rc = ARC_E_INPUT; break; }
+                w->win[w->wpos++] = (uint8_t)c;
+                if (w->wpos == ARC_WIN_SIZE) {
+                    int fr = aw_flush(w, ARC_WIN_SIZE);
+                    w->wpos = 0;
+                    if (fr < 0) { rc = w->tx.err; break; }
+                    if (fr > 0) goto done;
+                }
+            }
+            if (rc != ARC_OK) break;
+        } else if (btype == 1 || btype == 2) {
+            huff_t lit_h, dist_h;
+            int lit_len[288], dist_len[32];
+            if (btype == 1) {
+                for (int i = 0;   i <= 143; i++) lit_len[i] = 8;
+                for (int i = 144; i <= 255; i++) lit_len[i] = 9;
+                for (int i = 256; i <= 279; i++) lit_len[i] = 7;
+                for (int i = 280; i <= 287; i++) lit_len[i] = 8;
+                for (int i = 0; i < 32; i++) dist_len[i] = 5;
+            } else {
+                int hlit  = abi_bits(&w->bi, 5); if (hlit  < 0) { rc = ARC_E_INPUT; break; } hlit  += 257;
+                int hdist = abi_bits(&w->bi, 5); if (hdist < 0) { rc = ARC_E_INPUT; break; } hdist += 1;
+                int hclen = abi_bits(&w->bi, 4); if (hclen < 0) { rc = ARC_E_INPUT; break; } hclen += 4;
+                int cl[19];
+                for (int i = 0; i < 19; i++) cl[i] = 0;
+                int bad = 0;
+                for (int i = 0; i < hclen; i++) {
+                    int v = abi_bits(&w->bi, 3);
+                    if (v < 0) { bad = 1; break; }
+                    cl[code_order[i]] = v;
+                }
+                if (bad) { rc = ARC_E_INPUT; break; }
+                huff_t code_h;
+                build_huff(&code_h, cl, 19);
+                int comb[288 + 32];
+                int n = 0;
+                while (n < hlit + hdist) {
+                    int sym = abi_sym(&w->bi, &code_h);
+                    if (sym < 0) { bad = 1; break; }
+                    if (sym < 16) comb[n++] = sym;
+                    else if (sym == 16) {
+                        int c = abi_bits(&w->bi, 2); if (c < 0) { bad = 1; break; }
+                        c += 3;
+                        if (n == 0) { bad = 1; break; }
+                        int v = comb[n - 1];
+                        while (c-- > 0 && n < hlit + hdist) comb[n++] = v;
+                    } else if (sym == 17) {
+                        int c = abi_bits(&w->bi, 3); if (c < 0) { bad = 1; break; }
+                        c += 3;
+                        while (c-- > 0 && n < hlit + hdist) comb[n++] = 0;
+                    } else if (sym == 18) {
+                        int c = abi_bits(&w->bi, 7); if (c < 0) { bad = 1; break; }
+                        c += 11;
+                        while (c-- > 0 && n < hlit + hdist) comb[n++] = 0;
+                    } else { bad = 1; break; }
+                }
+                if (bad) { rc = ARC_E_FORMAT; break; }
+                for (int i = 0; i < 288; i++) lit_len[i]  = (i < hlit)  ? comb[i] : 0;
+                for (int i = 0; i < 32;  i++) dist_len[i] = (i < hdist) ? comb[hlit + i] : 0;
+            }
+            build_huff(&lit_h, lit_len, 288);
+            build_huff(&dist_h, dist_len, 32);
+            for (;;) {
+                int sym = abi_sym(&w->bi, &lit_h);
+                if (sym < 0) { rc = ARC_E_INPUT; break; }
+                if (sym < 256) {
+                    w->win[w->wpos++] = (uint8_t)sym;
+                    if (w->wpos == ARC_WIN_SIZE) {
+                        int fr = aw_flush(w, ARC_WIN_SIZE);
+                        w->wpos = 0;
+                        if (fr < 0) { rc = w->tx.err; break; }
+                        if (fr > 0) goto done;
+                    }
+                    continue;
+                }
+                if (sym == 256) break;
+                sym -= 257;
+                if (sym >= 29) { rc = ARC_E_FORMAT; break; }
+                int len = length_base[sym];
+                if (length_extra[sym]) {
+                    int e = abi_bits(&w->bi, length_extra[sym]);
+                    if (e < 0) { rc = ARC_E_INPUT; break; }
+                    len += e;
+                }
+                int dsym = abi_sym(&w->bi, &dist_h);
+                if (dsym < 0 || dsym >= 30) { rc = ARC_E_FORMAT; break; }
+                int dist = dist_base[dsym];
+                if (dist_extra[dsym]) {
+                    int e = abi_bits(&w->bi, dist_extra[dsym]);
+                    if (e < 0) { rc = ARC_E_INPUT; break; }
+                    dist += e;
+                }
+                // The window holds the last ARC_WIN_SIZE emitted bytes even
+                // across a flush (flushing copies out; it never clears), so a
+                // back-reference is valid whenever dist <= what we have
+                // produced so far, capped by the format's own 32K limit.
+                if ((uint64_t)dist > w->total + w->wpos || dist > ARC_WIN_SIZE) { rc = ARC_E_FORMAT; break; }
+                size_t src = (w->wpos - (size_t)dist) & ARC_WIN_MASK;
+                for (int i = 0; i < len; i++) {
+                    w->win[w->wpos++] = w->win[src];
+                    src = (src + 1) & ARC_WIN_MASK;
+                    if (w->wpos == ARC_WIN_SIZE) {
+                        int fr = aw_flush(w, ARC_WIN_SIZE);
+                        w->wpos = 0;
+                        if (fr < 0) { rc = w->tx.err; goto done; }
+                        if (fr > 0) goto done;
+                    }
+                }
+            }
+            if (rc != ARC_OK) break;
+        } else {
+            rc = ARC_E_FORMAT;
+            break;
+        }
+    } while (!bfinal);
+
+done:
+    if (rc == ARC_OK && !w->tx.stopped && w->wpos > 0) {
+        if (aw_flush(w, w->wpos) < 0) rc = w->tx.err;
+        w->wpos = 0;
+    }
+    if (rc == ARC_OK && w->bi.err) rc = ARC_E_INPUT;
+
+    // A member left open means the archive ended mid-file: the declared size
+    // never arrived. Fail closed and let the sink drop its partial output.
+    if (rc == ARC_OK && !w->tx.stopped) {
+        if (w->tx.state != TX_DONE && w->tx.state != TX_HDR) rc = ARC_E_FORMAT;
+        else if (w->tx.state == TX_HDR && w->tx.hdrfill != 0) rc = ARC_E_FORMAT;
+    }
+
+    // A stream stopped early on purpose has no trailer to check yet; the
+    // caller asked to stop, so that is not an integrity failure.
+    if (rc == ARC_OK && w->check_crc && !w->tx.stopped) {
+        abi_align(&w->bi);
+        uint32_t gcrc = 0, isize = 0;
+        int ok = 1;
+        for (int i = 0; i < 4; i++) { int b = abi_byte(&w->bi); if (b < 0) { ok = 0; break; } gcrc  |= (uint32_t)b << (8 * i); }
+        for (int i = 0; ok && i < 4; i++) { int b = abi_byte(&w->bi); if (b < 0) { ok = 0; break; } isize |= (uint32_t)b << (8 * i); }
+        if (!ok) rc = ARC_E_INPUT;
+        else if (gcrc != w->crc || isize != (uint32_t)(w->total & 0xFFFFFFFFu)) rc = ARC_E_CORRUPT;
+    }
+
+    if (rc != ARC_OK) tx_abort(&w->tx, rc);
+    if (rc == ARC_OK && w->tx.err != ARC_OK) rc = w->tx.err;
+    ARC_FREE(w);
+    return rc;
+}
+
+// Byte-count of the fixed working set this extractor allocates, so a caller
+// can report its own bounded footprint honestly instead of guessing.
+size_t arc_stream_workmem(void) { return sizeof(arc_stream_work); }

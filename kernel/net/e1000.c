@@ -401,13 +401,23 @@ int e1000_send(const void *data, uint16_t length) {
 
     e1000_write(E1000_TDT, tx_cur);
 
-    // Small delay to allow hardware to process
-    for (int i = 0; i < 1000; i++) {
-        io_wait();
-    }
+    // #615: THIS IS WHERE THE NETWORK STACK'S THROUGHPUT WENT. There used to be
+    // a "small delay to allow hardware to process" here: 1000 iterations of
+    // io_wait(). io_wait() is an OUT to port 0x80, and under KVM every one of
+    // those is a VM exit, so the "small delay" MEASURED ~5 MILLISECONDS PER
+    // TRANSMITTED PACKET - paid on every ACK, not just on data. On the wire that
+    // showed up as our receiver acknowledging exactly one segment every 5.25ms
+    // no matter how much data was already sitting in the ring, which capped a
+    // gigabit LAN download at ~271 KB/s (and, before the MSS fix, at ~98 KB/s
+    // because each of those packets carried only 536 bytes).
+    //
+    // It is not needed: the descriptor and its buffer are published with an
+    // mfence BEFORE the TDT write, which is the documented ordering requirement,
+    // and the loop below already waits on the descriptor-done bit for actual
+    // completion. Deleting it does not remove a single correctness check.
 
     // Wait for transmission to complete
-    timeout = 10000;
+    timeout = 100000;
     while (!(tx_descs[old_cur].status & E1000_TXD_STAT_DD) && timeout > 0) {
         timeout--;
     }

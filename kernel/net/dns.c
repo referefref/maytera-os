@@ -18,10 +18,13 @@
 #include "../mm/heap.h"
 #include "../serial.h"
 #include "../gui/syslog.h"
+#include "../cpu/mono.h"   // #499: sched_now_ms() - THE shared real-elapsed-ms clock
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // External declarations
 extern void net_poll(void);
-extern int net_is_up(void);   // #374 network-up gate
+extern int net_is_up(void);        // #374 network-up gate
+extern int net_wire_usable(void);  // #549 wire-usable gate (no FAULTY clause)
 extern volatile uint64_t timer_ticks;
 extern uint32_t g_timer_hz;   // real PIT frequency (250Hz), NOT the legacy 18.2Hz
 
@@ -30,8 +33,10 @@ extern uint32_t g_timer_hz;   // real PIT frequency (250Hz), NOT the legacy 18.2
 // too small: dns_wait's DNS_TIMEOUT_MS=1500ms became ~112ms, so DNS gave up
 // almost immediately under load and negative-cached the host (spurious "failed
 // to resolve"); cache TTLs were likewise ~14x too short (excess re-resolves).
-// Use the real timer frequency everywhere instead.
-static inline uint64_t dns_hz(void) { return g_timer_hz ? g_timer_hz : 250; }
+// Use the real timer frequency everywhere instead. #499 finished the job: the
+// ms->ticks helper (dns_hz) is GONE, because a tick count is not a duration at
+// all under KVM tick reinjection. Both the query wait and the cache TTL are now
+// REAL milliseconds on sched_now_ms().
 // Yield to the scheduler during DNS waits so the resolving process does not
 // busy-spin and starve the rest of the system (e.g. the compositor) for the
 // whole DNS timeout. Same pattern #180 applied to https.c / wget.c / dosexec.c.
@@ -60,7 +65,7 @@ typedef struct {
     char hostname[128];
     uint32_t ip;            // IP in host byte order (0 for negative entries)
     uint32_t ttl;           // honored TTL in seconds (diagnostics)
-    uint64_t expiry;        // Expiry time in timer ticks
+    uint64_t expiry_ms;     // #499: absolute expiry in sched_now_ms() REAL ms
     int valid;
     int negative;           // 1 = cached failure (do not re-query until expiry)
 } dns_cache_entry_t;
@@ -110,7 +115,7 @@ static inline uint32_t ntohl(uint32_t n) {
 static dns_cache_entry_t *dns_cache_lookup(const char *hostname) {
     for (int i = 0; i < DNS_CACHE_SIZE; i++) {
         if (dns_cache[i].valid &&
-            timer_ticks < dns_cache[i].expiry &&
+            (int64_t)(sched_now_ms() - dns_cache[i].expiry_ms) < 0 &&
             strcmp(dns_cache[i].hostname, hostname) == 0) {
             return &dns_cache[i];
         }
@@ -143,15 +148,15 @@ static void dns_cache_put(const char *hostname, uint32_t ip,
     }
     if (slot < 0) {
         for (int i = 0; i < DNS_CACHE_SIZE; i++) {
-            if (!dns_cache[i].valid || timer_ticks >= dns_cache[i].expiry) {
+            if (!dns_cache[i].valid || (int64_t)(sched_now_ms() - dns_cache[i].expiry_ms) >= 0) {
                 slot = i; break;
             }
         }
     }
     if (slot < 0) {
-        uint64_t oldest = dns_cache[0].expiry; slot = 0;
+        uint64_t oldest = dns_cache[0].expiry_ms; slot = 0;
         for (int i = 1; i < DNS_CACHE_SIZE; i++) {
-            if (dns_cache[i].expiry < oldest) { oldest = dns_cache[i].expiry; slot = i; }
+            if (dns_cache[i].expiry_ms < oldest) { oldest = dns_cache[i].expiry_ms; slot = i; }
         }
     }
 
@@ -159,7 +164,12 @@ static void dns_cache_put(const char *hostname, uint32_t ip,
     dns_cache[slot].hostname[sizeof(dns_cache[slot].hostname) - 1] = '\0';
     dns_cache[slot].ip = ip;
     dns_cache[slot].ttl = ttl_sec;
-    dns_cache[slot].expiry = timer_ticks + (uint64_t)ttl_sec * dns_hz();
+    // #499: the TTL is a WALL-CLOCK duration, so it must be measured on the
+    // wall clock. timer_ticks counts ticks DELIVERED, not time ELAPSED: a KVM
+    // tick burst re-delivers ~1250 missed ticks (a nominal 5s at 250Hz) in
+    // ~15ms of real time, which used to evict a just-resolved name instantly
+    // and force a re-query storm at exactly the busiest moment.
+    dns_cache[slot].expiry_ms = sched_now_ms() + (uint64_t)ttl_sec * 1000ULL;
     dns_cache[slot].valid = 1;
     dns_cache[slot].negative = negative;
 }
@@ -401,8 +411,10 @@ static uint32_t parse_ip(const char *str) {
 // Poll the network for up to ms milliseconds, returning early if the pending
 // query completed. Used both for response waits and inter-retry backoff.
 static int dns_wait(uint32_t ms) {
-    uint64_t until = timer_ticks + ((uint64_t)ms * dns_hz()) / 1000 + 1;
-    while (timer_ticks < until) {
+    // #499: REAL elapsed ms, not timer_ticks (a tick burst made this return
+    // immediately, so DNS gave up on the first query and negative-cached).
+    uint64_t until_ms = sched_now_ms() + (uint64_t)ms + 1;
+    while ((int64_t)(sched_now_ms() - until_ms) < 0) {
         net_poll();
         if (dns_query.complete) return 1;
         // Yield ~a couple ms to the scheduler each iteration instead of a
@@ -478,7 +490,7 @@ void dns_cache_stats(uint32_t *entries, uint32_t *hits, uint32_t *misses,
                      uint32_t *neg_hits) {
     uint32_t n = 0;
     for (int i = 0; i < DNS_CACHE_SIZE; i++)
-        if (dns_cache[i].valid && timer_ticks < dns_cache[i].expiry) n++;
+        if (dns_cache[i].valid && (int64_t)(sched_now_ms() - dns_cache[i].expiry_ms) < 0) n++;
     if (entries)  *entries  = n;
     if (hits)     *hits     = stat_hits;
     if (misses)   *misses   = stat_misses;
@@ -514,7 +526,11 @@ int dns_resolve(const char *hostname, uint32_t *ip_out) {
     // after several seconds (DNS_TIMEOUT_MS * DNS_MAX_RETRIES), and on a
     // link-down VM that repeats for every lookup. Negative-cache and return
     // immediately so callers back off without ever entering the wait.
-    if (!net_is_up()) {
+    // #549: net_wire_usable(), not net_is_up(). A re-probe has to be able to
+    // RESOLVE, or recovery would only ever work off a warm cache. Background
+    // clients still quiesce while FAULTY because they gate on net_is_up()
+    // before they ever get here.
+    if (!net_wire_usable()) {
         dns_cache_put(hostname, 0, DNS_NEG_TTL_SOFT, 1);   // #333/#374 transient: link/IP may return
         kprintf("[DNS] network down; skipping resolve of %s (soft-negative-cached %ds)\n",
                 hostname, DNS_NEG_TTL_SOFT);
@@ -783,7 +799,6 @@ static int dns_build_vector(uint8_t *buf, uint32_t kind, uint32_t *seed) {
 }
 
 void dns_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     static uint8_t buf[600];
     uint32_t seed = 0x1d0f5a3b;
     uint32_t vectors = 0, mismatches = 0;

@@ -1,0 +1,29 @@
+{
+  "app": "gallery",
+  "version": "1.0.0",
+  "description": "Contact-sheet image browser with thumbnails, preview and slideshow",
+  "icon": "gallery.bmp",
+  "category": "Graphics",
+  "file_associations": [],
+  "capabilities": [
+    {
+      "action": "open_folder",
+      "parameters": {"path": "string"},
+      "description": "Browse a folder as a thumbnail contact sheet",
+      "requires_capability": "filesystem.read"
+    },
+    {
+      "action": "preview_image",
+      "parameters": {"path": "string"},
+      "description": "Open the full preview for an image",
+      "requires_capability": "filesystem.read"
+    }
+  ],
+  "state_queries": [
+    {
+      "query": "get_folder_info",
+      "returns": {"path": "string", "images": "int", "folders": "int"},
+      "requires_capability": "app.gallery.read"
+    }
+  ]
+}

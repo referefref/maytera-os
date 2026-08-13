@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -m64 -ffreestanding -fno-stack-protector -nostdlib -nostdinc -mno-red-zone -mcmodel=large -fno-pic
+CFLAGS = -m64 -ffreestanding -fstack-protector-strong -mstack-protector-guard=global -nostdlib -nostdinc -mno-red-zone -mcmodel=large -fno-pic
 LDFLAGS = -nostdlib -static -m elf_x86_64 -T ../user.ld
 
 all: hello.elf

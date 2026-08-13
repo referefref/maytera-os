@@ -874,14 +874,23 @@ int main(int argc, char **argv) {
             }
         }
 
+        // #548: this used to draw_all()+win_invalidate() UNCONDITIONALLY
+        // every 50ms tick forever, even fully idle (no new IRC traffic, no
+        // input) - the same idle-CPU anti-pattern fixed in weather/rss
+        // (commit 1c03653 and this pass). Only repaint when something this
+        // tick could actually have changed: a real UI event (ret>0) or new
+        // socket data that process_recv() may have appended to the buffer.
+        int got_data = 0;
         if (sock >= 0 && irc_state >= IRC_CONNECTING) {
             char recv_buf[1024];
             int n = tcp_recv(sock, recv_buf, sizeof(recv_buf) - 1);
-            if (n > 0) process_recv(recv_buf, n);
+            if (n > 0) { process_recv(recv_buf, n); got_data = 1; }
         }
 
-        draw_all();
-        win_invalidate(win);
+        if (ret > 0 || got_data) {
+            draw_all();
+            win_invalidate(win);
+        }
     }
 
     if (sock >= 0) { irc_cmd("QUIT :Leaving"); tcp_close(sock); }

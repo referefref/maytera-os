@@ -48,7 +48,9 @@ typedef struct {
     uint32_t sector_size;    // Sector size (usually 512 or 4096)
     bool removable;          // Is removable media
     bool selected;           // Is currently selected
-    int  drive_id;           // ATA drive id (channel*2 + unit); used by the installer engine
+    int  drive_id;           // ATA drive id (channel*2 + unit). ATA targets only; -1 otherwise.
+    uint8_t kind;            // INST_KIND_*: what bus this disk is on
+    uint8_t index;           // ATA: (channel<<1)|drive.  AHCI: port.  USB: device index
 } installer_disk_t;
 
 // Partition information
@@ -151,6 +153,7 @@ void installer_run(void);
 typedef void (*installer_progress_fn)(void *ctx, int percent, const char *msg);
 int installer_do_install(int target_drive_id, installer_progress_fn cb, void *ctx);
 
+
 // Deferred headless auto-install (gated on /CONFIG/AUTOINST.CFG); logs to serial.
 void installer_start_deferred_autoinstall(void);
 
@@ -197,5 +200,32 @@ bool installer_create_user(installer_t *inst);
 void installer_handle_mouse_move(installer_t *inst, int32_t x, int32_t y);
 void installer_handle_mouse_down(installer_t *inst, int32_t x, int32_t y, uint32_t button);
 void installer_handle_key(installer_t *inst, uint32_t keycode, char key_char);
+
+// #306: install-target descriptor, mirrored by rustkern/instdisk.rs. The
+// _Static_assert is the lock: if this struct grows, the Rust side fails to
+// match and we find out at COMPILE time rather than by decoding garbage.
+#define INST_KIND_ATA   0
+#define INST_KIND_AHCI  1
+#define INST_KIND_USB   2
+#define INST_MAX_TARGETS 16
+typedef struct {
+    uint8_t  kind;      // INST_KIND_*
+    uint8_t  index;     // ATA: (channel<<1)|drive.  AHCI: port.  USB: device idx
+    uint8_t  is_boot;   // 1 = booted from this disk; never installable
+    uint8_t  _pad;
+    uint64_t sectors;   // capacity in 512-byte sectors
+} inst_target_t;
+_Static_assert(sizeof(inst_target_t) == 16, "inst_target_t must match rustkern/instdisk.rs InstTarget");
+
+int inst_enumerate_targets(inst_target_t *out, int max);
+int inst_target_installable(const inst_target_t *t, uint64_t min_sectors);
+
+// #306: the real install entry point. Takes a descriptor from
+// inst_enumerate_targets() so an AHCI or USB disk can actually be SELECTED,
+// not merely enumerated. installer_do_install() is a thin ATA-only wrapper
+// over this, kept for the #306 boot selftest and other drive-id callers.
+// Declared HERE rather than beside installer_do_install() because it needs
+// inst_target_t, which is defined below that point.
+int installer_do_install_target(const inst_target_t *t, installer_progress_fn cb, void *ctx);
 
 #endif // INSTALLER_H

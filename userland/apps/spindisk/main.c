@@ -10,7 +10,7 @@ static char buf[8192];
 int main(void) {
     volatile unsigned long iters = 0;
     for (;;) {
-        int fd = sys_open("/APPS/CALC.ELF", 0);
+        int fd = sys_open("/APPS/CALC", 0);
         if (fd >= 0) {
             while (sys_read(fd, buf, sizeof(buf)) > 0) { /* drain whole file */ }
             sys_close(fd);

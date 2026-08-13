@@ -29,6 +29,7 @@
 #include "../fs/bootlog.h"
 #include "../fs/vfs.h"
 #include "../fs/fat.h"
+#include "../security/uaccess_smap.h"  // #19/#645: AC bracket on the caller-buffer copy
 
 // -----------------------------------------------------------------------------
 // Device state (single CDC-ACM serial port supported)
@@ -72,7 +73,11 @@ int usb_cdc_acm_write(const void *data, uint32_t len, uint32_t timeout_ms) {
     uint32_t scrap = 0;
     (void)xhci_int_in_poll(d->xhc, d->slot_id, d->out_dci, &scrap, 0);
 
-    memcpy(d->tx_buf, data, len);
+    // #19/#645: `data` is the caller's buffer; Ring-3 via cdc_dev_write().
+    // Missing from the pre-existing ledger, which listed only the read twin.
+    {   uaccess_ac_t __ac = uaccess_begin();
+        memcpy(d->tx_buf, data, len);
+        uaccess_end(__ac); }
     if (xhci_int_in_submit(d->xhc, d->slot_id, d->out_dci,
                            (uint64_t)d->tx_buf, len) != 0) {
         return -1;
@@ -109,7 +114,10 @@ int usb_cdc_acm_read(void *buf, uint32_t maxlen, uint32_t timeout_ms) {
         if (r > 0) {
             d->in_armed = 0;
             uint32_t n = (got < maxlen) ? got : maxlen;
-            if (n) memcpy(buf, d->rx_buf, n);
+            // #19/#645: `buf` is the caller's buffer; Ring-3 via cdc_dev_read().
+            if (n) { uaccess_ac_t __ac = uaccess_begin();
+                     memcpy(buf, d->rx_buf, n);
+                     uaccess_end(__ac); }
             return (int)n;
         }
         if (r < 0) {
@@ -310,7 +318,7 @@ static int64_t cdc_dev_write(file_t *f, const void *buf, size_t count) {
     return (r < 0) ? -1 : (int64_t)count;
 }
 
-static void cdc_dev_release(file_t *f) { (void)f; }
+static int cdc_dev_release(file_t *f) { (void)f; return 0; }   // #695: nothing buffered
 
 static const file_ops_t cdc_dev_ops = {
     .read    = cdc_dev_read,

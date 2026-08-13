@@ -17,20 +17,119 @@
 //     pre-mount xHCI/USB-MSC enumeration details make it into the file even
 //     though the file obviously could not be written before the mount that
 //     it is itself reporting on).
-//   - After arming, EVERY bootlog_write() call re-writes the WHOLE
-//     accumulated buffer to /BOOTLOG.TXT via fat_write_file(). This is a full
-//     rewrite rather than a true incremental disk-append: the FAT driver's
-//     writes are already synchronous with no write-back cache (see
-//     fat_write_file/blk_write), so a full rewrite after each line is exactly
-//     as durable as a true append would be, without adding new incremental-
-//     append plumbing to the FAT driver while chasing a real-hardware bug.
-//     A boot logs on the order of ~100-300 short lines, so total write volume
-//     for one boot is a few hundred KB at most - negligible next to a single
-//     USB-MSC bulk file transfer, and it does not meaningfully slow boot.
+//   - After arming, EVERY bootlog_write() call reaches the medium before it
+//     returns, so a hard hang or power-cut immediately after any line still
+//     leaves that line on disk. That per-line durability is the whole point of
+//     the file and is NOT negotiable: this is the only post-mortem channel the
+//     iMac14,4 has.
+//   - #748: it reaches the medium as an INCREMENTAL APPEND of just the new
+//     bytes (ext2_append_file, #598), not as a rewrite of the whole file. The
+//     original text here read "A boot logs on the order of ~100-300 short
+//     lines, so total write volume for one boot is a few hundred KB at most".
+//     The line count was right and the conclusion was wrong: a full rewrite per
+//     line makes one boot an O(n^2) series, and with the ~25x device
+//     amplification measured on this stack that came to MOST of the 7.35 MB a
+//     boot wrote. Appending keeps every durability property above and makes the
+//     cost per line independent of the log so far. On FAT (the #348 single-
+//     partition live-USB image) there is no append primitive and the old
+//     whole-file rewrite is still used; see bootlog_persist().
+// #693: the bootlog IS the persistence of last resort, so it is the one writer
+// that CANNOT report its own failure into itself. Recursing into bootlog_write()
+// from a failed bootlog flush would loop on a wedged disk. The only channel left
+// is the serial console, and it is rate-limited to one line per path so a broken
+// disk cannot turn the log into the flood.
+// #742 completes that thought. Reporting on serial is necessary and was not
+// sufficient: the breadcrumb file exists precisely BECAUSE serial is silent in
+// GUI mode and on the real iMac, so "we told you on serial" tells the one reader
+// who cannot listen. Three things are added here:
+//
+//   1. bootlog_write() and friends RETURN a status, so a caller that cares can
+//      act. They are deliberately NOT MUST_CHECK: at 410 call sites, all of them
+//      logging, an attribute would produce 410 IGNORE_RESULT ceremonies and
+//      nobody would read any of them. The value is there for the callers who
+//      want it, and bootlog_persist_failures() is there for the rest.
+//
+//   2. THE FAILURE IS RECORDED IN-BAND, in the RAM buffer. This works because of
+//      a property of the design that is easy to miss: every flush rewrites the
+//      WHOLE buffer, so a failed flush is SELF-HEALING - if any later flush
+//      succeeds, everything the failed one would have written lands anyway. The
+//      only permanent loss is a sink that never succeeds again. So the honest
+//      artifact is a log that, once the medium recovers, CONTAINS the sentence
+//      "this flush failed". We append that to the buffer and deliberately do NOT
+//      re-flush it (that is the recursion the note below warns about).
+//
+//   3. bootlog_persist_failures() lets main.c, the shell, or a test say out loud
+//      that the breadcrumb file is not trustworthy evidence.
+// #748 WRITE COST. Measured on the golden with QEMU blockstats on the
+// usb-storage device: 7.35 MB written before the desktop settled, then
+// 2.49 MB and 3.28 MB over two untouched idle minutes, i.e. 43-57 KB/s to a
+// USB flash stick at COMPLETE IDLE, indefinitely. Two DIFFERENT faults, and
+// they need OPPOSITE fixes, so do not collapse them into one rule:
+//
+//   /BOOTLOG.TXT is the BOOT cost and writes ZERO at idle (138 writes, all
+//   during boot). Its cost is that every line rewrote the WHOLE accumulated
+//   file, so one boot is an O(n^2) series of full-file rewrites. Its VALUE is
+//   surviving a boot that HANGS on a machine with no serial port, which is the
+//   only post-mortem channel the iMac14,4 has, so per-line durability MUST
+//   survive the fix. Fixed by making it an INCREMENTAL APPEND
+//   (ext2_append_file, #598) instead of a rewrite: same line-by-line
+//   durability, cost per line no longer proportional to the log so far.
+//
+//   /HEARTBEAT.TXT is the IDLE bleed. Its ring is correctly bounded (this was
+//   already fixed once, for #373), but the whole ~4 KB of it was rewritten
+//   EVERY 2 SECONDS, forever. It is a debug trace, and a wedge is already
+//   recorded by /PANIC.TXT, so continuous persistence buys very little. Fixed
+//   by keeping the ring in RAM and persisting it only on a schedule, on the
+//   starvation anomaly it exists to catch, and on panic.
+//
+// WHY "PUT IT ON THE RAMDISK" IS NOT AN OPTION, do not re-propose it: there is
+// no RAM-only path below the filesystem. blockdev.c's blk_write() calls
+// usb_msc_write() UNCONDITIONALLY and only then updates the RAM copy for
+// coherence, and its comment names these two files as the reason. The ring has
+// to live ABOVE the filesystem, which is exactly where it already is.
+//
+// AND OPTIMISE FOR FEWER FLUSH EVENTS, NOT SMALLER ONES. Device traffic was
+// measured at ~25x the logical bytes rewritten (0.5 rewrites/s of 4 KB versus
+// 12.8-16.8 device write ops/s), the same amplification ext2.c:2063 records
+// (151,826 blk_write() calls = 1,062,742 sectors). A change that halves the
+// bytes but keeps a 2-second cadence is worth almost nothing.
+static void bootlog_flush_failed(const char *path, int rc);
+
 #include "bootlog.h"
+#include "ext2.h"
 #include "../serial.h"
 #include "../string.h"
+#include "../cpu/mono.h"
+#include "../sync/noblock.h"   // #745 (task #69): wq_noblock_reason()
 #include <stdarg.h>
+
+static void bootlog_append_raw(const char *s, uint32_t len);
+
+static uint32_t g_persist_failures = 0;
+static int      g_last_persist_rc  = 0;
+
+static void bootlog_flush_failed(const char *path, int rc) {
+    static const char *last_path = 0;
+    g_persist_failures++;
+    g_last_persist_rc = rc;
+    // In-band, into the RAM buffer only. NEVER re-flush here: that is the loop
+    // on a wedged disk the header warns about. A later successful flush of any
+    // sink that shares this buffer carries the note to the medium for free.
+    {
+        char note[128];
+        int n = snprintf(note, sizeof(note),
+                         "[BOOTLOG] FLUSH FAILED rc=%d path=%s (this file was "
+                         "INCOMPLETE at this point)\n", rc, path);
+        if (n > 0) bootlog_append_raw(note, (uint32_t)((unsigned)n < sizeof(note) ? (unsigned)n : sizeof(note) - 1));
+    }
+    if (last_path == path) return;    // one SERIAL report per sink, not per call
+    last_path = path;
+    kprintf("[BOOTLOG] PERSIST FAILED rc=%d path=%s - this log is INCOMPLETE "
+            "and must not be trusted as evidence\n", rc, path);
+}
+
+uint32_t bootlog_persist_failures(void) { return g_persist_failures; }
+int      bootlog_last_persist_rc(void)  { return g_last_persist_rc; }
 
 #define BOOTLOG_BUF_CAP  (96 * 1024)
 #define BOOTLOG_PATH     "/BOOTLOG.TXT"
@@ -49,6 +148,54 @@ static uint32_t g_bootlog_len = 0;
 static int      g_bootlog_armed = 0;
 static int      g_bootlog_full_warned = 0;
 static fat_fs_t *g_bootlog_fs = 0;
+static uint32_t g_bootlog_persisted = 0;   // #748: bytes of g_bootlog_buf on disk
+
+// ===========================================================================
+// #748 THE ONE PERSIST PRIMITIVE for every breadcrumb file in this module.
+// ===========================================================================
+// Three of the four files (/BOOTLOG.TXT, /USBLOG.TXT, /AUDIOLOG.TXT) are
+// APPEND-ONLY streams: their RAM buffer only ever grows, so the medium only
+// ever needs the bytes it has not seen. `*persisted` is how many of those bytes
+// are already down. Pass persisted = 0 for a file whose buffer is a RING whose
+// content SHIFTS (/HEARTBEAT.TXT drops whole lines off the front), because an
+// append is then simply the wrong operation and only a whole-file replace is
+// correct.
+//
+// Three properties worth stating because each one was a bug in some earlier
+// version of this file:
+//
+//   - THE FIRST WRITE IS ALWAYS A REPLACE (*persisted == 0). The file may not
+//     exist, or may be a stale copy from the PREVIOUS boot; appending to that
+//     would splice two boots together into one unreadable file.
+//   - A FAILED APPEND FALLS BACK TO A REPLACE, which both retries and REPAIRS:
+//     a replace writes the exact RAM content, so even a partial append is
+//     corrected. This is the self-healing property #742 relies on. The one
+//     case where it would DESTROY data is when the RAM buffer has stopped
+//     growing (buffer full) while the medium is ahead of it, so the fallback
+//     is suppressed there and the failure is reported instead.
+//   - FAT GETS THE OLD BEHAVIOUR. ext2_append_file() (#598) is ext2-only and
+//     the #348 live-USB image is single-FAT by design, so on FAT this stays a
+//     whole-file rewrite exactly as before. Nothing regresses; ext2-root
+//     (every golden) gets the O(n) path.
+static int bootlog_persist(const char *path, const char *buf, uint32_t len,
+                           uint32_t *persisted, int buf_full) {
+    if (!g_bootlog_armed || !g_bootlog_fs) return 0;
+
+    if (persisted) {
+        if (*persisted > len) *persisted = 0;   // buffer rewound: replace it
+        if (*persisted == len) return 0;        // nothing new to say
+        if (*persisted > 0 && fat_path_on_ext2(g_bootlog_fs, path)) {
+            int rc = ext2_append_file(fat_ext2_vol_path(path),
+                                      buf + *persisted, len - *persisted);
+            if (rc == 0) { *persisted = len; return 0; }
+            if (buf_full) return rc;   // see comment above
+        }
+    }
+
+    int rc = fat_write_file(g_bootlog_fs, path, buf, len);
+    if (rc == 0 && persisted) *persisted = len;
+    return rc;
+}
 
 static void bootlog_append_raw(const char *s, uint32_t len) {
     if (len == 0) return;
@@ -68,25 +215,164 @@ int bootlog_is_armed(void) {
     return g_bootlog_armed;
 }
 
-void bootlog_write(const char *fmt, ...) {
+// ---------------------------------------------------------------------------
+// #745 (task #62): THE LOGGER MUST NEVER WRITE TO THE MEDIUM FROM INSIDE THE
+// STORAGE STACK. See the ticket comment in usb_msc.c for the exact deadlock
+// this closes; the short version is that /BOOTLOG.TXT lives on the very device
+// whose driver was logging its own transfer errors, so a log line issued from
+// inside a SCSI command re-entered that driver's non-recursive command lock.
+//
+// TWO INDEPENDENT GUARDS, either of which alone breaks the loop:
+//
+//   g_bl_defer   an explicit window a caller opens around work that must not
+//                be logged-to-disk underneath (usb_msc_transport takes it
+//                around a whole command). Counted, not just flagged.
+//   g_bl_in_persist  a re-entrancy guard on the flush itself, so no future
+//                path can recurse into a flush regardless of who calls what.
+//
+// NEITHER LOSES A LINE. The line always reaches serial and the RAM buffer; only
+// the device write is skipped, and the next bootlog_write() from a safe context
+// persists the whole accumulated delta. bootlog_arm() and the panic path flush
+// the entire buffer unconditionally.
+// ---------------------------------------------------------------------------
+// #745 (task #69): THE THIRD GUARD, AND THE ONLY ONE THAT NEEDS NO CALLER TO
+// REMEMBER ANYTHING.
+//
+// The two guards above are both CALLER-DRIVEN: g_bl_defer only fires because
+// usb_msc_transport() remembers to open the window, and g_bl_in_persist only
+// fires on re-entry through the flush itself. Neither one can see the OTHER
+// way into the storage stack, which is a caller that is not in the storage
+// stack at all but holds a lock with interrupts off:
+//
+//   nic_send()                       kernel/net/net.c  - takes net_lock(),
+//                                    which does `cli` and keeps IF clear for
+//                                    the whole hold
+//     -> usb_eth_send()              kernel/drivers/usb_ecm.c
+//       -> usbnet_bulk_out()         calls bootlog_write() on its diagnostic
+//                                    and TX-submit-failure paths
+//         -> bootlog_persist()       -> fat/ext2 write -> blk_write()
+//           -> usb_msc_transport()   -> msc_cmd_lock()
+//             -> msc_cmd_lock_noblock()   because wq_may_block() is FALSE here
+//
+// msc_cmd_lock_noblock() is a `while (test_and_set)` with NO bound: it waits
+// for a lock that a DIFFERENT thread holds, from a context that cannot be
+// preempted (IF=0) and must not park. That is an unbounded wait entered with a
+// global lock held and interrupts disabled, i.e. the whole machine stops until
+// the other thread happens to finish - and the scheduler cannot run to let it.
+// usb_msc.c's own comment asserts this branch is "unreachable by construction
+// ... because every runtime caller reaches msc_cmd_lock() with interrupts on".
+// That claim is false, and this is the path that falsifies it.
+//
+// WHY THE GUARD LIVES HERE AND NOT AT THE CALL SITE. Removing the
+// bootlog_write() from usbnet_bulk_out() (also done, #745 task #69) fixes ONE
+// caller. The rule is "nothing may enter the storage stack from a context that
+// cannot afford an unbounded wait", and the only place that can be enforced for
+// every present and future caller is the logger's own device-write decision.
+// Same reasoning as #514: a stated rule is not a control.
+//
+// THE CONDITION. wq_noblock_reason() (sync/noblock.h) is the canonical
+// statement of "may this context park", so this reuses it rather than growing a
+// second private notion of the same thing. We defer on IRQ_OFF, but ONLY once
+// the scheduler is live: before proc_init() the kernel is single-threaded, so
+// msc_cmd_lock() is UNCONTENDED by construction and the write is safe. That
+// exception is load-bearing - deferring the whole pre-scheduler phase would
+// mean a machine that hangs during boot writes no /BOOTLOG.TXT at all, and on
+// the real iMac that file is the only telemetry there is.
+//
+// NOTHING IS LOST. The line still reaches serial and the RAM buffer; only the
+// device write is skipped, and the next bootlog_write() from a safe context
+// persists the whole accumulated delta, exactly like the other two guards.
+static volatile int      g_bl_defer     = 0;
+static volatile int      g_bl_in_persist = 0;
+uint64_t g_bootlog_flushes_deferred = 0;   // device writes suppressed by a guard
+
+// #745 (task #69): device writes declined specifically because the CALLING
+// CONTEXT had interrupts off with the scheduler live. Separate from
+// g_bootlog_flushes_deferred on purpose: bldef= counts the storage stack
+// protecting itself (expected, benign), and this counts a no-block context
+// being turned away at the door (a real #426 site, and until it is non-zero
+// nobody has watched this guard fire). Reported on [HB] as blgnb=.
+uint64_t g_bootlog_noblock_defers = 0;
+// Return address of the first caller ever turned away, for addr2line. One
+// address is enough: it names the offending path, and a second field that is
+// almost always the same value is noise on a 416-byte heartbeat record.
+uint64_t g_bootlog_noblock_ra = 0;
+
+void bootlog_defer_begin(void) { g_bl_defer++; }
+void bootlog_defer_end(void)   { if (g_bl_defer > 0) g_bl_defer--; }
+
+int bootlog_write(const char *fmt, ...) {
     char line[BOOTLOG_LINE_MAX];
     va_list args;
     va_start(args, fmt);
     int n = vsnprintf(line, sizeof(line), fmt, args);
     va_end(args);
-    if (n < 0) return;
+    if (n < 0) return -1;
     if ((uint32_t)n >= sizeof(line)) n = (int)sizeof(line) - 1;
 
     // Mirror to the existing serial log (additive, never replaces it).
     kprintf("[BOOTLOG] %s\n", line);
 
-    // Always buffer in RAM, armed or not - see file header.
-    bootlog_append_raw(line, (uint32_t)n);
-    bootlog_append_raw("\n", 1);
+    // Always buffer in RAM, armed or not - see file header. The newline is
+    // written INTO `line` (vsnprintf capped n at sizeof(line)-1, so index n is
+    // always spare) so the RAM append and the disk append are the same single
+    // contiguous run of bytes: on ext2 that is ONE ext2_append_file()
+    // transaction per line rather than two.
+    line[n] = '\n';
+    bootlog_append_raw(line, (uint32_t)n + 1);
+
+    // #745 (task #62): if the storage stack is busy underneath us, or we are
+    // already inside a flush, the line stays in RAM + serial and the medium is
+    // left alone. This is the whole fix: the recursion cannot start.
+    if (g_bl_defer || g_bl_in_persist) {
+        g_bootlog_flushes_deferred++;
+        return 0;
+    }
+
+    // #745 (task #69): third guard, see the block comment above. A context with
+    // interrupts off (and the scheduler live, so contention is possible) must
+    // not enter the storage stack, because msc_cmd_lock()'s no-block fallback
+    // there is an UNBOUNDED wait it cannot be preempted out of.
+    {
+        uint32_t _nb = wq_noblock_reason();
+        if ((_nb & WQ_NB_IRQ_OFF) && !(_nb & WQ_NB_NO_SCHED)) {
+            if (g_bootlog_noblock_defers++ == 0) {
+                g_bootlog_noblock_ra = (uint64_t)__builtin_return_address(0);
+                // Serial only, and once: we are inside somebody's cli region.
+                kprintf("[BLGNB] #745/#69: bootlog device write declined - "
+                        "caller has IRQs off (ra=%p). The line is in RAM+serial "
+                        "and persists from the next safe context. This guard is "
+                        "NOT dead code.\n", (void *)g_bootlog_noblock_ra);
+            }
+            g_bootlog_flushes_deferred++;
+            return 0;
+        }
+    }
 
     if (g_bootlog_armed && g_bootlog_fs) {
-        fat_write_file(g_bootlog_fs, BOOTLOG_PATH, g_bootlog_buf, g_bootlog_len);
+        // #745 (task #62): count what this write is about to cost the medium.
+        // On ext2 bootlog_persist() appends only the delta; if it has to fall
+        // back to fat_write_file() it rewrites the WHOLE buffer, and the
+        // difference between those two is exactly the #373 mechanism. Charging
+        // the delta here and the full length on the rewrite path would need
+        // bootlog_persist to report which it did; charging the delta is the
+        // honest floor, and a full-rewrite storm still shows up in
+        // g_blk_write_sectors on the same heartbeat line.
+        {
+            uint32_t _d = (g_bootlog_persisted <= g_bootlog_len)
+                        ? (g_bootlog_len - g_bootlog_persisted) : g_bootlog_len;
+            extern uint64_t g_bootlog_bytes_written;
+            g_bootlog_bytes_written += _d;
+        }
+        g_bl_in_persist++;
+        int _rc = bootlog_persist(BOOTLOG_PATH, g_bootlog_buf, g_bootlog_len,
+                                  &g_bootlog_persisted, g_bootlog_full_warned);
+        g_bl_in_persist--;
+        if (_rc != 0) { bootlog_flush_failed(BOOTLOG_PATH, _rc); return _rc; }
     }
+    // Not armed yet is NOT a failure: the line is in the RAM buffer and
+    // bootlog_arm() flushes the whole buffer the moment a filesystem exists.
+    return 0;
 }
 
 // #373 real-HW freeze diagnostic: constant-cost heartbeat writer. See the header
@@ -95,9 +381,91 @@ void bootlog_write(const char *fmt, ...) {
 // ring (the most recent beats, capped at HB_RING_CAP) to a SEPARATE fixed file,
 // so each write is constant and tiny no matter how long the machine runs.
 #define HB_PATH      "/HEARTBEAT.TXT"
-#define HB_RING_CAP  (4 * 1024)
+// #745 (task #62): 4 KB held about 30 beats of the OLD, shorter record. The
+// enriched record is roughly twice as long, and the fault being chased is a
+// ~60 s ramp that must be visible IN FULL alongside the beats before it. 16 KB
+// holds ~50 enriched beats = ~100 s at the 2 s cadence. The write stays
+// CONSTANT-cost (that is what #373 required); it is simply a bigger constant,
+// and it is paid only on the rare flush schedule below, not per beat.
+#define HB_RING_CAP  (16 * 1024)
 static char     g_hb_ring[HB_RING_CAP];
 static uint32_t g_hb_len = 0;
+
+// #748: the ring is bounded, which made every write CONSTANT. It did not make
+// the writes RARE, and rare is what a flash stick needs: a constant 4 KB
+// rewritten every 2 s forever is 43-57 KB/s of device traffic at complete idle
+// (see the file header). The ring now lives in RAM and reaches the medium on
+// three occasions, and each one is a deliberate answer to "what question is
+// this file being asked?":
+//
+//   1. ON A SCHEDULE (HB_FLUSH_MS, 30 min). The user asked for exactly this:
+//      "we could either do a periodic write to usb (every 30 minutes or so)
+//      for debugging, or just leave it on ramdisk only". This is the floor of
+//      "how recently was this machine alive", and 30 min of granularity is a
+//      fair price for ~1800x fewer write events.
+//   2. ON THE ANOMALY IT EXISTS TO CATCH. #373 was a machine being starved to
+//      death: the beats stretched 4s -> 27s and THEN stopped. A schedule can
+//      miss that entirely; an anomaly trigger cannot. A beat that arrives late
+//      by HB_ANOMALY_GAP_MS persists the ring immediately, so the widening
+//      gaps are on disk BEFORE the wedge, which is the whole point. Rate
+//      limited by HB_ANOMALY_MIN_MS so a permanently slow machine cannot turn
+//      the diagnostic back into the storm.
+//   3. ON PANIC, from panic_log_write(), after the panic record itself is
+//      safely down.
+//
+// Deliberately NOT flushed on every beat during boot either: a boot-time wedge
+// leaves /BOOTLOG.TXT (per-line durable, see above) and /PANIC.TXT, and case 2
+// covers the starvation signature on any timeline.
+#define HB_FLUSH_MS        (30u * 60u * 1000u)
+#define HB_ANOMALY_GAP_MS  6000u     // nominal beat is 2000ms
+// #745 (task #62): 60 s was too coarse for the reported fault. The machine
+// becomes unusable inside a minute, so a single anomaly flush followed by a
+// 60 s lockout can leave the ENTIRE degradation window in RAM and lose it to
+// the power switch. 15 s admits at most 4 flushes a minute, and only while the
+// machine is ALREADY pathologically slow - which is exactly when the evidence
+// is worth more than the write. A healthy machine never trips it at all.
+#define HB_ANOMALY_MIN_MS  15000u    // at most four anomaly flushes per minute
+static uint64_t g_hb_last_flush_ms = 0;
+static uint64_t g_hb_last_beat_ms  = 0;
+static uint64_t g_hb_last_anom_ms  = 0;
+static int      g_hb_dirty         = 0;   // ring has beats not yet on the medium
+static uint64_t g_hb_flushes       = 0;
+static uint64_t g_hb_beats         = 0;
+
+// Persist the ring NOW. Whole-file replace, never an append: the ring drops
+// whole lines off its FRONT, so its bytes shift and an append would duplicate.
+// Returns 0 if there was nothing to do or the write succeeded.
+// #745 (task #62): how many bytes has the LOGGING SUBSYSTEM ITSELF pushed at
+// the medium this boot? #373 was the logger starving the machine it was
+// logging, so a diagnostic that cannot exonerate itself is not a diagnostic.
+uint64_t g_bootlog_bytes_written = 0;
+
+int bootlog_heartbeat_flush(void) {
+    if (!g_hb_dirty || !g_bootlog_armed || !g_bootlog_fs) return 0;
+    // #745 (task #62): same guard as bootlog_write(). The anomaly flush fires
+    // exactly when the machine is already struggling, which is exactly when
+    // re-entering the storage stack is least affordable.
+    if (g_bl_defer || g_bl_in_persist) { g_bootlog_flushes_deferred++; return 0; }
+    g_bootlog_bytes_written += g_hb_len;
+    g_bl_in_persist++;
+    int rc = bootlog_persist(HB_PATH, g_hb_ring, g_hb_len, 0, 0);
+    g_bl_in_persist--;
+    if (rc != 0) { bootlog_flush_failed(HB_PATH, rc); return rc; }
+    g_hb_dirty = 0;
+    g_hb_flushes++;
+    if (mono_ready()) g_hb_last_flush_ms = mono_ms();
+    return 0;
+}
+
+void bootlog_heartbeat_stats(uint64_t *beats, uint64_t *flushes) {
+    if (beats)   *beats   = g_hb_beats;
+    if (flushes) *flushes = g_hb_flushes;
+}
+
+uint32_t bootlog_heartbeat_ring(const char **out) {
+    if (out) *out = g_hb_ring;
+    return g_hb_len;
+}
 
 void bootlog_heartbeat(const char *line) {
     if (!line) return;
@@ -127,12 +495,49 @@ void bootlog_heartbeat(const char *line) {
 
     // Always mirror to serial (proves liveness even if the on-disk write wedges).
     kprintf("[HBLOG] %s\n", line);
+    g_hb_dirty = 1;
+    g_hb_beats++;
 
-    // Constant-size write to the SEPARATE heartbeat file; never touches the big
-    // /BOOTLOG.TXT buffer, so this can never become the growing O(n^2) write.
-    if (g_bootlog_armed && g_bootlog_fs) {
-        fat_write_file(g_bootlog_fs, HB_PATH, g_hb_ring, g_hb_len);
+    // #748: decide whether this beat is worth a device write. See the block
+    // comment above HB_FLUSH_MS for why these three cases and no others.
+    if (!g_bootlog_armed || !g_bootlog_fs) return;
+    if (!mono_ready()) {
+        // No real clock yet, so no schedule and no gap measurement is possible.
+        // Persist once, so the file exists and says the machine got this far,
+        // and then stay quiet until the clock is up.
+        if (g_hb_last_flush_ms == 0 && g_hb_flushes == 0) bootlog_heartbeat_flush();
+        return;
     }
+    uint64_t now = mono_ms();
+    int due = 0;
+    if (g_hb_flushes == 0) {
+        due = 1;                                     // first persisted beat
+    } else if (now - g_hb_last_flush_ms >= HB_FLUSH_MS) {
+        due = 1;                                     // the 30-minute schedule
+    } else if (g_hb_last_beat_ms &&
+               now - g_hb_last_beat_ms >= HB_ANOMALY_GAP_MS &&
+               (g_hb_last_anom_ms == 0 || now - g_hb_last_anom_ms >= HB_ANOMALY_MIN_MS)) {
+        // The #373 starvation signature. Say so IN the artifact: a reader who
+        // finds this file after a wedge needs to know the gap was measured, not
+        // inferred from a missing line.
+        char note[96];
+        int nn = snprintf(note, sizeof(note),
+                          "[HBLOG] LATE BEAT: %llums gap (nominal 2000ms) - persisting ring now",
+                          (unsigned long long)(now - g_hb_last_beat_ms));
+        if (nn > 0) {
+            kprintf("%s\n", note);
+            uint32_t nl = (uint32_t)nn;
+            if (nl < HB_RING_CAP - g_hb_len - 1) {
+                memcpy(g_hb_ring + g_hb_len, note, nl);
+                g_hb_len += nl;
+                g_hb_ring[g_hb_len++] = '\n';
+            }
+        }
+        g_hb_last_anom_ms = now;
+        due = 1;
+    }
+    g_hb_last_beat_ms = now;
+    if (due) bootlog_heartbeat_flush();
 }
 
 // =============================================================================
@@ -158,6 +563,7 @@ void bootlog_heartbeat(const char *line) {
 static char     g_usblog_buf[USBLOG_BUF_CAP];
 static uint32_t g_usblog_len = 0;
 static int      g_usblog_full_warned = 0;
+static uint32_t g_usblog_persisted = 0;   // #748: bytes already on the medium
 
 static void usblog_append_raw(const char *s, uint32_t len) {
     if (len == 0) return;
@@ -185,11 +591,13 @@ void usblog_write(const char *fmt, ...) {
     // Mirror to serial (additive), same as bootlog_write().
     kprintf("[USBLOG] %s\n", line);
 
-    usblog_append_raw(line, (uint32_t)n);
-    usblog_append_raw("\n", 1);
+    line[n] = '\n';                       // #748: one contiguous append, see bootlog_write()
+    usblog_append_raw(line, (uint32_t)n + 1);
 
     if (g_bootlog_armed && g_bootlog_fs) {
-        fat_write_file(g_bootlog_fs, USBLOG_PATH, g_usblog_buf, g_usblog_len);
+        { int _rc = bootlog_persist(USBLOG_PATH, g_usblog_buf, g_usblog_len,
+                                    &g_usblog_persisted, g_usblog_full_warned);
+          if (_rc != 0) bootlog_flush_failed(USBLOG_PATH, _rc); }
     }
 }
 
@@ -209,6 +617,7 @@ void usblog_write(const char *fmt, ...) {
 static char     g_audiolog_buf[AUDIOLOG_BUF_CAP];
 static uint32_t g_audiolog_len = 0;
 static int      g_audiolog_full_warned = 0;
+static uint32_t g_audiolog_persisted = 0;   // #748: bytes already on the medium
 // #71: when set, audiolog_write() accumulates in RAM only and skips the
 // per-call full-file flush; audiolog_end_batch() does one flush at the end.
 // audiolog_write() rewrites the whole growing file on every call, so per-line
@@ -243,11 +652,13 @@ void audiolog_write(const char *fmt, ...) {
     // Mirror to serial (additive), same as usblog_write().
     kprintf("[AUDIOLOG] %s\n", line);
 
-    audiolog_append_raw(line, (uint32_t)n);
-    audiolog_append_raw("\n", 1);
+    line[n] = '\n';                       // #748: one contiguous append, see bootlog_write()
+    audiolog_append_raw(line, (uint32_t)n + 1);
 
     if (!g_audiolog_defer && g_bootlog_armed && g_bootlog_fs) {
-        fat_write_file(g_bootlog_fs, AUDIOLOG_PATH, g_audiolog_buf, g_audiolog_len);
+        { int _rc = bootlog_persist(AUDIOLOG_PATH, g_audiolog_buf, g_audiolog_len,
+                                    &g_audiolog_persisted, g_audiolog_full_warned);
+          if (_rc != 0) bootlog_flush_failed(AUDIOLOG_PATH, _rc); }
     }
 }
 
@@ -257,7 +668,12 @@ void audiolog_begin_batch(void) { g_audiolog_defer = 1; }
 void audiolog_end_batch(void) {
     g_audiolog_defer = 0;
     if (g_bootlog_armed && g_bootlog_fs) {
-        fat_write_file(g_bootlog_fs, AUDIOLOG_PATH, g_audiolog_buf, g_audiolog_len);
+        // #748: the whole deferred batch is exactly the un-persisted tail, so
+        // the batch still costs ONE write and it is now an append rather than a
+        // rewrite of the whole report.
+        { int _rc = bootlog_persist(AUDIOLOG_PATH, g_audiolog_buf, g_audiolog_len,
+                                    &g_audiolog_persisted, g_audiolog_full_warned);
+          if (_rc != 0) bootlog_flush_failed(AUDIOLOG_PATH, _rc); }
     }
 }
 
@@ -268,13 +684,19 @@ void bootlog_arm(fat_fs_t *fs) {
     // Flush everything logged since early boot (xHCI/USB enumeration, MSC
     // root-mount probing, etc.) in one shot; bootlog_write() stays live from
     // here on.
-    fat_write_file(fs, BOOTLOG_PATH, g_bootlog_buf, g_bootlog_len);
+    { int _rc = bootlog_persist(BOOTLOG_PATH, g_bootlog_buf, g_bootlog_len,
+                                &g_bootlog_persisted, g_bootlog_full_warned);
+      if (_rc != 0) bootlog_flush_failed(BOOTLOG_PATH, _rc); }
     // Same one-shot flush for the USB descriptor log accumulated so far (all of
     // xHCI/HID enumeration happens before any filesystem exists).
-    fat_write_file(fs, USBLOG_PATH, g_usblog_buf, g_usblog_len);
+    { int _rc = bootlog_persist(USBLOG_PATH, g_usblog_buf, g_usblog_len,
+                                &g_usblog_persisted, g_usblog_full_warned);
+      if (_rc != 0) bootlog_flush_failed(USBLOG_PATH, _rc); }
     // #71 / Cirrus: flush the HD Audio diagnostic accumulated during audio_init
     // (codec probe happens well before the FAT root is writable).
-    fat_write_file(fs, AUDIOLOG_PATH, g_audiolog_buf, g_audiolog_len);
+    { int _rc = bootlog_persist(AUDIOLOG_PATH, g_audiolog_buf, g_audiolog_len,
+                                &g_audiolog_persisted, g_audiolog_full_warned);
+      if (_rc != 0) bootlog_flush_failed(AUDIOLOG_PATH, _rc); }
     kprintf("[BOOTLOG] armed: /BOOTLOG.TXT (%u bytes) + /USBLOG.TXT (%u bytes) + /AUDIOLOG.TXT (%u bytes) now live\n",
             (unsigned)g_bootlog_len, (unsigned)g_usblog_len, (unsigned)g_audiolog_len);
 }

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // wallpapers.h - shared wallpaper enumeration for the MayteraOS userland (#517)
 //
 // The wallpaper picker (compositor) and the Settings Appearance grid used to keep

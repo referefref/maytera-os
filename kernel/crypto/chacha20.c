@@ -4,6 +4,7 @@
 #include "chacha20.h"
 #include "crypto.h"
 #include "../string.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // =============================================================================
 // ChaCha20 Core
@@ -523,7 +524,6 @@ static inline uint64_t cc20_tsc_serialized(void) {
 
 void chacha20_rust_selftest(void) {
     extern int kprintf(const char *fmt, ...);
-    extern void bootlog_write(const char *fmt, ...);
 
     uint32_t vectors = 0;
     uint32_t mismatches = 0;

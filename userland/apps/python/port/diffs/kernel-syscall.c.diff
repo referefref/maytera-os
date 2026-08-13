@@ -1,0 +1,144 @@
+--- /root/cpython-p2-backup/syscall.c.orig	2026-07-07 16:27:23.211769923 +0000
++++ <workspace>	2026-07-07 17:12:26.955397136 +0000
+@@ -580,6 +580,8 @@
+         // File I/O
+         case SYS_OPEN:
+             return sys_open((const char *)arg1, (int)arg2);
++        case SYS_FCNTL:
++            return sys_fcntl((int)arg1, (int)arg2, (long)arg3);
+         case SYS_CLOSE:
+             return sys_close((int)arg1);
+         case SYS_READ:
+@@ -1490,6 +1492,39 @@
+     return 1;
+ }
+ 
++/* #359 Phase 2: POSIX errno values so libc open() can set errno correctly
++   (CPython's import machinery needs a missing file to raise FileNotFoundError,
++   i.e. errno==ENOENT, not a bare OSError). sys_open now returns -errno. */
++#ifndef MOS_EOK
++#define MOS_EPERM   1
++#define MOS_ENOENT  2
++#define MOS_EBADF   9
++#define MOS_ENOMEM  12
++#define MOS_EACCES  13
++#define MOS_EINVAL  22
++#define MOS_EMFILE  24
++#define MOS_EOK     0
++#endif
++
++/* #359: fcntl(fd, cmd, arg). CPython needs F_GETFL/F_SETFL/F_GETFD/F_SETFD/
++   F_DUPFD to set up std fds and duplicate descriptors. We do not track a
++   per-fd flags word, so F_GETFL reports O_RDWR and F_SETFL is a no-op; the
++   duplicate commands reuse the existing per-process fd_dup(). */
++int64_t sys_fcntl(int fd, int cmd, long arg) {
++    switch (cmd) {
++        case 0:    /* F_DUPFD          */
++        case 1030: /* F_DUPFD_CLOEXEC  */ {
++            int r = fd_dup(fd, (int)arg);
++            return (r < 0) ? -MOS_EBADF : r;
++        }
++        case 1: return 0;        /* F_GETFD -> no FD_CLOEXEC tracked */
++        case 2: return 0;        /* F_SETFD -> accept, ignore        */
++        case 3: return 0x0002;   /* F_GETFL -> O_RDWR                */
++        case 4: return 0;        /* F_SETFL -> accept, ignore        */
++        default: return 0;       /* be permissive for other probes   */
++    }
++}
++
+ int64_t sys_open(const char *path, int flags) {
+     // #396: /dev/<name> device nodes (CDC-ACM serial, etc.) resolve through the
+     // in-kernel dev namespace and install a file_t in the per-process fd table.
+@@ -1511,7 +1546,7 @@
+         // or create them. No-op for normal processes (is_service == 0).
+         if (p->is_service && (flags & (1 | 2 | 0x40)) &&
+             !(p->svc_perms & SVC_PERM_FSWRITE)) {
+-            return -1;  // EPERM: service lacks fs-write capability
++            return -MOS_EPERM;  // service lacks fs-write capability
+         }
+         int access = R_OK;
+         if (flags & 1)  access = W_OK;          // O_WRONLY
+@@ -1520,7 +1555,7 @@
+         // ACLs); local POSIX perms (which default-deny W_OK to non-root) don't apply.
+         if (!path_is_smb(path) && !path_is_nfs(path) &&
+             perms_check(path, p->euid, p->egid, access) != 0) {
+-            return -1;  // EACCES
++            return -MOS_EACCES;
+         }
+     }
+ 
+@@ -1536,7 +1571,7 @@
+     }
+ 
+     if (fd < 0) {
+-        return -1;  // No free fd
++        return -MOS_EMFILE;  // no free fd
+     }
+ 
+     // #317 pass 2: SMB network share. Mount on demand, then open as a directory
+@@ -1567,7 +1602,7 @@
+             if (!s->rbuf) return -1;
+             s->rsize = sz; s->rpos = 0;
+         } else {
+-            return -1;  // not found and not creating
++            return -MOS_ENOENT;  // not found and not creating
+         }
+         s->used = 1;
+         fd_used[fd] = 1;
+@@ -1649,7 +1684,7 @@
+             e->wbuf = (uint8_t *)kmalloc(e->wcap);
+             if (!e->wbuf) return -1;
+         } else {
+-            return -1;
++            return -MOS_ENOENT;
+         }
+         e->used = 1;
+         fd_used[fd] = 1;
+@@ -1665,7 +1700,7 @@
+             fat_open(&g_fat_fs, path, &fd_table[fd]) == 0) {
+             // created and opened successfully
+         } else {
+-            return -1;
++            return -MOS_ENOENT;
+         }
+     }
+ 
+@@ -1941,6 +1976,38 @@
+         return 0;
+     }
+ 
++    // #359 Phase 2: ext2 root/volume paths. sys_stat previously had no ext2
++    // branch, so ext2 paths fell through to FAT (which fails), and libc stat()
++    // then fell back to open()+SEEK_END - which always reports S_IFREG. That made
++    // every ext2 DIRECTORY look like a regular file, so CPython's PathFinder
++    // (_path_isdir) never built a FileFinder and NO filesystem import worked.
++    // Resolve the inode and report the real type (ext2 i_mode is POSIX-layout:
++    // 0x4000=dir, 0x8000=reg, + perm bits) and size.
++    {
++        const char *rel = 0;
++        if (path_is_ext2(path))        rel = ext2_relpath(path);
++        else if (path_root_ext2(path)) rel = path;
++        if (rel) {
++            uint32_t ino = ext2_resolve_path(rel);
++            if (ino) {
++                ext2_inode_t in;
++                if (ext2_read_inode(ino, &in) == 0) {
++                    int is_dir = ((in.i_mode & 0xF000) == 0x4000);
++                    k_stat_t *st = (k_stat_t *)ubuf;
++                    memset(st, 0, sizeof(*st));
++                    st->st_mode    = in.i_mode ? in.i_mode
++                                     : (is_dir ? (0040000u|0755u) : (0100000u|0644u));
++                    st->st_nlink   = 1;
++                    st->st_size    = is_dir ? 0 : (long)in.i_size;
++                    st->st_blksize = 1024;
++                    st->st_blocks  = ((long)in.i_size + 511) / 512;
++                    return 0;
++                }
++            }
++            // Not present on ext2: fall through to FAT (file may be ESP-only).
++        }
++    }
++
+     fat_file_t f;
+     if (fat_open(&g_fat_fs, path, &f) != 0) return -1;
+ 

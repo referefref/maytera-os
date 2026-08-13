@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // grp.h - Group database access for MayteraOS
 // Provides POSIX-like getgrgid/getgrnam by reading /CONFIG/GROUP
 #ifndef _GRP_H

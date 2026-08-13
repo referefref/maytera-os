@@ -337,7 +337,18 @@ void glInit(void* zbuffer1) {
 	/* depth test */
 	c->zb->depth_test = 0;
 	c->zb->depth_write = 1;
+	c->zb->depth_func = GL_GEQUAL; /* AssaultCube phase 2: matches the old hardcoded ">=" */
 	c->zb->pointsize = 1;
+
+	/* AssaultCube port phase 2: glAlphaFunc / glScissor default state */
+	c->alpha_test_enabled = 0;
+	c->alpha_test_func = GL_ALWAYS;
+	c->alpha_test_ref = 0.0f;
+	c->scissor_enabled = 0;
+	c->scissor_x = 0;
+	c->scissor_y = 0;
+	c->scissor_w = 0;
+	c->scissor_h = 0;
 
 	/* raster position */
 	c->rasterpos.X = 0;

@@ -5,6 +5,7 @@
 #include "../serial.h"
 #include "../mm/heap.h"
 #include "theme_line.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // #404 theme-file line tokenizer seam. -DRUST_THEME_PARSE routes the live
 // untrusted-input parse to the Rust port theme_parse_line_rs (rustkern.rs);
@@ -699,7 +700,6 @@ void theme_parse_rust_selftest(void) {
     }
     kprintf("[RUST-DIFF] theme_parse: %s (%u KAT vectors, rs==c)\n",
             fails ? "FAIL" : "PASS", (unsigned)(sizeof(V)/sizeof(V[0])));
-    extern void bootlog_write(const char *fmt, ...);
     bootlog_write("[RUST-DIFF] theme_parse: %s (%u KAT vectors, rs==c)",
             fails ? "FAIL" : "PASS", (unsigned)(sizeof(V)/sizeof(V[0])));
     kprintf("[RUST-SEC] theme_parse: verbatim C is fully BOUNDED (no reachable "

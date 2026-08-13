@@ -29,7 +29,10 @@
 #
 # Boot with:
 #
-#   qemu-system-x86_64 -machine pc,accel=kvm -cpu host -m 2G \
+#   NOTE: use -cpu kvm64, NOT -cpu host. Passing the host CPU exposes AVX,
+#   which the compositor does not save/restore across context switches (the
+#   kernel builds soft-float with SSE disabled), and it crashes the desktop.
+#   qemu-system-x86_64 -machine pc,accel=kvm -cpu kvm64 -m 2G \
 #       -bios /usr/share/OVMF/OVMF_CODE.fd \
 #       -drive file=boot_disk.img,format=raw,if=ide \
 #       -serial stdio
@@ -97,7 +100,18 @@ if [ -d "${DISK_TEMPLATE}/THEMES" ]; then
     cp -r "${DISK_TEMPLATE}/THEMES" "$MNT/"
 fi
 
+echo "Installing font licences..."
+# The SIL Open Font License requires its text to be distributed WITH the font.
+# Shipping the fonts without these files would be a licence violation, so this
+# is not optional decoration.
+if [ -d "${DISK_TEMPLATE}/FONT-LICENSES" ]; then
+    mkdir -p "$MNT/FONTS"
+    cp -r "${DISK_TEMPLATE}/FONT-LICENSES" "$MNT/FONTS/LICENSES"
+    echo "  FONTS/LICENSES ($(ls -1 "${DISK_TEMPLATE}/FONT-LICENSES" | wc -l) file(s))"
+fi
+
 echo "Installing userland apps..."
+APPS_INSTALLED=0
 mkdir -p "$MNT/APPS"
 shopt -s nullglob
 for app_dir in "${ROOT_DIR}"/userland/apps/*/; do
@@ -114,15 +128,30 @@ for app_dir in "${ROOT_DIR}"/userland/apps/*/; do
         case "$candidate" in
             *.o|*.a|*.c|*.h|*.rs|*.asm|*.ld|*.md|*.yml|*.yaml|*.txt|*.TXT|*Makefile) continue ;;
         esac
-        # ELF magic + type 2 (ET_EXEC); skip relocatables and shared objects.
-        read -r -n 18 magic < "$candidate" 2>/dev/null || true
+        # ELF magic + an EXECUTABLE type. Accept BOTH:
+        #   2 = ET_EXEC  (legacy fixed-base apps)
+        #   3 = ET_DYN   (PIE; what every app links as since the #640 PIE
+        #                 migration, via `ld -pie -T user-pie.ld`)
+        # Accepting only ET_EXEC silently skipped all 145 apps and produced an
+        # image with an empty /APPS that booted to nothing. Relocatables (1)
+        # and core files (4) are still correctly rejected.
+        elf_type="$(od -An -tu1 -j16 -N1 "$candidate" 2>/dev/null | tr -d ' ')"
         if head -c 4 "$candidate" 2>/dev/null | grep -qP '^\x7fELF' \
-           && [ "$(od -An -tu1 -j16 -N1 "$candidate" 2>/dev/null | tr -d ' ')" = "2" ]; then
+           && { [ "$elf_type" = "2" ] || [ "$elf_type" = "3" ]; }; then
             cp "$candidate" "$MNT/APPS/"
+            APPS_INSTALLED=$((APPS_INSTALLED + 1))
             echo "  APPS/$(basename "$candidate")"
         fi
     done
 done
+
+if [ "$APPS_INSTALLED" -eq 0 ]; then
+    echo "error: ZERO userland apps were installed into /APPS." >&2
+    echo "       An image with no apps has no compositor and no login, so it" >&2
+    echo "       cannot reach a desktop. Run ./build.sh --all-apps first." >&2
+    exit 1
+fi
+echo "  ($APPS_INSTALLED app binaries installed)"
 
 echo "Installing DOOM..."
 mkdir -p "$MNT/GAMES/DOOM"
@@ -166,7 +195,7 @@ echo
 echo "Done. Bootable image: $IMG"
 echo
 echo "Test with:"
-echo "  qemu-system-x86_64 -machine pc,accel=kvm -cpu host -m 2G \\"
+echo "  qemu-system-x86_64 -machine pc,accel=kvm -cpu kvm64 -m 2G \\"
 echo "      -bios /usr/share/OVMF/OVMF_CODE.fd \\"
 echo "      -drive file=${IMG},format=raw,if=ide \\"
 echo "      -serial stdio"

@@ -47,6 +47,7 @@ mono_ready_rs
 mono_ms_rs
 mono_us_rs
 mono_tsc_khz_rs
+mono_busy_delay_us_rs
 
 # ---------------------------------------------------------------------------
 # rustkern/checksum.rs - #404 Phase B/D: IP + transport checksums.
@@ -74,6 +75,34 @@ clip_selftest_rs
 ext2_dirblock_find_rs
 
 # ---------------------------------------------------------------------------
+# rustkern/ext2.rs - #605: ext2 directory-entry INSERT within one block (the
+# WRITE twin of the scan above). Removes the #597 unsigned-underflow class
+# (`slack = rec - used` wrapping to ~4e9 -> out-of-block rec_len + OOB memcpy)
+# by construction: checked_sub + bounds-checked slice access, no unsafe in the
+# parsing module. Live under -DRUST_EXT2_DIRADD; C kept as
+# ext2_dirblock_insert_c.
+# ---------------------------------------------------------------------------
+ext2_bitmap_find_run_rs
+ext2_lblk_map_rs
+ext2_extent_selftest_rs
+ext2_dirblock_insert_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/ext2.rs - #746: ext2 directory-entry REPOINT within one block, the
+# atomic step of a rename over an existing destination. The third member of the
+# find/insert/repoint set; dirent REMOVAL is still C-only with no Rust twin.
+# Live under -DRUST_EXT2_DIRREPOINT; C kept as ext2_dirblock_repoint_c and
+# compared every boot by ext2_dirrepoint_rust_selftest().
+# ---------------------------------------------------------------------------
+ext2_dirblock_repoint_rs
+
+# rustkern/ext2fsck.rs - #610: the read-only ext2 consistency checker core.
+# All parsing/arithmetic/verdicts; fs/ext2.c keeps every byte of I/O, kmalloc
+# and locking. ext2_fsck_sizeof_rs feeds the C-side _Static_assert layout lock.
+ext2_fsck_run_rs
+ext2_fsck_sizeof_rs
+
+# ---------------------------------------------------------------------------
 # rustkern/sha256.rs, sha512.rs, md5.rs, md4.rs, aes.rs, chacha20.rs, hmac.rs
 # #404 Phases E-K (#487-#493): crypto cores + the RFC 2104 HMAC construction.
 # ---------------------------------------------------------------------------
@@ -83,6 +112,13 @@ md5_transform_rs
 md4_transform_rs
 aes_encrypt_block_rs
 aes_decrypt_block_rs
+
+# #615: AES-GCM GHASH, 4-bit table method (rustkern/ghash.rs). Replaces the
+# bit-serial crypto/crypto.c multiply that was measured at 36-40% of one core
+# for an entire App Store download. Live under -DRUST_GHASH.
+ghash_key_init_rs
+ghash_mul_rs
+ghash_update_rs
 chacha20_block_rs
 hmac_sha256_rs
 hmac_sha384_rs
@@ -109,6 +145,115 @@ pe_validate_full_rs
 # ---------------------------------------------------------------------------
 fat_dir_step_rs
 exfat_dir_step_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/fsperm.rs - #554: filesystem-aware permission/attribute support
+# (chmod/chown FAT-vs-ext2 routing + the SYS_FS_PERM_INFO syscall backing the
+# Files Properties permissions tab and details-view attribute columns).
+# ---------------------------------------------------------------------------
+rk_fs_perm_info
+rk_chmod_route
+rk_chown_route
+
+# ---------------------------------------------------------------------------
+# rustkern/permpath.rs - #674: POSIX path resolution for perms_check(). Walks
+# the canonical path and requires search (x) on every directory component. The
+# single-object decision stays in C as perms_check_leaf() (fs/perms.c).
+# ---------------------------------------------------------------------------
+perms_path_check_rs
+perms_canon_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/spawnid.rs - #692: the uid/gid a new Ring-3 process runs as. The
+# inputs (caller credentials, session uid, the PASSWD table) stay in C; the
+# DECISION, including the single gid-follows-uid rule and the refusal of an
+# unset identity, lives in Rust.
+# ---------------------------------------------------------------------------
+spawn_ident_resolve_rs
+spawn_ident_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/sessionid.rs - #745 session identity policy.
+# Owner: proc/syscall.c (sys_session_lock), proc/users.c
+# (users_create_first_admin) and main.c (the boot self-test).
+#
+# Two DECISIONS the non-root desktop flip turns on, kept out of the C plumbing
+# that owns the mutable tables:
+#   - may this session lock itself, given the lock reason, whether autologin is
+#     active, and whether the session user can authenticate at all. The last
+#     input is the one that makes an unlockable session impossible to create.
+#   - which uid a human account gets: the first-boot admin (no longer 0) and
+#     the next free uid for an account created later.
+# ---------------------------------------------------------------------------
+session_lock_decide_rs
+sessionid_selftest_rs
+
+# rustkern/elevate.rs - #745: the elevation request state machine, the
+# sanitiser for app-supplied text on the trusted surface, and the grant
+# path-coverage test. Owned by the security agent; see proc/elevate.h.
+elev_open_rs
+elev_view_rs
+elev_state_rs
+elev_owner_pid_rs
+elev_owner_uid_rs
+elev_attempt_rs
+elev_cancel_rs
+elev_reap_rs
+elev_tick_rs
+elev_path_covered_rs
+elevate_selftest_rs
+first_admin_uid_rs
+next_user_uid_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/loginmode.rs - #745: the /CONFIG/LOGIN.CFG contract. One parse for
+# the sign-in screen mode, and ONE composer that decides the whole file, so a
+# writer of either key cannot erase the other.
+# ---------------------------------------------------------------------------
+login_mode_parse_rs
+login_cfg_compose_rs
+loginmode_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/guestfs.rs - #708: the identity a DOS or Win16 GUEST program's
+# filesystem access is checked against. A guest runs inside a kernel thread and
+# so has no credentials of its own; its identity is captured AT LAUNCH from the
+# launcher (via the #692 resolver above), carried in a per-layer slot, and
+# consulted by every guest-reachable fs entry point in dos/dosexec.c,
+# exec/win16api.c and exec/ne.c. An unarmed slot DENIES.
+# ---------------------------------------------------------------------------
+guestfs_arm_rs
+guestfs_disarm_rs
+guestfs_cred_rs
+guestfs_stats_rs
+guestfs_check_rs
+guestfs_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/sshdcfg.rs - #697: whether sshd listens at all, which accounts may
+# authenticate, and which public keys authorize which account. The file I/O and
+# the credential check itself stay in C (fat_read_file, users_authenticate);
+# the PARSERS and the allow/deny DECISION live here. Absent config means the
+# listener does not start, which is what makes the remote-root class dead
+# rather than merely fixed.
+# ---------------------------------------------------------------------------
+sshd_cfg_parse_rs
+sshd_user_allowed_rs
+sshd_authkey_match_rs
+sshd_cfg_selftest_rs
+# #785: renders the policy back to canonical /CONFIG/SSHD.CFG text so the
+# service manager can PERSIST enable/disable. The renderer sits next to the
+# parser, in the same language, so there is one understanding of this format;
+# a C serializer would have been a second one, and two implementations of one
+# format is how the compiled-in credential survived review. Round trip is
+# checked by sshd_cfg_selftest_rs at boot.
+sshd_cfg_render_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/userconf.rs - #683: joins a user's home and a preference name into
+# <home>/CONFIG/<NAME>. The passwd-table lookup stays in C (fs/userconf.c).
+# ---------------------------------------------------------------------------
+userconf_join_rs
 
 # ---------------------------------------------------------------------------
 # rustkern/bmp.rs, png.rs, jpeg.rs, inflate.rs - #404 Phases U-X (#502):
@@ -159,6 +304,10 @@ http_decode_chunked_rs
 http_find_header_end_rs
 https_content_length_rs
 http_parse_uint_rs
+# #608 byte-range framing (new logic, Rust-first; no C twin)
+http_range_req_parse_rs
+http_content_range_parse_rs
+http_range_check_rs
 http2_frame_next_rs
 
 # ---------------------------------------------------------------------------
@@ -195,6 +344,14 @@ parttbl_mbr_find_rs
 uac_parse_config_rs
 
 # ---------------------------------------------------------------------------
+# rustkern/ptwalk.rs (#647): walk of the LIVE 4-level paging hierarchy adopted
+# from UEFI firmware by vmm_init(). Called from mm/vmm.c
+# vmm_reserve_boot_page_tables(); not behind a strangler flag (there is no C
+# original: this code never existed before, which is why the firmware's page
+# tables sat in the PMM free list).
+ptwalk_collect_rs
+ptwalk_contains_rs
+
 # rustkern/proc_mem.rs, vfs_path.rs, conn.rs, procinfo.rs
 # #487/#349 Task Manager kernel accessors + Ring-3 introspection builders.
 # ---------------------------------------------------------------------------
@@ -213,3 +370,261 @@ svc_build_rs
 syscall_validate_args
 syscall_desc_covers
 syscall_desc_count
+
+# ---------------------------------------------------------------------------
+# rustkern/tlspool.rs - #616 TLS connection reuse. The live-connection pool
+# state machine (exact host/port/alpn match, exclusive checkout, LRU eviction,
+# idle expiry) plus the response-header "may this connection carry another
+# request?" policy, which parses untrusted peer bytes.
+# ---------------------------------------------------------------------------
+tlspool_acquire_rs
+tlspool_reap_rs
+tlspool_store_rs
+tlspool_drop_rs
+tlspool_count_rs
+http_reuse_ok_rs
+
+# rustkern/sched_age.rs - #254/#601 scheduler anti-starvation policy
+sched_age_select_rs
+
+# rustkern/schedwatch.rs - #67 SMP scheduler livelock diagnostic + run-queue
+# placement policy. sched_storm_verdict_rs is the ONLY one of these that runs on
+# every build regardless of g_smp_user_sched: it is the context-switch storm
+# detector, and the failure it exists to catch is a SILENT wedge.
+sched_storm_verdict_rs
+sched_place_rs
+sched_steal_rs
+sched_core_pct_rs
+sched_watch_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/seccore.rs - #624 CPU security core. Owns the CPUID feature decode
+# (bounds-checked against the max supported leaf, which the C it replaces did
+# NOT do), the SMEP/SMAP enable POLICY, the CR4 readback verification, and the
+# live feature bitmask. C keeps only sec_cr4_read/sec_cr4_write, an irreducible
+# privileged-instruction pair.
+# ---------------------------------------------------------------------------
+sec_cpu_has_smep_rs
+sec_cpu_has_smap_rs
+sec_cpu_has_nx_rs
+sec_cpu_has_rdrand_rs
+sec_cpu_has_rdseed_rs
+sec_features_rs
+sec_rdtsc_rs
+sec_init_rs
+sec_entropy_source_rs
+sec_random_u64_rs
+sec_canary_generate_rs
+sec_mark_canary_live_rs
+
+# ---------------------------------------------------------------------------
+# rustkern.rs - #653 security event record formatting. Owns the pure half of
+# the security event sink: severity classification, event naming, and encoding
+# one audit record into a caller-supplied buffer. Every write is bounds-checked
+# against that buffer, which matters because the detail text can originate from
+# an event triggered by hostile input. The worker that performs the actual
+# filesystem writes stays in C (security/seclog.c) because it is entangled with
+# the C wait-queue, VFS and thread-creation APIs.
+# ---------------------------------------------------------------------------
+sec_fmt_record
+sec_event_severity
+sec_event_name
+
+# ---------------------------------------------------------------------------
+# rustkern/gfsjournal.rs - #711 GraphFS tamper-evident journal (slice 1). Owns
+# the record format, the SHA-256 hash chain, the seal, and ALL verification.
+# Verification is the code an attacker gets to feed (a tampered journal is
+# hostile input by definition), so it lives in the memory-safe language and
+# every read goes through a slice over an exactly-known extent. The I/O and
+# lifecycle glue stays in C (fs/graphfs/journal.c) because wait_event,
+# proc_create_ex and the fat/ext2 file APIs are C with no Rust bindings here.
+# ---------------------------------------------------------------------------
+gfsj_encode
+gfsj_seal_encode
+gfsj_seal_bootgen
+gfsj_verify
+gfsj_sizes
+
+# ---------------------------------------------------------------------------
+# rustkern/gfsfold.rs (#711 slice 2) - the FOLD: the in-memory graph that IS a
+# fold of the journal record stream. Owns the graph payload layouts, the escrow
+# rule and the Q1 enforcement check. Nothing else in the kernel holds graph
+# state.
+# ---------------------------------------------------------------------------
+gfsf_apply
+gfsf_grant_check
+gfsf_edges
+gfsf_nodes
+gfsf_node_state
+gfsf_stats
+gfsf_reset
+gfsf_set_ready
+gfsf_set_degraded
+gfsf_sizes
+gfsf_prerec
+gfsf_enc_node_create
+gfsf_enc_node_state
+gfsf_enc_edge_add
+gfsf_enc_edge_revoke
+
+# ---------------------------------------------------------------------------
+# rustkern/iso9660.rs - #196 ISO 9660 (+ Joliet) parsing. These three functions
+# interpret bytes off a CD image the user supplied, so every field they read
+# (record length, extent length, name length, the name bytes) is
+# attacker-controlled. This tree has shipped three heap over-reads in C parsers
+# of exactly this shape (#476 ext2 dirent, #490 FAT LFN, #597), which is why the
+# parse layer is Rust while the I/O plumbing under it (dos/imgfile.c) stays C.
+# The C references are kept as iso_*_c in dos/diskimg.c for rollback and for the
+# boot differential; -DRUST_ISO9660 selects which arm the live symbols call.
+# ---------------------------------------------------------------------------
+iso_vd_parse_rs
+iso_dirrec_at_rs
+iso_name_decode_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/certname.rs - #tls-certfix. X.509 subjectAltName parsing (length
+# delimited), RFC 6125 hostname matching, keyUsage/extendedKeyUsage parsing,
+# and the single chain policy chokepoint that enforces usage and
+# pathLenConstraint. New code, no C twin, no -DRUST_* fallback: a second and
+# weaker way to decide whether a certificate authorises a hostname is exactly
+# what this removed. Proven red-then-green by tools/tls-cert-harness.
+# ---------------------------------------------------------------------------
+cert_hostname_match_rs
+cert_san_parse_rs
+cert_ku_parse_rs
+cert_eku_parse_rs
+cert_chain_policy_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/tls_suite.rs - #tls-suitefix. The client's offered cipher suite list
+# has ONE definition here, read by both the ClientHello builder and the
+# ServerHello acceptance check, so the offer and the check cannot drift apart.
+# tls_suite_was_offered_rs has no C caller today and is part of the module API;
+# do not remove it to satisfy a linker.
+# ---------------------------------------------------------------------------
+tls_suite_offered_count_rs
+tls_suite_offered_at_rs
+tls_suite_was_offered_rs
+tls13_suite_acceptable_rs
+
+# rustkern/drvmap.rs - #739 / #196 layer 4: the drive-letter policy for mounted
+# disk images. Which class a letter is, which letter a new image gets, what
+# MSCDEX reports, and whether a Ring-3 caller's image path is even a path.
+# dos/diskimg.c, dos/dospath.c and dos/dosexec.c all derive their answers from
+# these; do not let a caller start hardcoding a letter again.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# rustkern/pwpolicy.rs - password strength policy + breached-password
+# rejection. Owner: proc/users.c (the one chokepoint every password-setting
+# path reaches), with proc/syscall.c, gui/login.c and main.c as callers.
+#
+# The DECISION (is this password acceptable?) is here; the C side owns only
+# the shadow table and the hashing. pwbreach.bin, the sorted truncated-hash
+# table, is include_bytes!'d by this module, so losing these exports would
+# take the breach check with it and the link would NOT complain: every caller
+# goes through users_password_check(), which is C.
+# ---------------------------------------------------------------------------
+pw_policy_check_rs
+pw_policy_info_rs
+pwpolicy_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/hidmap.rs - #763: HID usage -> PS/2 set-1 scancode translation
+hid_usage_to_set1_rs
+hidmap_selftest_rs
+
+drvmap_class_rs
+drvmap_class_for_fmt_rs
+drvmap_alloc_rs
+drvmap_place_rs
+drvmap_mscdex_rs
+drvmap_path_ok_rs
+drvmap_selftest_rs
+
+# instdisk.rs (#306) - install-target enumeration. Owner: installer (gui/installer.c).
+# Callers: installer_autoinstall_worker() and the future /APPS/INSTALL syscall path.
+inst_enumerate_targets
+inst_target_installable
+
+# sntp.rs (#797) - SNTP (RFC 4330) reply validation + civil-time conversion.
+# Owner: net/sntp.c. This is the check that decides whether a packet off the
+# network is allowed to move the system clock, so it is a security boundary:
+# if these ever go MISSING, the transport keeps building and starts trusting
+# unvalidated wire data again.
+sntp_build_request_rs
+sntp_parse_reply_rs
+sntp_selftest_rs
+
+# rustkern/netstat.rs - #745 OOBE Network page: structured live IPv4 status
+# (SYS_NET_STATUS 371) and the non-blocking probe (SYS_NET_PROBE 372).
+# New code, not a port: no _c twin and no -DRUST_* flag.
+net_status_build_rs
+net_probe_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/aiguard.rs - #745 LLM prompt-injection screen. New code, not a port:
+# no _c twin and no -DRUST_* flag. These are the ONLY things that make
+# security/nova.c reachable; if they go MISSING the matcher silently returns to
+# having zero callers, which is the exact defect #745 exists to remove.
+# ---------------------------------------------------------------------------
+aiguard_screen_rs
+aiguard_screen_post_rs
+aiguard_selftest_rs
+
+# rustkern/fetchown.rs - #745 (task #36) async HTTP job slot ownership + lifetime
+fetchown_slots_rs
+fetchown_claim_rs
+fetchown_abandon_rs
+fetchown_check_rs
+fetchown_owned_by_rs
+fetchown_release_rs
+fetchown_orphan_rs
+fetchown_worker_done_rs
+fetchown_owner_rs
+fetchown_note_exit_release_rs
+fetchown_stats_rs
+fetchown_selftest_rs
+
+# rustkern/fbown.rs - #745 (task #59) framebuffer claim ownership + lifetime
+fbown_arm_rs
+fbown_disarm_rs
+fbown_claim_rs
+fbown_is_owner_rs
+fbown_owner_rs
+fbown_release_rs
+fbown_note_stale_rs
+fbown_reset_rs
+fbown_stats_rs
+fbown_selftest_rs
+
+# rustkern/procreap.rs - #745 (task 37) zombie process-slot reclaim policy.
+# The async-fetch worker's zombie was never reclaimable because its ppid
+# named the Ring 3 caller, so 41 fetches filled the 64-entry process table
+# and every later fetch failed to start.
+proc_reap_scan_rs
+proc_reap_selftest_rs
+
+# rustkern/conring.rs - #745 (task #70) asynchronous console ring. The index
+# arithmetic and the overflow policy for the kernel log buffer: kprintf pushes
+# under a short lock and returns, and a drain thread does the ~87us-per-
+# character polled UART writes holding no long-lived lock. Owns the "drop whole
+# lines and say so" rule and the stalled-consumer fallback that reverts the
+# console to synchronous rather than black-holing the log.
+conring_init_rs
+conring_push_rs
+conring_pop_rs
+conring_pending_rs
+conring_stall_check_rs
+conring_selftest_rs
+
+# rustkern/pgrp.rs - #745 (local 82) POSIX process-group + session policy
+pgrp_setsid_decide_rs
+pgrp_resolve_pid_rs
+pgrp_resolve_pgid_rs
+pgrp_setpgid_decide_rs
+pgrp_selftest_rs
+
+# rustkern/pollsys.rs - #745 (local 82) poll(2)
+sys_poll_rs
+poll_bits_match_rs
+pollsys_selftest_rs

@@ -2,6 +2,7 @@
 // See waitq.h for API overview.
 
 #include "waitq.h"
+#include "noblock.h"
 #include "../proc/process.h"
 #include "../types.h"
 
@@ -68,6 +69,15 @@ void wait_queue_head_init(wait_queue_head_t *wq) {
 }
 
 void __wait_prepare(wait_queue_head_t *wq, wait_queue_entry_t *entry, int exclusive) {
+    // #426 Phase 2 CHOKEPOINT. Every wait_event*() macro in waitq.h reaches a
+    // sleep only through here, so ONE check covers the whole family: the
+    // interruptible/non-interruptible forms, the timed forms, and the drivers
+    // that open-code prepare/wait/finish. Placed FIRST, before the queue lock
+    // is taken, so the RFLAGS.IF we sample is the CALLER'S state and not one
+    // we created ourselves. Reports (or, with -DWQ_NOBLOCK_PANIC, panics) if
+    // this context must never block; see sync/noblock.h.
+    wq_assert_may_block("wait_event", __builtin_return_address(0));
+
     process_t *me = proc_current();
     entry->proc = me;
     entry->next = NULL;
@@ -82,7 +92,7 @@ void __wait_prepare(wait_queue_head_t *wq, wait_queue_entry_t *entry, int exclus
     // Mark process blocked and remember the entry so signal delivery can
     // find and kick us.
     if (me) {
-        me->state = PROC_STATE_BLOCKED;
+        sched_self_block(me, PROC_STATE_BLOCKED);   // #75: arm+set, one op
         me->wait_entry = entry;
     }
     spinlock_release_irqrestore(&wq->lock, flags);
@@ -168,7 +178,7 @@ int __wait_event_wait_deadline(wait_queue_entry_t *entry, uint64_t deadline) {
     //   - the timer tick -> wake_sleeping_procs(), which compares wake_time
     // WAIT_DEADLINE_NEVER is UINT64_MAX, which that sweep can never reach, so
     // the "no deadline" case needs no special-casing here.
-    me->state = PROC_STATE_SLEEPING;
+    sched_self_block(me, PROC_STATE_SLEEPING);  // #75: arm+set, one op
     me->wake_time = deadline;
     spinlock_release(&wq->lock);   // plain release: leaves interrupts OFF
     sched_schedule();              // sleeps here; the scheduler restores IF
@@ -194,12 +204,73 @@ int __wait_event_wait_timeout(wait_queue_entry_t *entry, uint64_t ticks) {
     return __wait_event_wait_deadline(entry, wq_deadline_in(ticks));
 }
 
+// #610 THE LOST-WAKEUP BUG. Counts how many times __wait_finish() had to
+// un-park a waiter that was left marked BLOCKED/SLEEPING while it was in fact
+// still running. Non-zero is not a warning, it is the race firing; before the
+// fix below each one of these was a thread permanently deleted from the
+// scheduler. Reported in the [HB] heartbeat line so a long run can be audited.
+volatile uint64_t g_wq_unpark_rescues = 0;
+static int g_wq_unpark_logged = 0;
+#define WQ_UNPARK_LOG_MAX 16
+extern int kprintf(const char *fmt, ...);
+
 void __wait_finish(wait_queue_head_t *wq, wait_queue_entry_t *entry) {
+    // ------------------------------------------------------------------
+    // #610: UNDO THE PARK BEFORE ANYTHING ELSE (Linux's finish_wait() does
+    // __set_current_state(TASK_RUNNING) first, for exactly this reason).
+    //
+    // __wait_prepare() parks the caller: it links the entry AND sets
+    // state = PROC_STATE_BLOCKED. Every wait_event*() macro then re-tests the
+    // condition ONCE MORE before sleeping, and if the condition became true in
+    // that window it breaks straight to here WITHOUT ever sleeping and WITHOUT
+    // any wake having run - so nothing ever cleared the BLOCKED state.
+    //
+    // Returning to the caller still marked BLOCKED is fatal, two ways:
+    //   1. sched_schedule() re-queues `prev` only when prev->state ==
+    //      PROC_STATE_RUNNING. A BLOCKED-but-running thread is therefore
+    //      DROPPED from the scheduler at its very next preemption, and since
+    //      __wait_finish() also unlinked it from the queue and cleared
+    //      wait_entry, no wake_up_all(), wake_up_process() or tick sweep can
+    //      ever find it again. It is gone, holding whatever lock it took.
+    //   2. If anything does call proc_wake() on it in the meantime (it still
+    //      LOOKS blocked), it is added to the ready queue WHILE RUNNING, and
+    //      on an SMP box a second CPU can then context_switch INTO it and run
+    //      it on its already-live kernel stack.
+    //
+    // Both were observed on build 955 during a 103MB App Store install: (1) as
+    // a dead halt with every thread asleep, (2) as
+    // "[SCHEDBUG] context_switch: pid=10 'heartbeat' rsp=... OUTSIDE kernel
+    // stack" followed by a page fault panic.
+    //
+    // Doing it under the queue lock makes it atomic against a concurrent
+    // wake_up_all(): that either sees us still linked and BLOCKED (unlinks +
+    // proc_wake, which is a no-op once we are RUNNING) or sees us gone.
+    // Only BLOCKED/SLEEPING is rewritten: a waiter that really did sleep comes
+    // back as RUNNING (the scheduler sets that when it picks us) or READY, and
+    // those must not be touched.
+    // ------------------------------------------------------------------
     uint64_t flags = spinlock_acquire_irqsave(&wq->lock);
+    int rescued = 0;
+    process_t *me = entry->proc;
+    if (me && (me->state == PROC_STATE_BLOCKED || me->state == PROC_STATE_SLEEPING)) {
+        sched_self_running(me);                     // #75: set+disarm, one op
+        me->wake_time = 0;
+        g_wq_unpark_rescues++;
+        rescued = 1;
+    }
     wq_unlink(wq, entry);
     spinlock_release_irqrestore(&wq->lock, flags);
     if (entry->proc && entry->proc->wait_entry == entry) {
         entry->proc->wait_entry = NULL;
+    }
+    // Log OUTSIDE the queue lock and with interrupts restored: kprintf drives
+    // the serial port and must never run under a spinlock with IF clear.
+    if (rescued && g_wq_unpark_logged < WQ_UNPARK_LOG_MAX) {
+        g_wq_unpark_logged++;
+        kprintf("[WQ] #610 un-parked pid=%u '%s' after a condition-became-true "
+                "wait_event break (rescue #%lu)\n",
+                me ? me->pid : 0u, me ? me->name : "?",
+                (unsigned long)g_wq_unpark_rescues);
     }
 }
 

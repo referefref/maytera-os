@@ -73,6 +73,15 @@ int ttf_get_advance(int codepoint, int size);
 // Get kerning adjustment between two characters
 int ttf_get_kerning(int cp1, int cp2, int size);
 
+// #589: THE single source of truth for the per-glyph cursor step (the glyph's
+// own advance + the kerning to next_cp; pass next_cp==0 for the last glyph).
+// The measure path and every draw path call this, so measured width == drawn
+// width by construction and the four TTF walks can no longer drift apart. `g` is
+// the glyph already resolved for this codepoint at this size/style (draw paths
+// have it in hand; the measure path resolves it the same way a draw would).
+int ttf_cursor_step_f(int face, const ttf_glyph_t *g, int cp, int next_cp, int size);
+int ttf_cursor_step(const ttf_glyph_t *g, int cp, int next_cp, int size);
+
 // Draw a string using TTF rendering (convenience function)
 // Renders anti-aliased text by alpha-blending glyph bitmaps onto the framebuffer.
 void ttf_draw_string(int x, int y, const char *str, int size, uint32_t color);

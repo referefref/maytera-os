@@ -8,6 +8,8 @@
 extern int g_draw_blend;   // draw.c blend factor (255=opaque)
 extern int g_win_opacity;  // main.c global window opacity
 #include "../../libc/syscall.h"
+#include "../../libc/theme.h"   // #723 theme_color()/THEME_COLOR_* for HA semantic tint
+#include "ha_format.h"          // #723 HA entity-state display formatter
 
 // #102/#379 dirty-rect: when set, widgets_render() only DRAWS (no state advance:
 // no sheep/dog update, no sysmon/netinfo sampling). The idle compositor advances
@@ -107,8 +109,8 @@ static void widget_analog_clock(int cx, int cy, int r) {
         wdg_line(ix, iy, ox, oy, tc);
     }
 
-    int h, m, s;
-    get_rtc_time(&h, &m, &s);
+    int h = 0, m = 0, s = 0;
+    tz_local_hms(&h, &m, &s);      // #49: local, not raw RTC
     int hour_pos = ((h % 12) * 5 + m / 12) % 60;
 
     wdg_hand(cx, cy, hour_pos, r - 22, 2, CLR_MENU_TEXT);  // hour
@@ -130,19 +132,16 @@ static int days_in_month(int m, int y) {
     return d[m - 1];
 }
 
-// Zeller's congruence -> weekday of (d/m/y), returned as 0=Sunday..6=Saturday.
-static int day_of_week(int d, int m, int y) {
-    if (m < 3) { m += 12; y -= 1; }
-    int K = y % 100, J = y / 100;
-    int h = (d + 13 * (m + 1) / 5 + K + K / 4 + J / 4 + 5 * J) % 7; // 0=Sat
-    return (h + 6) % 7;   // shift so 0=Sunday
-}
+// #50: was a second private copy of Zeller's congruence (clock.c had a third).
+// tz_wday() in libc/tz.c is THE implementation; this is a name-only shim so the
+// calendar's call sites read unchanged.
+static int day_of_week(int d, int m, int y) { return tz_wday(d, m, y); }
 
 static void itoa2(char *b, int v) { b[0] = '0' + (v / 10) % 10; b[1] = '0' + v % 10; b[2] = '\0'; }
 
 static void widget_calendar(int x, int y, int w) {
     int dd, mm, yy;
-    get_rtc_date(&dd, &mm, &yy);
+    tz_local_date(&dd, &mm, &yy);   // #49: "today" is a LOCAL date
     if (mm < 1 || mm > 12) mm = 1;
     if (yy < 1970 || yy > 3000) yy = 2026;
 
@@ -228,6 +227,12 @@ typedef struct {
     int climb;              // climbing the screen edge
     unsigned frame, rng;
     int anim, aidx, ahold;   // one-shot eSheep animation (#80): -1 = none
+    // (#40) Where the current climb ends. climb_ty is the y the pet stops at;
+    // climb_tx is the x it stands at when it gets there, or -1 for "it does
+    // not get over this edge", which is a screen edge: it turns around at the
+    // top and drops back down, exactly as it always did. A dock wall sets a
+    // real climb_tx, so the pet steps over onto the dock's top surface.
+    int climb_ty, climb_tx;
 } sheep_t;
 static sheep_t g_sheep[MAX_SHEEP];
 static int g_grabbed = -1;
@@ -236,26 +241,99 @@ static int g_grab_dx = 0, g_grab_dy = 0;
 static int sheep_sc(void){ return (g_sheep_size<=1)?75 : (g_sheep_size>=3)?135 : 100; }
 static int sheep_w(void){ return 50 * sheep_sc() / 100; }
 static int sheep_h(void){ return 34 * sheep_sc() / 100; }
-static int sheep_ground(void){ return g_fb_height - 36 - sheep_h(); }
 
-// Window cache (refreshed once per frame) so sheep can walk on window tops.
-static wm_window_info_t g_wlist[16];
+// (#40) The band a desktop pet lives in: the WIDGET AREA (taskbar_widget_
+// area()), not a hardcoded "screen minus 36". Under a bottom-taskbar style
+// that is screen-minus-the-taskbar, which is byte-identical to the old
+// `g_fb_height - 36` since TASKBAR_HEIGHT is 36; under the marble dock it
+// runs to the BOTTOM EDGE of the screen, which is what the user asked for,
+// and the dock itself then shows up as a wall in the surface list below.
+static void pet_bounds(int *top, int *bot) {
+    int wax, way, waw, wah;
+    taskbar_widget_area(&wax, &way, &waw, &wah);
+    if (top) *top = way;
+    if (bot) *bot = way + wah;
+}
+static int sheep_ground(void){ int b; pet_bounds(NULL, &b); return b - sheep_h(); }
+
+// (#40) THE surface list the pets collide with: app windows AND the active
+// dock style's chrome (taskbar_panel_rects()), in ONE array, so the floor
+// scan below stays a single loop over a single list rather than growing a
+// second, style-aware collision path.
+// `wall` marks a surface the pet cannot walk THROUGH. A window is not one: it
+// is walked behind, exactly as it always was. The marble dock is, because it
+// sits ON the screen's bottom edge and paints over the pets (widgets_render()
+// runs before taskbar_render()), so a sheep walking behind it would simply
+// vanish. Treating it as a wall is what makes it behave "like a window or
+// screen edge (climb and fall etc)".
+typedef struct { int x, y, w, h, wall; } pet_surface_t;
+#define PET_MAX_SURFACES  (16 + 4)
+static wm_window_info_t g_wlist[16];    // scratch for wm_get_windows()
 static int g_wn = 0;
-static int sheep_floor(int x, int w, int cur_y) {
-    int g = g_fb_height - 36 - sheep_h();      // taskbar surface (lowest = largest y)
-    int best = g;
-    int cx = x + w / 2;
-    for (int i = 0; i < g_wn; i++) {
+static pet_surface_t g_psurf[PET_MAX_SURFACES];
+static int g_psurf_n = 0;
+
+// Refresh the surface list. Called once per pet tick from the same two places
+// that used to refresh the window cache alone (the busy render path and the
+// idle damage-collect path), so there is still exactly one wm_get_windows()
+// syscall per tick and nothing in the draw path blocks.
+static void pets_refresh_surfaces(void) {
+    g_psurf_n = 0;
+    g_wn = wm_get_windows(g_wlist, 16);
+    if (g_wn < 0) g_wn = 0;
+    for (int i = 0; i < g_wn && g_psurf_n < PET_MAX_SURFACES; i++) {
         if (!g_wlist[i].visible || g_wlist[i].minimized) continue;
-        if (cx >= g_wlist[i].x && cx < g_wlist[i].x + g_wlist[i].width) {
-            int top = g_wlist[i].y - sheep_h();
+        g_psurf[g_psurf_n].x = g_wlist[i].x;
+        g_psurf[g_psurf_n].y = g_wlist[i].y;
+        g_psurf[g_psurf_n].w = g_wlist[i].width;
+        g_psurf[g_psurf_n].h = g_wlist[i].height;
+        g_psurf[g_psurf_n].wall = 0;
+        g_psurf_n++;
+    }
+    chrome_rect_t pr[4];
+    int pn = taskbar_panel_rects(pr, 4);
+    for (int i = 0; i < pn && g_psurf_n < PET_MAX_SURFACES; i++) {
+        g_psurf[g_psurf_n].x = pr[i].x;
+        g_psurf[g_psurf_n].y = pr[i].y;
+        g_psurf[g_psurf_n].w = pr[i].w;
+        g_psurf[g_psurf_n].h = pr[i].h;
+        g_psurf[g_psurf_n].wall = 1;
+        g_psurf_n++;
+    }
+}
+
+static int sheep_floor(int x, int w, int cur_y) {
+    int top_lim; pet_bounds(&top_lim, NULL);
+    int best = sheep_ground();                 // lowest floor = largest y
+    int cx = x + w / 2;
+    for (int i = 0; i < g_psurf_n; i++) {
+        if (cx >= g_psurf[i].x && cx < g_psurf[i].x + g_psurf[i].w) {
+            int top = g_psurf[i].y - sheep_h();
             // Only a valid floor if it is at/below the sheep's current feet, so a
             // sheep on the taskbar does NOT teleport up onto a window above it.
-            // A sheep only rests on a window it fell onto, then walks off it.
-            if (top > 24 && top >= cur_y && top < best) best = top;
+            // A sheep only rests on a surface it fell (or climbed) onto, then
+            // walks off it. The `>= top_lim` test is what keeps a pet out of a
+            // TOP panel: that panel's own top is above the widget area, so it
+            // is never offered as a floor. It replaces a hardcoded 24, which
+            // matched no dock style's top bar exactly.
+            if (top >= top_lim && top >= cur_y && top < best) best = top;
         }
     }
     return best;
+}
+
+// (#40) The first WALL surface the box at (nx, y) would enter, or -1. A wall
+// only blocks where the pet's body actually OVERLAPS it vertically: standing
+// ON its top edge is not a collision, which is exactly what lets a sheep that
+// has climbed the dock walk along its top and off the far end.
+static int pet_wall_hit(int nx, int y, int w, int h) {
+    for (int i = 0; i < g_psurf_n; i++) {
+        if (!g_psurf[i].wall) continue;
+        if (nx + w <= g_psurf[i].x || nx >= g_psurf[i].x + g_psurf[i].w) continue;
+        if (y + h <= g_psurf[i].y || y >= g_psurf[i].y + g_psurf[i].h) continue;
+        return i;
+    }
+    return -1;
 }
 
 static void sheep_spawn(int i) {
@@ -271,6 +349,7 @@ static void sheep_spawn(int i) {
     g_sheep[i].blink_t = 0;
     g_sheep[i].behavior = 0;
     g_sheep[i].climb = 0;
+    g_sheep[i].climb_ty = 0; g_sheep[i].climb_tx = -1;
     g_sheep[i].anim = -1; g_sheep[i].aidx = 0; g_sheep[i].ahold = 0;
     g_sheep[i].btimer = (int)(seed % 120u);
     g_sheep[i].rng = seed | 1u;
@@ -307,7 +386,14 @@ void sheep_drag_to(int x, int y) {
     sp->x = x - g_grab_dx; sp->y = y - g_grab_dy;
     if (sp->x < 0) sp->x = 0;
     if (sp->x > g_fb_width - sheep_w()) sp->x = g_fb_width - sheep_w();
-    if (sp->y < 0) sp->y = 0;
+    // (#40) Drag is bounded by the SAME band the pet walks in, so a dragged
+    // sheep can be put right on the screen's bottom edge under the marble
+    // dock, and can never be dropped behind a top panel. This was a bare
+    // `if (sp->y < 0) sp->y = 0;`, i.e. the top of the screen, with no bottom
+    // bound at all.
+    int ptop, pbot; pet_bounds(&ptop, &pbot);
+    if (sp->y < ptop) sp->y = ptop;
+    if (sp->y > pbot - sheep_h()) sp->y = pbot - sheep_h();
 }
 void sheep_release(void) {
     if (g_grabbed < 0) return;
@@ -333,6 +419,25 @@ static const struct { const unsigned char *f; int count; int hold; } g_sheep_ani
 };
 #define SHEEP_NANIM ((int)(sizeof(g_sheep_anims)/sizeof(g_sheep_anims[0])))
 
+// (#40) The pet reached an edge it cannot walk past. This is the coin flip the
+// SCREEN edges have always used, pulled out so the dock wall uses the identical
+// behaviour instead of a second, subtly different one: 30% of the time climb
+// the edge, otherwise turn away from it.
+//   climb_ty: the y the climb ends at.
+//   climb_tx: the x to stand at once up there, or -1 for "no top to stand on"
+//             (a screen edge), which turns and drops back down.
+//   away:     the direction to face if it does not climb.
+static void sheep_edge(sheep_t *sp, int away, int climb_ty, int climb_tx) {
+    int top_lim; pet_bounds(&top_lim, NULL);
+    if (climb_ty < top_lim) climb_ty = top_lim;
+    sp->rng = sp->rng * 1103515245u + 12345u;
+    if (((sp->rng >> 16) % 100u) < 30) {
+        sp->climb = 1; sp->climb_ty = climb_ty; sp->climb_tx = climb_tx;
+    } else {
+        sp->dir = away;
+    }
+}
+
 static void sheep_one_update(int idx) {
     sheep_t *sp = &g_sheep[idx];
     sp->frame++;
@@ -341,12 +446,20 @@ static void sheep_one_update(int idx) {
 
     if (idx == g_grabbed) { sp->state = 3; return; }
 
-    if (sp->climb) {                       // climbing the screen edge
+    if (sp->climb) {                       // climbing an edge: screen or dock
         sp->state = 1;                     // cling/splayed pose
         sp->y -= 3;
-        int top_target = ground - g_fb_height / 3;
-        if (top_target < 4) top_target = 4;
-        if (sp->y <= top_target) { sp->climb = 0; sp->vy = 0; sp->dir = -sp->dir; }
+        if (sp->y <= sp->climb_ty) {
+            sp->y = sp->climb_ty;
+            sp->climb = 0; sp->vy = 0;
+            // (#40) climb_tx >= 0 means this edge HAS a top the pet can stand
+            // on (the dock): step over onto it, keeping its direction, and it
+            // will walk along the dock and fall off the far end. A screen edge
+            // has no top (climb_tx < 0), so it turns around and drops back
+            // down, which is the behaviour this block always had.
+            if (sp->climb_tx >= 0) sp->x = sp->climb_tx;
+            else                   sp->dir = -sp->dir;
+        }
         sp->frame++;
         return;
     }
@@ -408,15 +521,38 @@ static void sheep_one_update(int idx) {
                 int iv = run ? 2 : (8 - g_sheep_speed); if (iv < 2) iv = 2;
                 int step = (2 + g_sheep_speed) * (run ? 2 : 1);
                 if ((sp->frame % (unsigned)iv) == 0) {
-                    sp->x += sp->dir * step;
-                    if (sp->x > g_fb_width - sheep_w()) {
-                        sp->x = g_fb_width - sheep_w();
-                        sp->rng = sp->rng * 1103515245u + 12345u;
-                        if (((sp->rng >> 16) % 100u) < 30) sp->climb = 1; else sp->dir = -1;
-                    } else if (sp->x < 0) {
+                    int sw = sheep_w(), sh = sheep_h();
+                    int nx = sp->x + sp->dir * step;
+                    // A screen edge: no top to stand on, so the climb ends a
+                    // third of the screen up and the pet drops back down.
+                    int edge_ty = ground - (int)g_fb_height / 3;
+                    int wall;
+                    if (nx > (int)g_fb_width - sw) {
+                        sp->x = (int)g_fb_width - sw;
+                        sheep_edge(sp, -1, edge_ty, -1);
+                    } else if (nx < 0) {
                         sp->x = 0;
-                        sp->rng = sp->rng * 1103515245u + 12345u;
-                        if (((sp->rng >> 16) % 100u) < 30) sp->climb = 1; else sp->dir = 1;
+                        sheep_edge(sp, 1, edge_ty, -1);
+                    } else if ((wall = pet_wall_hit(nx, sp->y, sw, sh)) >= 0) {
+                        // (#40) The dock. Stop at the face it walked into,
+                        // then the same climb-or-turn roll as a screen edge,
+                        // with the dock's TOP as somewhere to stand: climbing
+                        // it puts the pet on the dock, walking on from there
+                        // eventually takes it off the far end and it falls.
+                        const pet_surface_t *s = &g_psurf[wall];
+                        int ty = s->y - sh, tx;
+                        if (sp->dir > 0) { sp->x = s->x - sw;        tx = s->x + 2; }
+                        else             { sp->x = s->x + s->w;      tx = s->x + s->w - sw - 2; }
+                        // Both the face and the landing spot stay on screen:
+                        // a dock whose edge is within one sheep width of the
+                        // screen edge must not push the pet off it.
+                        if (sp->x < 0) sp->x = 0;
+                        if (sp->x > (int)g_fb_width - sw) sp->x = (int)g_fb_width - sw;
+                        if (tx < 0) tx = 0;
+                        if (tx > (int)g_fb_width - sw) tx = (int)g_fb_width - sw;
+                        sheep_edge(sp, -sp->dir, ty, tx);
+                    } else {
+                        sp->x = nx;
                     }
                 }
             }
@@ -621,7 +757,10 @@ static void sheep_one_draw(const sheep_t *sp) {
 }
 
 // --- Sheepdog (border collie): drag to herd; sheep flee from it (#93) -------
-static int dog_ground(void) { return g_fb_height - 36 - DOG_H; }
+// (#40) Same band as the sheep it herds (pet_bounds()), so the two can never
+// stand at different "ground" levels: under the marble dock both reach the
+// screen's bottom edge, under a bottom-taskbar style both stop on top of it.
+static int dog_ground(void) { int b; pet_bounds(NULL, &b); return b - DOG_H; }
 
 int dog_hit(int x, int y) {
     if (!g_dog_enabled) return 0;
@@ -636,7 +775,10 @@ void dog_drag_to(int x, int y) {
     dog_x = new_x; dog_y = y - dog_gdy;
     if (dog_x < 0) dog_x = 0;
     if (dog_x > g_fb_width - DOG_W) dog_x = g_fb_width - DOG_W;
-    if (dog_y < 0) dog_y = 0;
+    // (#40) Bounded by the pet band, same as sheep_drag_to().
+    int ptop, pbot; pet_bounds(&ptop, &pbot);
+    if (dog_y < ptop) dog_y = ptop;
+    if (dog_y > pbot - DOG_H) dog_y = pbot - DOG_H;
 }
 void dog_release(void) { dog_dragging = 0; }
 int dog_is_dragging(void) { return dog_dragging; }
@@ -647,9 +789,20 @@ static void dog_update(void) {
     if (dog_dragging) return;
     if (dog_y < dog_ground()) { dog_y += 5; if (dog_y > dog_ground()) dog_y = dog_ground(); }
     else if ((dog_frame & 7) == 0) {
-        dog_x += dog_dir * 2;
-        if (dog_x > g_fb_width - DOG_W) dog_dir = -1;
-        if (dog_x < 0) dog_dir = 1;
+        int nx = dog_x + dog_dir * 2;
+        // (#40) The dog uses the same wall list as the sheep. It does not
+        // climb (it never has, at a screen edge either), it just turns, so
+        // the dock stops it the same way the screen edge does instead of
+        // letting it walk behind the dock glass and disappear.
+        int wall = pet_wall_hit(nx, dog_y, DOG_W, DOG_H);
+        if (wall >= 0) {
+            const pet_surface_t *s = &g_psurf[wall];
+            nx = (dog_dir > 0) ? s->x - DOG_W : s->x + s->w;
+            dog_dir = -dog_dir;
+        }
+        dog_x = nx;
+        if (dog_x > (int)g_fb_width - DOG_W) { dog_x = (int)g_fb_width - DOG_W; dog_dir = -1; }
+        if (dog_x < 0) { dog_x = 0; dog_dir = 1; }
     }
 }
 
@@ -905,7 +1058,14 @@ int g_worldtime_x = -1, g_worldtime_y = -1, g_worldtime_locked = 0;
 int g_wt_off[WT_ZONES] = { 0, -300, 540 };   // UTC, New York(-5), Tokyo(+9)
 static const char *s_wt_lbl[WT_ZONES] = { "UTC", "NYC", "TYO" };
 
-// Apply a signed minute offset to the local RTC h/m and render HH:MM.
+// Apply a signed minute offset to UTC and render HH:MM.
+//
+// #49 DELIBERATELY NOT tz_local_hms(): this widget is UTC-referenced by
+// construction (its own g_wt_off[] rows are offsets FROM UTC, and its first row
+// is literally labelled "UTC"). Adding the session timezone here would apply
+// two offsets and make every row wrong by the local offset. The raw RTC read is
+// the correct primitive for this one widget, and the same is true of the World
+// Clock app (userland/apps/clock).
 static void wt_fmt(char *buf, int off_min) {
     long rtc = sys_get_rtc_time();
     int h = (int)((rtc >> 16) & 0xFF), m = (int)((rtc >> 8) & 0xFF);
@@ -1014,6 +1174,7 @@ void widget_settings_open(int id);   // forward decl (settings dialog, below)
 int g_show_ha = 1;                 // flagship widget: shown by default
 int g_ha_x = -1, g_ha_y = -1, g_ha_locked = 0;
 static char s_ha_entity[96]="", s_ha_friendly[96]="", s_ha_state[64]="", s_ha_unit[24]="", s_ha_domain[24]="";
+static char s_ha_dclass[24]="";    // #723 device_class (6th /HA0.TXT field)
 static int  s_ha_h = 74;
 static char s_ha_cat[200000];      // /HALIST.TXT catalog for the picker
 static int  s_ha_cat_len = 0;
@@ -1046,6 +1207,8 @@ static void ha_refresh_cache(void){
     ha_field(b,2,s_ha_state,sizeof(s_ha_state));
     ha_field(b,3,s_ha_unit,sizeof(s_ha_unit));
     ha_field(b,4,s_ha_domain,sizeof(s_ha_domain));
+    ha_field(b,5,s_ha_dclass,sizeof(s_ha_dclass));   // #723 (absent on an old
+                                                      // cache line -> stays "")
 }
 static char ha_lc(char c){ return (c>='A'&&c<='Z')?(char)(c+32):c; }
 // case-insensitive: does haystack contain needle?
@@ -1134,11 +1297,40 @@ static int ha_state_num(long *out){
     long m=v*10+d; *out = neg?-m:m; return 1;
 }
 // #419 classify a non-numeric state as "active" (green) vs inactive (gray).
-static int ha_state_active(void){
-    const char *s=s_ha_state;
-    if(ha_ci_has(s,"on")||ha_ci_has(s,"open")||ha_ci_has(s,"home")||ha_ci_has(s,"playing")
-       ||ha_ci_has(s,"active")||ha_ci_has(s,"heat")||ha_ci_has(s,"cool")||ha_ci_has(s,"locked")) return 1;
-    return 0;
+// #723 Map a formatter semantic bucket to the active theme's semantic token
+// (THEME_COLOR_SUCCESS/WARNING/ERROR/INFO/MUTED - see ../../libc/theme.h).
+// These are the SAME tokens every other themed surface draws from; no new
+// hardcoded literal is introduced for what is, precisely, what that token
+// table exists for. UNAVAILABLE deliberately maps to MUTED, not ERROR: most
+// of an instance's "unavailable" entities are disabled/removed integrations,
+// not active problems, and painting all of them alarm-red is noise fatigue -
+// the WARN triangle icon shape still marks the reading as suspect.
+static uint32_t ha_sem_color(ha_semantic_t sem){
+    switch(sem){
+        case HA_SEM_ACTIVE: return theme_color(THEME_COLOR_SUCCESS);
+        case HA_SEM_WARN:   return theme_color(THEME_COLOR_WARNING);
+        case HA_SEM_ALERT:  return theme_color(THEME_COLOR_ERROR);
+        case HA_SEM_INFO:   return theme_color(THEME_COLOR_INFO);
+        case HA_SEM_NEUTRAL:
+        case HA_SEM_UNAVAILABLE:
+        default:            return theme_color(THEME_COLOR_MUTED);
+    }
+}
+// Truncate `src` to fit `max_w` pixels (appending "...") instead of a blind
+// character-count cut, so a long HA friendly name or humanized state never
+// overflows the card. `scale`=1 measures with text_width(); >1 uses the
+// draw_text_large metric (draw_text_large scale must match what's on screen).
+static void ha_fit_text(const char *src,int max_w,int scale,char *out,int cap){
+    int n=0; for(;src[n]&&n<cap-1;n++) out[n]=src[n]; out[n]=0;
+    int w = (scale<=1)? text_width(out) : text_width_large(out,scale);
+    if (w<=max_w || max_w<=0) return;
+    while (n>1){
+        n--;
+        char t[64]; int m=0; for(;m<n&&m<60;m++) t[m]=out[m];
+        t[m++]='.'; t[m++]='.'; t[m++]='.'; t[m]=0;
+        int tw = (scale<=1)? text_width(t) : text_width_large(t,scale);
+        if (tw<=max_w || n<=1){ int i=0; for(;t[i]&&i<cap-1;i++) out[i]=t[i]; out[i]=0; return; }
+    }
 }
 // #419 mini sparkline (line chart) of the cached series in box (x,y,w,h).
 static void ha_draw_spark(int x,int y,int w,int h){
@@ -1156,30 +1348,40 @@ static void ha_draw_spark(int x,int y,int w,int h){
 static void ha_card_draw(int x,int y){
     ha_refresh_cache();
     if((s_ha_io_tick++ % 24)==0){ ha_load_label(); ha_load_spark(); }
+    // #723 domain/device_class -> humanized text + icon + semantic, once per
+    // frame. Never touches the network (ha_refresh_cache() above only reads
+    // the /HA0.TXT cache haservice already wrote - #211/#381 rule).
+    ha_display_t hd; ha_format_state(s_ha_domain,s_ha_dclass,s_ha_state,s_ha_unit,&hd);
+    uint32_t semc = ha_sem_color(hd.sem);
     int W=HA_W;
     int have_spark = (s_ha_spark_n>=2 && g_ha_mode!=3);
     int top = 10 + FONT_CHAR_H + 8;                       // below the title
     int valh = (g_ha_mode==1)? (FONT_CHAR_H*3+6) : (g_ha_mode==2)? 30 : (g_ha_mode==3)? 30 : (FONT_CHAR_H*2+6);
     int sparkh = have_spark ? 26 : 0;
-    int H = top + valh + (sparkh?sparkh+6:0) + 8 + FONT_CHAR_H + 8;  s_ha_h=H;
+    // No trailing entity-id row (#723: the raw id is noise on the always-
+    // visible card - it stays available in the widget's Settings picker and,
+    // for an already-bound widget, in the settings header caption below).
+    int H = top + valh + (sparkh?sparkh+6:0) + 8;  s_ha_h=H;
     draw_fill_rect(x,y,W,H,0x00202832);
     draw_rect_outline(x,y,W,H,0x00415A6E);
     draw_fill_rect(x,y,W,4,0x0041B0E0);                   // HA accent
-    // Title: custom label overrides HA friendly name (#419 rename).
+    // Title: custom label overrides HA friendly name (#419 rename). The
+    // entity_id fallback only fires before anything has ever loaded (#723:
+    // it is not "the name", it is "nothing better to show yet").
     const char *title = g_ha_label[0]?g_ha_label:(s_ha_friendly[0]?s_ha_friendly:(s_ha_entity[0]?s_ha_entity:"Home Assistant"));
-    char tt[34]; int i=0; for(;title[i]&&i<32;i++) tt[i]=title[i]; tt[i]=0;
+    char tt[64]; ha_fit_text(title,W-24,1,tt,sizeof(tt));
     draw_text(x+12,y+10,tt,0x00CFE8F5);
     int vy = y+top;
     long num; int is_num = ha_state_num(&num);
+    int isz = (g_ha_mode==1)?32:(g_ha_mode==2)?24:(g_ha_mode==3)?16:28;   // icon size per mode
     if(g_ha_mode==2){                                     // ---- state badge ----
-        int act = is_num ? -1 : ha_state_active();
-        uint32_t bg = (act==1)?0x001E7A3C : (act==0)?0x00444C55 : 0x00274A63;
-        char bt[40]; int bi=0; const char *bs=s_ha_state[0]?s_ha_state:"...";
-        for(;bs[bi]&&bi<24;bi++) bt[bi]=bs[bi]; bt[bi]=0;
-        int bw = text_width(bt)+24; if(bw<64)bw=64; if(bw>W-24)bw=W-24;
-        draw_fill_rect(x+12,vy,bw,24,bg);
-        draw_rect_outline(x+12,vy,bw,24,0x0080A0B8);
-        draw_text_centered(x+12+bw/2,vy+4,bt,0x00FFFFFF);
+        icon_draw_scaled(hd.icon, x+12, vy, isz, semc);
+        int bx = x+12+isz+8;
+        char bt[40]; ha_fit_text(hd.text, W-24-isz-8-24, 1, bt, sizeof(bt));
+        int bw = text_width(bt)+24; if(bw<64)bw=64; if(bw>W-24-isz-8)bw=W-24-isz-8;
+        draw_fill_rect(bx,vy,bw,24,semc);
+        draw_rect_outline(bx,vy,bw,24,readable_ink_dim(semc));
+        draw_text_centered(bx+bw/2,vy+4,bt,readable_ink(semc));   // #723 contrast-safe on any theme's semantic color
     } else if(g_ha_mode==3){                              // ---- gauge / bar ----
         long v = is_num? num : 0;
         if(is_num && v/10 > g_ha_max){ g_ha_max = (int)(v/10); }   // auto-grow range
@@ -1189,22 +1391,17 @@ static void ha_card_draw(int x,int y){
         draw_fill_rect(x+12,vy,gw,gh,0x00161E26);
         draw_fill_rect(x+12,vy,(int)((long)gw*frac/1000),gh,0x0041B0E0);
         draw_rect_outline(x+12,vy,gw,gh,0x00304556);
-        char val[48]; int vi=0; if(s_ha_state[0]) for(int j=0;s_ha_state[j]&&vi<40;j++) val[vi++]=s_ha_state[j];
-        if(s_ha_unit[0]){ val[vi++]=' '; for(int j=0;s_ha_unit[j]&&vi<46;j++) val[vi++]=s_ha_unit[j]; } val[vi]=0;
-        draw_text(x+12,vy+gh+2,val,0x00CFE8F5);
+        icon_draw_scaled(hd.icon, x+12, vy+gh+3, isz, semc);
+        char val[48]; ha_fit_text(hd.text, W-24-isz-6, 1, val, sizeof(val));
+        draw_text(x+12+isz+6,vy+gh+3,val,0x00CFE8F5);
     } else {                                              // ---- value / big ----
-        char val[90]; int vi=0;
-        const char *body = s_ha_state[0]?s_ha_state:"...";
-        for(int j=0;body[j]&&vi<80;j++) val[vi++]=body[j];
-        if(g_ha_mode!=1 && s_ha_unit[0]){ val[vi++]=' '; for(int j=0;s_ha_unit[j]&&vi<86;j++) val[vi++]=s_ha_unit[j]; }
-        val[vi]=0;
         int scale = (g_ha_mode==1)?3:2;
-        draw_text_large(x+12,vy,val,0x00FFFFFF,scale);
-        if(g_ha_mode==1 && s_ha_unit[0]) draw_text(x+12,vy+FONT_CHAR_H*3-6,s_ha_unit,0x008FA9BD);
+        icon_draw_scaled(hd.icon, x+12, vy+(valh-isz)/2, isz, semc);
+        int tx = x+12+isz+8;
+        char val[48]; ha_fit_text(hd.text, W-24-isz-8, scale, val, sizeof(val));
+        draw_text_large(tx,vy,val,0x00FFFFFF,scale);
     }
     if(have_spark) ha_draw_spark(x+12,vy+valh+6,W-24,20);
-    char eb[36]; i=0; for(;s_ha_entity[i]&&i<34;i++) eb[i]=s_ha_entity[i]; eb[i]=0;
-    draw_text(x+12,y+H-FONT_CHAR_H-8,eb,0x007E93A6);
 }
 
 // Bounding box of widget `id` (top-left). Returns 0 if hidden/unplaced.
@@ -1300,23 +1497,64 @@ void widget_grab(int x, int y) {
     int bx, by, bw, bh; widget_box(g_wdrag, &bx, &by, &bw, &bh);
     g_wdx = x - bx; g_wdy = y - by;
 }
+// (#745) Clamp a widget box into the WORK AREA, not into three guessed
+// constants. The old floor of 24 was a stand-in for "some top bar" that
+// matched no style exactly (Retro Bench is 20, Lumina 24, XFCE 30) and the -30
+// bottom margin matched neither the 36px taskbar nor the 64px docks.
+// (#40) The bounds are the WIDGET AREA, not the window work area: under the
+// marble dock a widget may be dragged right down to the screen's bottom edge
+// (the dock floats over the desktop there and the style's taskbar is at the
+// TOP, which this still keeps clear), while an app window still may not.
+static void widget_clamp_pos(int bw, int bh, int *nx, int *ny) {
+    int wax, way, waw, wah;
+    taskbar_widget_area(&wax, &way, &waw, &wah);
+    if (*nx > wax + waw - bw) *nx = wax + waw - bw;
+    if (*ny > way + wah - bh) *ny = way + wah - bh;
+    if (*nx < wax) *nx = wax;      // after the max clamps, so a widget wider
+    if (*ny < way) *ny = way;      // than the work area still starts inside it
+}
+
+// The single write-back for a widget's top-left. Was inline in widget_drag_to;
+// pulled out so the re-clamp path below cannot drift from the drag path.
+static void widget_set_pos(int id, int nx, int ny) {
+    if (id == 0)       { g_clock_cx = nx + s_clk_r; g_clock_cy = ny + s_clk_r; }
+    else if (id == 1)  { g_cal_x = nx; g_cal_y = ny; }
+    else if (id == 5)  { g_digclk_x = nx; g_digclk_y = ny; }
+    else if (id == 6)  { g_sysmon_x = nx; g_sysmon_y = ny; }
+    else if (id == 7)  { g_timer_x = nx; g_timer_y = ny; }
+    else if (id == 8)  { g_worldtime_x = nx; g_worldtime_y = ny; }
+    else if (id == 9)  { g_uptime_x = nx; g_uptime_y = ny; }
+    else if (id == 10) { g_ha_x = nx; g_ha_y = ny; }
+    else               { int c = id - 2; *s_card_x[c] = nx; *s_card_y[c] = ny; }
+}
+
 void widget_drag_to(int x, int y) {
     if (g_wdrag < 0) return;
     int bx, by, bw, bh; if (!widget_box(g_wdrag, &bx, &by, &bw, &bh)) return;
     int nx = x - g_wdx, ny = y - g_wdy;                 // new top-left
-    if (nx < 0) nx = 0;
-    if (ny < 24) ny = 24;
-    if (nx > g_fb_width - bw) nx = g_fb_width - bw;
-    if (ny > g_fb_height - bh - 30) ny = g_fb_height - bh - 30;
-    if (g_wdrag == 0)      { g_clock_cx = nx + s_clk_r; g_clock_cy = ny + s_clk_r; }
-    else if (g_wdrag == 1) { g_cal_x = nx; g_cal_y = ny; }
-    else if (g_wdrag == 5) { g_digclk_x = nx; g_digclk_y = ny; }
-    else if (g_wdrag == 6) { g_sysmon_x = nx; g_sysmon_y = ny; }
-    else if (g_wdrag == 7) { g_timer_x = nx; g_timer_y = ny; }
-    else if (g_wdrag == 8) { g_worldtime_x = nx; g_worldtime_y = ny; }
-    else if (g_wdrag == 9) { g_uptime_x = nx; g_uptime_y = ny; }
-    else if (g_wdrag == 10) { g_ha_x = nx; g_ha_y = ny; }
-    else                   { int c = g_wdrag - 2; *s_card_x[c] = nx; *s_card_y[c] = ny; }
+    widget_clamp_pos(bw, bh, &nx, &ny);
+    widget_set_pos(g_wdrag, nx, ny);
+}
+
+// (#745/#40) Re-clamp every relocatable widget into the CURRENT widget area
+// (taskbar_widget_area(), which is the work area except under an overlay dock
+// style). A widget position comes out of UIPROFIL.YML, which may have been
+// written under a different dock style (or before this fix existed), so "it
+// was clamped when it was dragged" is not enough: it has to be re-clamped
+// when the reserved edge changes. Called from taskbar_apply_work_area() and,
+// per #40, once per frame from widgets_render() so a widget's FIRST-EVER
+// default placement is covered too.
+void widgets_clamp_to_bounds(void) {
+    for (int id = 0; id <= 10; id++) {
+        int bx, by, bw, bh;
+        if (!widget_box(id, &bx, &by, &bw, &bh)) continue;
+        int nx = bx, ny = by;
+        widget_clamp_pos(bw, bh, &nx, &ny);
+        if (nx != bx || ny != by) {
+            widget_set_pos(id, nx, ny);
+            g_needs_redraw = true;
+        }
+    }
 }
 void widget_release(void) { g_wdrag = -1; }
 
@@ -1333,8 +1571,10 @@ static int widget_menu_nitems(void) {
 static void widget_menu_geom(int *mx, int *my, int *h) {
     int hh = widget_menu_nitems() * WMENU_IH + 4;
     int x = g_wmenu_x, y = g_wmenu_y;
-    if (x + WMENU_W > g_fb_width) x = g_fb_width - WMENU_W;
-    if (y + hh > g_fb_height) y = g_fb_height - hh;
+    // (local 81) was clamped against the raw framebuffer with no x<0/y<0 floor,
+    // so a menu wider/taller than the screen started off-screen and one opened
+    // near the dock was painted over it. Shared helper, one definition.
+    popup_clamp_to_work_area(WMENU_W, hh, &x, &y);
     *mx = x; *my = y; *h = hh;
 }
 void widget_menu_render(void) {
@@ -1692,10 +1932,15 @@ static int  g_wset_drag = 0, g_wset_grab_dx = 0, g_wset_grab_dy = 0;
 // header stay on-screen no matter how far the user drags.
 static void modal_clamp(int *x, int *y, int w, int h) {
     int margin = 72;
-    if (*x > g_fb_width - margin)  *x = g_fb_width - margin;
-    if (*x < margin - w)           *x = margin - w;
-    if (*y < 0)                    *y = 0;
-    if (*y > g_fb_height - 30)      *y = g_fb_height - 30;
+    // (#745) Relative to the work area: under a top-panel dock style a floor of
+    // 0 put this modal's own 26px header under the panel, which is the same
+    // unreachable-header fault as the app-window one.
+    int wax, way, waw, wah;
+    taskbar_work_area(&wax, &way, &waw, &wah);
+    if (*x > wax + waw - margin)  *x = wax + waw - margin;
+    if (*x < wax + margin - w)    *x = wax + margin - w;
+    if (*y < way)                 *y = way;
+    if (*y > way + wah - 30)      *y = way + wah - 30;
     (void)h;
 }
 
@@ -1795,11 +2040,29 @@ static void ha_picker_render(void){
     draw_rect_outline(x,y,HAP_W,HAP_H,CLR_MENU_BORDER);
     draw_fill_rect(x,y,HAP_W,26,CLR_MENU_ITEM_HOVER);
     draw_text(x+12,y+7,"Home Assistant widget - settings",CLR_MENU_TEXT);
+    // #723 The bound entity_id is deliberately NOT shown on the desktop card
+    // (that was the raw-id noise the redesign removed) - this settings header
+    // is the "properties view" it moved to instead: the one place a user who
+    // wants the technical identifier (to verify the right entity is bound, or
+    // to cross-reference it in Home Assistant itself) can find it, without it
+    // cluttering the always-visible card.
+    if (s_ha_entity[0]) {
+        char eid[40]; ha_fit_text(s_ha_entity, 180, 1, eid, sizeof(eid));
+        int ew = text_width(eid);
+        draw_text(x+HAP_W-24-8-ew, y+7, eid, readable_ink_dim(CLR_MENU_ITEM_HOVER));
+    }
     // Close (X) button, top-right of the title bar (excluded from the header drag).
     { int cxx=x+HAP_W-24; draw_fill_rect(cxx,y+5,18,16,0x00A83232);
       draw_rect_outline(cxx,y+5,18,16,0x00D06060); draw_text_centered(cxx+9,y+6,"X",0x00FFFFFF); }
     int fw=HAP_W-28;
     // --- rename field (#419), focus 1 ---
+    // (#745) the 0x0066B3FF focus rings below are HARDCODED and theme-blind.
+    // They were checked and NOT changed: they measure 6.20:1 on the default
+    // CLR_MENU_BG and 7.34:1 on the #202020 field fill, so they are not a
+    // contrast defect and there is nothing here for the 3:1 floor to fix. They
+    // are still debt, because a theme cannot influence them; the compositor
+    // does not link the libc style engine's palette, so moving them wants a
+    // theme_color(THEME_COLOR_FOCUS_RING) read rather than gui_pal().
     int rx=x+14, ry=y+HAP_RENAME_DY;
     draw_text(rx,ry-14,"Display name (blank = use HA name)",readable_ink_dim(CLR_MENU_BG));
     draw_fill_rect(rx,ry,fw,24,0x00202020);
@@ -2143,15 +2406,28 @@ void widgets_render(void) {
         netinfo_render();               // #81-83 weather/crypto/stock cards
         if (g_wxtest < 0) { int fd = sys_open("/WXTEST.TXT", 0); g_wxtest = (fd >= 0); if (fd >= 0) sys_close(fd); }
         if (g_wxtest) draw_icon_gallery();
+        // (#40) The THIRD placement path. Drag clamps (widget_drag_to) and a
+        // dock-style change clamps (taskbar_apply_work_area), but a widget
+        // whose stored position was still "unset" gets its DEFAULT placed a
+        // few lines above from raw screen geometry, which knows nothing about
+        // a top panel, and that happens the first time each widget is shown,
+        // not once at startup. Re-running THE one clamp here (not a second
+        // copy of the arithmetic) covers all three, costs a handful of global
+        // reads, and is a no-op once everything already sits inside the band.
+        if (!g_widgets_draw_only) widgets_clamp_to_bounds();
         g_draw_blend = 255;             // sheep + dog are never transparent
     }
+    // (#40) One surface-list refresh per tick for BOTH pets: the dog used to
+    // get no list at all when the sheep were disabled, which would have left
+    // it walking through the dock.
+    if (!g_widgets_draw_only && (g_sheep_enabled || g_dog_enabled))
+        pets_refresh_surfaces();
     if (g_sheep_enabled) {
         if (g_sheep_count < 1) g_sheep_count = 1;
         if (g_sheep_count > MAX_SHEEP) g_sheep_count = MAX_SHEEP;
         if (!g_widgets_draw_only) {
             // Advance positions only in the full/busy path; the idle path has
             // already stepped the sheep in widgets_collect_damage().
-            g_wn = wm_get_windows(g_wlist, 16); if (g_wn < 0) g_wn = 0;
             for (int i = 0; i < g_sheep_count; i++) {
                 if (!g_sheep[i].inited) sheep_spawn(i);
                 sheep_one_update(i);
@@ -2180,10 +2456,15 @@ void widgets_collect_damage(void) {
     int bx, by, bw, bh;
 
     if (g_widgets_enabled) {
-        long rtc = sys_get_rtc_time();
-        int sec = (int)(rtc & 0xFF);
-        int minu = (int)((rtc >> 8) & 0xFF);
-        int day = 19, mon = 6, yr = 2026; get_rtc_date(&day, &mon, &yr);
+        // #49: damage must be driven by the LOCAL reading, because that is what
+        // is on screen. A :30/:45 zone rolls its minute half an hour away from
+        // UTC's, and a zone can be on a different calendar DAY, so a UTC-driven
+        // rollover would repaint the clock and the calendar at the wrong moment.
+        tz_time_t lt; tz_local_now(&lt);
+        int sec = lt.sec;
+        int minu = lt.min;
+        int day = lt.day, mon = lt.month, yr = lt.year;
+        (void)mon; (void)yr;
 
         static int last_sec = -1, last_min = -1, last_day = -1;
         int sec_ch = (sec != last_sec);
@@ -2243,10 +2524,10 @@ void widgets_collect_damage(void) {
         unsigned long nowms = uptime_ms();
         if (nowms - last_pet_ms >= 200) {   // ~5 FPS pets (the old idle path drew
             last_pet_ms = nowms;
+            pets_refresh_surfaces();   // (#40) windows + dock chrome, once per tick
             if (g_sheep_enabled) {
                 if (g_sheep_count < 1) g_sheep_count = 1;
                 if (g_sheep_count > MAX_SHEEP) g_sheep_count = MAX_SHEEP;
-                g_wn = wm_get_windows(g_wlist, 16); if (g_wn < 0) g_wn = 0;
                 int sw = sheep_w(), sh = sheep_h();
                 for (int i = 0; i < g_sheep_count; i++) {
                     if (!g_sheep[i].inited) sheep_spawn(i);
@@ -2288,7 +2569,18 @@ static const widget_desc_t g_widget_registry[] = {
     { "Home Assistant","show_ha",       &g_show_ha        },   // #414
     { "Sticky Notes",  "show_stickies", &g_show_stickies  },   // #270
     { "Sheep",         "sheep_show",    &g_sheep_enabled  },
-    { "AI Chat",       "show_aichat",   &g_aichat_enabled },   // #185 external app
+    { "Dog",           "dog_show",      &g_dog_enabled    },   // #745 P2: has a draw fn
+                                                                 // (dog_update/dog_draw), a bind
+                                                                 // (traymenu.c tm_get/tm_set
+                                                                 // "dog_show"), a profile key
+                                                                 // ("dog") and its own hash term
+                                                                 // in profile_tick(), but was never
+                                                                 // added here, so it was invisible
+                                                                 // to the Tray > Widgets menu and to
+                                                                 // anything (like the widget
+                                                                 // live-apply channel) that treats
+                                                                 // this array as the widget list.
+    { "Maytera AI",    "show_aichat",   &g_aichat_enabled },   // #185 external app
 };
 const widget_desc_t *widget_registry(int *count) {
     if (count) *count = (int)(sizeof(g_widget_registry) / sizeof(g_widget_registry[0]));

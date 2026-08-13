@@ -1,0 +1,828 @@
+#!/usr/bin/env python3
+# concurrency-lint - MayteraOS reinvented-spin-loop / busy-wait detector (#426)
+#
+# Enforces the CLAUDE.md rule "Reuse the existing shared primitives; NEVER
+# reinvent them" for the concurrency/waiting family. It scans the kernel and
+# userland C sources and FLAGS hand-rolled busy-waits and poll loops that
+# should instead go through the shared wait-queue (kernel/sync/waitq.h:
+# wait_event / wait_event_interruptible) or the futex layer
+# (kernel/sync/futex.c). This bug class caused the freeze/hang tickets
+# #211 #212 #230 #231 #347 #381 #419 #420.
+#
+# The lint is BASELINED: an allowlist file (allowlist.txt) records the sites
+# that already exist in the tree so the build goes green today, while any NEW
+# spin/poll added later FAILS the lint. Fingerprints are keyed on the source
+# path + rule + a hash of the offending code snippet (NOT the line number), so
+# unrelated edits that shift line numbers do not spuriously trip the check.
+#
+# #514 (2026-08-02): THE TOOL NOW LIVES INSIDE kernel/. It used to sit at the
+# repo root (tools/concurrency-lint/) and be invoked as `../tools/...` from
+# kernel/Makefile. build-golden.sh ships ONLY `git archive <commit> kernel` to
+# the kernel build container, so that path did not exist where the kernel is
+# actually built and `make lint` died with "No such file or directory". The
+# lint was documented in CLAUDE.md as a build guardrail while being incapable
+# of running in a build. Same rationale and placement as rust-symbol-gate,
+# syscall-dispatch-gate, syscall-ptr-lint and copy-user-lint: a gate travels
+# with the Makefile that invokes it.
+#
+# #514 ALLOWLIST DISCIPLINE. The allowlist can no longer grow silently:
+#   * every entry MUST carry a category tag, [LEGIT] or [DEBT], plus a real
+#     justification. An entry without one FAILS the lint.
+#   * [LEGIT] = correct by design (pre-scheduler code, real-time pacing).
+#     [DEBT]  = an accepted pre-existing poll loop that SHOULD be converted.
+#     The DEBT ledger is printed loudly on every run, like copy-user-lint's
+#     KNOWN GAP ledger, so the debt is visible rather than buried.
+#   * a STALE entry (fingerprint that matches nothing in the scanned tree)
+#     FAILS the lint, so fixing a site forces removing its allowlist line in
+#     the same commit and the file cannot rot into a list of dead hashes.
+#
+# Usage:
+#   concurrency-lint [--root DIR] [--dirs a,b] [--allowlist FILE]
+#         Scan and print violations. Exit 0 if none are NEW, 1 if any NEW
+#         violation is outside the allowlist, or the allowlist itself is
+#         unjustified/stale.
+#   concurrency-lint --update-allowlist
+#         Rewrite the allowlist to baseline the current tree (records every
+#         current hit with a TODO note). The notes must then be filled in by
+#         hand; a TODO note is NOT a justification and still fails.
+#   concurrency-lint --report
+#         Print the full categorized list of every hit (allowlisted or not),
+#         for use as a cleanup backlog. Always exits 0.
+#   concurrency-lint --self-test
+#         PROVE the lint is trustworthy: RED on a synthetic new spin loop of
+#         every rule, GREEN on a clean fixture. Exit 0 only if all cases are
+#         correct. A gate nobody has seen go red is not a gate.
+#
+# NO em-dashes anywhere in this file (project style rule).
+
+import argparse
+import hashlib
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+
+# Directories scanned, relative to --root (the active-code/source tree).
+SCAN_DIRS = ["kernel", "userland"]
+# Paths (substring match on the relative path) that are never scanned.
+SKIP_PATH_SUBSTR = [
+    "/obj/",              # build objects
+    "/sync/",             # the canonical primitives themselves live here
+    "/games/doom/",       # legacy DOOM port, compiled -w, out of scope
+    "games/doom/",
+    "apps/doom/",         # userland DOOM copy (same legacy code)
+    # vendored / third-party libraries: algorithmic loops, not our
+    # concurrency code. The spin/hang bug class lives in first-party code.
+    "/media/opus/",
+    "/media/tremor/",
+    "/media/faad2/",
+    "/media/libmad/",
+    "/grep-gnu/",
+    "/micropython/",
+    "/rogue/",
+    # #514: the vendored OpenArena/ioquake3 tree is third-party game code with
+    # the same standing as the other vendored entries above. Its `while(
+    # SDL_PeepEvents(...) )` / `while(PC_ReadLine(...))` drain loops are
+    # side-effecting consumer loops, not CPU spins, and were pure noise.
+    "/openarena/vendor/",
+    # stray nested copy accidentally under kernel<WORKSPACE>/...
+    "<WORKSPACE>/",
+]
+# Small proc_sleep(N)/msleep(N) argument at or below this is treated as a poll.
+SMALL_SLEEP_MS = 16
+
+# Canonical blocking primitives. If a loop body uses one of these it is
+# considered correctly routed and is NOT flagged as a spin.
+BLOCKING_PRIMITIVES = [
+    "wait_event", "wait_event_interruptible", "wait_event_timeout",
+    "futex_wait", "sys_futex", "wake_up", "waitq_wait", "wq_wait",
+    "sem_down", "sem_wait", "cond_wait", "block_on",
+]
+
+# Names (function or file basename) that identify a NO-BLOCK context in which
+# ANY sleep/yield/block is a bug: IRQ/ISR handlers and the compositor draw
+# thread. Kept deliberately narrow to avoid false positives.
+NOBLOCK_FUNC_RE = re.compile(
+    r"(?:^|_)(?:irq|isr)(?:$|_)"
+    r"|(?:irq|isr|interrupt)_handler"
+    r"|handle_(?:irq|isr|interrupt)"
+    r"|on_draw\b|draw_thread\b|compositor_draw\b|draw_frame\b|_draw_cb\b",
+    re.IGNORECASE,
+)
+NOBLOCK_CALLS = [
+    "proc_sleep", "proc_yield", "msleep", "usleep",
+    "wait_event", "futex_wait", "sem_down", "sem_wait",
+]
+
+# #514: calls that burn time WITHOUT ever yielding the CPU. A loop whose body
+# is made of nothing but these is a pure hardware spin: it holds the core for
+# the whole wait. This is the e1000_send() `for (i=0;i<1000;i++) io_wait();`
+# / xhci_delay() class, which the old rule set missed entirely because the
+# body was not EMPTY, it was full of delay calls.
+DELAY_ONLY_CALLS = [
+    "io_wait", "pause", "cpu_relax", "cpu_pause", "rep_nop",
+    "udelay", "ndelay", "mdelay", "delay_us", "delay_ms",
+    "__builtin_ia32_pause",
+]
+# Statements permitted alongside the delay calls in a "pure delay" body without
+# making it something other than a spin (counters, breaks, kprintf tracing).
+_PURE_DELAY_NOISE_RE = re.compile(
+    r"\b(?:break|continue|;)\b|\+\+|--|^\s*$"
+)
+
+RULES = {
+    "SPIN_BUSYWAIT": "Empty-bodied busy-wait loop (spins the CPU). Route the "
+                     "wait through wait_event()/futex_wait().",
+    "YIELD_SPIN":    "proc_yield()/sched_schedule() spin loop. The waiter "
+                     "stays RUNNABLE, so it can starve the very context it is "
+                     "waiting for (#746). Replace the hand-rolled yield loop "
+                     "with wait_event()/futex_wait().",
+    "SLEEP_POLL":    "Short-sleep poll loop (proc_sleep/msleep of a small "
+                     "value inside a loop). Use wait_event_interruptible() so "
+                     "a waker unblocks you instead of polling.",
+    "NOBLOCK_BLOCK": "Blocking/sleeping call in a no-block context (IRQ/ISR "
+                     "handler or compositor draw thread). These must never "
+                     "block; do async-fetch-then-cache instead.",
+    "DELAY_SPIN":    "Loop whose body is nothing but hardware delay calls "
+                     "(io_wait/pause/udelay). This pegs a core for the whole "
+                     "wait. Use wait_event_timeout() once the scheduler is up.",
+}
+
+
+def strip_comments_and_strings(src):
+    """Replace comments and string/char literals with spaces, preserving
+    newlines and byte offsets so line numbers stay correct."""
+    out = []
+    i = 0
+    n = len(src)
+    while i < n:
+        c = src[i]
+        two = src[i:i + 2]
+        if two == "//":
+            while i < n and src[i] != "\n":
+                out.append(" ")
+                i += 1
+        elif two == "/*":
+            out.append("  ")
+            i += 2
+            while i < n and src[i:i + 2] != "*/":
+                out.append("\n" if src[i] == "\n" else " ")
+                i += 1
+            if i < n:
+                out.append("  ")
+                i += 2
+        elif c in "\"'":
+            quote = c
+            out.append(" ")
+            i += 1
+            while i < n and src[i] != quote:
+                if src[i] == "\\" and i + 1 < n:
+                    out.append("  ")
+                    i += 2
+                    continue
+                out.append("\n" if src[i] == "\n" else " ")
+                i += 1
+            if i < n:
+                out.append(" ")
+                i += 1
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def line_of(src, off):
+    return src.count("\n", 0, off) + 1
+
+
+def match_paren(s, open_idx):
+    """Given index of an opening bracket, return index just past its match."""
+    open_ch = s[open_idx]
+    close_ch = {"(": ")", "{": "}"}[open_ch]
+    depth = 0
+    i = open_idx
+    n = len(s)
+    while i < n:
+        if s[i] == open_ch:
+            depth += 1
+        elif s[i] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return -1
+
+
+def extract_loop_body(clean, hdr_end):
+    """From the char just after a loop's condition, return (body_text,
+    body_start_off, body_end_off)."""
+    i = hdr_end
+    n = len(clean)
+    while i < n and clean[i] in " \t\r\n":
+        i += 1
+    if i >= n:
+        return "", hdr_end, hdr_end
+    if clean[i] == "{":
+        end = match_paren(clean, i)
+        if end < 0:
+            end = n
+        return clean[i + 1:end - 1], i + 1, end - 1
+    # single-statement body up to the terminating semicolon
+    j = i
+    while j < n and clean[j] != ";":
+        j += 1
+    return clean[i:j], i, j
+
+
+def find_enclosing_func(clean, off):
+    """Best-effort: scan backwards for the nearest function-definition-looking
+    header at column 0 and return its name."""
+    text = clean[:off]
+    best = None
+    for m in re.finditer(
+        r"(?m)^[A-Za-z_][\w \t\*]*?\b([A-Za-z_]\w*)\s*\([^;{]*\)\s*\{?",
+        text,
+    ):
+        # crude filter: skip obvious statements / control keywords
+        name = m.group(1)
+        if name in ("if", "for", "while", "switch", "return", "sizeof"):
+            continue
+        best = name
+    return best or ""
+
+
+def normalize(snippet):
+    return re.sub(r"\s+", " ", snippet).strip()
+
+
+def fingerprint(relpath, rule, snippet):
+    h = hashlib.sha1(normalize(snippet).encode("utf-8", "replace")).hexdigest()[:12]
+    return f"{relpath}|{rule}|{h}"
+
+
+LOOP_HDR_RE = re.compile(r"\b(while|for)\s*\(")
+# operators in a loop condition that let the loop make its own progress
+# (assignment or in/decrement); their presence means the loop is NOT a pure
+# read-spin busy-wait.
+# #514 BUG FIX, found by the new --self-test. The old pattern was
+#   \+\+|--|[-+*/|&^]?=(?!=)
+# whose `=(?!=)` branch happily matched the SECOND `=` of a `==`, because that
+# `=` is not followed by another `=`. So `while (*flag == 0) ;` - the single
+# most canonical busy-wait in the codebase, and the exact shape of the xhci and
+# blockdev spins - was classified as "the loop makes its own progress" and
+# never flagged. The rule existed, ran, and could not fire on its headline
+# case. Comparison operators (== != <= >=) are now excluded by lookbehind;
+# genuine assignment and compound assignment (= += |= ...) still count.
+COND_PROGRESS_RE = re.compile(r"\+\+|--|(?<![=!<>])=(?!=)")
+
+
+def find_dowhile_tails(clean):
+    """Return the set of offsets of `while` tokens that terminate a do-while
+    (their body precedes them, so they must not be treated as loop headers)."""
+    tails = set()
+    for m in re.finditer(r"\bdo\b", clean):
+        i = m.end()
+        n = len(clean)
+        while i < n and clean[i] in " \t\r\n":
+            i += 1
+        if i < n and clean[i] == "{":
+            end = match_paren(clean, i)
+            if end < 0:
+                continue
+            j = end
+        else:
+            # do <stmt> ; while(...)
+            j = clean.find(";", i)
+            if j < 0:
+                continue
+            j += 1
+        while j < n and clean[j] in " \t\r\n":
+            j += 1
+        if clean[j:j + 5] == "while":
+            tails.add(j)
+    return tails
+
+
+def body_uses_blocking(body):
+    return any(re.search(r"\b" + re.escape(p) + r"\s*\(", body)
+               for p in BLOCKING_PRIMITIVES)
+
+
+_FUNC_DEF_RE = re.compile(
+    r"(?m)^\s*(?:static\s+)?(?:inline\s+)?(?:void|int)\s+([A-Za-z_]\w*)\s*\([^;{]*\)\s*\{"
+)
+
+
+def find_delay_wrappers(clean):
+    """#514: a one-line helper that hides a sleep defeats a body-text lint.
+
+    net/ftp.c's `ftp_delay()` is exactly that: seven call sites poll through a
+    wrapper whose whole body is `proc_sleep(1);`, so every enclosing loop read
+    as clean while being a textbook poll. Collect the names of such wrappers in
+    THIS file (a tiny body that does nothing but sleep or hardware-delay) and
+    treat calls to them as the sleep they are. Scoped per file deliberately:
+    a cross-file call graph is guesswork, and a lint that guesses gets muted.
+    """
+    names = set()
+    for m in _FUNC_DEF_RE.finditer(clean):
+        name = m.group(1)
+        if name in ("if", "for", "while", "switch", "return", "sizeof"):
+            continue
+        brace = clean.find("{", m.end() - 1)
+        end = match_paren(clean, brace)
+        if end < 0:
+            continue
+        body = clean[brace + 1:end - 1]
+        if body.count(";") > 4:
+            continue                       # not a thin wrapper
+        if body_uses_blocking(body):
+            continue                       # correctly routed, not a spin
+        sleeps = re.search(r"\b(proc_sleep|msleep|usleep)\s*\(", body)
+        delays = any(re.search(r"\b" + re.escape(d) + r"\s*\(", body)
+                     for d in DELAY_ONLY_CALLS)
+        volspin = re.search(r"for\s*\([^;]*volatile", body)
+        if sleeps or delays or volspin:
+            names.add(name)
+    return names
+
+
+def small_sleep_in(body, wrappers=()):
+    for m in re.finditer(r"\b(proc_sleep|msleep|usleep)\s*\(\s*(\d+)", body):
+        val = int(m.group(2))
+        # usleep is microseconds; treat <=SMALL_SLEEP_MS*1000 as poll
+        thresh = SMALL_SLEEP_MS * 1000 if m.group(1) == "usleep" else SMALL_SLEEP_MS
+        if val <= thresh:
+            return True
+    # #514: the same poll wearing a one-line helper (ftp_delay(), xhci_delay()).
+    for w in wrappers:
+        if re.search(r"\b" + re.escape(w) + r"\s*\(", body):
+            return True
+    # proc_sleep(1) with a macro/var arg still looks like a poll if the loop
+    # re-checks a condition; a bare small literal is the clearest signal.
+    return False
+
+
+def body_is_pure_delay(body):
+    """True when the loop body consists ONLY of hardware delay calls (plus
+    trivial counter/break noise). That is a core-pegging spin, not a wait."""
+    calls = re.findall(r"\b([A-Za-z_]\w*)\s*\(", body)
+    if not calls:
+        return False
+    if not any(c in DELAY_ONLY_CALLS for c in calls):
+        return False
+    # every call in the body must be a delay call; one real call (a status
+    # read, a completion check) means the loop is doing work, not just burning.
+    return all(c in DELAY_ONLY_CALLS for c in calls)
+
+
+def scan_file(path, relpath):
+    try:
+        with open(path, "r", errors="replace") as f:
+            src = f.read()
+    except OSError:
+        return []
+    clean = strip_comments_and_strings(src)
+    delay_wrappers = find_delay_wrappers(clean)
+    hits = []
+    seen = set()  # (line, rule) dedupe within a file
+
+    def add(off, rule, snippet):
+        ln = line_of(clean, off)
+        key = (ln, rule)
+        if key in seen:
+            return
+        seen.add(key)
+        # snippet for reporting: the actual source line(s) header
+        hits.append({
+            "relpath": relpath, "line": ln, "rule": rule,
+            "snippet": normalize(snippet)[:160],
+            "fp": fingerprint(relpath, rule, snippet),
+        })
+
+    # --- loop-based rules ---
+    dowhile_tails = find_dowhile_tails(clean)
+    for m in LOOP_HDR_RE.finditer(clean):
+        if m.start() in dowhile_tails:
+            continue  # trailing while of a do-while: body is before it
+        kw = m.group(1)
+        cond_open = m.end() - 1
+        cond_end = match_paren(clean, cond_open)
+        if cond_end < 0:
+            continue
+        body, bstart, bend = extract_loop_body(clean, cond_end)
+        body_stripped = body.strip()
+        cond_inner = clean[cond_open + 1:cond_end - 1].strip()
+
+        # #746: sched_schedule() is the RAW scheduler entry that proc_yield()
+        # wraps. A loop that calls it directly is the same anti-pattern and was
+        # invisible to this rule until #746, which is exactly how fs/fat.c's
+        # yield-spin FAT lock shipped and then livelocked a boot (pid 0 took
+        # the lock, was preempted, and is deliberately never re-queued, so the
+        # runnable yield-spinners could never let it finish). The waiter stays
+        # RUNNABLE either way: that, not the spelling of the call, is the bug.
+        has_yield = re.search(r"\b(?:proc_yield|sched_schedule)\s*\(", body) is not None
+        has_block = body_uses_blocking(body)
+        has_poll_sleep = small_sleep_in(body, delay_wrappers)
+        has_pure_delay = body_is_pure_delay(body)
+
+        hdr_snippet = clean[m.start():cond_end]
+
+        # SPIN_BUSYWAIT: empty-bodied loop that spins the CPU.
+        # A pure read-spin is the anti-pattern: an empty body whose loop
+        # cannot make its own progress. Two idioms are flagged:
+        #   while(<pure-read condition>) ;      // waits on shared state
+        #   for(;;) ; / for(volatile ...) ;     // infinite / delay busy-loop
+        if body_stripped == "":
+            if kw == "while":
+                pure_read = COND_PROGRESS_RE.search(cond_inner) is None
+                trivially_false = cond_inner in ("0", "false")
+                if pure_read and not trivially_false:
+                    add(m.start(), "SPIN_BUSYWAIT", hdr_snippet)
+                    continue
+            else:  # for
+                clauses = cond_inner.split(";")
+                init = clauses[0] if clauses else ""
+                is_forever = cond_inner.replace(" ", "") == ";;"
+                is_delay = "volatile" in init  # classic calibrated delay loop
+                if is_forever or is_delay:
+                    add(m.start(), "SPIN_BUSYWAIT", hdr_snippet)
+                    continue
+
+        # YIELD_SPIN: loop whose only wait mechanism is proc_yield().
+        if has_yield and not has_block:
+            add(m.start(), "YIELD_SPIN", hdr_snippet)
+            continue
+
+        # DELAY_SPIN (#514): body is nothing but io_wait()/pause()/udelay().
+        # Checked BEFORE SLEEP_POLL because it is the more specific diagnosis.
+        if has_pure_delay and not has_block:
+            add(m.start(), "DELAY_SPIN", hdr_snippet)
+            continue
+
+        # SLEEP_POLL: small proc_sleep/msleep inside a loop, not routed through
+        # a blocking primitive; this is a poll loop that should wait_event().
+        if has_poll_sleep and not has_block:
+            add(m.start(), "SLEEP_POLL", hdr_snippet)
+            continue
+
+    # --- no-block-context rule ---
+    fname_base = os.path.basename(relpath)
+    file_is_noblock = bool(re.search(r"irq|interrupt|\bidt\b", fname_base, re.IGNORECASE))
+    for callname in NOBLOCK_CALLS:
+        for m in re.finditer(r"\b" + re.escape(callname) + r"\s*\(", clean):
+            func = find_enclosing_func(clean, m.start())
+            in_noblock = NOBLOCK_FUNC_RE.search(func) is not None
+            if file_is_noblock and callname in ("proc_sleep", "proc_yield",
+                                                "wait_event", "futex_wait",
+                                                "sem_down", "sem_wait", "msleep",
+                                                "usleep"):
+                in_noblock = True
+            if in_noblock:
+                ln_start = clean.rfind("\n", 0, m.start()) + 1
+                ln_end = clean.find("\n", m.start())
+                snippet = clean[ln_start:ln_end if ln_end > 0 else len(clean)]
+                add(m.start(), "NOBLOCK_BLOCK", f"{func}: {snippet}")
+
+    return hits
+
+
+def walk(root, dirs=None):
+    files = []
+    for d in (dirs or SCAN_DIRS):
+        base = os.path.join(root, d)
+        if not os.path.isdir(base):
+            continue
+        for dirpath, _dirs, names in os.walk(base):
+            for name in names:
+                if not (name.endswith(".c") or name.endswith(".h")):
+                    continue
+                full = os.path.join(dirpath, name)
+                rel = os.path.relpath(full, root)
+                if any(s in "/" + rel for s in SKIP_PATH_SUBSTR):
+                    continue
+                files.append((full, rel))
+    files.sort(key=lambda t: t[1])
+    return files
+
+
+# Categories, in descending order of how much review a line has actually had.
+#   LEGIT  = individually reviewed, correct by design (pre-scheduler code with
+#            no scheduler to wait on, real-time pacing sleeps).
+#   DEBT   = individually reviewed, accepted for now, SHOULD become wait_event.
+#   LEGACY = bulk-baselined at #514 and NOT individually reviewed. It exists so
+#            the 167 sites the old lint was blind to (the `==` bug below) do not
+#            masquerade as reviewed exceptions. Never add a LEGACY line by hand;
+#            a NEW site must be fixed, or reviewed into LEGIT/DEBT.
+CATEGORY_RE = re.compile(r"\[(LEGIT|DEBT|LEGACY)\]")
+# A justification must be real prose, not "baseline" or "TODO". Enforced so the
+# allowlist cannot quietly become a dumping ground (#514).
+MIN_JUSTIFICATION = 24
+BAD_NOTES = ("baseline", "todo", "tbd", "fixme", "n/a", "auto")
+
+
+def load_allowlist(path):
+    """Return {fingerprint: {'cat':..., 'note':..., 'line':...}} plus a list of
+    malformed entries. A malformed entry is a hard FAIL, not a warning."""
+    entries = {}
+    bad = []
+    if not os.path.exists(path):
+        return entries, bad
+    with open(path) as f:
+        for lineno, line in enumerate(f, 1):
+            line = line.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            fp = line.split()[0]
+            comment = line.split("#", 1)[1] if "#" in line else ""
+            cm = CATEGORY_RE.search(comment)
+            note = CATEGORY_RE.sub("", comment).strip()
+            # strip the leading "<path>:<line> RULE" bookkeeping from the note
+            note = re.sub(r"^\S+?:\d+\s+[A-Z_]+\s*", "", note).strip()
+            if not cm:
+                bad.append((lineno, fp, "no [LEGIT]/[DEBT] category tag"))
+                continue
+            if len(note) < MIN_JUSTIFICATION or note.lower().startswith(BAD_NOTES):
+                bad.append((lineno, fp, "no real justification (%r)" % note[:40]))
+                continue
+            entries[fp] = {"cat": cm.group(1), "note": note, "line": lineno}
+    return entries, bad
+
+
+def collect(root, dirs=None):
+    all_hits = []
+    for full, rel in walk(root, dirs):
+        all_hits.extend(scan_file(full, rel))
+    all_hits.sort(key=lambda h: (h["relpath"], h["line"]))
+    return all_hits
+
+
+def write_allowlist(path, hits):
+    lines = [
+        "# concurrency-lint allowlist (baseline of the tree at #426).",
+        "# Each line: <fingerprint>  # <path>:<line> <RULE>  <note>",
+        "# Fingerprint = path|rule|sha1(normalized-snippet)[:12]; it is stable",
+        "# across line-number drift. A site listed here is an ACCEPTED legacy",
+        "# hit and does NOT fail the lint. Remove a line once the site is fixed;",
+        "# do NOT add new lines by hand except to knowingly accept a reviewed",
+        "# exception (append a real justification note).",
+        "#",
+        "# Regenerate the baseline with: concurrency-lint --update-allowlist",
+        "",
+    ]
+    for h in hits:
+        lines.append(
+            f"{h['fp']}  # {h['relpath']}:{h['line']} {h['rule']} [DEBT] TODO "
+            f"replace this TODO with a real justification, the lint rejects it"
+        )
+    with open(path, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+# --------------------------------------------------------------------------
+# #514 self-test: PROVE the lint goes RED on a new violation and GREEN on a
+# clean tree. Every rule gets its own synthetic fixture, built here in a temp
+# dir rather than checked in, so the fixtures can never be compiled by accident
+# or drift away from the rule they claim to exercise.
+# --------------------------------------------------------------------------
+SELFTEST_CASES = {
+    "SPIN_BUSYWAIT": """
+void st_spin(volatile int *flag) {
+    while (*flag == 0) ;
+}
+""",
+    "YIELD_SPIN": """
+void st_yield(volatile int *flag) {
+    while (*flag == 0) { proc_yield(); }
+}
+""",
+    # #746 negative control: the EXACT shape of the FAT lock that livelocked a
+    # boot. Before #746 this fixture was GREEN, which is the whole point of
+    # checking it in as a test rather than asserting the rule got wider.
+    "YIELD_SPIN_SCHED": """
+void st_yield_sched(volatile void **owner, void *me) {
+    for (;;) {
+        if (*owner == 0) { *owner = me; return; }
+        sched_schedule();
+    }
+}
+""",
+    "SLEEP_POLL": """
+void st_poll(volatile int *flag) {
+    while (*flag == 0) { proc_sleep(1); }
+}
+""",
+    "DELAY_SPIN": """
+void st_delay(void) {
+    for (int i = 0; i < 1000; i++) { io_wait(); }
+}
+""",
+    "SLEEP_POLL_VIA_WRAPPER": """
+static void st_dly(int n) { (void)n; proc_sleep(1); }
+void st_wrapped(volatile int *flag) {
+    while (*flag == 0) { st_dly(100); }
+}
+""",
+}
+SELFTEST_CLEAN = """
+#include "../sync/waitq.h"
+void st_ok(volatile int *flag) {
+    wait_event(&some_wq, *flag != 0);
+}
+void st_ok2(volatile int *flag) {
+    while (*flag == 0) { wait_event_timeout(&some_wq, *flag != 0, 100); }
+}
+"""
+
+
+def self_test():
+    import tempfile
+    ok = True
+    with tempfile.TemporaryDirectory() as td:
+        allow = os.path.join(td, "empty-allowlist.txt")
+        open(allow, "w").write("# intentionally empty\n")
+
+        def run(name, body, expect_red, expect_rule=None):
+            nonlocal ok
+            root = os.path.join(td, name)
+            os.makedirs(os.path.join(root, "kernel", "drivers"), exist_ok=True)
+            with open(os.path.join(root, "kernel", "drivers", "fixture.c"), "w") as f:
+                f.write(body)
+            hits = collect(root, ["kernel"])
+            entries, bad = load_allowlist(allow)
+            new = [h for h in hits if h["fp"] not in entries]
+            red = bool(new) or bool(bad)
+            got = ",".join(sorted({h["rule"] for h in new})) or "-"
+            good = (red == expect_red) and (
+                expect_rule is None or expect_rule in got)
+            ok = ok and good
+            verdict = "PASS" if good else "FAIL"
+            state = "RED" if red else "GREEN"
+            print(f"  {verdict}  {name:<26} -> {state:<5} rules={got}")
+
+        print("concurrency-lint --self-test: the lint must go RED on each "
+              "synthetic spin and GREEN on correct code.")
+        for rule, body in SELFTEST_CASES.items():
+            want = ("SLEEP_POLL" if rule == "SLEEP_POLL_VIA_WRAPPER" else
+                    "YIELD_SPIN" if rule == "YIELD_SPIN_SCHED" else rule)
+            run(rule, body, True, want)
+        run("CLEAN_waitq", SELFTEST_CLEAN, False)
+
+        # the allowlist discipline itself must fail closed
+        badallow = os.path.join(td, "bad-allowlist.txt")
+        open(badallow, "w").write("deadbeef|SPIN_BUSYWAIT|0123456789ab  # no tag\n")
+        _e, _b = load_allowlist(badallow)
+        good = bool(_b) and not _e
+        ok = ok and good
+        print(f"  {'PASS' if good else 'FAIL'}  UNJUSTIFIED_ALLOWLIST      "
+              f"-> rejected={bool(_b)}")
+
+    print("\nconcurrency-lint --self-test: %s" %
+          ("PASS (RED on every synthetic spin, GREEN on the clean fixture)"
+           if ok else "FAIL - the lint cannot be trusted, fix it before use"))
+    return 0 if ok else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description="MayteraOS concurrency lint (#426)")
+    ap.add_argument("--root", default=None,
+                    help="source root containing kernel/ and userland/ "
+                         "(default: autodetect from tool location)")
+    ap.add_argument("--allowlist", default=os.path.join(HERE, "allowlist.txt"))
+    ap.add_argument("--update-allowlist", action="store_true",
+                    help="rewrite the allowlist to baseline the current tree")
+    ap.add_argument("--report", action="store_true",
+                    help="print every hit (allowlisted or not); always exit 0")
+    ap.add_argument("--dirs", default=None,
+                    help="comma-separated subdirs to scan (default kernel,userland). "
+                         "The build gate passes 'kernel' so the verdict is the "
+                         "same on the build container, which only has kernel/.")
+    ap.add_argument("--self-test", action="store_true",
+                    help="prove the lint goes RED on a synthetic new spin loop")
+    args = ap.parse_args()
+
+    if args.self_test:
+        return self_test()
+
+    dirs = [d.strip() for d in args.dirs.split(",")] if args.dirs else None
+
+    root = args.root
+    if root is None:
+        # #514: the tool lives at <source>/kernel/tools/concurrency-lint/, so
+        # the source root is ../../.. . Keep the old <source>/tools/ layout
+        # working too, in case an out-of-tree copy is still invoked that way.
+        for up in ("../../..", "../.."):
+            cand = os.path.abspath(os.path.join(HERE, up))
+            if os.path.isdir(os.path.join(cand, "kernel")):
+                root = cand
+                break
+        root = root or "."
+    root = os.path.abspath(root)
+
+    # FAIL CLOSED. A gate that silently finds nothing to scan reports OK, which
+    # is exactly how `make lint` "passed" on a container with no sources.
+    scanned = walk(root, dirs)
+    if not scanned:
+        print(f"[concurrency-lint] ERROR: no C sources found under {root} "
+              f"(dirs={dirs or SCAN_DIRS}). Refusing to report OK on an empty "
+              f"scan; a gate that skips silently is not a gate.")
+        return 1
+
+    hits = collect(root, dirs)
+
+    if args.update_allowlist:
+        write_allowlist(args.allowlist, hits)
+        print(f"[concurrency-lint] baselined {len(hits)} site(s) into "
+              f"{args.allowlist}")
+        return 0
+
+    if args.report:
+        by_rule = {}
+        for h in hits:
+            by_rule.setdefault(h["rule"], []).append(h)
+        print(f"# concurrency-lint full report - {len(hits)} site(s) under {root}\n")
+        for rule in sorted(by_rule):
+            print(f"## {rule}: {RULES[rule]}")
+            for h in by_rule[rule]:
+                print(f"  {h['relpath']}:{h['line']}  {h['snippet']}")
+            print()
+        return 0
+
+    allow, bad = load_allowlist(args.allowlist)
+    new = [h for h in hits if h["fp"] not in allow]
+
+    rc = 0
+
+    # (a) every allowlist entry must carry a category + a real justification
+    if bad:
+        rc = 1
+        print(f"[concurrency-lint] FAIL: {len(bad)} allowlist entr(ies) in "
+              f"{args.allowlist} are not justified. An exception without a "
+              f"stated reason is how an allowlist silently grows (#514):")
+        for lineno, fp, why in bad:
+            print(f"  line {lineno}: {fp}\n      -> {why}")
+            print("      Format: <fingerprint>  # <path>:<line> <RULE> "
+                  "[LEGIT|DEBT] <why this site is acceptable>")
+        print()
+
+    # (b) an allowlisted fingerprint that no longer matches anything is stale.
+    #     Scoped to the dirs actually scanned, so a kernel-only run does not
+    #     trip over the userland entries.
+    live = {h["fp"] for h in hits}
+    scan_prefixes = tuple((d.rstrip("/") + "/") for d in (dirs or SCAN_DIRS))
+    stale = [fp for fp in allow
+             if fp not in live and fp.startswith(scan_prefixes)]
+    if stale:
+        rc = 1
+        print(f"[concurrency-lint] FAIL: {len(stale)} allowlist entr(ies) match "
+              f"nothing in the tree. Either the site was fixed (delete the line "
+              f"in the same commit) or it moved (re-fingerprint it). A list of "
+              f"dead hashes is not a baseline:")
+        for fp in sorted(stale):
+            print(f"  STALE  {fp}  ({allow[fp]['cat']}) {allow[fp]['note'][:60]}")
+        print()
+
+    # (c) the DEBT ledger, printed loudly on every run so accepted poll loops
+    #     stay visible instead of being buried in a file nobody opens.
+    debt = sorted(fp for fp in allow
+                  if allow[fp]["cat"] == "DEBT" and fp in live)
+    legacy = [fp for fp in allow if allow[fp]["cat"] == "LEGACY" and fp in live]
+    legit = [fp for fp in allow if allow[fp]["cat"] == "LEGIT" and fp in live]
+    if debt:
+        print(f"[concurrency-lint] DEBT LEDGER - {len(debt)} reviewed and "
+              f"accepted poll/spin site(s) still to convert to the shared wait "
+              f"primitives:")
+        for fp in debt:
+            print(f"  DEBT   {fp.split('|')[0]}  {allow[fp]['note'][:90]}")
+        print()
+    if legacy:
+        print(f"[concurrency-lint] LEGACY BASELINE - {len(legacy)} site(s) "
+              f"bulk-baselined at #514 and NOT individually reviewed. These are "
+              f"a backlog, not an endorsement; `--report` lists them.")
+        print()
+
+    if not new:
+        if rc == 0:
+            print(f"[concurrency-lint] OK: {len(scanned)} file(s) scanned, "
+                  f"{len(hits)} known site(s) allowlisted "
+                  f"({len(legit)} LEGIT / {len(debt)} DEBT / "
+                  f"{len(legacy)} LEGACY-unreviewed), "
+                  f"0 new spin/poll violations.")
+        return rc
+
+    rc = 1
+    print(f"[concurrency-lint] FAIL: {len(new)} NEW concurrency violation(s) "
+          f"(not in allowlist):\n")
+    for h in new:
+        print(f"  {h['relpath']}:{h['line']}  [{h['rule']}]")
+        print(f"      {h['snippet']}")
+        print(f"      -> {RULES[h['rule']]}")
+        print(f"      (allowlist fingerprint if truly acceptable: {h['fp']})")
+    print("\nRoute the wait through kernel/sync/waitq.h (wait_event / "
+          "wait_event_interruptible)\nor kernel/sync/futex.c. See "
+          "kernel/tools/concurrency-lint/README.md.")
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

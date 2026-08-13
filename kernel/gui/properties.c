@@ -432,6 +432,7 @@ int properties_save_xattrs(properties_dialog_t *dlg) {
     if (!dlg || !dlg->has_changes) return 0;
     
     int saved = 0;
+    int failed = 0;   // #693
     
     // Save modified attributes
     for (int i = 0; i < dlg->xattr_count; i++) {
@@ -455,22 +456,30 @@ int properties_save_xattrs(properties_dialog_t *dlg) {
     
     // Save standard attributes if modified
     if (dlg->mime_type[0]) {
-        xattr_set(dlg->filepath, XATTR_USER_MIME_TYPE, dlg->mime_type, 
-                 strlen(dlg->mime_type), 0);
+        if (xattr_set(dlg->filepath, XATTR_USER_MIME_TYPE, dlg->mime_type, 
+                     strlen(dlg->mime_type), 0) != 0) failed++;
     }
     if (dlg->description[0]) {
-        xattr_set(dlg->filepath, XATTR_USER_DESCRIPTION, dlg->description,
-                 strlen(dlg->description), 0);
+        if (xattr_set(dlg->filepath, XATTR_USER_DESCRIPTION, dlg->description,
+                     strlen(dlg->description), 0) != 0) failed++;
     }
     if (dlg->tags[0]) {
-        xattr_set(dlg->filepath, XATTR_USER_TAGS, dlg->tags,
-                 strlen(dlg->tags), 0);
+        if (xattr_set(dlg->filepath, XATTR_USER_TAGS, dlg->tags,
+                     strlen(dlg->tags), 0) != 0) failed++;
     }
     if (dlg->open_with[0]) {
-        xattr_set(dlg->filepath, XATTR_USER_OPEN_WITH, dlg->open_with,
-                 strlen(dlg->open_with), 0);
+        if (xattr_set(dlg->filepath, XATTR_USER_OPEN_WITH, dlg->open_with,
+                     strlen(dlg->open_with), 0) != 0) failed++;
     }
     
+    // #693: write -> check -> ONLY THEN clear the dirty flag. Clearing
+    // has_changes after a failed xattr_set would silently discard what the user
+    // typed and leave the dialog looking saved.
+    if (failed) {
+        kprintf("[PROPS] %d extended attribute(s) FAILED to save for %s; the "
+                "dialog stays dirty so nothing typed is lost\n", failed, dlg->filepath);
+        return -failed;
+    }
     dlg->has_changes = false;
     dlg->buttons[PROP_BTN_APPLY].enabled = false;
     
@@ -755,9 +764,9 @@ void properties_handle_mouse(properties_dialog_t *dlg, int32_t mx, int32_t my, b
             if (left_click) {
                 switch (i) {
                     case PROP_BTN_OK:
-                        if (dlg->has_changes) {
-                            properties_save_xattrs(dlg);
-                        }
+                        // #693: OK only closes if the save actually landed.
+                        if (dlg->has_changes && properties_save_xattrs(dlg) < 0)
+                            break;
                         dlg->result = PROP_RESULT_OK;
                         dlg->running = false;
                         break;
@@ -766,7 +775,8 @@ void properties_handle_mouse(properties_dialog_t *dlg, int32_t mx, int32_t my, b
                         dlg->running = false;
                         break;
                     case PROP_BTN_APPLY:
-                        properties_save_xattrs(dlg);
+                        // #693: Apply leaves the dialog dirty if it failed.
+                        (void)properties_save_xattrs(dlg);
                         break;
                     case PROP_BTN_ADD_ATTR:
                         prop_add_xattr(dlg);
@@ -811,9 +821,9 @@ void properties_handle_key(properties_dialog_t *dlg, char c, uint32_t keycode) {
     
     // Enter to confirm
     if (c == '\n' || c == '\r') {
-        if (dlg->has_changes) {
-            properties_save_xattrs(dlg);
-        }
+        // #693: Enter only confirms if the save actually landed.
+        if (dlg->has_changes && properties_save_xattrs(dlg) < 0)
+            return;
         dlg->result = PROP_RESULT_OK;
         dlg->running = false;
         return;

@@ -2,6 +2,7 @@
 // Implements RFC 8446 key derivation and record layer
 
 #include "tls13.h"
+#include "../../crypto/csprng.h"   // #tls-rngfix
 #include "../../crypto/crypto.h"
 #include "../../crypto/chacha20.h"
 #include "../../string.h"
@@ -291,8 +292,30 @@ static void x25519_scalar_mult(uint8_t out[32], const uint8_t scalar[32], const 
 static const uint8_t x25519_basepoint[32] = {9};
 
 void x25519_generate_keypair(x25519_keypair_t *kp) {
-    // Generate random private key
-    rng_get_bytes(kp->private_key, 32);
+    // #tls-rngfix: THE EPHEMERAL PRIVATE KEY CAME FROM THE WEAK RNG.
+    //
+    // This is the single most valuable secret in a TLS 1.3 handshake. It is the
+    // client half of the ECDHE, so it alone determines the shared secret, and
+    // therefore the confidentiality of the whole session. It was drawn from
+    // crypto/rng.c, which uses RDRAND when the CPU has it and otherwise falls
+    // back to a 256-byte pool seeded from `timer_ticks` and one `rdtsc`, mixed
+    // with an XOR-and-rotate. That fallback is not a corner case: it is the
+    // LIVE path on every machine without RDRAND, which includes every MayteraOS
+    // VM, because CLAUDE.md mandates cpu=kvm64 (cpu=host crashes the
+    // compositor) and kvm64 does not expose RDRAND.
+    //
+    // A predictable ephemeral key breaks confidentiality RETROACTIVELY: anyone
+    // who recorded the traffic can derive the session keys afterwards. Forward
+    // secrecy, which is the entire reason for using ephemeral keys, was absent
+    // on exactly the machines that most needed it.
+    //
+    // csprng_bytes() is the audited HMAC-DRBG (SP 800-90A 10.1.2) that already
+    // backs /dev/urandom, ASLR and password salts. The entropy work was done;
+    // TLS was simply never moved onto it. crypto/rng.c is now a shim over the
+    // same DRBG, so there is no longer a weak generator to reach for, but this
+    // call site names the DRBG directly because a reader of the most
+    // security-critical line in the handshake should not have to go and check.
+    csprng_bytes(kp->private_key, 32);
     
     // Clamp private key
     kp->private_key[0] &= 248;

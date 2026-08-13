@@ -1,0 +1,12 @@
+# Internet - all-users Start-menu default fragment. Migrated verbatim from the
+# old hardcoded startmenu_init() (userland/apps/compositor/startmenu.c) as
+# part of the "no hardcoded menu entry, ever" change. See
+# userland/apps/compositor/startmenu_model.rs for the fragment grammar.
+category: Internet
+item: Browser | /APPS/BROWSER | icon=browser
+item: IRC | /APPS/IRC | icon=irc
+# #371: on-disk entry is "/APPS/AICHAT" (uppercase; ext2 is case-sensitive),
+# matching AICHAT_APP_PATH in userland/apps/compositor/main.c.
+item: Maytera AI | /APPS/AICHAT | icon=aichat
+item: Weather | /APPS/WEATHER | icon=weather
+item: Feeds | /APPS/RSS | icon=feeds

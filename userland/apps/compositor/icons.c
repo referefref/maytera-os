@@ -244,6 +244,168 @@ static const uint8_t icon_data_game[72] = {
 };
 
 // ============================================================================
+// #723 Home Assistant entity-state glyphs (ha_format.c chooses among these by
+// domain/device_class; widgets.c tints them per semantic bucket). Generated
+// procedurally (simple geometric shapes rasterized to the same 24x24 1bpp
+// grid) and proofed as a contact-sheet render before being committed here -
+// see the task's deliverable notes for the review image.
+// ============================================================================
+
+static const uint8_t icon_data_ha_sun[72] = {
+    0x00,0x10,0x00, 0x00,0x18,0x00, 0x00,0x18,0x00,
+    0x08,0x18,0x10, 0x1C,0x18,0x38, 0x0E,0x10,0x70,
+    0x07,0x00,0xE0, 0x02,0x7E,0x40, 0x00,0xFF,0x00,
+    0x01,0xFF,0x80, 0x01,0xFF,0x80, 0x79,0xFF,0x9E,
+    0xFD,0xFF,0xBF, 0x01,0xFF,0x80, 0x01,0xFF,0x80,
+    0x00,0xFF,0x00, 0x02,0x7E,0x40, 0x07,0x00,0xE0,
+    0x0E,0x08,0x70, 0x1C,0x18,0x38, 0x08,0x18,0x10,
+    0x00,0x18,0x00, 0x00,0x18,0x00, 0x00,0x08,0x00
+};
+
+static const uint8_t icon_data_ha_moon[72] = {
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00,
+    0x00,0x00,0x00, 0x00,0xE0,0x00, 0x01,0xC0,0x00,
+    0x03,0x80,0x00, 0x07,0x80,0x00, 0x0F,0x80,0x00,
+    0x0F,0x00,0x00, 0x0F,0x00,0x00, 0x0F,0x80,0x00,
+    0x0F,0x80,0x00, 0x0F,0x80,0x00, 0x0F,0xC0,0x00,
+    0x0F,0xE0,0x00, 0x07,0xF0,0x00, 0x03,0xFE,0x40,
+    0x01,0xFF,0x80, 0x00,0xFF,0x00, 0x00,0x00,0x00,
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00
+};
+
+static const uint8_t icon_data_ha_door_closed[72] = {
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00,
+    0x03,0xFF,0xC0, 0x03,0xFF,0xC0, 0x03,0xFF,0xC0,
+    0x03,0xFF,0xC0, 0x03,0xFF,0xC0, 0x03,0xFF,0xC0,
+    0x03,0xFF,0xC0, 0x03,0xFF,0xC0, 0x03,0xF9,0xC0,
+    0x03,0xF9,0xC0, 0x03,0xFF,0xC0, 0x03,0xFF,0xC0,
+    0x03,0xFF,0xC0, 0x03,0xFF,0xC0, 0x03,0xFF,0xC0,
+    0x03,0xFF,0xC0, 0x03,0xFF,0xC0, 0x1F,0xFF,0xF8,
+    0x3F,0xFF,0xF8, 0x1F,0xFF,0xF8, 0x00,0x00,0x00
+};
+
+static const uint8_t icon_data_ha_door_open[72] = {
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00,
+    0x03,0xFF,0xC0, 0x03,0xE0,0x40, 0x02,0xF8,0x40,
+    0x02,0x3C,0x40, 0x02,0x1E,0x40, 0x02,0x0F,0x40,
+    0x02,0x07,0xC0, 0x02,0x03,0xE0, 0x02,0x01,0xF0,
+    0x02,0x00,0x70, 0x02,0x00,0x70, 0x02,0x00,0x40,
+    0x02,0x00,0x40, 0x02,0x00,0x40, 0x02,0x00,0x40,
+    0x02,0x00,0x40, 0x02,0x00,0x40, 0x1F,0xFF,0xF8,
+    0x3F,0xFF,0xF8, 0x1F,0xFF,0xF8, 0x00,0x00,0x00
+};
+
+static const uint8_t icon_data_ha_lock_locked[72] = {
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00,
+    0x00,0x1C,0x00, 0x00,0x7F,0x00, 0x00,0xE3,0x80,
+    0x00,0xC1,0x80, 0x01,0x80,0xC0, 0x01,0x80,0xC0,
+    0x01,0x80,0xC0, 0x07,0xFF,0xE0, 0x07,0xFF,0xE0,
+    0x07,0xFF,0xE0, 0x07,0xFF,0xE0, 0x07,0xFF,0xE0,
+    0x07,0xFF,0xE0, 0x07,0xFF,0xE0, 0x07,0xFF,0xE0,
+    0x07,0xFF,0xE0, 0x07,0xFF,0xE0, 0x07,0xFF,0xE0,
+    0x07,0xFF,0xE0, 0x00,0x00,0x00, 0x00,0x00,0x00
+};
+
+static const uint8_t icon_data_ha_lock_unlocked[72] = {
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x18,0x00,
+    0x00,0x78,0x00, 0x00,0xE0,0x00, 0x00,0xC0,0x00,
+    0x01,0x80,0x00, 0x01,0x80,0x00, 0x01,0x80,0x00,
+    0x00,0xC0,0x00, 0x07,0xFF,0xE0, 0x07,0xFF,0xE0,
+    0x07,0xFF,0xE0, 0x07,0xFF,0xE0, 0x07,0xFF,0xE0,
+    0x07,0xFF,0xE0, 0x07,0xFF,0xE0, 0x07,0xFF,0xE0,
+    0x07,0xFF,0xE0, 0x07,0xFF,0xE0, 0x07,0xFF,0xE0,
+    0x07,0xFF,0xE0, 0x00,0x00,0x00, 0x00,0x00,0x00
+};
+
+static const uint8_t icon_data_ha_bulb[72] = {
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00,
+    0x00,0x3E,0x00, 0x00,0xFF,0x80, 0x01,0xC1,0xC0,
+    0x01,0x80,0xC0, 0x03,0x00,0x60, 0x03,0x00,0x60,
+    0x02,0x00,0x20, 0x02,0x00,0x20, 0x03,0x00,0x60,
+    0x03,0x00,0x60, 0x01,0x80,0xC0, 0x01,0xC1,0xC0,
+    0x00,0xFF,0x80, 0x00,0x7F,0x00, 0x00,0x41,0x00,
+    0x00,0x7F,0x00, 0x00,0x7F,0x00, 0x00,0x00,0x00,
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00
+};
+
+static const uint8_t icon_data_ha_motion[72] = {
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00,
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00,
+    0x01,0xF0,0x00, 0x01,0xF8,0x00, 0x00,0x1E,0x00,
+    0x01,0xC7,0x00, 0x01,0xF3,0x80, 0x00,0x79,0x80,
+    0x00,0x1C,0xC0, 0x01,0xCE,0xE0, 0x01,0xE6,0x60,
+    0x00,0x77,0x60, 0x00,0x33,0x60, 0x07,0x33,0x60,
+    0x07,0x00,0x00, 0x07,0x00,0x00, 0x00,0x00,0x00,
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00
+};
+
+static const uint8_t icon_data_ha_thermometer[72] = {
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00,
+    0x00,0x3C,0x00, 0x00,0x24,0x00, 0x00,0x2C,0x00,
+    0x00,0x2C,0x00, 0x00,0x2C,0x00, 0x00,0x2C,0x00,
+    0x00,0x2C,0x00, 0x00,0x2C,0x00, 0x00,0x2C,0x00,
+    0x00,0x2C,0x00, 0x00,0x2C,0x00, 0x00,0x3C,0x00,
+    0x00,0xFF,0x00, 0x00,0xFF,0x00, 0x01,0xFF,0x80,
+    0x01,0xFF,0x80, 0x01,0xFF,0x80, 0x00,0xFF,0x00,
+    0x00,0xFF,0x00, 0x00,0x3C,0x00, 0x00,0x00,0x00
+};
+
+static const uint8_t icon_data_ha_droplet[72] = {
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x08,0x00,
+    0x00,0x18,0x00, 0x00,0x3C,0x00, 0x00,0x3C,0x00,
+    0x00,0x7E,0x00, 0x00,0x7E,0x00, 0x00,0xFF,0x00,
+    0x00,0xFF,0x00, 0x01,0xFF,0x80, 0x01,0xFF,0x80,
+    0x03,0xFF,0xC0, 0x03,0xFF,0xC0, 0x03,0xFF,0xC0,
+    0x03,0xFF,0xC0, 0x03,0xFF,0xC0, 0x03,0xFF,0xC0,
+    0x01,0xFF,0x80, 0x00,0xFF,0x00, 0x00,0xFF,0x00,
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00
+};
+
+static const uint8_t icon_data_ha_bolt[72] = {
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x02,0x00,
+    0x00,0x06,0x00, 0x00,0x06,0x00, 0x00,0x0E,0x00,
+    0x00,0x1E,0x00, 0x00,0x3C,0x00, 0x00,0x3C,0x00,
+    0x00,0x7C,0x00, 0x00,0xFF,0xF0, 0x01,0xFF,0xE0,
+    0x01,0xFF,0xC0, 0x00,0x1F,0x80, 0x00,0x1F,0x80,
+    0x00,0x1F,0x00, 0x00,0x3E,0x00, 0x00,0x3C,0x00,
+    0x00,0x38,0x00, 0x00,0x38,0x00, 0x00,0x70,0x00,
+    0x00,0x60,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00
+};
+
+static const uint8_t icon_data_ha_battery[72] = {
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00,
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00,
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x1F,0xFF,0xF0,
+    0x10,0x00,0x10, 0x17,0xF0,0x1C, 0x17,0xF0,0x1C,
+    0x17,0xF0,0x1C, 0x17,0xF0,0x1C, 0x17,0xF0,0x1C,
+    0x10,0x00,0x10, 0x1F,0xFF,0xF0, 0x00,0x00,0x00,
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00,
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00
+};
+
+static const uint8_t icon_data_ha_warn[72] = {
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x08,0x00,
+    0x00,0x1C,0x00, 0x00,0x3E,0x00, 0x00,0x36,0x00,
+    0x00,0x77,0x00, 0x00,0x63,0x00, 0x00,0xEB,0x80,
+    0x00,0xC9,0x80, 0x01,0x88,0xC0, 0x01,0x88,0xC0,
+    0x03,0x08,0x60, 0x03,0x08,0x60, 0x06,0x08,0x30,
+    0x0E,0x08,0x38, 0x0C,0x00,0x18, 0x1C,0x18,0x1C,
+    0x18,0x18,0x0C, 0x38,0x00,0x0E, 0x3F,0xFF,0xFE,
+    0x3F,0xFF,0xFE, 0x00,0x00,0x00, 0x00,0x00,0x00
+};
+
+static const uint8_t icon_data_ha_check[72] = {
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00,
+    0x00,0x00,0x00, 0x00,0x00,0x04, 0x00,0x00,0x0E,
+    0x00,0x00,0x1C, 0x00,0x00,0x18, 0x00,0x00,0x30,
+    0x00,0x00,0x70, 0x00,0x00,0xE0, 0x00,0x00,0xC0,
+    0x08,0x01,0x80, 0x0C,0x03,0x00, 0x0E,0x07,0x00,
+    0x07,0x0E,0x00, 0x03,0x8C,0x00, 0x01,0xD8,0x00,
+    0x00,0xF8,0x00, 0x00,0x70,0x00, 0x00,0x20,0x00,
+    0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00
+};
+
+// ============================================================================
 // Icon table: maps icon_id_t enum values to data arrays.
 // Game variant entries (DOOM, PONG, SOLITAIRE, LEMMINGS) reuse ICON_GAME data.
 // ============================================================================
@@ -289,6 +451,25 @@ static const icon_t icons[ICON_COUNT] = {
     /* ICON_SLIDERS       */ { icon_data_cog,         24, 24 },
     /* ICON_CHEVD         */ { icon_data_cog,         24, 24 },
     /* ICON_CHEVR         */ { icon_data_cog,         24, 24 },
+    // #723: designated (not positional) so this doesn't depend on counting
+    // through the ~30 "color-icon only" entries above (ICON_WIN3X..
+    // ICON_3DPRINT), which intentionally have NO entry here (they rely
+    // entirely on a runtime-loaded color icon; see icon_draw_color_if_present
+    // and the enum comments in compositor.h).
+    [ICON_HA_SUN]           = { icon_data_ha_sun,           24, 24 },
+    [ICON_HA_MOON]          = { icon_data_ha_moon,          24, 24 },
+    [ICON_HA_DOOR_OPEN]     = { icon_data_ha_door_open,     24, 24 },
+    [ICON_HA_DOOR_CLOSED]   = { icon_data_ha_door_closed,   24, 24 },
+    [ICON_HA_LOCK_LOCKED]   = { icon_data_ha_lock_locked,   24, 24 },
+    [ICON_HA_LOCK_UNLOCKED] = { icon_data_ha_lock_unlocked, 24, 24 },
+    [ICON_HA_BULB]          = { icon_data_ha_bulb,          24, 24 },
+    [ICON_HA_MOTION]        = { icon_data_ha_motion,        24, 24 },
+    [ICON_HA_THERMOMETER]   = { icon_data_ha_thermometer,   24, 24 },
+    [ICON_HA_DROPLET]       = { icon_data_ha_droplet,       24, 24 },
+    [ICON_HA_BOLT]          = { icon_data_ha_bolt,          24, 24 },
+    [ICON_HA_BATTERY]       = { icon_data_ha_battery,       24, 24 },
+    [ICON_HA_WARN]          = { icon_data_ha_warn,          24, 24 },
+    [ICON_HA_CHECK]         = { icon_data_ha_check,         24, 24 },
 };
 
 // ============================================================================
@@ -398,7 +579,7 @@ void icon_draw_scaled(icon_id_t id, int32_t x, int32_t y, int32_t size, uint32_t
 // ARGB (0xAARRGGBB) pixels. Loaded into static slots, alpha-blended on draw.
 // ============================================================================
 #define COLOR_ICON_DIM    64
-#define COLOR_ICON_SLOTS  28
+#define COLOR_ICON_SLOTS  64  // #562: bumped 28->64, 23 existing + 23 new per-app loads
 
 typedef struct {
     int      id;     // icon_id_t this overrides
@@ -410,9 +591,15 @@ static color_icon_t g_color_icons[COLOR_ICON_SLOTS];
 static int          g_color_icon_count = 0;
 int icon_color_count(void) { return g_color_icon_count; }
 
+static color_icon_t *color_icon_find(int id)
+{
+    for (int i = 0; i < g_color_icon_count; i++)
+        if (g_color_icons[i].id == id) return &g_color_icons[i];
+    return 0;
+}
+
 int icon_load_color(icon_id_t id, const char *path)
 {
-    if (g_color_icon_count >= COLOR_ICON_SLOTS) return -1;
     int fd = sys_open(path, 0);
     if (fd < 0) return -1;
     unsigned char hdr[12];
@@ -425,7 +612,22 @@ int icon_load_color(icon_id_t id, const char *path)
     if (w <= 0 || h <= 0 || w > COLOR_ICON_DIM || h > COLOR_ICON_DIM) {
         sys_close(fd); return -1;
     }
-    color_icon_t *ci = &g_color_icons[g_color_icon_count];
+    // #44: reuse an EXISTING slot for this id if one is already loaded,
+    // instead of always appending a new one. color_icon_find() returns the
+    // FIRST match by id, so a second icon_load_color() call for the same id
+    // (a user's "Change Icon" override loaded after main.c's boot-time
+    // defaults, or re-importing to replace an earlier override) used to be
+    // silently invisible: the new pixels landed in a later slot that
+    // color_icon_find() would never reach, so the app kept showing its old
+    // icon forever with no error anywhere. Slot reuse is what makes
+    // icon_load_color() safe to call more than once for the same id, which
+    // per-user icon overrides depend on.
+    color_icon_t *ci = color_icon_find((int)id);
+    if (!ci) {
+        if (g_color_icon_count >= COLOR_ICON_SLOTS) { sys_close(fd); return -1; }
+        ci = &g_color_icons[g_color_icon_count];
+        g_color_icon_count++;
+    }
     ci->id = (int)id; ci->w = w; ci->h = h;
     int want = w * h * 4, got = 0;
     char *dst = (char *)ci->px;
@@ -436,18 +638,203 @@ int icon_load_color(icon_id_t id, const char *path)
     }
     sys_close(fd);
     if (got != want) return -1;
-    g_color_icon_count++;
     return 0;
 }
 
-static color_icon_t *color_icon_find(int id)
+// ============================================================================
+// #44 custom dock icons: import a user-supplied PNG/JPG/BMP, decode+scale it
+// ONCE here (never per-frame - the draw path only ever does a plain nearest-
+// sample blit of already-decoded pixels, same as every other color icon),
+// write it to disk as a MICO file (the SAME format icon_load_color() already
+// reads, so a re-import or a reboot reloads it through the exact same path
+// as every shipped icon), and apply it live via icon_load_color().
+// ============================================================================
+
+// Derive the deterministic per-app MICO filename from an exec_path, e.g.
+// "/APPS/PAINT" -> "PAINT.MICO". This is the SAME basename convention #41
+// already established for app_id (kernel-resolved binary basename), so a
+// user's override file for an app is discoverable without a separate index
+// file that could go stale: startmenu_apply_icon_overrides() just checks
+// whether "<home>/ICONS/<basename>.MICO" exists.
+void icon_mico_basename(const char *exec_path, char *out, int cap)
 {
-    for (int i = 0; i < g_color_icon_count; i++)
-        if (g_color_icons[i].id == id) return &g_color_icons[i];
-    return 0;
+    if (!out || cap <= 0) return;
+    out[0] = '\0';
+    if (!exec_path || !exec_path[0]) return;
+    const char *base = exec_path;
+    for (const char *p = exec_path; *p; p++) if (*p == '/') base = p + 1;
+    int i = 0;
+    while (base[i] && i < cap - 6) {   // leave room for ".MICO\0"
+        char c = base[i];
+        if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+        out[i] = c;
+        i++;
+    }
+    const char *suf = ".MICO";
+    int j = 0;
+    while (suf[j] && i < cap - 1) out[i++] = suf[j++];
+    out[i] = '\0';
 }
 
-// Nearest-sample blit (proven) with optional translucent-black shadow pass.
+// Read src_path (bounded), decode+downscale to at most COLOR_ICON_DIM square
+// via SYS_DECODE_IMAGE (auto-detects BMP/PNG/JPEG, never upscales - see
+// kernel/proc/syscall.c sys_decode_image()), force full opacity where the
+// decoder left every pixel transparent, write the result to out_mico_path as
+// a MICO file, and apply it live to `id`. Returns 0 on success, -1 on any
+// failure (unreadable/unsupported source, decode failure, or write failure -
+// on a write failure the partial file is removed rather than left as a
+// corrupt MICO a future boot would reject).
+int icon_import_and_apply(icon_id_t id, const char *src_path, const char *out_mico_path)
+{
+    if (!src_path || !src_path[0] || !out_mico_path || !out_mico_path[0]) return -1;
+
+    int fd = sys_open(src_path, 0);
+    if (fd < 0) return -1;
+    // 8MB cap. MEASURED, not guessed: an earlier 2MB cap here was sized on
+    // "generous for a PNG/JPG someone would pick", which turned out wrong
+    // against this OS's own shipped uncompressed 24bpp BMP wallpapers - a
+    // 1280x800x24bpp source is 3,072,054 bytes on disk (measured against
+    // BOOT.BMP/ABSTRACT_1.BMP), already over a 2MB cap, so EVERY import of a
+    // real, fully-supported 24bpp BMP silently truncated mid-read and then
+    // failed to decode - "Could not import that image (unsupported
+    // format?)" on a file whose format was never the problem. Caught live,
+    // on-device, importing this OS's own wallpapers as a test corpus - the
+    // exact "measure before you cap" mistake this project's blame.md keeps
+    // recording under other names. 8MB covers a 1920x1080x32bpp source
+    // (~8.3MB) with room to spare while still being a bounded,
+    // synchronous-read-friendly size for a menu-click-triggered import, not
+    // the draw/render path (#426) - same class of operation as
+    // wallpaper_load()'s existing 4MB g_file_buf.
+    static uint8_t s_import_buf[8 * 1024 * 1024];
+    uint32_t total = 0;
+    while (total < sizeof(s_import_buf)) {
+        long n = sys_read(fd, (char *)s_import_buf + total, sizeof(s_import_buf) - total);
+        if (n <= 0) break;
+        total += (uint32_t)n;
+    }
+    sys_close(fd);
+    if (total < 8) return -1;   // too small to be any supported header
+
+    static uint32_t s_import_px[COLOR_ICON_DIM * COLOR_ICON_DIM];
+    int dims[2] = { 0, 0 };
+    extern int decode_image(const void *data, unsigned int len, int tw, int th,
+                            void *out, unsigned int out_cap, int *dims);
+    int rc = decode_image(s_import_buf, total, COLOR_ICON_DIM, COLOR_ICON_DIM,
+                          s_import_px, sizeof(s_import_px), dims);
+    if (rc < 0) return -1;
+    int w = dims[0], h = dims[1];
+    if (w <= 0 || h <= 0 || w > COLOR_ICON_DIM || h > COLOR_ICON_DIM) return -1;
+
+    // CHECK WHAT SYS_DECODE_IMAGE ACTUALLY SUPPORTS, not what it looks like it
+    // should: kernel/gui/image.c's bmp_decode_c() hard-rejects anything but
+    // 24/32bpp BMP (an 8-bit indexed BMP never decodes - already cost this
+    // project one asset that shipped and did nothing), and the BMP decode path
+    // that DOES succeed emits every pixel as 0x00RRGGBB - alpha deliberately
+    // zero, documented at img_scale_rows()'s own #745 comment in
+    // kernel/proc/syscall.c, because BMP has no alpha channel at all. Left
+    // uncorrected, a BMP-sourced custom icon would decode successfully, write
+    // successfully, and then render as NOTHING (color_icon_blit() skips any
+    // pixel whose alpha byte is 0) - success at every step, invisible result,
+    // exactly the failure mode this task's brief warned about. JPEG and an
+    // opaque (non-alpha) PNG already come back alpha=0xFF (jpeg.c always sets
+    // it; png.c defaults a=255 for RGB/grayscale), and an RGBA PNG is already
+    // flattened to alpha=0xFF by img_scale_rows' own onto-white composite - so
+    // the only real case below is BMP, but the check samples the ACTUAL
+    // decoded result (every alpha byte reads 0) instead of re-detecting the
+    // source format, so it stays correct even if a future decoder's
+    // convention changes.
+    int n = w * h;
+    int all_zero_alpha = 1;
+    for (int i = 0; i < n; i++) {
+        if ((s_import_px[i] >> 24) != 0) { all_zero_alpha = 0; break; }
+    }
+    if (all_zero_alpha) {
+        for (int i = 0; i < n; i++) s_import_px[i] |= 0xFF000000u;
+    }
+
+    unsigned char hdr[12];
+    hdr[0] = 'M'; hdr[1] = 'I'; hdr[2] = 'C'; hdr[3] = 'O';
+    hdr[4] = (unsigned char)(w);       hdr[5] = (unsigned char)(w >> 8);
+    hdr[6] = (unsigned char)(w >> 16); hdr[7] = (unsigned char)(w >> 24);
+    hdr[8] = (unsigned char)(h);       hdr[9] = (unsigned char)(h >> 8);
+    hdr[10] = (unsigned char)(h >> 16); hdr[11] = (unsigned char)(h >> 24);
+
+    sys_unlink(out_mico_path);   // clean truncate, matches profile_save()'s idiom
+    int ofd = sys_open(out_mico_path, 0x41);   // O_WRONLY | O_CREAT
+    if (ofd < 0) return -1;
+    int ok = (sys_write(ofd, (char *)hdr, 12) == 12);
+    if (ok) {
+        int want = w * h * 4, wr = 0;
+        char *psrc = (char *)s_import_px;
+        while (wr < want) {
+            long wn = sys_write(ofd, psrc + wr, (unsigned long)(want - wr));
+            if (wn <= 0) { ok = 0; break; }
+            wr += (int)wn;
+        }
+    }
+    sys_close(ofd);
+    if (!ok) { sys_unlink(out_mico_path); return -1; }
+
+    return icon_load_color(id, out_mico_path);
+}
+
+// ============================================================================
+// #63/#745: area-average (box filter) source sampling, replacing the old
+// pure nearest-neighbour pick (`ci->px[(sy_fp>>8)*w + (sx_fp>>8)]`) every
+// color-icon draw path used. MEASURED, not asserted: the shipped set is
+// 64x64 (COLOR_ICON_DIM) drawn at ~40px in the Marble dock
+// (XFCE_DOCK_ICON/XFCE_DOCK_ICON_DRAW, taskbar.c), a non-integer ~1.6-1.8x
+// downscale ratio nearest-neighbour aliases badly at (see blame.md's
+// "does not match the format" note - the fix that landed there was a
+// stroke-weight retrofit, not this, because this bug did not exist yet).
+// This is a genuine per-destination-pixel AREA AVERAGE of every source
+// texel that pixel's footprint covers (alpha-weighted, so a transparent
+// border texel cannot drag a solid edge toward black) - not a blur: at 1:1
+// or any upscale the footprint collapses to <=1 texel and this degenerates
+// back to exact/nearest sampling, so magnified content (hover-grow) stays
+// crisp, only the downscale case gets smoothed. One shared implementation
+// so every consumer (raw-color blit, single-ink tinted blit) gets the same
+// fix in one place, per this project's "reuse the shared primitive, do not
+// fork a private copy" rule.
+static void color_icon_sample_box(const color_icon_t *ci,
+                                  int32_t sx0_fp, int32_t sx1_fp,
+                                  int32_t sy0_fp, int32_t sy1_fp,
+                                  uint32_t *out_a, uint32_t *out_r,
+                                  uint32_t *out_g, uint32_t *out_b)
+{
+    int sx0 = sx0_fp >> 8, sx1 = (sx1_fp - 1) >> 8;
+    int sy0 = sy0_fp >> 8, sy1 = (sy1_fp - 1) >> 8;
+    if (sx1 >= ci->w) sx1 = ci->w - 1;
+    if (sy1 >= ci->h) sy1 = ci->h - 1;
+    if (sx1 < sx0) sx1 = sx0;
+    if (sy1 < sy0) sy1 = sy0;
+
+    uint32_t sa = 0, sr = 0, sg = 0, sb = 0, n = 0;
+    for (int sy = sy0; sy <= sy1; sy++) {
+        const uint32_t *row = &ci->px[sy * ci->w];
+        for (int sx = sx0; sx <= sx1; sx++) {
+            uint32_t p = row[sx];
+            uint32_t a = (p >> 24) & 0xFF;
+            sa += a;
+            // Alpha-weighted colour sum: a fully transparent texel (alpha 0,
+            // arbitrary/garbage RGB by convention) contributes zero weight
+            // instead of polluting the average with an undefined colour.
+            sr += ((p >> 16) & 0xFF) * a;
+            sg += ((p >> 8)  & 0xFF) * a;
+            sb += ( p        & 0xFF) * a;
+            n++;
+        }
+    }
+    *out_a = n ? sa / n : 0;
+    if (sa > 0) { *out_r = sr / sa; *out_g = sg / sa; *out_b = sb / sa; }
+    else        { *out_r = *out_g = *out_b = 0; }
+}
+
+// Box-filtered blit (see color_icon_sample_box above) with optional
+// translucent-black shadow pass. Same signature/behaviour as the old
+// nearest-sample color_icon_blit(), so every existing caller (desktop
+// icons, start menu, tray, the dock's own raw-color path) gets the
+// antialiasing fix with no call-site change.
 static void color_icon_blit(color_icon_t *ci, int32_t x, int32_t y, int32_t size, int shadow)
 {
     if (size <= 0) return;
@@ -455,21 +842,18 @@ static void color_icon_blit(color_icon_t *ci, int32_t x, int32_t y, int32_t size
     int32_t step_y = (ci->h << 8) / size;
     int32_t sy_fp = 0;
     for (int32_t dr = 0; dr < size; dr++, sy_fp += step_y) {
-        int sy = sy_fp >> 8; if (sy >= ci->h) sy = ci->h - 1;
         int py = y + dr;
-        if (py < 0 || py >= g_fb_height) continue;
+        if (py < 0 || py >= g_fb_height) { continue; }
         int32_t sx_fp = 0;
         for (int32_t dc = 0; dc < size; dc++, sx_fp += step_x) {
-            int sx = sx_fp >> 8; if (sx >= ci->w) sx = ci->w - 1;
             int px = x + dc;
             if (px < 0 || px >= g_fb_width) continue;
             if (!draw_pt_in_clip(px, py)) continue;
-            uint32_t spx = ci->px[sy * ci->w + sx];
-            uint32_t a = (spx >> 24) & 0xFF;
+            uint32_t a, sr, sg, sb;
+            color_icon_sample_box(ci, sx_fp, sx_fp + step_x, sy_fp, sy_fp + step_y,
+                                  &a, &sr, &sg, &sb);
             if (a == 0) continue;
-            uint32_t sr, sg, sb;
             if (shadow) { sr = sg = sb = 0; a = (a * 150) / 255; }
-            else { sr = (spx >> 16) & 0xFF; sg = (spx >> 8) & 0xFF; sb = spx & 0xFF; }
             uint32_t *d = &g_fb[py * g_fb_pitch + px];
             uint32_t dv = *d;
             uint32_t dr2 = (dv >> 16) & 0xFF, dg = (dv >> 8) & 0xFF, db = dv & 0xFF;
@@ -491,34 +875,39 @@ int icon_draw_color_if_present(icon_id_t id, int32_t x, int32_t y, int32_t size)
     return 1;
 }
 
-// Draw a loaded color icon recoloured to a single ink, using the source
-// luminance as coverage. Lets monochrome (white) glyphs like the tray sliders
-// stay readable on any taskbar colour. Returns 0 if the icon is not loaded.
-int icon_draw_color_tinted(icon_id_t id, int32_t x, int32_t y, int32_t size, uint32_t ink)
+// Box-filtered (see color_icon_sample_box above), single-ink recolour of a
+// loaded color icon, using the source's alpha-weighted luminance as
+// coverage. Lets monochrome (white/off-white) glyphs like the tray sliders
+// and the Marble dock (#63/#745) stay legible on any taskbar/dock colour.
+// `shadow`: draw a translucent-black pass instead of `ink` (same 150/255
+// dimming color_icon_blit's shadow arg uses), for callers that want the
+// same drop-shadow treatment the raw-color dock/desktop icon path gets -
+// see icon_draw_color_tinted()/icon_draw_dock_icon() below, the two public
+// wrappers around this.
+static void color_icon_blit_tinted(color_icon_t *ci, int32_t x, int32_t y, int32_t size,
+                                   uint32_t ink, int shadow)
 {
-    color_icon_t *ci = color_icon_find((int)id);
-    if (!ci || size <= 0) return 0;
+    if (size <= 0) return;
     uint32_t ir = (ink >> 16) & 0xFF, ig = (ink >> 8) & 0xFF, ib = ink & 0xFF;
     int32_t step_x = (ci->w << 8) / size;
     int32_t step_y = (ci->h << 8) / size;
     int32_t sy_fp = 0;
     for (int32_t dr = 0; dr < size; dr++, sy_fp += step_y) {
-        int sy = sy_fp >> 8; if (sy >= ci->h) sy = ci->h - 1;
         int py = y + dr;
         if (py < 0 || py >= g_fb_height) continue;
         int32_t sx_fp = 0;
         for (int32_t dc = 0; dc < size; dc++, sx_fp += step_x) {
-            int sx = sx_fp >> 8; if (sx >= ci->w) sx = ci->w - 1;
             int px = x + dc;
             if (px < 0 || px >= g_fb_width) continue;
             if (!draw_pt_in_clip(px, py)) continue;
-            uint32_t spx = ci->px[sy * ci->w + sx];
-            uint32_t a = (spx >> 24) & 0xFF;
+            uint32_t a, lr, lg, lb;
+            color_icon_sample_box(ci, sx_fp, sx_fp + step_x, sy_fp, sy_fp + step_y,
+                                  &a, &lr, &lg, &lb);
             if (a == 0) continue;
-            uint32_t lr = (spx >> 16) & 0xFF, lg = (spx >> 8) & 0xFF, lb = spx & 0xFF;
             uint32_t cov = (lr * 30 + lg * 59 + lb * 11) / 100;
             a = (a * cov) / 255;
             if (a == 0) continue;
+            if (shadow) { a = (a * 150) / 255; if (a == 0) continue; }
             uint32_t *d = &g_fb[py * g_fb_pitch + px];
             uint32_t dv = *d;
             uint32_t dr2 = (dv >> 16) & 0xFF, dg = (dv >> 8) & 0xFF, db = dv & 0xFF;
@@ -528,5 +917,31 @@ int icon_draw_color_tinted(icon_id_t id, int32_t x, int32_t y, int32_t size, uin
             *d = 0xFF000000u | (rr << 16) | (rg << 8) | rb;
         }
     }
+}
+
+int icon_draw_color_tinted(icon_id_t id, int32_t x, int32_t y, int32_t size, uint32_t ink)
+{
+    color_icon_t *ci = color_icon_find((int)id);
+    if (!ci || size <= 0) return 0;
+    color_icon_blit_tinted(ci, x, y, size, ink, 0);
+    return 1;
+}
+
+// #63/#745: dock-specific variant of icon_draw_color_tinted() that ALSO
+// draws the same translucent-black drop shadow icon_draw_color_if_present()
+// gives the raw-color icon path, so switching the dock from raw colour to a
+// single recoloured ink (see taskbar.c xfce_draw_slot()) does not also
+// silently drop the shadow every other dock/desktop icon still has. Same
+// "try color, else caller falls back to the mono bitmap" contract
+// icon_draw_color_tinted() already established (see its two startmenu.c
+// callers) - returns 0 if `id` has no loaded color icon, and callers use
+// the identical `if (!icon_draw_dock_icon(...)) icon_draw_scaled(...)` idiom.
+int icon_draw_dock_icon(icon_id_t id, int32_t x, int32_t y, int32_t size, uint32_t ink)
+{
+    color_icon_t *ci = color_icon_find((int)id);
+    if (!ci || size <= 0) return 0;
+    int off = size / 40; if (off < 1) off = 1;
+    color_icon_blit_tinted(ci, x + off, y + off, size, 0x000000u, 1);
+    color_icon_blit_tinted(ci, x, y, size, ink, 0);
     return 1;
 }

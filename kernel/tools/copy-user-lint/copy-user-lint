@@ -1,0 +1,593 @@
+#!/usr/bin/env python3
+"""
+copy-user-lint - FAILS THE BUILD if a syscall handler DIRECTLY DEREFERENCES a
+user pointer (reads/writes *p, p->field, p[i], or hands p to a bare
+memcpy/memset/...) instead of going through the #509 TOCTOU-safe copy_*_user
+primitives - unless the handler is on the checked-in exemption/known-gap
+manifest (kernel/syscall-copyuser.manifest).
+
+WHY THIS EXISTS (#566, the adoption-enforcement half of #509 / #514)
+--------------------------------------------------------------------------
+#509 made copy_from_user/copy_to_user/strncpy_from_user/clear_user an ATOMIC
+check-AND-use: the entry U/S walk plus a fault-fixup in mm/fault.c, so if a
+sibling thread unmaps/remaps the page between the check and the use, the copy
+faults to a fixup and returns -EFAULT instead of the kernel dereferencing a
+freed/remapped frame. The OLD pattern - validate_user_ptr() at entry, THEN a
+plain `*p` / memcpy(p,...) deeper in the handler - is a TOCTOU hole: the check
+and the use are two separate events and the page can change in between.
+
+sibling gate syscall-ptr-lint (#565) proves each pointer syscall is VALIDATED
+AT ENTRY. That is necessary but NOT sufficient: entry validation is exactly the
+check half of the TOCTOU pair. This gate proves the USE half is atomic too -
+that the handler does not then direct-deref the pointer it just validated.
+
+SCOPE (stated plainly, because a gate's blind spots must be documented)
+-----------------------------------------------------------------------
+This lint reasons about THE SYSCALL LAYER: the dispatcher case bodies in
+proc/syscall.c AND the handler functions a pointer-syscall case calls with a
+user pointer (one level of tracing). A direct deref of a user pointer inside
+that layer - a `st->st_mode = ...` on a `(k_stat_t*)ubuf`, a
+`memcpy(kbuf, userptr, n)` - is the unit it catches and gates. A user pointer
+that a handler hands DOWN to a subsystem in another translation unit (VFS,
+net/*_kcr3, crypto) leaves the layer; the deref, if any, is that subsystem's
+contract and out of this lint's scope (many switch CR3 or bounce internally).
+The boundary is therefore: "the syscall layer must not itself raw-deref a user
+pointer; bounce it through copy_*_user first, or hand it to a subsystem." That
+line is enforceable without whole-tree dataflow and is where struct in/out
+params (the classic TOCTOU targets) actually live.
+
+THE SYSCALL LAYER IS NOT ONE FILE ANY MORE (#746b), AND THAT IS WHY --handlers
+EXISTS. Until 2026-08-08 the analysed set was literally "functions defined in
+proc/syscall.c", so moving a handler to a sibling translation unit removed it
+from this lint's sight WITHOUT FAILING ANYTHING. That was measured, not feared:
+with the legacy fd layer deleted from syscall.c, this lint went from reporting
+`DEBT SYS_READ` to reporting `SYS_READ ... no longer has an unsafe direct deref
+(adopted?); remove it (stale)` and exited 0. The tree read CLEANER than before
+while being no safer, and the note actively invited deletion of the ledger entry
+recording a real unfixed TOCTOU hole. Four pointer syscalls left the analysed
+set (SYS_OPEN, SYS_READ, SYS_WRITE, SYS_READDIR); three of them would have gone
+from passing GENUINELY to passing VACUOUSLY, and nothing in the output could
+distinguish the two.
+
+So every file that defines syscall handlers must be named with --handlers, and:
+  * a --handlers path that does not exist is FATAL, because a typo would shrink
+    the analysed set silently, which is the very fault being fixed;
+  * the analysed set is PRINTED on every green run, so the scope is visible
+    rather than assumed (#514: a gate must report what it looked at).
+--self-test proves the tracing actually crosses the file boundary, by showing
+the SAME injected violation GREEN without --handlers and RED with it.
+
+HOW IT ENUMERATES (auto-discovery, not a hand list; self-updating)
+------------------------------------------------------------------
+1. Parse the dispatcher switch. A `case SYS_X:` that casts an argN to a pointer
+   is a POINTER SYSCALL (same discovery as syscall-ptr-lint; fallthrough labels
+   share the following body). This is self-updating: a new pointer syscall is
+   seen the moment its case is added.
+2. For each pointer syscall, build its ANALYSIS TEXT = the case body PLUS the
+   body of every function defined in syscall.c that the case calls and passes a
+   user pointer to (the handler). Inside a handler, the user pointers are its
+   pointer PARAMETERS plus simple local aliases (`T *v = (T*)param;`).
+3. In the analysis text, a DIRECT DEREF of a user pointer v is any of:
+      *v            v->field        v[i]
+      memcpy/memmove/memset/strcpy/strncpy/strcat/sprintf/snprintf(... v ...)
+   A deref routed through copy_from_user / copy_to_user / strncpy_from_user /
+   strnlen_user / clear_user / __uaccess_* is SAFE (adopted), not a direct deref.
+
+THE RULES (same shape as syscall-ptr-lint)
+------------------------------------------
+For every pointer syscall SYS_X whose analysis text has an unsafe direct deref:
+  * on [EXEMPT] in the manifest  => the handler is already safe for a documented
+    reason (bounces once through a kernel buffer via a bare copy the regex
+    cannot model, or has legitimate kernel-pointer callers). Good.
+  * on [KNOWN_GAP] in the manifest => a DEBT-LEDGER entry: a real still-direct
+    deref, TRACKED and printed LOUDLY every build but tolerated (build not
+    wedged) until converted. NOT a silent exemption.
+  * else => the build FAILS, naming SYS_X and the deref. Convert it to
+    copy_*_user, or (if genuinely already safe) add it under [EXEMPT] with the
+    reason, or (if honestly deferred) under [KNOWN_GAP] with the owning task.
+
+A pointer syscall with NO unsafe direct deref (pure delegation, or every deref
+via copy_*_user) is ADOPTED - clean, needs no manifest entry.
+
+Manifest hygiene (typo guard): a name under [EXEMPT]/[KNOWN_GAP] that is not a
+real SYS_* #define fails the build. A name that no longer direct-derefs is a
+stale entry: reported as an advisory to remove it (non-fatal).
+
+USAGE
+  copy-user-lint --header <syscall.h> --dispatch <syscall.c> \
+                 --manifest <syscall-copyuser.manifest>
+  copy-user-lint ... --self-test   # RED on a direct-deref fixture, GREEN on the real tree
+"""
+import argparse, os, re, sys, tempfile
+
+DEFINE_RE = re.compile(r'^\s*#\s*define\s+(SYS_[A-Z0-9_]+)\s+(\d+)', re.M)
+LABEL_RE  = re.compile(r'\bcase\s+(SYS_[A-Z0-9_]+)\s*:|\bdefault\s*:')
+PTR_CAST_RE = re.compile(
+    r'\(\s*(?:const\s+|volatile\s+|struct\s+|unsigned\s+|signed\s+)*'
+    r'[A-Za-z_][A-Za-z0-9_]*(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s*\*+\s*\)\s*arg([1-6])')
+# a local bound to an argN pointer cast:  T *v = (T *)argN;   or  v = (T*)argN
+CAST_BIND_RE = re.compile(
+    r'\b([A-Za-z_]\w*)\s*=\s*\(\s*(?:const\s+|volatile\s+|struct\s+|unsigned\s+|signed\s+)*'
+    r'[A-Za-z_][A-Za-z0-9_]*(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s*\*+\s*\)\s*(arg[1-6]|[A-Za-z_]\w*)')
+CALL_RE   = re.compile(r'\b([a-z_][a-z0-9_]*)\s*\(')
+SAFE_FUNCS = ('copy_from_user', 'copy_to_user', 'strncpy_from_user',
+              'strnlen_user', 'clear_user')
+DEREF_FUNCS = ('memcpy', 'memmove', 'memset', 'strcpy', 'strncpy', 'strcat',
+               'strncat', 'sprintf', 'snprintf', 'strlcpy')
+# words that can precede `*v` yet are NOT a type (so `*v` is a real deref there)
+_KEYWORDS = {'return', 'if', 'while', 'for', 'else', 'do', 'switch', 'case',
+             'sizeof', 'goto'}
+
+# a top-level function definition:  <ret ...> name(<params>) {   (column 0 start)
+FUNC_DEF_RE = re.compile(
+    r'^([A-Za-z_][\w\s\*]*?\b)([a-z_][a-z0-9_]+)\s*\(([^;{}]*)\)\s*\{', re.M)
+
+
+def read(path):
+    with open(path, 'r') as f:
+        return f.read()
+
+
+def strip_comments(s):
+    s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
+    s = re.sub(r'//[^\n]*', '', s)
+    return s
+
+
+def parse_defines(header_src):
+    name2num, num2name = {}, {}
+    for m in DEFINE_RE.finditer(header_src):
+        name2num[m.group(1)] = int(m.group(2))
+        num2name.setdefault(int(m.group(2)), m.group(1))
+    return name2num, num2name
+
+
+def _match_block(src, open_idx):
+    """Given index of a '{', return index just past the matching '}'."""
+    depth = 0
+    i = open_idx
+    n = len(src)
+    while i < n:
+        c = src[i]
+        if c == '{':
+            depth += 1
+        elif c == '}':
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return n
+
+
+def parse_functions(dispatch_nc):
+    """Map function-name -> (param_str, body_text) for every top-level function
+    defined in the (comment-stripped) file."""
+    funcs = {}
+    for m in FUNC_DEF_RE.finditer(dispatch_nc):
+        name = m.group(2)
+        if name in ('if', 'for', 'while', 'switch', 'return', 'sizeof', 'case'):
+            continue
+        params = m.group(3)
+        brace = dispatch_nc.index('{', m.end() - 1)
+        end = _match_block(dispatch_nc, brace)
+        funcs[name] = (params, dispatch_nc[brace:end])
+    return funcs
+
+
+def parse_pointer_cases(dispatch_nc):
+    """Return {SYS_X: casebody_text} for every case whose body casts an arg to a
+    pointer. Fallthrough labels share the following body."""
+    try:
+        body = dispatch_nc[dispatch_nc.index('switch (num)'):]
+    except ValueError:
+        body = dispatch_nc
+    labels = [(m.start(), m.end(), (m.group(1) or '__default__'))
+              for m in LABEL_RE.finditer(body)]
+    out, pending = {}, []
+    for i, (s, e, name) in enumerate(labels):
+        nxt = labels[i + 1][0] if i + 1 < len(labels) else len(body)
+        seg = body[e:nxt]
+        pending.append(name)
+        if seg.strip():
+            if PTR_CAST_RE.search(seg):
+                for nm in pending:
+                    if nm != '__default__':
+                        out[nm] = seg
+            pending = []
+    return out
+
+
+def pointer_params(param_str):
+    """Names of pointer-typed parameters (they carry user pointers into a
+    syscall handler). `char *p` / `void *q` / `const T *r` / `T **s`."""
+    names = []
+    for part in param_str.split(','):
+        part = part.strip()
+        if not part or part == 'void':
+            continue
+        if '*' in part:
+            m = re.search(r'\*\s*([A-Za-z_]\w*)\s*$', part)
+            if m:
+                names.append(m.group(1))
+    return names
+
+
+def user_ptr_names(text, seeds):
+    """Given analysis text and seed user-pointer names, expand with simple
+    aliases `x = (T*)seed;` / `x = seed;` to a fixpoint."""
+    names = set(seeds)
+    for _ in range(6):
+        added = False
+        for m in CAST_BIND_RE.finditer(text):
+            lhs, rhs = m.group(1), m.group(2)
+            if (rhs in names or rhs.startswith('arg')) and lhs not in names:
+                names.add(lhs); added = True
+        # plain alias:  x = seed;
+        for m in re.finditer(r'\b([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*[;,)]', text):
+            lhs, rhs = m.group(1), m.group(2)
+            if rhs in names and lhs not in names and lhs not in ('if', 'return'):
+                names.add(lhs); added = True
+        if not added:
+            break
+    return names
+
+
+def find_derefs(text, unames):
+    """Return a list of (kind, snippet) for each UNSAFE direct deref of a user
+    pointer in text. A deref inside a copy_*_user(...) call is SAFE."""
+    # Blank out safe-copy call argument lists so a user ptr appearing as their
+    # argument is not counted as a direct deref.
+    safe_spans = []
+    for fn in SAFE_FUNCS:
+        for m in re.finditer(r'\b' + fn + r'\s*\(', text):
+            op = text.index('(', m.end() - 1)
+            depth = 0; i = op
+            while i < len(text):
+                if text[i] == '(':
+                    depth += 1
+                elif text[i] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            safe_spans.append((m.start(), i + 1))
+
+    def in_safe(pos):
+        return any(a <= pos < b for a, b in safe_spans)
+
+    hits = []
+    for v in sorted(unames, key=len, reverse=True):
+        ve = re.escape(v)
+        # v->field   and   v[i]
+        for pat, kind in ((r'\b' + ve + r'\s*->', 'v->field'),
+                          (r'\b' + ve + r'\s*\[', 'v[i]')):
+            for m in re.finditer(pat, text):
+                if not in_safe(m.start()):
+                    hits.append((kind, text[max(0, m.start()-8):m.start()+18].strip()))
+        # *v  scalar deref (read or write). EXCLUDE the declaration `T *v = ...`:
+        # a declaration has a TYPE IDENTIFIER right before the `*` (e.g.
+        # `char *ub`, `unsigned long *up`); a deref has punctuation / an operator
+        # / `=` / a keyword (`if (t) *t = x`, `return *p`, `; *p; p++`).
+        for m in re.finditer(r'\*\s*' + ve + r'\b', text):
+            if in_safe(m.start()):
+                continue
+            pre = text[:m.start()].rstrip(' \t*')
+            mw = re.search(r'([A-Za-z_]\w*)$', pre)
+            if mw and mw.group(1) not in _KEYWORDS:
+                continue  # `type *v` -> a declaration, not a deref
+            hits.append(('*v', text[m.start():m.start()+18].strip()))
+    # bare mem/str funcs taking a user pointer as an argument
+    for fn in DEREF_FUNCS:
+        for m in re.finditer(r'\b' + fn + r'\s*\(', text):
+            op = text.index('(', m.end() - 1)
+            depth = 0; i = op
+            while i < len(text):
+                if text[i] == '(':
+                    depth += 1
+                elif text[i] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            args = text[op + 1:i]
+            toks = set(re.findall(r'[A-Za-z_]\w*', args))
+            if toks & unames:
+                hits.append((fn + '()', (fn + '(' + args.strip())[:40]))
+    return hits
+
+
+def analyze_case(sys_name, casebody, funcs):
+    """Return list of unsafe derefs for a pointer syscall: case body + one level
+    of in-file handler bodies it passes a user pointer to."""
+    text = casebody
+    seeds = set()
+    # user pointers named directly in the case body
+    for m in CAST_BIND_RE.finditer(casebody):
+        seeds.add(m.group(1))
+    unames = user_ptr_names(casebody, seeds)
+    hits = find_derefs(casebody, unames | {'__inlinecast__'})
+
+    # trace one level: any in-file function this case calls that takes a pointer
+    # param inherits its pointer params as user pointers.
+    for m in CALL_RE.finditer(casebody):
+        fn = m.group(1)
+        if fn in funcs and fn not in SAFE_FUNCS and fn not in DEREF_FUNCS:
+            params, body = funcs[fn]
+            pp = pointer_params(params)
+            if not pp:
+                continue
+            hunames = user_ptr_names(body, pp)
+            hits += find_derefs(body, hunames)
+    return hits
+
+
+def parse_manifest(path):
+    exempt, gap = [], []
+    if not os.path.exists(path):
+        return exempt, gap
+    section = None
+    for raw in read(path).splitlines():
+        line = raw.split('#', 1)[0].rstrip()
+        st = line.strip()
+        if not st:
+            continue
+        up = st.upper()
+        if up == '[EXEMPT]':
+            section = exempt; continue
+        if up == '[KNOWN_GAP]':
+            section = gap; continue
+        parts = st.split(None, 1)
+        name = parts[0]
+        reason = parts[1] if len(parts) > 1 else ''
+        if section is None:
+            section = exempt
+        section.append((name, reason))
+    return exempt, gap
+
+
+def run(header, dispatch, manifest, handlers=(), out=sys.stdout):
+    name2num, _ = parse_defines(read(header))
+    disp_nc = strip_comments(read(dispatch))
+    funcs = parse_functions(disp_nc)
+    ptr_cases = parse_pointer_cases(disp_nc)
+
+    # #746b: handler bodies that live in a SIBLING translation unit. A missing
+    # path is FATAL: a typo that silently shrank the analysed set would be the
+    # exact fault this option exists to prevent (see the SCOPE note above).
+    for hpath in handlers:
+        if not os.path.exists(hpath):
+            print("copy-user-lint: FAIL - --handlers source not found: %s"
+                  % hpath, file=out)
+            print("   A handler source that cannot be read is not coverage;"
+                  " it is a gap that looks like coverage.", file=out)
+            return 1
+        for nm, val in parse_functions(strip_comments(read(hpath))).items():
+            funcs.setdefault(nm, val)   # the dispatch file wins a name collision
+    exempt, gap = parse_manifest(manifest)
+    exempt_names = {n for n, _ in exempt}
+    gap_names = {n for n, _ in gap}
+
+    def p(*a):
+        print(*a, file=out)
+
+    if not ptr_cases:
+        p("copy-user-lint: ERROR - found NO pointer syscalls in %s." % dispatch)
+        p("   The dispatcher parse failed; a lint that checks nothing is worse")
+        p("   than no lint. Refusing to pass.")
+        return 1
+
+    deref = {}  # SYS_X -> hits (only those with >=1 unsafe direct deref)
+    for nm, seg in ptr_cases.items():
+        hits = analyze_case(nm, seg, funcs)
+        if hits:
+            deref[nm] = hits
+
+    deref_names = sorted(deref.keys(), key=lambda n: name2num.get(n, 9999))
+
+    ex, gp, undeclared = [], [], []
+    for n in deref_names:
+        if n in exempt_names:
+            ex.append(n)
+        elif n in gap_names:
+            gp.append(n)
+        else:
+            undeclared.append(n)
+
+    fatal = False
+    # manifest hygiene: bad names
+    bad_names = [n for n in (exempt_names | gap_names) if n not in name2num]
+    if bad_names:
+        fatal = True
+        p("copy-user-lint: FAIL - manifest names that are not SYS_* #defines")
+        p("   (typo? a mis-spelled allowlist entry protects nothing):")
+        for n in sorted(bad_names):
+            p("   BAD NAME: %s" % n)
+    # stale: on manifest but no longer direct-derefs
+    stale = [n for n in (exempt_names | gap_names)
+             if n in name2num and n not in deref]
+    for n in stale:
+        p("copy-user-lint: note - %s is on the allowlist but no longer has an"
+          " unsafe direct deref (adopted?); remove it (stale)." % n)
+
+    if gp:
+        p("")
+        p("copy-user-lint: KNOWN GAP LEDGER - %d syscall handler(s) still"
+          " DIRECT-DEREF a user pointer (TOCTOU debt, NOT silently exempt):" % len(gp))
+        greason = dict(gap)
+        for n in sorted(gp, key=lambda x: name2num.get(x, 9999)):
+            kinds = sorted({k for k, _ in deref[n]})
+            p("   DEBT %-22s derefs=%s  %s"
+              % (n, ','.join(kinds), greason.get(n, '')))
+        p("   These are real TOCTOU holes to close (bounce through copy_*_user).")
+        p("   They do NOT fail the build, but they are on the record every build.")
+
+    if undeclared:
+        fatal = True
+        p("")
+        p("copy-user-lint: FAIL - %d syscall handler(s) DIRECT-DEREF a user"
+          " pointer with no copy_*_user and no manifest entry:" % len(undeclared))
+        for n in sorted(undeclared, key=lambda x: name2num.get(x, 9999)):
+            kinds = sorted({k for k, _ in deref[n]})
+            ex1 = deref[n][0][1]
+            p("   DIRECT-DEREF: %s (num %s) derefs=%s  e.g. `%s`"
+              % (n, name2num.get(n, '?'), ','.join(kinds), ex1))
+        p("")
+        p("   A user pointer dereferenced directly after an entry check is a")
+        p("   TOCTOU hole (#509): a sibling thread can remap the page between the")
+        p("   check and the deref. FIX: bounce it through a kernel buffer with")
+        p("   copy_from_user / copy_to_user (atomic check-and-use), OR - if the")
+        p("   handler is already safe - add it under [EXEMPT] in")
+        p("   %s naming why, OR - if honestly deferred -" % os.path.basename(manifest))
+        p("   under [KNOWN_GAP] with the owning task.")
+
+    if fatal:
+        return 1
+
+    p("")
+    p("copy-user-lint: OK - %d pointer syscall(s): %d direct-deref handler(s)"
+      " (%d in-handler EXEMPT, %d tracked KNOWN_GAP), rest adopted/delegated."
+      " No undeclared TOCTOU holes."
+      % (len(ptr_cases), len(deref), len(ex), len(gp)))
+    if handlers:
+        p("copy-user-lint: handler sources analysed with %s: %s"
+          % (os.path.basename(dispatch),
+             ', '.join(os.path.basename(h) for h in handlers)))
+    return 0
+
+
+def self_test(header, dispatch, manifest, handlers=()):
+    import io
+    ok_all = True
+
+    buf = io.StringIO()
+    rc = run(header, dispatch, manifest, handlers=handlers, out=buf)
+    green_ok = (rc == 0)
+    print("self-test GREEN (real tree): rc=%d -> %s"
+          % (rc, "PASS" if green_ok else "FAIL (expected 0)"))
+    if not green_ok:
+        print(buf.getvalue())
+    ok_all = ok_all and green_ok
+
+    FAKE = "SYS_COPYUSER_SELFTEST_VICTIM"
+    name2num, _ = parse_defines(read(header))
+    fake_num = max(name2num.values()) + 4243
+    hdr_src = read(header) + "\n#define %s %d\n" % (FAKE, fake_num)
+    disp_src = read(dispatch)
+    # a dispatcher case that casts arg1 to a pointer and WRITES through it
+    inject = ("\n        case %s: {\n"
+              "            int *victim = (int *)arg1;\n"
+              "            victim[0] = 42;   /* raw user-pointer write */\n"
+              "            return 0;\n"
+              "        }\n" % FAKE)
+    marker = "    switch (num) {"
+    idx = disp_src.index(marker) + len(marker)
+    disp_src = disp_src[:idx] + inject + disp_src[idx:]
+
+    with tempfile.TemporaryDirectory() as td:
+        hp = os.path.join(td, "h.h"); dp = os.path.join(td, "d.c")
+        with open(hp, 'w') as f: f.write(hdr_src)
+        with open(dp, 'w') as f: f.write(disp_src)
+        buf = io.StringIO()
+        rc = run(hp, dp, manifest, handlers=handlers, out=buf)
+        text = buf.getvalue()
+        red_ok = (rc != 0) and (FAKE in text) and ("DIRECT-DEREF" in text)
+        print("self-test RED (injected direct-deref handler): rc=%d -> %s"
+              % (rc, "PASS" if red_ok else "FAIL (expected non-zero naming the victim)"))
+        if not red_ok:
+            print(text)
+        else:
+            for line in text.splitlines():
+                if FAKE in line:
+                    print("   proof:%s" % line.strip())
+        ok_all = ok_all and red_ok
+
+    # ---- #746b: the CROSS-FILE arm ------------------------------------------
+    # The point of --handlers is that a handler in a SIBLING file is still
+    # analysed. Proving only the RED half would not show the option is what does
+    # the work, so the SAME violation is run BOTH ways: blind without
+    # --handlers (which is the coverage loss, reproduced on demand) and caught
+    # with it. A gate whose new option is untested is a gate with a new hole.
+    FAKE2 = "SYS_COPYUSER_SELFTEST_XFILE"
+    xnum = max(name2num.values()) + 4244
+    xhdr = read(header) + "\n#define %s %d\n" % (FAKE2, xnum)
+    xinject = ("\n        case %s: {\n"
+               "            char *xv = (char *)arg1;\n"
+               "            cul_selftest_xfile_handler(xv);\n"
+               "            return 0;\n"
+               "        }\n" % FAKE2)
+    xdisp = read(dispatch)
+    xi = xdisp.index(marker) + len(marker)
+    xdisp = xdisp[:xi] + xinject + xdisp[xi:]
+    xhandler = ("void cul_selftest_xfile_handler(char *v) {\n"
+                "    v[0] = 42;   /* raw user-pointer write, in ANOTHER file */\n"
+                "}\n")
+
+    with tempfile.TemporaryDirectory() as td:
+        hp = os.path.join(td, "h.h"); dp = os.path.join(td, "d.c")
+        xp = os.path.join(td, "handlers.c")
+        with open(hp, 'w') as f: f.write(xhdr)
+        with open(dp, 'w') as f: f.write(xdisp)
+        with open(xp, 'w') as f: f.write(xhandler)
+
+        buf = io.StringIO()
+        rc_blind = run(hp, dp, manifest, handlers=(), out=buf)
+        blind_text = buf.getvalue()
+        blind_ok = (rc_blind == 0) and (FAKE2 not in blind_text)
+        print("self-test BLIND (handler in a sibling file, --handlers NOT given):"
+              " rc=%d -> %s" % (rc_blind,
+              "PASS (loss reproduced)" if blind_ok else "FAIL (expected 0 and silent)"))
+        if not blind_ok:
+            print(blind_text)
+        ok_all = ok_all and blind_ok
+
+        buf = io.StringIO()
+        rc_seen = run(hp, dp, manifest, handlers=(xp,), out=buf)
+        seen_text = buf.getvalue()
+        seen_ok = (rc_seen != 0) and (FAKE2 in seen_text) and ("DIRECT-DEREF" in seen_text)
+        print("self-test RED (same handler, --handlers given): rc=%d -> %s"
+              % (rc_seen, "PASS" if seen_ok else "FAIL (expected non-zero naming the victim)"))
+        if not seen_ok:
+            print(seen_text)
+        else:
+            for line in seen_text.splitlines():
+                if FAKE2 in line:
+                    print("   proof:%s" % line.strip())
+        ok_all = ok_all and seen_ok
+
+        buf = io.StringIO()
+        rc_missing = run(hp, dp, manifest,
+                         handlers=(os.path.join(td, "nope.c"),), out=buf)
+        miss_ok = (rc_missing != 0) and ("not found" in buf.getvalue())
+        print("self-test RED (--handlers path that does not exist): rc=%d -> %s"
+              % (rc_missing, "PASS" if miss_ok else "FAIL (expected non-zero)"))
+        if not miss_ok:
+            print(buf.getvalue())
+        ok_all = ok_all and miss_ok
+
+    print("")
+    if ok_all:
+        print("copy-user-lint --self-test: PASS (RED on direct-deref in the"
+              " dispatch file AND in a --handlers file, BLIND without"
+              " --handlers, RED on a missing --handlers path, GREEN on real tree)")
+        return 0
+    print("copy-user-lint --self-test: FAIL - the gate is not trustworthy")
+    return 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--header', required=True)
+    ap.add_argument('--dispatch', required=True)
+    ap.add_argument('--manifest', required=True)
+    ap.add_argument('--handlers', action='append', default=[],
+                    help='additional C source defining syscall handlers; '
+                         'repeatable. A path that does not exist is fatal.')
+    ap.add_argument('--self-test', action='store_true')
+    a = ap.parse_args()
+    if a.self_test:
+        return self_test(a.header, a.dispatch, a.manifest, tuple(a.handlers))
+    return run(a.header, a.dispatch, a.manifest, tuple(a.handlers))
+
+
+if __name__ == '__main__':
+    sys.exit(main())

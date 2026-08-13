@@ -10,6 +10,7 @@
 #include "../crypto/md4.h"
 #include "../crypto/md5.h"
 #include "../crypto/hmac.h"
+#include "../cpu/mono.h"   // #499: sched_now_ms() - THE shared real-elapsed-ms clock
 
 // External timer ticks
 extern volatile uint64_t timer_ticks;
@@ -18,14 +19,17 @@ extern void net_poll(void);          // pump NIC RX/TX + DHCP
 extern void tcp_timer(void);         // drive TCP retransmit/timeouts
 extern void proc_sleep(uint32_t ms); // yield to scheduler
 
-// task #317: convert milliseconds to timer ticks using the REAL timer
-// frequency. The original code assumed 18.2 Hz, but the PIT runs at
-// g_timer_hz (250 Hz), so a "5000 ms" timeout was really ~0.36 s. Use the
-// live frequency so SMB ops actually wait long enough for a server reply.
-static inline uint64_t smb_ms_to_ticks(int ms) {
-    uint32_t hz = g_timer_hz ? g_timer_hz : 250;
-    uint64_t t = ((uint64_t)ms * hz) / 1000;
-    return t ? t : 1;
+// task #317: milliseconds used to be converted to timer ticks using the REAL
+// timer frequency. The original code assumed 18.2 Hz, but the PIT runs at
+// g_timer_hz (250 Hz), so a "5000 ms" timeout was really ~0.36 s.
+// #499: every deadline below is now measured on sched_now_ms(), REAL elapsed
+// milliseconds, instead of timer_ticks (which counts ticks DELIVERED, so a KVM
+// tick burst collapsed each SMB send/recv/connect budget to zero). This helper
+// therefore became an identity with a 1ms floor, keeping the call sites intact.
+// The filetime/nonce uses of timer_ticks further down are timestamps, NOT
+// deadlines, and are deliberately left alone.
+static inline uint64_t smb_ms_span(int ms) {
+    return ms > 0 ? (uint64_t)ms : 1;
 }
 
 // Pump the network stack once and briefly yield. Mirrors the wget/https
@@ -163,21 +167,21 @@ static smb_file_t *get_file(int fd) {
 // timeout/error.
 static int smb_send_all(smb_connection_t *conn, const uint8_t *p, uint32_t len) {
     uint32_t sent = 0;
-    uint64_t start = timer_ticks;
-    uint64_t deadline = smb_ms_to_ticks(10000);
+    uint64_t start = sched_now_ms();
+    uint64_t deadline_ms = smb_ms_span(10000);
     while (sent < len) {
         uint16_t chunk = (len - sent) > 1400 ? 1400 : (uint16_t)(len - sent);
         int s = tcp_send(conn->tcp_socket, p + sent, chunk);
         if (s > 0) {
             sent += s;
-            start = timer_ticks;
+            start = sched_now_ms();
             smb_net_pump();
         } else if (s == TCP_ERR_WOULD_BLOCK) {
             smb_net_pump();
         } else {
             return -1;  // hard error
         }
-        if (timer_ticks - start > deadline) {
+        if (sched_now_ms() - start > deadline_ms) {
             kprintf("[SMB] send timeout (%u/%u)\n", sent, len);
             return -1;
         }
@@ -209,8 +213,8 @@ static int smb_send_packet(smb_connection_t *conn, const void *data, uint32_t le
 static int smb_recv_packet(smb_connection_t *conn, void *buffer, uint32_t max_len, int timeout_ms) {
     uint8_t header[4];
     int total_recv = 0;
-    uint64_t start = timer_ticks;
-    uint64_t timeout_ticks = smb_ms_to_ticks(timeout_ms);
+    uint64_t start = sched_now_ms();
+    uint64_t budget_ms = smb_ms_span(timeout_ms);
 
     // Receive NetBIOS header. CRITICAL (task #317): pump the NIC each
     // iteration; tcp_recv only returns data that a prior net_poll buffered.
@@ -219,11 +223,11 @@ static int smb_recv_packet(smb_connection_t *conn, void *buffer, uint32_t max_le
         int r = tcp_recv(conn->tcp_socket, header + total_recv, 4 - total_recv);
         if (r > 0) {
             total_recv += r;
-            start = timer_ticks;
+            start = sched_now_ms();
         } else if (r < 0 && r != TCP_ERR_WOULD_BLOCK) {
             return -1;
         }
-        if (timer_ticks - start > timeout_ticks) {
+        if (sched_now_ms() - start > budget_ms) {
             kprintf("[SMB] Receive timeout waiting for header\n");
             return -1;
         }
@@ -238,7 +242,7 @@ static int smb_recv_packet(smb_connection_t *conn, void *buffer, uint32_t max_le
 
     // Receive data. tcp_recv length arg is uint16_t, so chunk large payloads.
     total_recv = 0;
-    start = timer_ticks;
+    start = sched_now_ms();
     while ((uint32_t)total_recv < len) {
         smb_net_pump();
         uint32_t want = len - total_recv;
@@ -246,11 +250,11 @@ static int smb_recv_packet(smb_connection_t *conn, void *buffer, uint32_t max_le
         int r = tcp_recv(conn->tcp_socket, (uint8_t*)buffer + total_recv, (uint16_t)want);
         if (r > 0) {
             total_recv += r;
-            start = timer_ticks;
+            start = sched_now_ms();
         } else if (r < 0 && r != TCP_ERR_WOULD_BLOCK) {
             return -1;
         }
-        if (timer_ticks - start > timeout_ticks) {
+        if (sched_now_ms() - start > budget_ms) {
             kprintf("[SMB] Receive timeout waiting for data (%d/%u)\n", total_recv, len);
             return -1;
         }
@@ -1291,10 +1295,10 @@ int smb_mount_auth(uint32_t server_ip, const char *share,
     {
         extern int arp_resolve(uint32_t ip, uint8_t *mac);
         uint8_t pmac[6];
-        uint64_t astart = timer_ticks;
+        uint64_t astart = sched_now_ms();
         while (!arp_resolve(server_ip, pmac)) {
             smb_net_pump();
-            if (timer_ticks - astart > smb_ms_to_ticks(5000)) {
+            if (sched_now_ms() - astart > smb_ms_span(5000)) {
                 kprintf("[SMB] ARP for server timed out\n");
                 break;
             }
@@ -1323,12 +1327,12 @@ int smb_mount_auth(uint32_t server_ip, const char *share,
             continue;
         }
 
-        uint64_t cstart = timer_ticks;
-        uint64_t ctimeout = smb_ms_to_ticks(6000);
+        uint64_t cstart = sched_now_ms();
+        uint64_t ctimeout = smb_ms_span(6000);
         while (!tcp_is_connected(conn->tcp_socket)) {
             smb_net_pump();
             if (tcp_get_state(conn->tcp_socket) == TCP_STATE_CLOSED) break;
-            if (timer_ticks - cstart > ctimeout) break;
+            if (sched_now_ms() - cstart > ctimeout) break;
         }
 
         if (tcp_get_state(conn->tcp_socket) == TCP_STATE_ESTABLISHED) {

@@ -8,6 +8,10 @@
 #include "../string.h"
 #include "../mm/heap.h"
 #include "../proc/process.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
+#include "../sync/waitq.h"    // #746 fatlock: the canonical blocking primitive
+#include "../sync/noblock.h"  // #746 fatlock: wq_may_block(), the ONE no-block rule
+#include "../security/uaccess_smap.h"  // #19/#645: AC bracket on the caller-buffer copy
 
 // Sector buffer
 static uint8_t sector_buf[512];
@@ -29,45 +33,211 @@ static uint8_t sector_buf[512];
 //
 // Fix: a single recursive lock held across each whole public FAT operation, so
 // the entire sector_buf read-modify-write span (including multi-sector scan
-// loops) runs without another FAT context interleaving. The lock yields the CPU
-// while contended (it does NOT keep preemption disabled during disk I/O), so
-// non-FAT work keeps running; preemption is only briefly disabled around the
-// test-and-set itself. Recursive (owner-tracked) so nested public calls
-// (fat_copy -> fat_read_file/fat_write_file, fat_move -> fat_rename) are safe.
-static volatile void *g_fat_lock_owner = 0;
-static volatile int   g_fat_lock_depth = 0;
+// loops) runs without another FAT context interleaving. Recursive
+// (owner-tracked) so nested public calls (fat_copy -> fat_read_file/
+// fat_write_file, fat_move -> fat_rename) are safe.
+//
+// ===========================================================================
+// #746 fatlock: WHY THIS IS A WAIT QUEUE AND NOT A YIELD-SPIN ANY MORE
+// ===========================================================================
+// The original acquire loop was:
+//
+//     for (;;) {
+//         ...test-and-set under sched_set_preemption(false)...
+//         sched_schedule();   // another context holds it; yield and retry
+//     }
+//
+// A waiter that "yields" this way STAYS RUNNABLE. It is re-queued on the ready
+// queue by sched_schedule() (proc/process.c: prev->state == RUNNING =>
+// add_to_ready_queue) and comes straight back. That is fine against any holder
+// the scheduler will eventually re-run. It is FATAL against pid 0, because:
+//
+//   * pid 0 is deliberately NEVER re-queued when it is preempted
+//     (proc/process.c: `if (prev->pid != 0) add_to_ready_queue(prev);`, #601),
+//     and
+//   * pid 0 is ALSO the idle process, so the ONLY way it is ever selected again
+//     is the empty-ready-queue fallback (`if (!next) next = &proc_table[0];`).
+//
+// So: pid 0 takes this lock, a timer tick preempts it mid-write, it is left
+// READY but off the queue, and every other FAT toucher then yield-spins and
+// stays runnable. The ready queue can never drain, so pid 0 is never selected,
+// so the lock is never released. MEASURED on a single-partition-FAT boot
+// (3/3 hangs): g_fat_lock_owner == &proc_table[0] ("idle", pid 0),
+// g_fat_lock_depth == 2, current_process == "win16auto", proc_table[0].state ==
+// READY, ready_queue_head non-NULL on every sample, 100% of one core, serial
+// dead. pid 0 IS the desktop context and writes to FAT for the whole session,
+// so this is not a boot-only hazard.
+//
+// The fix is the project's standing rule, which this lock was violating: ALL
+// waiting goes through the wait queue (sync/waitq.h). A waiter now LEAVES the
+// ready queue, so the queue drains, so the empty-queue fallback selects pid 0,
+// which finishes its write and wakes everyone. The shape is copied from
+// drivers/usb_msc.c's msc_cmd_lock() (#617), which is the canonical in-tree
+// "hand-rolled spin -> wait queue with a counted no-block fallback".
+//
+// THE NO-BLOCK PROBLEM, AND WHAT WE DO ABOUT IT
+// ---------------------------------------------
+// fat_lock() IS reachable from contexts that must never park (sync/noblock.h:
+// scheduler not live, or proc_current()==NULL, or RFLAGS.IF clear). Measured
+// reachability, by reading the tree:
+//
+//   (a) PRE-SCHEDULER. main.c calls fat_exists()/fat_read_file() ~14 times
+//       before proc_init(). Single-threaded, so the lock is UNCONTENDED there
+//       by construction; note fat_lock_self() already returns a shared
+//       sentinel for all of them, so they also alias as one owner.
+//   (b) THE PANIC PATH. kpanic() does cli(), then panic_log_write() ->
+//       bootlog_heartbeat_flush() -> bootlog_persist() -> fat_write_file().
+//       With the OLD lock, a panic that landed while another context held the
+//       lock called sched_schedule() with IF=0 and hung the box instead of
+//       recording the panic. fs/panic.c's own fixed_slot_write() is carefully
+//       lock-free; the heartbeat flush punched a hole through it.
+//   (c) net_lock()'d TX diagnostics. drivers/usb_ecm.c calls bootlog_write()
+//       from usbnet_bulk_out(), which runs under net_lock() (cli + a PLAIN,
+//       non-irqsave spinlock) and also runs before the scheduler.
+//
+// A blocking acquire in any of those is wrong, so we do not attempt one. But
+// there is no correct way to WAIT in a context that can neither park nor
+// yield, so we do not pretend otherwise: the no-block arm spins BOUNDED and
+// then FAILS, and fat_lock() returns a bool that every caller checks. A
+// bounded, counted, loudly-reported I/O failure is strictly better than an
+// unbounded wedge, and it is the only outcome that is honest about the
+// constraint. On SMP the bounded spin can genuinely win (the holder is running
+// on another core); on a single core it cannot, and it gives up instead of
+// hanging. Either way it returns.
+//
+// Both fallback events are COUNTED rather than asserted away, because "this is
+// unreachable" is exactly the kind of claim that rots (#617).
+//
+// SMP NOTE: the test-and-set no longer relies on sched_set_preemption(), which
+// only ever disabled preemption on the LOCAL cpu and therefore never excluded
+// a second core at all. It is a compare-and-swap now, which is both correct on
+// SMP and cheaper on the uncontended path (one locked cmpxchg instead of two
+// preemption toggles). The recursive re-entry test needs no atomic: only the
+// owner can observe owner == me, and only the owner ever writes depth.
+static void * volatile g_fat_lock_owner = 0;
+static volatile int    g_fat_lock_depth = 0;
+static wait_queue_head_t g_fat_lock_wq = { .head = NULL, .lock = SPINLOCK_INIT };
+
+// Per-park deadline. Belt and braces only: fat_unlock() ALWAYS wake_up_all()s,
+// and the acquire loop re-checks the owner after __wait_prepare() (the
+// lost-wake close), so a waiter cannot miss a release. The deadline exists so
+// that if that reasoning is ever wrong the symptom is a COUNTER
+// (g_fat_lock_wait_timeouts) rather than a hang. Non-zero means the wake path
+// is broken and must be fixed; it is not a licence to leave it broken.
+#define FAT_LOCK_BLOCK_MS      10
+
+// Bound on the no-block fallback spin. ~200k pause iterations is single-digit
+// milliseconds on any plausible core.
+#define FAT_LOCK_NOBLOCK_SPINS 200000u
+
+// Iterations burned by the no-block fallback, times it gave up, and times a
+// parked waiter hit its deadline with no wake. All three should be ZERO.
+volatile uint64_t g_fat_lock_noblock_spins  = 0;
+volatile uint64_t g_fat_lock_noblock_fails  = 0;
+volatile uint64_t g_fat_lock_wait_timeouts  = 0;
+
+// #746 fatlock exclusion witness (test builds only; see fs/fat_lock_test.c).
+// Counts contexts inside the critical section. Anything other than 1 while the
+// lock is held means the lock does not exclude.
+#ifdef FAT_LOCK_SELFTEST
+volatile int      g_fat_lock_occupancy       = 0;
+volatile uint64_t g_fat_lock_excl_violations = 0;
+#endif
 
 static inline void *fat_lock_self(void) {
     void *p = (void *)proc_current();
     return p ? p : (void *)1;   // sentinel for the early-boot single-threaded path
 }
 
-static void fat_lock(void) {
-    void *me = fat_lock_self();
-    for (;;) {
-        bool old = sched_set_preemption(false);
-        if (g_fat_lock_owner == 0 || g_fat_lock_owner == me) {
-            g_fat_lock_owner = me;
-            g_fat_lock_depth++;
-            sched_set_preemption(old);
-            return;
+// Claim the lock at depth 1. Returns true if this call took it.
+static inline bool fat_lock_try(void *me) {
+#ifdef FAT_LOCK_SELFTEST_RED
+    // NEGATIVE CONTROL (`make fatlock-selftest-red`). A lock that excludes
+    // nobody: every acquire "succeeds". fs/fat_lock_test.c MUST report FAIL
+    // against this build, or the test proves nothing about the real one.
+    g_fat_lock_owner = me;
+    g_fat_lock_depth = 1;
+#else
+    if (!__sync_bool_compare_and_swap(&g_fat_lock_owner, (void *)0, me))
+        return false;
+    g_fat_lock_depth = 1;
+#endif
+#ifdef FAT_LOCK_SELFTEST
+    if (__sync_add_and_fetch(&g_fat_lock_occupancy, 1) != 1)
+        __sync_fetch_and_add(&g_fat_lock_excl_violations, 1);
+#endif
+    return true;
+}
+
+// Bounded fallback for a context that must not park. See the header comment.
+static bool fat_lock_noblock(void *me) {
+    for (uint32_t i = 0; i < FAT_LOCK_NOBLOCK_SPINS; i++) {
+        if (fat_lock_try(me)) {
+            if (__sync_fetch_and_add(&g_fat_lock_noblock_spins, i + 1) == 0)
+                kprintf("[FAT] #746: a no-block context hit contention on the FAT "
+                        "lock; the bounded fallback is NOT dead code\n");
+            return true;
         }
-        sched_set_preemption(old);
-        sched_schedule();   // another context holds it; yield and retry
+        __asm__ volatile("pause");
+    }
+    if (__sync_fetch_and_add(&g_fat_lock_noblock_fails, 1) == 0)
+        kprintf("[FAT] #746: no-block context (reason=0x%x, caller=%p) could not "
+                "take the FAT lock; REFUSING the operation rather than wedging\n",
+                (unsigned)wq_noblock_reason(), __builtin_return_address(0));
+    return false;
+}
+
+// Acquire the FAT lock. Returns false ONLY in a no-block context that lost a
+// bounded race for it; a context that is allowed to park never fails, so no
+// normal caller sees a new error path.
+static bool fat_lock(void) {
+    void *me = fat_lock_self();
+
+    // Recursive re-entry: safe without an atomic (see the SMP NOTE above).
+    if (g_fat_lock_owner == me) { g_fat_lock_depth++; return true; }
+
+    // Uncontended acquire: one cmpxchg, no queue, no lock. The common case.
+    if (fat_lock_try(me)) return true;
+
+    for (;;) {
+        if (!wq_may_block()) return fat_lock_noblock(me);
+
+        wait_queue_entry_t wqe;
+        __wait_prepare(&g_fat_lock_wq, &wqe, 0);
+        // Re-check AFTER queueing: this is the lost-wake close. If the holder
+        // released between our failed acquire and here, it either already saw
+        // us on the queue and woke us, or the owner now reads 0 and we skip
+        // the park entirely.
+        if (g_fat_lock_owner != 0) {
+            if (__wait_event_wait_deadline(&wqe, sched_now_ms() + FAT_LOCK_BLOCK_MS)
+                    == WAIT_TIMEOUT)
+                __sync_fetch_and_add(&g_fat_lock_wait_timeouts, 1);
+        }
+        __wait_finish(&g_fat_lock_wq, &wqe);
+
+        if (fat_lock_try(me)) return true;
     }
 }
 
 static void fat_unlock(void) {
-    bool old = sched_set_preemption(false);
-    if (g_fat_lock_depth > 0 && --g_fat_lock_depth == 0)
-        g_fat_lock_owner = 0;
-    sched_set_preemption(old);
+    if (g_fat_lock_depth <= 0) return;      // unbalanced release: ignore, as before
+    if (--g_fat_lock_depth == 0) {
+#ifdef FAT_LOCK_SELFTEST
+        __sync_sub_and_fetch(&g_fat_lock_occupancy, 1);
+#endif
+        __sync_lock_release(&g_fat_lock_owner);
+        // Unconditional, exactly like msc_cmd_unlock(): wake_up_all() is
+        // documented safe from IRQ context and is a NULL check on an empty
+        // queue, so it costs nothing in the uncontended case and cannot lose a
+        // wake in the contended one.
+        wake_up_all(&g_fat_lock_wq);
+    }
 }
 
 // Inner (unlocked) implementations; the public wrappers below take the FAT lock.
 static int      fat_open_inner(fat_fs_t *fs, const char *path, fat_file_t *file);
 static int      fat_read_inner(fat_file_t *file, void *buffer, uint32_t size);
-static int      fat_readdir_inner(fat_file_t *dir, fat_dir_entry_t *entry, char *name_out);
+static int      fat_readdir_inner(fat_file_t *dir, fat_dir_entry_t *entry, char *name_out, size_t name_cap);
 static void     fat_list_dir_inner(fat_fs_t *fs, const char *path);
 static int      fat_create_inner(fat_fs_t *fs, const char *path);
 static int      fat_mkdir_inner(fat_fs_t *fs, const char *path);
@@ -79,23 +249,272 @@ static int      fat_move_inner(fat_fs_t *fs, const char *src_path, const char *d
 static int      fat_write_file_inner(fat_fs_t *fs, const char *path, const void *data, uint32_t size);
 static int      fat_exists_inner(fat_fs_t *fs, const char *path);
 static uint32_t fat_get_free_clusters_inner(fat_fs_t *fs);
+// #746: fat_truncate() is grouped with the other public wrappers above the two
+// statics it uses, so they are declared here rather than the wrapper being
+// moved away from its siblings.
+static int      fat_free_cluster_chain(fat_fs_t *fs, uint32_t start_cluster);
+static int      fat_persist_dirent(fat_file_t *file);
+static int      fat_erase_name_entries(fat_fs_t *fs, fat_file_t *dir, const char *name);
 
+// #725: 8.3-ise an ext2 name into the 11-byte padded field of a synthesized
+// fat_dir_entry_t. Callers that read entry->name (dosexec's INT 21h 4Eh/4Fh
+// FindFirst/FindNext runs it back through fat11_to_dotname) then behave exactly
+// as they do on FAT. Long ext2 names truncate here; the caller's name_out still
+// receives the full name, so nothing that uses name_out loses information.
+static void ext2_name_to_83(const char *name, uint8_t out[11]) {
+    for (int i = 0; i < 11; i++) out[i] = ' ';
+    int dot = -1;
+    for (int k = 0; name[k]; k++) if (name[k] == '.') dot = k;
+    int o = 0;
+    for (int i = 0; name[i] && (dot < 0 || i < dot) && o < 8; i++) {
+        char ch = name[i];
+        if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+        out[o++] = (uint8_t)ch;
+    }
+    if (dot >= 0) {
+        o = 8;
+        for (int k = dot + 1; name[k] && o < 11; k++) {
+            char ch = name[k];
+            if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+            out[o++] = (uint8_t)ch;
+        }
+    }
+}
+
+// #725: one directory step over an ext2-backed handle. Mirrors
+// fat_readdir_inner's contract exactly: 0 = filled entry/name_out and advanced
+// the cursor, -1 = end of directory or error.
+static int fat_readdir_ext2(fat_file_t *dir, fat_dir_entry_t *entry,
+                            char *name_out, size_t name_cap) {
+    if (!dir->is_dir) return -1;
+    char nm[256];
+    uint32_t ino = 0, pos = dir->ext2_dirpos;
+    uint8_t ftype = 0;
+    if (ext2_readdir_ino(dir->ext2_ino, &pos, nm, (int)sizeof(nm), &ino, &ftype) != 0)
+        return -1;
+    dir->ext2_dirpos = pos;
+    dir->position = pos;
+    if (name_out && name_cap > 0) {
+        size_t k = 0;
+        while (k + 1 < name_cap && nm[k] != 0) { name_out[k] = nm[k]; k++; }
+        name_out[k] = 0;
+    }
+    if (entry) {
+        memset(entry, 0, sizeof(*entry));
+        ext2_name_to_83(nm, entry->name);
+        int isdir = (ftype == 2);            // EXT2_FT_DIR
+        if (ftype == 0) {                    // rev0 volume: no type in the dirent
+            int d = 0;
+            if (ext2_get_is_dir(ino, &d) == 0) isdir = d;
+        }
+        entry->attr = isdir ? FAT_ATTR_DIRECTORY : FAT_ATTR_ARCHIVE;
+        if (!isdir) {
+            ext2_inode_t in;
+            if (ext2_read_inode(ino, &in) == 0) entry->file_size = in.i_size;
+        }
+    }
+    return 0;
+}
+
+// ===========================================================================
+// #196: is `path` inside a removable drive that currently has a disk IMAGE
+// mounted on it? If so, return the drive letter and point *rel at the path
+// INSIDE the image; otherwise return 0.
+//
+// The folder /WINDIR/DRIVE_E also exists on the root filesystem, so this test
+// MUST run before the ext2 redirect below or the empty folder wins and the
+// mounted disc stays invisible. That ordering is the whole mechanism.
+// ===========================================================================
+static char fat_img_path(const char *path, const char **rel) {
+    extern int diskimg_is_mounted(char letter);
+    if (!path) return 0;
+    const char *pfx = "/WINDIR/DRIVE_";
+    int i = 0;
+    while (pfx[i]) { if (path[i] != pfx[i]) return 0; i++; }
+    char letter = path[i];
+    // #739: ANY letter, not the two hardcoded ones. Which letters may hold an
+    // image is rustkern/drvmap.rs's decision, and diskimg_is_mounted() is the
+    // single live answer to "is there a disc in it". Listing letters here again
+    // is how the three copies of the drive map drifted apart in the first place.
+    if (letter < 'A' || letter > 'Z') return 0;
+    if (!diskimg_is_mounted(letter)) return 0;
+    const char *r = path + i + 1;
+    while (*r == '/' || *r == '\\') r++;
+    if (rel) *rel = r;
+    return letter;
+}
+
+// ===========================================================================
+// #725: THE ONE PLACE A PATH BECOMES A HANDLE.
+//
+// fat_open() is the only fat_* entry point that turns a path into a fat_file_t,
+// and fat_read/fat_seek/fat_size/fat_readdir_n/fat_is_dir/fat_close are all
+// implemented on that handle. Putting the ext2-root redirect HERE therefore
+// fixes every one of them at once, plus fat_list_dir() (which is written on top
+// of fat_open + fat_readdir), plus every future caller: there is nothing left
+// for anyone to forget to add.
+//
+// This is the fix for the actual reported fault: fat_read_file() had the
+// redirect and fat_open() did not, so on an ext2-root golden a DOS program's
+// .EXE loaded (whole-file read) and then every data file it opened through
+// INT 21h 3Dh failed ("[dos] 3Dh open FAIL '/DOS/KEEN5/EGAGRAPH.CK5'"). The
+// same hole silently affected gui/ttf.c font loading, gui/thumbnailer.c,
+// gui/filebrowser.c, gui/properties.c, fs/xattr.c, fs/fat_vfs.c, fs/netfs.c and
+// exec/win16api.c, all of which fat_open() paths that live only on ext2.
+//
+// Order is ext2-first-then-FAT, matching fat_read_file()/fat_exists(): a path
+// that is not present on ext2 may still be ESP-only, so a miss falls through.
+// ===========================================================================
 int fat_open(fat_fs_t *fs, const char *path, fat_file_t *file) {
-    fat_lock(); int r = fat_open_inner(fs, path, file); fat_unlock(); return r;
+    // #196: a removable drive with a mounted image serves its files from the
+    // image. This must precede the ext2 branch (the /WINDIR/DRIVE_E folder is
+    // itself an ext2 directory, and it would otherwise shadow the disc).
+    if (file) {
+        extern int diskimg_stat(char letter, const char *relpath,
+                                uint64_t *size_out, int *isdir_out);
+        const char *rel = 0;
+        char dl = fat_img_path(path, &rel);
+        if (dl) {
+            uint64_t isz = 0; int isdir = 0;
+            if (diskimg_stat(dl, rel, &isz, &isdir)) {
+                extern uint32_t diskimg_generation(char letter);
+                memset(file, 0, sizeof(*file));
+                file->fs = fs;
+                file->img_drive = dl;
+                // #739: stamp WHICH disc this is. Everything below re-resolves
+                // img_rel on the drive, so this is the only thing that ties the
+                // handle to the disc that was actually opened.
+                file->img_gen = diskimg_generation(dl);
+                { size_t k = 0;
+                  while (k + 1 < sizeof(file->img_rel) && rel[k]) { file->img_rel[k] = rel[k]; k++; }
+                  file->img_rel[k] = 0; }
+                file->is_dir = isdir;
+                // A handle exposes a 32-bit size. Every real CD file is well
+                // under 4 GiB (the largest on the target discs is 500 MB), and
+                // clamping is safer than wrapping if one ever is not.
+                file->file_size = (isz > 0xFFFFFFFFULL) ? 0xFFFFFFFFu : (uint32_t)isz;
+                file->attr = isdir ? FAT_ATTR_DIRECTORY : FAT_ATTR_ARCHIVE;
+                file->position = 0;
+                file->open = 1;
+                { const char *b = rel, *q = rel;
+                  for (; *q; q++) if (*q == '/' || *q == '\\') b = q + 1;
+                  size_t k = 0;
+                  while (k + 1 < sizeof(file->name) && b[k]) { file->name[k] = b[k]; k++; }
+                  file->name[k] = 0; }
+                return 0;
+            }
+            // Mounted, but the disc does not have this path: report a miss
+            // rather than falling through to the (empty) /WINDIR folder, so a
+            // mounted disc is authoritative for its own drive letter.
+            return -1;
+        }
+    }
+    if (file && fat_path_on_ext2(fs, path)) {
+        uint32_t ino = ext2_resolve_path(fat_ext2_vol_path(path));
+        ext2_inode_t in;
+        if (ino != 0 && ext2_read_inode(ino, &in) == 0) {
+            memset(file, 0, sizeof(*file));
+            file->fs = fs;
+            file->ext2_ino = ino;
+            file->ext2_dirpos = 0;
+            file->is_dir = ((in.i_mode & 0xF000) == 0x4000) ? 1 : 0;
+            file->file_size = file->is_dir ? 0 : in.i_size;
+            file->attr = file->is_dir ? FAT_ATTR_DIRECTORY : FAT_ATTR_ARCHIVE;
+            file->position = 0;
+            file->open = 1;
+            {   // file->name is the basename, as fat_open_inner leaves it
+                const char *b = path, *q = path;
+                for (; *q; q++) if (*q == '/') b = q + 1;
+                size_t k = 0;
+                while (k + 1 < sizeof(file->name) && b[k] != 0) { file->name[k] = b[k]; k++; }
+                file->name[k] = 0;
+            }
+            return 0;
+        }
+        // not on ext2: fall through to the FAT ESP below
+    }
+    if (!fat_lock()) return -1;
+    int r = fat_open_inner(fs, path, file); fat_unlock(); return r;
 }
 int fat_read(fat_file_t *file, void *buffer, uint32_t size) {
-    fat_lock(); int r = fat_read_inner(file, buffer, size); fat_unlock(); return r;
+    // #196: image-backed handle. diskimg_read_range streams out of the image
+    // through the imgfile cache, so a 454 MB file on a mounted CD reads without
+    // ever being resident.
+    if (file && file->open && file->img_drive) {
+        extern int64_t diskimg_read_range_gen(char letter, uint32_t gen, const char *relpath,
+                                              uint64_t off, uint64_t len, void *dst);
+        if (file->is_dir || !buffer) return -1;
+        if (file->position >= file->file_size) return 0;
+        uint32_t avail = file->file_size - file->position;
+        if (size > avail) size = avail;
+        if (size == 0) return 0;
+        // #739: pass the stamp. If the disc was ejected or swapped since
+        // fat_open(), this FAILS. A guest gets a read error, which is what a
+        // program that had its disc pulled should see, instead of plausible
+        // bytes off a different disc.
+        int64_t got = diskimg_read_range_gen(file->img_drive, file->img_gen, file->img_rel,
+                                             file->position, size, buffer);
+        if (got < 0) return -1;
+        file->position += (uint32_t)got;
+        return (int)got;
+    }
+    // #725: ext2-backed handle. Bounded streaming read (ext2_read_file_range
+    // touches only the covering blocks, #572), so a large file does not need a
+    // whole-file kmalloc.
+    if (file && file->open && file->ext2_ino) {
+        if (file->is_dir || !buffer) return -1;
+        if (file->position >= file->file_size) return 0;
+        uint32_t avail = file->file_size - file->position;
+        if (size > avail) size = avail;
+        if (size == 0) return 0;
+        int64_t got = ext2_read_file_range(file->ext2_ino, file->position, size, buffer);
+        if (got < 0) return -1;
+        file->position += (uint32_t)got;
+        return (int)got;
+    }
+    if (!fat_lock()) return -1;
+    int r = fat_read_inner(file, buffer, size); fat_unlock(); return r;
 }
-int fat_readdir(fat_file_t *dir, fat_dir_entry_t *entry, char *name_out) {
-    fat_lock(); int r = fat_readdir_inner(dir, entry, name_out); fat_unlock(); return r;
+int fat_readdir_n(fat_file_t *dir, fat_dir_entry_t *entry, char *name_out, size_t name_cap) {
+    // #196: image-backed directory. `position` is the entry INDEX here (a byte
+    // offset would mean exposing the image's on-disc record layout to callers).
+    if (dir && dir->open && dir->img_drive) {
+        extern int diskimg_readdir_n_gen(char letter, uint32_t gen, const char *relpath,
+                                         unsigned index, char *name_out, int name_cap,
+                                         int *isdir_out, unsigned *size_out);
+        if (!dir->is_dir) return -1;
+        char nm[128]; int isdir = 0; unsigned sz = 0;
+        // #739: same stamp check as fat_read. A directory cursor that survived
+        // a disc swap would otherwise walk the NEW disc from the OLD index.
+        if (diskimg_readdir_n_gen(dir->img_drive, dir->img_gen, dir->img_rel, dir->position,
+                                  nm, (int)sizeof nm, &isdir, &sz) != 1)
+            return -1;
+        dir->position++;
+        if (name_out && name_cap > 0) {
+            size_t k = 0;
+            while (k + 1 < name_cap && nm[k]) { name_out[k] = nm[k]; k++; }
+            name_out[k] = 0;
+        }
+        if (entry) {
+            memset(entry, 0, sizeof(*entry));
+            ext2_name_to_83(nm, entry->name);
+            entry->attr = isdir ? FAT_ATTR_DIRECTORY : FAT_ATTR_ARCHIVE;
+            if (!isdir) entry->file_size = sz;
+        }
+        return 0;
+    }
+    if (dir && dir->open && dir->ext2_ino) return fat_readdir_ext2(dir, entry, name_out, name_cap);
+    if (!fat_lock()) return -1;
+    int r = fat_readdir_inner(dir, entry, name_out, name_cap); fat_unlock(); return r;
 }
 void fat_list_dir(fat_fs_t *fs, const char *path) {
-    fat_lock(); fat_list_dir_inner(fs, path); fat_unlock();
+    if (!fat_lock()) return;
+    fat_list_dir_inner(fs, path); fat_unlock();
 }
 // #99 cutover: true when ext2 is the root fs and `path` is a normal "/" path
 // that should be served from the ext2 volume. The UEFI ESP paths (/boot, /EFI)
 // are never redirected; they must stay on the FAT ESP the firmware boots from.
-static int fat_path_on_ext2(fat_fs_t *fs, const char *path) {
+int fat_path_on_ext2(fat_fs_t *fs, const char *path) {
     extern fat_fs_t g_fat_fs;
     if (!g_root_ext2 || fs != &g_fat_fs || !path || path[0] != '/') return 0;
     if (path[1]=='b'&&path[2]=='o'&&path[3]=='o'&&path[4]=='t'&&(path[5]=='/'||path[5]==0)) return 0;
@@ -103,12 +522,12 @@ static int fat_path_on_ext2(fat_fs_t *fs, const char *path) {
     return 1;
 }
 
-// #316: map a fat-layer path to its ext2-volume path. Userland strips the
+// #316/#725: map a fat-layer path to its ext2-volume path. Userland strips the
 // "/ext2" mount prefix in sys_open (ext2_relpath); kernel-internal callers of
 // fat_*_file may still pass "/ext2/...", so strip it here too ("/ext2/a"->"/a",
 // "/ext2"->"/"). All other paths (incl. /HOME, /CONFIG, /APPS) pass through
 // unchanged, so existing ext2-root persistence is unaffected.
-static const char *ext2_vol_path(const char *path) {
+const char *fat_ext2_vol_path(const char *path) {
     if (path && path[0]=='/' && path[1]=='e' && path[2]=='x' && path[3]=='t' &&
         path[4]=='2' && (path[5]=='/' || path[5]==0))
         return (path[5]==0) ? "/" : (path+5);
@@ -118,31 +537,112 @@ static const char *ext2_vol_path(const char *path) {
 int fat_create(fat_fs_t *fs, const char *path) {
     // Create an (empty) file on ext2 when it is root; ext2 has no standalone
     // create, so an empty write produces a zero-length file.
-    if (fat_path_on_ext2(fs, path)) return (ext2_write_file(ext2_vol_path(path), "", 0) == 0) ? 0 : -1;
-    fat_lock(); int r = fat_create_inner(fs, path); fat_unlock(); return r;
+    if (fat_path_on_ext2(fs, path)) return (ext2_write_file(fat_ext2_vol_path(path), "", 0) == 0) ? 0 : -1;
+    if (!fat_lock()) return -1;
+    int r = fat_create_inner(fs, path); fat_unlock(); return r;
 }
 int fat_mkdir(fat_fs_t *fs, const char *path) {
-    if (fat_path_on_ext2(fs, path)) return (ext2_mkdir(ext2_vol_path(path)) == 0) ? 0 : -1;
-    fat_lock(); int r = fat_mkdir_inner(fs, path); fat_unlock(); return r;
+    // task #578: preserve ext2_mkdir()'s distinct "-2 == already exists"
+    // return instead of collapsing every non-zero result to a generic -1.
+    // Callers up the stack (sys_mkdir -> userland mkdir() -> errno) rely on
+    // being able to tell "the directory is already there" (POSIX EEXIST=17)
+    // apart from a real failure; collapsing both to -1 made EVERY caller's
+    // EEXIST check (e.g. ioquake3's Sys_Mkdir/FS_CreatePath, ported
+    // verbatim in userland/apps/openarena/sys_maytera.c) silently wrong,
+    // not just for OpenArena. -17 matches userland/libc/errno.h's EEXIST so
+    // unistd.c's mkdir() (fixed alongside this) can set errno=17 directly.
+    if (fat_path_on_ext2(fs, path)) {
+        int er = ext2_mkdir(fat_ext2_vol_path(path));
+        if (er == 0) return 0;
+        if (er == -2) return -17;   // EEXIST
+        return -1;
+    }
+    if (!fat_lock()) return -1;
+    int r = fat_mkdir_inner(fs, path); fat_unlock(); return r;
 }
 int fat_delete(fat_fs_t *fs, const char *path) {
     if (fat_path_on_ext2(fs, path)) {
-        if (ext2_unlink(ext2_vol_path(path)) == 0) return 0;
+        int er = ext2_unlink(fat_ext2_vol_path(path));
+        if (er == 0) return 0;
+        // #736: -2 means "that is a DIRECTORY", which ext2_unlink refuses by
+        // design. fat.h documents fat_delete as removing "a file or empty
+        // directory", so the directory case has to go somewhere, and falling
+        // through to the FAT ESP (which does not have the file at all) turned
+        // it into a silent failure on every ext2-rooted image. INT 21h AH=3Ah
+        // measured cf=1 ax=0005 because of exactly this.
+        if (er == -2) {
+            int rr = ext2_rmdir(fat_ext2_vol_path(path));
+            if (rr == 0) return 0;
+            return rr;            // -3 = not empty, preserved for the caller
+        }
         // not on ext2 (or failed): fall back to FAT (file may be ESP-only)
     }
-    fat_lock(); int r = fat_delete_inner(fs, path); fat_unlock(); return r;
+    if (!fat_lock()) return -1;
+    int r = fat_delete_inner(fs, path); fat_unlock(); return r;
 }
 int fat_rename(fat_fs_t *fs, const char *old_path, const char *new_path) {
-    // ext2 has no in-place rename; emulate with copy + delete (both of which
-    // route to ext2 via the hooks above). Works for regular files.
+    // #746: ext2 DOES have an in-place rename now (ext2_rename), and this used
+    // to be fat_copy + fat_delete: it read and rewrote every byte, so a failure
+    // half way left the destination TRUNCATED. That is precisely why
+    // write-temp-then-rename was not a safe save on this system. Relink instead;
+    // no file data is touched at all.
     if (fat_path_on_ext2(fs, old_path) && fat_path_on_ext2(fs, new_path)) {
-        if (fat_copy(fs, old_path, new_path) != 0) return -1;
-        return fat_delete(fs, old_path);
+        int er = ext2_rename(fat_ext2_vol_path(old_path), fat_ext2_vol_path(new_path));
+        if (er == 0) return 0;
+        // -2 means "one endpoint is a directory", which ext2_rename refuses by
+        // design. Fall back to the old copy+delete for THAT case only, so the
+        // Files app keeps working on directories; a regular-file rename never
+        // reaches a data copy again.
+        if (er == -2) {
+            if (fat_copy(fs, old_path, new_path) != 0) return -1;
+            return fat_delete(fs, old_path);
+        }
+        return -1;
     }
-    fat_lock(); int r = fat_rename_inner(fs, old_path, new_path); fat_unlock(); return r;
+    if (!fat_lock()) return -1;
+    int r = fat_rename_inner(fs, old_path, new_path); fat_unlock(); return r;
 }
+// #746 O_TRUNC. The legacy FAT open path ignored the flags word entirely, so
+// O_TRUNC on an existing FAT file was a NO-OP: the new contents were written
+// over the old ones from byte 0 and everything past the new end survived as a
+// stale tail, while the SAME flag on the ext2 root emptied the file. Two
+// filesystems, one flag, opposite behaviour, and nothing said so.
+//
+// Empties the file: frees the cluster chain and writes size 0 / cluster 0 back
+// to the directory entry. The handle is left usable and positioned at 0.
+// Refuses the two backings that have no FAT cluster chain, for the same reason
+// fat_write() refuses them.
+int fat_truncate(fat_file_t *file) {
+    if (!file || !file->fs || !file->open) return -1;
+    if (file->img_drive) return -1;     // #196 read-only disk image
+    if (file->ext2_ino)  return -1;     // #725 ext2-backed handle
+    if (file->is_dir)    return -1;
+    if (!fat_lock()) return -1;
+    int rc = 0;
+    if (file->first_cluster >= 2) {
+        if (fat_free_cluster_chain(file->fs, file->first_cluster) != 0) rc = -1;
+    }
+    file->first_cluster   = 0;
+    file->current_cluster = 0;
+    file->file_size       = 0;
+    file->position        = 0;
+    if (fat_persist_dirent(file) != 0) rc = -1;
+    fat_unlock();
+    return rc;
+}
+
 int fat_write(fat_file_t *file, const void *buffer, uint32_t size) {
-    fat_lock(); int r = fat_write_inner(file, buffer, size); fat_unlock(); return r;
+    // #725: an ext2-backed handle has no FAT cluster chain, so fat_write_inner
+    // would write into whatever cluster 0 maps to. Refuse honestly instead.
+    // Whole-file and append writes to ext2 go through fat_write_file() /
+    // ext2_append_file(); handle-based streaming write to ext2 is not
+    // implemented (see the CHANGELOG note on INT 21h 40h).
+    // #196: no write-back to a mounted disk image is implemented, and E: is a
+    // CD-ROM in any case. Refuse rather than corrupt or silently no-op.
+    if (file && file->img_drive) return -1;
+    if (file && file->ext2_ino) return -1;
+    if (!fat_lock()) return -1;
+    int r = fat_write_inner(file, buffer, size); fat_unlock(); return r;
 }
 int fat_copy(fat_fs_t *fs, const char *src_path, const char *dst_path) {
     // #316: fat_copy_inner uses raw FAT file handles (fat_open/read/write),
@@ -158,10 +658,28 @@ int fat_copy(fat_fs_t *fs, const char *src_path, const char *dst_path) {
         kfree(data);
         return rc;
     }
-    fat_lock(); int r = fat_copy_inner(fs, src_path, dst_path); fat_unlock(); return r;
+    if (!fat_lock()) return -1;
+    int r = fat_copy_inner(fs, src_path, dst_path); fat_unlock(); return r;
 }
 int fat_move(fat_fs_t *fs, const char *src_path, const char *dst_path) {
-    fat_lock(); int r = fat_move_inner(fs, src_path, dst_path); fat_unlock(); return r;
+    // #725: fat_move had NO ext2 redirect while its sibling fat_rename did, so
+    // Files' cut+paste of an ext2-root file moved nothing (fat_move_inner only
+    // ever saw the FAT ESP). ext2 has no in-place rename, so do the same
+    // copy+delete fat_rename() does; both halves route through the hooks above.
+    if (fat_path_on_ext2(fs, src_path) || fat_path_on_ext2(fs, dst_path)) {
+        // #746: when BOTH ends are on ext2 this is a rename, so relink instead
+        // of copying every byte. A cross-volume move (one end on the FAT ESP)
+        // genuinely has to copy, and keeps the old path.
+        if (fat_path_on_ext2(fs, src_path) && fat_path_on_ext2(fs, dst_path)) {
+            int er = ext2_rename(fat_ext2_vol_path(src_path), fat_ext2_vol_path(dst_path));
+            if (er == 0) return 0;
+            if (er != -2) return -1;   // -2 = directory: fall through to copy
+        }
+        if (fat_copy(fs, src_path, dst_path) != 0) return -1;
+        return fat_delete(fs, src_path);
+    }
+    if (!fat_lock()) return -1;
+    int r = fat_move_inner(fs, src_path, dst_path); fat_unlock(); return r;
 }
 int fat_write_file(fat_fs_t *fs, const char *path, const void *data, uint32_t size) {
     // (#133) Complete the ext2-root cutover: "/" writes must land on the ext2
@@ -169,14 +687,32 @@ int fat_write_file(fat_fs_t *fs, const char *path, const void *data, uint32_t si
     // this, writes went to the FAT ESP while reads came from ext2 - so a written
     // file (e.g. C:\WINDOWS\WIN.INI under /WINDIR) could never be read back.
     // /boot and /EFI stay on the FAT ESP (excluded by fat_path_on_ext2).
-    if (fat_path_on_ext2(fs, path)) return (ext2_write_file(ext2_vol_path(path), data, size) == 0) ? 0 : -1;
-    fat_lock(); int r = fat_write_file_inner(fs, path, data, size); fat_unlock(); return r;
+    if (fat_path_on_ext2(fs, path)) return (ext2_write_file(fat_ext2_vol_path(path), data, size) == 0) ? 0 : -1;
+    if (!fat_lock()) return -1;
+    int r = fat_write_file_inner(fs, path, data, size); fat_unlock(); return r;
 }
 int fat_exists(fat_fs_t *fs, const char *path) {
-    fat_lock(); int r = fat_exists_inner(fs, path); fat_unlock(); return r;
+    // #99 Phase C / #568: mirror fat_read_file's ext2-root dispatch. With ext2
+    // as the root fs, an existence test on a normal "/" path must consult the
+    // ext2 volume FIRST; fat_exists_inner (below) only sees the FAT ESP, so it
+    // falsely reported every ext2-only file (e.g. /CONFIG/PASSWD, /APPS/*) as
+    // absent (#568). ext2_resolve_path returns a non-zero inode for a present
+    // file OR directory without reading it, and 0 if absent (or ext2 unmounted,
+    // so this is safe when ext2 is not the root). Fall through to the FAT ESP
+    // check when the path is not on ext2, or when ext2 does not have it (an
+    // ESP-only file), matching fat_read_file's ext2-first-then-FAT fallback.
+    if (fat_path_on_ext2(fs, path)) {
+        if (ext2_resolve_path(fat_ext2_vol_path(path)) != 0) return 1;
+        // not present on ext2: fall through to the FAT ESP check below
+    }
+    // A lock failure must NOT read as "present": callers test this for
+    // truth, so -1 would mean the opposite of what happened.
+    if (!fat_lock()) return 0;
+    int r = fat_exists_inner(fs, path); fat_unlock(); return r;
 }
 uint32_t fat_get_free_clusters(fat_fs_t *fs) {
-    fat_lock(); uint32_t r = fat_get_free_clusters_inner(fs); fat_unlock(); return r;
+    if (!fat_lock()) return 0;
+    uint32_t r = fat_get_free_clusters_inner(fs); fat_unlock(); return r;
 }
 
 // Helper to extract channel and drive from drive ID
@@ -336,12 +872,15 @@ static int fat_read_cluster(fat_fs_t *fs, uint32_t cluster, void *buffer) {
 // sequence is unsafe to reuse there). This is the same raw primitive every
 // other write path in this file already funnels through; exposing it does not
 // change any existing locked call site.
+// #742: 0 on success, -1 on failure. blk_write() speaks in SECTOR COUNTS; this
+// is the boundary where that is translated into fat.h's 0/-1 status polarity,
+// so no caller of a fat_* function has to remember which convention it is in.
 int fat_write_sector(fat_fs_t *fs, uint32_t sector, const void *buffer) {
     fat_cache_invalidate();   // a FAT-region write may change next-cluster links
     uint32_t lba = fs->part_start_lba + sector;
     uint8_t channel = drive_to_channel(fs->drive);
     uint8_t unit = drive_to_unit(fs->drive);
-    return blk_write(channel, unit, lba, 1, buffer);
+    return (blk_write(channel, unit, lba, 1, buffer) == 1) ? 0 : -1;
 }
 
 // Write multiple sectors
@@ -400,14 +939,22 @@ static int fat_set_fat_entry(fat_fs_t *fs, uint32_t cluster, uint32_t value) {
     }
 
     // Write back FAT sector (to both FAT copies)
-    if (fat_write_sector(fs, fat_sector, sector_buf) <= 0) {
+    if (fat_write_sector(fs, fat_sector, sector_buf) != 0) {
         return -1;
     }
 
     // Write to second FAT if present
     if (fs->num_fats > 1) {
         uint32_t fat2_sector = fat_sector + fs->fat_size;
-        fat_write_sector(fs, fat2_sector, sector_buf);
+        // #695: was unchecked. A lost mirror write leaves FAT2 disagreeing with
+        // FAT1. Deliberately NOT fatal: FAT1 is authoritative here and already
+        // landed, so failing now would make the caller treat the allocation as
+        // failed and leak the cluster it just claimed. Log it loudly instead,
+        // because a silently divergent mirror is what a later repair tool may
+        // "fix" in the wrong direction.
+        if (fat_write_sector(fs, fat2_sector, sector_buf) != 0)
+            kprintf("[FAT] FAT mirror write FAILED (sector %u); FAT2 now stale\n",
+                    fat2_sector);
     }
 
     return 0;
@@ -898,7 +1445,7 @@ static int dir_write_entry(fat_fs_t *fs, fat_file_t *dir, uint32_t idx, const ui
     if (dir_locate(fs, dir, idx, &sec, &off, 1) != 0) return -1;
     if (fat_read_sector(fs, sec, sector_buf) <= 0) return -1;
     memcpy(sector_buf + off, in32, 32);
-    if (fat_write_sector(fs, sec, sector_buf) <= 0) return -1;
+    if (fat_write_sector(fs, sec, sector_buf) != 0) return -1;
     return 0;
 }
 
@@ -955,6 +1502,9 @@ _Static_assert(sizeof(fat_parsed_entry_t) == 292, "fat_parsed_entry_t must be 29
 #define FAT_STEP_CONTINUE 0   // LFN fragment or 0xE5 deleted entry consumed
 #define FAT_STEP_SHORT    1   // short entry decoded into *out
 #define FAT_STEP_END      2   // 0x00 end-of-directory marker
+// #490: downstream caller name buffers are 256 bytes == 255 chars + NUL.
+// Both fat_dir_step_c and fat_dir_step_rs cap the emitted name to this.
+#define FAT_NAME_MAX      255
 
 // Rust mirror (rustkern.rs), live under -DRUST_FAT. It CONFINES the reachable
 // overflow the C reference has downstream (see below).
@@ -968,10 +1518,14 @@ extern int fat_dir_step_rs(fat_lfn_state_t *st, const uint8_t *e, fat_parsed_ent
 // the original readdir/lookup) - kept identical so the differential is honest.
 //
 // The internal longname[260] reassembly is self-contained safe (the
-// (seq-1)*13<255 guard caps the last write index at 259). The REACHABLE overflow
-// is DOWNSTREAM: this reference can emit a name of up to 259 chars, and
-// fat_readdir_inner then strcpy()s it into a caller buffer that is only 256 (and
-// as small as 64 / 16 at two call sites). See fat_rust_selftest's [RUST-SEC].
+// (seq-1)*13<255 guard caps the last write index at 259). #490 HARDENING
+// (2026-07-26): the OLD reference could EMIT a name of up to 259 chars, which
+// fat_readdir_inner then strcpy()s into a 256-byte caller buffer -> a REACHABLE
+// heap overflow on a crafted LFN set when this C fallback ships (-DRUST_FAT
+// dropped). It now caps the emitted name at FAT_NAME_MAX (255), matching
+// fat_dir_step_rs; on any real name (< 256 chars) it is byte-identical to before.
+// It still does NOT validate the LFN checksum (neither did the original
+// readdir/lookup). See fat_rust_selftest's [RUST-SEC].
 int fat_dir_step_c(fat_lfn_state_t *st, const uint8_t *e, fat_parsed_entry_t *out) {
     uint8_t b = e[0];
     if (b == 0x00) return FAT_STEP_END;
@@ -987,7 +1541,15 @@ int fat_dir_step_c(fat_lfn_state_t *st, const uint8_t *e, fat_parsed_entry_t *ou
     }
     // short entry
     memcpy(out->raw, e, 32);
-    if (st->have_long) { st->longname[259] = 0; strcpy(out->name, st->longname); }
+    if (st->have_long) {
+        st->longname[259] = 0;
+        // #490 confinement: copy at most FAT_NAME_MAX (255) chars, stopping
+        // at the first NUL, so the downstream strcpy(name_out, out->name) in
+        // fat_readdir_inner cannot overflow a 256-byte caller buffer.
+        int k = 0;
+        while (k < FAT_NAME_MAX && st->longname[k] != 0) { out->name[k] = st->longname[k]; k++; }
+        out->name[k] = 0;
+    }
     else fat_name_to_str(e, out->name);
     return FAT_STEP_SHORT;
 }
@@ -1231,6 +1793,16 @@ static int fat_open_inner(fat_fs_t *fs, const char *path, fat_file_t *file) {
 // Close file
 void fat_close(fat_file_t *file) {
     file->open = 0;
+    // #725: clear the ext2 backing too, so a reused stack handle cannot be
+    // mistaken for an ext2 handle by fat_read/fat_write after a failed reopen.
+    file->ext2_ino = 0;
+    file->ext2_dirpos = 0;
+    // #196: and the disk-image backing, for the same reason. A stale img_drive
+    // on a reused stack handle would send the next fat_read at a disc that is
+    // no longer the one this handle was opened on.
+    file->img_drive = 0;
+    file->img_rel[0] = 0;
+    file->img_gen = 0;
 }
 
 // Read from file
@@ -1267,7 +1839,13 @@ static int fat_read_inner(fat_file_t *file, void *buffer, uint32_t size) {
                                   (size - bytes_read) : bytes_in_cluster;
 
         // kprintf("[FAT] memcpy dest=%p src=%p len=%u\n", out + bytes_read, cluster_buf + cluster_offset, bytes_to_copy);
-        memcpy(out + bytes_read, cluster_buf + cluster_offset, bytes_to_copy);
+        // #19/#645: `out` is the CALLER's buffer, and on the sys_read path it
+        // is a raw Ring-3 pointer (proc/fdlayer.c hands it straight through).
+        // fat_read() also has many kernel callers, so this is an AC bracket on
+        // the one copy rather than a copy_to_user.
+        {   uaccess_ac_t __ac = uaccess_begin();
+            memcpy(out + bytes_read, cluster_buf + cluster_offset, bytes_to_copy);
+            uaccess_end(__ac); }
         bytes_read += bytes_to_copy;
         file->position += bytes_to_copy;
 
@@ -1297,6 +1875,14 @@ uint32_t fat_size(fat_file_t *file) {
 int fat_seek(fat_file_t *file, uint32_t position) {
     if (!file->open) return -1;
     if (position > file->file_size) position = file->file_size;
+    // #725: an ext2-backed handle has no cluster chain to walk; the position IS
+    // the state (ext2_read_file_range takes an absolute byte offset). This is
+    // what makes INT 21h 42h (lseek) work on an ext2 root.
+    // #196: an image-backed handle has no cluster chain either; the position is
+    // an absolute byte offset handed straight to diskimg_read_range. This is
+    // what makes INT 21h 42h (lseek) work on a mounted CD.
+    if (file->img_drive) { file->position = position; return 0; }
+    if (file->ext2_ino) { file->position = position; return 0; }
 
     fat_fs_t *fs = file->fs;
     uint32_t bytes_per_cluster = fs->sectors_per_cluster * fs->bytes_per_sector;
@@ -1316,7 +1902,7 @@ int fat_seek(fat_file_t *file, uint32_t position) {
 }
 
 // Read directory entry
-static int fat_readdir_inner(fat_file_t *dir, fat_dir_entry_t *entry, char *name_out) {
+static int fat_readdir_inner(fat_file_t *dir, fat_dir_entry_t *entry, char *name_out, size_t name_cap) {
     if (!dir->open || !dir->is_dir) return -1;
 
     fat_fs_t *fs = dir->fs;
@@ -1343,10 +1929,15 @@ static int fat_readdir_inner(fat_file_t *dir, fat_dir_entry_t *entry, char *name
         if (r == FAT_STEP_END) { dir->position = (idx + 1) * 32; return -1; }
         if (r == FAT_STEP_SHORT) {
             memcpy(entry, pe.raw, 32);
-            // Under -DRUST_FAT pe.name is confined to <=255 chars (fits every
-            // >=256-byte caller). The C reference can emit up to 259 chars here
-            // (the reachable overflow this port removes on the live path).
-            strcpy(name_out, pe.name);
+            // #591 bounded emit: copy at most name_cap-1 chars + NUL, never
+            // past the caller's buffer. pe.name is already <=255 (the #490 cap /
+            // -DRUST_FAT), but bounding here makes the primitive safe for ANY
+            // buffer size, so a smaller caller truncates instead of overflowing.
+            if (name_cap > 0) {
+                size_t k = 0;
+                while (k + 1 < name_cap && pe.name[k] != 0) { name_out[k] = pe.name[k]; k++; }
+                name_out[k] = 0;
+            }
             dir->position = (idx + 1) * 32;
             return 0;
         }
@@ -1432,7 +2023,6 @@ static int fat_walk(const uint8_t *dir, int nent, char out_names[][260], int use
 }
 
 void fat_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     static uint8_t buf[2048];
     static char names_c[8][260];
     static char names_r[8][260];
@@ -1522,10 +2112,16 @@ void fat_rust_selftest(void) {
             if (lr > 255) r_overlong++;
             if (lc != lr) divergences++;
         }
-        kprintf("[RUST-SEC] fat: REACHABLE - C emits >255-char LFN name %u/%u (overflows 256-byte name_buf downstream); Rust confined %u/%u; divergences=%u\n",
-                c_overlong, n, r_overlong, n, divergences);
-        bootlog_write("[RUST-SEC] fat: C overlong %u/%u (reachable name_buf overflow) Rust confined %u/%u div=%u",
-                      c_overlong, n, r_overlong, n, divergences);
+        // #490 REGRESSION GUARD (2026-07-26): fat_dir_step_c is now hardened to
+        // cap the emitted name at 255 chars, matching fat_dir_step_rs, so on
+        // these crafted 256..259-char LFN sets BOTH paths must confine and the
+        // downstream strcpy into a 256-byte name_buf can no longer overflow.
+        const char *sverdict = (c_overlong == 0 && r_overlong == 0) ? "PASS" : "FAIL";
+        kprintf("[RUST-SEC] fat: #490 both paths confine crafted 256..259-char LFN names to <=255 - "
+                "C overlong=%u/%u Rust overlong=%u/%u divergences=%u -> %s\n",
+                c_overlong, n, r_overlong, n, divergences, sverdict);
+        bootlog_write("[RUST-SEC] fat: #490 C overlong=%u/%u Rust overlong=%u/%u div=%u -> %s",
+                      c_overlong, n, r_overlong, n, divergences, sverdict);
     }
 
     // Part 3: RDTSC micro-benchmark over a fixed well-formed directory. LIGHT: 5k.
@@ -1640,24 +2236,21 @@ void *fat_read_file(fat_fs_t *fs, const char *path, uint32_t *size_out) {
         extern void *nfs_vfs_read_whole(const char *p, uint32_t *sz);
         return nfs_vfs_read_whole(path, size_out);
     }
-    // #196: a removable drive (A:/E:) with a disk image mounted serves its files
-    // from the image, not the /WINDIR folder. diskimg_try_read returns non-NULL
-    // ONLY for "/WINDIR/DRIVE_E|A/.." paths when an image is mounted there; it is
-    // inert (returns NULL) for every other path, so the no-mount case is unchanged.
-    if (fs == &g_fat_fs && path) {
-        extern void *diskimg_try_read(const char *p, unsigned int *sz);
-        unsigned int isz = 0;
-        void *ib = diskimg_try_read(path, &isz);
-        if (ib) { if (size_out) *size_out = isz; return ib; }
-    }
+    // #196: a removable drive (A:/E:) with a mounted disk image is handled by
+    // the ONE redirect in fat_open() below, which this function falls through
+    // to. It used to be hooked here INSTEAD, and that was the #725 defect in
+    // miniature: whole-file reads saw the disc and handle-based opens did not.
     // #99 Phase C: with ext2 as the root fs, serve "/" reads from the ext2
     // volume first; fall back to FAT when a file is not on ext2. The FAT ESP /
     // boot paths (/boot, /EFI) are never redirected (UEFI loads from them).
-    if (g_root_ext2 && fs == &g_fat_fs && path && path[0] == '/' &&
-        !(path[1]=='b' && path[2]=='o' && path[3]=='o' && path[4]=='t') &&
-        !(path[1]=='E' && path[2]=='F' && path[3]=='I')) {
+    // #725: this used to be an INLINE SECOND COPY of the fat_path_on_ext2()
+    // test, and it had already drifted: it matched any path merely STARTING
+    // "/boot"/"/EFI" (no separator check), so "/bootcfg.txt" would have been
+    // read from the FAT ESP while fat_write_file() wrote it to ext2. One
+    // predicate now, shared with every other entry point.
+    if (fat_path_on_ext2(fs, path)) {
         uint32_t esz = 0;
-        void *eb = ext2_read_whole(ext2_vol_path(path), &esz);
+        void *eb = ext2_read_whole(fat_ext2_vol_path(path), &esz);
         if (eb) { if (size_out) *size_out = esz; return eb; }
         // not present on ext2: fall through to the FAT read below
     }
@@ -1875,10 +2468,13 @@ static int fat_mkdir_inner(fat_fs_t *fs, const char *path) {
     }
 
     // Check if directory already exists
+    // task #578: -17 (EEXIST), not a generic -1, matching the ext2-redirect
+    // fix above in fat_mkdir() so both backends give callers the same
+    // already-exists signal instead of an indistinguishable hard failure.
     fat_file_t test_dir;
     if (fat_open(fs, path, &test_dir) == 0) {
         fat_close(&test_dir);
-        return -1;  // Already exists
+        return -17;  // Already exists (EEXIST)
     }
 
     // Open parent directory
@@ -2013,19 +2609,32 @@ static int fat_delete_inner(fat_fs_t *fs, const char *path) {
         return -1;
     }
 
-    fat_dir_entry_t e; uint32_t sidx = 0, fidx = 0;
-    if (fat_lookup(fs, parent_dir.first_cluster, filename, &e, &sidx, &fidx) != 0) {
+    if (fat_erase_name_entries(fs, &parent_dir, filename) != 0) {
         fat_close(&parent_dir);
         return -1;  // Entry not found
     }
-    for (uint32_t i = fidx; i <= sidx; i++) {
-        uint8_t buf[32];
-        if (dir_read_entry(fs, &parent_dir, i, buf) < 0) break;
-        buf[0] = 0xE5;
-        dir_write_entry(fs, &parent_dir, i, buf);
-    }
     fat_close(&parent_dir);
     kprintf("[FS] Deleted: %s\n", path);
+    return 0;
+}
+
+// #746: erase the WHOLE entry set for `name` in an open directory: the LFN
+// entries plus the short 8.3 entry. Removes the NAME only; it never touches the
+// cluster chain, which is what makes it usable by rename as well as delete.
+//
+// Lifted out of fat_delete_inner rather than copied, because the copy that
+// already existed inside fat_rename_inner cleared only the SHORT entry's first
+// byte and left the preceding LFN entries live - so a long-named file that was
+// moved kept a ghost of its old name in the directory.
+static int fat_erase_name_entries(fat_fs_t *fs, fat_file_t *dir, const char *name) {
+    fat_dir_entry_t e; uint32_t sidx = 0, fidx = 0;
+    if (fat_lookup(fs, dir->first_cluster, name, &e, &sidx, &fidx) != 0) return -1;
+    for (uint32_t i = fidx; i <= sidx; i++) {
+        uint8_t buf[32];
+        if (dir_read_entry(fs, dir, i, buf) < 0) break;
+        buf[0] = 0xE5;
+        dir_write_entry(fs, dir, i, buf);
+    }
     return 0;
 }
 
@@ -2033,12 +2642,86 @@ static int fat_delete_inner(fat_fs_t *fs, const char *path) {
 static int fat_rename_inner(fat_fs_t *fs, const char *old_path, const char *new_path) {
     if (!fs || !fs->mounted || !old_path || !new_path) return -1;
 
-    // For now, only support rename within same directory
-    char old_parent[256], old_name[64];
-    char new_parent[256], new_name[64];
+    // #746: was char[64] while fat_split_path() strcpy()s an arbitrary-length
+    // component into it, and every other buffer of this kind in this file is
+    // char[256]. A path component over 63 bytes smashed this stack frame.
+    char old_parent[256], old_name[256];
+    char new_parent[256], new_name[256];
 
     fat_split_path(old_path, old_parent, old_name);
     fat_split_path(new_path, new_parent, new_name);
+
+    // ------------------------------------------------------------------
+    // #746 ATOMIC REPLACE, the FAT half.
+    //
+    // WHAT WAS WRONG. Neither branch below looked at the DESTINATION at all.
+    // Renaming over an existing file therefore left TWO directory entries: the
+    // old destination, still pointing at its own cluster chain, and the renamed
+    // source. userland/libc/userconf.c documents the consequence: deleting
+    // either name frees blocks the other still points at. So the standard
+    // write-temp-then-rename safe-save was not safe here, which is the whole
+    // reason the pattern is unavailable in this OS.
+    //
+    // WHAT THIS DOES INSTEAD, and why the order is this order. FAT has no
+    // atomic-replace primitive, but a directory entry is 32 bytes inside one
+    // sector, so REPOINTING the destination entry at the source's cluster chain
+    // is a SINGLE SECTOR WRITE - the same shape as the ext2 dirent repoint, and
+    // the same guarantee:
+    //
+    //   1. the destination entry starts naming the SOURCE's chain (one write);
+    //   2. the source's entry set is erased, WITHOUT freeing the chain;
+    //   3. only then is the destination's OLD chain freed.
+    //
+    // A crash at any point leaves the caller's new data reachable under one
+    // name or the other. It never leaves a truncated destination, which is
+    // exactly what copy-then-delete could not promise.
+    // ------------------------------------------------------------------
+    {
+        fat_file_t dst;
+        if (fat_open(fs, new_path, &dst) == 0) {
+            if (dst.is_dir || dst.ext2_ino || dst.img_drive || dst.dirent_lba == 0) {
+                fat_close(&dst);
+                return -1;      // not a plain FAT file we can replace in place
+            }
+            uint32_t dest_lba = dst.dirent_lba, dest_off = dst.dirent_off;
+            uint32_t dest_old_chain = dst.first_cluster;
+            fat_close(&dst);
+
+            fat_file_t src;
+            if (fat_open(fs, old_path, &src) != 0) return -1;
+            if (src.is_dir || src.ext2_ino || src.img_drive) { fat_close(&src); return -1; }
+            uint32_t src_chain = src.first_cluster, src_size = src.file_size;
+            fat_close(&src);
+
+            if (src_chain == dest_old_chain) return 0;   // already the same file
+
+            // STEP 1: one sector write, and the replacement has happened.
+            if (fat_read_sector(fs, dest_lba, sector_buf) <= 0) return -1;
+            if (dest_off + 32 > fs->bytes_per_sector) return -1;
+            fat_dir_entry_t *de = (fat_dir_entry_t *)(sector_buf + dest_off);
+            de->cluster_lo = (uint16_t)(src_chain & 0xFFFF);
+            de->cluster_hi = (uint16_t)((src_chain >> 16) & 0xFFFF);
+            de->file_size  = src_size;
+            if (fat_write_sector(fs, dest_lba, sector_buf) != 0) return -1;
+
+            // STEP 2: the source name goes away. The chain is NOT freed: the
+            // destination entry owns it now.
+            {
+                fat_file_t odir;
+                if (fat_open(fs, old_parent, &odir) == 0) {
+                    if (fat_erase_name_entries(fs, &odir, old_name) != 0)
+                        kprintf("[FAT] rename: source dirent %s NOT cleared; it now "
+                                "shares a cluster chain with %s\n", old_path, new_path);
+                    fat_close(&odir);
+                }
+            }
+            // STEP 3: and only now the destination's old data.
+            if (dest_old_chain >= 2) fat_free_cluster_chain(fs, dest_old_chain);
+            kprintf("[FS] Replaced (dirent): %s -> %s (cl=%u sz=%u)\n",
+                    old_path, new_path, src_chain, src_size);
+            return 0;
+        }
+    }
 
     if (strcmp(old_parent, new_parent) != 0) {
         // Cross-directory move by relocating the directory entry (no data copy):
@@ -2070,13 +2753,22 @@ static int fat_rename_inner(fat_fs_t *fs, const char *old_path, const char *new_
         ne->cluster_lo = (uint16_t)(first_cluster & 0xFFFF);
         ne->cluster_hi = (uint16_t)((first_cluster >> 16) & 0xFFFF);
         ne->file_size = fsize;
-        if (fat_write_sector(fs, esec, sector_buf) <= 0) return -1;
+        if (fat_write_sector(fs, esec, sector_buf) != 0) return -1;
 
         // Mark the old entry free (0xE5). Clusters are now owned by the new
         // entry, so we deliberately do NOT free them.
         if (fat_read_sector(fs, old_lba, sector_buf) > 0) {
             sector_buf[old_off] = 0xE5;
-            fat_write_sector(fs, old_lba, sector_buf);
+            // #695: was unchecked. The new entry already owns the cluster
+            // chain, so if the old entry is not cleared the SAME chain is
+            // reachable under two names, and deleting either one frees clusters
+            // the other still points at. Fail the move rather than leave that.
+            if (fat_write_sector(fs, old_lba, sector_buf) != 0) {
+                kprintf("[FAT] move: old dirent NOT cleared (lba=%u); "
+                        "%s and %s would share a cluster chain\n",
+                        old_lba, old_path, new_path);
+                return -1;
+            }
         }
         kprintf("[FS] Moved (dirent): %s -> %s (cl=%u sz=%u)\n",
                 old_path, new_path, first_cluster, fsize);
@@ -2112,9 +2804,16 @@ static int fat_rename_inner(fat_fs_t *fs, const char *old_path, const char *new_
                 fat_dir_entry_t *entry = (fat_dir_entry_t *)(sector_buf + i);
                 if (memcmp(entry->name, old_fat_name, 11) == 0) {
                     memcpy(entry->name, new_fat_name, 11);
-                    fat_write_sector(fs, fs->root_start_lba + s, sector_buf);
+                    // #695: was unchecked, so a failed rename reported success
+                    // and the file kept its old name.
+                    int wr = fat_write_sector(fs, fs->root_start_lba + s, sector_buf);
                     kfree(cluster_buf);
                     fat_close(&parent_dir);
+                    if (wr != 0) {
+                        kprintf("[FAT] rename: dirent write FAILED (lba=%u)\n",
+                                fs->root_start_lba + s);
+                        return -1;
+                    }
                     kprintf("[FS] Renamed: %s -> %s\n", old_path, new_path);
                     return 0;
                 }
@@ -2148,7 +2847,106 @@ static int fat_rename_inner(fat_fs_t *fs, const char *old_path, const char *new_
     return -1;
 }
 
+// #554: FAT native permission/attribute support. FAT has no uid/gid/mode
+// concept - unlike ext2/POSIX paths (which route through the path-keyed
+// perms.c overlay), these operate on the REAL on-disk FAT_ATTR_* byte in the
+// directory entry, so a Properties dialog or `ls` reading it back sees a true
+// filesystem attribute, not a fabricated value. Callers (proc/syscall.c's
+// sys_chmod/sys_chown routing, via rustkern/fsperm.rs) only reach these for
+// genuine FAT (ESP: /boot, /EFI) paths; ext2/root paths never call them.
+//
+// fat_open() already resolves and stores dirent_lba/dirent_off for the file's
+// OWN short directory entry (see fat_rename_inner's cross-directory move,
+// which rewrites the identical two fields), so no new directory-walk logic is
+// needed here - just a read-modify-write of the one attribute byte.
+static int fat_set_readonly_inner(fat_fs_t *fs, const char *path, int readonly) {
+    fat_file_t f;
+    if (fat_open_inner(fs, path, &f) != 0) return -1;
+    uint32_t lba = f.dirent_lba, off = f.dirent_off;
+    fat_close(&f);
+    if (lba == 0) return -1;  // FAT12/16 root-dir entry or unknown location
+    if (fat_read_sector(fs, lba, sector_buf) <= 0) return -1;
+    fat_dir_entry_t *e = (fat_dir_entry_t *)(sector_buf + off);
+    if (readonly) e->attr |= FAT_ATTR_READ_ONLY;
+    else          e->attr &= (uint8_t)~FAT_ATTR_READ_ONLY;
+    if (fat_write_sector(fs, lba, sector_buf) != 0) return -1;
+    return 0;
+}
+int fat_set_readonly(const char *path, int readonly) {
+    // #725: the comment above says ext2 paths "never call" these. There are
+    // currently ZERO callers of either function, so that sentence has never
+    // been tested; make it true by construction instead. An ext2 inode has no
+    // FAT attribute byte, and fat_set_readonly_inner()'s read-modify-write of a
+    // directory entry has no meaning on ext2, so refuse rather than silently
+    // touch a stale ESP copy of the same path.
+    {
+        extern fat_fs_t g_fat_fs;
+        if (fat_path_on_ext2(&g_fat_fs, path)) return -1;
+    }
+    extern fat_fs_t g_fat_fs;
+    if (!g_fat_fs.mounted) return -1;
+    if (!fat_lock()) return -1;
+    int r = fat_set_readonly_inner(&g_fat_fs, path, readonly); fat_unlock(); return r;
+}
+
+static int fat_get_attr_info_inner(fat_fs_t *fs, const char *path,
+                                   uint8_t *attr_out, int *is_dir_out) {
+    fat_file_t f;
+    if (fat_open_inner(fs, path, &f) != 0) return -1;
+    if (attr_out)  *attr_out  = f.attr;
+    if (is_dir_out) *is_dir_out = (f.is_dir || (f.attr & FAT_ATTR_DIRECTORY)) ? 1 : 0;
+    fat_close(&f);
+    return 0;
+}
+int fat_get_attr_info(const char *path, uint8_t *attr_out, int *is_dir_out) {
+    extern fat_fs_t g_fat_fs;
+    if (!g_fat_fs.mounted) return -1;
+    // #725: fat_get_attr_info_inner() calls fat_open_inner(), which is the
+    // UNROUTED open and so only ever sees the FAT ESP. Answer ext2-root paths
+    // through the routed fat_open() instead, so this reports the real file
+    // rather than "not found" (it has no callers today; a future one must not
+    // rediscover the #725 hole).
+    if (fat_path_on_ext2(&g_fat_fs, path)) {
+        fat_file_t f;
+        if (fat_open(&g_fat_fs, path, &f) != 0) return -1;
+        if (attr_out)   *attr_out   = f.attr;
+        if (is_dir_out) *is_dir_out = f.is_dir ? 1 : 0;
+        fat_close(&f);
+        return 0;
+    }
+    if (!fat_lock()) return -1;
+    int r = fat_get_attr_info_inner(&g_fat_fs, path, attr_out, is_dir_out); fat_unlock(); return r;
+}
+
 // Write data to a file at current position
+// #746: write first_cluster + file_size back into this handle's directory
+// entry. Factored out of fat_write_inner() so fat_truncate() below performs the
+// SAME operation rather than a second copy of it. Returns 0 when the entry is
+// consistent with the handle (including the "we do not know where the entry is"
+// case, which is not an error the caller can act on), -1 when the sector write
+// failed - in which case the data on disk is unreachable and the clusters are
+// leaked, so it must NOT be reported as success.
+static int fat_persist_dirent(fat_file_t *file) {
+    if (!file || !file->fs) return -1;
+    fat_fs_t *fs = file->fs;
+    if (!file->dirent_lba || fs->bytes_per_sector > 512) return 0;
+    uint8_t dbuf[512];
+    if (fat_read_sector(fs, file->dirent_lba, dbuf) <= 0) return 0;
+    if (file->dirent_off + 32 > fs->bytes_per_sector) return 0;
+    fat_dir_entry_t *de = (fat_dir_entry_t *)(dbuf + file->dirent_off);
+    de->cluster_lo = (uint16_t)(file->first_cluster & 0xFFFF);
+    de->cluster_hi = (uint16_t)(file->first_cluster >> 16);
+    de->file_size  = file->file_size;
+    // #695: was unchecked. Without this the data is on disk but the directory
+    // entry still reports the OLD size / cluster, so the bytes are unreachable
+    // and the clusters are leaked, while fat_write() returned a healthy count.
+    if (fat_write_sector(fs, file->dirent_lba, dbuf) != 0) {
+        kprintf("[FAT] dirent update FAILED (lba=%u)\n", file->dirent_lba);
+        return -1;
+    }
+    return 0;
+}
+
 static int fat_write_inner(fat_file_t *file, const void *buffer, uint32_t size) {
     if (!file || !file->fs || !buffer || size == 0) return -1;
 
@@ -2232,7 +3030,10 @@ static int fat_write_inner(fat_file_t *file, const void *buffer, uint32_t size) 
         if (to_write > space_in_cluster) to_write = space_in_cluster;
 
         // Copy data
-        memcpy(cluster_buf + offset_in_cluster, src + bytes_written, to_write);
+        // #19/#645: `src` is the CALLER's buffer; Ring-3 on the sys_write path.
+        {   uaccess_ac_t __ac = uaccess_begin();
+            memcpy(cluster_buf + offset_in_cluster, src + bytes_written, to_write);
+            uaccess_end(__ac); }
 
         // Write cluster back
         if (fat_write_cluster(fs, cluster, cluster_buf) <= 0) {
@@ -2258,16 +3059,12 @@ static int fat_write_inner(fat_file_t *file, const void *buffer, uint32_t size) 
     // Persist first_cluster + file_size back to the directory entry. Without
     // this, written data is invisible (the entry still reports size 0 / cluster 0)
     // and the allocated cluster is leaked. (Was an unfinished TODO.)
-    if (file->dirent_lba && fs->bytes_per_sector <= 512) {
-        uint8_t dbuf[512];
-        if (fat_read_sector(fs, file->dirent_lba, dbuf) > 0 &&
-            file->dirent_off + 32 <= fs->bytes_per_sector) {
-            fat_dir_entry_t *de = (fat_dir_entry_t *)(dbuf + file->dirent_off);
-            de->cluster_lo = (uint16_t)(file->first_cluster & 0xFFFF);
-            de->cluster_hi = (uint16_t)(file->first_cluster >> 16);
-            de->file_size  = file->file_size;
-            fat_write_sector(fs, file->dirent_lba, dbuf);
-        }
+    // #746: the write-back is now fat_persist_dirent(), because fat_truncate()
+    // needs the identical operation and a second hand-written copy of it is
+    // exactly how the two halves of a pair drift apart in this tree.
+    if (fat_persist_dirent(file) != 0) {
+        kfree(cluster_buf);
+        return -1;
     }
 
     kfree(cluster_buf);
@@ -2367,6 +3164,7 @@ static int fat_write_file_inner(fat_fs_t *fs, const char *path, const void *data
 
     // Update the short directory entry with the real size + first cluster.
     // Uses the LFN-aware lookup so it works for both 8.3 and long (aliased) names.
+    int dirent_ok = 1;          // #695: did the size/cluster update land?
     char parent_path[256], filename[256];
     fat_split_path(path, parent_path, filename);
 
@@ -2381,7 +3179,14 @@ static int fat_write_file_inner(fat_fs_t *fs, const char *path, const void *data
                 de->file_size = size;
                 de->cluster_hi = (file.first_cluster >> 16) & 0xFFFF;
                 de->cluster_lo = file.first_cluster & 0xFFFF;
-                fat_write_sector(fs, sec, sector_buf);
+                // #695: was unchecked, and this function returns
+                // (written == size) ? 0 : -1, so a failed dirent update
+                // reported SUCCESS while the file reads back as size 0 with its
+                // clusters leaked. That is the FAT twin of the ext2 bug.
+                if (fat_write_sector(fs, sec, sector_buf) != 0) {
+                    kprintf("[FAT] write_file: dirent update FAILED for %s\n", path);
+                    dirent_ok = 0;
+                }
             }
         }
         fat_close(&parent_dir);
@@ -2389,7 +3194,7 @@ static int fat_write_file_inner(fat_fs_t *fs, const char *path, const void *data
 
     fat_close(&file);
     kprintf("[FS] Wrote file: %s (%d bytes)\n", path, written);
-    return (written == (int)size) ? 0 : -1;
+    return (dirent_ok && written == (int)size) ? 0 : -1;
 }
 
 // Check if a path exists

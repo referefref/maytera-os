@@ -7,6 +7,9 @@
 #include "../serial.h"
 #include "../string.h"
 #include "../sync/waitq.h"   // #515: wq_ms_to_ticks() (the one ms->ticks helper)
+#include "../cpu/mono.h"   // #499: sched_now_ms() - THE shared real-elapsed-ms clock
+#include "../security/uaccess_smap.h"  // #19/#645: AC brackets on the payload copies
+#include "../security/validate.h"      // #19/#645: strncpy_from_user for Ring-3 names
 
 // External timer for timestamps
 extern volatile uint64_t timer_ticks;
@@ -83,7 +86,11 @@ static int msg_queue_message(msg_connection_t *conn, const void *data, size_t le
     msg->header.size = (len > MSG_MAX_SIZE) ? MSG_MAX_SIZE : (uint32_t)len;
     msg->header.sender_pid = sender_pid;
     msg->header.timestamp = timer_ticks;
-    memcpy(msg->data, data, msg->header.size);
+    // #19/#645: `data` is the SENDER'S Ring-3 payload (msg_queue_message is
+    // static; both callers are sys_msg_send). One copy, one bracket.
+    {   uaccess_ac_t __ac = uaccess_begin();
+        memcpy(msg->data, data, msg->header.size);
+        uaccess_end(__ac); }
 
     q->tail = (q->tail + 1) % MSG_QUEUE_SIZE;
     q->count++;
@@ -106,7 +113,12 @@ static int msg_dequeue_message(msg_connection_t *conn, void *buf, size_t max_len
     if (header_out) {
         *header_out = msg->header;
     }
-    memcpy(buf, msg->data, copy_len);
+    // #19/#645: `buf` is the RECEIVER'S Ring-3 buffer. Note that
+    // *header_out just above is a KERNEL pointer (sys_msg_recv's stack), so a
+    // bracket around the whole function body would be wrong as well as wide.
+    {   uaccess_ac_t __ac = uaccess_begin();
+        memcpy(buf, msg->data, copy_len);
+        uaccess_end(__ac); }
 
     q->head = (q->head + 1) % MSG_QUEUE_SIZE;
     q->count--;
@@ -340,16 +352,20 @@ int64_t sys_msg_recv(int conn_id, void *buf, size_t len, int timeout) {
     // freed under a parked waiter, whose __wait_finish() then takes a spinlock
     // on freed memory: a use-after-free WRITE, strictly worse than the
     // pre-existing UAF read of conn->state this loop already performs. Fix the
-    // connection lifetime (#515) first, then convert. See the internal wait-migration plan.
+    // connection lifetime (#515) first, then convert. See docs/WAIT_MIGRATION_PLAN.md.
     //
     // Units fixed now (independent of the above, and the #420/#512 bug family):
     // the deadline was `(uint64_t)timeout / 10`, i.e. milliseconds/10, which is
     // only ticks on a 100Hz build. At the actual g_timer_hz of 250 it expired
     // 2.5x EARLY, so a caller asking for 1000ms got ~400ms. Now converted by the
     // one sanctioned helper against the live tick rate.
-    uint64_t start = timer_ticks;
-    uint64_t timeout_ticks = (timeout > 0) ? wq_ms_to_ticks((uint64_t)timeout)
-                                           : 0xFFFFFFFFFFFFFFFFULL;
+    // #499: and the deadline is measured on sched_now_ms(), REAL elapsed ms,
+    // not timer_ticks. timer_ticks counts ticks DELIVERED: under KVM a starved
+    // vCPU has its missed ticks re-delivered in a BURST, so a caller asking for
+    // a 1000ms recv timeout could get a 0ms one at exactly the busiest moment.
+    uint64_t start_ms = sched_now_ms();
+    uint64_t timeout_budget_ms = (timeout > 0) ? (uint64_t)timeout
+                                               : 0xFFFFFFFFFFFFFFFFULL;
 
     while (1) {
         // Check for message
@@ -359,7 +375,7 @@ int64_t sys_msg_recv(int conn_id, void *buf, size_t len, int timeout) {
         }
 
         // Check timeout
-        if (timeout > 0 && (timer_ticks - start) >= timeout_ticks) {
+        if (timeout > 0 && (sched_now_ms() - start_ms) >= timeout_budget_ms) {
             return 0;  // Timeout
         }
 
@@ -561,8 +577,14 @@ typedef struct {
 static ipc_name_entry_t g_name_table[IPC_NAME_MAX_ENTRIES];
 static int g_name_table_inited = 0;
 
-int64_t sys_ipc_register_name(const char *name, int channel_id) {
-    if (!name || channel_id < 0) return -1;
+int64_t sys_ipc_register_name(const char *uname, int channel_id) {
+    if (!uname || channel_id < 0) return -1;
+    // #19/#645: `uname` is a Ring-3 string that the strncmp/strncpy loops below
+    // walk with plain Ring-0 loads, three times over. Bounce it ONCE through
+    // the canonical primitive and use the kernel copy everywhere after, which
+    // also closes the check-and-use race the repeated re-reads had.
+    char name[IPC_NAME_MAX_LEN];
+    if (strncpy_from_user(name, uname, sizeof(name)) < 0) return -1;
     if (!g_name_table_inited) {
         for (int i = 0; i < IPC_NAME_MAX_ENTRIES; i++) g_name_table[i].active = 0;
         g_name_table_inited = 1;
@@ -594,8 +616,11 @@ int64_t sys_ipc_register_name(const char *name, int channel_id) {
     return -1;
 }
 
-int64_t sys_ipc_lookup_name(const char *name) {
-    if (!name) return -1;
+int64_t sys_ipc_lookup_name(const char *uname) {
+    if (!uname) return -1;
+    // #19/#645: see sys_ipc_register_name().
+    char name[IPC_NAME_MAX_LEN];
+    if (strncpy_from_user(name, uname, sizeof(name)) < 0) return -1;
     for (int i = 0; i < IPC_NAME_MAX_ENTRIES; i++) {
         if (g_name_table[i].active &&
             strncmp(g_name_table[i].name, name, IPC_NAME_MAX_LEN) == 0) {

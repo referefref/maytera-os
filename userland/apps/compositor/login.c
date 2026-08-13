@@ -1,5 +1,14 @@
 // login.c - Login screen for the MayteraOS userland compositor
 // Handles user selection, password entry, auto-login, and authentication.
+//
+// #567 visual polish pass (docs/mockups/login-mockup.html "Login screen" tab,
+// approved with the user's edits already applied there: no wordmark, no
+// instructional text). Brings this screen up to the same aesthetic as
+// lockscreen.c (#566): a softened/darkened wallpaper backdrop (reusing
+// a full-resolution darkened wallpaper, no mosaic), a
+// centered frosted panel, a big live clock, and the same avatar/field/button
+// styling. Pure layout/visual change: do_authenticate()/login_handle_key()'s
+// auth logic and login_init()'s autologin-config read are untouched.
 
 #include "compositor.h"
 #include "../../libc/syscall.h"
@@ -32,8 +41,10 @@ static inline int sh(void) { return (int)g_fb_height; }
 // Compute the X origin of the centered login panel.
 static inline int panel_x(void) { return (sw() - LOGIN_PANEL_W) / 2; }
 
-// Compute the Y origin of the centered login panel.
-static inline int panel_y(void) { return (sh() - LOGIN_PANEL_H) / 2; }
+// Compute the Y origin of the centered login panel. #567: +30 leaves room
+// for the live clock drawn above it, the same offset lockscreen.c's own
+// lock_geom() uses, so the two panels sit at the same visual height.
+static inline int panel_y(void) { return (sh() - LOGIN_PANEL_H) / 2 + 30; }
 
 // Copy at most (dst_len - 1) characters from src into dst and NUL-terminate.
 // Returns number of characters written (excluding the NUL).
@@ -87,6 +98,8 @@ static int extract_after(const char *src, const char *prefix,
 // On success: updates g_logged_in, g_login_uid, g_login_username,
 // plays startup sound, and returns 1.
 // On failure: sets g_error_msg and returns 0.
+// #567: auth logic unchanged from the pre-polish version - still the same
+// sys_authenticate() call, same bootlog lines, same failure state machine.
 static int do_authenticate(const char *username, const char *password)
 {
     char logmsg[96];
@@ -117,15 +130,19 @@ static int do_authenticate(const char *username, const char *password)
 
 // Draw a single bullet dot representing one masked password character.
 // cx, cy is the center of the dot.
-static void draw_bullet(int32_t cx, int32_t cy)
+// #566: shared with lockscreen.c (prototyped in compositor.h) - not static.
+void draw_bullet(int32_t cx, int32_t cy)
 {
     draw_circle_filled(cx, cy, 4, CLR_LOGIN_TEXT);
 }
 
 // Draw the password input field box at position (x, y) with dimensions
 // (LOGIN_INPUT_W x LOGIN_INPUT_H). Shows bullets for each character and a
-// blinking cursor at the end.
-static void draw_password_field(int32_t x, int32_t y)
+// blinking cursor at the end. password_len/cursor_blink are passed in
+// (rather than read from this file's own g_password_len/g_cursor_blink)
+// so the lock screen (lockscreen.c, #566) can reuse this exact renderer
+// with its own independent password-entry state instead of a second copy.
+void draw_password_field(int32_t x, int32_t y, int password_len, int cursor_blink)
 {
     // Background.
     draw_fill_rect(x, y, LOGIN_INPUT_W, LOGIN_INPUT_H, CLR_LOGIN_INPUT_BG);
@@ -135,20 +152,21 @@ static void draw_password_field(int32_t x, int32_t y)
     // Draw one bullet per typed character.
     int32_t bx = x + 10;
     int32_t by = y + LOGIN_INPUT_H / 2;
-    for (int i = 0; i < g_password_len; i++) {
+    for (int i = 0; i < password_len; i++) {
         draw_bullet(bx + i * 12, by);
     }
 
     // Blinking cursor: a vertical bar after the last bullet.
-    if (g_cursor_blink) {
-        int32_t cx = bx + g_password_len * 12;
+    if (cursor_blink) {
+        int32_t cx = bx + password_len * 12;
         draw_fill_rect(cx, y + 5, 2, LOGIN_INPUT_H - 10, CLR_LOGIN_TEXT);
     }
 }
 
 // Draw a button rectangle with centered text.
-static void draw_button(int32_t x, int32_t y, int32_t w, int32_t h,
-                        const char *label, uint32_t bg)
+// #566: shared with lockscreen.c (prototyped in compositor.h) - not static.
+void draw_button(int32_t x, int32_t y, int32_t w, int32_t h,
+                 const char *label, uint32_t bg)
 {
     draw_rounded_rect(x, y, w, h, 4, bg);
     draw_rect_outline(x, y, w, h, CLR_LOGIN_BORDER);
@@ -156,21 +174,143 @@ static void draw_button(int32_t x, int32_t y, int32_t w, int32_t h,
     draw_text(x + (w - lw) / 2, y + (h - FONT_CHAR_H) / 2, label, CLR_LOGIN_TEXT);
 }
 
-// Draw the user avatar circle with the user's initial inside.
-// highlight controls whether the avatar is drawn in the selected color.
-static void draw_avatar(int32_t cx, int32_t cy, const char *username, bool highlight)
-{
-    uint32_t fill = highlight ? CLR_LOGIN_AVATAR_S : CLR_LOGIN_AVATAR;
-    draw_circle_filled(cx, cy, LOGIN_AVATAR_SIZE / 2, fill);
-    draw_circle_outline(cx, cy, LOGIN_AVATAR_SIZE / 2, CLR_LOGIN_BORDER);
+// #745 identity dot palette: reused VERBATIM from Settings'
+// avatar_palette (userland/apps/settings/main.c users_refresh()), same 8
+// hexes, same uid%8 indexing (section 8.2 of the design doc) - kept as an
+// independent literal copy rather than a shared header because the two
+// apps are separate binaries on separate toolkits (draw.c vs the gui_*
+// handle-based one) with no common color-token module between them; a
+// mismatch here would only ever be cosmetic (which of 8 hues), never a
+// correctness bug, and grep is the check that keeps them in sync.
+static const uint32_t g_avatar_id_palette[8] = {
+    0xFF569CD6, 0xFF66BB66, 0xFFCC8844, 0xFFAA66CC,
+    0xFFCC6666, 0xFF44AAAA, 0xFF888888, 0xFFBBAA44
+};
 
-    // Draw the first letter of the username, scaled up, centered.
+// Draw the user avatar: an antialiased "glass" disc (#745 port of
+// docs/LOGIN_AVATARS_AND_PROFILE.html) with the user's initial inside.
+//
+// GLASS, HONESTLY: the real glass_render() backdrop blur cannot reach a 64px
+// circle (no circular mask primitive, no spare cache surface, and its own
+// bleed would wash a disc this small to near-flat anyway - design doc
+// section 4) and in any case this panel is a flat opaque fill, not glass, so
+// there is no backdrop behind the avatar to blur. This draws a translucent
+// tint fill plus a soft highlight patch (upper-left) and shade patch
+// (lower-right), the two patches sized/offset so they stay fully inside the
+// fill disc - no circular clip needed. It reads as a lit, translucent
+// material; it does not claim to show blurred content, because there is none
+// to show.
+//
+// CONTRAST BY CONSTRUCTION: the fill is now the SAME token in every state
+// (CLR_LOGIN_AVATAR_FILL) - the old code swapped to a blue fill on
+// "selected", which put the fixed-color initial at 2.71:1, under the 4.5:1
+// text floor (design doc section 3). Selection is communicated by the ring
+// alone, which is why `state` only ever changes the ring here.
+//
+// #566: shared with lockscreen.c (prototyped in compositor.h) - not static.
+// (lockscreen.c does not currently call it - #745 removed its own avatar
+// disc as a considered "username only" decision - but the prototype stays
+// shared in case that decision is revisited.)
+void draw_avatar(int32_t cx, int32_t cy, const char *username, unsigned int uid, int state)
+{
+    float r = (float)(LOGIN_AVATAR_SIZE / 2);
+
+    // Base glass fill, uniform across all states.
+    draw_circle_filled_aa(cx, cy, r, CLR_LOGIN_AVATAR_FILL, 255);
+    // Soft highlight patch, upper-left (specular glint).
+    draw_circle_filled_aa(cx - (int32_t)(r * 0.30f), cy - (int32_t)(r * 0.32f),
+                          r * 0.50f, CLR_LOGIN_AVATAR_HI, 90);
+    // Soft shade patch, lower-right.
+    draw_circle_filled_aa(cx + (int32_t)(r * 0.30f), cy + (int32_t)(r * 0.32f),
+                          r * 0.45f, CLR_LOGIN_AVATAR_SHADE, 80);
+
+    // Ring: the only state-dependent boundary.
+    uint32_t ring_color;
+    float stroke;
+    if (state == AVATAR_ST_SELECTED) {
+        ring_color = CLR_LOGIN_AVATAR_RING_SEL;
+        stroke = 3.0f;
+        // 1px soft outer glow (design doc 7.1).
+        draw_circle_ring_aa(cx, cy, r + 4.5f, 2.0f, CLR_LOGIN_AVATAR_RING_SEL, 45);
+    } else if (state == AVATAR_ST_HOVER) {
+        ring_color = CLR_LOGIN_AVATAR_RING_HOVER;
+        stroke = 2.0f;
+    } else {
+        ring_color = CLR_LOGIN_AVATAR_RING;
+        stroke = 2.0f;
+    }
+    draw_circle_ring_aa(cx, cy, r + stroke * 0.5f, stroke, ring_color, 255);
+
+    // Identity dot (decorative only - design doc section 7.3, exempt from the
+    // 3:1 boundary floor: removing it changes nothing about which account is
+    // which). 12px, 2px panel-color border, bottom-right.
+    int32_t dot_r = 6;
+    int32_t dot_cx = cx + (int32_t)(r * 0.74f);
+    int32_t dot_cy = cy + (int32_t)(r * 0.74f);
+    draw_circle_filled_aa(dot_cx, dot_cy, (float)(dot_r + 2), CLR_LOGIN_PANEL, 255);
+    draw_circle_filled_aa(dot_cx, dot_cy, (float)dot_r, g_avatar_id_palette[uid % 8], 255);
+
+    // Draw the first letter of the username, scaled up, centered. One ink,
+    // every state (5.58:1 against the fill - design doc 7.2) - no longer
+    // needs to change with the fill because the fill no longer changes.
     char letter[2] = { username[0], '\0' };
     if (letter[0] >= 'a' && letter[0] <= 'z') {
         letter[0] -= 32; // uppercase
     }
     int lw = text_width_large(letter, 2);
     draw_text_large(cx - lw / 2, cy - FONT_CHAR_H, letter, CLR_LOGIN_TEXT, 2);
+}
+
+// ============================================================================
+// Layout (#567): computed fresh each call from the same inputs so render and
+// hit-testing cannot drift apart, the same idiom lockscreen.c's lock_geom()
+// uses - replaces the old "must match login_render" duplicated-arithmetic
+// comments with a single source of the numbers.
+// ============================================================================
+
+typedef struct {
+    int content_y;    // y of the top of the avatar row
+    int avatar_cell;  // avatar width + spacing
+    int row_w;        // total row width (0 users -> 0)
+    int row_x;        // x of the first avatar
+} login_select_geom_t;
+
+static void login_select_geom(login_select_geom_t *g)
+{
+    int px = panel_x();
+    int py = panel_y();
+    g->content_y   = py + 34;   // top padding inside the panel (no title/subtitle any more)
+    g->avatar_cell = LOGIN_AVATAR_SIZE + LOGIN_AVATAR_SPACE;
+    g->row_w       = (g_user_count > 0) ? (g_user_count * g->avatar_cell - LOGIN_AVATAR_SPACE) : 0;
+    g->row_x       = px + (LOGIN_PANEL_W - g->row_w) / 2;
+}
+
+typedef struct {
+    int avatar_cy;
+    int field_y;
+    int err_y;
+    int btn_y;
+    int back_y;
+} login_pw_geom_t;
+
+static void login_pw_geom(login_pw_geom_t *g)
+{
+    int py = panel_y();
+
+    int content_y = py + 26;
+    g->avatar_cy = content_y + LOGIN_AVATAR_SIZE / 2;
+    content_y += LOGIN_AVATAR_SIZE + 8 + FONT_CHAR_H + 16;
+
+    g->field_y = content_y;
+    content_y += LOGIN_INPUT_H + 12;
+
+    g->err_y = content_y;
+    if (g_login_state == LOGIN_STATE_ERROR && g_error_msg[0] != '\0') content_y += FONT_CHAR_H + 8;
+
+    g->btn_y = content_y;
+    content_y += LOGIN_BUTTON_H + 18;
+
+    g->back_y = content_y;
 }
 
 // ============================================================================
@@ -292,54 +432,64 @@ void login_render(void)
     int s_w = sw();
     int s_h = sh();
 
-    // Full-screen dark gradient background.
-    draw_gradient_v(0, 0, s_w, s_h, CLR_LOGIN_BG_TOP, CLR_LOGIN_BG_BOT);
+    // #569 backdrop: the real wallpaper at FULL RESOLUTION, DARKENED ONLY. The
+    // block-mosaic "frosted glass" pass this used to run is deleted - it is
+    // what made the wallpaper look pixelated on real hardware.
+    wallpaper_render_background();
+    g_draw_blend = 145;
+    draw_fill_rect(0, 0, s_w, s_h, 0xFF0B0F18);
+    g_draw_blend = 255;
+
+    // Big live clock + date: same formatting helpers and position as the
+    // lock screen (clock.c's lock_clock_hms()/lock_clock_date()), also the
+    // liveness indicator across two screenshots (see blame.md).
+    {
+        char tbuf[16], dbuf[24];
+        lock_clock_hms(tbuf, 1);
+        lock_clock_date(dbuf);
+        int tw = text_width_ttf(tbuf, 64);
+        int cy = s_h * 14 / 100;
+        draw_text_ttf((s_w - tw) / 2, cy, tbuf, 64, CLR_LOGIN_TEXT);
+        draw_text_centered(s_w / 2, cy + 74, dbuf, CLR_LOGIN_DIMMED);
+    }
 
     int px = panel_x();
     int py = panel_y();
 
-    // Central panel.
-    draw_rounded_rect(px, py, LOGIN_PANEL_W, LOGIN_PANEL_H, 8, CLR_LOGIN_PANEL);
+    // Frosted panel: same rounded-12 glassy treatment as the lock screen.
+    // Per the approved mockup (docs/mockups/login-mockup.html, user's edits
+    // already applied): no wordmark, no instructional text - just the
+    // clock/date above, avatars/field/button inside, power controls below.
+    draw_rounded_rect(px, py, LOGIN_PANEL_W, LOGIN_PANEL_H, 12, CLR_LOGIN_PANEL);
     draw_rect_outline(px, py, LOGIN_PANEL_W, LOGIN_PANEL_H, CLR_LOGIN_BORDER);
 
-    // Title: "MayteraOS" in scale-2 text, centered horizontally in the panel.
-    const char *title = "MayteraOS";
-    int title_w = text_width_large(title, 2);
-    int title_x = px + (LOGIN_PANEL_W - title_w) / 2;
-    int title_y = py + 18;
-    draw_text_large(title_x, title_y, title, CLR_LOGIN_TEXT, 2);
-
-    // Subtitle.
-    const char *subtitle = "Sign in to continue";
-    int sub_w = text_width(subtitle);
-    int sub_x = px + (LOGIN_PANEL_W - sub_w) / 2;
-    int sub_y = title_y + FONT_CHAR_H * 2 + 8;
-    draw_text(sub_x, sub_y, subtitle, CLR_LOGIN_DIMMED);
-
-    // Divider line below subtitle.
-    int div_y = sub_y + FONT_CHAR_H + 10;
-    draw_hline(px + 16, div_y, LOGIN_PANEL_W - 32, CLR_LOGIN_BORDER);
-
-    int content_y = div_y + 14;
-
     if (g_login_state == LOGIN_STATE_SELECT_USER) {
-        // Draw user avatars in a centered horizontal row.
+        login_select_geom_t g;
+        login_select_geom(&g);
+
         if (g_user_count == 0) {
             const char *no_user = "No user accounts found";
             int nw = text_width(no_user);
-            draw_text(px + (LOGIN_PANEL_W - nw) / 2, content_y + 20,
+            draw_text(px + (LOGIN_PANEL_W - nw) / 2, g.content_y + 20,
                       no_user, CLR_LOGIN_DIMMED);
         } else {
-            // Compute total row width.
-            int avatar_cell = LOGIN_AVATAR_SIZE + LOGIN_AVATAR_SPACE;
-            int row_w = g_user_count * avatar_cell - LOGIN_AVATAR_SPACE;
-            int row_x = px + (LOGIN_PANEL_W - row_w) / 2;
-
+            int32_t r = LOGIN_AVATAR_SIZE / 2;
             for (int i = 0; i < g_user_count; i++) {
-                int32_t cx = row_x + i * avatar_cell + LOGIN_AVATAR_SIZE / 2;
-                int32_t cy = content_y + LOGIN_AVATAR_SIZE / 2;
-                bool hi = (i == g_selected_user);
-                draw_avatar(cx, cy, g_users[i].username, hi);
+                int32_t cx = g.row_x + i * g.avatar_cell + LOGIN_AVATAR_SIZE / 2;
+                int32_t cy = g.content_y + LOGIN_AVATAR_SIZE / 2;
+                // #745: genuine mouse hover (no click needed), not "index 0
+                // always looks selected" - the old `i == g_selected_user`
+                // check was true for avatar 0 by default (g_selected_user
+                // inits to 0 and only ever moves on a click that leaves this
+                // screen), so it permanently highlighted the first avatar
+                // for no reason tied to the mouse. That was the same fill
+                // swap the design doc's contrast section flags as a defect,
+                // now replaced entirely: nothing is "selected" on this
+                // screen, only hovered or not.
+                bool hover = (g_mouse_x >= cx - r && g_mouse_x <= cx + r &&
+                             g_mouse_y >= cy - r && g_mouse_y <= cy + r);
+                draw_avatar(cx, cy, g_users[i].username, g_users[i].uid,
+                           hover ? AVATAR_ST_HOVER : AVATAR_ST_NORMAL);
 
                 // Username label below avatar.
                 const char *uname = g_users[i].display_name[0] != '\0'
@@ -348,54 +498,61 @@ void login_render(void)
                 int uw = text_width(uname);
                 int lx = cx - uw / 2;
                 int ly = cy + LOGIN_AVATAR_SIZE / 2 + 6;
-                draw_text(lx, ly, uname, hi ? CLR_LOGIN_TEXT : CLR_LOGIN_DIMMED);
+                draw_text(lx, ly, uname, hover ? CLR_LOGIN_TEXT : CLR_LOGIN_DIMMED);
             }
-
-            // Hint text at the bottom of the panel.
-            const char *hint = "Click an account or press 1-9";
-            int hw = text_width(hint);
-            draw_text(px + (LOGIN_PANEL_W - hw) / 2,
-                      py + LOGIN_PANEL_H - FONT_CHAR_H - 12,
-                      hint, CLR_LOGIN_DIMMED);
         }
     } else if (g_login_state == LOGIN_STATE_PASSWORD ||
                g_login_state == LOGIN_STATE_ERROR) {
 
-        // Selected user name.
+        login_pw_geom_t g;
+        login_pw_geom(&g);
+        int32_t cx = px + LOGIN_PANEL_W / 2;
+
+        // Selected user avatar + name (mirrors the lock screen's user-chip).
         const char *uname = (g_selected_user >= 0 && g_selected_user < g_user_count)
                             ? (g_users[g_selected_user].display_name[0] != '\0'
                                ? g_users[g_selected_user].display_name
                                : g_users[g_selected_user].username)
                             : "Unknown";
-        int unw = text_width(uname);
-        draw_text(px + (LOGIN_PANEL_W - unw) / 2, content_y, uname, CLR_LOGIN_TEXT);
-        content_y += FONT_CHAR_H + 20;
+        unsigned int uid = (g_selected_user >= 0 && g_selected_user < g_user_count)
+                           ? g_users[g_selected_user].uid : 0;
+        draw_avatar(cx, g.avatar_cy, uname, uid, AVATAR_ST_SELECTED);
+        {
+            int unw = text_width(uname);
+            draw_text(cx - unw / 2, g.avatar_cy + LOGIN_AVATAR_SIZE / 2 + 10, uname, CLR_LOGIN_TEXT);
+        }
 
         // Password field, centered in the panel.
         int32_t field_x = px + (LOGIN_PANEL_W - LOGIN_INPUT_W) / 2;
-        int32_t field_y = content_y;
-        draw_password_field(field_x, field_y);
-        content_y += LOGIN_INPUT_H + 14;
+        draw_password_field(field_x, g.field_y, g_password_len, g_cursor_blink);
 
         // Error message (shown in ERROR state).
         if (g_login_state == LOGIN_STATE_ERROR && g_error_msg[0] != '\0') {
             int ew = text_width(g_error_msg);
-            draw_text(px + (LOGIN_PANEL_W - ew) / 2, content_y,
-                      g_error_msg, CLR_LOGIN_ERROR);
-            content_y += FONT_CHAR_H + 10;
+            draw_text(cx - ew / 2, g.err_y, g_error_msg, CLR_LOGIN_ERROR);
         }
 
         // "Sign In" button.
         int32_t btn_x = px + (LOGIN_PANEL_W - LOGIN_BUTTON_W) / 2;
-        draw_button(btn_x, content_y, LOGIN_BUTTON_W, LOGIN_BUTTON_H,
+        draw_button(btn_x, g.btn_y, LOGIN_BUTTON_W, LOGIN_BUTTON_H,
                     "Sign In", CLR_LOGIN_ACCENT);
-        content_y += LOGIN_BUTTON_H + 10;
 
-        // "Back" link text.
-        const char *back_label = "Back";
-        int bw = text_width(back_label);
-        draw_text(px + (LOGIN_PANEL_W - bw) / 2, content_y,
-                  back_label, CLR_LOGIN_DIMMED);
+        // "Back" link: dimmed text, left-aligned in the panel - the same
+        // position/style lockscreen.c uses for "Switch User", so the two
+        // panels' bottom rows read as the same control.
+        draw_text(px + 16, g.back_y, "Back", CLR_LOGIN_DIMMED);
+    }
+
+    // Power controls: available before any authentication, same geometry as
+    // the lock screen's (lockscreen.c lock_render()) so the two screens
+    // present the identical control in the identical place.
+    {
+        int bw = 100, bh = 34, gap = 12;
+        int by = s_h - bh - 20;
+        int bx2 = s_w - 20 - bw;
+        int bx1 = bx2 - gap - bw;
+        draw_button(bx1, by, bw, bh, "Restart",   CLR_MENU_ITEM_NORM);
+        draw_button(bx2, by, bw, bh, "Shut Down", CLR_POWER_RED);
     }
 }
 
@@ -454,23 +611,33 @@ void login_handle_mouse(int32_t x, int32_t y, bool clicked)
 {
     if (!clicked) return;
 
+    int s_w = sw();
+    int s_h = sh();
+
+    // Power controls: available before authentication (mirrors lockscreen.c
+    // lock_handle_mouse() exactly - same geometry as login_render() above).
+    {
+        int bw = 100, bh = 34, gap = 12;
+        int by = s_h - bh - 20;
+        int bx2 = s_w - 20 - bw;
+        int bx1 = bx2 - gap - bw;
+        if (y >= by && y <= by + bh) {
+            if (x >= bx1 && x <= bx1 + bw) { reboot();   return; }
+            if (x >= bx2 && x <= bx2 + bw) { poweroff(); return; }
+        }
+    }
+
     int px = panel_x();
-    int py = panel_y();
 
     if (g_login_state == LOGIN_STATE_SELECT_USER) {
         if (g_user_count == 0) return;
 
-        // Reconstruct avatar row geometry (must match login_render).
-        int div_y     = py + 18 + FONT_CHAR_H * 2 + 8 + FONT_CHAR_H + 10;
-        int content_y = div_y + 14;
-
-        int avatar_cell = LOGIN_AVATAR_SIZE + LOGIN_AVATAR_SPACE;
-        int row_w = g_user_count * avatar_cell - LOGIN_AVATAR_SPACE;
-        int row_x = px + (LOGIN_PANEL_W - row_w) / 2;
+        login_select_geom_t g;
+        login_select_geom(&g);
 
         for (int i = 0; i < g_user_count; i++) {
-            int32_t cx = row_x + i * avatar_cell + LOGIN_AVATAR_SIZE / 2;
-            int32_t cy = content_y + LOGIN_AVATAR_SIZE / 2;
+            int32_t cx = g.row_x + i * g.avatar_cell + LOGIN_AVATAR_SIZE / 2;
+            int32_t cy = g.content_y + LOGIN_AVATAR_SIZE / 2;
             int32_t r  = LOGIN_AVATAR_SIZE / 2;
 
             // Hit-test: bounding box of the avatar circle.
@@ -490,32 +657,24 @@ void login_handle_mouse(int32_t x, int32_t y, bool clicked)
     if (g_login_state == LOGIN_STATE_PASSWORD ||
         g_login_state == LOGIN_STATE_ERROR) {
 
-        // Reconstruct content_y to locate buttons (must match login_render).
-        int div_y     = py + 18 + FONT_CHAR_H * 2 + 8 + FONT_CHAR_H + 10;
-        int content_y = div_y + 14;
-        // Skip username line.
-        content_y += FONT_CHAR_H + 20;
-        // Skip password field.
-        content_y += LOGIN_INPUT_H + 14;
-        // Skip error line if visible.
-        if (g_login_state == LOGIN_STATE_ERROR && g_error_msg[0] != '\0') {
-            content_y += FONT_CHAR_H + 10;
-        }
+        login_pw_geom_t g;
+        login_pw_geom(&g);
 
         // "Sign In" button bounds.
         int32_t btn_x = px + (LOGIN_PANEL_W - LOGIN_BUTTON_W) / 2;
-        int32_t btn_y = content_y;
         if (x >= btn_x && x <= btn_x + LOGIN_BUTTON_W &&
-            y >= btn_y && y <= btn_y + LOGIN_BUTTON_H) {
+            y >= g.btn_y && y <= g.btn_y + LOGIN_BUTTON_H) {
             if (g_selected_user >= 0 && g_selected_user < g_user_count) {
                 do_authenticate(g_users[g_selected_user].username, g_password);
             }
             return;
         }
-        content_y += LOGIN_BUTTON_H + 10;
 
-        // "Back" link bounds (approximate: full-width strip, one text line).
-        if (y >= content_y && y <= content_y + FONT_CHAR_H + 4) {
+        // "Back" link bounds (matches the render position: left-aligned,
+        // px+16, sized to the actual text width plus a little slack).
+        int back_w = text_width("Back");
+        if (x >= px + 16 && x <= px + 16 + back_w + 12 &&
+            y >= g.back_y && y <= g.back_y + FONT_CHAR_H + 4) {
             g_login_state  = LOGIN_STATE_SELECT_USER;
             g_password_len = 0;
             g_password[0]  = '\0';

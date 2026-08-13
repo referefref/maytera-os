@@ -1,36 +1,40 @@
-# Build artifacts
+# Build outputs
 *.o
 *.a
 *.elf
+*.ELF
+*.efi
+*.EFI
 *.bin
-obj/
 kernel/kernel.elf
+boot/uefi/BOOTX64.EFI
+userland/libc/libc.a
+userland/libc/crt0.o
+userland/libgl/libgl.a
+
+# Rust build trees
+target/
 **/target/
 
-# Disk images (published separately with releases, never committed)
+# Disk images and release artifacts
 *.img
+*.img.gz
 *.iso
+boot_disk.img
+.stage-mnt/
 
-# Editor / snapshot backups
-*.bak
-*.bak-*
-*.pre-*
-*.orig
-*.rej
-*.tmp
+# Editor and OS noise
+*.swp
 *~
+.DS_Store
 
-# Secrets - never commit
+# Never commit local credentials or machine-specific config.
+# The disk template under disk/CONFIG carries only non-secret defaults
+# (autologin, menu, theme). Anything holding a real key, token or password
+# belongs outside this repository.
+*.KEY
 *.key
-*.pem
-id_rsa
-id_*
-apitoken
-**/KIMI.KEY
-**/SSH*.CFG
-**/SSHHOST.KEY
-**/AUTHKEYS
-**/EXTSVC.CFG
-**/PASSWD
-**/SHADOW
-secret.conf
+AUTHKEYS
+SHADOW
+SSH.CFG
+EXTSVC.CFG

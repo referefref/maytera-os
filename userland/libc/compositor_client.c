@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // compositor_client.c - Window compositor IPC client implementation
 // Connects to user-mode compositor via message passing and shared memory
 

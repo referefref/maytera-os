@@ -3,6 +3,7 @@
 #include "../../libc/maytera.h"
 #include "../../libc/unistd.h"
 #include "../../libc/pwd.h"
+#include "../../libc/userconf.h"   // #745: <home>/APPS on PATH
 #include "../../libc/termios.h"
 #include "../../libc/aiclient.h"
 
@@ -205,7 +206,26 @@ static void env_unset(const char *key) {
 }
 
 static void env_init(void) {
-    env_set("PATH", "/APPS");
+    // #745: "<home>/APPS:/APPS", the per-user application directory first. See
+    // the block comment at the top of this patch hunk's changelog entry: an app
+    // a user installed for themselves lives ONLY in <home>/APPS, so without
+    // this it cannot be run by name. Deduped when they are the same string,
+    // which is exactly the root case (root's home is "/").
+    {
+        char hp[192];
+        char pathv[400];
+        if (userhome_path(0, "APPS", hp, sizeof(hp)) == 0 && !str_eq(hp, "/APPS")) {
+            int o = 0;
+            for (int i = 0; hp[i] && o < (int)sizeof(pathv) - 8; i++) pathv[o++] = hp[i];
+            pathv[o++] = ':';
+            const char *sysdir = "/APPS";
+            for (int i = 0; sysdir[i] && o < (int)sizeof(pathv) - 1; i++) pathv[o++] = sysdir[i];
+            pathv[o] = '\0';
+            env_set("PATH", pathv);
+        } else {
+            env_set("PATH", "/APPS");
+        }
+    }
     env_set("SHELL", "/APPS/MSH");
     env_set("PS1", "\\u@maytera:\\w$ ");
 
@@ -1227,7 +1247,7 @@ static void ai_handle(const char *rest) {
         if (g_ai_ready == 1) aiclient_reset();   // seed system prompt once per session
     }
     if (g_ai_ready != 1) {
-        printf("AI unavailable: no API key at /CONFIG/KIMI.KEY\n");
+        printf("Set your API key in Settings > AI.\n");
         return;
     }
     aiclient_add(0, rest);

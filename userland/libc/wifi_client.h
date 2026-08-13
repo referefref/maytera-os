@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // wifi_client.h - userland Wi-Fi client + MOCK backend for the UI (#384)
 // =============================================================================
 // The Settings "Wi-Fi" panel and the Network tray indicator code against THIS

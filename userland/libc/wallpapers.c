@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // wallpapers.c - shared wallpaper enumeration (#517). See wallpapers.h.
 //
 // Scans "/" for *.BMP via SYS_READDIR (the kernel's deterministic directory order),
@@ -53,22 +57,34 @@ static void wp_append_num(char **p, const char *stem, int off) {
 
 // Derive a friendly display name from a BMP filename into out (WP_NAME_MAX).
 static void wp_pretty(const char *file, char *out) {
-    // 1. exact-match curated names for the originally-shipped set.
-    static const struct { const char *f; const char *n; } curated[] = {
-        { "MAYTERA.BMP", "Maytera Modern" },
-        { "CYBER.BMP",   "Maytera Cyber" },
-        { "DESERT.BMP",  "Maytera Desert" },
-        { "GREEN.BMP",   "Maytera Green" },
-        { "MARK.BMP",    "Maytera Mark" },
-        { "BACK.BMP",    "Default Blue" },
-        { "MTNMAY1.BMP", "Mountain Maytera" },
-        { "MTNMAY2.BMP", "Mountain Maytera 2" },
-        { 0, 0 }
-    };
-    for (int i = 0; curated[i].f; i++) {
-        if (wp_ieq(file, curated[i].f)) { wp_ncpy(out, curated[i].n, WP_NAME_MAX); return; }
-    }
-
+    // Tier 1 used to be an exact-match curated table for the originally-shipped
+    // set ("MAYTERA.BMP" -> "Maytera Modern", "BACK.BMP" -> "Default Blue", ...).
+    // REMOVED 2026-08-11 (#745, second pass): the 2026-08-11 wallpaper-library
+    // reset deleted every file those eight entries named, and the compositor
+    // binary still carried the eight old filenames as string literals from this
+    // very table, which is what tripped `build/invariant-gate.sh`'s "every
+    // wallpaper the compositor references exists on the image" check - the
+    // COMPILED CODE, not any data file, was the thing still pointing at removed
+    // files. See blame.md, "checking the data and not the code" for the general
+    // lesson.
+    //
+    // Not repointing the table at the new 8.3-ish names: the tier-3 fallback
+    // below (fixed the same day - see the blame.md entry on wp_pretty's
+    // title-casing) already reproduces every display name the table used to
+    // curate, from the CURRENT filenames alone, because gen-wallpapers.sh names
+    // the modern equivalents word-for-word: "MAYTERA_MODERN.BMP" -> "Maytera
+    // Modern", "MAYTERA_CYBER.BMP" -> "Maytera Cyber", "MAYTERA_DESERT.BMP" ->
+    // "Maytera Desert", "MOUNTAIN_MAYTERA.BMP" -> "Mountain Maytera",
+    // "MOUNTAIN_MAYTERA_2.BMP" -> "Mountain Maytera 2" (verified with a
+    // standalone harness against this exact function). "Maytera Green" and
+    // "Maytera Mark" have no file in the current set to curate, and "Default
+    // Blue" named a swirl/starfield brand wallpaper the user's curated set does
+    // not include at all (see the default-wallpaper fix in wallpaper.c and
+    // kernel/gui/{login,desktop}.c for what replaced it as the default). A
+    // curated table is one more thing that can silently go stale exactly like
+    // this one did; the fallback needs no maintenance to stay correct as
+    // wallpapers come and go.
+    //
     // stem = filename without the ".BMP" extension.
     char stem[WP_FILE_MAX];
     int L = wp_len(file);
@@ -77,7 +93,7 @@ static void wp_pretty(const char *file, char *out) {
     for (int i = 0; i < slen; i++) stem[i] = wp_upper(file[i]);
     stem[slen] = 0;
 
-    // 2. category prefixes with a trailing number: EBERG -> Mountain, etc.
+    // 1. category prefixes with a trailing number: EBERG -> Mountain, etc.
     static const struct { const char *pfx; const char *label; } prefix[] = {
         { "EBERG", "Mountain" },
         { "OCEAN", "Ocean" },
@@ -100,10 +116,43 @@ static void wp_pretty(const char *file, char *out) {
         }
     }
 
-    // 3. fallback: title-case the stem ("TCX" -> "Tcx", "PLASMA" -> "Plasma").
+    // 2. fallback: title-case EVERY word of the stem, not just the first character
+    // of the whole string (#745 wallpaper-library-reset). The old version did
+    // "TCX" -> "Tcx" (fine, one word) but "MOUNTAIN_VISTA" -> "Mountain_vista"
+    // (wrong: only the very first letter of the entire name was capitalised,
+    // every other word silently lower-cased, and the separator itself was left
+    // in the display string). That was invisible on every wallpaper shipped
+    // before 2026-08-11 because each one matched a curated exact name or an
+    // EBERG/OCEAN/MACRO + number prefix, so this fallback path was never
+    // exercised by a multi-word name. The 2026-08-11 wallpaper set
+    // ("MOUNTAIN_VISTA.BMP", "CYBERPUNK_MAYTERA_WALL.BMP", ...) hits it for
+    // most of the library, so the bug became visible in the picker.
+    //
+    // Shipped filenames use '_' as the word separator, NOT a space. Space was
+    // tried first and reverted: build/build-golden.sh and build/invariant-
+    // gate.sh both extract wallpaper filenames from `debugfs -R "ls -l /" |
+    // awk '{print $NF}'`, which splits on whitespace, so a name with a real
+    // space (e.g. "MOUNTAIN VISTA.BMP") gets truncated to its last word
+    // ("VISTA.BMP") by that tooling and its WPTHUMB dump/lookup then misses
+    // the file. '_' survives that parsing untouched.
+    //
+    // Fix here: '_' emits an actual space in the DISPLAY string and starts a
+    // new word; every other character is capitalised only if it opens a word
+    // (position 0, or right after a '_'), lower-cased otherwise. "TCX" and
+    // every other underscore-free one-word name are byte-identical to the old
+    // output (start_of_word is 1 only at i==0), so this changes nothing for
+    // any name that used to look right.
     char *p = out;
+    int start_of_word = 1;
     for (int i = 0; i < slen && (p - out) < WP_NAME_MAX - 1; i++) {
-        *p++ = (i == 0) ? wp_upper(stem[i]) : wp_lower(stem[i]);
+        char c = stem[i];
+        if (c == '_') {
+            *p++ = ' ';
+            start_of_word = 1;
+            continue;
+        }
+        *p++ = start_of_word ? wp_upper(c) : wp_lower(c);
+        start_of_word = 0;
     }
     *p = 0;
 }

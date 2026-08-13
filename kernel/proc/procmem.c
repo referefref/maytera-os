@@ -118,13 +118,25 @@ void proc_mem_fill_in(const void *pv, proc_mem_in_t *in) {
 }
 
 // Gather `pid`'s inputs from the live tables and run the (Rust) accounting.
+//
+// #421 phase 5: fill_in()+account() run under the shared proc-mm lock (the
+// same lock cleanup_proc_slot(), process.c, holds across mm_destroy()+null).
+// Without this, a concurrent process-teardown on another core can free the
+// exact vma_list this walks, mid-walk (this is what panicked the kernel for
+// real during AssaultCube phase 4 bring-up, inside proc_mem_account_rs).
+// Taken via proc_mm_lock()/proc_mm_unlock() (process.h), not a raw
+// spinlock_t, so this file does not need sync/spinlock.h. See process.h for
+// the full writeup, including why the lock is not exposed directly.
 int proc_mem_info(uint32_t pid, proc_mem_out_t *out) {
     if (!out) return 0;
     process_t *p = proc_get(pid);
     if (!p) return 0;
     proc_mem_in_t in;
+    proc_mm_lock();
     proc_mem_fill_in(p, &in);
-    return proc_mem_account(&in, out) == 1 ? 1 : 0;
+    int rc = proc_mem_account(&in, out);
+    proc_mm_unlock();
+    return rc == 1 ? 1 : 0;
 }
 
 // ---------------------------------------------------------------------------

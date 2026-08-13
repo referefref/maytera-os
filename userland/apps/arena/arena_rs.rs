@@ -9,18 +9,41 @@
 // BUILD (pinned, see rust-toolchain.toml -> rustc 1.97.0):
 //   rustc --edition 2021 --crate-type staticlib --target x86_64-unknown-none \
 //         -C opt-level=2 -C panic=abort \
-//         -C code-model=large -C relocation-model=static
+//         -C relocation-model=pic
+//
+// ticket 89 (2026-08-13): this comment used to say "-C code-model=large
+// -C relocation-model=static" and claimed that matched the C side's
+// "-fno-pic/-fno-pie (static link)". Both halves were stale/wrong even before
+// the bug: the C app has been PIE (-fPIE, user-pie.ld, #640) for a while, and
+// the ACTUAL Makefile flag was already "-C relocation-model=pic", not
+// "static". The real, measured bug was "-C code-model=large" combined with
+// PIC: LLVM's large-model-PIC codegen calls external functions (malloc,
+// realloc, __rust_no_alloc_shim_is_unstable_v2, ...) through a per-callsite
+// computed GOT-base register fed by R_X86_64_GOTPC64/R_X86_64_GOT64
+// relocations, and this toolchain's `ld` resolved those into WRONG movabs
+// immediates for at least one call site (verified via objdump+readelf: the
+// computed base landed ~0x770 bytes into unrelated .rodata, not the real
+// GOT). Every such call is an indirect jump through garbage, and the very
+// first one gets hit unconditionally at startup (arena_rs_selftest() below
+// grows a Vec<u32>), so /APPS/ARENA page-faulted on every single launch. See
+// blame.md/CHANGELOG.md, 2026-08-13, "ticket 89", for the full trail.
 //
 // WHY THESE FLAGS (userland ABI, NOT the kernel ABI):
 //   * target x86_64-unknown-none  : freestanding, precompiled `core` + `alloc`
 //     ship for it, no build-std needed (mirrors the kernel port's simplicity).
-//   * -C code-model=large         : the Arena C app is built -mcmodel=large and
-//     LINKED AT 0x80000000 (user.ld). The default/small code model would emit
-//     R_X86_64_32S relocations that OVERFLOW at 0x80000000 (2^31 does not fit a
-//     signed 32-bit field) -> "relocation truncated to fit R_X86_64_32S". Large
-//     uses movabs / R_X86_64_64 (no truncation), exactly like the C build.
-//   * -C relocation-model=static  : the app is -fno-pic/-fno-pie, statically
-//     linked. Match it so no GOT/PLT indirection is introduced.
+//   * NO -C code-model=large      : this crate (arena_rs.rs + bsp.rs) is a few
+//     hundred KB, far inside the default (small) model's +-2GB reach, so it
+//     never needed the large model. The large model was only ever there to
+//     mirror the C side's OLD non-PIE -mcmodel=large (fixed 0x80000000+ link
+//     base, #427); now that both C and Rust are PIE, that constraint applies
+//     to neither, and the default small-PIC model produces ordinary
+//     `call [rip+disp32]` GOT-relative calls (one clean R_X86_64_GOTPCREL-
+//     style fixup per call site) instead of the broken large-PIC GOT-base
+//     synthesis above.
+//   * -C relocation-model=pic     : matches the C side's -fPIE. All resulting
+//     R_X86_64_RELATIVE fixups are applied at load time by the kernel's PIE
+//     loader (kernel/exec/elf.c), the same mechanism every other PIE app
+//     uses; it does not care what code model produced them.
 //   * -C panic=abort              : no unwinding tables, no eh_personality.
 //   NOTE on float model: the precompiled `core` for x86_64-unknown-none is
 //   built soft-float while the Arena C is -msse/-msse2 (hardware float). Stage 0

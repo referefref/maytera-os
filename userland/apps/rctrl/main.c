@@ -174,7 +174,7 @@ static void cmd_help(rc_session_t *s) {
 
 static void cmd_net(rc_session_t *s) {
     net_info_t info;
-    if (net_get_info(&info) < 0) {
+    if (get_net_info(&info, (long)sizeof(info)) < 0) {
         rc_puts(s, "net_get_info failed\r\n");
         return;
     }
@@ -188,7 +188,7 @@ static void cmd_net(rc_session_t *s) {
     rc_printf(s, "Netmask: %d.%d.%d.%d\r\n", p[3],p[2],p[1],p[0]);
     p = (uint8_t *)&info.gateway;
     rc_printf(s, "Gateway: %d.%d.%d.%d\r\n", p[3],p[2],p[1],p[0]);
-    rc_printf(s, "Link:    %s\r\n", info.link_up ? "Up" : "Down");
+    rc_printf(s, "Link:    %s\r\n", info.connected ? "Up" : "Down");
 }
 
 static void cmd_ping(rc_session_t *s, const char *arg) {
@@ -198,7 +198,7 @@ static void cmd_ping(rc_session_t *s, const char *arg) {
         if (!target) { rc_puts(s, "Invalid IP. Usage: ping a.b.c.d\r\n"); return; }
     } else {
         net_info_t info;
-        if (net_get_info(&info) < 0 || !info.gateway) {
+        if (get_net_info(&info, (long)sizeof(info)) < 0 || !info.gateway) {
             rc_puts(s, "No gateway. Usage: ping a.b.c.d\r\n"); return;
         }
         target = info.gateway;
@@ -209,19 +209,20 @@ static void cmd_ping(rc_session_t *s, const char *arg) {
 
     int sent = 0, received = 0;
     for (int i = 0; i < 4; i++) {
-        icmp_ping(target); sent++;
-        int got = 0;
-        for (int w = 0; w < 300 && !got; w++) {
-            uint32_t rip = 0; uint16_t seq = 0, ms = 0;
-            if (icmp_ping_recv(&rip, &seq, &ms)) {
-                uint8_t *rp = (uint8_t *)&rip;
-                rc_printf(s, "Reply from %d.%d.%d.%d: seq=%d time=%dms\r\n",
-                          rp[3],rp[2],rp[1],rp[0], seq, ms);
-                received++; got = 1;
-            }
-            sys_sleep(1);
+        // Current libc: sys_ping() BLOCKS up to the timeout and returns the
+        // round-trip in ms (>=0), or -1 on timeout/error. The old
+        // icmp_ping() + icmp_ping_recv() send-then-poll pair is gone, and with
+        // it the 300-iteration wait loop that used to live here - the waiting
+        // now happens inside sys_ping.
+        int rtt = sys_ping(target, 1000);
+        sent++;
+        if (rtt >= 0) {
+            rc_printf(s, "Reply from %d.%d.%d.%d: seq=%d time=%dms\r\n",
+                      tp[3], tp[2], tp[1], tp[0], i, rtt);
+            received++;
+        } else {
+            rc_puts(s, "Request timed out.\r\n");
         }
-        if (!got) rc_puts(s, "Request timed out.\r\n");
         rc_flush(s);
     }
     rc_printf(s, "--- %d sent, %d received, %d%% loss ---\r\n",
@@ -236,7 +237,7 @@ static void cmd_ls(rc_session_t *s, const char *path) {
         int r = sys_readdir(path, idx, &entry);
         if (r != 0) break;
         if (!entry.name[0] || entry.name[0] == '.') continue;
-        if (entry.is_directory)
+        if (DIRENT_IS_DIR(entry))
             rc_printf(s, "  [DIR]  %s\r\n", entry.name);
         else
             rc_printf(s, "  %8u  %s\r\n", entry.size, entry.name);
@@ -348,8 +349,8 @@ int main(void) {
     int srv = tcp_socket();
     if (srv < 0) sys_exit(1);
 
-    if (tcp_bind(srv, RCTRL_PORT) < 0) { tcp_close(srv); sys_exit(1); }
-    if (tcp_listen(srv, 4) < 0)        { tcp_close(srv); sys_exit(1); }
+    // #443: bind+listen are ONE call now; tcp_bind() no longer exists.
+    if (tcp_listen(srv, RCTRL_PORT, 4) < 0)        { tcp_close(srv); sys_exit(1); }
 
     for (;;) {
         int client = tcp_accept(srv);

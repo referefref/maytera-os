@@ -235,6 +235,30 @@ void gl_draw_triangle(GLVertex* p0, GLVertex* p1, GLVertex* p2) {
 	GLContext* c = gl_get_context();
 	GLint co, cc[3], front;
 
+	/* AssaultCube port phase 2: glAlphaFunc. TinyGL's rasterizer has no
+	   per-fragment alpha to test against (and its textures carry no alpha
+	   channel at all, see texture.c / PORT-STATUS.md), so this is a
+	   primitive-granularity approximation, not a per-fragment GL alpha
+	   test: reject the whole triangle only if EVERY vertex color fails,
+	   so a partially-opaque triangle still draws rather than vanishing. */
+	if (c->alpha_test_enabled) {
+		GLfloat ref = c->alpha_test_ref;
+		GLint pass0, pass1, pass2;
+		switch (c->alpha_test_func) {
+		case GL_NEVER:    pass0 = pass1 = pass2 = 0; break;
+		case GL_LESS:     pass0 = p0->color.W <  ref; pass1 = p1->color.W <  ref; pass2 = p2->color.W <  ref; break;
+		case GL_EQUAL:    pass0 = p0->color.W == ref; pass1 = p1->color.W == ref; pass2 = p2->color.W == ref; break;
+		case GL_LEQUAL:   pass0 = p0->color.W <= ref; pass1 = p1->color.W <= ref; pass2 = p2->color.W <= ref; break;
+		case GL_GREATER:  pass0 = p0->color.W >  ref; pass1 = p1->color.W >  ref; pass2 = p2->color.W >  ref; break;
+		case GL_NOTEQUAL: pass0 = p0->color.W != ref; pass1 = p1->color.W != ref; pass2 = p2->color.W != ref; break;
+		case GL_GEQUAL:   pass0 = p0->color.W >= ref; pass1 = p1->color.W >= ref; pass2 = p2->color.W >= ref; break;
+		case GL_ALWAYS:
+		default:          pass0 = pass1 = pass2 = 1; break;
+		}
+		if (!pass0 && !pass1 && !pass2)
+			return;
+	}
+
 	cc[0] = p0->clip_code;
 	cc[1] = p1->clip_code;
 	cc[2] = p2->clip_code;
@@ -244,9 +268,32 @@ void gl_draw_triangle(GLVertex* p0, GLVertex* p1, GLVertex* p2) {
 	/* we handle the non clipped case here to go faster */
 	if (co == 0) {
 		GLfloat norm;
+
+		/* AssaultCube port phase 2: glScissor. Whole-primitive bounding-box
+		   rejection: real (a triangle fully outside the scissor rect never
+		   draws), but NOT exact per-pixel clipping (a triangle straddling
+		   the scissor edge still draws in full past the edge). Only safe
+		   to do here, in the fast already-on-screen path, where zp.x/zp.y
+		   are guaranteed valid for all three vertices. See PORT-STATUS.md. */
+		if (c->scissor_enabled) {
+			GLint xmin = p0->zp.x, xmax = p0->zp.x;
+			GLint ymin = p0->zp.y, ymax = p0->zp.y;
+			if (p1->zp.x < xmin) xmin = p1->zp.x;
+			if (p1->zp.x > xmax) xmax = p1->zp.x;
+			if (p2->zp.x < xmin) xmin = p2->zp.x;
+			if (p2->zp.x > xmax) xmax = p2->zp.x;
+			if (p1->zp.y < ymin) ymin = p1->zp.y;
+			if (p1->zp.y > ymax) ymax = p1->zp.y;
+			if (p2->zp.y < ymin) ymin = p2->zp.y;
+			if (p2->zp.y > ymax) ymax = p2->zp.y;
+			if (xmax < c->scissor_x || xmin > c->scissor_x + c->scissor_w ||
+			    ymax < c->scissor_y || ymin > c->scissor_y + c->scissor_h)
+				return;
+		}
+
 		norm = (GLfloat)(p1->zp.x - p0->zp.x) * (GLfloat)(p2->zp.y - p0->zp.y) - (GLfloat)(p2->zp.x - p0->zp.x) * (GLfloat)(p1->zp.y - p0->zp.y);
 
-		if (norm == 0) 
+		if (norm == 0)
 			return;
 
 		front = norm < 0.0;

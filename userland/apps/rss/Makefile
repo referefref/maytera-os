@@ -7,11 +7,11 @@ CC = gcc
 LD = ld
 LIBC_DIR = ../../libc
 
-CFLAGS = -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=large \
+CFLAGS = -ffreestanding -fstack-protector-strong -mstack-protector-guard=global -fPIE -mno-red-zone \
          -nostdlib -nostdinc -fno-builtin -Wall -Wextra -O2 -g \
          -I. -I$(LIBC_DIR) -isystem /usr/lib/gcc/x86_64-linux-gnu/12/include
 
-LDFLAGS = -nostdlib -z max-page-size=0x1000 -T ../../user.ld
+LDFLAGS = -pie --no-dynamic-linker -z notext -nostdlib -z max-page-size=0x1000 -T ../../user-pie.ld
 
 TARGET = rss
 OBJS = main.o
@@ -29,7 +29,7 @@ RUST_SRC         = rss_rs.rs
 RUST_LIB         = librss_rs.a
 RUSTFLAGS = --edition 2021 --crate-type staticlib --target x86_64-unknown-none \
             -C opt-level=2 -C panic=abort \
-            -C code-model=large -C relocation-model=static
+            -C code-model=large -C relocation-model=pic
 
 all: $(TARGET)
 

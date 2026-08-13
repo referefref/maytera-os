@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // dirent.h - directory traversal for MayteraOS userland
 #ifndef LIBC_DIRENT_H
 #define LIBC_DIRENT_H
@@ -20,6 +24,8 @@ typedef struct DIR DIR;
 
 DIR *opendir(const char *name);
 struct dirent *readdir(DIR *dirp);
+// AssaultCube port phase 3 (docs/ASSAULTCUBE_PORT_PLAN.md): see dirent.c.
+int readdir_r(DIR *dirp, struct dirent *entry, struct dirent **result);
 int closedir(DIR *dirp);
 void rewinddir(DIR *dirp);
 

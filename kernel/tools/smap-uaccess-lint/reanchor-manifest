@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""
+reanchor-manifest - re-anchor kernel/smap-uaccess.manifest's line numbers after
+an unrelated edit shifts them.
+
+WHY THIS EXISTS, AND WHY IT IS CHECKED IN
+-----------------------------------------
+smap-uaccess.manifest records unwrapped Ring-0 accesses to user memory as
+`<file>:<line>: <substring>`, and smap-uaccess-lint rule B1 FAILS the build if
+that substring is no longer within a few lines of that number. The gate is
+correct and it does its job. But ANY change that inserts or deletes lines in a
+listed file moves every entry below it, and the build then fails with a wall of
+identical-looking errors that have nothing to do with the change.
+
+That happened at #692 (about eleven inserted lines in proc/syscall.c, 59 entries
+moved) and again at #695 (SYS_FSYNC, 21 entries). blame.md wrote down the right
+approach both times, the tool was written ad hoc both times, and kept neither
+time. Second occurrence is the signal, so it is checked in: the third time is a
+command, not a rediscovery.
+
+WHY IT IS A DIFF AND NOT A SEARCH
+---------------------------------
+The obvious implementation is content addressing: search for the entry's
+substring and take the occurrence NEAREST the old line. That is what #692's
+throwaway did, and on a SMALL shift it is right. It is WRONG on a large one, and
+this was measured, not assumed: at #695 the shift was about 130 lines, and the
+lint only compares the first 24 characters of a substring, so `process_t *p =
+proc_current();` matched 28 places. Three entries from three different syscall
+handlers all "re-anchored" to the same line, producing a ledger that points at
+one site three times and at two real sites not at all. That is worse than the
+build failure it was fixing, and it is silent.
+
+So the anchor is the DIFF, which is exact. This reconstructs the line mapping
+between the committed baseline the manifest was correct at and the working tree,
+by opcode, and maps each old line to its new one. Content is then used as a
+CHECK, never as the primary locator: after mapping, the substring must actually
+be in the lint's own window at the new line, or the entry is reported.
+
+WHAT IT REFUSES TO DO
+---------------------
+ * An entry whose line was DELETED by the diff is reported and this exits
+   non-zero. It is never silently dropped and never guessed at: a ledger entry
+   that quietly vanishes is precisely the failure the ledger exists to prevent.
+   If the site was FIXED, DELETE the entry by hand, in the same change, and say
+   why in the CHANGELOG.
+ * An entry that maps to a line whose content does not match is reported the same
+   way. That means the region itself was edited, and a human must look at it.
+
+PRECONDITION
+------------
+The manifest must be correct against the baseline (default: HEAD). That is the
+normal case: the gate passed before you started editing. If the manifest was
+already stale at HEAD, fix that first, or this will faithfully re-anchor a lie.
+
+USAGE
+  reanchor-manifest [--baseline REV] [--manifest F] [--root D] [--check]
+    --check   report what would change, write nothing, exit 1 if anything would.
+"""
+import argparse, difflib, os, re, subprocess, sys
+
+ENTRY = re.compile(r'^([A-Za-z0-9_./-]+):(\d+):\s?(.*)$')
+# The lint compares only the first 24 characters, so verify exactly what the
+# lint verifies. Demanding more would flag entries the lint would accept.
+KEY = 24
+
+
+def git_show(repo, rev, path):
+    try:
+        out = subprocess.run(["git", "-C", repo, "show", "%s:%s" % (rev, path)],
+                             capture_output=True)
+    except OSError:
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.decode("utf-8", "replace").split("\n")
+
+
+def build_map(old, new):
+    """old line number (1-based) -> new line number, or None if deleted."""
+    m = {}
+    sm = difflib.SequenceMatcher(a=old, b=new, autojunk=False)
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag in ("equal", "replace"):
+            for k in range(i2 - i1):
+                # 'replace' maps positionally; the content check below is what
+                # decides whether that mapping is acceptable.
+                m[i1 + k + 1] = (j1 + k + 1) if (j1 + k) < j2 else None
+        elif tag == "delete":
+            for k in range(i1, i2):
+                m[k + 1] = None
+    return m
+
+
+def main():
+    here = os.path.dirname(os.path.abspath(__file__))
+    kroot = os.path.abspath(os.path.join(here, "..", ".."))     # kernel/
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--manifest", default=os.path.join(kroot, "smap-uaccess.manifest"))
+    ap.add_argument("--root", default=kroot)
+    ap.add_argument("--baseline", default="HEAD")
+    ap.add_argument("--check", action="store_true")
+    a = ap.parse_args()
+
+    repo = os.path.abspath(os.path.join(a.root, ".."))          # repo root
+    prefix = os.path.basename(os.path.abspath(a.root)) + "/"    # "kernel/"
+
+    with open(a.manifest, "r") as f:
+        lines = f.read().split("\n")
+
+    cur, base, lmap = {}, {}, {}
+
+    def load(rel):
+        if rel in cur:
+            return
+        p = os.path.join(a.root, rel)
+        cur[rel] = open(p).read().split("\n") if os.path.isfile(p) else None
+        base[rel] = git_show(repo, a.baseline, prefix + rel)
+        if cur[rel] is not None and base[rel] is not None:
+            lmap[rel] = build_map(base[rel], cur[rel])
+        else:
+            lmap[rel] = None
+
+    moved, ok, problems = [], 0, []
+
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if not s or s.startswith("#") or s.startswith("["):
+            continue
+        m = ENTRY.match(s)
+        if not m:
+            continue
+        rel, num, sub = m.group(1), int(m.group(2)), m.group(3)
+        load(rel)
+        body, key = cur[rel], sub[:KEY]
+        if body is None:
+            problems.append((rel, num, key, "the file no longer exists; delete the entry"))
+            continue
+        # Already where the lint wants it: leave it completely alone.
+        if key and any(key in w for w in body[max(0, num - 4): num + 3]):
+            ok += 1
+            continue
+        if lmap[rel] is None:
+            problems.append((rel, num, key, "no baseline %s:%s%s to diff against" % (a.baseline, prefix, rel)))
+            continue
+        new = lmap[rel].get(num)
+        if new is None:
+            problems.append((rel, num, key,
+                             "the baseline line was DELETED. If the site was FIXED, delete this "
+                             "entry by hand and say so in the CHANGELOG"))
+            continue
+        if key and not any(key in w for w in body[max(0, new - 4): new + 3]):
+            problems.append((rel, num, key,
+                             "maps to line %d but the substring is not there: the region itself "
+                             "was edited, look at it by hand" % new))
+            continue
+        moved.append((rel, num, new, key))
+        lines[i] = "%s:%d: %s" % (rel, new, sub)
+
+    for rel, num, key, why in problems:
+        sys.stderr.write("PROBLEM  %s:%d  %r\n         %s\n" % (rel, num, key, why))
+    for rel, old, new, key in moved:
+        print("re-anchor  %s:%d -> %d  %r" % (rel, old, new, key))
+    print("in place: %d   re-anchored: %d   problems: %d" % (ok, len(moved), len(problems)))
+
+    if problems:
+        return 1
+    if a.check:
+        return 1 if moved else 0
+    if moved:
+        with open(a.manifest, "w") as f:
+            f.write("\n".join(lines))
+        print("wrote %s" % a.manifest)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

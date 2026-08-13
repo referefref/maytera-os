@@ -82,7 +82,7 @@ typedef struct thread {
     process_priority_t priority; // Thread priority (inherited from process)
     uint64_t time_slice;        // Remaining time slice
     uint64_t total_time;        // Total CPU time used
-    uint64_t wake_time;         // Tick count to wake (for sleeping)
+    uint64_t wake_time;         // #483/#499: absolute mono_ms() deadline (ms) to wake
 
     // CPU context (saved on context switch)
     uint64_t rsp;               // Saved stack pointer
@@ -121,6 +121,10 @@ typedef struct thread {
     // Thread group list
     struct thread *group_next;  // Next thread in same process
     struct thread *group_prev;  // Previous thread in same process
+
+    // #446: per-thread FXSAVE image, same contract as process_t::fpu_area.
+    // MUST stay 16-byte aligned (fxsave64/fxrstor64 #GP otherwise).
+    uint8_t fpu_area[512] __attribute__((aligned(16)));
 } thread_t;
 
 // ============================================================================

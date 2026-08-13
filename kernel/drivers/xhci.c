@@ -9,7 +9,10 @@
 #include "../mm/pmm.h"
 #include "../mm/vmm.h"
 #include "../fs/bootlog.h"
-#include "../proc/process.h"   // #433: proc_create/PRIO_* for the re-scan worker
+#include "../proc/process.h"
+#include "../cpu/mono.h"    // #507/#525: THE shared clock + busy-delay (no private PIT loop here)
+#include "../sync/waitq.h"
+#include "../sync/noblock.h"   // #614: g_xhci_evt_wq, the event-ring wait queue   // #433: proc_create/PRIO_* for the re-scan worker
 
 // =============================================================================
 // Global State
@@ -45,6 +48,10 @@ static volatile uint32_t g_xfer_residual[XHCI_MAX_SLOTS][XHCI_MAX_ENDPOINTS];
 // transfer (observed: MSC "Data transfer failed" when the HID worker drained
 // the ring first). This flag serializes event-ring consumption: blocking
 // callers spin-acquire it; pollers try-acquire and simply skip if busy.
+// #614: event-ring wait queue. See xhci_evt_worker() below for why blocking
+// here is safe on hardware that never raises an interrupt.
+static wait_queue_head_t g_xhci_evt_wq = { .head = NULL, .lock = SPINLOCK_INIT };
+
 static volatile int g_evt_busy = 0;
 static inline int xhci_evt_trylock(void) { return __sync_lock_test_and_set(&g_evt_busy, 1) == 0; }
 static inline void xhci_evt_unlock(void) { __sync_lock_release(&g_evt_busy); }
@@ -92,70 +99,39 @@ static int xhci_enumerate_port(xhci_controller_t *xhc, uint32_t port, int speed)
 static int xhci_try_enumerate_port(xhci_controller_t *xhc, uint32_t port,
                                    int speed, int idx);
 
-// #307 real-hardware follow-up: xhci_delay() used to be a fixed-iteration
-// PAUSE-instruction spin ("ms * 10000" iterations), which is calibrated to
-// whatever per-instruction cost happens to apply wherever it runs. QEMU's TCG
-// emulation executes PAUSE far slower than real silicon, so the exact same
-// loop that reliably burns ~1ms under QEMU can burn only a small FRACTION of
-// a millisecond of real wall-clock time on real hardware. Every xHCI control
-// transfer (device enumeration for BOTH HID and MSC) and every MSC bulk
-// transfer waits via xhci_wait_for_event()/xhci_wait_transfer(), which loop
-// "timeout_ms" times calling this function once per iteration - so an
-// inaccurate xhci_delay() silently shrinks every one of those timeouts on
-// real hardware, including the real-hardware-specific post-Address-Device and
-// malformed-descriptor recovery delays #307 itself added (see
-// xhci_enumerate_devices), which were meant to give slow real devices extra
-// time and are undermined if the "ms" they ask for isn't really milliseconds.
+// #307/#375/#507: xhci_delay() is a REAL-TIME busy delay. It must be, because
+// USB bring-up runs with interrupts still OFF (see main.c) and with no
+// scheduler, and because USB enumeration is built out of spec-mandated MINIMUM
+// waits: port-reset recovery (TDRSTR), the 2ms Set-Address recovery of USB 2.0
+// 9.2.6.3, hub power-good, and the extra recovery gaps #307 added for slow real
+// devices. A delay that is shorter than it claims does not fail loudly; it
+// makes enumeration INTERMITTENT, which is exactly the shape of #433 (xHCI
+// enumeration race), #373 (hub enumeration) and #366 (USB2/EHCI hand-off).
 //
-// Fix: measure real elapsed time using the legacy PIT channel 0 countdown
-// directly (latch-and-read via ports 0x43/0x40), which keeps counting down in
-// hardware regardless of whether interrupts are enabled. This matters because
-// xHCI/USB bring-up runs with interrupts still OFF (see main.c), so the
-// interrupt-driven timer_ticks/g_timer_hz counter used elsewhere in the
-// kernel does NOT advance here - PIT channel 0 is the only wall-clock source
-// available this early. pit_init() (cpu/pic.c) programs channel 0 and it is
-// left running continuously; nothing else in the kernel reprograms channel 0
-// (the PC speaker uses channel 2), so this is safe to read at any time after
-// pit_init() runs in main(), which is long before xHCI init.
-#define XHCI_PIT_CMD_PORT   0x43
-#define XHCI_PIT_CH0_PORT   0x40
-#define XHCI_PIT_INPUT_HZ   1193182u
-
+// HISTORY, because both wrong answers are instructive:
+//   1. Originally a fixed-iteration PAUSE spin ("ms * 10000"). That is
+//      calibrated to whatever per-instruction cost happens to apply wherever it
+//      runs, and QEMU's TCG executes PAUSE far slower than real silicon, so the
+//      loop that burned ~1ms under emulation burned a small FRACTION of a
+//      millisecond on the real iMac. Fixed by #307 by measuring the PIT.
+//   2. That PIT measurement was a PRIVATE copy of the latch-and-read loop, and
+//      it treated one observed counter unit as one PIT input clock. cpu/pic.c
+//      programs channel 0 with command byte 0x36, whose mode bits are 011 =
+//      MODE 3 (square wave), in which the counter is decremented by TWO per
+//      input clock. So every delay here ran for HALF its nominal duration
+//      (#507). The factor of two was already correct forty lines into
+//      rustkern/mono.rs, where the same constant is needed to calibrate the
+//      monotonic clock: the defect was the DUPLICATION, not the arithmetic.
+//
+// So there is no private clock here any more. Timing comes from the one module
+// that owns the PIT and the TSC (cpu/mono.h, #525), which is calibrated in
+// main() immediately after pit_init() and therefore ready long before
+// usb_init() enumerates the controller. See mono_busy_delay_us().
 extern uint32_t g_timer_hz;
-
-static inline uint16_t xhci_pit_latch(void) {
-    outb(XHCI_PIT_CMD_PORT, 0x00);  // latch command, channel 0 (counting unaffected)
-    uint8_t lo = inb(XHCI_PIT_CH0_PORT);
-    uint8_t hi = inb(XHCI_PIT_CH0_PORT);
-    return (uint16_t)((hi << 8) | lo);
-}
 
 static void xhci_delay(uint32_t ms) {
     if (ms == 0) return;
-
-    uint32_t hz = g_timer_hz ? g_timer_hz : 250;
-    uint32_t reload = XHCI_PIT_INPUT_HZ / hz;
-    if (reload == 0 || reload > 65535) reload = 65535;
-
-    uint64_t target_counts = ((uint64_t)ms * XHCI_PIT_INPUT_HZ) / 1000;
-    uint64_t counted = 0;
-    uint16_t prev = xhci_pit_latch();
-
-    // Safety cap: an extremely generous upper bound on loop iterations so a
-    // wedged/absent PIT (should not happen - see comment above) degrades to
-    // "delay ends a bit early" instead of an unbounded hang. This is far more
-    // iterations than any real ms budget used in this file needs even at a
-    // pessimistic per-iteration cost.
-    uint32_t safety_iters = ms * 200000u + 1000000u;
-
-    while (counted < target_counts && safety_iters--) {
-        __asm__ volatile("pause");
-        uint16_t cur = xhci_pit_latch();
-        uint32_t delta = (cur <= prev) ? (uint32_t)(prev - cur)
-                                        : (uint32_t)(prev + (reload - cur));
-        counted += delta;
-        prev = cur;
-    }
+    mono_busy_delay_us((uint64_t)ms * 1000ull);
 }
 
 // #362: exported wrapper so other USB drivers (usb_ecm.c / usb_asix.c) can
@@ -1300,6 +1276,52 @@ static void xhci_drain_events(xhci_controller_t *xhc) {
     }
 
     xhci_evt_unlock();
+
+    // #614: wake anybody blocked waiting for a completion. Unconditional (not
+    // only when `processed`), exactly as hda_service_stream() wakes
+    // g_hda_space_wq: this function is also called from the periodic drain
+    // workers, so an unconditional wake makes the wait SELF-HEALING - no lost
+    // wakeup can outlive one drain pass - and costs a lock plus a NULL check
+    // when nobody is waiting, which is the overwhelmingly common case. Every
+    // waiter re-tests its own (slot,DCI) completion byte, so a spurious wake is
+    // harmless by construction. wake_up_all() is documented safe from IRQ
+    // context and is a no-op on an empty queue, so this is also safe on the
+    // early-boot path where no process exists yet.
+    wake_up_all(&g_xhci_evt_wq);
+}
+
+// #614: may THIS context sleep? Three conditions, all necessary:
+//   - the scheduler is live (otherwise there is nothing to switch to);
+//   - we are a process (pid 0 / pre-proc_init callers have no wait entry);
+//   - interrupts are ON, i.e. we are not inside a cli+spinlock section or an
+//     IRQ handler. #549 is the precedent: a TX path holding net_lock that
+//     blocks on a wait queue DEADLOCKS, because the wake can never be
+//     delivered. Callers of xhci_bulk_transfer()/xhci_control_transfer() are
+//     not all under our control, so this is checked rather than assumed.
+// #426 Phase 2: this WAS the private original of the rule. It has been
+// generalised into sync/noblock.h (wq_may_block()) and asserted at the
+// wait-queue and futex chokepoints, so this is now a one-line alias rather
+// than a second, drifting copy of the same three conditions (CLAUDE.md: reuse
+// the canonical primitive, never fork a private copy).
+static inline int xhci_may_block(void) {
+    return wq_may_block();
+}
+
+// #614: block until a drainer records a completion into *cc, or block_ms of the
+// monotonic clock elapses. The prepare-then-RE-CHECK order is what closes the
+// lost-wake window: we are already queued before we test *cc, so a drainer that
+// records the completion between our test and our sleep still wakes us.
+// The per-call cap is deliberate belt-and-braces: even if BOTH periodic drainers
+// somehow stopped, this degrades to a bounded (zero-CPU) re-poll rather than
+// stranding the caller until its overall transfer timeout.
+#define XHCI_BLOCK_MS 10
+static void xhci_block_for_cc(volatile uint8_t *cc) {
+    wait_queue_entry_t wqe;
+    __wait_prepare(&g_xhci_evt_wq, &wqe, 0);
+    if (!*cc) {
+        (void)__wait_event_wait_deadline(&wqe, sched_now_ms() + XHCI_BLOCK_MS);
+    }
+    __wait_finish(&g_xhci_evt_wq, &wqe);
 }
 
 // #348: block until the outstanding command completes. Drain-based and
@@ -1318,13 +1340,58 @@ static void xhci_drain_events(xhci_controller_t *xhc) {
 //
 // Fix: keep the boot path byte-for-byte (busy-spin, iteration-count budget so
 // the v1.65 bounded timeouts are preserved exactly), but at RUNTIME
-// (sched_preemption_enabled()) switch to an adaptive spin-THEN-SLEEP: poll fast
-// for a few ms to catch the common quick completion with low latency, then
-// proc_sleep() between polls so the core idle-HLTs instead of burning while the
-// slow stick transfers. The event ring is DMA'd by the controller regardless of
+// (sched_preemption_enabled()) switch to an adaptive poll-THEN-BLOCK: poll for
+// a bounded ~1ms window at a FINE quantum (#619: XHCI_WAIT_POLL_US, a poll
+// interval, NOT a spec delay) to catch the common quick completion with low
+// latency, then block on g_xhci_evt_wq so the core idle-HLTs instead of burning
+// while the slow stick transfers. The event ring is DMA'd by the controller regardless of
 // interrupts, so draining after each sleep still observes the completion (no IRQ
 // wiring needed). The runtime wait is bounded in real wall-clock via timer_ticks.
-#define XHCI_WAIT_FAST_SPINS 4   // ~4ms of quick polling before we start sleeping
+// #614: was 4. Each of these "spins" used to be an xhci_delay(1), a
+// MILLISECOND-granularity busy delay, so the old value burned up to ~4ms of a
+// core on EVERY transfer, and a USB-root box does tens of thousands of
+// transfers per large file. #614 cut it to two spins so that everything slower
+// BLOCKS on g_xhci_evt_wq at zero CPU instead of spinning.
+//
+// #619: that was still wrong, and #507 is what made the wrongness visible. A
+// SPEC DELAY and a POLL INTERVAL are different things and must not share a
+// primitive. xhci_delay() exists to satisfy USB's spec-mandated MINIMUM waits
+// (port-reset recovery, the 2ms Set-Address recovery of USB 2.0 9.2.6.3, hub
+// power-good); it is SUPPOSED to be at least as long as it claims, and #507
+// fixed it to be exactly that (the old private PIT loop omitted the MODE 3
+// factor of two, so every delay ran for HALF its nominal length). The fast path
+// here is not waiting out a hardware-mandated gap: it is SAMPLING a DMA-written
+// completion byte, and the only thing that makes a sampling interval correct is
+// being as short as is cheap. Because this one call site borrowed the spec-delay
+// primitive to do it, #507's correctness fix silently DOUBLED the completion
+// polling quantum from ~0.5ms to a real 1ms. Enumeration was unaffected
+// (+0.17s), but everything that reads through the USB block device roughly
+// doubled: the boot fsck went 7.6s -> 14.2s on the same volume, and power-on to
+// DESKTOP_READY went 56.0s -> 72.3s (measured, golden 979 vs golden 983).
+//
+// So the two uses are decoupled now. The spec delays KEEP #507's corrected
+// duration, because that is the fix that matters on the real iMac. The fast path
+// gets its OWN quantum, in microseconds, from the same shared monotonic clock
+// (cpu/mono.h) that xhci_delay() itself uses, so there is still no private clock
+// here. XHCI_WAIT_FAST_US is the total REAL-TIME budget of the fast path and is
+// deliberately held at the pre-#507 value of ~1ms, so the CPU burned per
+// transfer is no worse than the build this regressed from, while the SAMPLING is
+// 40x finer: a completion that lands in microseconds (which is what a virtual
+// bulk transfer does) is now observed within tens of microseconds instead of
+// half a millisecond. Anything slower than the fast window still blocks on
+// g_xhci_evt_wq at zero CPU, exactly as #614 intended.
+//
+// Why not delete the fast poll entirely and always block, now that #614/#616
+// give this wait a real wait queue with two always-armed drainers? Because both
+// drainers run at TICK granularity (this driver's own worker is a proc_sleep(1)
+// loop, the HID worker is ~4ms), so a pure block would FLOOR per-transfer
+// latency at about a tick and make the common case far worse than either 979 or
+// 983. The short fine-grained poll is what keeps the common case fast; the wait
+// queue is what keeps the slow case free. They are complementary, not
+// alternatives.
+#define XHCI_WAIT_POLL_US    25u
+#define XHCI_WAIT_FAST_US    1000u
+#define XHCI_WAIT_FAST_SPINS (XHCI_WAIT_FAST_US / XHCI_WAIT_POLL_US)
 
 // sched_preemption_enabled() + proc_sleep() come from proc/process.h (included
 // above for the #433 re-scan worker); do not re-declare sched_preemption_enabled
@@ -1392,11 +1459,35 @@ int xhci_wait_for_event(xhci_controller_t *xhc, uint32_t type, uint32_t timeout_
             // Expire on REAL elapsed time, not on ticks delivered (#525).
             if (mono_dl ? ((mono_ms() - mono_start) >= (uint64_t)timeout_ms)
                         : (timer_ticks >= deadline)) break;
-            if (spins < XHCI_WAIT_FAST_SPINS) { xhci_delay(1); spins++; }
-            else proc_sleep(1);   // sleeps >= 1 tick; core can HLT meanwhile
+            if (spins < XHCI_WAIT_FAST_SPINS) { mono_busy_delay_us(XHCI_WAIT_POLL_US); spins++; }
+            else if (xhci_may_block()) xhci_block_for_cc(&g_cmd_cc);
+            else proc_sleep(1);   // cannot sleep on a wq here; bounded fallback
         } else {
-            if (spins >= timeout_ms) break;   // preserve boot iteration-count budget
-            xhci_delay(1); spins++;
+            // BOOT path (no scheduler, interrupts off): there is nothing to
+            // block ON, so this is necessarily a busy poll. #619 applies the
+            // same separation here. The QUANTUM is XHCI_WAIT_POLL_US, a poll
+            // interval; the BUDGET is REAL ELAPSED TIME from the shared
+            // monotonic clock, which is calibrated in main() before usb_init()
+            // and is the very clock xhci_delay() itself reads, so the timeout
+            // semantics are unchanged from the post-#507 build (there, one
+            // iteration was one real millisecond, so the iteration budget WAS a
+            // real-time budget; this states that directly instead of encoding
+            // it in the quantum). The old iteration-count budget is kept
+            // verbatim as the uncalibrated fallback, so a calibration failure
+            // leaves this path exactly as it was and can never be worse.
+            //
+            // This branch is NOT a micro-optimisation: on a USB-root box the
+            // pre-scheduler phase reads the whole FAT through it (the free-
+            // cluster scan alone was 4.4s of a 57s boot at a 1ms quantum), and
+            // that is why "USB init complete to ext2 mounted" doubled from
+            // 5.97s to 11.07s between goldens 979 and 983.
+            if (mono_ok) {
+                if ((mono_ms() - mono_start) >= (uint64_t)timeout_ms) break;
+                mono_busy_delay_us(XHCI_WAIT_POLL_US);
+            } else {
+                if (spins >= timeout_ms) break;   // pre-calibration fallback
+                xhci_delay(1); spins++;
+            }
         }
     }
 
@@ -1419,9 +1510,11 @@ static int xhci_wait_transfer(xhci_controller_t *xhc, int slot_id, int dci,
         dci < 1 || dci >= XHCI_MAX_ENDPOINTS) {
         return -1;
     }
-    // #375: adaptive spin-then-sleep at runtime (see xhci_wait_for_event). This
+    // #375: adaptive poll-then-block at runtime (see xhci_wait_for_event). This
     // is the HOTTEST path on a USB-root box - every MSC bulk read/write CSW waits
-    // here - so it is what pegs a core on a slow stick. Boot path unchanged.
+    // here - so it is what pegs a core on a slow stick. #619: the BOOT path below
+    // is no longer unchanged either; it had the same borrowed-quantum defect and
+    // it is the branch the whole pre-scheduler root read goes through.
     int runtime = sched_preemption_enabled();
     uint32_t hz = g_timer_hz ? g_timer_hz : 250;
     uint64_t deadline = timer_ticks + ((uint64_t)timeout_ms * hz + 999) / 1000 + 1;
@@ -1449,11 +1542,35 @@ static int xhci_wait_transfer(xhci_controller_t *xhc, int slot_id, int dci,
             // Expire on REAL elapsed time, not on ticks delivered (#525).
             if (mono_dl ? ((mono_ms() - mono_start) >= (uint64_t)timeout_ms)
                         : (timer_ticks >= deadline)) break;
-            if (spins < XHCI_WAIT_FAST_SPINS) { xhci_delay(1); spins++; }
-            else proc_sleep(1);   // sleeps >= 1 tick; core idle-HLTs meanwhile
+            if (spins < XHCI_WAIT_FAST_SPINS) { mono_busy_delay_us(XHCI_WAIT_POLL_US); spins++; }
+            else if (xhci_may_block()) xhci_block_for_cc(&g_xfer_cc[slot_id - 1][dci]);
+            else proc_sleep(1);   // cannot sleep on a wq here; bounded fallback
         } else {
-            if (spins >= timeout_ms) break;   // preserve boot iteration-count budget
-            xhci_delay(1); spins++;
+            // BOOT path (no scheduler, interrupts off): there is nothing to
+            // block ON, so this is necessarily a busy poll. #619 applies the
+            // same separation here. The QUANTUM is XHCI_WAIT_POLL_US, a poll
+            // interval; the BUDGET is REAL ELAPSED TIME from the shared
+            // monotonic clock, which is calibrated in main() before usb_init()
+            // and is the very clock xhci_delay() itself reads, so the timeout
+            // semantics are unchanged from the post-#507 build (there, one
+            // iteration was one real millisecond, so the iteration budget WAS a
+            // real-time budget; this states that directly instead of encoding
+            // it in the quantum). The old iteration-count budget is kept
+            // verbatim as the uncalibrated fallback, so a calibration failure
+            // leaves this path exactly as it was and can never be worse.
+            //
+            // This branch is NOT a micro-optimisation: on a USB-root box the
+            // pre-scheduler phase reads the whole FAT through it (the free-
+            // cluster scan alone was 4.4s of a 57s boot at a 1ms quantum), and
+            // that is why "USB init complete to ext2 mounted" doubled from
+            // 5.97s to 11.07s between goldens 979 and 983.
+            if (mono_ok) {
+                if ((mono_ms() - mono_start) >= (uint64_t)timeout_ms) break;
+                mono_busy_delay_us(XHCI_WAIT_POLL_US);
+            } else {
+                if (spins >= timeout_ms) break;   // pre-calibration fallback
+                xhci_delay(1); spins++;
+            }
         }
     }
     // The real-vs-ticks pair is the whole diagnostic: if a "5000ms" budget
@@ -3365,11 +3482,44 @@ static void xhci_rescan_worker(void *arg) {
     }
 }
 
+// #614: THE REDUNDANT, ALWAYS-ARMED WAKE SOURCE.
+//
+// This kernel has NO xHCI interrupt handler at all: the event ring is DMA-polled
+// (see xhci_drain_events). So a waiter that blocks on g_xhci_evt_wq needs a
+// drainer that is GUARANTEED to run, whether or not the controller ever raises
+// an interrupt and whether or not any other subsystem happens to be polling.
+// Two INDEPENDENT periodic drainers now exist, both funnelling through
+// xhci_drain_events(), which wakes the queue on every pass:
+//   (a) usb_hid_poll_worker() at ~4ms - pre-existing, but it only runs if a USB
+//       HID device enumerated. A PS/2-only or headless box has none, so it can
+//       never be the sole wake source.
+//   (b) this worker - unconditional whenever ANY xHCI controller initialised.
+// A completion can therefore strand a waiter for at most one ~4ms pass even on
+// hardware that never interrupts (the real iMac's xHCI, #433/#373/#366), and
+// xhci_block_for_cc() additionally caps each block at XHCI_BLOCK_MS. This is
+// strictly stronger than the ISR-plus-worker shape the HDA PCM pump uses: there
+// the ISR is the fast path and the worker the safety net, whereas here BOTH legs
+// are timer-driven and neither depends on the device behaving.
+static void xhci_evt_worker(void *arg) {
+    (void)arg;
+    bootlog_write("[xHCI] event-ring drain worker started (%d controller(s))",
+                  xhci_controller_count);
+    for (;;) {
+        for (int i = 0; i < xhci_controller_count; i++) {
+            if (xhci_controllers[i].initialized)
+                xhci_drain_events(&xhci_controllers[i]);
+        }
+        proc_sleep(1);   // one tick; a real timer sleep, never a busy spin (#426)
+    }
+}
+
 void xhci_start_rescan_thread(void) {
     if (xhci_controller_count <= 0) {
         bootlog_write("[xHCI] no controllers; port re-scan worker NOT started");
         return;
     }
     proc_create("xhci_rescan", xhci_rescan_worker, NULL, PRIO_NORMAL);
-    kprintf("[xHCI] periodic port re-scan worker created\n");
+    // #614: the always-armed event-ring drainer that makes blocking waits safe.
+    proc_create("xhci_evt", xhci_evt_worker, NULL, PRIO_NORMAL);
+    kprintf("[xHCI] periodic port re-scan + event drain workers created\n");
 }

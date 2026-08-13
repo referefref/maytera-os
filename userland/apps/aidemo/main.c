@@ -16,16 +16,28 @@ int main(int argc, char *argv[]) {
     int win = win_create(AIDEMO_MESSAGE, 240, 200, 420, 200);
     if (win < 0) return 1;
 
-    for (;;) {
-        win_draw_rect(win, 0, 0, 420, 200, 0x00203040);
-        win_draw_text_ttf(win, 24, 70, AIDEMO_MESSAGE, 22, 0x00FFFF80);
-        win_draw_text(win, 24, 120, "AI userland compiler demo (#294)", 0x00FFFFFF);
-        win_invalidate(win);
+    // #548: this window's content never changes, but the loop used to redraw
+    // + win_invalidate() UNCONDITIONALLY every 500ms tick forever - a real
+    // (if small: 2 Hz on a static 420x200 window) instance of the idle-CPU
+    // echo-loop anti-pattern. Draw once, then block on the wait-queue
+    // (win_get_event timeout -1) and only repaint on a genuine EVENT_REDRAW
+    // (resize/create/explicit invalidate), matching the fontbook/print3d
+    // pattern of an idle window costs <workspace> CPU.
+    win_draw_rect(win, 0, 0, 420, 200, 0x00203040);
+    win_draw_text_ttf(win, 24, 70, AIDEMO_MESSAGE, 22, 0x00FFFF80);
+    win_draw_text(win, 24, 120, "AI userland compiler demo (#294)", 0x00FFFFFF);
+    win_invalidate(win);
 
+    for (;;) {
         gui_event_t ev;
-        int et = win_get_event(win, &ev, 500);
-        if (et != 0) {
-            if (ev.type == EVENT_WINDOW_CLOSE) break;
+        int et = win_get_event(win, &ev, -1);
+        if (et == 0) continue;
+        if (ev.type == EVENT_WINDOW_CLOSE) break;
+        if (ev.type == EVENT_REDRAW) {
+            win_draw_rect(win, 0, 0, 420, 200, 0x00203040);
+            win_draw_text_ttf(win, 24, 70, AIDEMO_MESSAGE, 22, 0x00FFFF80);
+            win_draw_text(win, 24, 120, "AI userland compiler demo (#294)", 0x00FFFFFF);
+            win_invalidate(win);
         }
     }
     win_destroy(win);

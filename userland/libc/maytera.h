@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // maytera.h - Main header for MayteraOS user-space programs
 // Include this single header for basic functionality
 #ifndef _MAYTERA_H

@@ -1,0 +1,16 @@
+# Accessories - all-users Start-menu default fragment. Migrated verbatim from
+# the old hardcoded startmenu_init(). Expanded by default, as it was before.
+category: Accessories | expanded
+item: Terminal | /APPS/TERMINAL | icon=terminal
+item: Files | /APPS/FILES | icon=folder
+item: Editor | /APPS/EDITOR | icon=highlight
+item: Notes | /APPS/NOTES | icon=notes
+item: Calculator | /APPS/CALC | icon=calculator
+item: Converter | /APPS/CONVERT | icon=converter
+item: World Clock | /APPS/clock | icon=clock
+item: Timers | /APPS/TIMERS | icon=timers
+item: Authenticator | /APPS/mfa | icon=auth
+item: Launcher | /APPS/LAUNCHER | icon=launcher
+item: Task Switcher | /APPS/WINSWTCH | icon=taskswitch
+item: Python | /APPS/PYTHON.ELF | icon=python
+item: Help | /APPS/help | icon=help

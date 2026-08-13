@@ -30,6 +30,13 @@ typedef struct _WINDOW {
 extern WINDOW *stdscr;
 extern WINDOW *curscr;
 
+/* MayteraOS port note: traditional BSD curses exposes the "true" cursor
+ * position via the struct fields _cury/_curx. Rogue's upstream main.c
+ * (tstp(), unmodified) reads/writes curscr->_cury/_curx directly. Alias
+ * them to our cury/curx fields instead of duplicating the state. */
+#define _cury cury
+#define _curx curx
+
 /* ── Arrow key codes (returned by getch) ─────────────────────────── */
 #define KEY_MIN    0x101
 #define KEY_UP     0x103
@@ -57,10 +64,21 @@ int scrollok(WINDOW *win, int bf);
 
 /* ── Window management ───────────────────────────────────────────── */
 WINDOW *newwin(int nlines, int ncols, int begin_y, int begin_x);
+WINDOW *subwin(WINDOW *orig, int nlines, int ncols, int begin_y, int begin_x);
+int     mvwin(WINDOW *win, int y, int x);
 int     delwin(WINDOW *win);
 int     touchwin(WINDOW *win);
 int     wnoutrefresh(WINDOW *win);
 int     doupdate(void);
+int     getmaxx(WINDOW *win);
+int     getmaxy(WINDOW *win);
+int     isendwin(void);
+int     baudrate(void);
+int     mvcur(int oldrow, int oldcol, int newrow, int newcol);
+int     erasechar(void);
+int     killchar(void);
+int     flushinp(void);
+char   *unctrl(chtype ch);
 
 /* ── Output ──────────────────────────────────────────────────────── */
 int refresh(void);
@@ -104,7 +122,14 @@ int getch(void);
 int wgetch(WINDOW *win);
 int getstr(char *str);
 int wgetstr(WINDOW *win, char *str);
+int wgetnstr(WINDOW *win, char *str, int n);
 int mvgetstr(int y, int x, char *str);
+
+/* ── Read-back ───────────────────────────────────────────────────── */
+chtype inch(void);
+chtype winch(WINDOW *win);
+chtype mvinch(int y, int x);
+chtype mvwinch(WINDOW *win, int y, int x);
 
 /* ── Screen state ────────────────────────────────────────────────── */
 int beep(void);

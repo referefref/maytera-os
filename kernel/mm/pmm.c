@@ -37,6 +37,13 @@ int g_pmm_freewatch = 0;  // debug detector disabled (syscall reentrancy bug fix
 static uint64_t memory_start = 0;  // First usable page
 static uint64_t memory_end = 0;    // Last usable page + 1
 
+// #647: the boot memory map, kept so later code can ask what TYPE a physical
+// address was given. pmm_init() used to consume it and drop it, which meant the
+// only record of "where did this page come from" died with the function.
+static memory_map_entry_t *g_mmap = 0;
+static uint32_t g_mmap_entries = 0;
+static uint64_t g_phys_limit = 0;   // one past the highest address in the map
+
 // Spinlock for thread safety (simple implementation)
 static volatile int pmm_lock = 0;
 
@@ -78,6 +85,14 @@ void pmm_init(uint64_t mem_map_addr, uint32_t mem_map_entries) {
     memset(page_bitmap, 0xFF, sizeof(page_bitmap));
 
     memory_map_entry_t *entries = (memory_map_entry_t *)mem_map_addr;
+
+    // #647: retain the map. See g_mmap above.
+    g_mmap = entries;
+    g_mmap_entries = mem_map_entries;
+    for (uint32_t i = 0; i < mem_map_entries; i++) {
+        uint64_t top = entries[i].base + entries[i].length;
+        if (top > g_phys_limit) g_phys_limit = top;
+    }
 
     // First pass: find total memory and mark usable regions as free
     for (uint32_t i = 0; i < mem_map_entries; i++) {
@@ -212,6 +227,44 @@ void pmm_init(uint64_t mem_map_addr, uint32_t mem_map_entries) {
             used_pages, (used_pages * PMM_PAGE_SIZE) / MB);
 }
 
+#ifdef PTWALK_SELFTEST
+// #647 IN-SERVICE detector. DEBUG BUILDS ONLY (`make PTWALKTEST=1`).
+//
+// The boot self-test proves what the allocator WOULD do if drained. This proves
+// what it ACTUALLY does under the real workload, which is the question that
+// matters for #606 and #483: those bugs happen 20 seconds in, not at exhaustion.
+// Armed only after the boot self-test finishes, so the test's own drains do not
+// spam. g_pmm_hwm is the highest page ever handed out, which says how close the
+// live system gets to the table region even when it never reaches it.
+extern int vmm_is_boot_page_table(uint64_t phys);
+int g_pmm_live_detect = 0;
+uint64_t g_pmm_hwm = 0;
+
+static void pmm_live_check(uint64_t pa, uint64_t count, uint64_t ret) {
+    if (!g_pmm_live_detect) return;
+    uint64_t top = pa + count * PMM_PAGE_SIZE;
+    if (top > g_pmm_hwm) {
+        // Report only when the mark crosses a 16MB boundary. Printing per PAGE
+        // emits a serial line every 4KB, which floods the port badly enough to
+        // dominate boot timing: the first version of this instrument left the
+        // allocator at 9MB after 140 seconds of uptime, i.e. it was measuring
+        // its own output rather than the system.
+        if ((top >> 24) != (g_pmm_hwm >> 24)) {
+            kprintf("[PT647-HWM] allocator high-water mark 0x%lx (%lu MB)\n",
+                    top, top / MB);
+        }
+        g_pmm_hwm = top;
+    }
+    for (uint64_t i = 0; i < count; i++) {
+        if (vmm_is_boot_page_table(pa + i * PMM_PAGE_SIZE)) {
+            kprintf("[PT647-LIVE] *** ALLOC OF LIVE PAGE TABLE 0x%lx "
+                    "(block 0x%lx x%lu) caller=0x%lx ***\n",
+                    pa + i * PMM_PAGE_SIZE, pa, count, ret);
+        }
+    }
+}
+#endif
+
 // Allocate a single physical page
 uint64_t pmm_alloc_page(void) {
     pmm_acquire_lock();
@@ -224,6 +277,9 @@ uint64_t pmm_alloc_page(void) {
             used_pages++;
             pmm_release_lock();
             uint64_t pa = page * PMM_PAGE_SIZE;
+#ifdef PTWALK_SELFTEST
+            pmm_live_check(pa, 1, (uint64_t)__builtin_return_address(0));
+#endif
             if (g_pmm_freewatch) {
                 // If the page we just handed out is STILL mapped live (USER) in
                 // the current address space, it was freed while in use: a
@@ -272,6 +328,10 @@ uint64_t pmm_alloc_pages(uint64_t count) {
             free_pages -= count;
             used_pages += count;
             pmm_release_lock();
+#ifdef PTWALK_SELFTEST
+            pmm_live_check(start_page * PMM_PAGE_SIZE, count,
+                           (uint64_t)__builtin_return_address(0));
+#endif
             return start_page * PMM_PAGE_SIZE;
         }
     }
@@ -333,6 +393,152 @@ uint64_t pmm_get_free_pages(void) {
 uint64_t pmm_get_used_pages(void) {
     return used_pages;
 }
+
+// ===========================================================================
+// #647: reservation of memory that is LIVE but has no linker symbol.
+//
+// pmm_init() re-reserves only what it can name: kernel text/rodata, the
+// __data_start..__kernel_end region, the bitmap, and the legacy 1-4MB window.
+// Anything live that is reachable only through a HARDWARE REGISTER (CR3, and in
+// principle GDTR/IDTR) is invisible to it. vmm_init() adopts UEFI's page tables
+// and never switches away from them, so the entire paging hierarchy is exactly
+// that kind of object. These entry points let the owner of such an object hand
+// it to the PMM after the fact.
+// ===========================================================================
+
+// Mark one page as USED. Idempotent. Returns:
+//    1  newly reserved (it was free, i.e. it WOULD have been handed out)
+//    0  already marked used (nothing to do)
+//   -1  outside the range the allocator will ever consider, so moot
+int pmm_reserve_page(uint64_t phys_addr) {
+    uint64_t page = phys_addr / PMM_PAGE_SIZE;
+
+    if (page < memory_start || page >= memory_end) {
+        return -1;
+    }
+
+    pmm_acquire_lock();
+    if (bitmap_test(page)) {
+        pmm_release_lock();
+        return 0;
+    }
+    bitmap_set(page);
+    free_pages--;
+    used_pages++;
+    pmm_release_lock();
+    return 1;
+}
+
+// Is this page currently allocatable? 1 = free (would be handed out), 0 = not.
+// Pages outside [memory_start, memory_end) report 0: the allocator's scan never
+// reaches them.
+int pmm_page_is_free(uint64_t phys_addr) {
+    uint64_t page = phys_addr / PMM_PAGE_SIZE;
+    if (page < memory_start || page >= memory_end) return 0;
+    return !bitmap_test(page);
+}
+
+// #647 diagnostic: which boot memory-map entry does this physical address fall
+// in, and what type did the bootloader give it? Returns the MEMORY_TYPE_* value
+// or 0 if no entry covers it. Optionally reports the entry index and extent.
+uint32_t pmm_mmap_type_of(uint64_t phys_addr, uint32_t *out_index,
+                          uint64_t *out_base, uint64_t *out_len) {
+    for (uint32_t i = 0; i < g_mmap_entries; i++) {
+        if (phys_addr >= g_mmap[i].base &&
+            phys_addr < g_mmap[i].base + g_mmap[i].length) {
+            if (out_index) *out_index = i;
+            if (out_base)  *out_base = g_mmap[i].base;
+            if (out_len)   *out_len = g_mmap[i].length;
+            return g_mmap[i].type;
+        }
+    }
+    return 0;
+}
+
+uint64_t pmm_phys_limit(void) { return g_phys_limit; }
+
+const char *pmm_mmap_type_name(uint32_t type) {
+    switch (type) {
+        case MEMORY_TYPE_USABLE:           return "USABLE(EfiConventional|EfiBootServicesCode|EfiBootServicesData)";
+        case MEMORY_TYPE_RESERVED:         return "RESERVED";
+        case MEMORY_TYPE_ACPI_RECLAIMABLE: return "ACPI_RECLAIMABLE";
+        case MEMORY_TYPE_ACPI_NVS:         return "ACPI_NVS";
+        case MEMORY_TYPE_BAD:              return "BAD";
+        case MEMORY_TYPE_BOOTLOADER:       return "BOOTLOADER(EfiLoaderCode|EfiLoaderData)";
+        case MEMORY_TYPE_KERNEL:           return "KERNEL";
+        case MEMORY_TYPE_FRAMEBUFFER:      return "FRAMEBUFFER";
+        default:                           return "<not in map>";
+    }
+}
+
+// #647 diagnostic: dump the whole boot memory map. Adjacency matters when
+// reading it: the bootloader copies UEFI descriptors 1:1 and never merges them,
+// so TWO ABUTTING ENTRIES OF THE SAME converted type were necessarily DIFFERENT
+// raw UEFI types (UEFI itself would have merged them otherwise). That is the
+// only signal we have about the raw type, because convert_memory_type() in the
+// bootloader collapses three raw types into MEMORY_TYPE_USABLE and the raw value
+// is not carried anywhere in memory_map_entry_t.
+void pmm_dump_mmap(void) {
+    kprintf("[PMM-MAP] %u entries, phys_limit=0x%lx\n", g_mmap_entries, g_phys_limit);
+    for (uint32_t i = 0; i < g_mmap_entries; i++) {
+        uint64_t base = g_mmap[i].base;
+        uint64_t len = g_mmap[i].length;
+        int abuts_prev = (i > 0) &&
+            (g_mmap[i - 1].base + g_mmap[i - 1].length == base) &&
+            (g_mmap[i - 1].type == g_mmap[i].type);
+        kprintf("[PMM-MAP] %3u 0x%012lx..0x%012lx %8lu KB type=%u attr=0x%x%s\n",
+                i, base, base + len, len / 1024, g_mmap[i].type,
+                g_mmap[i].attributes,
+                abuts_prev ? "  <-SPLIT-FROM-PREV(same converted type, different raw UEFI type)" : "");
+    }
+}
+
+#ifdef PTWALK_SELFTEST
+// ---------------------------------------------------------------------------
+// #647 self-test support. DEBUG BUILDS ONLY (`make PTWALKTEST=1`).
+//
+// The end-to-end proof of the fix is "drain the allocator and check that no page
+// it hands out is a live page table". A literal drain via pmm_alloc_page() is
+// O(n^2): the allocator is a first-fit linear scan from memory_start with NO
+// cursor, so draining ~500k pages costs ~1.4e11 bit tests. pmm_selftest_drain()
+// is the single-pass equivalent: pmm_alloc_page()'s selection rule is exactly
+// "the lowest-index free page", so one ascending pass over the bitmap yields the
+// same pages in the same order. vmm.c cross-checks that claim against a real
+// bounded pmm_alloc_page() drain before trusting it.
+//
+// The bitmap is snapshotted and restored around the drain so the test leaves no
+// trace. The drain never WRITES to the pages it "allocates"; it only compares
+// their addresses.
+// ---------------------------------------------------------------------------
+static uint8_t pmm_test_backup[PMM_BITMAP_SIZE];
+static uint64_t bk_free, bk_used, bk_total;
+
+void pmm_selftest_snapshot(void) {
+    memcpy(pmm_test_backup, page_bitmap, sizeof(page_bitmap));
+    bk_free = free_pages; bk_used = used_pages; bk_total = total_pages;
+}
+
+void pmm_selftest_restore(void) {
+    memcpy(page_bitmap, pmm_test_backup, sizeof(page_bitmap));
+    free_pages = bk_free; used_pages = bk_used; total_pages = bk_total;
+}
+
+// Visit every page pmm_alloc_page() would hand out, in order, until exhaustion.
+// Returns the number visited. Marks each used as it goes (so the sequence is the
+// real one); pair with snapshot/restore.
+uint64_t pmm_selftest_drain(void (*cb)(uint64_t phys, uint64_t ordinal, void *ctx),
+                            void *ctx) {
+    uint64_t n = 0;
+    for (uint64_t page = memory_start; page < memory_end; page++) {
+        if (!bitmap_test(page)) {
+            bitmap_set(page);
+            if (cb) cb(page * PMM_PAGE_SIZE, n, ctx);
+            n++;
+        }
+    }
+    return n;
+}
+#endif // PTWALK_SELFTEST
 
 // Print memory statistics
 void pmm_print_stats(void) {

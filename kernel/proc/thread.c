@@ -2,6 +2,7 @@
 // Part of Task #25 (Threading with clone() syscall)
 
 #include "thread.h"
+#include "../cpu/sse.h"   // #446: fxsave_area_t for the FPU-area init
 #include "process.h"
 #include "../mm/heap.h"
 #include "../security/validate.h"   // #503: deferred-write validation (clear_child_tid)
@@ -11,6 +12,7 @@
 #include "../serial.h"
 #include "../string.h"
 #include "../sync/spinlock.h"
+#include "../cpu/mono.h"   // #483/#499: sched_now_ms(), the monotonic deadline clock
 
 // ============================================================================
 // Global State
@@ -296,7 +298,8 @@ int thread_create(uint32_t flags, void *stack, uint32_t *parent_tid,
 
     // Set up TID addresses
     if ((flags & CLONE_PARENT_SETTID) && parent_tid) {
-        *parent_tid = thread->tid;
+        uint32_t v = thread->tid;                      // #509 TOCTOU-safe write
+        (void)copy_to_user(parent_tid, &v, sizeof(v));
     }
 
     if (flags & CLONE_CHILD_SETTID) {
@@ -332,6 +335,9 @@ int thread_create(uint32_t flags, void *stack, uint32_t *parent_tid,
     *(uint64_t *)stack_top = 0x202;
 
     thread->rsp = stack_top;
+    // #446: FXSAVE image lives in the thread struct, not on the stack, and is
+    // seeded through the one shared helper (see process.c).
+    fpu_area_init(thread->fpu_area);
 
     // Add to thread group
     add_to_thread_group(thread, proc);
@@ -397,6 +403,9 @@ int thread_create_kernel(const char *name, void (*entry)(void *), void *arg,
     *(uint64_t *)stack_top = 0x202;
 
     thread->rsp = stack_top;
+    // #446: FXSAVE image lives in the thread struct, not on the stack, and is
+    // seeded through the one shared helper (see process.c).
+    fpu_area_init(thread->fpu_area);
 
     // Add to ready queue
     spinlock_acquire(&ready_queue_lock);
@@ -440,12 +449,13 @@ void thread_exit(int exit_code) {
     // validate_user_ptr() walks the right address space. It only walks page
     // tables (no locks, no allocation), so it is safe under cli().
     if (self->clear_child_tid) {
-        if (validate_user_ptr(self->clear_child_tid, sizeof(uint32_t),
-                              ACCESS_RW_USER) == VALIDATE_OK) {
-            *self->clear_child_tid = 0;
-
-            // Wake any threads waiting on futex at this address
-            // (futex_wake will be called from futex.c)
+        // #509: TOCTOU-safe. copy_to_user validates U/S AND survives a racing
+        // unmap of the tid word (returns EFAULT instead of a Ring-0 write to a
+        // freed frame). Runs on the exiting thread's own CR3; the target is the
+        // still-present tid word, so no demand fault is expected under cli().
+        uint32_t zero = 0;
+        if (copy_to_user(self->clear_child_tid, &zero, sizeof(zero)) == 0) {
+            // Wake any threads waiting on futex at this address.
             extern void futex_wake_addr(uint32_t *addr, int count);
             futex_wake_addr(self->clear_child_tid, 1);
         } else {
@@ -630,9 +640,10 @@ void thread_sleep(uint32_t ms) {
 
     cli();
 
-    // Calculate wake time (assuming 100Hz timer)
-    uint64_t ticks = (ms + 9) / 10;  // Round up
-    current_thread->wake_time = timer_ticks + ticks;
+    // #483/#499: wake against the MONOTONIC ms clock, not timer_ticks. wake_time
+    // is now an absolute mono_ms() deadline in MILLISECONDS. (This also fixes an
+    // old hardcoded-100Hz ms->ticks conversion that slept ~40% short at 250Hz.)
+    current_thread->wake_time = sched_now_ms() + (uint64_t)ms;
     current_thread->state = THREAD_STATE_SLEEPING;
 
     thread_schedule();
@@ -687,11 +698,13 @@ void thread_sched_tick(void) {
     // Update total time
     current_thread->total_time++;
 
-    // Check for sleeping threads to wake
+    // Check for sleeping threads to wake. #483/#499: wake_time is an absolute
+    // mono_ms() deadline in ms; sample the monotonic clock once for the sweep.
+    uint64_t now = sched_now_ms();
     spinlock_acquire(&thread_table_lock);
     for (int i = 0; i < MAX_THREADS; i++) {
         thread_t *t = &thread_table[i];
-        if (t->state == THREAD_STATE_SLEEPING && t->wake_time <= timer_ticks) {
+        if (t->state == THREAD_STATE_SLEEPING && t->wake_time <= now) {
             t->state = THREAD_STATE_READY;
             t->wake_time = 0;
 
@@ -766,13 +779,24 @@ void thread_schedule(void) {
 
     // Context switch
     if (old) {
-        extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
-        context_switch(&old->rsp, next->rsp);
+        extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp,
+                                   void *old_fpu, void *new_fpu,
+                                   volatile int32_t *old_release,
+                                   volatile int32_t *new_unpin);
+        // #67: NULL release. This is the thread_t switcher, a separate path from
+        // the process scheduler; a thread_t is never placed on a process run
+        // queue, so there is no ownership flag for another core to test.
+        context_switch(&old->rsp, next->rsp, old->fpu_area, next->fpu_area,
+                       (volatile int32_t *)0, (volatile int32_t *)0);
     } else {
         // First thread - save old state and switch to new context
-        extern void context_start(uint64_t *old_rsp, uint64_t new_rsp, uint64_t new_cr3);
+        extern void context_start(uint64_t *old_rsp, uint64_t new_rsp, uint64_t new_cr3,
+                                  void *old_fpu, volatile int32_t *old_release,
+                                  volatile int32_t *new_unpin);
         static uint64_t dummy_rsp;
-        context_start(&dummy_rsp, next->rsp, next->process ? next->process->cr3 : 0);
+        context_start(&dummy_rsp, next->rsp, next->process ? next->process->cr3 : 0,
+                      g_dummy_fpu_area, (volatile int32_t *)0,
+                      (volatile int32_t *)0);   // #67/#75: thread_t is never queued
     }
 
     // Returned from context switch - re-enable interrupts

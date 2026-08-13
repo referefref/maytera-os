@@ -10,8 +10,18 @@
 #include "signal.h"
 #include "process.h"
 #include "syscall.h"
+#include "../security/validate.h"  // #509: copy_*_user adoption
 #include "../serial.h"
 #include "../sync/waitq.h"   // #426: sys_pause() parks instead of yield-spinning
+#include "../cpu/mono.h"      // #483/#499: sched_now_ms() for the alarm deadline
+
+// #565: SZ_K_SIGACTION in rustkern/argtab.rs is the byte count the syscall
+// pointer chokepoint validates for SYS_SIGACTION's new_act (READ) and old_act
+// (WRITE). Lock it to the real struct here (public struct, its owning TU) so a
+// field change fails the build pointing at THIS line rather than silently
+// validating the wrong length. Same discipline as syscall_argtab_lock.c.
+_Static_assert(sizeof(k_sigaction_t) == 40,
+               "#565 argtab: SZ_K_SIGACTION in rustkern/argtab.rs is stale");
 
 extern process_t *proc_current(void);
 extern void proc_wake(process_t *p);
@@ -128,30 +138,47 @@ static void deliver_signal(saved_frame_t *sf, process_t *p, int signo) {
 
     sigframe_t *frame = (sigframe_t *)user_rsp;
 
-    // IMPORTANT: we are writing to user memory while still in the user
-    // process's cr3 (syscalls do not swap cr3). If user_rsp is bogus the
-    // write will page-fault here; Phase D4's paranoia can add validation.
-    frame->saved_rax    = sf->rax;
-    frame->saved_rbx    = sf->rbx;
-    frame->saved_rcx    = sf->rcx;
-    frame->saved_rdx    = sf->rdx;
-    frame->saved_rsi    = sf->rsi;
-    frame->saved_rdi    = sf->rdi;
-    frame->saved_rbp    = sf->rbp;
-    frame->saved_r8     = sf->r8;
-    frame->saved_r9     = sf->r9;
-    frame->saved_r10    = sf->r10;
-    frame->saved_r11    = sf->r11;
-    frame->saved_r12    = sf->r12;
-    frame->saved_r13    = sf->r13;
-    frame->saved_r14    = sf->r14;
-    frame->saved_r15    = sf->r15;
-    frame->saved_rip    = sf->rip;
-    frame->saved_rflags = sf->rflags;
-    frame->saved_rsp    = sf->user_rsp;
-    frame->saved_mask   = p->sig_mask;
-    frame->signo        = (uint32_t)signo;
-    frame->__pad        = 0;
+    // #19/#645: build the frame in KERNEL memory and hand it over with the
+    // canonical primitive. Two things change, both of them fixes:
+    //   * copy_to_user brackets the store with stac/clac, so this path stops
+    //     being a guaranteed #PF the moment CR4.SMAP is armed. There are 21
+    //     field stores here; a 21-line AC window would be far wider than the
+    //     access, and this is one instruction's worth of window instead.
+    //   * the comment above admitted the old code took a kernel page fault on a
+    //     bogus user_rsp ("Phase D4's paranoia can add validation"). It never
+    //     did. copy_to_user validates U/S and carries the exception fixup, so a
+    //     hostile or simply overflowed stack now terminates ONE process rather
+    //     than panicking the kernel.
+    sigframe_t kframe;
+    kframe.saved_rax    = sf->rax;
+    kframe.saved_rbx    = sf->rbx;
+    kframe.saved_rcx    = sf->rcx;
+    kframe.saved_rdx    = sf->rdx;
+    kframe.saved_rsi    = sf->rsi;
+    kframe.saved_rdi    = sf->rdi;
+    kframe.saved_rbp    = sf->rbp;
+    kframe.saved_r8     = sf->r8;
+    kframe.saved_r9     = sf->r9;
+    kframe.saved_r10    = sf->r10;
+    kframe.saved_r11    = sf->r11;
+    kframe.saved_r12    = sf->r12;
+    kframe.saved_r13    = sf->r13;
+    kframe.saved_r14    = sf->r14;
+    kframe.saved_r15    = sf->r15;
+    kframe.saved_rip    = sf->rip;
+    kframe.saved_rflags = sf->rflags;
+    kframe.saved_rsp    = sf->user_rsp;
+    kframe.saved_mask   = p->sig_mask;
+    kframe.signo        = (uint32_t)signo;
+    kframe.__pad        = 0;
+    if (copy_to_user(frame, &kframe, sizeof(kframe)) != 0) {
+        kprintf("[SIG] pid=%u signal %d: user stack 0x%llx not writable; "
+                "terminating instead of faulting in Ring 0\n",
+                p->pid, signo, (unsigned long long)user_rsp);
+        p->sig_pending &= ~(1ULL << (signo - 1));
+        proc_exit(128 + signo);
+        return;
+    }
 
     // Update sig_mask: block this signal (unless SA_NODEFER) and block
     // the signals in sa_mask while the handler runs.
@@ -197,8 +224,15 @@ static void deliver_signal(saved_frame_t *sf, process_t *p, int signo) {
     }
 
     // Push trampoline as the "return address" the handler will ret to.
+    // #19/#645: one qword to the USER stack, through the primitive.
     user_rsp -= 8;
-    *(uint64_t *)user_rsp = trampoline;
+    if (copy_to_user((void *)user_rsp, &trampoline, sizeof(trampoline)) != 0) {
+        kprintf("[SIG] pid=%u signal %d: trampoline slot 0x%llx not writable; "
+                "terminating\n", p->pid, signo, (unsigned long long)user_rsp);
+        p->sig_pending &= ~(1ULL << (signo - 1));
+        proc_exit(128 + signo);
+        return;
+    }
 
     sf->user_rsp = user_rsp;
     sf->rip      = (uint64_t)handler;
@@ -288,28 +322,32 @@ int64_t sys_sigaction(int signo, const void *new_act, void *old_act) {
     process_t *p = proc_current();
     if (!p) return -1;
 
-    const k_sigaction_t *na = (const k_sigaction_t *)new_act;
-    k_sigaction_t *oa = (k_sigaction_t *)old_act;
-
-    if (oa) {
-        oa->sa_handler  = p->sig_handlers[signo - 1];
-        oa->sa_mask     = p->sig_handler_mask[signo - 1];
-        oa->sa_flags    = (uint32_t)p->sig_flags[signo - 1];
-        oa->__pad       = 0;
-        oa->sa_restorer = (void *)0;
-        oa->__reserved  = 0;
+    // #509: use copy_*_user (TOCTOU-safe) instead of dereferencing the
+    // user-supplied k_sigaction_t pointers directly. old_act is written FIRST
+    // (state unchanged if it faults) and via copy_to_user, so a racing unmap of
+    // old_act cannot land a Ring-0 write on a freed/remapped frame.
+    if (old_act) {
+        k_sigaction_t oa;
+        oa.sa_handler  = p->sig_handlers[signo - 1];
+        oa.sa_mask     = p->sig_handler_mask[signo - 1];
+        oa.sa_flags    = (uint32_t)p->sig_flags[signo - 1];
+        oa.__pad       = 0;
+        oa.sa_restorer = (void *)0;
+        oa.__reserved  = 0;
+        if (copy_to_user(old_act, &oa, sizeof(oa)) != 0) return -14;  // EFAULT
     }
 
-    if (na) {
-        p->sig_handlers[signo - 1]     = na->sa_handler;
-        p->sig_handler_mask[signo - 1] = na->sa_mask;
-        p->sig_flags[signo - 1]        = na->sa_flags;
+    if (new_act) {
+        k_sigaction_t na;
+        if (copy_from_user(&na, new_act, sizeof(na)) != 0) return -14;  // EFAULT
+        p->sig_handlers[signo - 1]     = na.sa_handler;
+        p->sig_handler_mask[signo - 1] = na.sa_mask;
+        p->sig_flags[signo - 1]        = na.sa_flags;
 
-        // The first sigaction call with a real handler is expected to
-        // carry the trampoline address in __reserved. We latch it into
-        // g_sig_trampoline. Subsequent calls may pass 0 and it's ignored.
-        if (na->__reserved != 0 && g_sig_trampoline == 0) {
-            g_sig_trampoline = na->__reserved;
+        // The first sigaction call with a real handler carries the trampoline
+        // address in __reserved; latch it. Subsequent calls may pass 0.
+        if (na.__reserved != 0 && g_sig_trampoline == 0) {
+            g_sig_trampoline = na.__reserved;
         }
     }
     return 0;
@@ -319,10 +357,15 @@ int64_t sys_sigprocmask(int how, const uint64_t *set, uint64_t *oldset) {
     process_t *p = proc_current();
     if (!p) return -1;
 
-    if (oldset) *oldset = p->sig_mask;
+    // #509: TOCTOU-safe read/write of the user masks via copy_*_user.
+    if (oldset) {
+        uint64_t old = p->sig_mask;
+        if (copy_to_user(oldset, &old, sizeof(old)) != 0) return -14;  // EFAULT
+    }
     if (!set) return 0;
 
-    uint64_t nv = *set;
+    uint64_t nv;
+    if (copy_from_user(&nv, set, sizeof(nv)) != 0) return -14;  // EFAULT
     // SIGKILL and SIGSTOP cannot be masked.
     nv &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
 
@@ -382,7 +425,27 @@ int64_t sys_rt_sigreturn(void) {
     if (!sf) return -1;
 
     // User RSP currently points at the sigframe.
-    sigframe_t *frame = (sigframe_t *)sf->user_rsp;
+    // #19/#645: read it into KERNEL memory through the primitive first. This
+    // was a raw Ring-0 read of a fully user-controlled address: sf->user_rsp is
+    // whatever Ring 3 left in RSP before invoking rt_sigreturn, so the old code
+    // would happily load 21 kernel qwords into the register frame it is about
+    // to return through. copy_from_user rejects a PRESENT supervisor page (the
+    // confused-deputy half) and its exception fixup handles an unmapped one
+    // (the TOCTOU half), and it brackets the read for SMAP.
+    // The user frame address is lifted into its own local FIRST. Passing
+    // `sf->user_rsp` directly to copy_from_user makes smap-uaccess-lint's B3
+    // provenance rule attribute `sf` itself as a user pointer, and every later
+    // `sf->` field restore (all kernel memory, the syscall's own saved frame)
+    // then reads as an unbracketed user deref. Naming the user address is both
+    // clearer and what the lint needs.
+    uint64_t ufrm = sf->user_rsp;
+    sigframe_t kframe;
+    if (copy_from_user(&kframe, (const void *)ufrm, sizeof(kframe)) != 0) {
+        kprintf("[SIG] pid=%u rt_sigreturn: sigframe at 0x%llx is not readable "
+                "user memory; refusing\n", p->pid, (unsigned long long)ufrm);
+        return -1;
+    }
+    const sigframe_t *frame = &kframe;
 
     // Restore saved state.
     sf->r15      = frame->saved_r15;
@@ -440,22 +503,23 @@ int64_t sys_alarm(uint32_t seconds) {
     process_t *p = proc_current();
     if (!p) return 0;
 
-    extern volatile uint64_t timer_ticks;
-    extern uint32_t g_timer_hz;
-    uint32_t hz = g_timer_hz ? g_timer_hz : 250;
+    // #483/#499: alarm_time is an absolute mono_ms() deadline in MILLISECONDS
+    // now, not a timer_ticks value, so a KVM tick burst cannot fire SIGALRM
+    // early. The sweep in wake_sleeping_procs() reads the same mono_ms() clock.
+    uint64_t now = sched_now_ms();
 
     // Remaining time on the previous alarm, rounded UP so a live alarm never
     // reports 0 (0 is indistinguishable from "no alarm was set").
     uint64_t prev = 0;
     if (p->alarm_time != 0) {
-        int64_t left = (int64_t)(p->alarm_time - timer_ticks);   // signed: wrap-safe
-        if (left > 0) prev = ((uint64_t)left + hz - 1) / hz;
+        int64_t left = (int64_t)(p->alarm_time - now);   // ms, signed: wrap-safe
+        if (left > 0) prev = ((uint64_t)left + 999) / 1000;   // ms -> seconds, round up
     }
 
     // Arm or cancel. Interrupts off: the sweep runs from the tick, so the
     // read-modify-write of alarm_time must not be observed half-done.
     __asm__ volatile("cli");
-    p->alarm_time = seconds ? (timer_ticks + (uint64_t)seconds * hz) : 0;
+    p->alarm_time = seconds ? (now + (uint64_t)seconds * 1000ULL) : 0;
     __asm__ volatile("sti");
 
     return (int64_t)prev;

@@ -14,6 +14,7 @@ extern fat_fs_t g_fat_fs;
 
 // External timer for timeouts
 extern volatile uint64_t timer_ticks;
+#include "../cpu/mono.h"   // #499: sched_now_ms() - THE shared real-elapsed-ms clock
 
 // ============================================================================
 // Global State
@@ -297,21 +298,17 @@ static int process_op_nop(io_ring_t *ring, io_sqe_t *sqe) {
     return 0;
 }
 
-// Process fsync operation
-static int process_op_fsync(io_ring_t *ring, io_sqe_t *sqe) {
-    UNUSED(ring);
-
-    int fd = sqe->fd;
-    uint32_t flags = sqe->fsync_flags;
-
-    UNUSED(fd);
-    UNUSED(flags);
-
-    // Placeholder: would sync file to disk
-    kprintf("[AIO] Fsync op: fd=%d, flags=0x%x (simulated)\n", fd, flags);
-
-    return 0;
-}
+// #695: process_op_fsync() USED TO LIVE HERE. It took an fd, ignored it,
+// printed "(simulated)" and returned 0 - a second fsync sitting in exactly the
+// place someone wiring a real one would look, which is the two-of-everything
+// pattern pre-loaded (see the COMPOSIT/COMPOSITOR and two-Task-Managers entries
+// in blame.md). It is DELETED rather than implemented because this whole ring
+// has no submitter anywhere in the tree: aio_process_sqe()'s only caller is
+// inside this file, so there is no path from userland or the kernel that can
+// reach it. Wiring it would have been wiring a dead path and would have left
+// two fsync implementations to keep in step.
+//
+// THE fsync is sys_fsync() in proc/syscall.c, reached by SYS_FSYNC (358).
 
 // Process timeout operation
 static int process_op_timeout(io_ring_t *ring, io_sqe_t *sqe) {
@@ -373,7 +370,12 @@ int aio_process_sqe(io_ring_t *ring, io_sqe_t *sqe) {
             break;
 
         case IORING_OP_FSYNC:
-            result = process_op_fsync(ring, sqe);
+            // #695: deliberately NOT SUPPORTED rather than silently "successful".
+            // The real fsync is SYS_FSYNC -> sys_fsync() (proc/syscall.c). If
+            // this ring ever gains a real submitter, route this case there
+            // instead of growing a second implementation here.
+            kprintf("[AIO] fsync not supported on this ring; use SYS_FSYNC\n");
+            result = AIO_ERR_INVAL;
             break;
 
         case IORING_OP_TIMEOUT:
@@ -472,8 +474,13 @@ int aio_wait(io_ring_t *ring, io_wait_params_t *params) {
     uint32_t min_complete = params ? params->min_complete : 1;
     uint32_t timeout_ms = params ? params->timeout_ms : 0;
 
-    uint64_t start_ticks = timer_ticks;
-    uint64_t timeout_ticks = timeout_ms;  // Assuming ~1ms per tick
+    // #499: wait on REAL elapsed time. This was `start_ticks = timer_ticks` and
+    // `timeout_ticks = timeout_ms` ("assuming ~1ms per tick"), which is a
+    // straight UNIT bug at the 250Hz PIT: a 1000ms timeout waited 1000 TICKS =
+    // 4 real seconds. And because timer_ticks counts ticks DELIVERED rather
+    // than time ELAPSED, a KVM tick-replay burst could also expire it instantly.
+    // sched_now_ms() (cpu/mono.h) is the one shared real-elapsed-ms clock.
+    uint64_t start_ms = sched_now_ms();
 
     while (1) {
         // Check for completions
@@ -484,8 +491,8 @@ int aio_wait(io_ring_t *ring, io_wait_params_t *params) {
 
         // Check timeout
         if (timeout_ms > 0) {
-            uint64_t elapsed = timer_ticks - start_ticks;
-            if (elapsed >= timeout_ticks) {
+            uint64_t elapsed_ms = sched_now_ms() - start_ms;
+            if (elapsed_ms >= (uint64_t)timeout_ms) {
                 return ready > 0 ? (int)ready : AIO_ERR_TIMEOUT;
             }
         }

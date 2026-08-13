@@ -1,3 +1,7 @@
+; SPDX-License-Identifier: MIT
+; Copyright (c) MayteraOS contributors.
+; Full license text: userland/libc/LICENSE (MIT License).
+;
 ; Optimized memcpy for userland - uses REP MOVSB (fast on modern CPUs with ERMSB)
 ; and SSE for very large copies
 
@@ -95,3 +99,8 @@ memmove_fast:
     pop rdi
     pop rbp
     ret
+
+; #640 leg 4: mark the stack NON-EXECUTABLE. ld marks PT_GNU_STACK RWE for
+; the WHOLE link if ANY input object lacks this note, so every hand-written
+; NASM object needs it, not just crt0. gcc emits it automatically for C.
+section .note.GNU-stack noalloc noexec nowrite progbits

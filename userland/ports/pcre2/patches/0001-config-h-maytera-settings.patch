@@ -1,0 +1,62 @@
+--- a/src/config.h
++++ b/src/config.h
+@@ -481,3 +481,59 @@
+ 
+ /* Define to `unsigned int' if <sys/types.h> does not define. */
+ /* #undef size_t */
++
++/* ---------------------------------------------------------------------------
++ * MayteraOS mports build settings (userland/ports/pcre2).
++ *
++ * WHY THIS IS AN APPENDED BLOCK AND NOT A SCATTER OF EDITS. Every setting
++ * above is either a commented-out `/ * #undef X * /` or an `#ifndef`-guarded
++ * default, and config.h is the first thing every PCRE2 translation unit
++ * includes, so defining our settings once at the end is exactly equivalent to
++ * editing them in place and it survives upstream reordering the file. The
++ * whole of OUR delta is therefore this one hunk, which is the point: a version
++ * bump must be a diff a human can read (docs/MPORTS.md).
++ *
++ * config.h itself is NOT patched into existence: `prepare` copies upstream's
++ * own src/config.h.generic, which is the procedure upstream documents in
++ * NON-AUTOTOOLS-BUILD step (1). Freezing a copy of their generated header in
++ * our patch series would rot silently at the next version bump.
++ * ------------------------------------------------------------------------ */
++
++/* Step (1) of NON-AUTOTOOLS-BUILD: at least one code-unit width must be set.
++   8 bits is the only one we build; MayteraOS text is byte-oriented. */
++#define SUPPORT_PCRE2_8 1
++
++/* The MayteraOS libc has all four, and PCRE2 falls back to slower or absent
++   behaviour when they are not declared. HAVE_MEMMOVE in particular: without
++   it PCRE2 looks for bcopy() and, finding neither, compiles its own byte
++   loop. Each of these is a real function in userland/libc, measured with
++   `nm --defined-only userland/libc/libc.a`. */
++#define HAVE_MEMMOVE 1
++#define HAVE_LIMITS_H 1
++#define HAVE_STDLIB_H 1
++#define HAVE_STRING_H 1
++
++/* SUPPORT_JIT IS DELIBERATELY LEFT UNDEFINED, and this is a policy decision,
++   not an oversight. PCRE2's JIT is sljit, whose default POSIX allocator
++   (deps/sljit/sljit_src/allocator_src/sljitExecAllocatorPosix.c:33) maps its
++   code buffer PROT_READ|PROT_WRITE|PROT_EXEC in one mapping; the variants
++   that avoid that need mprotect() or shm_open(). MayteraOS enforces W^X per
++   ELF segment since #640 (kernel/exec/elf.c warns only for a single-RWX
++   image, which no shipping app now produces) and has NO mprotect syscall at
++   all: `grep -rn SYS_MPROTECT kernel/ userland/libc/` is empty. So a JIT
++   build could not run here even if we wanted it. src/pcre2_jit_compile.c is
++   still COMPILED, because upstream requires it: with SUPPORT_JIT undefined it
++   contains no code generator, only the stubs that make pcre2_jit_compile()
++   return PCRE2_ERROR_JIT_BADOPTION.
++
++   SUPPORT_UNICODE IS ALSO LEFT UNDEFINED, and this one is a measured size
++   trade, reversible with one line. Measured on this toolchain: the 8-bit
++   archive is 1,101,112 bytes without it and 1,600,108 with it, because
++   pcre2_ucd.o goes from 4,712 bytes to 126,976. The failure mode of leaving
++   it off is LOUD, which is what makes it an acceptable default: compiling a
++   pattern with PCRE2_UTF or PCRE2_UCP returns
++   PCRE2_ERROR_UNICODE_NOT_SUPPORTED (-32) at pcre2_compile() time rather
++   than silently matching something else, and userland/apps/pcre2test asserts
++   exactly that so the limitation is a tested fact and not a claim. ASCII
++   \d \w \s \b and the POSIX [[:alpha:]] classes do NOT need it. Turn it on
++   here, and update that assertion, the day a consumer needs \p{...}. */

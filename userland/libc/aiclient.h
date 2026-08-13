@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // aiclient.h - Shared MayteraOS AI (Kimi) client + ReAct tool loop.
 //
 // This is the single source of truth for the AI integration used by BOTH the
@@ -64,5 +68,12 @@ int  aiclient_ask(const char *prompt, char *out, int outcap, int verbose);
 // driver so it can drive build.compile_app/deploy_app deterministically through
 // the same consent + audit path the AI uses.
 int  aiclient_run_action(const char *id, const char *args, char *obs, int ocap);
+
+// #745 prompt-injection screen. 1 while a HIGH-severity match is pending, i.e.
+// the next send WILL be refused. aiclient_guard_note() is the last message the
+// screen produced (block or annotate), for a host app that wants to show it in
+// its own chrome rather than as a chat turn. Empty string if nothing has fired.
+int         aiclient_guard_blocked(void);
+const char *aiclient_guard_note(void);
 
 #endif // AICLIENT_H

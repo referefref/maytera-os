@@ -1,3 +1,40 @@
+MayteraOS - kernel and operating system source code
+=====================================================
+
+MayteraOS's own kernel and operating-system source code is free software:
+you can redistribute it and/or modify it under the terms of the GNU
+General Public License as published by the Free Software Foundation,
+either version 2 of the License, or (at your option) any later version.
+
+This program is distributed in the hope that it will be useful, but
+WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
+Public License for more details.
+
+Scope: this license covers MayteraOS's own kernel and OS code. It does
+NOT relicense the vendored and ported third-party components the tree
+carries, each of which keeps its own upstream license; see
+ATTRIBUTION.md at the repository root for the complete per-component
+list (GPLv2/GPLv2+, BSD, MIT, zlib-style, public domain, OFL, CC BY 4.0,
+and others). Two carve-outs are worth stating explicitly here because
+they are easy to assume incorrectly:
+
+  - The DOOM engine source under kernel/games/doom (and the derived
+    d_*/i_*/r_*/p_*/w_*/z_* files) is covered by id Software's own DOOM
+    Source Code License, a SEPARATE license, not the GPL. See
+    kernel/games/doom/DOOMLICENSE.md.
+  - The userland libc (userland/libc/) is deliberately licensed under
+    the permissive MIT License, not GPLv2, so that applications linking
+    against libc.a do not inherit a copyleft obligation from the OS
+    itself. See the header at the top of each userland/libc source file
+    and userland/libc/LICENSE.
+
+The complete text of GNU General Public License version 2 follows below.
+Later versions of the GNU General Public License may be obtained from
+the Free Software Foundation at <https://www.gnu.org/licenses/>.
+
+---------------------------------------------------------------------------
+
                     GNU GENERAL PUBLIC LICENSE
                        Version 2, June 1991
 

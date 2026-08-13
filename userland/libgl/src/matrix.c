@@ -272,3 +272,64 @@ void glopFrustum(GLParam* p) {
 
 	gl_matrix_update();
 }
+
+/* AssaultCube port phase 2: glOrtho was entirely missing (TinyGL only had
+   glFrustum, a perspective projection). Standard orthographic projection
+   matrix, same derivation/layout style as glopFrustum above (row-major M4,
+   left-multiplied onto the current matrix stack entry). Used by AC's HUD /
+   2D menu rendering path, which needs a non-perspective projection. */
+void glOrtho(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top, GLdouble near, GLdouble farv) {
+	GLParam p[7];
+#include "error_check_no_context.h"
+	p[0].op = OP_Ortho;
+	p[1].f = left;
+	p[2].f = right;
+	p[3].f = bottom;
+	p[4].f = top;
+	p[5].f = near;
+	p[6].f = farv;
+
+	gl_add_op(p);
+}
+
+void glopOrtho(GLParam* p) {
+	GLContext* c = gl_get_context();
+	GLfloat* r;
+	M4 m;
+	GLfloat left = p[1].f;
+	GLfloat right = p[2].f;
+	GLfloat bottom = p[3].f;
+	GLfloat top = p[4].f;
+	GLfloat near = p[5].f;
+	GLfloat farp = p[6].f;
+	GLfloat x, y, z, tx, ty, tz;
+
+	x = 2.0f / (right - left);
+	y = 2.0f / (top - bottom);
+	z = -2.0f / (farp - near);
+	tx = -(right + left) / (right - left);
+	ty = -(top + bottom) / (top - bottom);
+	tz = -(farp + near) / (farp - near);
+
+	r = &m.m[0][0];
+	r[0] = x;
+	r[1] = 0;
+	r[2] = 0;
+	r[3] = tx;
+	r[4] = 0;
+	r[5] = y;
+	r[6] = 0;
+	r[7] = ty;
+	r[8] = 0;
+	r[9] = 0;
+	r[10] = z;
+	r[11] = tz;
+	r[12] = 0;
+	r[13] = 0;
+	r[14] = 0;
+	r[15] = 1;
+
+	gl_M4_MulLeft(c->matrix_stack_ptr[c->matrix_mode], &m);
+
+	gl_matrix_update();
+}

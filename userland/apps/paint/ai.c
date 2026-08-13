@@ -14,7 +14,12 @@
 #include "../../libc/stdlib.h"
 #include "../../libc/string.h"
 
-#define KEY_PATH   "/CONFIG/KIMI.KEY"
+// #684: was KEY_PATH "/CONFIG/KIMI.KEY", a THIRD private copy of the key
+// reader. It now reads the same per-user AISVC.CFG as libc/aiclient.c and
+// Settings. The duplicated parser is debt, recorded in the CHANGELOG; the
+// point of this change is that no app opens /CONFIG/KIMI.KEY.
+#include "userconf.h"
+#define AISVC_NAME "AISVC.CFG"
 #define API_URL    "https://api.moonshot.ai/v1/chat/completions"
 #define API_MODEL  "kimi-k2.6"
 #define RESP_MAX   65536
@@ -22,6 +27,14 @@
 #define CONTENT_MAX 8192
 #define PLAN_MAX   16
 #define POST_TIMEOUT_MS 90000u
+
+// #745: kimi_chat() returns 0 on success and -1 on any failure. This third
+// value distinguishes "the kernel's prompt-injection screen refused this
+// request" from a network or API error, so ai_command() can say so instead of
+// blaming the network. Studio is a SECOND, independent LLM client: it does not
+// link the shared aiclient, so the kernel chokepoint is the only thing
+// screening it, and this is how that refusal becomes visible to the user.
+#define AI_BLOCKED_BY_GUARD (-3)
 
 static char g_key[256];
 static int  g_key_state = -1;         // -1 unknown, 0 missing, 1 present
@@ -35,7 +48,7 @@ static char *g_content = 0;           // malloc'd extracted assistant content
 static void load_key(void) {
     g_key_state = 0;
     g_key[0] = 0;
-    int fd = sys_open(KEY_PATH, O_RDONLY);
+    int fd = userconf_open_read(AISVC_NAME, 0);   // #684: no legacy fallback
     if (fd < 0) return;
     long n = sys_read(fd, g_key, sizeof(g_key) - 1);
     sys_close(fd);
@@ -216,6 +229,12 @@ static int kimi_chat(const char *system_prompt, const char *user_msg) {
         g_resp[0] = 0;
         int status = 0;
         int job = http_post_start(API_URL, headers, g_body);
+        // #745: the kernel's prompt-injection screen refuses an LLM request
+        // carrying a HIGH-severity match, with its own code. Retrying is
+        // pointless (the body will not change) and reporting it as a network
+        // failure would be a lie that also hides a security event, so bail
+        // immediately and distinctly. A silent block is its own bug.
+        if (job == NET_ERR_AIGUARD) return AI_BLOCKED_BY_GUARD;
         if (job < 0) { sys_sleep(500); continue; }
         unsigned long t0 = uptime_ms();
         int done = 0, failed = 0;
@@ -362,7 +381,7 @@ int ai_command(const char *prompt, char *reply, int cap) {
     if (reply && cap > 0) reply[0] = 0;
     if (!prompt || !prompt[0]) return -2;
     if (!ai_available() || !buffers_ok()) {
-        if (reply) strlcpy(reply, "AI unavailable: no /CONFIG/KIMI.KEY.", (size_t)cap);
+        if (reply) strlcpy(reply, "Set your API key in Settings > AI.", (size_t)cap);
         return -1;
     }
     char user[512];
@@ -373,7 +392,16 @@ int ai_command(const char *prompt, char *reply, int cap) {
              g_doc.w, g_doc.h, g_doc.nlayers, lname,
              g_doc.sel_active ? "active" : "none", prompt);
 
-    if (kimi_chat(k_system_planner, user) != 0) {
+    int chat_rc = kimi_chat(k_system_planner, user);
+    if (chat_rc == AI_BLOCKED_BY_GUARD) {
+        // #745: refused by the kernel's prompt-injection screen before anything
+        // reached the wire. Not retryable and not a network fault; say which.
+        if (reply) strlcpy(reply,
+            "Blocked by the prompt-injection screen. Nothing was sent to the AI.",
+            (size_t)cap);
+        return -1;
+    }
+    if (chat_rc != 0) {
         if (reply) strlcpy(reply, "AI request failed (network or API error).", (size_t)cap);
         return -1;
     }

@@ -18,12 +18,12 @@ MayteraOS includes a minimal but functional Python interpreter that supports:
 ## User-Space Python Interpreter
 
 The main Python interpreter is built as a user-space application in:
-`/opt/maytera/userland/apps/python/`
+`<workspace>`
 
 ### Building
 
 ```bash
-cd /opt/maytera/userland/apps/python
+cd <workspace>
 make
 ```
 
@@ -85,7 +85,7 @@ import socket
 
 # Create TCP client
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-sock.connect(("10.0.0.1", 80))
+sock.connect(("192.0.2.1", 80))
 sock.send(b"GET / HTTP/1.0\r\n\r\n")
 data = sock.recv(1024)
 sock.close()

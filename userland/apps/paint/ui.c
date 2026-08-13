@@ -1,9 +1,10 @@
-// ui.c - Maytera Studio UI: menubar, tool strip, options bar, right dock
-// (Layers / Channels / Paths / Histogram / History / Color), zoomable+pannable
-// canvas with rulers/grid/guides, registry-driven Colors + Filters menus with a
-// generic live-preview parameter dialog, blend-mode picker, layer masks, modal
-// text/message boxes, and the AI command bar. All app logic lives here; main.c
-// is only the window + event loop. Uses the module APIs declared in studio.h.
+// ui.c - Maytera Studio UI: menubar, left tool panel (tool grid + per-tool
+// Tool Options below it, #473), right dock (Layers / Channels / Paths /
+// Histogram / History / Color), zoomable+pannable canvas with rulers/grid/
+// guides, registry-driven Colors + Filters menus with a generic live-preview
+// parameter dialog, blend-mode picker, layer masks, modal text/message boxes,
+// and the AI command bar. All app logic lives here; main.c is only the window
+// + event loop. Uses the module APIs declared in studio.h.
 #include "studio.h"
 #include "brushes.h"        // brush/pattern/gradient engine (SEC_BRUSHES/SEC_PATTERNS + gradient options)
 #include "../../libc/gui.h"
@@ -13,8 +14,15 @@
 // Geometry
 // ---------------------------------------------------------------------------
 #define MENU_H    22
-#define OPT_H     30
-#define STRIP_W   46
+// #473: the left column is now one panel - a tool icon grid at the top, then
+// the active tool's options (sliders/cycles/brush picker/FG-BG colour) stacked
+// below it, GIMP-style (Toolbox + Tool Options in the same left dock). This
+// replaces the old full-width horizontal options bar (OPT_H), reclaiming that
+// strip for canvas and giving every tool as much option space as it needs.
+#define PANEL_W     198
+#define TOOLGRID_COLS 6
+#define TOOLGRID_BW   26
+#define TOOLGRID_BH   24
 #define DOCK_W    240
 #define STATUS_H  22
 #define RULER     14        // top ruler HEIGHT
@@ -23,12 +31,20 @@
 static int   g_win = -1;
 static int   g_w = 1180, g_h = 740;
 
+// Bottom y of the tool icon grid inside the left panel (grid top is MENU_H+6).
+// Tool Options draw/hit-test start right below this, so both stay in sync off
+// one source of truth (TL_COUNT rows), rather than duplicating the row count.
+static int toolgrid_bottom(void){
+    int rows = (TL_COUNT + TOOLGRID_COLS - 1) / TOOLGRID_COLS;
+    return MENU_H + 6 + rows*TOOLGRID_BH + 8;
+}
+
 // Canvas viewport (screen space) - the top ruler eats RULER px off the top and
 // the left ruler eats RULER_Y px off the left.
-static int cv_x(void){ return STRIP_W + RULER_Y; }
-static int cv_y(void){ return MENU_H + OPT_H + RULER; }
-static int cv_w(void){ int v = g_w - STRIP_W - RULER_Y - DOCK_W; return v < 16 ? 16 : v; }
-static int cv_h(void){ int v = g_h - MENU_H - OPT_H - RULER - STATUS_H; return v < 16 ? 16 : v; }
+static int cv_x(void){ return PANEL_W + RULER_Y; }
+static int cv_y(void){ return MENU_H + RULER; }
+static int cv_w(void){ int v = g_w - PANEL_W - RULER_Y - DOCK_W; return v < 16 ? 16 : v; }
+static int cv_h(void){ int v = g_h - MENU_H - RULER - STATUS_H; return v < 16 ? 16 : v; }
 
 // ---------------------------------------------------------------------------
 // Palette (studio chrome). The chrome colors track the shared OS style engine
@@ -94,6 +110,15 @@ static const int ZSTOPS[] = { 5,10,15,25,33,50,67,75,100,125,150,200,300,400,600
 #define NZSTOP ((int)(sizeof(ZSTOPS)/sizeof(ZSTOPS[0])))
 
 static int grid_on = 0, grid_sp = 32;
+// Snap to Grid (View menu): a SEPARATE toggle from grid visibility (grid_on),
+// matching GIMP's model where you can snap without the lines shown or show
+// lines without snapping. Only constrains shape-tool corners and guide drags
+// (canvas_down/move/up, is_shape_tool branch), never freehand brush strokes.
+static int grid_snap = 0;
+// Canvas Size modal (MP_CANVAS): which of the 3x3 anchor cells is selected.
+// 0..8, row-major (col=anchor%3: 0 left/1 center/2 right; row=anchor/3: 0 top/
+// 1 mid/2 bottom), matching doc_resize()'s anchor semantics in tools.c.
+static int canvas_anchor = 0;
 #define MAX_GUIDES 32
 static int guide_v[MAX_GUIDES], nguide_v = 0;   // vertical guides at canvas-x
 static int guide_h[MAX_GUIDES], nguide_h = 0;   // horizontal guides at canvas-y
@@ -196,7 +221,7 @@ static int   modal_purpose = 0;
 static char  modal_msg[512];
 enum { MP_OPEN = 1, MP_SAVEAS, MP_EXPORT, MP_AICMD, MP_AIPAL, MP_NEWSZ,
        MP_SGROW, MP_SSHRINK, MP_SBORDER, MP_SFEATHER, MP_SROUND,
-       MP_ROT, MP_SCALE, MP_CANVAS, MP_GRIDSP, MP_LRENAME, MP_EXPORTBMP };
+       MP_ROT, MP_SCALE, MP_SHEAR, MP_CANVAS, MP_GRIDSP, MP_LRENAME, MP_EXPORTBMP };
 
 // Print / Preview modal state (its own overlay, like the file browser).
 static int   pr_open = 0, pr_have = 0;
@@ -332,8 +357,9 @@ static int ilog2s(unsigned int v){
 }
 
 // ---------------------------------------------------------------------------
-// Tool-contextual options bar (item 1). Controls are recorded during draw so
-// the hit-tester in click_optbar() shares the exact geometry (no duplication).
+// Tool-contextual options panel (#473, left column below the tool grid).
+// Controls are recorded during draw so the hit-tester in click_toolopts()
+// shares the exact geometry (no duplication).
 // ---------------------------------------------------------------------------
 enum { OC_SLIDER=0, OC_CYCLE, OC_SWAP, OC_DEFCOL, OC_TOGGLE };
 typedef struct { int type,x,y,w,h; int *val; int vmax; int pct; const char **choices; int nch; } optctl_t;
@@ -343,18 +369,25 @@ static int opt_drag = -1;                 // index into g_oc of the slider being
 static const char *SELMODE_NAMES[4] = {"New","Add","Subtract","Intersect"};
 // Gradient blend-mode cycle: a small contiguous index maps to the (non-contiguous)
 // blend_t enum values so OC_CYCLE can advance it 0..4 and store the mode into
-// g_tool.grad_blend on redraw (see draw_optbar gradient branch).
+// g_tool.grad_blend on redraw (see draw_toolopts gradient branch).
 static const char  *GRADBLEND_NAMES[5] = {"Normal","Multiply","Screen","Difference","Overlay"};
 static const blend_t GRADBLEND_MODES[5] = {BLEND_NORMAL,BLEND_MULTIPLY,BLEND_SCREEN,BLEND_DIFFERENCE,BLEND_OVERLAY};
 static int grad_mode_idx = 0;
 // Gradient shape / repeat cycles (P3-GRADSHAPE/REPEAT). These contiguous indices
-// map 1:1 onto the GRAD_* enums in brushes.h, so draw_optbar pushes them straight
+// map 1:1 onto the GRAD_* enums in brushes.h, so draw_toolopts pushes them straight
 // into grad_shape_set()/grad_repeat_set() after drawing (mirrors grad_mode_idx).
 static const char *GRADSHAPE_NAMES[GRAD_SHAPE_COUNT]  = {"Linear","Bi-Lin","Radial","Square","Conical","Spiral"};
 static const char *GRADREPEAT_NAMES[GRAD_REPEAT_COUNT] = {"None","Saw","Tri"};
 static int grad_shape_idx = 0, grad_repeat_idx = 0, grad_rev_idx = 0;
-// Brush preset picker geometry (recorded during draw_optbar, hit-tested in click_optbar)
+// Brush preset picker geometry (recorded during draw_toolopts, hit-tested in click_toolopts)
 static int bp_shown=0, bp_x0=0, bp_x1=0, bp_y=0, bp_sz=0;
+// #530 "Choose Font..." button geometry (TL_TEXT only), recorded during draw,
+// hit-tested in click_toolopts - same pattern as the brush-tip picker above.
+static int fontbtn_shown=0, fontbtn_x=0, fontbtn_y=0, fontbtn_w=0, fontbtn_h=0;
+// #530 tracks which layer index the Text tool's font was last synced from, so
+// draw_toolopts only re-pulls a layer's remembered font on an actual layer
+// switch, never mid-edit on every redraw.
+static int text_font_synced_layer = -2;   // -2 = never synced (distinct from a real -1 "no active layer")
 
 static int tool_is_selection(tool_id_t t){
     return t==TL_SEL_RECT||t==TL_SEL_ELLIPSE||t==TL_SEL_LASSO||t==TL_SEL_WAND||t==TL_SEL_BYCOLOR;
@@ -363,42 +396,53 @@ static int tool_is_brush(tool_id_t t){
     return t==TL_BRUSH||t==TL_PENCIL||t==TL_ERASER||t==TL_AIRBRUSH||t==TL_CLONE||
            t==TL_SMUDGE||t==TL_BLUR||t==TL_HEAL||t==TL_DODGE||t==TL_BURN||t==TL_SHARPEN||t==TL_INK;
 }
-// A labeled slider control (item 1): draws label + shared slider() + value.
-static int oc_slider(int x,int y0,const char*label,int*val,int vmax,int pct){
-    int ty=y0+8;
-    Ts(x,ty,label,C_DIM); x+=text_w(label)+7;
-    int sw=80;
-    slider(x,y0+4,sw,*val,vmax);
-    if(g_noc<24){ optctl_t*o=&g_oc[g_noc++]; o->type=OC_SLIDER; o->x=x; o->y=y0+4; o->w=sw; o->h=16;
-                  o->val=val; o->vmax=vmax; o->pct=pct; o->choices=0; o->nch=0; }
-    x+=sw+6;
+// #473: Tool Options controls now stack VERTICALLY in the left panel (one row
+// per control, label - slider/cycle - value all on that row, width-fitted to
+// the panel) instead of chaining horizontally across the old full-width top
+// bar. Each helper takes the row's (x,y,w) and returns the y of the next row,
+// so a tool's option block is just a straight-line sequence of calls (see
+// draw_toolopts). Geometry is still recorded into g_oc[] for click_toolopts,
+// unchanged in spirit from the old horizontal bar.
+static int oc_slider(int x,int y,int w,const char*label,int*val,int vmax,int pct){
+    int ty=y+8;
+    Ts(x,ty,label,C_DIM);
+    int lw=text_w(label);
+    int fw = pct?32:26;
     char b[16]; int dv = pct ? (*val*100/(vmax>0?vmax:1)) : *val;
     if(pct) snprintf(b,sizeof b,"%d%%",dv); else snprintf(b,sizeof b,"%d",dv);
-    int fw = pct?34:28;
-    field_inset(x-2, y0+4, fw, 19);
-    Ts(x+2,ty,b,C_TEXT); x += fw;
-    return x;
+    field_inset(x+w-fw, y+4, fw, 19);
+    Ts(x+w-fw+4,ty,b,C_TEXT);
+    int sx=x+lw+7, sw=w-lw-7-fw-6; if(sw<20) sw=20;
+    slider(sx,y+4,sw,*val,vmax);
+    if(g_noc<24){ optctl_t*o=&g_oc[g_noc++]; o->type=OC_SLIDER; o->x=sx; o->y=y+4; o->w=sw; o->h=16;
+                  o->val=val; o->vmax=vmax; o->pct=pct; o->choices=0; o->nch=0; }
+    return y+26;
 }
 // A labeled cycle control (click advances through choices), e.g. selection Mode.
-static int oc_cycle(int x,int y0,const char*label,int*val,const char**ch,int nch){
-    int ty=y0+8;
-    Ts(x,ty,label,C_DIM); x+=text_w(label)+7;
+static int oc_cycle(int x,int y,int w,const char*label,int*val,const char**ch,int nch){
+    int ty=y+8;
+    Ts(x,ty,label,C_DIM);
+    int lw=text_w(label);
     int cur=*val; if(cur<0)cur=0; if(cur>=nch)cur=nch-1;
-    int cw=82;
-    sbutton(x,y0+4,cw,22,ch[cur],0);
-    if(g_noc<24){ optctl_t*o=&g_oc[g_noc++]; o->type=OC_CYCLE; o->x=x; o->y=y0+4; o->w=cw; o->h=22;
+    int cx=x+lw+7, cw=w-lw-7; if(cw<40) cw=40;
+    sbutton(cx,y+3,cw,20,ch[cur],0);
+    if(g_noc<24){ optctl_t*o=&g_oc[g_noc++]; o->type=OC_CYCLE; o->x=cx; o->y=y+3; o->w=cw; o->h=20;
                   o->val=val; o->vmax=nch; o->pct=0; o->choices=ch; o->nch=nch; }
-    x+=cw+10;
-    return x;
+    return y+27;
 }
-// A compact on/off toggle button (click flips *val). Used for gradient Reverse.
-static int oc_toggle(int x,int y0,const char*label,int*val){
-    int w=34;
-    sbutton(x,y0+4,w,22,label,*val);
-    if(g_noc<24){ optctl_t*o=&g_oc[g_noc++]; o->type=OC_TOGGLE; o->x=x; o->y=y0+4; o->w=w; o->h=22;
+// A compact on/off toggle button placed at an explicit x WITHIN the current
+// row (does not advance y - used to pack several toggles, e.g. text B/I/U,
+// onto one row; the caller advances the row once after placing them all).
+static void oc_toggle_at(int x,int y,int w,const char*label,int*val){
+    sbutton(x,y,w,20,label,*val);
+    if(g_noc<24){ optctl_t*o=&g_oc[g_noc++]; o->type=OC_TOGGLE; o->x=x; o->y=y; o->w=w; o->h=20;
                   o->val=val; o->vmax=2; o->pct=0; o->choices=0; o->nch=2; }
-    x+=w+8;
-    return x;
+}
+// A single labeled toggle taking its own full row (e.g. gradient Reverse).
+static int oc_toggle(int x,int y,int w,const char*label,int*val){
+    (void)w;
+    oc_toggle_at(x,y+3,44,label,val);
+    return y+27;
 }
 
 // Branded splash shown for ~0.8s at launch (the STUDIO.BMP art if present,
@@ -413,7 +457,19 @@ static void splash_disc(int cx,int cy,int r,uint32_t c){
 // #472 Rectangular image-editor splash: a maritime scene above a dark studio
 // info panel that reveals verbose loading lines + a progress bar. The whole
 // window IS the splash card (Photoshop/GIMP style), branded "Maytera Studio".
-void ui_splash(int win, int w, int h){
+//
+// HONEST, not decorative: this does the real startup work (doc_new, then
+// studio_register_all) IN LINE with the steps that claim to be doing it,
+// rather than drawing a canned animation while the real init runs silently
+// afterward. The brush/pattern counts are read live from brush_count()/
+// pattern_count() so the text can never go stale if those tables grow, and
+// the filter count is the real studio_op_count() AFTER registration actually
+// ran. Each step still gets a minimum on-screen time (sys_sleep) so a step
+// that finishes in microseconds is still readable - that pacing is honest
+// too: it is not simulating work, it is giving the human time to read real
+// work that already happened. Returns 0 on success, -1 if doc_new failed
+// (mirrors the old main.c-level check, now performed inside step 0).
+int ui_splash(int win, int w, int h){
     g_win = win;
     theme_sync();
 
@@ -457,19 +513,29 @@ void ui_splash(int win, int w, int h){
     win_draw_text_ttf(win, lx+28, artH+22, "Maytera Studio", 30, 0x00f2f5f8);
     win_draw_text_ttf(win, lx+30, artH+54, "Image Editor  \xC2\xB7  Version 2.0", 13, 0x008fa0b4);
 
-    // Progress bar + verbose loading lines revealed one at a time.
-    static const char *steps[] = {
+    // Progress bar + verbose loading lines revealed one at a time. Lines that
+    // depend on real numbers are formatted from live queries, not hardcoded.
+    char l_brushes[48], l_patterns[48], l_filters[64];
+    snprintf(l_brushes, sizeof l_brushes, "Loading %d stock brushes", brush_count());
+    snprintf(l_patterns,sizeof l_patterns,"Loading %d tileable patterns", pattern_count());
+    strcpy(l_filters, "Registering filters and effects");   // updated with the real count below
+    const char *steps[] = {
         "Initializing canvas + layer engine",
-        "Loading 66 stock brushes",
-        "Loading 59 tileable patterns",
+        l_brushes,
+        l_patterns,
         "Building gradient + palette engine",
-        "Registering filters and effects",
+        l_filters,
         "Maytera Studio ready",
     };
     int nsteps = (int)(sizeof(steps)/sizeof(steps[0]));
     int barX = w/2-150, barY = h-46, barW = 300, barH = 8;
     int listX = w/2-150, listY = artH+92, lineH = (barY-8-listY)/nsteps; if(lineH<14) lineH=14;
+    int doc_ok = 0;
     for(int s=0;s<nsteps;s++){
+        // Do the real work this step names BEFORE drawing it as done, so the
+        // bar tracks actual startup, not a timed animation.
+        if(s==0) doc_ok = (doc_new(STUDIO_DEF_W, STUDIO_DEF_H, argb(255,255,255,255))==0);
+        if(s==4){ studio_register_all(); snprintf(l_filters,sizeof l_filters,"Registered %d filters and effects", studio_op_count()); }
         // bar track + fill
         R(barX,barY,barW,barH, 0x00263040);
         int fill = (barW*(s+1))/nsteps;
@@ -482,8 +548,9 @@ void ui_splash(int win, int w, int h){
         }
         gui_text_ttf_centered(win, barX, barY-20, barW, 16, steps[s], 0x00aab6c4, 12);
         win_invalidate(win);
-        sys_sleep(s==nsteps-1?360:180);
+        sys_sleep(s==nsteps-1?360:180);   // minimum readable time, not simulated work
     }
+    return doc_ok ? 0 : -1;
 }
 
 // ---------------------------------------------------------------------------
@@ -513,8 +580,8 @@ enum {
     A_LNEW, A_LDUP, A_LDEL, A_LUP, A_LDOWN, A_LMERGE, A_LOPUP, A_LOPDN,
     A_LMASKADD, A_LMASKAPPLY, A_LMASKDEL, A_LMASKTOG, A_LLOCKA, A_LBLENDPOP,
     A_SELALL, A_SELNONE, A_SELINV, A_SGROW, A_SSHRINK, A_SBORDER, A_SFEATHER, A_SROUND,
-    A_IFLIPH, A_IFLIPV, A_IROT90CW, A_IROT90CCW, A_IROTARB, A_ISCALE, A_ICROP, A_ICANVAS,
-    A_VGRID, A_VGRIDSP, A_VGCLEAR, A_ZIN, A_ZOUT, A_ZFIT,
+    A_IFLIPH, A_IFLIPV, A_IROT90CW, A_IROT90CCW, A_IROTARB, A_ISCALE, A_ISHEAR, A_ICROP, A_ICANVAS,
+    A_VGRID, A_VGRIDSP, A_VGCLEAR, A_VSNAP, A_ZIN, A_ZOUT, A_ZFIT, A_ZACTUAL,
     A_CHSAVE,
     A_AICMD, A_AIPAL, A_ABOUT,
     A_REVERT,
@@ -559,12 +626,13 @@ static const mitem_t M_LAYER[] = {
 static const mitem_t M_IMAGE[] = {
     {"Flip Horizontal", A_IFLIPH}, {"Flip Vertical", A_IFLIPV},
     {"Rotate 90 CW", A_IROT90CW}, {"Rotate 90 CCW", A_IROT90CCW},
-    {"Rotate..", A_IROTARB}, {"Scale Layer..", A_ISCALE},
+    {"Rotate..", A_IROTARB}, {"Scale Layer..", A_ISCALE}, {"Shear..", A_ISHEAR},
     {"Crop to Selection", A_ICROP}, {"Canvas Size..", A_ICANVAS}, {"Flatten", A_FLATTEN}
 };
 static const mitem_t M_VIEW[] = {
-    {"Zoom In", A_ZIN, "+"}, {"Zoom Out", A_ZOUT, "-"}, {"Fit", A_ZFIT}, {"", A_SEP},
-    {"Grid", A_VGRID}, {"Grid Spacing..", A_VGRIDSP}, {"Clear Guides", A_VGCLEAR}
+    {"Zoom In", A_ZIN, "+"}, {"Zoom Out", A_ZOUT, "-"}, {"Fit", A_ZFIT},
+    {"Actual Size (100%)", A_ZACTUAL, "1"}, {"", A_SEP},
+    {"Grid", A_VGRID}, {"Snap to Grid", A_VSNAP}, {"Grid Spacing..", A_VGRIDSP}, {"Clear Guides", A_VGCLEAR}
 };
 static const mitem_t M_AI[] = { {"AI Command..", A_AICMD}, {"AI Palette..", A_AIPAL} };
 static const mitem_t M_HELP[] = { {"About Maytera Studio", A_ABOUT} };
@@ -636,6 +704,7 @@ static int action_disabled(int a){
 static int action_checked(int a){
     switch(a){
         case A_VGRID:    return grid_on;
+        case A_VSNAP:    return grid_snap;
         case A_LMASKTOG: return g_doc.layer[g_doc.active].mask && g_doc.layer[g_doc.active].mask_active;
         case A_LLOCKA:   return g_doc.layer[g_doc.active].lock_alpha;
         default:         return 0;
@@ -674,6 +743,15 @@ static void screen_to_canvas(int sx,int sy,int *cx,int *cy){
     *cy = pan_y + (sy - cv_y()) * 100 / z;
 }
 static int pt_in_canvas(int sx,int sy){ return IN(sx,sy,cv_x(),cv_y(),cv_w(),cv_h()); }
+// Round a single canvas-space coordinate to the nearest grid_sp multiple, when
+// Snap to Grid is on. Nearest (not floor) so a click just past a line still
+// lands on it, matching the "sticky line" feel users expect from other editors.
+static int snap1(int v){
+    if(!grid_snap || grid_sp<2) return v;
+    int half = grid_sp/2;
+    return v>=0 ? ((v+half)/grid_sp)*grid_sp : -(((-v+half)/grid_sp)*grid_sp);
+}
+static void snap_xy(int *x,int *y){ *x=snap1(*x); *y=snap1(*y); }
 
 // ---- Zoom control (item 2) -------------------------------------------------
 // Fit-to-window zoom percent.
@@ -879,97 +957,142 @@ static void draw_menubar(void){
     }
 }
 
-// Tool-contextual options bar. Branches on the active tool and lays out shared
-// slider()/cycle controls, recording their geometry in g_oc for hit testing.
-static void draw_optbar(void){
-    int y0 = MENU_H;
-    vgrad(0,y0,g_w,OPT_H, mix(C_PANEL2,0x00ffffff,7), C_PANEL2);
-    R(0,y0+OPT_H-1,g_w,1,C_LINE);
+// #473: Tool Options panel. Lives in the LEFT panel below the tool icon grid
+// (draw_toolpanel draws the grid; this draws everything under it), instead of
+// the old full-width bar under the menu. Branches on the active tool and lays
+// out shared slider()/cycle controls STACKED VERTICALLY, tool-specific,
+// including the brush hard/soft picker and the FG/BG colour swatches (which
+// used to sit off to the side of the bar for every tool alike - now they are
+// part of the same per-tool options column, right below whatever that tool
+// needs). Recording geometry in g_oc for hit testing is unchanged from the
+// old bar; only the layout direction and container moved.
+static void draw_toolopts(void){
+    int px = 12;                          // panel content inset
+    int pw = PANEL_W - 2*px;              // usable control width
+    int y0 = toolgrid_bottom();
+    int panelBottom = g_h - STATUS_H;
+    vgrad(0,y0,PANEL_W,panelBottom-y0, mix(C_PANEL,0x00ffffff,4), C_PANEL);
+    R(0,y0,PANEL_W,1,C_LINE);             // separator under the tool grid
     g_noc = 0;
     bp_shown = 0;
+    fontbtn_shown = 0;
     tool_id_t t = g_tool.id;
-    int x=8;
-    draw_tool_icon((int)t, x, y0+7, C_ACCENT2); x += 20;   // active tool glyph
-    T(x,y0+8, tool_name(t), C_TEXT); x += text_w(tool_name(t))+8;
-    R(x,y0+6,1,OPT_H-12,C_LINE); x+=12;                 // group separator
+    int y = y0+8;
+    draw_tool_icon((int)t, px, y, C_ACCENT2);
+    T(px+20,y-1, tool_name(t), C_TEXT);
+    y += 22;
+    R(px,y,pw,1,C_LINE); y+=8;            // group separator under the tool name
 
     if(tool_is_selection(t)){
-        x=oc_cycle (x,y0,"Mode",   &g_tool.sel_mode, SELMODE_NAMES,4);
-        x=oc_slider(x,y0,"Feather",&g_tool.feather, 64,0);
+        y=oc_cycle (px,y,pw,"Mode",   &g_tool.sel_mode, SELMODE_NAMES,4);
+        y=oc_slider(px,y,pw,"Feather",&g_tool.feather, 64,0);
         if(t==TL_SEL_WAND||t==TL_SEL_BYCOLOR)
-            x=oc_slider(x,y0,"Tolerance",&g_tool.wand_tolerance,255,0);
+            y=oc_slider(px,y,pw,"Tolerance",&g_tool.wand_tolerance,255,0);
     }else if(tool_is_brush(t)){
         // brush preset picker (Hard/Soft Round) with a rendered tip preview
-        Ts(x,y0+8,"Brush",C_DIM); x+=text_w("Brush")+7;
-        { int sz=22, py=y0+3; bp_shown=1; bp_y=py; bp_sz=sz;
+        Ts(px,y+7,"Brush",C_DIM);
+        { int sz=26, bx=px+44, py=y; bp_shown=1; bp_y=py; bp_sz=sz;
           int hard=(g_tool.hardness>=200), soft=!hard;
-          bp_x0=x; sbutton(x,py,sz,sz,"",hard);
-          draw_brush_tip(x+sz/2,py+sz/2,sz/2-3,255,C_TEXT, hard?C_ACCENT:C_BTN);
-          x+=sz+3;
-          bp_x1=x; sbutton(x,py,sz,sz,"",soft);
-          draw_brush_tip(x+sz/2,py+sz/2,sz/2-3,70,C_TEXT, soft?C_ACCENT:C_BTN);
-          x+=sz+10;
+          bp_x0=bx; sbutton(bx,py,sz,sz,"",hard);
+          draw_brush_tip(bx+sz/2,py+sz/2,sz/2-3,255,C_TEXT, hard?C_ACCENT:C_BTN);
+          bx+=sz+4;
+          bp_x1=bx; sbutton(bx,py,sz,sz,"",soft);
+          draw_brush_tip(bx+sz/2,py+sz/2,sz/2-3,70,C_TEXT, soft?C_ACCENT:C_BTN);
         }
-        x=oc_slider(x,y0,"Size",    &g_tool.size,     64,0);
-        x=oc_slider(x,y0,"Hardness",&g_tool.hardness, 255,1);
-        x=oc_slider(x,y0,"Opacity", &g_tool.opacity,  255,1);
-        x=oc_slider(x,y0,"Flow",    &g_tool.flow,     255,1);
+        y += 26+8;
+        y=oc_slider(px,y,pw,"Size",    &g_tool.size,     64,0);
+        y=oc_slider(px,y,pw,"Hardness",&g_tool.hardness, 255,1);
+        y=oc_slider(px,y,pw,"Opacity", &g_tool.opacity,  255,1);
+        y=oc_slider(px,y,pw,"Flow",    &g_tool.flow,     255,1);
     }else if(t==TL_LINE||t==TL_RECT||t==TL_ELLIPSE){
-        x=oc_slider(x,y0,"Size",    &g_tool.size,    64,0);
-        x=oc_slider(x,y0,"Opacity", &g_tool.opacity, 255,1);
+        y=oc_slider(px,y,pw,"Size",    &g_tool.size,    64,0);
+        y=oc_slider(px,y,pw,"Opacity", &g_tool.opacity, 255,1);
     }else if(t==TL_FILL){
-        x=oc_slider(x,y0,"Tolerance",&g_tool.wand_tolerance,255,0);
-        x=oc_slider(x,y0,"Opacity",  &g_tool.opacity,       255,1);
+        y=oc_slider(px,y,pw,"Tolerance",&g_tool.wand_tolerance,255,0);
+        y=oc_slider(px,y,pw,"Opacity",  &g_tool.opacity,       255,1);
     }else if(t==TL_GRADIENT){
-        x=oc_slider(x,y0,"Opacity", &g_tool.opacity, 255,1);
-        x=oc_cycle (x,y0,"Mode",    &grad_mode_idx, GRADBLEND_NAMES,5);
+        y=oc_slider(px,y,pw,"Opacity", &g_tool.opacity, 255,1);
+        y=oc_cycle (px,y,pw,"Mode",    &grad_mode_idx, GRADBLEND_NAMES,5);
         g_tool.grad_blend = GRADBLEND_MODES[clampi(grad_mode_idx,0,4)];
-        // Shape + Repeat + Reverse (P3-GRADSHAPE/REPEAT). Short labels (Shp/Rep)
-        // keep the cluster clear of the right-aligned FG/BG swatches.
-        x=oc_cycle (x,y0,"Shp",     &grad_shape_idx,  GRADSHAPE_NAMES,  GRAD_SHAPE_COUNT);
+        // Shape + Repeat + Reverse (P3-GRADSHAPE/REPEAT).
+        y=oc_cycle (px,y,pw,"Shape",   &grad_shape_idx,  GRADSHAPE_NAMES,  GRAD_SHAPE_COUNT);
         grad_shape_set(grad_shape_idx);
-        x=oc_cycle (x,y0,"Rep",     &grad_repeat_idx, GRADREPEAT_NAMES, GRAD_REPEAT_COUNT);
+        y=oc_cycle (px,y,pw,"Repeat",  &grad_repeat_idx, GRADREPEAT_NAMES, GRAD_REPEAT_COUNT);
         grad_repeat_set(grad_repeat_idx);
-        x=oc_toggle(x,y0,"Rev",     &grad_rev_idx);
+        y=oc_toggle(px,y,pw,"Rev",     &grad_rev_idx);
         grad_reverse_set(grad_rev_idx);
     }else if(t==TL_TEXT){
-        // Installed TrueType faces from the OS font registry (queried once).
-        static char        fn_buf[16][40];
-        static const char *fn_ptr[16];
-        static int         fn_n = 0;
-        if(fn_n==0){
-            int nc=font_count(); if(nc<1)nc=1; if(nc>16)nc=16;
-            for(int i=0;i<nc;i++){
-                font_name(i, fn_buf[i], (int)sizeof(fn_buf[i]));
-                if(!fn_buf[i][0]){ fn_buf[i][0]='F'; fn_buf[i][1]=(char)('0'+i%10); fn_buf[i][2]=0; }
-                fn_ptr[i]=fn_buf[i];
+        // #530: per-layer font memory. The active layer may already have text
+        // on it with its own remembered family/style/size (text_save_layer_font
+        // in tools.c saved it there the last time a stamp landed). Pick that up
+        // whenever the ACTIVE LAYER changes while the Text tool is selected, so
+        // switching to a layer that already has text continues in ITS font
+        // instead of whatever the tool last had. Guarded by an index-change
+        // check so this does not clobber an in-progress choice every redraw.
+        if(text_font_synced_layer != g_doc.active){
+            text_font_synced_layer = g_doc.active;
+            layer_t *AL = &g_doc.layer[g_doc.active];
+            if(AL->has_text_font){
+                strncpy(g_tool.text_family,AL->text_family,sizeof(g_tool.text_family)-1);
+                g_tool.text_family[sizeof(g_tool.text_family)-1]=0;
+                strncpy(g_tool.text_style, AL->text_style, sizeof(g_tool.text_style)-1);
+                g_tool.text_style[sizeof(g_tool.text_style)-1]=0;
+                g_tool.text_font=AL->text_face; g_tool.text_bold=AL->text_bold;
+                g_tool.text_italic=AL->text_italic; g_tool.size=AL->text_size;
             }
-            fn_n=nc;
         }
-        if(g_tool.text_font>=fn_n) g_tool.text_font=0;
-        x=oc_cycle (x,y0,"Font",    &g_tool.text_font, fn_ptr, fn_n);
-        x=oc_slider(x,y0,"Size",    &g_tool.size,    64,0);
-        x=oc_toggle(x,y0,"B",       &g_tool.text_bold);
-        x=oc_toggle(x,y0,"I",       &g_tool.text_italic);
-        x=oc_toggle(x,y0,"U",       &g_tool.text_underline);
-        x=oc_slider(x,y0,"Opacity", &g_tool.opacity, 255,1);
+        // "Choose Font..." opens the SHARED ChooseFont dialog (libc/gui_font.c,
+        // #533 clip fix already in it) instead of a Studio-only picker - family/
+        // style/size list with live preview, exactly like Settings/Editor use.
+        Ts(px,y,"Font",C_DIM); y+=12;
+        fontbtn_shown=1; fontbtn_x=px; fontbtn_y=y; fontbtn_w=pw; fontbtn_h=22;
+        sbutton(fontbtn_x,fontbtn_y,fontbtn_w,fontbtn_h,"Choose Font...",0);
+        y += fontbtn_h+4;
+        { char cur[96];
+          const char *fam = g_tool.text_family[0] ? g_tool.text_family : "Default";
+          if(g_tool.text_style[0]) snprintf(cur,sizeof cur,"%s, %s, %dpt", fam, g_tool.text_style, g_tool.size);
+          else                     snprintf(cur,sizeof cur,"%s, %dpt", fam, g_tool.size);
+          Ts(px,y,cur,C_DIM); y+=16;
+        }
+        // Size stays a quick slider (nudge without reopening the dialog); B/I/U
+        // stay as force-toggles on TOP of whatever face Choose Font resolved -
+        // harmless on a synthetic-style face, only redundant (not wrong) if the
+        // dialog already resolved a real bold/italic face for that family.
+        y=oc_slider(px,y,pw,"Size",    &g_tool.size,    64,0);
+        oc_toggle_at(px,     y+3,34,"B",&g_tool.text_bold);
+        oc_toggle_at(px+38,  y+3,34,"I",&g_tool.text_italic);
+        oc_toggle_at(px+76,  y+3,34,"U",&g_tool.text_underline);
+        y += 27;
+        y=oc_slider(px,y,pw,"Opacity", &g_tool.opacity, 255,1);
     }else{
-        const char*hint = (t==TL_MOVE)   ? "Drag on the canvas to move the active layer" :
-                          (t==TL_PICK)   ? "Click the canvas to pick a colour" :
-                          (t==TL_CROP)   ? "Drag a rectangle, release to crop" :
-                          (t==TL_MEASURE)? "Drag to measure distance and angle" :
-                          (t==TL_PATH)   ? "Click to add path nodes, release to close" : "";
-        if(hint[0]) Ts(x,y0+8,hint,C_DIM);
+        // Pre-wrapped to the panel's narrower width (was one line across the
+        // old full-width bar; two short lines fit the column cleanly).
+        const char*hint1 = (t==TL_MOVE)   ? "Drag on the canvas" :
+                           (t==TL_PICK)   ? "Click the canvas to" :
+                           (t==TL_CROP)   ? "Drag a rectangle," :
+                           (t==TL_MEASURE)? "Drag to measure" :
+                           (t==TL_PATH)   ? "Click to add path" : "";
+        const char*hint2 = (t==TL_MOVE)   ? "to move the active layer" :
+                           (t==TL_PICK)   ? "pick a colour" :
+                           (t==TL_CROP)   ? "release to crop" :
+                           (t==TL_MEASURE)? "distance and angle" :
+                           (t==TL_PATH)   ? "nodes, release to close" : "";
+        if(hint1[0]){ Ts(px,y+1,hint1,C_DIM); Ts(px,y+13,hint2,C_DIM); }
+        y += 30;
     }
 
-    // foreground/background colour + swap, kept right-aligned in the visible bar
-    int rx=(g_w-DOCK_W)-96; if(rx<x+8) rx=x+8;
-    R(rx,y0+4,22,22,g_tool.fg);       OUT(rx,y0+4,22,22,C_LINE);
-    R(rx+14,y0+10,16,16,g_tool.bg);   OUT(rx+14,y0+10,16,16,C_LINE);
-    sbutton(rx+38,y0+4,22,22,"x",0);
-    if(g_noc<24){ optctl_t*o=&g_oc[g_noc++]; o->type=OC_SWAP; o->x=rx+38; o->y=y0+4; o->w=22; o->h=22; o->val=0; o->nch=0; }
-    sbutton(rx+62,y0+4,20,22,"D",0);                    // default colours (black/white)
-    if(g_noc<24){ optctl_t*o=&g_oc[g_noc++]; o->type=OC_DEFCOL; o->x=rx+62; o->y=y0+4; o->w=20; o->h=22; o->val=0; o->nch=0; }
+    // FG/BG colour swatches + swap/default, now part of the per-tool column
+    // (item #473 "including brushes and colour") instead of a fixed corner of
+    // the old bar. Shown for every tool since colour is meaningful context
+    // even for non-painting tools (e.g. Fill/Stroke via Edit menu).
+    y += 6; R(px,y,pw,1,C_LINE); y+=10;
+    Ts(px,y-2,"Colour",C_DIM); y+=12;
+    R(px,y,26,26,g_tool.fg);       OUT(px,y,26,26,C_LINE);
+    R(px+16,y+12,18,18,g_tool.bg); OUT(px+16,y+12,18,18,C_LINE);
+    sbutton(px+42,y,26,26,"x",0);
+    if(g_noc<24){ optctl_t*o=&g_oc[g_noc++]; o->type=OC_SWAP; o->x=px+42; o->y=y; o->w=26; o->h=26; o->val=0; o->nch=0; }
+    sbutton(px+72,y,26,26,"D",0);                    // default colours (black/white)
+    if(g_noc<24){ optctl_t*o=&g_oc[g_noc++]; o->type=OC_DEFCOL; o->x=px+72; o->y=y; o->w=26; o->h=26; o->val=0; o->nch=0; }
 }
 
 // ---- tiny vector-glyph primitives for tool icons --------------------------
@@ -1064,19 +1187,27 @@ static void draw_tool_icon(int t,int x,int y,uint32_t c){
     #undef BOX
 }
 
-static void draw_strip(void){
-    vgrad(0,MENU_H+OPT_H,STRIP_W,g_h-MENU_H-OPT_H-STATUS_H, C_PANEL, C_PANEL2);
-    R(STRIP_W-1,MENU_H+OPT_H,1,g_h-MENU_H-OPT_H-STATUS_H,C_LINE);
-    int bw=22,bh=22, x0=(STRIP_W-2*bw-2)/2, y0=MENU_H+OPT_H+4;
+// #473: left panel = tool icon grid up top + that tool's options below it
+// (draw_toolopts), one continuous column instead of a narrow icon strip plus
+// a separate full-width bar. toolgrid_bottom() is the single source of truth
+// both this and draw_toolopts()/click_toolgrid() use for the grid/options
+// split, so they can never drift apart.
+static void draw_toolpanel(void){
+    int h = g_h-MENU_H-STATUS_H;
+    vgrad(0,MENU_H,PANEL_W,h, C_PANEL, C_PANEL2);
+    R(PANEL_W-1,MENU_H,1,h,C_LINE);
+    int bw=TOOLGRID_BW-2, bh=TOOLGRID_BH-2;
+    int gridw=TOOLGRID_COLS*TOOLGRID_BW-2, x0=(PANEL_W-gridw)/2, y0=MENU_H+6;
     for(int i=0;i<TL_COUNT;i++){
-        int col=i&1, row=i>>1;
-        int x=x0+col*(bw+2), y=y0+row*(bh+2);
+        int col=i%TOOLGRID_COLS, row=i/TOOLGRID_COLS;
+        int x=x0+col*TOOLGRID_BW, y=y0+row*TOOLGRID_BH;
         int on = ((int)g_tool.id==i), hot=(hover_tool==i);
         if(on)       vgrad(x,y,bw,bh, C_ACCENT2, C_ACCENT);
         else         vgrad(x,y,bw,bh, mix(hot?C_BTN_HOV:C_BTN,0x00ffffff,24), C_PANEL2);
         bevel(x,y,bw,bh, mix(C_BTN_HOV,0x00ffffff,40), C_LINE);
-        draw_tool_icon(i, x+3, y+3, on?0x00ffffff:C_TEXT);
+        draw_tool_icon(i, x+2, y+2, on?0x00ffffff:C_TEXT);
     }
+    draw_toolopts();
 }
 
 // Dock section y positions for hit testing.
@@ -1722,7 +1853,7 @@ static int pd_bx(void){
     if(pd_has_handles()){ int x=g_w-DOCK_W-360-16; if(x<cv_x()+8) x=cv_x()+8; return x; }
     return (g_w-360)/2;
 }
-static int pd_by(void){ int by=(g_h-pd_h())/2; if(by<MENU_H+OPT_H+4) by=MENU_H+OPT_H+4; return by; }
+static int pd_by(void){ int by=(g_h-pd_h())/2; if(by<MENU_H+4) by=MENU_H+4; return by; }
 // Screen y (row baseline) of param k, matching the draw loop.
 static int pd_row_top(int k){ int y=pd_by()+40+pd_pane_area(); for(int i=0;i<k && i<pd_np;i++) y+=pd_row_h_k(i); return y; }
 // Geometry of the SP_ANGLE dial / SP_CURVE graph for a given param row.
@@ -2143,9 +2274,23 @@ static int click_param_dialog(int mx,int my){
 // ---------------------------------------------------------------------------
 // Modal overlays (text/message)
 // ---------------------------------------------------------------------------
+// Canvas Size modal (MP_CANVAS) grows a 3x3 anchor picker below the WxH field,
+// so "which corner/side stays put" is an explicit choice instead of always
+// silently anchoring top-left (doc_resize's anchor param was previously always
+// called with 0 from here). Geometry lives in ONE place (this fn) so the
+// draw in draw_modal() and the hit-test in the mouse-down handler can never
+// drift apart; idx is row-major 0..8 matching doc_resize()'s anchor semantics.
+#define CA_CELL 22
+#define CA_GAP  4
+static void canvas_anchor_cell_rect(int bx,int by,int idx,int*ox,int*oy){
+    int col=idx%3, row=idx/3;
+    *ox = bx+16 + col*(CA_CELL+CA_GAP);
+    *oy = by+96 + row*(CA_CELL+CA_GAP);
+}
+static int modal_bh(void){ return modal==2 ? 260 : (modal_purpose==MP_CANVAS ? 246 : 120); }
 static void draw_modal(void){
     if(!modal) return;
-    int bw=520, bh=(modal==2)?260:120;
+    int bw=520, bh=modal_bh();
     int bx=(g_w-bw)/2, by=(g_h-bh)/2;
     R(bx-2,by-2,bw+4,bh+4,C_LINE); R(bx,by,bw,bh,C_PANEL); OUT(bx,by,bw,bh,C_ACCENT);
     if(modal==1){
@@ -2153,7 +2298,12 @@ static void draw_modal(void){
         R(bx+16,by+44,bw-32,26,C_PANEL2); OUT(bx+16,by+44,bw-32,26,C_LINE);
         T(bx+22,by+49, modal_buf, C_TEXT);
         int cw=gui_string_width(modal_buf); R(bx+22+cw,by+47,2,20,C_ACCENT2);
-        Ts(bx+16,by+90,"Enter = OK    Esc = Cancel", C_DIM);
+        if(modal_purpose==MP_CANVAS){
+            Ts(bx+16,by+80,"Anchor (which side/corner stays fixed):", C_DIM);
+            for(int i=0;i<9;i++){ int cx,cy; canvas_anchor_cell_rect(bx,by,i,&cx,&cy);
+                button(cx,cy,CA_CELL,CA_CELL,"",0,i==canvas_anchor); }
+        }
+        Ts(bx+16,by+bh-30,"Enter = OK    Esc = Cancel", C_DIM);
         button(bx+bw-172,by+bh-34,76,24,"Cancel",0,0);
         button(bx+bw-88, by+bh-34,76,24,"OK",0,0);
     }else{
@@ -2179,8 +2329,7 @@ void ui_full_redraw(void){
     draw_overlays();
     draw_pd_handles();
     draw_menubar();
-    draw_optbar();
-    draw_strip();
+    draw_toolpanel();
     draw_dock();
     draw_status();
     draw_dropdown();
@@ -2221,6 +2370,19 @@ static void open_msg(const char*title,const char*body){
     i=0; if(body){ while(body[i]&&i<511){modal_msg[i]=body[i];i++;} } modal_msg[i]=0;
 }
 static int parse_int(const char*s){ int v=0,neg=0,i=0; if(s[0]=='-'){neg=1;i=1;} while(s[i]>='0'&&s[i]<='9'){v=v*10+s[i]-'0';i++;} return neg?-v:v; }
+// "AxB" with an optional leading '-' on either side (shear percentages can be
+// negative, unlike the WxH size fields which reuse a plain unsigned parse).
+static void parse_pair_signed(const char*s,int*a,int*b){
+    int i=0,neg=0; *a=0; *b=0;
+    if(s[i]=='-'){neg=1;i++;}
+    while(s[i]>='0'&&s[i]<='9'){*a=*a*10+s[i]-'0';i++;}
+    if(neg) *a=-*a;
+    if(s[i]=='x'||s[i]=='X'){
+        i++; neg=0; if(s[i]=='-'){neg=1;i++;}
+        while(s[i]>='0'&&s[i]<='9'){*b=*b*10+s[i]-'0';i++;}
+        if(neg) *b=-*b;
+    }
+}
 
 static void run_op(int i){
     const studio_op_t*op=studio_op_get(i); if(!op) return;
@@ -2368,20 +2530,24 @@ static void do_action(int a){
         case A_IROT90CCW: undo_push("Rotate 90 CCW"); layer_rotate90(g_doc.active,0); g_doc.comp_dirty=1; ui_full_redraw(); break;
         case A_IROTARB: open_modal_text(MP_ROT,"Rotate layer (degrees):","15"); break;
         case A_ISCALE: open_modal_text(MP_SCALE,"Scale layer to (WxH):","480x300"); break;
+        case A_ISHEAR: open_modal_text(MP_SHEAR,"Shear layer X% x Y% (e.g. 20x0):","20x0"); break;
         case A_ICROP: undo_push("Crop"); doc_crop_to_selection(); g_zoom_pct=100; pan_x=pan_y=0; g_doc.comp_dirty=1; ui_status("Cropped"); ui_full_redraw(); break;
-        case A_ICANVAS: open_modal_text(MP_CANVAS,"Canvas size (WxH):","960x600"); break;
+        case A_ICANVAS: { canvas_anchor=0; char cb[24]; snprintf(cb,sizeof cb,"%dx%d",g_doc.w,g_doc.h);
+            open_modal_text(MP_CANVAS,"Canvas size (WxH):",cb); } break;
         case A_ZIN: zoom_step(+1); ui_full_redraw(); break;
         case A_ZOUT: zoom_step(-1); ui_full_redraw(); break;
         case A_ZFIT: g_zoom_pct=zoom_fit_pct(); pan_x=pan_y=0; ui_full_redraw(); break;
+        case A_ZACTUAL: zoom_to_center(100); ui_full_redraw(); break;
         case A_VGRID: grid_on=!grid_on; ui_full_redraw(); break;
+        case A_VSNAP: grid_snap=!grid_snap; ui_status(grid_snap?"Snap to Grid on":"Snap to Grid off"); ui_full_redraw(); break;
         case A_VGRIDSP: open_modal_text(MP_GRIDSP,"Grid spacing (px):","32"); break;
         case A_VGCLEAR: nguide_v=nguide_h=0; ui_full_redraw(); break;
         case A_AICMD:
-            if(!ai_available()){ open_msg("AI","AI is unavailable. Place a key at /CONFIG/KIMI.KEY and connect to a network."); ui_full_redraw(); }
+            if(!ai_available()){ open_msg("AI","AI is unavailable. Set your API key in Settings > AI and connect to a network."); ui_full_redraw(); }
             else open_modal_text(MP_AICMD,"Describe an edit:","warmer and higher contrast");
             break;
         case A_AIPAL:
-            if(!ai_available()){ open_msg("AI","AI is unavailable. Place a key at /CONFIG/KIMI.KEY and connect to a network."); ui_full_redraw(); }
+            if(!ai_available()){ open_msg("AI","AI is unavailable. Set your API key in Settings > AI and connect to a network."); ui_full_redraw(); }
             else open_modal_text(MP_AIPAL,"Palette prompt:","autumn forest");
             break;
         case A_ABOUT:
@@ -2406,7 +2572,7 @@ static void modal_confirm(void){
             if(w<1||h<1){w=STUDIO_DEF_W;h=STUDIO_DEF_H;}
             w=clampi(w,1,STUDIO_MAX_W); h=clampi(h,1,STUDIO_MAX_H);
             if(purpose==MP_NEWSZ){ doc_new(w,h,argb(255,255,255,255)); }
-            else { undo_push("Canvas Size"); doc_resize(w,h,0); }
+            else { undo_push("Canvas Size"); doc_resize(w,h,canvas_anchor); }
             g_zoom_pct=100; pan_x=pan_y=0; ui_status("Resized");
         } break;
         case MP_OPEN:
@@ -2425,6 +2591,7 @@ static void modal_confirm(void){
         case MP_SROUND: undo_push("Rounded"); sel_round(parse_int(buf)); ui_status("Rounded"); break;
         case MP_ROT: undo_push("Rotate"); layer_rotate_arbitrary(g_doc.active,parse_int(buf)); g_doc.comp_dirty=1; ui_status("Rotated"); break;
         case MP_SCALE: { int w=0,h=0,s=0; while(buf[s]>='0'&&buf[s]<='9'){w=w*10+buf[s]-'0';s++;} if(buf[s]=='x'||buf[s]=='X'){s++; while(buf[s]>='0'&&buf[s]<='9'){h=h*10+buf[s]-'0';s++;}} if(w>0&&h>0){ undo_push("Scale Layer"); layer_scale(g_doc.active,w,h); g_doc.comp_dirty=1; ui_status("Scaled"); } } break;
+        case MP_SHEAR: { int sx=0,sy=0; parse_pair_signed(buf,&sx,&sy); undo_push("Shear"); layer_shear(g_doc.active,sx,sy); g_doc.comp_dirty=1; ui_status("Sheared"); } break;
         case MP_GRIDSP: { int v=parse_int(buf); if(v>=2) grid_sp=v; grid_on=1; ui_status("Grid set"); } break;
         case MP_LRENAME: { layer_t *L=&g_doc.layer[g_doc.active]; int i=0;
             for(; buf[i] && i<STUDIO_NAME_LEN-1; i++) L->name[i]=buf[i]; L->name[i]=0;
@@ -2754,11 +2921,39 @@ static int click_guard(int mx,int my){
 // ---------------------------------------------------------------------------
 // Chrome hit testing
 // ---------------------------------------------------------------------------
-static int click_optbar(int mx,int my){
-    int y0=MENU_H; if(my<y0||my>=y0+OPT_H) return 0;
+static int click_toolopts(int mx,int my){
+    int y0=toolgrid_bottom(); if(mx>=PANEL_W||my<y0) return 0;
     if(bp_shown){
-        if(IN(mx,my,bp_x0,bp_y,bp_sz,bp_sz)){ g_tool.hardness=255; draw_optbar(); win_invalidate(g_win); return 1; }
-        if(IN(mx,my,bp_x1,bp_y,bp_sz,bp_sz)){ g_tool.hardness=60;  draw_optbar(); win_invalidate(g_win); return 1; }
+        if(IN(mx,my,bp_x0,bp_y,bp_sz,bp_sz)){ g_tool.hardness=255; draw_toolopts(); win_invalidate(g_win); return 1; }
+        if(IN(mx,my,bp_x1,bp_y,bp_sz,bp_sz)){ g_tool.hardness=60;  draw_toolopts(); win_invalidate(g_win); return 1; }
+    }
+    // #530 "Choose Font..." - the shared ChooseFont dialog. Pre-fills from the
+    // tool's current family/style/size (which is itself either what the user
+    // last picked, or what got pulled in from the active layer's own memory
+    // above in draw_toolopts), so reopening always starts on the live selection,
+    // never resets to the OS default. Modal: blocks here until closed.
+    if(fontbtn_shown && IN(mx,my,fontbtn_x,fontbtn_y,fontbtn_w,fontbtn_h)){
+        gui_font_sel_t sel; memset(&sel,0,sizeof sel);
+        if(g_tool.text_family[0]){
+            strncpy(sel.family,g_tool.text_family,sizeof(sel.family)-1);
+            strncpy(sel.style, g_tool.text_style, sizeof(sel.style)-1);
+            sel.size = g_tool.size;
+        }else{
+            gui_font_sel_default(&sel);
+            if(g_tool.size>0) sel.size = g_tool.size;   // keep the tool's size, not the UI font's
+        }
+        if(gui_font_dialog(&sel)){
+            strncpy(g_tool.text_family,sel.family,sizeof(g_tool.text_family)-1);
+            g_tool.text_family[sizeof(g_tool.text_family)-1]=0;
+            strncpy(g_tool.text_style, sel.style, sizeof(g_tool.text_style)-1);
+            g_tool.text_style[sizeof(g_tool.text_style)-1]=0;
+            g_tool.text_font   = sel.face;
+            g_tool.text_bold   = (sel.style_bits & FONT_STYLE_BOLD)   ? 1 : 0;
+            g_tool.text_italic = (sel.style_bits & FONT_STYLE_ITALIC) ? 1 : 0;
+            g_tool.size = sel.size;
+        }
+        ui_full_redraw();   // the font dialog covered the whole window
+        return 1;
     }
     for(int i=0;i<g_noc;i++){
         optctl_t*o=&g_oc[i];
@@ -2766,22 +2961,22 @@ static int click_optbar(int mx,int my){
         if(o->type==OC_SLIDER && o->val){
             int v=(mx-o->x)*o->vmax/(o->w>0?o->w:1);
             *o->val=clampi(v,0,o->vmax); opt_drag=i;
-            draw_optbar(); win_invalidate(g_win); return 1;
+            draw_toolopts(); win_invalidate(g_win); return 1;
         }else if(o->type==OC_CYCLE && o->val){
             *o->val=(*o->val+1)%(o->nch>0?o->nch:1);
-            draw_optbar(); win_invalidate(g_win); return 1;
+            draw_toolopts(); win_invalidate(g_win); return 1;
         }else if(o->type==OC_TOGGLE && o->val){
             *o->val = !*o->val;
-            draw_optbar(); win_invalidate(g_win); return 1;
+            draw_toolopts(); win_invalidate(g_win); return 1;
         }else if(o->type==OC_SWAP){
             uint32_t t=g_tool.fg; g_tool.fg=g_tool.bg; g_tool.bg=t;
-            draw_optbar(); draw_dock(); win_invalidate(g_win); return 1;
+            draw_toolopts(); draw_dock(); win_invalidate(g_win); return 1;
         }else if(o->type==OC_DEFCOL){
             g_tool.fg=argb(255,0,0,0); g_tool.bg=argb(255,255,255,255);
-            draw_optbar(); draw_dock(); win_invalidate(g_win); return 1;
+            draw_toolopts(); draw_dock(); win_invalidate(g_win); return 1;
         }
     }
-    return 1;   // consume any click on the options bar
+    return 1;   // consume any click below the tool grid in the panel
 }
 // Granular zoom control in the status bar (item 2): readout, -/+ steppers,
 // continuous slider, and Fit / 1:1 quick buttons.
@@ -2798,12 +2993,14 @@ static int click_status(int mx,int my){
     }
     return 1;   // consume clicks anywhere on the status bar
 }
-static int click_strip(int mx,int my){
-    if(mx>=STRIP_W || my<MENU_H+OPT_H) return 0;
-    int bw=20,bh=20,x0=3,y0=MENU_H+OPT_H+4;
+static int click_toolgrid(int mx,int my){
+    if(mx>=PANEL_W || my<MENU_H || my>=toolgrid_bottom()) return 0;
+    int bw=TOOLGRID_BW-2, bh=TOOLGRID_BH-2;
+    int gridw=TOOLGRID_COLS*TOOLGRID_BW-2, x0=(PANEL_W-gridw)/2, y0=MENU_H+6;
     for(int i=0;i<TL_COUNT;i++){
-        int col=i&1,row=i>>1; int x=x0+col*(bw+2), y=y0+row*(bh+2);
-        if(IN(mx,my,x,y,bw,bh)){ g_tool.id=(tool_id_t)i; draw_strip(); draw_optbar(); win_invalidate(g_win); return 1; }
+        int col=i%TOOLGRID_COLS, row=i/TOOLGRID_COLS;
+        int x=x0+col*TOOLGRID_BW, y=y0+row*TOOLGRID_BH;
+        if(IN(mx,my,x,y,bw,bh)){ g_tool.id=(tool_id_t)i; draw_toolpanel(); win_invalidate(g_win); return 1; }
     }
     return 1;
 }
@@ -2877,7 +3074,7 @@ static int click_dock(int mx,int my){
         int total=1+brush_count();
         for(int c=0;c<total;c++){
             int cxp=dx+8+(c%BPCOLS)*BPSTRIDE, cyp=BR_y+(c/BPCOLS)*BPSTRIDE;
-            if(IN(mx,my,cxp,cyp,BPCELL,BPCELL)){ brush_set(c-1); draw_optbar(); ui_full_redraw(); return 1; }
+            if(IN(mx,my,cxp,cyp,BPCELL,BPCELL)){ brush_set(c-1); draw_toolopts(); ui_full_redraw(); return 1; }
         }
     }
     // ===== Patterns =====
@@ -2985,14 +3182,14 @@ static void canvas_down(int mx,int my){
     if(t==TL_SEL_LASSO||t==TL_PATH){ shaping=0; if(t==TL_SEL_LASSO){ sel_combine_before(); sel_lasso_begin(cx,cy);} else { path_reset(); path_add_node(cx,cy,0,0,0,0);} painting=2; return; }
     if(t==TL_SEL_WAND){ sel_combine_before(); sel_wand(cx,cy,g_tool.wand_tolerance?g_tool.wand_tolerance:32); sel_combine_after(); ui_full_redraw(); return; }
     if(t==TL_SEL_BYCOLOR){ sel_combine_before(); sel_by_color(cx,cy,g_tool.wand_tolerance?g_tool.wand_tolerance:32); sel_combine_after(); ui_full_redraw(); return; }
-    if(is_shape_tool(t)){ shaping=1; sh_x0=sh_x1=cx; sh_y0=sh_y1=cy; return; }
+    if(is_shape_tool(t)){ snap_xy(&cx,&cy); shaping=1; sh_x0=sh_x1=cx; sh_y0=sh_y1=cy; return; }
     undo_push(tool_name(t));
     tool_begin(cx,cy); painting=1; g_doc.comp_dirty=1; redraw_canvas_only();
 }
 static void canvas_move(int mx,int my){
     int cx,cy; screen_to_canvas(mx,my,&cx,&cy);
     if(painting==2){ if(g_tool.id==TL_PATH) path_add_node(cx,cy,0,0,0,0); else sel_lasso_point(cx,cy); return; }
-    if(shaping){ sh_x1=cx; sh_y1=cy; redraw_canvas_only(); return; }
+    if(shaping){ snap_xy(&cx,&cy); sh_x1=cx; sh_y1=cy; redraw_canvas_only(); return; }
     if(painting==1){ tool_drag(cx,cy); g_doc.comp_dirty=1; redraw_canvas_only(); }
 }
 static void canvas_up(int mx,int my){
@@ -3001,6 +3198,7 @@ static void canvas_up(int mx,int my){
     if(painting==2){ if(t==TL_PATH){ path_close(); ui_status("Path closed"); } else { sel_lasso_end(); sel_combine_after(); } painting=0; ui_full_redraw(); return; }
     if(shaping){
         shaping=0;
+        snap_xy(&cx,&cy);
         if(t==TL_SEL_RECT){ sel_combine_before(); sel_rect(sh_x0,sh_y0,cx,cy,g_tool.feather); sel_combine_after(); }
         else if(t==TL_SEL_ELLIPSE){ sel_combine_before(); sel_ellipse(sh_x0,sh_y0,cx,cy,g_tool.feather); sel_combine_after(); }
         else if(t==TL_CROP){ sel_rect(sh_x0,sh_y0,cx,cy,0); undo_push("Crop"); doc_crop_to_selection(); g_zoom_pct=100; pan_x=pan_y=0; }
@@ -3048,6 +3246,7 @@ static int handle_key(gui_event_t *e){
         case 'x': { uint32_t t=g_tool.fg; g_tool.fg=g_tool.bg; g_tool.bg=t; } break;
         case '+': case '=': zoom_step(+1); break;
         case '-': case '_': zoom_step(-1); break;
+        case '1': zoom_to_center(100); break;
         case '[': g_tool.size=clampi(g_tool.size-1,1,64); break;
         case ']': g_tool.size=clampi(g_tool.size+1,1,64); break;
         default: return 1;
@@ -3136,9 +3335,13 @@ int ui_handle_event(void *evp){
             if(pr_open){ click_print_preview(mx,my); return 1; }
             if(pd_open){ int hh=pd_handle_hit(mx,my); if(hh>=0){ pd_hdrag=hh; pd_handle_setxy(hh,mx,my); return 1; } click_param_dialog(mx,my); return 1; }
             if(modal==2){ int bw=520,bh=260,bx=(g_w-bw)/2,by=(g_h-bh)/2; if(IN(mx,my,bx+bw-90,by+bh-34,74,24)){ modal=0; ui_full_redraw(); } break; }
-            if(modal==1){ int bw=520,bh=120,bx=(g_w-bw)/2,by=(g_h-bh)/2;
+            if(modal==1){ int bw=520,bh=modal_bh(),bx=(g_w-bw)/2,by=(g_h-bh)/2;
                 if(IN(mx,my,bx+bw-88,by+bh-34,76,24)){ modal_confirm(); return 1; }   // OK
                 if(IN(mx,my,bx+bw-172,by+bh-34,76,24)){ modal=0; ui_full_redraw(); return 1; } // Cancel
+                if(modal_purpose==MP_CANVAS){
+                    for(int i=0;i<9;i++){ int cx,cy; canvas_anchor_cell_rect(bx,by,i,&cx,&cy);
+                        if(IN(mx,my,cx,cy,CA_CELL,CA_CELL)){ canvas_anchor=i; ui_full_redraw(); return 1; } }
+                }
                 break; }
             if(blend_pop){
                 int x,y,w,h; int rowh=blend_pop_geom(&x,&y,&w,&h);
@@ -3166,8 +3369,8 @@ int ui_handle_event(void *evp){
             if(mx>=cv_x() && mx<cv_x()+cv_w() && my>=cv_y()-RULER && my<cv_y()){ // top ruler
                 int cx,cy; screen_to_canvas(mx,cv_y(),&cx,&cy); dragging_guide=1; drag_guide_pos=cx; ui_full_redraw(); return 1; }
             if(space_down && pt_in_canvas(mx,my)){ panning=1; pan_mx=mx; pan_my=my; return 1; }
-            if(click_optbar(mx,my)) return 1;
-            if(click_strip(mx,my)) return 1;
+            if(click_toolgrid(mx,my)) return 1;
+            if(click_toolopts(mx,my)) return 1;
             // Status bar spans the full width and is drawn ON TOP of the dock's
             // bottom edge, so it must claim its clicks BEFORE click_dock (which
             // otherwise consumes everything in the dock x-column, including the
@@ -3196,7 +3399,7 @@ int ui_handle_event(void *evp){
                 return 1;
             }
             if(opt_drag>=0 && opt_drag<g_noc){ optctl_t*o=&g_oc[opt_drag];
-                if(o->type==OC_SLIDER && o->val){ int v=(mx-o->x)*o->vmax/(o->w>0?o->w:1); *o->val=clampi(v,0,o->vmax); draw_optbar(); win_invalidate(g_win); }
+                if(o->type==OC_SLIDER && o->val){ int v=(mx-o->x)*o->vmax/(o->w>0?o->w:1); *o->val=clampi(v,0,o->vmax); draw_toolopts(); win_invalidate(g_win); }
                 return 1; }
             if(zoom_slider_drag){
                 int sw=zc_slider_w>10?zc_slider_w-8:1;
@@ -3205,7 +3408,7 @@ int ui_handle_event(void *evp){
                 ui_full_redraw(); return 1;
             }
             if(lop_drag){ int sx=g_w-DOCK_W+62, sw=DOCK_W-100; int v=clampi((mx-sx)*255/(sw>12?sw-12:1),0,255); layer_set_opacity(g_doc.active,v); g_doc.comp_dirty=1; ui_full_redraw(); return 1; }
-            if(dragging_guide){ int cx,cy; screen_to_canvas(mx,my,&cx,&cy); drag_guide_pos=(dragging_guide==1)?cx:cy; redraw_canvas_only(); return 1; }
+            if(dragging_guide){ int cx,cy; screen_to_canvas(mx,my,&cx,&cy); snap_xy(&cx,&cy); drag_guide_pos=(dragging_guide==1)?cx:cy; redraw_canvas_only(); return 1; }
             if(panning){ int z=zoom(); pan_x -= (mx-pan_mx)*100/z; pan_y -= (my-pan_my)*100/z; pan_mx=mx; pan_my=my; redraw_canvas_only(); return 1; }
             if(modal){ draw_modal(); win_invalidate(g_win); return 1; }
             if(menu_open>=0){
@@ -3226,15 +3429,17 @@ int ui_handle_event(void *evp){
             }
             if(blend_pop){ draw_blend_pop(); win_invalidate(g_win); return 1; }
             int nh=-1;
-            if(mx<STRIP_W && my>=MENU_H+OPT_H){
-                int bw=20,bh=20,x0=3,y0=MENU_H+OPT_H+4;
-                for(int i=0;i<TL_COUNT;i++){ int col=i&1,row=i>>1; if(IN(mx,my,x0+col*(bw+2),y0+row*(bh+2),bw,bh)){ nh=i; break; } }
+            if(mx<PANEL_W && my>=MENU_H && my<toolgrid_bottom()){
+                int bw=TOOLGRID_BW-2, bh=TOOLGRID_BH-2;
+                int gridw=TOOLGRID_COLS*TOOLGRID_BW-2, x0=(PANEL_W-gridw)/2, y0=MENU_H+6;
+                for(int i=0;i<TL_COUNT;i++){ int col=i%TOOLGRID_COLS,row=i/TOOLGRID_COLS;
+                    if(IN(mx,my,x0+col*TOOLGRID_BW,y0+row*TOOLGRID_BH,bw,bh)){ nh=i; break; } }
             }
-            if(nh!=hover_tool){ hover_tool=nh; draw_strip(); win_invalidate(g_win); }
+            if(nh!=hover_tool){ hover_tool=nh; draw_toolpanel(); win_invalidate(g_win); }
             if(painting||shaping) canvas_move(mx,my);
             // hover repaint of the chrome panel under the pointer (button hover/press)
             if(my<MENU_H){ g_last_over_grid=0; draw_menubar(); win_invalidate(g_win); }
-            else if(my<MENU_H+OPT_H){ g_last_over_grid=0; draw_optbar(); win_invalidate(g_win); }
+            else if(mx<PANEL_W && my>=toolgrid_bottom()){ g_last_over_grid=0; draw_toolopts(); win_invalidate(g_win); }
             else if(my>=g_h-STATUS_H){ g_last_over_grid=0; draw_status(); win_invalidate(g_win); }
             else if(mx>=g_w-DOCK_W){
                 // The Brushes/Patterns cell grids have no hover feedback, so skip
@@ -3266,10 +3471,10 @@ int ui_handle_event(void *evp){
             if(fb_open){ fb_sb_drag=0; return 1; }
             if(guard_open) return 1;
             if(zoom_slider_drag){ zoom_slider_drag=0; return 1; }
-            if(opt_drag>=0){ opt_drag=-1; draw_optbar(); win_invalidate(g_win); return 1; }
+            if(opt_drag>=0){ opt_drag=-1; draw_toolopts(); win_invalidate(g_win); return 1; }
             if(lop_drag){ lop_drag=0; ui_full_redraw(); return 1; }
             if(pd_open){ int wasl=pd_loupe_drag; pd_drag=-1; pd_dialdrag=-1; pd_cvdrag=-1; pd_hdrag=-1; pd_kdrag=0; pd_loupe_drag=0; if(wasl) redraw_canvas_only(); return 1; }
-            if(dragging_guide){ int cx,cy; screen_to_canvas(mx,my,&cx,&cy);
+            if(dragging_guide){ int cx,cy; screen_to_canvas(mx,my,&cx,&cy); snap_xy(&cx,&cy);
                 if(dragging_guide==1 && nguide_v<MAX_GUIDES && cx>=0 && cx<g_doc.w) guide_v[nguide_v++]=cx;
                 if(dragging_guide==2 && nguide_h<MAX_GUIDES && cy>=0 && cy<g_doc.h) guide_h[nguide_h++]=cy;
                 dragging_guide=0; ui_full_redraw(); return 1; }
@@ -3277,7 +3482,7 @@ int ui_handle_event(void *evp){
             if(painting||shaping){ canvas_up(mx,my); break; }
             // release over chrome: repaint so the pressed look clears
             if(my<MENU_H){ draw_menubar(); win_invalidate(g_win); }
-            else if(my<MENU_H+OPT_H){ draw_optbar(); win_invalidate(g_win); }
+            else if(mx<PANEL_W){ draw_toolpanel(); win_invalidate(g_win); }
             else if(mx>=g_w-DOCK_W){ draw_dock(); win_invalidate(g_win); }
             break;
         }

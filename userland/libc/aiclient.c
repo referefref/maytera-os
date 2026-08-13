@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // aiclient.c - Shared MayteraOS AI (Kimi) client + ReAct tool loop.
 //
 // Single source of truth for the AI integration (Kimi HTTPS POST + the
@@ -13,8 +17,42 @@
 #include "fcntl.h"
 #include "aiclient.h"
 #include "aicap.h"      // #293 capability tokens + consent + audit
+#include "aiguard.h"    // #745 prompt-injection screen (kernel-owned ruleset)
+#include "userconf.h"   // #684: per-user protected AI settings
 
-#define KEY_PATH      "/CONFIG/KIMI.KEY"
+// ===========================================================================
+// #684: THE AI KEY IS PROVISIONED, NOT READ FROM /etc
+// ===========================================================================
+// User's decision, verbatim: "we can leave kimi.key in there, in a users
+// deployment they'll insert their own key in the settings app, this kimi.key
+// file should only be used to write that value to settings (in a way that's
+// protected from other users and apps) not be called directly by the ai chat
+// app".
+//
+// So /CONFIG/KIMI.KEY is now a one-time PROVISIONING SEED, read by exactly one
+// root-privileged path (kernel/main.c at session start, Ring 0), which writes
+// its value into the user's own protected settings at <home>/CONFIG/AISVC.CFG,
+// owned by that user, mode 0600. It may be ABSENT ENTIRELY on a normal
+// deployment, where the user types their key into Settings and that is the only
+// way it is ever set. Nothing in userland opens /CONFIG/KIMI.KEY any more.
+//
+// NO LEGACY READ FALLBACK, AND THAT IS THE GENERAL RULE FOR SECRETS.
+// Preferences fall back to their old system location so an upgrade keeps them
+// (see libc/userconf.c). Credentials MUST NOT, because a fallback silently
+// re-creates the very read we are denying: it would put /CONFIG/AISVC.CFG back
+// in this app's open() path, and on a non-root session that is exactly the
+// [PERMS-DENY] we set out to remove. Migration for a secret is the privileged
+// provisioner's job, not the reader's. If you are adding a config file: does it
+// hold a credential? Then no fallback. Otherwise fall back.
+//
+// WHAT THIS ACHIEVES, HONESTLY. The key is now protected from OTHER USERS: the
+// per-user file is 0600 owned by its user, and since #674 perms_check() walks
+// the path properly, so another uid cannot read it. It is NOT protected from
+// other APPS RUNNING AS THE SAME USER. Any process with this user's euid can
+// open the same file. Closing that requires the per-app capability broker
+// (#465-#468, #656); this change does not do it and must not be described as
+// if it did.
+#define AISVC_NAME    "AISVC.CFG"   // per-user, via libc/userconf.c
 #define API_URL       "https://api.moonshot.ai/v1/chat/completions"
 #define API_MODEL     "kimi-k2.6"
 #define MAX_MSGS      AICLIENT_MAX_MSGS
@@ -50,7 +88,7 @@ static int  g_have_key = 0;
 // #367: provider-agnostic AI config. Defaults reproduce the historical Kimi
 // behavior EXACTLY, so with no /CONFIG/AISVC.CFG present the client is byte-for
 // -byte unchanged (endpoint/model/style below = the old hardcoded constants).
-#define AISVC_CFG          "/CONFIG/AISVC.CFG"
+// (was /CONFIG/AISVC.CFG; now per-user only, no fallback: see the #684 note above)
 #define AI_STYLE_BEARER    0   // OpenAI-compatible: Authorization: Bearer, chat/completions
 #define AI_STYLE_ANTHROPIC 1   // Anthropic Messages API: x-api-key, /v1/messages
 static char g_endpoint[256] = API_URL;
@@ -64,7 +102,81 @@ static int   g_have_appgen = 0;
 
 static msg_t g_msgs[MAX_MSGS];
 static int   g_nmsgs = 0;
+
+// ===========================================================================
+// #745 PROMPT-INJECTION SCREENING, at add_msg().
+//
+// WHY HERE. add_msg() is the ONE function through which every message enters
+// the conversation, whatever produced it: the user's typed prompt, an RSS
+// article, a file read by files.read, a filename from files.list, a weather
+// response off the network, a compiler log from the #294 build service. There
+// is no second door. Screening per producer would have meant eleven call sites
+// and a twelfth one appearing next week unscreened.
+//
+// WHAT THIS IS NOT. It is not the enforcement point and must never be
+// described as one. It is Ring 3 screening its own input, so a hostile or
+// simply forgetful app can skip it. The control that BINDS is in the kernel,
+// at sys_http_post_start(), which refuses the POST whether or not this ran.
+// This layer exists so the refusal has WORDS: which rule, which severity,
+// which literal, and which SOURCE.
+//
+// ROLES SCREENED: 0 (the user's own turn) and 5 (a tool OBSERVATION, i.e. text
+// the OS fetched rather than authored). Role 3 is our own system prompt, role
+// 2 is a local error string, and roles 1/4 are the model's own output. The
+// model's output is a real exfiltration vector but it is a different control
+// with a different policy, and pretending this one covers it would overstate
+// the coverage.
+// ===========================================================================
+static int  g_guard_block = 0;      // one-shot: consumed by the next send
+static char g_guard_note[320];      // what the user is told, verbatim
+static char g_guard_last[320];      // last note, for a host app to display
+
+static void guard_note(int role, const aiguard_verdict_t *v, int blocked)
+{
+    const char *src = (role == 5) ? "A tool result" : "Your message";
+    snprintf(g_guard_note, sizeof(g_guard_note),
+             "%s %s the prompt-injection screen: rule %s (%s, %s), matched \"%s\".%s",
+             src,
+             blocked ? "was BLOCKED by" : "was flagged by",
+             v->rule[0] ? v->rule : "(unnamed)",
+             v->category[0] ? v->category : "-",
+             aiguard_sev_name(v->severity),
+             v->matched[0] ? v->matched : "-",
+             blocked ? " Nothing was sent to the model."
+                     : " It was sent, and the event was recorded.");
+    strlcpy(g_guard_last, g_guard_note, sizeof(g_guard_last));
+}
+
+int aiclient_guard_blocked(void) { return g_guard_block; }
+const char *aiclient_guard_note(void) { return g_guard_last; }
 static void add_msg(int role, const char *text) {
+    // #745: screen untrusted-origin text as it enters the conversation.
+    if (text && (role == 0 || role == 5)) {
+        aiguard_verdict_t v;
+        int verdict = aiguard_check(text, &v);
+        if (verdict == AIGUARD_BLOCK) {
+            guard_note(role, &v, 1);
+            g_guard_block = 1;
+            // A tool OBSERVATION cannot simply be dropped: the ReAct loop has
+            // already emitted the matching ACTION, and a turn with an ACTION
+            // and no OBSERVATION is malformed. Substitute an explicit refusal
+            // so the model sees that the tool ran and its output was withheld,
+            // rather than seeing the payload. The turn ends either way, because
+            // g_guard_block makes the next send return the note.
+            if (role == 5)
+                text = "OBSERVATION {\"error\":\"BLOCKED_BY_AIGUARD\","
+                       "\"detail\":\"tool output withheld: prompt-injection "
+                       "pattern\"}";
+            else
+                text = "[blocked by the prompt-injection screen]";
+        } else if (verdict == AIGUARD_ANNOTATE) {
+            // Allowed. Recorded, and the host app can show the note. Not
+            // blocking on LOW/MEDIUM is deliberate: those rules fire on
+            // ordinary words often enough that blocking would train the user
+            // to distrust the guard, which is how a control gets switched off.
+            guard_note(role, &v, 0);
+        }
+    }
     if (g_nmsgs >= MAX_MSGS) {
         // drop the oldest pair to make room (keep history bounded)
         free(g_msgs[0].text);
@@ -79,29 +191,16 @@ static void add_msg(int role, const char *text) {
     g_msgs[g_nmsgs].text = copy;
     g_nmsgs++;
 }
-static void load_key(void) {
-    g_have_key = 0;
-    int fd = sys_open(KEY_PATH, O_RDONLY);
-    if (fd < 0) return;
-    long n = sys_read(fd, g_apikey, sizeof(g_apikey) - 1);
-    sys_close(fd);
-    if (n <= 0) return;
-    g_apikey[n] = 0;
-    // trim trailing whitespace / newlines
-    int i = (int)n - 1;
-    while (i >= 0 && (g_apikey[i] == '\n' || g_apikey[i] == '\r' ||
-                      g_apikey[i] == ' '  || g_apikey[i] == '\t')) {
-        g_apikey[i] = 0; i--;
-    }
-    if (g_apikey[0]) g_have_key = 1;
-}
+// #684: load_key() DELETED. It opened /CONFIG/KIMI.KEY directly, which is the
+// read the user's decision removes. The key now arrives only via the per-user
+// AISVC.CFG that the kernel provisions (or that Settings writes).
 // #367: load /CONFIG/AISVC.CFG (provider-agnostic endpoint/model/key/style).
 // key=value lines: provider= endpoint= model= api_key= api_style=(bearer|anthropic).
 // Absent or partial => keep the compiled defaults, so existing installs (which
 // carry only /CONFIG/KIMI.KEY) keep working unchanged. Called AFTER load_key so
 // an api_key here overrides KIMI.KEY.
 static void load_aisvc(void) {
-    int fd = sys_open(AISVC_CFG, O_RDONLY);
+    int fd = userconf_open_read(AISVC_NAME, 0);   // #684: no legacy fallback (secret)
     if (fd < 0) return;
     static char buf[1024];
     long n = sys_read(fd, buf, sizeof(buf) - 1);
@@ -490,7 +589,7 @@ static void load_tools(void) {
 static const char *system_prompt(void) {
     static char sp[TOOLLIST_MAX + APPGEN_MAX + 2048];
     int sl = snprintf(sp, sizeof(sp),
-        "You are Kimi, the built-in assistant for MayteraOS. You can call OS tools "
+        "You are Maytera AI, the built-in assistant for MayteraOS. You can call OS tools "
         "to read the filesystem, the weather, settings, disk usage, and to launch "
         "apps/games and open webpages.\n"
         "When you need data or want to perform an action, reply with EXACTLY ONE "
@@ -691,8 +790,8 @@ static void exec_files_read(const char *args, char *obs, int ocap) {
 
 static void exec_files_open(const char *args, char *obs, int ocap) {
     (void)args;
-    int pid = sys_spawn("/APPS/files");
-    snprintf(obs, ocap, "{\"launched\":\"/APPS/files\",\"pid\":%d}", pid);
+    int pid = sys_spawn("/APPS/FILES");
+    snprintf(obs, ocap, "{\"launched\":\"/APPS/FILES\",\"pid\":%d}", pid);
 }
 
 // --- HIGH-risk: write a file (#293). Gated by aicap before dispatch. ----------
@@ -747,7 +846,7 @@ static void exec_web_open(const char *args, char *obs, int ocap) {
     sys_write(fd, full, strlen(full));
     sys_write(fd, "\n", 1);
     sys_close(fd);
-    int pid = sys_spawn("/APPS/browser");
+    int pid = sys_spawn("/APPS/BROWSER");
     snprintf(obs, ocap, "{\"opened\":\"%s\",\"pid\":%d}", full, pid);
 }
 
@@ -795,20 +894,20 @@ static void exec_settings_theme(const char *args, char *obs, int ocap) {
 
 static void exec_settings_open(const char *args, char *obs, int ocap) {
     (void)args;
-    int pid = sys_spawn("/APPS/settings");
-    snprintf(obs, ocap, "{\"launched\":\"/APPS/settings\",\"pid\":%d}", pid);
+    int pid = sys_spawn("/APPS/SETTINGS");
+    snprintf(obs, ocap, "{\"launched\":\"/APPS/SETTINGS\",\"pid\":%d}", pid);
 }
 
 static void exec_terminal_open(const char *args, char *obs, int ocap) {
     (void)args;
-    int pid = sys_spawn("/APPS/terminal");
-    snprintf(obs, ocap, "{\"launched\":\"/APPS/terminal\",\"pid\":%d}", pid);
+    int pid = sys_spawn("/APPS/TERMINAL");
+    snprintf(obs, ocap, "{\"launched\":\"/APPS/TERMINAL\",\"pid\":%d}", pid);
 }
 
 static void exec_calc_open(const char *args, char *obs, int ocap) {
     (void)args;
-    int pid = sys_spawn("/APPS/calc");
-    snprintf(obs, ocap, "{\"launched\":\"/APPS/calc\",\"pid\":%d}", pid);
+    int pid = sys_spawn("/APPS/CALC");
+    snprintf(obs, ocap, "{\"launched\":\"/APPS/CALC\",\"pid\":%d}", pid);
 }
 
 // --- Generic app launcher (#292) -----------------------------------------
@@ -826,21 +925,21 @@ typedef struct { const char *id; const char *path; int kind; const char *name; }
 // Table mirrors compositor/startmenu.c (LAUNCH_NATIVE/WIN16/DOS). Keep in sync.
 static const launch_ent_t g_launch_tbl[] = {
     // --- native GUI apps + native games ---
-    { "files",     "/APPS/files",       LK_GUI,   "Files" },
-    { "terminal",  "/APPS/terminal",    LK_GUI,   "Terminal" },
-    { "calc",      "/APPS/calc",        LK_GUI,   "Calculator" },
-    { "calculator","/APPS/calc",        LK_GUI,   "Calculator" },
-    { "editor",    "/APPS/editor",      LK_GUI,   "Text Editor" },
-    { "settings",  "/APPS/settings",    LK_GUI,   "Settings" },
-    { "browser",   "/APPS/browser",     LK_GUI,   "Browser" },
-    { "python",    "/APPS/python",      LK_GUI,   "Python" },
-    { "doom",      "/APPS/DOOM.ELF",    LK_GUI,   "DOOM" },
+    { "files",     "/APPS/FILES",       LK_GUI,   "Files" },
+    { "terminal",  "/APPS/TERMINAL",    LK_GUI,   "Terminal" },
+    { "calc",      "/APPS/CALC",        LK_GUI,   "Calculator" },
+    { "calculator","/APPS/CALC",        LK_GUI,   "Calculator" },
+    { "editor",    "/APPS/EDITOR",      LK_GUI,   "Text Editor" },
+    { "settings",  "/APPS/SETTINGS",    LK_GUI,   "Settings" },
+    { "browser",   "/APPS/BROWSER",     LK_GUI,   "Browser" },
+    { "python",    "/APPS/PYTHON.ELF",  LK_GUI,   "Python" },
+    { "doom",      "/GAMES/DOOM/DOOM.ELF", LK_GUI, "DOOM" },
     { "lemmings",  "/APPS/lemmings",    LK_GUI,   "Lemmings" },
-    { "solitaire", "/APPS/solitr",      LK_GUI,   "Solitaire" },
-    { "solitr",    "/APPS/solitr",      LK_GUI,   "Solitaire" },
+    { "solitaire", "/APPS/SOLITAIRE",      LK_GUI,   "Solitaire" },
+    { "solitr",    "/APPS/SOLITAIRE",      LK_GUI,   "Solitaire" },
     { "pong",      "/APPS/pong",        LK_GUI,   "Pong" },
-    { "hello",     "/APPS/hello",       LK_GUI,   "Hello" },
-    { "aidemo",    "/APPS/aidemo",      LK_GUI,   "AI Demo" },
+    { "hello",     "/APPS/HELLO",       LK_GUI,   "Hello" },
+    { "aidemo",    "/APPS/AIDEMO",      LK_GUI,   "AI Demo" },
     // --- Win16 NE apps (run by the Win16 interpreter) ---
     { "skifree",   "/WIN16/EP3/SKI.EXE",        LK_WIN16, "SkiFree" },
     { "tetris",    "/WIN16/MSEP/TETRIS.EXE",    LK_WIN16, "Tetris" },
@@ -1480,6 +1579,17 @@ static int kimi_post(char *out, int ocap) {
 }
 
 static int kimi_post_once(char *out, int ocap) {
+    // #745: refuse to send a conversation that add_msg() flagged at HIGH.
+    // Returns 1, which every caller already treats as "not a network problem,
+    // show this text": aichat renders it as a local message, terminal and msh
+    // print it. The user is told, by name, what was refused and why. There is
+    // no "send anyway", no remembered choice and no timeout that allows it.
+    if (g_guard_block) {
+        g_guard_block = 0;          // one-shot; the poisoned text is not in the
+                                    // history, so the next turn is clean
+        strlcpy(out, g_guard_note, ocap);
+        return 1;
+    }
     static char headers[512];
     if (g_api_style == AI_STYLE_ANTHROPIC)
         snprintf(headers, sizeof(headers),
@@ -1608,7 +1718,6 @@ int aiclient_init(void) {
     if (!g_body) g_body = (char *)malloc(BODY_MAX);
     if (g_resp) g_resp[0] = 0;
     if (g_body) g_body[0] = 0;
-    load_key();
     load_aisvc();     // #367: provider-agnostic endpoint/model/key/style (overrides defaults)
     load_buildsvc();  // #294: build-service URL override
     load_appgen();    // #327: app-generation RAG corpus for chat-to-app
@@ -1620,18 +1729,20 @@ int aiclient_init(void) {
 void aiclient_reset(void) {
     for (int i = 0; i < g_nmsgs; i++) { if (g_msgs[i].text) free(g_msgs[i].text); g_msgs[i].text = 0; }
     g_nmsgs = 0;
+    g_guard_block = 0;              // #745: a new conversation starts clean
+    g_guard_note[0] = 0;
     add_msg(3, system_prompt());
 }
 
 int aiclient_run_turn(char *out, int outcap, int verbose) {
     if (!g_resp || !g_body) { strlcpy(out, "aiclient: not initialized", outcap); return -1; }
-    if (!g_have_key)        { strlcpy(out, "aiclient: no API key at " KEY_PATH, outcap); return -1; }
+    if (!g_have_key)        { strlcpy(out, "aiclient: no API key. Set one in Settings > AI.", outcap); return -1; }
     return run_tool_loop(out, outcap, verbose);
 }
 
 int aiclient_ask(const char *prompt, char *out, int outcap, int verbose) {
     if (!g_resp || !g_body) aiclient_init();
-    if (!g_have_key)        { strlcpy(out, "aiclient: no API key at " KEY_PATH, outcap); return -1; }
+    if (!g_have_key)        { strlcpy(out, "aiclient: no API key. Set one in Settings > AI.", outcap); return -1; }
     aiclient_reset();
     aiclient_add(0, prompt);
     return aiclient_run_turn(out, outcap, verbose);

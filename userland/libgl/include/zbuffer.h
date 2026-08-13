@@ -8,6 +8,16 @@
 #include "zfeatures.h"
 #include "GL/gl.h"
 
+/* AssaultCube port phase 3 (docs/ASSAULTCUBE_PORT_PLAN.md): this header had
+ * no extern "C" guard at all, unlike GL/gl.h (which does), so a C++ TU
+ * including it directly (sdlshim.cpp, for ZB_open/ZB_close/ZBuffer) got
+ * C++-mangled declarations for functions zbuffer.c exports with plain C
+ * linkage, i.e. "undefined reference to ZB_close(ZBuffer*)" at link time
+ * even though the real symbol is right there in libgl.a. Same fix as gl.h
+ * already has, applied here for the first time. */
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define ZB_Z_BITS 16
 
@@ -272,6 +282,11 @@ typedef struct {
     /* depth */
     GLint depth_test;
     GLint depth_write;
+    /* AssaultCube port phase 2: real glDepthFunc (was hardcoded ">="
+       inside ZCMP/ZCMPSIMP in ztriangle.c). Defaults to GL_GEQUAL in
+       ZB_open() so existing callers that never call glDepthFunc see
+       byte-identical behavior to before this change. */
+    GLenum depth_func;
     GLubyte frame_buffer_allocated;
 } ZBuffer;
 
@@ -295,6 +310,21 @@ ZBuffer *ZB_open(int xsize,int ysize,int mode,
 void ZB_close(ZBuffer *zb);
 
 void ZB_resize(ZBuffer *zb,void *frame_buffer,GLint xsize,GLint ysize);
+
+/* T0(a) #578: shared half-resolution render support (see zbuffer.c).
+ * ZB_setRenderScale sets a global num/den render scale (clamped to
+ * [1/4,1/1]; default 2/2=1.0=OFF). ZB_scaleDim maps a full window dim
+ * to the render dim (floored to a multiple of 4, never 0) so ZB_open
+ * dims and upscale src dims always agree. ZB_upscaleNearest does an
+ * int nearest-neighbor upscale of a small render buffer into the full
+ * window blit buffer, forcing opaque alpha. Default scale keeps the
+ * exact current 1:1 present path. */
+void ZB_setRenderScale(int num,int den);
+int  ZB_scaleDim(int full);
+int  ZB_renderScaleActive(void);
+void ZB_upscaleNearest(const PIXEL *src,int sw,int sh,
+		       PIXEL *dst,int dw,int dh,int dstride);
+
 void ZB_clear(ZBuffer *zb,GLint clear_z,GLint z,
 	      GLint clear_color,GLint r,GLint g,GLint b);
 /* linesize is in BYTES */
@@ -357,6 +387,10 @@ void *gl_zalloc(GLint size);
 static void gl_free(void* p) { free(p); }
 static void* gl_malloc(GLint size) { return malloc(size); }
 static void* gl_zalloc(GLint size) { return calloc(1, size); }
+#endif
+
+#ifdef __cplusplus
+}
 #endif
 
 #endif /* _tgl_zbuffer_h_ */

@@ -57,6 +57,14 @@ int png_defilter(const uint8_t *inflated, uint32_t inflated_len,
                  uint32_t width, uint32_t height, uint32_t bpp,
                  uint8_t *out, uint32_t out_cap);
 
+// #703: the DEFLATE core, exported. src is a BARE deflate stream (no 2-byte zlib
+// header; image_load_png strips that itself before calling in). Added so the
+// compiled-in boot splash decompresses through the SAME strangler dispatcher the
+// PNG path uses, rather than growing a second inflate in the tree: under
+// -DRUST_INFLATE this is the Rust inflate_rs, exactly as for a downloaded PNG.
+int png_inflate_raw(const uint8_t *src, uint32_t src_len,
+                    uint8_t *dst, uint32_t dst_cap, uint32_t *dst_len);
+
 /**
  * Load a PNG image from memory
  *

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // pwd.h - Password database access for MayteraOS
 // Provides POSIX-like getpwuid/getpwnam by reading /CONFIG/PASSWD
 #ifndef _PWD_H

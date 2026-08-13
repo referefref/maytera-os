@@ -1,8 +1,12 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // aicap.h - MayteraOS AI capability tokens + consent + audit (#293).
 //
 // This is the SECURITY GUARDRAIL that gates the AI tool loop (aiclient.c) before
 // any powerful write/execute tool runs. It implements the temporal capability
-// TOKEN model from aitools/PROTOCOL.md (layer 3) and the internal LLM contracts design notes:
+// TOKEN model from aitools/PROTOCOL.md (layer 3) and docs/LLM_CONTRACTS.md:
 //
 //   - A RISK TABLE classifies every wired tool into a capability namespace
 //     (system.* / app.* / fs.* / media.*) and a risk level (LOW or HIGH).

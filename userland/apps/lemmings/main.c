@@ -1046,7 +1046,16 @@ int main(int argc, char **argv) {
                         game_state = STATE_MENU;
                         redraw();
                     } else {
+                        // #548: handle_key() can change game_state (SPACE at
+                        // the menu starts a level, 'p' pauses/unpauses) or
+                        // current_level/selected_skill at the menu, none of
+                        // which used to trigger an immediate repaint - it
+                        // relied on the unconditional 50ms backup tick below,
+                        // which is being restricted to STATE_PLAYING (see
+                        // that tick's comment). Redraw once here so every
+                        // key still shows its effect right away.
                         handle_key(event.key_char, event.keycode);
+                        redraw();
                     }
                     break;
 
@@ -1070,12 +1079,23 @@ int main(int argc, char **argv) {
             }
         }
 
-        // Game update at roughly 20 fps (50ms per tick)
+        // #548: this unconditionally called game_update()+redraw() every
+        // 50ms tick FOREVER, even sitting on the static MENU/PAUSED/WON/LOST
+        // screens where game_update() is already a no-op (it early-returns
+        // unless game_state == STATE_PLAYING) and redraw() repaints the
+        // exact same static pixels - the idle-CPU echo-loop anti-pattern.
+        // Only run the 20fps tick while a level is actually in motion
+        // (lemmings walking); the menu/pause/end screens now redraw only on
+        // a real event (see the EVENT_KEY_DOWN handling above), so an idle
+        // Lemmings window sitting on its start menu costs ~0 CPU instead of
+        // repainting 20x/sec forever.
         uint64_t now = sys_clock();
         if (now - last_tick >= 50) {
             last_tick = now;
-            game_update();
-            redraw();
+            if (game_state == STATE_PLAYING) {
+                game_update();
+                redraw();
+            }
         }
     }
 

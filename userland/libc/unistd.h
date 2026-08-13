@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // unistd.h - POSIX unistd for MayteraOS userland
 #ifndef LIBC_UNISTD_H
 #define LIBC_UNISTD_H
@@ -24,6 +28,11 @@ int   execvp(const char *file, char *const argv[]);
 void  _exit(int status) __attribute__((noreturn));
 
 // read/write/close come from stdlib.h (historical); lseek is new.
+// #695: fsync is declared here too, because a POSIX program reaches for
+// <unistd.h> to get it. The full contract - in particular what state the
+// destination file is in after a NON-ZERO return - is on the declaration in
+// stdlib.h. Read that before using this.
+int     fsync(int fd);
 long    read(int fd, void *buf, size_t count);
 long    write(int fd, const void *buf, size_t count);
 int     close(int fd);
@@ -106,10 +115,12 @@ int mkdir(const char *path, int mode);
 int rmdir(const char *path);
 int rename(const char *oldpath, const char *newpath);
 
-// #359 Phase 3a: legacy BSD utime(2) (time_t[2] form, NULL = "set to now").
-// MayteraOS's filesystem layer has no mtime-set syscall yet; implemented as
-// a no-op stub in the CPython port's compat supplement (compatsupp/compat.c),
-// same pattern as the Phase 2 ftruncate/truncate no-op.
-int utime(const char *path, const long *times);
+// #745 (local 72): utime() is declared in <utime.h>, with the POSIX signature
+// (const struct utimbuf *), NOT here with a const long *. The two spellings
+// cannot coexist: any translation unit that included both headers would have
+// failed to compile on conflicting types for the same function. The old
+// declaration here also had no implementation anywhere in libc, so a caller
+// that believed it got either a link error or, if it was the CPython port,
+// that port's own no-op. See utime.h for why the real one always fails.
 
 #endif

@@ -5,6 +5,7 @@
 #include "../serial.h"
 #include "../string.h"
 #include "../cpu/isr.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // ARP cache entry
 typedef struct {
@@ -144,6 +145,14 @@ void arp_request(uint32_t ip) {
 }
 
 // Resolve IP to MAC
+// #745 (task #62): CACHE-ONLY lookup - never transmits. See arp.h.
+int arp_lookup_cached(uint32_t ip, uint8_t *mac) {
+    arp_entry_t *entry = arp_find(ip);
+    if (!entry) return 0;
+    if (mac) memcpy(mac, entry->mac, 6);
+    return 1;
+}
+
 int arp_resolve(uint32_t ip, uint8_t *mac) {
     // uint8_t *p = (uint8_t *)&ip;
     // kprintf("[ARP] arp_resolve: looking for 0x%08x (%d.%d.%d.%d)\n",
@@ -516,7 +525,6 @@ static int arp_parsed_eq(int rc_a, const arp_parsed_t *a, int rc_b, const arp_pa
 }
 
 void arp_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     static uint8_t buf[128];
     uint32_t seed = 0xa3c1f025;
     uint32_t vectors = 0, mismatches = 0;

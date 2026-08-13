@@ -1,0 +1,1331 @@
+name=Maytera Dark
+author=MayteraOS
+version=2
+style=modern
+dark=1
+titlebar_active=0x0024242B
+titlebar_inactive=0x001A1A1F
+titlebar_text=0x00F2F3F5
+window_bg=0x001A1A1F
+window_border=0x00454551
+close_button=0x00D93A2F
+close_button_hover=0x00E8503F
+minimize_button=0x0024242B
+maximize_button=0x0024242B
+button_bg=0x0024242B
+button_bg_hover=0x002E2E37
+button_bg_pressed=0x00191920
+button_border=0x00454551
+button_text=0x00F2F3F5
+button_disabled=0x005D636C
+label_text=0x00F2F3F5
+textbox_bg=0x00121216
+textbox_border=0x00454551
+textbox_text=0x00F2F3F5
+textbox_cursor=0x002563C9
+checkbox_bg=0x00121216
+checkbox_border=0x00454551
+checkbox_check=0x002563C9
+desktop_bg=0x00121216
+taskbar_bg=0x0024242B
+taskbar_hover=0x002E2E37
+taskbar_active=0x002563C9
+start_button=0x002563C9
+gauge_bg=0x00121216
+gauge_fg=0x002563C9
+menu_bg=0x002C2C35
+menu_border=0x00454551
+menu_item_hover=0x00343442
+menu_text=0x00F2F3F5
+menu_text_disabled=0x005D636C
+menu_separator=0x002E2E37
+scrollbar_bg=0x001F1F25
+scrollbar_thumb=0x00454551
+scrollbar_thumb_hover=0x005D636C
+selection_bg=0x002563C9
+selection_text=0x00FFFFFF
+color_error=0x00D93A2F
+color_warning=0x00FFB020
+color_success=0x0032D74B
+color_info=0x002563C9
+link_color=0x005AA9FF
+link_visited=0x00BF5AF2
+link_hover=0x008EC5FF
+tooltip_bg=0x002C2C35
+tooltip_text=0x00F2F3F5
+tooltip_border=0x00454551
+
+# --- mtheme v2 (#711) ---------------------------------------------------
+# Elevation model: four levels, each DEFINED as a (surface, border) pair.
+# 0 sunken / 1 base / 2 raised / 3 overlay. In this dark scheme, higher is a
+# lighter tint; level 3 additionally takes color.border_strong. There are no
+# shadows; see decor.* below.
+#
+# --- Loop 1 colour-scheme pass (designer 4/6): what changed here --------
+# Two real defects fixed, plus three legacy keys re-aligned to the semantic
+# tokens they were meant to track. Full numbers and the legacy-key mapping
+# table are in the Loop 1 report; short version:
+#  1. color.focus_ring was literally color.accent (0x2563C9). Measured
+#     against color.surface_raised it was 2.72:1, under this family's own
+#     3:1 floor. A distinct, brighter tint of the SAME accent hue (~217 deg
+#     in both cases) fixes it without inventing a second accent colour:
+#     0x4C8EFF measures 5.46:1 on surface and 4.86:1 on surface_raised.
+#  2. color.danger (0xFF453A) put on_danger/danger at 3.41:1, short of the
+#     4.5:1 AA floor this file's other body-text pairs all clear. Deepened
+#     to 0x00D93A2F (hue unchanged, ~4 deg, still unmistakably red, not the
+#     accent blue) for 4.57:1.
+#  3. close_button/close_button_hover/color_error re-pointed at the new
+#     danger red so the legacy keys and color.danger agree again.
+#  4. desktop_bg (0x16161A) and taskbar_bg (0x1F1F25) were near-misses of
+#     color.surface_sunken and color.titlebar_bottom rather than exact
+#     matches, the only two places this file's legacy block wasn't
+#     bit-identical with its semantic equivalent. Set equal for coherency;
+#     the visual delta is under 2% luminance, imperceptible on its own.
+#
+# --- Loop 2 colour-scheme pass (designer 4/6): what changed here --------
+# Director redirect B1/B2/B3/B10 plus C6. Full numbers, both luminance
+# metrics, and the legacy-key mapping table are in the Loop 2 report; short
+# version:
+#  1. B1/B2 (color.accent, color.on_accent, color.sel_bg, color.sel_fg):
+#     already correct from Loop 1, unchanged this loop. accent=0x2563C9,
+#     on_accent=0xFFFFFF (5.67:1), sel_bg=accent, sel_fg=on_accent (same
+#     5.67:1). Verified, not re-derived.
+#  2. B3 (secondary label text): color.on_surface_muted moved from
+#     0x9BA1AA to the director-mandated 0x9AA3AF (6.79:1 on color.surface,
+#     was 6.66:1; both pass, this is the settled shared value, not a new
+#     defect fix). Every literal copy in this file updated in lockstep:
+#     state.field_placeholder_fg, state.scrollbar_thumb_hover,
+#     btn.segmented.rest.fg.
+#  3. Gradient delta fix on color.titlebar_top: the surfaces family (Loop 1
+#     comment further down this file) flagged the active titlebar gradient
+#     using an HSL-lightness metric (25.5% swing, over the ~12% budget).
+#     Re-measured here with WCAG relative luminance (Y), the metric used
+#     for every contrast ratio elsewhere in this file: the OLD pair
+#     (0x30303A -> 0x24242B) was actually 40.6% by that metric, worse than
+#     flagged, not better. The Loop 1 CHANGELOG entry's claimed "1.2%" for
+#     this same pair was a miscalculation; corrected here, not repeated.
+#     New color.titlebar_top = 0x26262F keeps titlebar_bottom (0x24242B)
+#     untouched, same hue family (blue-gray, +9 offset on B, matching the
+#     rest of the palette's +7..+10 pattern), lands at 9.6% relative-
+#     luminance swing (and 7.1% by the HSL-lightness metric too, so it
+#     clears BOTH definitions with margin, not just whichever one is
+#     convenient). Direction unchanged: top still lighter than bottom.
+#  4. B10 (terminal ANSI palette per-scheme): NOT implemented in this file.
+#     kernel/gui/terminal.c and userland/apps/terminal/main.c both hold a
+#     static const ansi_colors[16] array; there is no ansi.* key, no
+#     reader, no consumer anywhere in the theme engine. Adding ansi.* keys
+#     here would be exactly the dead-data mistake Section 11 exists to
+#     stop (0 grep hits for a reader = 0 keys added). This needs an engine
+#     hook (an ansi.0..15 reader in kernel/gui/themes.c plus both terminal
+#     call sites switched from the literal array to it) before a colour
+#     file can carry it; flagged to the director/substrate owner, see
+#     report. The two literal values the director specified for when that
+#     hook exists: light-scheme green 0x007A00 (5.6:1 on white), cyan
+#     0x007878 (5.3:1 on white); dark scheme values were already fine per
+#     the director and need no change.
+#  5. C6 (selected-swatch indicator, 2px on_accent inner ring + 1px outer
+#     contrast line): the draw call WAS kernel/gui/settings/panel_appearance.c
+#     draw_color_swatch(), which hardcoded a single 1px 0xFFFFFF ring. #703
+#     deleted kernel/gui/settings/ (the unified panel framework had zero
+#     callers; the shipping Settings is the userland /APPS/SETTINGS), so this
+#     item now has no kernel draw call to change. This
+#     family writes color hex values only, never C source (own brief,
+#     restated at the top of the Loop 1 header above); the fix is a ~6-line
+#     C edit, not a token file edit. Both required colours already exist as
+#     tokens: color.on_accent for the 2px inner ring (unused in that file
+#     today). For the 1px outer line I measured three candidates against
+#     color.surface_raised (the swatch grid's panel background) before
+#     picking one, because a first pass here used border_strong without
+#     measuring it and that number (1.63:1) turned out to be too low to
+#     trust for an implementer to build against:
+#       color.border_strong        1.63:1 (too close to the panel, rejected)
+#       color.on_surface_disabled  2.54:1 (still short of a 3:1 floor)
+#       color.on_surface_muted     6.04:1 (comfortably clears 3:1, and it
+#                                   is a mid-tone, not near-white, so it
+#                                   still frames the ring against a light or
+#                                   near-white swatch fill too, not only
+#                                   against the dark panel)
+#     Recommended: color.on_surface_muted for the outer line. Spec handed
+#     to the Settings/panel implementer in the Loop 2 report: replace the
+#     single 0xFFFFFF ring with SYS_THEME_COLOR(on_accent) at the swatch
+#     bounds (2px) then SYS_THEME_COLOR(on_surface_muted) 1px further out,
+#     same nested-fill ordering Family 2/3 already use for buttons/inputs.
+color.surface_sunken=0x00121216
+color.surface=0x001A1A1F
+color.surface_raised=0x0024242B
+color.surface_overlay=0x002C2C35
+color.on_surface=0x00F2F3F5
+color.on_surface_muted=0x009AA3AF
+color.on_surface_disabled=0x005D636C
+color.accent=0x002563C9
+color.on_accent=0x00FFFFFF
+color.accent_hover=0x003170D8
+color.accent_active=0x001B4FA6
+color.danger=0x00D93A2F
+color.on_danger=0x00FFFFFF
+color.border_subtle=0x002E2E37
+color.border_strong=0x00454551
+color.focus_ring=0x004C8EFF
+color.sel_bg=0x002563C9
+color.sel_fg=0x00FFFFFF
+color.titlebar_top=0x0026262F
+color.titlebar_bottom=0x0024242B
+color.titlebar_inactive_top=0x001F1F25
+color.titlebar_inactive_bottom=0x001A1A1F
+color.titlebar_text=0x00F2F3F5
+color.titlebar_text_inactive=0x008A9099
+# titlebar_text_inactive WIRED #711 loop 2 (was parsed since loop 1, zero
+# consumers): window.c now swaps to this ink for an unfocused window's title,
+# gated to decor.style != beveled (retro_unix's own titlebar_text_inactive=
+# 0xFFFFFF, set identical to its active value, would otherwise visibly change
+# retro_unix - out of scope, B8/director spec covers modern only, active
+# titlebar ink is untouched in both cases per that same spec).
+
+# state.* : rest / hover / active / focus / disabled / selected, all explicit.
+# None of these may be expressed as "the same colour at 20% alpha": there is
+# no per-pixel alpha in this renderer to express it with.
+state.btn_rest_bg=0x0024242B
+state.btn_rest_fg=0x00F2F3F5
+state.btn_hover_bg=0x002E2E37
+state.btn_hover_fg=0x00F2F3F5
+state.btn_active_bg=0x00191920
+state.btn_active_fg=0x00F2F3F5
+state.btn_focus_ring=0x004C8EFF
+state.btn_disabled_bg=0x0024242B
+state.btn_disabled_fg=0x005D636C
+state.btn_selected_bg=0x002563C9
+state.btn_selected_fg=0x00FFFFFF
+# --- #711 Loop 2 / Family 2 (Buttons): the four border keys the
+# generic matrix never carried, plus the B9 accent-fill focus-ring fix.
+# Additive only, same key family, wired the moment the parser table
+# g_theme_fields[] and theme_t (kernel/gui/themes.c / themes.h) grow six
+# entries mirroring the state.btn_* pattern already there - no renderer
+# change needed beyond that, see report.
+state.btn_rest_border=0x00454551      # = color.border_strong
+state.btn_hover_border=0x00454551     # = color.border_strong (unchanged; fill lifts)
+state.btn_active_border=0x00454551    # = color.border_strong
+state.btn_disabled_border=0x002E2E37  # = color.border_subtle
+state.btn_selected_border=0x001B4FA6  # = color.accent_active
+# B9 (Loop 2, settled): a focus ring drawn in color.focus_ring on a
+# button whose OWN fill is color.accent reads as no ring at all - in
+# this theme color.focus_ring literally equals color.accent bit-for-bit
+# (see color.* above), so state.btn_focus_ring on the accent-filled
+# selected state would be a same-colour ring on a same-colour button,
+# completely invisible. state.btn_focus_ring (already wired) stays the
+# ring for rest/hover/active/disabled, none of which are accent-filled.
+state.btn_selected_focus_ring=0x00FFFFFF  # = color.on_accent, per B9
+state.item_rest_bg=0x002C2C35
+state.item_rest_fg=0x00F2F3F5
+state.item_hover_bg=0x00343442
+state.item_hover_fg=0x00F2F3F5
+state.item_active_bg=0x002563C9
+state.item_active_fg=0x00FFFFFF
+state.item_focus_ring=0x004C8EFF
+state.item_disabled_bg=0x002C2C35
+state.item_disabled_fg=0x005D636C
+state.item_selected_bg=0x002563C9
+state.item_selected_fg=0x00FFFFFF
+state.input_rest_bg=0x00121216
+state.input_rest_fg=0x00F2F3F5
+state.input_rest_border=0x009AA3AF   # #711 loop2 (Family 3): was 0x454551 (= color.border_strong,
+                                   # 1.98:1 against state.input_rest_bg/color.surface_sunken -
+                                   # under the 3:1 non-text UI floor). Repointed at
+                                   # color.on_surface_muted instead (7.32:1 on surface_sunken, resynced to the B3-updated on_surface_muted),
+                                   # still an existing token, no invented hex. This is the box
+                                   # border for text field / checkbox / dropdown-closed at rest
+                                   # AND (via the literal copy below) the radio ring at rest -
+                                   # one fix, four controls.
+state.input_hover_border=0x005D636C
+state.input_active_border=0x002563C9
+state.input_focus_ring=0x004C8EFF
+state.input_disabled_bg=0x00121216
+state.input_disabled_fg=0x005D636C
+state.input_selected_bg=0x002563C9
+state.input_selected_fg=0x00FFFFFF
+
+# metric.* : geometry, in pixels. Modern defaults per the #711 scales.
+# NOT this designer's family (colour schemes only) - values untouched.
+metric.titlebar_h=28
+metric.border_w=1
+metric.btn_h=28
+metric.input_h=28
+metric.pad=12
+metric.gap=8
+metric.focus_w=2
+metric.focus_offset=1                     # #711 Loop 2 / surfaces (B9): ring
+                                           #   sits 1px OUTSIDE the control's
+                                           #   own bounds. New key, unwired.
+                                           #   Re-applied after a concurrent
+                                           #   write reverted it (see blame.md).
+metric.winmenu_roww=224
+metric.winmenu_rowh=28
+metric.winmenu_hdr=24
+metric.titlebar_btn=20
+metric.titlebar_btn_gap=4
+metric.grip=10
+metric.scrollbar_w=16
+metric.menu_row_h=28
+
+# radius.* : none=0 sm=3 md=6 lg=10 . Window OUTER corners are always 0: the
+# frame is a kernel-drawn rect over wallpaper and there is no alpha compositing
+# to round it against.
+# #711 Loop 2 / surfaces (director redirect B6, settled): radius.btn/input/
+# menu move 6 -> 4px. These are WIRED keys (kernel/gui/themes.c
+# g_theme_fields: TM_RADIUS_BTN/INPUT/MENU) so this is a LIVE value change.
+# RE-APPLIED after a concurrent write on this shared file reverted it back
+# to 6 the first time this loop (see blame.md, "a second write can silently
+# revert a first" entry) - checked with grep immediately before re-editing.
+radius.btn=4
+radius.input=4
+radius.menu=4
+radius.card=10
+
+# decor.* : beveled | flat | gradient. The only gradient this renderer has is
+# a 2-stop vertical linear one, and the two stops are color.titlebar_top /
+# color.titlebar_bottom above. There are no shadows in this system: window
+# shadows were removed by explicit decision (#189) and elevation is expressed
+# as a (surface token, border token) pair, never as a shadow.
+# NOT this designer's family - values untouched.
+decor.style=gradient
+decor.titlebar_gradient=1
+decor.grip=1
+# decor.grip WIRED #711 loop 2 (parsed since #711 substrate, zero consumers
+# before this loop): window.c's resize-grip draw block now also checks
+# TM_DECOR_GRIP, not just WINDOW_FLAG_RESIZABLE. 1 reproduces the prior
+# always-on behaviour for every theme that does not set the key.
+
+# type.* : whole px on the glyph-cache ladder; lineheight = round(px*1.4);
+# regular and faux-bold only. No body text below 12px, no caption below 11px:
+# text is whole-pixel positioned and unhinted. NOT this designer's family.
+type.caption=11
+type.caption_lineheight=15
+type.caption_weight=regular
+type.body=14
+type.body_lineheight=20
+type.body_weight=regular
+type.title=16
+type.title_lineheight=22
+type.title_weight=regular
+type.heading=20
+type.heading_lineheight=28
+type.heading_weight=bold
+type.display=28
+type.display_lineheight=39
+type.display_weight=bold
+
+# --- window-decoration live-reload fix (#711 loop 2, designer 1) ---------
+# window.c cached win->border_color and win->titlebar_color once at window
+# creation (border_color: never refreshed again; titlebar_color: refreshed
+# only on focus change), so an ALREADY-OPEN window's frame border, and a
+# beveled-theme window's flat titlebar fill, went stale on a live theme
+# switch until the next focus change or window recreate. No app in the tree
+# writes either field per-window (unlike bg_color, which several apps
+# legitimately customise and which this family does not touch), so both are
+# now computed fresh every window_draw call from color.border_strong and the
+# legacy titlebar_active/titlebar_inactive keys (via WINDOW_FLAG_FOCUSED)
+# instead of the cached fields. No value changes for this file; this is a
+# staleness fix, not a recolour.
+#
+# --- window-decoration state tokens (#711 follow-up, designer 1 loop 1) ---
+# window.c currently draws titlebar min/max/filter buttons in ONE state
+# (rest) only, and the close button in two (rest/hover, via the legacy
+# close_button/close_button_hover keys). These three keys give it the
+# hover/active fills needed for the full six-state contract (focus is
+# already expressed at the WINDOW level via the active/inactive titlebar
+# swap, not per-button; disabled = button simply omitted, e.g. non-CLOSABLE
+# windows already skip drawing the close button; selected does not apply
+# to these momentary action buttons). Values are NOT new invented colours:
+# btn_hover/btn_active are copied verbatim from the existing generic
+# state.btn_hover_bg/state.btn_active_bg tokens above, and close_active is
+# close_button mechanically darkened 15% (the same kind of deterministic
+# derivation as the existing titlebar gradient's "lift 22% toward white",
+# not an aesthetic pick).
+# STATUS (#711 loop 2): WIRED for hover. kernel/gui/themes.h gained
+# c_titlebar_btn_hover/active/close_active fields + TM_TITLE_INSET;
+# kernel/gui/window.c's wm_handle_mouse_move now tracks which titlebar
+# button (filter/min/max/close) the cursor is over per-window and
+# window_draw fills that button with titlebar_btn_hover (close uses the
+# pre-existing legacy close_button_hover key instead, its documented
+# purpose, now also its first consumer). btn_active/close_active remain
+# PARSED BUT NOT RENDERED: these three buttons execute their action on
+# mouse DOWN with no frame boundary before the resulting redraw, so a
+# "pressed" fill drawn synchronously before minimize/maximize/close runs
+# is never actually presented - there is no timing system to hold it
+# visible for even one frame (renderer limit, not a data gap). Rendering
+# a real pressed state needs the buttons to execute on mouse UP instead
+# (standard button semantics, matches every other click target in this
+# renderer), which is a click-semantics change, not a chrome-drawing one;
+# flagged to Substrate/engine as scoped follow-up, not done this loop.
+color.titlebar_btn_hover=0x002E2E37
+color.titlebar_btn_active=0x00191920
+color.titlebar_close_active=0x00BE3B31
+# Title text left inset from the border. WIRED (#711 loop 2): window.c reads
+# metric.title_inset via TM_TITLE_INSET instead of the hardcoded
+# "title_x = x + BORDER_WIDTH + 4"; unset themes default to 4 (pixel-identical
+# to pre-loop-2). This is the modern spec value: 12px = space.md.
+metric.title_inset=12
+
+# --- space.* : the 4px spacing grid (surfaces family, loop 1, #711 follow-on) ---
+# Six steps, xs..xxl. EVERY margin, padding and gap in EVERY brief must be one
+# of these six numbers; no eyeballed pixel value. metric.pad above is space.md
+# (12) and metric.gap is space.sm (8): those two are already read by the
+# kernel offset table, so this scale is not new geometry, it is the NAMED
+# scale those two values were already silently drawn from, now written down.
+# The other four steps (xs, lg, xl, xxl) have no reader yet: nothing in
+# kernel/gui/themes.c's g_theme_fields consumes "space.*" as a key. They are
+# staged here as literal, forward-compatible data (per the mtheme v2 rule
+# that unknown keys are ignored) so a family that needs a specific new
+# metric.<widget>_pad has a numeric target to hit and a name to cite, not a
+# blank page. Adding a reader for a NEW metric.* key that consumes one of
+# these values is scoped engineering, not a data change; see
+# docs/UI_STYLE_GUIDE.md, "Surfaces & Foundation Spec".
+space.xs=4
+space.sm=8
+space.md=12
+space.lg=16
+space.xl=24
+space.xxl=32
+
+# --- elevation.* : the four-level model, spelled out explicitly (surfaces
+# family, loop 1). This is documentation of the existing color.* keys above,
+# not new keys: the model IS a (surface token, border token) pair per level,
+# there is nothing else to store. Written out here because "level 3 takes
+# border_strong" was previously the only assignment on paper; levels 0-2 need
+# stating too, since a family building a new surface has to pick one.
+#   level 0 (sunken)  = color.surface_sunken  + color.border_subtle
+#   level 1 (base)    = color.surface         + color.border_subtle
+#   level 2 (raised)  = color.surface_raised  + color.border_subtle
+#   level 3 (overlay) = color.surface_overlay + color.border_strong  (always)
+# Dark scheme: higher level = lighter tint. sunken 0x121216 -> base 0x1A1A1F
+# -> raised 0x24242B -> overlay 0x2C2C35, strictly increasing. No shadows:
+# removed by #189, elevation is tint+border only, never a blur/soft-shadow.
+
+# --- Taskbar / start menu / tray menu / notification: elevation assignment
+# and geometry (surfaces family, loop 1). Colour is ALREADY theme-driven for
+# these four (taskbar_bg/hover/active, menu_bg/border/item_hover, tooltip_bg
+# are read today via the legacy THEME_* macros). GEOMETRY is not: taskbar.c,
+# startmenu.c, traymenu.c and notif.c in userland/apps/compositor/ carry their
+# own compiled #define heights/widths (TASKBAR_HEIGHT=36 in kernel/gui/
+# desktop.h; LUMINA_MENUBAR_H=24/CLASSIC_UNIX_PANEL_H=58/RETRO_BENCH_BAR_H=20
+# and TB_BTN_W=120/TRAY_ICON_W=26 in taskbar.c; TOAST_W=320/TOAST_H=64 in
+# notif.c; TM_W=214/SND_W=308/SND_H=214 in traymenu.c). None of that is
+# readable from a theme file today: editing a value here does nothing until
+# an offset-table entry + a call-site read replaces the #define, exactly the
+# "mechanism, not instance" pattern #711 already used for the five window
+# chrome geometry macros. Flagging as scoped engineering, not claiming it
+# live. Assignments and PROPOSED values (this file, on the surfaces scales):
+#
+#   Taskbar (persistent dock)   elevation 2 raised.  color.surface_raised +
+#     color.border_subtle (top edge only, 1px, full-bleed: it never floats
+#     free of the screen edge so an inset separator would read as a stray
+#     line). PROPOSED metric.taskbar_h=44, derived from metric.btn_h(28) +
+#     2*space.sm(8) so the bar has one space.sm of breathing room above and
+#     below its own buttons, up from the compiled 36. Needs a
+#     "retro ? <current per-style constant> : 44" default exactly like every
+#     other metric.* field already follows, so the three alternate compiled
+#     layouts (Lumina/Classic-Unix/Retro-Bench) keep their current heights
+#     until a theme opts in by setting this key.
+#   Start menu (launcher popup) elevation 3 overlay. color.surface_overlay +
+#     color.border_strong, radius.menu, metric.menu_row_h per row. Reuses the
+#     EXISTING generic menu metrics rather than inventing startmenu_* twins:
+#     a start menu is structurally a menu. No new key needed.
+#   Tray menu (volume/network/battery popups) elevation 3 overlay. Same
+#     reuse: color.surface_overlay + color.border_strong, radius.menu,
+#     metric.menu_row_h. No new key needed.
+#   Notification toast   elevation 3 overlay. color.surface_overlay +
+#     color.border_strong, radius.card (10, a self-contained card, not an
+#     anchored menu, so the larger corner reads correctly). PROPOSED
+#     metric.notif_w=320, metric.notif_h=64 (matches notif.c's current
+#     compiled TOAST_W/TOAST_H exactly, so wiring this key changes nothing
+#     visually until a theme edits it) and metric.notif_pad=space.md(12) for
+#     its internal content inset.
+metric.taskbar_h=44
+metric.notif_w=320
+metric.notif_h=64
+metric.notif_pad=12
+
+# --- Gradient policy check (surfaces family, loop 1): I own the POLICY
+# (2-stop vertical only, subtle, max ~12% luminance delta, top stop always
+# the lighter one, direction never inverts between schemes) but not the hex
+# values in color.titlebar_top/bottom above (colour-scheme family's tokens).
+# Measured this loop: titlebar_top 0x30303A -> titlebar_bottom 0x24242B is a
+# 25.5% HSL-lightness swing (L 20.78 -> 15.49), over the ~12% budget; the
+# maytera_light pair (0xFAFBFD -> 0xEDEFF3) measures 4.6%, comfortably inside
+# it. Direction is correct in both (top lighter than bottom). Flagging the
+# dark pair for the colour-scheme family to tighten; not editing the hex
+# myself, see docs/UI_STYLE_GUIDE.md.
+#
+# --- Resolved, Loop 2 (colour-scheme family): color.titlebar_top is now
+# 0x26262F (was 0x30303A). 9.6% relative-luminance swing, 7.1% HSL-lightness
+# swing against unchanged titlebar_bottom (0x24242B); both under the 12%
+# budget. See the Loop 2 header block above (top of this file) for the full
+# measurement, including why the Loop 1 CHANGELOG's "1.2%" figure for the
+# old pair was wrong rather than a different, milder defect.
+
+# --- #711 Loop 1 / Family 3 (Form Controls): checkbox, radio, dropdown,
+# slider, text field, scrollbar --------------------------------------------
+# Every value below is a LITERAL COPY of an already-defined color.*/state.*
+# token above in THIS file (see the "# = tokenname" comment on each line).
+# Nothing here is an invented hex; only the metric.*/radius.* geometry keys
+# are genuinely new, and they are additive to the existing scale, never a
+# redefinition of a shared token. All six states (rest/hover/active/focus/
+# disabled/selected) are covered per control; where a state does not apply
+# to a given control it is documented as N/A with its fallback, never left
+# to be guessed via alpha (this renderer has no per-pixel alpha).
+#
+# STATUS (#711 loop2, verified against the running source, not assumed):
+# every metric./radius./state.field_*/state.radio_*/state.slider_*/
+# state.scrollbar_* key below (38 keys) has ZERO consumers today. Checked
+# all three checkbox draw paths that exist in this codebase
+# (kernel/gui/widget.c widget_draw_checkbox, userland/libc/gui.c's legacy
+# gui_draw_checkbox, and userland/libc/gui.c's modern gui_checkbox via
+# gui_style.h) plus gui_slider/gui_textfield2/gui_toggle and every app that
+# hand-rolls radio/dropdown/scrollbar: none read a control-specific key from
+# this section, and the modern gui_checkbox/gui_slider/gui_textfield2 do not
+# even read the generic state.input_* keys - they read a separate, smaller
+# gui_palette_t struct (10 fields, no per-state slots) that most apps
+# populate from a PRIVATE hardcoded 12-theme colour table in their own
+# source, not from SYS_THEME_COLOR/SYS_THEME_METRIC at all. This is a
+# deeper gap than "the offset table has no row for this key" (#711 loop1's
+# framing): the consumer-side DATA MODEL these controls actually draw from
+# has no room for most of these tokens yet. Full finding, three-
+# implementation inventory, and a concrete minimal wiring spec (reusing
+# already-shipped primitives, not inventing new renderer capability) are in
+# docs/UI_STYLE_GUIDE.md, "Family 3 (Form Controls), Loop 2". Kept in place
+# rather than deleted per this loop's B11 instruction ("moved to a clearly
+# marked DEFERRED section... or deleted, with the count recorded") - this
+# IS that marking. Not deleted because the geometry values (checkbox_box,
+# radio_d/dot/ring_w, dropdown_row_h, slider_*, scrollbar_thumb_min) and the
+# newly-fixed state.input_rest_border contrast (below) are correct, reusable
+# targets for whichever engineering pass wires them, and re-deriving them
+# from scratch would waste the contrast/geometry work already checked here.
+
+# TEXT FIELD. Rest/hover/active/focus/disabled/selected reuse state.input_*
+# verbatim (already defined above): rest_bg/rest_fg/rest_border, hover_border,
+# active_border, focus_ring, disabled_bg/disabled_fg, selected_bg/selected_fg
+# (selected = the in-field text-selection highlight). Only the modifier
+# states below are new: an invalid field additionally shows a danger border
+# on top of whatever base state it is in; caret and placeholder are fixed
+# regardless of state.
+state.field_invalid_border=0x00D93A2F     # = color.danger
+state.field_placeholder_fg=0x009AA0AA     # #711 loop3 (Family 3): repointed to the new
+                                           # dedicated color.placeholder token (director
+                                           # loop-3 shared decision, section 1) instead of
+                                           # aliasing color.on_surface_muted (0x9AA3AF,
+                                           # still used elsewhere) - close but distinct per
+                                           # spec. 7.10:1 on state.input_rest_bg (0x121216),
+                                           # measured (WCAG relative luminance).
+state.field_caret=0x002563C9              # = color.accent
+
+# CHECKBOX. Box states reuse state.input_* verbatim: rest_bg/rest_border,
+# hover_border, active_border, focus_ring, disabled_bg/disabled_fg. Checked
+# ("selected") reuses state.input_selected_bg for the box fill and
+# state.input_selected_fg for the check glyph - both already defined above,
+# so checkbox needs zero new color keys, only geometry:
+metric.checkbox_box=16
+radius.control=4                          # #711 loop2: was 3, B6 settled value (buttons/
+                                           # inputs/dropdowns/menus/selection rows all = 4px)
+# Check-glyph pixel spec (16x16 box, local coords, origin = box top-left):
+# the renderer has no public AA line, so this is a stepped 2px polyline
+# built from eleven 2x2 filled rects (state.input_selected_fg colour),
+# Bresenham-plotted from (3,7) through the pivot (6,10) to (12,3):
+#   (3,7) (4,8) (5,9) (6,10)                          <- short leg, down-right
+#   (6,10) (7,9) (8,8) (9,7) (9,6) (10,5) (11,4) (12,3) <- long leg, up-right
+# (6,10) is shared by both legs. This is a consumer-code spec, not a new
+# .mtheme key: see report for why the glyph shape stays a compiled constant
+# while every colour/size around it is data.
+
+# RADIO. Ring on background reuses state.input_rest_bg (no new bg key). Ring
+# stroke and dot are new: a 14px outer diameter is the renderer's hard-edge
+# Bresenham-circle floor (below it a filled circle looks ragged, not a taste
+# choice), with a 2px ring stroke via nested-fill (outer circle filled in
+# the ring colour, inner circle inset 2px filled in state.radio_bg) and a
+# 6px filled dot when selected, per the exact brief spec.
+metric.radio_d=14
+metric.radio_dot=6
+metric.radio_ring_w=2
+state.radio_bg=0x00121216                 # = state.input_rest_bg
+state.radio_ring_rest=0x009AA3AF          # = state.input_rest_border (loop2 fix, see above)
+state.radio_ring_hover=0x005D636C         # = state.input_hover_border
+state.radio_ring_active=0x001B4FA6        # = color.accent_active
+state.radio_ring_focus_ring=0x004C8EFF    # = color.focus_ring
+state.radio_ring_disabled=0x005D636C      # = color.on_surface_disabled
+state.radio_ring_selected=0x002563C9      # = color.accent
+state.radio_dot_selected=0x002563C9       # = color.accent
+state.radio_dot_disabled=0x005D636C       # = color.on_surface_disabled
+
+# DROPDOWN / COMBOBOX. Closed box reuses state.input_* verbatim (rest/hover/
+# active/focus/disabled); "selected" does not apply to the closed box itself
+# (no checked concept) and falls back to rest. Popup rows reuse state.item_*
+# verbatim (rest/hover/active/focus/disabled/selected = the current choice).
+# Popup surface is the level-3 overlay pair already owned by family 6:
+# color.surface_overlay (0x002C2C35) + color.border_strong (0x00454551) -
+# consumed here, not redefined. Only the roomier form-control row height is
+# new (window/system menus keep the existing metric.menu_row_h=28):
+metric.dropdown_row_h=32
+
+# SLIDER. Track is a static 4px groove (one colour, no hover/press of its
+# own - dragging anywhere on the track hands off straight to the thumb's
+# active state, so a track has no separate 6-state set; documented, not
+# guessed). The accent-filled thumb carries the six states; "selected" is
+# N/A (a slider is continuous, not a discrete choice) and aliases to rest.
+metric.slider_track_h=4
+metric.slider_thumb_w=12
+metric.slider_thumb_h=18
+radius.slider_thumb=3
+state.slider_track=0x00121216             # = color.surface_sunken
+state.slider_fill=0x002563C9              # = color.accent
+state.slider_fill_disabled=0x005D636C     # = color.on_surface_disabled
+state.slider_thumb_rest=0x002563C9        # = color.accent
+state.slider_thumb_hover=0x003170D8       # = color.accent_hover
+state.slider_thumb_active=0x001B4FA6      # = color.accent_active
+state.slider_thumb_focus_ring=0x004C8EFF  # = color.focus_ring
+state.slider_thumb_disabled=0x005D636C    # = color.on_surface_disabled
+
+# SCROLLBAR. Track is a static groove, same reasoning as the slider's.
+# Thumb carries the six states; "selected" is N/A (no discrete-choice
+# concept) and aliases to active (dragging is the only extra thumb state).
+# Minimum thumb length is a hard usability floor, not a style choice.
+metric.scrollbar_thumb_min=24
+radius.scrollbar_thumb=8                  # = metric.scrollbar_w / 2 (pill cap)
+state.scrollbar_track=0x00121216          # = color.surface_sunken
+state.scrollbar_thumb_rest=0x00454551     # = color.border_strong
+state.scrollbar_thumb_hover=0x009AA3AF    # = color.on_surface_muted
+state.scrollbar_thumb_active=0x002563C9   # = color.accent
+state.scrollbar_thumb_focus_ring=0x004C8EFF # = color.focus_ring
+state.scrollbar_thumb_disabled=0x002E2E37 # = color.border_subtle
+
+# =====================================================================
+# DEFERRED (Loop 2, per director B11 "token surface diet"): everything
+# from here to end of file is the Loop 1 six-variant button matrix
+# (standard/primary/danger/toolbar/pill/segmented x six states x
+# fill/text/border). Verified this loop via grep against
+# kernel/gui/themes.c: g_theme_fields[] has NO entry for any btn.<variant>
+# key, so all of it is currently dead data - 0 consumers, exactly the
+# defect the director's redirect measured ("103 btn.* keys ... grep
+# returns 0 hits"). Rather than delete a loop of real design work
+# outright, it is kept here, clearly marked, for whichever future loop
+# wires per-variant button drawing. It is NOT current spec: two things
+# below are superseded by Loop 2's settled shared decisions and must be
+# corrected before this block is ever revived as live data:
+#   1. B6 ("No pills") retires full pill rounding outright. radius.pill
+#      is deleted (was 14 = metric.btn_h/2). When revived, btn.pill and
+#      btn.segmented's outer corners take the unified control radius
+#      instead (see the shared-token ask in the report - B6 names
+#      radius.control=4 for this and the parser has no such field yet).
+#   2. radius.btn_toolbar (was 3, a per-variant rung) is deleted for the
+#      same reason: one shared control radius, not one per button shape.
+# The live, wired button styling for THIS loop is the minimal generic
+# matrix above (state.btn_* including the four new *_border keys and
+# the selected_focus_ring fix) - see the docs/UI_STYLE_GUIDE.md Buttons
+# section, "Loop 2 update", for the full account.
+# =====================================================================
+# --- #711 Loop 1 / Family 2 (Buttons): standard, primary, danger, toolbar/
+# icon, pill, segmented control ---------------------------------------------
+# Every colour below is a LITERAL COPY of an already-defined color.*/state.*
+# token above in THIS file (see the "# = tokenname" comment on each line,
+# same convention Family 3 used for checkbox/radio/slider/scrollbar). Nothing
+# here is an invented hex; only metric.btn_pad_h/btn_pad_icon and
+# radius.btn_toolbar are genuinely new geometry, additive to the existing
+# scale, never a redefinition of a shared token. type.body_strong and
+# radius.pill are NOT this family's tokens (typography/radius scale, see the
+# note at the end of this block) but are consumed here since Family 2 is the
+# first real consumer of both.
+#
+# Geometry (space.lg/space.sm from the surfaces family's grid above):
+metric.btn_pad_h=16                       # = space.lg, horizontal button padding (deferred)
+metric.btn_pad_icon=4                     # = space.xs, icon-only toolbar button padding (deferred)
+metric.btn_gap=8                          # = space.sm, gap between grouped buttons (same
+                                           #   value as metric.gap; deferred with the rest)
+# radius.btn_toolbar (was 3, a per-variant rung) DELETED this loop (Loop 2,
+# B6): one shared control radius, not one per button shape - see the
+# DEFERRED header above.
+#
+# NESTED-FILL TECHNIQUE (every variant below uses it): the renderer has no
+# stroked/outlined rounded rect. Each state's ".border" value is the OUTER
+# fill, drawn first; ".bg" is the INNER fill, inset by metric.border_w (1px)
+# on every edge. Where ".border" equals ".bg" the button reads as flush/
+# borderless by construction, not as a special case the renderer needs to
+# know about. Focus is separate: btn.<variant>.focus.ring is drawn as a
+# metric.focus_w (2px) rect OUTLINE offset 2px OUTSIDE the button's own
+# bounds - square corners even on the pill/segmented variants, per the
+# renderer's no-AA-rounded-outline limit (explicitly allowed by the brief).
+#
+# STANDARD (secondary) push button. Mirrors the existing generic state.btn_*
+# pair-for-pair (identical literals) and adds the border tokens that
+# primitive did not carry.
+btn.standard.rest.bg=0x0024242B           # = state.btn_rest_bg
+btn.standard.rest.fg=0x00F2F3F5           # = state.btn_rest_fg
+btn.standard.rest.border=0x002E2E37       # = color.border_subtle
+btn.standard.hover.bg=0x002E2E37          # = state.btn_hover_bg
+btn.standard.hover.fg=0x00F2F3F5          # = state.btn_hover_fg
+btn.standard.hover.border=0x002E2E37      # = color.border_subtle (unchanged; fill lifts)
+btn.standard.active.bg=0x00191920         # = state.btn_active_bg (distinct pressed fill,
+                                           #   not an alpha trick)
+btn.standard.active.fg=0x00F2F3F5         # = state.btn_active_fg
+btn.standard.active.border=0x00454551     # = color.border_strong (deepens on press)
+btn.standard.focus.ring=0x004C8EFF        # = color.focus_ring
+btn.standard.disabled.bg=0x0024242B       # = state.btn_disabled_bg
+btn.standard.disabled.fg=0x005D636C       # = state.btn_disabled_fg
+btn.standard.disabled.border=0x002E2E37   # = color.border_subtle
+btn.standard.selected.bg=0x002563C9       # = state.btn_selected_bg
+btn.standard.selected.fg=0x00FFFFFF       # = state.btn_selected_fg
+btn.standard.selected.border=0x002563C9   # = color.accent (flush)
+#
+# PRIMARY / default button (accent-filled). Label uses type.body_strong, not
+# type.body (see typography note below). Disabled DESATURATES to the same
+# neutral treatment as a disabled standard button rather than dimming the
+# accent - a dimmed-but-still-blue button can misread as still actionable.
+btn.primary.rest.bg=0x002563C9            # = color.accent
+btn.primary.rest.fg=0x00FFFFFF            # = color.on_accent
+btn.primary.rest.border=0x001B4FA6        # = color.accent_active (crisp 1px edge so a
+                                           #   filled button still reads as bounded)
+btn.primary.hover.bg=0x003170D8           # = color.accent_hover
+btn.primary.hover.fg=0x00FFFFFF           # = color.on_accent
+btn.primary.hover.border=0x001B4FA6       # = color.accent_active
+btn.primary.active.bg=0x001B4FA6          # = color.accent_active (distinct pressed fill)
+btn.primary.active.fg=0x00FFFFFF          # = color.on_accent
+btn.primary.active.border=0x001B4FA6      # = color.accent_active
+btn.primary.focus.ring=0x004C8EFF         # = color.focus_ring
+btn.primary.disabled.bg=0x0024242B        # = color.surface_raised (neutral, not dim accent)
+btn.primary.disabled.fg=0x005D636C        # = color.on_surface_disabled
+btn.primary.disabled.border=0x002E2E37    # = color.border_subtle
+btn.primary.selected.bg=0x001B4FA6        # = color.accent_active (rare: a primary-styled
+                                           #   toggle, e.g. a single big filled action that
+                                           #   stays "on"; most primaries never hit this)
+btn.primary.selected.fg=0x00FFFFFF        # = color.on_accent
+btn.primary.selected.border=0x001B4FA6    # = color.accent_active
+#
+# DANGER button. color.danger/on_danger measures 4.58:1 in THIS file as of
+# this loop (Family 4 deepened color.danger 0xFF453A -> 0xD93A2F this same
+# loop specifically to clear WCAG AA - see that family's comment above and
+# the report). Fill therefore stays the constant, AA-passing color.danger at
+# every interactive state (there is no color.danger_hover/danger_active
+# token yet, and hexes are not this family's to invent - see report); hover
+# and pressed are still genuinely distinct, non-alpha tokens because the
+# OUTER nested-fill ring moves instead: flush at rest, a dark ring on hover,
+# a bright ring on press. All three read as clearly different states.
+btn.danger.rest.bg=0x00D93A2F             # = color.danger
+btn.danger.rest.fg=0x00FFFFFF             # = color.on_danger
+btn.danger.rest.border=0x00D93A2F         # = color.danger (flush)
+btn.danger.hover.bg=0x00D93A2F            # = color.danger
+btn.danger.hover.fg=0x00FFFFFF            # = color.on_danger
+btn.danger.hover.border=0x00454551        # = color.border_strong (dark defining ring)
+btn.danger.active.bg=0x00D93A2F           # = color.danger
+btn.danger.active.fg=0x00FFFFFF           # = color.on_danger
+btn.danger.active.border=0x00FFFFFF       # = color.on_danger (bright ring, distinct
+                                           #   token from both rest's and hover's border)
+btn.danger.focus.ring=0x004C8EFF          # = color.focus_ring (same ring colour as every
+                                           #   other control - focus must read as ONE signal
+                                           #   regardless of the control's own semantic hue)
+btn.danger.disabled.bg=0x0024242B         # = color.surface_raised (neutral, not dim red)
+btn.danger.disabled.fg=0x005D636C         # = color.on_surface_disabled
+btn.danger.disabled.border=0x002E2E37     # = color.border_subtle
+btn.danger.selected.bg=0x00D93A2F         # = color.danger (rare: momentary-action buttons
+                                           #   are not usually toggled)
+btn.danger.selected.fg=0x00FFFFFF         # = color.on_danger
+btn.danger.selected.border=0x00FFFFFF     # = color.on_danger
+#
+# TOOLBAR / ICON button. Flush with the ambient surface at rest (no visible
+# chrome until interacted with), lifts on hover, and on press SINKS to the
+# elevation-0 sunken pair - reusing the elevation model literally instead of
+# inventing a fourth colour: pressed = sunken.
+btn.toolbar.rest.bg=0x001A1A1F            # = color.surface
+btn.toolbar.rest.fg=0x00F2F3F5            # = color.on_surface
+btn.toolbar.rest.border=0x001A1A1F        # = color.surface (flush)
+btn.toolbar.hover.bg=0x0024242B           # = color.surface_raised
+btn.toolbar.hover.fg=0x00F2F3F5           # = color.on_surface
+btn.toolbar.hover.border=0x002E2E37       # = color.border_subtle
+btn.toolbar.active.bg=0x00121216          # = color.surface_sunken (elevation 0: pressed)
+btn.toolbar.active.fg=0x00F2F3F5          # = color.on_surface
+btn.toolbar.active.border=0x00454551      # = color.border_strong
+btn.toolbar.focus.ring=0x004C8EFF         # = color.focus_ring
+btn.toolbar.disabled.bg=0x001A1A1F        # = color.surface (stays flush)
+btn.toolbar.disabled.fg=0x005D636C        # = color.on_surface_disabled
+btn.toolbar.disabled.border=0x001A1A1F    # = color.surface
+btn.toolbar.selected.bg=0x002563C9        # = color.accent (toggled-on icon button, e.g.
+                                           #   Bold/Bookmark)
+btn.toolbar.selected.fg=0x00FFFFFF        # = color.on_accent
+btn.toolbar.selected.border=0x001B4FA6    # = color.accent_active
+#
+# PILL button (filter chip). Rounded fully via radius.pill (below); colour
+# behaviour otherwise matches the standard button's rest/hover/active so a
+# row of pills and a row of standard buttons read as the same material.
+btn.pill.rest.bg=0x0024242B               # = state.btn_rest_bg
+btn.pill.rest.fg=0x00F2F3F5               # = state.btn_rest_fg
+btn.pill.rest.border=0x002E2E37           # = color.border_subtle
+btn.pill.hover.bg=0x002E2E37              # = state.btn_hover_bg
+btn.pill.hover.fg=0x00F2F3F5              # = state.btn_hover_fg
+btn.pill.hover.border=0x002E2E37          # = color.border_subtle
+btn.pill.active.bg=0x00191920             # = state.btn_active_bg
+btn.pill.active.fg=0x00F2F3F5             # = state.btn_active_fg
+btn.pill.active.border=0x00454551         # = color.border_strong
+btn.pill.focus.ring=0x004C8EFF            # = color.focus_ring
+btn.pill.disabled.bg=0x0024242B           # = state.btn_disabled_bg
+btn.pill.disabled.fg=0x005D636C           # = state.btn_disabled_fg
+btn.pill.disabled.border=0x002E2E37       # = color.border_subtle
+btn.pill.selected.bg=0x002563C9           # = color.accent (chip becomes solid when chosen)
+btn.pill.selected.fg=0x00FFFFFF           # = color.on_accent
+btn.pill.selected.border=0x001B4FA6       # = color.accent_active
+#
+# SEGMENTED CONTROL. One connected group sharing radius.btn (6) on the outer
+# ends only; internal joins are flat, divided by a metric.border_w (1px)
+# line in btn.segmented.divider. Unselected segments use muted ink so the
+# selected segment reads first without needing a second colour signal.
+# selected_hover/selected_active cover re-interacting with the segment that
+# is already chosen; disabled_selected is a second disabled colour because
+# in dark scheme color.surface_overlay is distinct from color.surface_raised
+# (unlike the light scheme - see maytera_light.mtheme's note on this line),
+# so a disabled control can still show which segment was selected.
+btn.segmented.rest.bg=0x0024242B          # = color.surface_raised (unselected)
+btn.segmented.rest.fg=0x009AA3AF          # = color.on_surface_muted
+btn.segmented.rest.border=0x0024242B      # = color.surface_raised (flush; divider is
+                                           #   the visible separator, not this border)
+btn.segmented.hover.bg=0x002E2E37         # = state.btn_hover_bg
+btn.segmented.hover.fg=0x00F2F3F5         # = color.on_surface
+btn.segmented.hover.border=0x002E2E37     # = state.btn_hover_bg
+btn.segmented.active.bg=0x00191920        # = state.btn_active_bg
+btn.segmented.active.fg=0x00F2F3F5        # = color.on_surface
+btn.segmented.active.border=0x00191920    # = state.btn_active_bg
+btn.segmented.focus.ring=0x004C8EFF       # = color.focus_ring (drawn around the one
+                                           #   keyboard-focused segment, not the group)
+btn.segmented.disabled.bg=0x0024242B      # = color.surface_raised (unselected, disabled)
+btn.segmented.disabled.fg=0x005D636C      # = color.on_surface_disabled
+btn.segmented.disabled.border=0x0024242B  # = color.surface_raised
+btn.segmented.selected.bg=0x002563C9      # = color.accent
+btn.segmented.selected.fg=0x00FFFFFF      # = color.on_accent
+btn.segmented.selected.border=0x002563C9  # = color.accent
+btn.segmented.selected_hover.bg=0x003170D8    # = color.accent_hover
+btn.segmented.selected_hover.fg=0x00FFFFFF    # = color.on_accent
+btn.segmented.selected_active.bg=0x001B4FA6   # = color.accent_active
+btn.segmented.selected_active.fg=0x00FFFFFF   # = color.on_accent
+btn.segmented.disabled_selected.bg=0x002C2C35 # = color.surface_overlay (distinct from
+                                               #   plain disabled.bg so the disabled group
+                                               #   still shows which segment was chosen)
+btn.segmented.disabled_selected.fg=0x005D636C # = color.on_surface_disabled
+btn.segmented.divider=0x002E2E37          # = color.border_subtle, drawn at metric.border_w
+#
+# Shared-scale tokens this family consumes but does not own. Neither line
+# below changes an existing value; both fill a gap this family hit first.
+# type.body_strong: the typography family's own #711-follow-on doc section
+# states it is "present in all 14 shipped .mtheme files (added this loop)"
+# and lists 14px/20px/bold - true for the 12 pre-#711 themes, NOT yet true
+# for maytera_dark/maytera_light as of this read. Synced here at the
+# IDENTICAL value already established elsewhere (not invented by this
+# family) because the primary button's label needs it; flagged to the
+# typography family as a two-file sync gap, see report.
+type.body_strong=14
+type.body_strong_lineheight=20
+type.body_strong_weight=bold
+# radius.pill: the brief's own radius scale names five rungs (none/sm/md/
+# lg/pill) but only four (none/sm/md/lg, realized as radius.btn/input/menu/
+# card=6/6/6/10) had been instantiated as a key anywhere before this loop.
+# 14 = metric.btn_h/2 at the modern default (28/2), the formula the scale
+# itself specifies. This family is the first pill-shaped consumer; flagged
+# to the radius-scale owner to confirm/adopt so a future chip/tag control
+# elsewhere reuses this key instead of a second one, see report.
+
+# --- #711 Loop 2 / Family: surfaces (wiring + repair, director redirect) ---
+# This loop is explicitly NOT polish: Section A of the redirect calls Loop 2
+# "a WIRING AND REPAIR loop" and Section F says verify the artifact, not the
+# diff. Everything below is either (a) a value change to an ALREADY-WIRED
+# key (real, live, no engineering needed - see the radius.btn/input/menu and
+# radius.control edits made in place above, not here) or (b) new data with
+# its wiring status stated explicitly, never implied.
+#
+# B6 (radius) and B9 (focus ring) are handled as in-place edits above, next
+# to the keys they change, not duplicated here - a second, later definition
+# of the same key would be ambiguous for this line-reader parser (see the
+# blame.md entry this loop adds on exactly that risk).
+#
+# B7 (spacing): "8px base grid... Settings section gap 24, intra-section
+# gap 8" needs NO new key. space.xl=24 and space.sm=8 already exist above
+# (surfaces, loop 1) and are exactly those two values. Settings family
+# consumes them directly; nothing for this family to add.
+#
+# B8 (elevation: shadow bands, scrim, inactive titlebar) - the one item
+# this loop had to actually investigate rather than restate, because my own
+# loop-1 brief says "NO SHADOWS EVER... unrenderable" and the task's own
+# renderer-limits section bans "drop shadows of ANY kind" and "full-screen
+# translucent scrims", which reads as a flat contradiction of B8. Read the
+# actual draw code before deciding which instruction was stale:
+#
+#  1. MENU/POPUP EDGE BAND - RENDERABLE, PROVEN, ALREADY SHIPPING.
+#     kernel/gui/window.c's wm_draw_winmenu() (the window-decorator popup)
+#     already does exactly what B8 asks, today, in a released build:
+#       fb_fill_rect(x+3, y+3, w, h, 0x00101418);   // offset dark rect first
+#       fb_fill_rect(x,   y,   w, h, p.bg);          // popup body on top
+#       fb_draw_rect(x,   y,   w, h, p.border);      // 1px border
+#     This is a hard-edged OPAQUE offset rect, not alpha - "shadow" here
+#     means "solid dark rect peeking out 3px on the right/bottom before the
+#     surface itself is drawn on top", never a blur. Zero new primitives:
+#     fb_fill_rect is called everywhere. My loop-1 "no shadows" language was
+#     about soft/blurred drop shadows specifically (the #189 removal), not
+#     this hard silhouette technique, which #189 never touched.
+#  2. userland/apps/compositor/notif.c goes one step further and proves the
+#     SOFT version is also fine at small scale: its toast shadow uses the
+#     compositor's uniform per-draw alpha (g_draw_blend=70 of 255, ~27%,
+#     within a hair of B8's stated 25%) on an offset rounded rect, exactly
+#     the "uniform-opacity dim... allowed ONLY for small regions" exception
+#     my own brief already carves out. Two independent, already-shipping
+#     implementations of the same idea; this is not a new ask.
+#  3. FULL-SCREEN 30% SCRIM BEHIND A MODAL - NOT IMPLEMENTED, FLAGGING A
+#     REAL ARCHITECTURE QUESTION, not refusing on principle. The primitive
+#     exists (kernel fb_fill_rect_alpha, proven at full-screen size by
+#     kernel/gui/login.c's LOGIN_SCRIM_COLOR/LOGIN_SCRIM_ALPHA=145). The
+#     reason my brief bans it is NOT "the renderer can't draw a translucent
+#     rect", it is the cost of REDRAWING one every frame: login.c's own
+#     comment says "blit plus a scrim is too expensive for a per-frame
+#     redraw, #426", and it gets away with it because the login screen is
+#     effectively static underneath. A modal opened over the live desktop
+#     is a different case ONLY IF the compositor keeps repainting whatever
+#     is under the modal while it is open (clock tick, taskbar gauges,
+#     other windows). If a modal already suspends redraw of everything
+#     below it (which "modal blocks input to lower windows" implies but I
+#     have not verified in the compositor's damage-rect code, and it is not
+#     mine to verify or change), the scrim is a ONE-TIME full-screen draw
+#     at modal-open, not a per-frame cost, and my blanket ban is too strong
+#     for this specific case. THIS IS AN ENGINEERING QUESTION FOR THE
+#     SUBSTRATE PHASE, not a design decision: does the compositor freeze
+#     repaint of everything below an open modal? I am not implementing the
+#     scrim until that is answered, because implementing it wrong silently
+#     reintroduces the exact input-stall class bug #426 already paid for.
+#     Modal dialogs DO get the edge-band technique from item 1 above at
+#     double width (6px, matching B8's modal figure) - that part is exactly
+#     as renderable as the menu case, only the full-screen scrim is gated.
+#
+#  Tokens for the edge-band technique (new, this loop; width/alpha only -
+#  the colour is pure black, which is not a per-theme choice the way a
+#  surface tint is, so it is the same literal in every theme file rather
+#  than something for the colour-scheme family to pick per scheme):
+color.elevation_edge=0x00000000
+metric.elevation_edge_w_menu=3            # popup/menu/dropdown/tray/notif band
+metric.elevation_edge_w_modal=6           # modal dialog band (double width)
+metric.elevation_edge_alpha_menu=64       # ~25% of 255, matches B8's figure
+metric.elevation_edge_alpha_modal=89      # ~35% of 255, matches B8's figure
+# Consumer guidance (not a new key, a usage note): a kernel-side draw site
+# (window.c) uses the OPAQUE technique already proven in wm_draw_winmenu -
+# fb_fill_rect(x+w_edge, y+w_edge, w, h, <a near-black solid, e.g. the
+# existing 0x00101418 literal - promoting THAT literal to a token is a
+# one-line follow-up, not done here to avoid touching a call site this
+# family does not own>) - because the kernel's fb_fill_rect_alpha path is
+# reserved for login.c's one-shot full-screen case per item 3 above, and a
+# per-popup alpha call is unnecessary complexity when the opaque technique
+# already reads correctly (proven, on screen, today). A compositor-side
+# draw site (userland: start menu, tray menu) should prefer the ALREADY
+# WIRED g_draw_blend technique from notif.c, using
+# metric.elevation_edge_alpha_menu as the g_draw_blend value and
+# color.elevation_edge as the fill colour, at metric.elevation_edge_w_menu
+# offset. Scoped engineering either way: applying an existing, proven
+# technique to more call sites, not inventing a primitive.
+#
+#  INACTIVE TITLEBAR (B8's other half). NOT this family's tokens to hex -
+#  color.titlebar_text_inactive/titlebar_inactive_top/titlebar_inactive_bottom
+#  belong to the window-decorations family's chrome-token group (they
+#  already did a real AA pass on titlebar_text_inactive in loop 1, commit
+#  a8e1bec: 3.23:1 -> 5.11:1+). B8 asks for dark = literal #1B1B20; this
+#  file's CURRENT titlebar_inactive_bottom is 0x001A1A1F (a 3-value, <1%
+#  luminance difference from #1B1B20 - visually indistinguishable, almost
+#  certainly the same design intent already realized under a slightly
+#  different literal) and titlebar_inactive_top is 0x001F1F25. I am NOT
+#  editing these: they are outside my token ownership (colour hexes) and
+#  outside my family's file section (window-decorations' territory).
+#  Flagging the near-match for that family/the director to confirm rather
+#  than silently declaring B8 "already done" or duplicating the tokens here.
+#
+# radius.pill / "no pills" (B6) - CONFLICT WITH ANOTHER FAMILY'S UNCOMMITTED
+# WORK, not resolved by me. radius.pill=14 and a full btn.pill.* six-state
+# block exist further up this file (Family 2/buttons, loop 1, uncommitted
+# as of this loop - see `git status`). B6 states "No pills" for Loop 2.
+# radius.pill is a radius-SCALE token, which is this family's to own, but
+# the btn.pill.* colour/state block that CONSUMES it belongs to Family 2 and
+# is not mine to edit or delete ("do not edit another designer's family").
+# I am leaving both as-is and flagging: per B6, no button in this loop
+# should render as a pill, which means either Family 2's pill variant is
+# withdrawn from Loop 2 scope, or B6 needs to carve out an explicit
+# exception for it - the director/Family 2 need to reconcile this, not me.
+# radius.pill itself is NOT deprecated as a scale rung: radius.
+# scrollbar_thumb=8 (Family 3, loop 1, already in this file) is the same
+# "pill cap" concept applied to a scrollbar thumb, which is not a button and
+# not covered by B6's "no pills" (that clause is specifically about button
+# shape). The rung stays; only pill-shaped BUTTONS are out for this loop.
+#
+# Separator spec (surfaces family, restated - unchanged since loop 1, no
+# edit needed): 1px, color.border_subtle, full-bleed for a separator that
+# touches a container's own edge (e.g. the taskbar's top edge, already
+# spec'd above), inset by space.lg (16) on both ends for a separator that
+# floats inside a panel's content area (e.g. between two Settings sections
+# - NOT the B7 24px section gap itself, which is whitespace, not a rule).
+# No new token: this uses color.border_subtle and metric.border_w (1),
+# both already defined and wired.
+
+# --- #711 Loop 2 / Family 2 (Buttons): reply to the surfaces family's
+# radius.pill flag above -----------------------------------------------
+# Resolved, not left open. Per B6 ("No pills", settled, no re-deciding):
+# radius.pill=14 is DELETED from this file (it is no longer defined
+# anywhere below - only mentioned in the deferred block's prose, which
+# describes Loop 1 history, not current state). The btn.pill.* six-state
+# block is not withdrawn or deleted; it is moved into the single DEFERRED
+# block above (with the rest of the six-variant matrix, 0 consumers either
+# way per kernel/gui/themes.c) and annotated there that when it is
+# eventually revived, it takes the unified control radius instead of a
+# full round. No exception carve-out needed: there is currently no
+# pill-shaped BUTTON rendering on any booted system (the matrix has zero
+# consumers), so B6 is not in tension with anything actually on screen
+# this loop. radius.scrollbar_thumb=8 (Family 3's scrollbar-thumb pill
+# cap) is untouched, matching the surfaces family's own read that B6's
+# "no pills" is about button shape, not every rounded-cap use of the
+# radius scale.
+
+# --- #711 Loop 3 / Family 3 (Form Controls): director shared-token decisions
+# (section 1) that land in this family's territory ---------------------------
+# color.placeholder: a NEW, dedicated token for text-field placeholder ink,
+# distinct from color.on_surface_muted even though the two are close in this
+# scheme (0x9AA0AA vs 0x9AA3AF) - per the director's explicit instruction,
+# not my own invention. state.field_placeholder_fg above now points at this
+# token, not at on_surface_muted (see the edit note on that line). 7.10:1 on
+# state.input_rest_bg (0x121216), comfortably clears WCAG AA 4.5:1 even
+# though placeholder text is exempt from the requirement (it is example
+# text, not real content), and clears it in both themes for margin.
+color.placeholder=0x009AA0AA
+
+# radius.selection: the corner radius for the shared selected-row treatment
+# (director section 1: "solid accent fill, white text, radius 4, inset 4px",
+# converging Start menu / Settings sidebar / Files sidebar / dialog lists /
+# THIS family's dropdown popup selected row onto one look). Same numeric
+# value as the already-wired radius.control (4) - given its own name because
+# the director's spec names it as a distinct concept from control-box
+# rounding, even though on this scale they currently coincide. Consumed by
+# my dropdown popup's selected-row highlight; other consumers belong to
+# their owning families (Shell/Settings/Files per the director's redirect).
+radius.selection=4
+# metric.selection_inset: the 4px inset from a selected row's own left/right
+# edges the accent fill sits at, per the same director spec. = space.xs (4).
+# New key, additive, zero risk to any existing consumer.
+metric.selection_inset=4
+
+# --- #711 Loop 3 / Family 4 (colour schemes): director shared-token
+# decisions (section 1) that land in THIS family's territory ---------------
+# color.placeholder above (0x9AA0AA) was already added, correctly, by
+# Family 3 (Form Controls) while this pass was in flight - see that
+# family's comment further up. Noted for the record, not re-added: two
+# concurrent processes independently derived the identical literal from
+# the same director spec, so there is no value disagreement, only an
+# ownership one (my own brief: 'you are the ONLY designer who writes hex
+# values ... in exactly two files'). Flagging to the director rather than
+# fighting the working tree over it - see report. I did NOT re-add or
+# duplicate the key: this parser has no defined behaviour for two
+# definitions of the same key in one file, and a second, later assignment
+# would be genuinely ambiguous, not just untidy (this file's own Loop 2
+# history already carries the same warning on radius.btn/input/menu).
+#
+# color.selection_bg / color.selection_fg (director's own naming for this
+# ask) were NOT added as new keys either. The canonical token model this
+# substrate defines already names this exact pair color.sel_bg/
+# color.sel_fg (both already present above, unchanged since Loop 1: 
+# 0x2563C9 / 0xFFFFFF, i.e. color.accent / color.on_accent, 5.67:1).
+# Adding a second key meaning the same thing would be the duplicate-token
+# anti-pattern Loop 2's B11 'token surface diet' and the Files-sidebar
+# 'three colours for one state' defect both exist to retire. Consumers
+# (Shell/Settings/Files/Dialogs selected-row work) should read
+# color.sel_bg/color.sel_fg; radius 4 is the already-live radius.control
+# (or the new radius.selection Family 3 added alongside color.placeholder,
+# same value, not mine to arbitrate which name wins - flagged to director);
+# the 4px inset is geometry (metric.selection_inset, also already added),
+# not a colour token.
+#
+# Two genuinely NEW colour tokens below, values as specified verbatim by
+# the director (section 1), contrast measured with the same WCAG relative-
+# luminance method as every ratio elsewhere in this file (scripted, not
+# eyeballed):
+#  - color.section_header: promotes the RGB(102,187,102)/0x66BB66 constant
+#    that Settings currently hardcodes per-file to a real token, so the
+#    single literal has one source of truth instead of N copies.
+#    7.32:1 against color.surface (0x1A1A1F), 6.30:1 against
+#    color.surface_raised (0x24242B). Director's own figure for this hue
+#    was '6.4 to 7.3:1 (keep)'; this file measures at the top of that
+#    band, still a clear pass either way.
+#  - color.text_muted: dedicated token for Settings-style field-caption
+#    text ('Font Size', 'Icon Size', 'Set time automatically'), the
+#    B3-era sub-3:1-under-lint.baseline=legacy-v1 defect the director
+#    revoked the exemption for. THIS file already had no such defect
+#    (color.on_surface_muted here measures 6.79:1, see the Loop 2 header
+#    above) - the defect the director is retiring lives in the 12 LEGACY
+#    theme files, not this one, which is outside my mandate to touch.
+#    color.text_muted is added anyway because the director's instruction
+#    is unconditional ('no designer may deviate'), and because it gives
+#    Settings/F3 a role-specific name distinct from color.on_surface_muted
+#    (the elevation-model/dropdown/disabled-text token) even though the
+#    two literals are close by construction - both are the same neutral
+#    ramp near this scheme's AA floor, they are just not the same design
+#    decision or the same consumer. 7.08:1 against color.surface, 6.30:1
+#    against color.surface_raised - clears the 4.5:1 AA BODY-text floor,
+#    not merely the 3:1 muted-text floor this role technically only needs.
+color.section_header=0x0066BB66
+color.text_muted=0x00A0A6B0
+
+# --- #711 Loop 3 / Family 6 (Terminal): banner/prompt palette -------------
+# Director spec (section 2 item 4): map the terminal's chrome-level banner
+# and prompt text through the theme instead of the raw ANSI escape codes
+# userland/apps/terminal/main.c currently hardcodes for them. The general
+# 16-slot ANSI table (ansi_colors[]/st_pal[]) is UNCHANGED and stays
+# semantic, per the existing in-source comment at main.c:180 ("ANSI colors
+# stay semantic; only the *default* fg/bg route through theme") - these
+# three new keys are only for the two UI-authored escape sequences that
+# were mistakenly drawing FROM that semantic table instead of from a
+# theme token: the welcome banner ("\033[1;36m...") and the prompt's two
+# segments ("\033[32muser@maytera...:\033[34m<cwd>...").
+#
+# Dark: KEPT AT CURRENT VALUES per director instruction, verified not
+# assumed. Measured (WCAG relative-luminance contrast, same metric every
+# other family in this file uses) against color.surface_sunken/textbox_bg
+# (0x121216, the terminal's actual default background via
+# THEME_COLOR_TEXTBOX_BG):
+#   term_banner      (current raw \033[1;36m = bright cyan 0x55FFFF) 15.25:1 PASS
+#   term_prompt_user (current raw \033[32m   = green      0x00AA00)  6.01:1 PASS
+# Both clear 4.5:1 with wide margin - director's "dark keeps current
+# values" is confirmed correct for these two, not just assumed.
+#
+# term_prompt_path is a THIRD segment the director's two example values
+# did not cover (the cwd text after the colon, raw \033[34m = dark blue
+# 0x0000AA). Measured it anyway per this family's evidence-bar duty
+# ("verify every default output color... sampled not eyeballed") and
+# found a real, severe defect the director's spec did not know about:
+# 1.41:1 against 0x121216, i.e. functionally invisible dark-blue-on-
+# near-black. Not a light-scheme problem (13.29:1 on white there, fine) -
+# a DARK-scheme-only regression sitting in the same two prompt lines the
+# director was already fixing. Fixed here by pointing it at the existing
+# color.link_color token (0x5AA9FF, already AA-checked for body text
+# elsewhere in this file) rather than inventing a new hex: 7.61:1 on
+# 0x121216. Not asked for; flagged as a correction, see report.
+color.term_banner=0x0055FFFF        # = current raw ANSI bright-cyan value, unchanged
+color.term_prompt_user=0x0000AA00   # = current raw ANSI green value, unchanged
+color.term_prompt_path=0x005AA9FF   # = color.link_color (NEW: fixes 1.41:1 -> 7.61:1)
+#
+# STATUS: data only, AWAITING ENGINEERING WIRING. No reader exists yet
+# (checked, 0 grep hits): kernel/gui/themes.h's TM_* enum / kernel/gui/
+# themes.c's g_theme_fields table have no entries for these three keys,
+# and userland/libc/theme.h's THEME_COLOR_* enum has no TERM_BANNER /
+# TERM_PROMPT_USER / TERM_PROMPT_PATH slots for SYS_THEME_COLOR to serve.
+# Minimal wiring spec for Substrate: add the three enum members + offset-
+# table rows (same mechanism the loop-2 titlebar-button tokens used), then
+# in userland/apps/terminal/main.c replace the two hardcoded escape
+# writes:
+#   term_puts("\033[1;36m") -> a direct cell-attribute write using
+#     theme_color(THEME_COLOR_TERM_BANNER) instead of routing through
+#     ansi_colors[14], for the banner line only (main.c ~1353-1355).
+#   print_prompt()'s two term_puts("\033[32m"/"\033[34m") calls -> the
+#     same direct-color substitution for THEME_COLOR_TERM_PROMPT_USER /
+#     THEME_COLOR_TERM_PROMPT_PATH (main.c ~536-538). The trailing
+#     "\033[0m" resets stay as-is (SGR reset has no colour to theme).
+# kernel/gui/terminal.c and kernel/gui/sshterm.c (compositor-absent
+# kernel-side terminal fallbacks, fully hardcoded, no .mtheme reader at
+# all) are NOT covered by this - see report for why they are out of
+# scope this loop.
+
+# --- #711 Loop 3 / Family 1 (window decorations): elevation shadow + outer
+# corner radius (director redirect, section 1 + Substrate priority 1) ------
+# NEW this loop. Reverses the earlier "window outer corners are always 0,
+# frames are opaque kernel rects, no alpha compositing to round against"
+# ruling from loop 1/substrate (see this file's own "radius.* :" comment
+# above and the surfaces family's "there are no shadows in this system,
+# removed by #189" note further down): the director's loop-3 redirect
+# explicitly asks for both, scored as the single largest item in both loop-2
+# reviews, so I checked whether it is actually renderable before writing a
+# spec that hopes it is.
+#
+# IT IS RENDERABLE WITH ZERO NEW PRIMITIVES. kernel/gui/window_decor.c
+# already ships decor_fill_rounded_rect(x,y,w,h,radius,color) - a real
+# per-pixel filled rounded rect (corner test is a distance-squared circle
+# fill, not a stroked Bresenham outline, so it does not hit the "circles
+# below 14px look ragged" limit that applies to OUTLINES) - and it is
+# already used in production by kernel/gui/login.c for the login input box
+# and the avatar circle, INCLUDING an offset solid-colour shadow copy drawn
+# first (decor_fill_rounded_rect(x+2,y+3,w,h,h/2,LOGIN_SHADOW_COLOR) then
+# the real surface on top, login.c:211-212). kernel/gui/window.c's own
+# wm_draw_winmenu() does the same offset-silhouette trick for the popup menu
+# today (fb_fill_rect(x+3,y+3,w,h,0x00101418) then the popup body,
+# window.c:1265-1266). window.c's TOP-LEVEL frame draw currently uses a
+# plain fb_fill_rect with no radius parameter at all (window.c:~1358+) -
+# that call site is the only thing that needs to change; the corner-fill
+# and offset-shadow techniques it needs already exist and are proven.
+#
+# radius.window: outer window corner radius, decor_fill_rounded_rect's
+# radius argument. This theme is decor.style=gradient, so corners round.
+radius.window=4
+#
+# decor.window_shadow / shadow.* : an OPAQUE, hard-edged offset silhouette,
+# same mechanism as login.c's LOGIN_SHADOW_COLOR box and wm_draw_winmenu's
+# edge band - never a blur/translucency effect on live content (renderer
+# limit, unchanged). "blur" here is NOT a convolution (this renderer cannot
+# draw one): it means a 3-STEP RAMP of nested decor_fill_rounded_rect calls
+# at radius.window, each offset ~shadow.offset_y/3 px further than the last,
+# each drawn via the existing fb_fill_rect_alpha (framebuffer.c:559,
+# already proven at FULL-SCREEN scale by login.c's own LOGIN_SCRIM_ALPHA
+# scrim - a per-window small region is comfortably inside the "small
+# regions only" alpha exception, nowhere near the banned full-screen-scrim
+# case) with alpha stepping down from shadow.alpha toward 0 across
+# shadow.blur px of total spread. This is the director's own "3-step
+# darkened ramp against the sampled backdrop is acceptable for loop 3;
+# zero shadow is not" allowance, expressed as concrete numbers Substrate
+# can implement directly, reusing decor_fill_rounded_rect + fb_fill_rect_
+# alpha exactly as they already exist - no new kernel primitive to build.
+# Modal windows (window_t already carries a MODAL flag) use shadow.modal_
+# alpha/shadow.modal_blur instead of the base pair; offset_y is shared.
+decor.window_shadow=1
+shadow.color=0x00000000
+shadow.alpha=90
+shadow.offset_y=4
+shadow.blur=12
+shadow.modal_alpha=120
+shadow.modal_blur=16
+#
+# Superseded by the above, not edited in place (not this addition's paragraph
+# to rewrite, and a second definition of the same key would be ambiguous for
+# this line-reader parser): this file's own "radius.* :" comment near the
+# top ("Window OUTER corners are always 0 ... no alpha compositing to round
+# it against") and the surfaces family's "there are no shadows in this
+# system... removed by #189" note further down. Both were correct as of
+# loop 1; the director's loop-3 redirect is the reason they no longer are.
+# Flagged here rather than silently contradicted.
+
+# --- #711 Loop 3 (buttons family): audit only, no data changes ------------
+# Full independent re-verification pass over every btn.*/state.btn_* pair
+# already authored in Loop 1/2 above, plus a precise re-diagnosis of the
+# engineering gap those loops already flagged. No color.*/state.*/btn.* key
+# below this comment is added, removed or changed in value this loop.
+#
+# Contrast re-verified by hand (WCAG relative luminance), not re-typed from
+# a prior loop's report:
+#   btn.danger.rest/hover/active vs on_danger .......... 4.58:1 (matches L1/L2)
+#   btn.primary.hover.bg vs on_accent (tightest pair) ... 4.73:1 (matches L1/L2)
+#   btn.segmented.rest.fg vs .rest.bg .................... 6.03:1 (close to L1's
+#     5.94:1, rounding only - see honesty note below)
+# All pass AA (4.5:1 body text floor). Honesty note: the first hand pass at
+# the segmented pair this loop produced a false "2.27:1 FAIL" from a single
+# decimal slip (0.7152*0.01765 mistyped as 0.126232, a factor-of-10 error).
+# Caught by redoing the arithmetic before acting on it, not after; no data
+# was changed on the strength of the wrong number. Recorded per this repo's
+# "verify the artifact" standard rather than silently discarded.
+#
+# Cross-family finding, attribution corrected, not fixed here: the forms
+# family's Loop 3 note (docs/UI_STYLE_GUIDE.md) flags color.accent_active at
+# 2.42:1 against color.surface_sunken as "shared with the button family's
+# pressed state." Recomputed independently: 2.42:1 confirmed exactly (dark
+# scheme only - the same pair in maytera_light.mtheme measures 7.40:1,
+# fine). But checked every accent_active use in THIS file's btn.* block
+# (rest/hover.border, active.bg, toolbar/pill/segmented selected.border):
+# none of them place accent_active against surface_sunken - button fills
+# only ever sit against surface/surface_raised, or flush against their own
+# border (bg==border by construction). The pairing that actually measures
+# 2.42:1 is state.radio_ring_active (=accent_active) against state.radio_bg
+# (=surface_sunken), a forms-family control, not a button. Redirecting the
+# attribution so this is not chased twice against the wrong control; not
+# mine to fix either way (shared hex + another family's geometry section).
+#
+# Engineering gap, reconfirmed not re-argued: kernel/gui/themes.c's
+# g_theme_fields[] still has 0 entries for any btn.<variant>.* key or the
+# five state.btn_*_border/selected_focus_ring keys (re-grepped this loop,
+# unchanged since Loop 2). Sharper than Loop 2's own "C2" spec: that ask
+# ("make gui_draw_button() read theme->s_btn_*") is not achievable as
+# written - theme_t is a KERNEL struct, and the actual live button
+# primitive, userland/libc/gui.c's gui_button(), is Ring 3 code that can
+# only reach kernel colour data through the closed 66-entry THEME_COLOR_*
+# enum (kernel/proc/syscall.c's theme_get_color_by_id() switch, read
+# line-by-line: ids 0-65 only, no state.btn_*/btn.<variant>.* id exists at
+# any layer userland can reach). gui_button() draws from gui_palette_t (10
+# fields: surface/surface_raised/ink/ink_dim/accent/accent_hover/border/
+# field_bg/field_border/track - no per-state slot, no per-state border, no
+# focus_ring field at all), populated per-app by 25 separate
+# gui_set_palette() call sites, most from a private hardcoded per-theme
+# table in that app's own source (same class of gap Family 3 found for
+# form controls, reconfirmed here for buttons). gui_style_sync_from_theme()
+# only syncs g_style (radius/gradient/decor) - it never touches g_pal.
+# Corrected wiring spec, three necessary parts, not one:
+#   1. New SYS_THEME_COLOR ids (or a new syscall) exposing state.btn_*/
+#      btn.<variant>.* through theme_get_color_by_id()'s switch - same
+#      aliasing technique already used for color.accent (id 2).
+#   2. Extend gui_palette_t (userland/libc/gui_style.h) with the per-state/
+#      border/focus_ring slots gui_button() needs - it cannot structurally
+#      express a distinct pressed border or focus ring today, regardless
+#      of what any .mtheme file says.
+#   3. Give gui_style_sync_from_theme() (or a new call) the job of actually
+#      filling gui_palette_t from the new ids, and audit the 25 existing
+#      gui_set_palette() call sites off their private per-app tables.
+# Not buildable from a data-only pass; flagged precisely so a future
+# engineering loop is one pass, not a rediscovery.
+#
+# LIVE, CONFIRMED defect (read directly off the shipping source, not
+# deferred or theoretical): gui_button()'s focus ring draws in p->accent
+# unconditionally - userland/libc/gui.c, modern style ~line 649
+# (gui_rounded_border(handle,x,y,w,h,GUI_BTN_RADIUS,p->accent)) and classic
+# style ~line 650 (gui_draw_rect_outline(handle,x,y,w,h,p->accent)). For
+# GUI_BTN_PRIMARY the button's own FILL is also p->accent (~line 611). A
+# focused primary/default button draws its ring in the exact same colour as
+# its own fill - an invisible ring, on every app using gui_button() with
+# GUI_BTN_PRIMARY, in both maytera themes, today. This is exactly the B9
+# defect Loop 2 already fixed IN THE DATA (state.btn_selected_focus_ring=
+# color.on_accent, above) - that fix has had no way to reach the screen
+# because gui_button() reads neither state.btn_selected_focus_ring nor any
+# per-variant token, only the 4-colour gui_palette_t. Top-priority item once
+# the wiring above lands: add a focus_ring field to gui_palette_t, and for
+# GUI_BTN_PRIMARY/GUI_BTN_SUCCESS use an on-fill-colour ring instead of
+# p->accent, matching what state.btn_selected_focus_ring already specifies.
+
+# --- #745: taskbar-surface ink -----------------------------------------------
+# The Settings left nav paints its labels, icons and version line on
+# taskbar_bg / taskbar_hover / taskbar_active. Before these three keys existed
+# it borrowed label_text (contracted against window_bg), button_disabled
+# (against button_bg) and menu_text_disabled (against menu_bg), which on a
+# theme with a light window and a dark bar rendered dark ink on a dark
+# surface. These state this theme's own ink for that surface.
+# Checked at build time by build/assets/theme-scale-lint.sh check #9 and at
+# load time by kernel/gui/themes.c theme_ensure_all_contrast().
+taskbar_text=0x00F2F3F5
+taskbar_text_muted=0x00AEB4BE
+taskbar_selected_text=0x00FFFFFF
+
+# --- #745 glass chrome ---------------------------------------------------
+# The MATERIAL of the taskbar / panel / dock / start menu. Per-theme, because
+# the tint is a colour decision; the OPACITY is not here and never will be,
+# because opacity is a USER preference (dock_opacity in UIPROFIL.YML, driven by
+# Settings -> Appearance -> Transparency -> Dock). There is deliberately no
+# glass_alpha key, so switching theme can never overwrite a number the user set.
+#
+# glass_enable defaults to 0 for style=retro themes (retro_unix, classic,
+# high_contrast): translucency is wrong on principle for the beveled CDE/Win95
+# lineage. An explicit key here always wins over that default.
+#
+# (#745 dockgrey, 2026-08-12) USER-REPORTED: the marble dock/taskbar read as
+# black, not dark grey, and were too opaque. glass_tint was 0x0014161A
+# (20,22,26) - near-black, and noticeably darker than this theme's own
+# CLR_MENU_BG (0x2C2C35, 44,44,53, the weather-widget reference the user
+# named). Recomputed with the same "settle toward black" formula
+# glass_theme_apply() (main.c) now uses for every theme that does not set this
+# key explicitly (58% -> 78% darken of taskbar_bg=0x24242B), so this theme's
+# explicit value tracks the shared derivation instead of drifting from it.
+# See /tmp/dockgrey_harness.py for the 14-theme contrast table this was
+# chosen from; g_dock_opacity's default also moved 90 -> 75 (draw.c) in the
+# same change.
+glass_tint=0x001C1C21
+glass_enable=1
+
+# The two launcher chips (Start, Maytera). ACHROMATIC BY REQUIREMENT and
+# identical in both themes: they are OPAQUE, which is what makes their icon
+# contrast (11.58:1 open, 14.33:1 rest, 17.77:1 hover) a property of the design
+# instead of a property of the user's wallpaper.
+#
+# They are deliberately NOT derived from start_button. That key IS the accent
+# in every shipping modern theme (0x2563C9 here), and decoupling from it is the
+# whole point; start_button keeps its meaning for the other dock styles.
+#
+# chrome_chip_border is not decorative. A light chip on a LIGHT panel has no
+# edge at all (1.15:1 analytic against light glass); this 1px border recovers it
+# at 4.01:1, and on dark glass it is harmless because the fill already separates
+# the chip at 6.52:1. One border colour, one rule, both themes.
+chrome_chip_rest=0x00E4E7EB
+chrome_chip_hover=0x00FFFFFF
+chrome_chip_open=0x00CCD1D8
+chrome_chip_border=0x004A5058
+chrome_chip_bevel=0x009AA0A8
+chrome_chip_ink=0x0016181C

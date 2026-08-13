@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // math.h - freestanding libm for MayteraOS userland.
 // Base set added for TinyGL (#319); extended for CPython #359 / #422.
 #ifndef _MAYTERA_MATH_H
@@ -87,6 +91,14 @@ float expf(float x);
 float fmodf(float x, float y);
 float sinhf(float x);
 float coshf(float x);
+// AssaultCube port phase 3 (docs/ASSAULTCUBE_PORT_PLAN.md): the same
+// float-variant pattern as every declaration above, just four functions
+// nothing needed until now.
+float tanf(float x);
+float atan2f(float y, float x);
+float asinf(float x);
+float acosf(float x);
+float modff(float x, float *iptr);
 float tanhf(float x);
 float hypotf(float x, float y);
 float fmaxf(float x, float y);

@@ -44,6 +44,14 @@
 #include "../exec/elf.h"
 #include "../version.h"
 #include "ota_pubkey.h"    // GENERATED baked-in RSA-2048 public key (OTA_PUBKEY_N/E)
+#include "app_pubkey.h"    // GENERATED baked-in RSA-2048 APP-REPO key (#563 key split)
+
+// During the app/kernel key-split migration the app-manifest verifier ALSO
+// accepts the legacy shared OTA key, so app manifests signed before the split
+// still verify on updated clients. The kernel-OTA path never gets this. Removing
+// this define (and re-signing every app manifest with the app key) is the FINAL
+// cutover step and is BREAKING for any client not yet updated; see docs.
+#define APP_VERIFY_ACCEPT_LEGACY_OTA_KEY 1
 
 extern fat_fs_t g_fat_fs;
 extern void acpi_reboot(void);
@@ -125,17 +133,30 @@ static int restore_all(fat_fs_t *fs, const void *old_bytes, uint32_t old_len) {
 // image digest against the baked-in OTA public key. Returns 1 if the signature
 // is valid, 0 otherwise. This is the authentication gate: only the holder of
 // the update server's private key can produce a signature that verifies here.
-static int selfupdate_verify_signature(const uint8_t digest[32],
-                                       const uint8_t *sig, uint32_t sig_len) {
+// Verify a detached PKCS#1 v1.5 SHA-256 signature over `digest` against an
+// explicit RSA public key. Factored out so the OTA key and the app key are
+// checked by identical, already-audited code, with the key the ONLY difference.
+static int verify_with_key(const uint8_t *n, size_t n_len,
+                           const uint8_t *e, size_t e_len,
+                           const uint8_t digest[32],
+                           const uint8_t *sig, uint32_t sig_len) {
     if (!sig || sig_len == 0) return 0;
     rsa_public_key_t pub = {
-        .n = (uint8_t *)OTA_PUBKEY_N, .n_len = sizeof(OTA_PUBKEY_N),
-        .e = (uint8_t *)OTA_PUBKEY_E, .e_len = sizeof(OTA_PUBKEY_E),
+        .n = (uint8_t *)n, .n_len = n_len,
+        .e = (uint8_t *)e, .e_len = e_len,
     };
     // rsa_verify_pkcs1_sha256 rebuilds the standard SHA-256 DigestInfo and
     // compares, matching `openssl dgst -sha256 -sign` on the server.
-    int rc = rsa_verify_pkcs1_sha256(&pub, digest, 32, sig, (size_t)sig_len);
-    return rc == RSA_SUCCESS;
+    return rsa_verify_pkcs1_sha256(&pub, digest, 32, sig, (size_t)sig_len) == RSA_SUCCESS;
+}
+
+// KERNEL-OTA domain: trusts ONLY the OTA key. Never the app key. This is the
+// gate that must not be wideneable by anything that only holds the app key.
+static int selfupdate_verify_signature(const uint8_t digest[32],
+                                       const uint8_t *sig, uint32_t sig_len) {
+    return verify_with_key(OTA_PUBKEY_N, sizeof(OTA_PUBKEY_N),
+                           OTA_PUBKEY_E, sizeof(OTA_PUBKEY_E),
+                           digest, sig, sig_len);
 }
 
 // Public wrapper so the OTA client (via SYS_OTA_VERIFY_SIG) can authenticate a
@@ -146,6 +167,30 @@ int kernel_ota_verify_sig(const uint8_t digest[32],
                           const uint8_t *sig, uint32_t sig_len) {
     if (!digest) return -1;
     return selfupdate_verify_signature(digest, sig, sig_len) ? 0 : -1;
+}
+
+// APP-REPOSITORY domain (#563 key split). Authenticates a signed APP manifest
+// against the DEDICATED app key (app_pubkey.h). Domain-separated from the
+// kernel-OTA path above: this accepts the app key, and during migration also
+// the legacy OTA key (compile-gated), but the OTA/self-update path NEVER accepts
+// the app key. Net effect: whoever holds only the app-repo private key can sign
+// app manifests but can never sign a kernel image. Returns 0 if valid, -1 else.
+int kernel_app_verify_sig(const uint8_t digest[32],
+                          const uint8_t *sig, uint32_t sig_len) {
+    if (!digest) return -1;
+    if (verify_with_key(APP_PUBKEY_N, sizeof(APP_PUBKEY_N),
+                        APP_PUBKEY_E, sizeof(APP_PUBKEY_E),
+                        digest, sig, sig_len))
+        return 0;
+#ifdef APP_VERIFY_ACCEPT_LEGACY_OTA_KEY
+    // Transition only: pre-split app manifests are OTA-key-signed. Accept them
+    // until the cutover re-signs everything with the app key.
+    if (verify_with_key(OTA_PUBKEY_N, sizeof(OTA_PUBKEY_N),
+                        OTA_PUBKEY_E, sizeof(OTA_PUBKEY_E),
+                        digest, sig, sig_len))
+        return 0;
+#endif
+    return -1;
 }
 
 int kernel_selfupdate_apply(const void *new_kernel, uint32_t len,

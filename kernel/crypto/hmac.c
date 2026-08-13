@@ -5,6 +5,7 @@
 #include "md5.h"
 #include "crypto.h"
 #include "../string.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 #define HMAC_IPAD 0x36
 #define HMAC_OPAD 0x5C
@@ -216,7 +217,6 @@ static inline uint64_t hmac_tsc_serialized(void) {
 
 void hmac_rust_selftest(void) {
     extern int kprintf(const char *fmt, ...);
-    extern void bootlog_write(const char *fmt, ...);
 
     uint32_t vectors = 0;
     uint32_t mismatches = 0;

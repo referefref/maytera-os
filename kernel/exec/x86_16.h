@@ -2,6 +2,46 @@
 #define X86_16_H
 #include "../types.h"
 
+// ===========================================================================
+// #736 Stage 1b: THE PER-GUEST ENVIRONMENT LIVES ON THE CPU, NOT IN STATICS.
+//
+// These callbacks used to be file-scope statics in x86_16.c with global
+// setters, so the LAST guest to call a setter owned them for EVERY guest. That
+// is not a style problem, it is a measured bug: launching a Win16 app while a
+// DOS game runs redirected the game's INT 21h, its I/O ports and its EGA memory
+// hook into the Win16 layer. On golden 1744 Commander Keen 5 DERAILED and died;
+// on build 1750 it survived and froze, emitting 46,390 "unhandled INT 33" lines.
+//
+// It is also WHY the tree grew three INT 21h implementations: with one global
+// handler slot, a second guest layer that wanted INT 21h had no way to ask for
+// "this CPU's handler", so writing its own was the only thing the interface
+// could express. Consolidating the services (Stage 1) without fixing this would
+// have left the next subsystem in the same position, making the same choice.
+//
+// Every hook already receives the cpu it is running on; it simply had nowhere
+// to look. Now it does: cpu->owner is the caller's own object.
+// ===========================================================================
+// The tag MUST be forward-declared at FILE scope before these prototypes. In C,
+// a struct tag first mentioned inside a function prototype has scope limited to
+// that prototype, so without this line each typedef below would declare its own
+// distinct incomplete `struct x86_16_cpu` and gcc reports the memorable
+// "expected 'struct x86_16_cpu *' but argument is of type 'x86_16_cpu_t *'
+// {aka 'struct x86_16_cpu *'}".
+struct x86_16_cpu;
+
+typedef int      (*x86_16_int_fn)   (struct x86_16_cpu *cpu, uint8_t intno);
+typedef int      (*x86_16_farcall_fn)(struct x86_16_cpu *cpu, uint16_t off);
+typedef uint16_t (*x86_16_in_fn)    (struct x86_16_cpu *cpu, uint16_t port, int width);
+typedef void     (*x86_16_out_fn)   (struct x86_16_cpu *cpu, uint16_t port, uint16_t val, int width);
+typedef void     (*x86_16_mem_w_fn) (struct x86_16_cpu *cpu, uint32_t lin, uint16_t val, int width);
+typedef uint16_t (*x86_16_mem_r_fn) (struct x86_16_cpu *cpu, uint32_t lin, int width);
+
+// x87 stack depth. The software FPU's state was a file-scope static too, and
+// its failure mode is the nastiest of the set: the bugs it produces are stack
+// DEPTH errors, so once two guests share one stack every subsequent result in
+// BOTH drifts arbitrarily rather than failing cleanly.
+#define X86_16_FP_STACK 8
+
 typedef struct x86_16_cpu {
     uint8_t  *mem;     // pointer to a 1 MiB (0x100000) byte array supplied by caller
     // 16-bit register file (layout UNCHANGED from the original so every existing
@@ -22,12 +62,27 @@ typedef struct x86_16_cpu {
     unsigned long insn_count;
     // (#194) high 16 bits of EAX..EDI (index order 0=AX..7=DI, matching reg16_ptr).
     uint16_t exhi[8];
-} x86_16_cpu_t;
 
-// Software-interrupt callback. Implement DOS INT 21h, Win16 thunks, etc here.
-// Return 0 if handled (continue), non-zero to stop the CPU.
-// Set cpu->halted=1 inside to terminate (e.g. INT 21h AH=4Ch).
-typedef int (*x86_16_int_fn)(struct x86_16_cpu *cpu, uint8_t intno);
+    // ---- #736 Stage 1b: per-instance environment (appended, so every field
+    // offset above is byte-identical and no established access path shifts).
+    void             *owner;          // the caller's own object; hooks read this
+                                      // instead of reaching for a file static
+    x86_16_int_fn     int_fn;
+    x86_16_in_fn      in_fn;
+    x86_16_out_fn     out_fn;
+    uint32_t          mh_lo, mh_hi;   // memory-hook window [lo, hi)
+    x86_16_mem_w_fn   mh_w;
+    x86_16_mem_r_fn   mh_r;
+    x86_16_farcall_fn farcall_fn;
+    uint16_t          farcall_seg;
+    int               farcall_active;
+    int             (*callfar_abort_fn)(void);
+    int               pmode;          // 0 = real mode, 1 = Win16 selectors/LDT
+    // Software x87. ST(0) is fp[fp_top]; the stack grows DOWNWARD and is empty
+    // when fp_top == X86_16_FP_STACK.
+    uint64_t          fp[X86_16_FP_STACK];
+    int               fp_top;
+} x86_16_cpu_t;
 
 // Far-CALL trap callback. Registered for a single trap segment (e.g. the Win16
 // thunk segment 0xF000). When a far CALL (opcode 0x9A or 0xFF /3) resolves to a
@@ -37,8 +92,6 @@ typedef int (*x86_16_int_fn)(struct x86_16_cpu *cpu, uint8_t intno);
 // Pascal-style return itself: it reads the caller's return CS:IP off the stack,
 // sets cpu->cs/cpu->ip to that, and adjusts cpu->sp accordingly. After fn returns,
 // the interpreter simply continues fetching at cpu->cs:cpu->ip.
-typedef int (*x86_16_farcall_fn)(struct x86_16_cpu *cpu, uint16_t off);
-
 void x86_16_init(x86_16_cpu_t *cpu, uint8_t *mem1mb);
 int  x86_16_selftest_386(void);   // (#194) 386-opcode self-test, logs PASS/FAIL
 
@@ -62,7 +115,14 @@ int  x86_16_selftest_386(void);   // (#194) 386-opcode self-test, logs PASS/FAIL
 // (i.e. index<<3 | 7), exactly as Win16 KERNEL hands them out, so the low 3
 // bits survive arithmetic the apps do. Lookups mask them off.
 // ===========================================================================
-extern int g_win16_pmode;           // 0 = real-mode (default), 1 = protected selectors
+// #736 Stage 1b: THIS IS THE WIN16 LAYER'S FLAG, NOT THE INTERPRETER'S.
+// The interpreter translates addresses using cpu->pmode, so a DOS guest is
+// unaffected by a Win16 guest entering protected mode (it used to be
+// catastrophically affected: membase() handed the DOS CPU the Win16 ARENA).
+// This global remains as the Win16 layer's record of which mode it asked for,
+// read by ne.c and win16api.c, whose "the guest" is unambiguously the single
+// Win16 guest. win16_pmode_enable() writes both and nothing else writes either.
+extern int g_win16_pmode;
 
 #define WIN16_LDT_ENTRIES  4096     // max selectors (one per segment / GlobalAlloc tile)
 #define WIN16_SEL_SHIFT    3        // selector = (index << 3) | 7
@@ -89,23 +149,21 @@ void     win16_arena_reset(void);
 
 // Convenience: enable/disable protected mode for the next run. Resets the LDT +
 // arena when turning on. Safe to call with on==0 to return to real mode.
-void     win16_pmode_enable(int on);
+void     win16_pmode_enable(x86_16_cpu_t *cpu, int on);
 
 // (#289 Phase 1) Protected-mode selector self-test. Proves LDT translation, the
 // >64 KiB consecutive-selector tiling, and inter-selector far calls. Logs
 // PASS/FAIL and leaves g_win16_pmode == 0. Called at boot like the 386 selftest.
 int  x86_16_selftest_pmode(void);
-void x86_16_set_int_handler(x86_16_int_fn fn);
-void x86_16_set_farcall_trap(uint16_t seg, x86_16_farcall_fn fn);
+void x86_16_set_int_handler(x86_16_cpu_t *cpu, x86_16_int_fn fn);
+void x86_16_set_farcall_trap(x86_16_cpu_t *cpu, uint16_t seg, x86_16_farcall_fn fn);
 // (#256) Abort hook for x86_16_call_far's resume loop (return nonzero to stop).
-void x86_16_set_callfar_abort(int (*fn)(void));
+void x86_16_set_callfar_abort(x86_16_cpu_t *cpu, int (*fn)(void));
 
 // I/O port hooks (#201 DOS). When set, IN/OUT instructions call these instead of
 // the default stub. width is 1 (al/imm8/dx byte) or 2 (ax/dx word). Pass NULLs to
 // restore the default (IN -> 0xFF, OUT -> ignored). Used to capture VGA DAC writes.
-typedef uint16_t (*x86_16_in_fn)(struct x86_16_cpu *cpu, uint16_t port, int width);
-typedef void     (*x86_16_out_fn)(struct x86_16_cpu *cpu, uint16_t port, uint16_t val, int width);
-void x86_16_set_io_handlers(x86_16_in_fn infn, x86_16_out_fn outfn);
+void x86_16_set_io_handlers(x86_16_cpu_t *cpu, x86_16_in_fn infn, x86_16_out_fn outfn);
 
 // Memory-mapped I/O hooks (#202 EGA planar VGA). When set, any byte/word write
 // or read whose LINEAR address falls in [lo, hi) is routed to these callbacks
@@ -113,9 +171,7 @@ void x86_16_set_io_handlers(x86_16_in_fn infn, x86_16_out_fn outfn);
 // planar framebuffer at 0xA0000-0xAFFFF (4 hidden bitplanes selected by the
 // VGA sequencer/graphics-controller registers), which Commander Keen and other
 // mode-0Dh games rely on. Pass lo==hi (or 0,0) to disable. width is 1 or 2.
-typedef void     (*x86_16_mem_w_fn)(struct x86_16_cpu *cpu, uint32_t lin, uint16_t val, int width);
-typedef uint16_t (*x86_16_mem_r_fn)(struct x86_16_cpu *cpu, uint32_t lin, int width);
-void x86_16_set_mem_hook(uint32_t lo, uint32_t hi, x86_16_mem_w_fn wfn, x86_16_mem_r_fn rfn);
+void x86_16_set_mem_hook(x86_16_cpu_t *cpu, uint32_t lo, uint32_t hi, x86_16_mem_w_fn wfn, x86_16_mem_r_fn rfn);
 
 // Diagnostic: end the current x86_16_run burst at the next instruction boundary
 // (run returns 1, as if it hit the slice cap). Used by the DOS layer to drop
@@ -132,6 +188,13 @@ void x86_16_set_fn_trace(uint16_t seg, uint16_t off);
 // Execute up to max_insns instructions (or until halted). Returns:
 //  0 = halted normally, 1 = hit max_insns, -1 = unsupported/illegal opcode (logs via kprintf).
 int  x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns);
+
+// Diagnostic instruction ring. x86_16_ring_enable(1) starts recording every
+// executed instruction (cs:ip, first three opcode bytes, the register file) into
+// a fixed 4096-entry ring; x86_16_ring_dump() prints the last n oldest-first.
+// Off by default: recording costs one predictable branch per instruction.
+void x86_16_ring_enable(int on);
+void x86_16_ring_dump(const char *tag, int n);
 
 // 8/16-bit linear memory helpers (real-mode seg:off -> (seg<<4)+off, wrapped to 1MiB):
 uint8_t  x86_16_rd8 (x86_16_cpu_t *cpu, uint16_t seg, uint16_t off);

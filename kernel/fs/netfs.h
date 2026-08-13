@@ -227,7 +227,7 @@ bool vfs_is_file(const char *path);
 void *vfs_read_file(const char *path, size_t *size_out);
 
 // Write entire file from memory
-int vfs_write_file(const char *path, const void *data, size_t size);
+MUST_CHECK int vfs_write_file(const char *path, const void *data, size_t size);
 
 // Get last error message
 const char *vfs_strerror(int error);

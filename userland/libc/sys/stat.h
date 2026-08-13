@@ -1,8 +1,13 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // sys/stat.h
 #ifndef LIBC_SYS_STAT_H
 #define LIBC_SYS_STAT_H
 
 #include "../types.h"
+#include "types.h"   // mode_t (task #568: sys/stat.h used mode_t without pulling in sys/types.h)
 
 #define S_IFMT   0xF000
 #define S_IFREG  0x8000

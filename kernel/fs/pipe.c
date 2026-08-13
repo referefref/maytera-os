@@ -12,6 +12,7 @@
 #include "../proc/process.h"
 #include "../sync/waitq.h"   /* #511: block on a wait queue, never poll (#426) */
 #include "vfs.h"
+#include "../security/uaccess_smap.h"  // #19/#645: AC bracket on the caller-buffer copy
 
 #define PIPE_BUF_SIZE  65536  /* 64KB ring buffer */
 
@@ -36,8 +37,55 @@ typedef struct pipe_state {
 /* Forward declarations for file_ops */
 static int64_t pipe_read_fn(file_t *f, void *buf, size_t count);
 static int64_t pipe_write_fn(file_t *f, const void *buf, size_t count);
-static void    pipe_release_read(file_t *f);
-static void    pipe_release_write(file_t *f);
+static int     pipe_release_read(file_t *f);
+static int     pipe_release_write(file_t *f);
+
+/* #745 (local 82). A pipe is THE one file kind for which "no ops->poll"
+ * would have been an outright lie. poll(2) treats a file with no ops->poll
+ * as a regular file, i.e. always ready, which is correct for FAT/ext2 files
+ * and for /dev/null but is exactly wrong for an EMPTY pipe: the caller would
+ * be told to read, would get zero bytes, and would spin. So the answer is
+ * computed from the same three facts pipe_read_fn() blocks on.
+ *
+ * POLL_HUP on the read end means "no writers left": with the buffer drained
+ * that is EOF, and reporting it is how a poll()-driven reader learns to stop
+ * rather than waiting forever for a writer that will never come. */
+static int pipe_read_poll(file_t *f, int events) {
+    pipe_state_t *ps = (pipe_state_t *)f->priv;
+    if (!ps) return POLL_ERR;
+    int r = 0;
+    if ((events & POLL_IN) && ps->count > 0) r |= POLL_IN;
+    if (ps->writers <= 0) r |= POLL_HUP;
+    return r;
+}
+
+static int pipe_write_poll(file_t *f, int events) {
+    pipe_state_t *ps = (pipe_state_t *)f->priv;
+    if (!ps) return POLL_ERR;
+    int r = 0;
+    /* Writable while the ring has room. pipe_write_fn() never blocks: it
+     * writes what fits and reports it, so "room for at least one byte" is
+     * the honest readiness test. */
+    if ((events & POLL_OUT) && ps->count < ps->size) r |= POLL_OUT;
+    /* No readers left: a write would be a SIGPIPE case. POLL_ERR is what
+     * poll(2) callers check before writing. */
+    if (ps->readers <= 0) r |= POLL_ERR;
+    return r;
+}
+
+/* The queue a poll(2) waiter parks on. Only the READ end publishes one: it
+ * is woken by pipe_write_fn() on every write and by pipe_release_write() on
+ * EOF, so both events a reader waits for reach it. The write end has no
+ * queue because nothing wakes a blocked writer today (pipe_write_fn does not
+ * block), and publishing a queue nobody wakes would be worse than publishing
+ * none: poll() would sleep the full timeout believing it had an exact wake,
+ * instead of bounding the sleep and re-scanning. */
+static struct wait_queue_head *pipe_read_poll_wq(file_t *f, int events) {
+    pipe_state_t *ps = (pipe_state_t *)f->priv;
+    (void)events;
+    if (!ps) return NULL;
+    return &ps->read_wq;
+}
 
 static const file_ops_t pipe_read_ops = {
     .read    = pipe_read_fn,
@@ -45,7 +93,8 @@ static const file_ops_t pipe_read_ops = {
     .seek    = NULL,
     .ioctl   = NULL,
     .release = pipe_release_read,
-    .poll    = NULL,
+    .poll    = pipe_read_poll,
+    .poll_wq = pipe_read_poll_wq,
 };
 
 static const file_ops_t pipe_write_ops = {
@@ -54,7 +103,8 @@ static const file_ops_t pipe_write_ops = {
     .seek    = NULL,
     .ioctl   = NULL,
     .release = pipe_release_write,
-    .poll    = NULL,
+    .poll    = pipe_write_poll,
+    .poll_wq = NULL,
 };
 
 /* Read from the pipe buffer. Blocks until data arrives or the last writer
@@ -87,10 +137,14 @@ static int64_t pipe_read_fn(file_t *f, void *buf, size_t count) {
     uint32_t avail = ps->count;
     uint32_t to_read = ((uint32_t)count < avail) ? (uint32_t)count : avail;
 
-    for (uint32_t i = 0; i < to_read; i++) {
-        out[i] = ps->buf[ps->read_pos];
-        ps->read_pos = (ps->read_pos + 1) % ps->size;
-    }
+    /* #19/#645: every store lands in the caller's buffer (Ring-3 via
+       sys_read), so the bracket is the copy loop. */
+    {   uaccess_ac_t __ac = uaccess_begin();
+        for (uint32_t i = 0; i < to_read; i++) {
+            out[i] = ps->buf[ps->read_pos];
+            ps->read_pos = (ps->read_pos + 1) % ps->size;
+        }
+        uaccess_end(__ac); }
     ps->count -= to_read;
     return (int64_t)to_read;
 }
@@ -105,10 +159,14 @@ static int64_t pipe_write_fn(file_t *f, const void *buf, size_t count) {
     uint32_t free_space = ps->size - ps->count;
     uint32_t to_write = ((uint32_t)count < free_space) ? (uint32_t)count : free_space;
 
-    for (uint32_t i = 0; i < to_write; i++) {
-        ps->buf[ps->write_pos] = in[i];
-        ps->write_pos = (ps->write_pos + 1) % ps->size;
-    }
+    /* #19/#645: every load comes from the caller's buffer (Ring-3 via
+       sys_write), so the bracket is the copy loop. */
+    {   uaccess_ac_t __ac = uaccess_begin();
+        for (uint32_t i = 0; i < to_write; i++) {
+            ps->buf[ps->write_pos] = in[i];
+            ps->write_pos = (ps->write_pos + 1) % ps->size;
+        }
+        uaccess_end(__ac); }
     ps->count += to_write;
     /* #511: wake the reader. Unconditional on "we added bytes" and done AFTER
      * ps->count is published, so a reader that wakes always observes the data.
@@ -125,16 +183,18 @@ static void pipe_maybe_free(pipe_state_t *ps) {
     }
 }
 
-static void pipe_release_read(file_t *f) {
+// #695: a pipe buffer is memory, not a medium, so both releases report 0.
+static int pipe_release_read(file_t *f) {
     pipe_state_t *ps = (pipe_state_t *)f->priv;
-    if (!ps) return;
+    if (!ps) return 0;
     ps->readers--;
     pipe_maybe_free(ps);
+    return 0;
 }
 
-static void pipe_release_write(file_t *f) {
+static int pipe_release_write(file_t *f) {
     pipe_state_t *ps = (pipe_state_t *)f->priv;
-    if (!ps) return;
+    if (!ps) return 0;
     ps->writers--;
     /* #511: this is the EOF wake, and it is what makes the reader's untimed
      * block safe: a reader parked on read_wq re-tests writers<=0 and returns a
@@ -144,6 +204,7 @@ static void pipe_release_write(file_t *f) {
      * implies an open read end, so this costs a lock and a NULL check.) */
     wake_up_all(&ps->read_wq);
     pipe_maybe_free(ps);
+    return 0;
 }
 
 /* Create an anonymous pipe. On success, pipefd[0] = read end,
@@ -170,7 +231,14 @@ int pipe_create(int pipefd[2]) {
     if (!rf) { kfree(ps->buf); kfree(ps); return -1; }
 
     file_t *wf = file_alloc(&pipe_write_ops, ps, O_WRONLY);
-    if (!wf) { file_put(rf); return -1; }
+    // #695: pipe cleanup stays UNCONDITIONAL and its status is deliberately
+    // dropped. A pipe release cannot fail (it flushes nothing), and making any
+    // of these puts conditional would be a leak on one branch and a double free
+    // on the other.
+    if (!wf) { IGNORE_RESULT("pipe release flushes nothing and cannot fail; "
+                             "a conditional put here would leak on one branch "
+                             "and double-free on the other (#695)", file_put(rf));
+                   return -1; }
 
     // #487/#349: pipes have no filesystem path; name them so the Task Manager
     // renders "pipe:[read]" rather than a blank handle (matching the way
@@ -179,10 +247,14 @@ int pipe_create(int pipefd[2]) {
     file_set_path(wf, "pipe:[write]");
 
     int rfd = fd_alloc_install(rf);
-    if (rfd < 0) { file_put(rf); file_put(wf); return -1; }
+    if (rfd < 0) { IGNORE_RESULT("pipe release cannot fail; unwind must be unconditional (#695)", file_put(rf));
+                   IGNORE_RESULT("pipe release cannot fail; unwind must be unconditional (#695)", file_put(wf));
+                   return -1; }
 
     int wfd = fd_alloc_install(wf);
-    if (wfd < 0) { fd_close(rfd); file_put(wf); return -1; }
+    if (wfd < 0) { (void)fd_close(rfd);
+                   IGNORE_RESULT("pipe release cannot fail; unwind must be unconditional (#695)", file_put(wf));
+                   return -1; }
 
     pipefd[0] = rfd;
     pipefd[1] = wfd;

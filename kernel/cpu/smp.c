@@ -53,6 +53,7 @@ typedef struct {
 } cpu_local_t;
 static cpu_local_t cpu_local[SMP_MAX_CPUS] __attribute__((aligned(64)));
 
+#include "mono.h"   // #67 pass 5: mono_us() for BKL hold times
 #define MSR_GS_BASE 0xC0000101
 
 // Point this CPU's GS base at its cpu_local slot. Call AFTER the final gdt_load
@@ -61,7 +62,63 @@ static cpu_local_t cpu_local[SMP_MAX_CPUS] __attribute__((aligned(64)));
 // fast per-CPU path (before this, callers fall back to the BSP global).
 volatile int g_smp_current_ready = 0;
 volatile int g_ap_running_user[SMP_MAX_CPUS];
-int g_smp_user_sched = 1;  // #279: SMP scheduling ENABLED (restoring b390 verified state; livelock was a screensaver misdiagnosis)
+int g_smp_user_sched = 0;  // #67: DEFAULT OFF. AP user-process scheduling.
+//
+// ---------------------------------------------------------------------------
+// #67 (2026-08-12): READ THIS BEFORE CHANGING THE DEFAULT.
+//
+// WHAT THIS FLAG ACTUALLY DOES TODAY, MEASURED, not inherited from the note it
+// replaces: it gates THE ENTIRE SMP BRING-UP. main.c only calls
+// smp_start_aps() when this flag is set, so on the shipping golden NO
+// APPLICATION PROCESSOR IS EVER STARTED and the whole OS - kernel jobs
+// included - runs on the BSP. The previous version of this comment claimed
+// "APs still run kernel jobs (smp_work_*) in parallel, so SMP is not disabled,
+// only concurrent USER scheduling is". THAT IS FALSE and had been false since
+// the flag was set to 0: kernel/tools/concurrency-lint/allowlist.txt already
+// recorded the same finding from the other direction ("unreachable today:
+// main.c gates smp_start_aps() on g_smp_user_sched, which is 0"). This is why
+// a 2-vCPU VM sits at exactly 50% host CPU for hours: one core saturated, one
+// core never started.
+//
+// THE ORIGINAL DEFECT (#421 phase 7), which was real and is NOT the
+// screensaver misdiagnosis an earlier re-enable blamed it on: with this =1, an
+// AP that took a user proc drove the GLOBAL ready_queue and current_proc
+// concurrently with the BSP. Two things were broken, independently:
+//   1. the ready queue had NO LOCK - only the #610 cli(), which masks the
+//      LOCAL timer and is not a lock at all against another core; and
+//   2. the scheduler published `prev` on the ready queue BEFORE
+//      context_switch had saved prev->rsp, and released the BKL across the
+//      switch (bkl_release_all), so another core could pop prev and switch to
+//      a stale rsp. Two cores, one kernel stack, two RIPs.
+// The result was a context-switch storm livelock that SILENTLY wedged the box:
+// heartbeat dead, no panic, no log line. Build 912 hung; even with the
+// per-cpu-current hardening (sched_cpu_current(), process.c) one boot survived
+// and the next hung, so the window was narrowed, not closed.
+//
+// WHAT #67 CHANGED (all of it inert while this flag is 0):
+//   * proc/context_switch.asm now CLEARS process_t::sched_on_cpu itself, after
+//     the rsp store and after the core has left the outgoing stack. That is
+//     the safe handoff: a queued entry whose flag is set is skipped, never
+//     switched to. It has to live in the asm because context_start never
+//     returns to its caller, so no C hook can observe "the save is done" for
+//     the first-entry path.
+//   * proc/process.c grew PER-CPU RUN QUEUES behind a real spinlock
+//     (g_rq_lock, irqsave), with placement/steal policy in
+//     rustkern/schedwatch.rs.
+//   * a CONTEXT-SWITCH STORM DETECTOR that is NOT gated and runs on every
+//     build, because the recorded failure mode is silence. It prints
+//     [SCHEDSTORM] with the core, the rate and the processes; `make
+//     SCHEDSTORMPANIC=1` turns it into a kpanic, because a panic with state
+//     beats a hang. [SCHEDCORE] reports the per-core split every ~4 s.
+//
+// DO NOT FLIP THIS DEFAULT casually. The bar is the one #421 failed: not one
+// clean boot, but many runs of a real multi-process load with no [SCHEDSTORM]
+// and no wedge. Until then it is enabled per-boot, with no rebuild, by putting
+// an empty /SMPSCHED.TXT at the root of the FAT ESP (main.c), so the SAME
+// kernel binary can be tested both ways.
+// ---------------------------------------------------------------------------
+void smp_user_sched_enable(int on) { g_smp_user_sched = on ? 1 : 0; }
+
 // #279 3b-3C: whole-kernel Big Kernel Lock so APs can run SYSCALL-making apps
 // (BSP kernel code holds the BKL too, serializing against AP syscalls).
 int g_smp_bkl_full = 1;     // #279: whole-kernel BKL ENABLED
@@ -493,6 +550,27 @@ static void smp_run_job(const smp_job_t *j) {
 // #279 3b-3: kick HLT'd APs so they re-check the migratable queue.
 void smp_wake_aps(void) { if (cpu_count > 1) lapic_send_ipi_all_excluding_self(SMP_WAKE_VECTOR); }
 
+// #67 pass 8: DIRECTED wake, to ONE core.
+//
+// smp_wake_aps() broadcasts to every other core. That was harmless when the APs
+// only drained a job ring, and became a feedback loop once they run the
+// scheduler: each core's scheduling activity interrupts every other core, whose
+// wake handler takes the BKL (idt.c wraps every ISR in bkl_acquire), whose
+// scheduling then interrupts the first core back. MEASURED on build 254 with
+// broadcast wakes: a single BKL hold of 2,886,374 us attributed to vector 0xF0 -
+// this very handler - alongside 111,884,639 spin iterations in one window. 2.9
+// seconds is far longer than the handler runs, so it is a NEST: the hold is
+// measured from depth 0->1 to 1->0, and IPIs arriving faster than the nest
+// unwinds keep the depth off zero for seconds at a time.
+//
+// Waking exactly the core that has work, and only when it is actually halted,
+// removes the loop at its source.
+void smp_wake_cpu(uint32_t cpu) {
+    if (cpu_count <= 1 || cpu >= cpu_count) return;
+    if (cpu == smp_this_cpu()) return;          // never IPI yourself
+    lapic_send_ipi(per_cpu_data[cpu].apic_id, SMP_WAKE_VECTOR);
+}
+
 int smp_work_run_one(void) {
     smp_job_t j;
     if (smp_work_pop(&j)) { smp_run_job(&j); return 1; }
@@ -677,6 +755,49 @@ void ap_entry(void) {
     // has NX=1 would raise a reserved-bit #PF on any core that lacks NXE.
     { extern void cpu_enable_nx(void); cpu_enable_nx(); }
 
+    // #19/#645/#624: CR4 IS PER-CPU, AND SO ARE SMEP AND SMAP.
+    //
+    // security_init() runs once, on the BSP, and sets CR4.SMEP|CR4.SMAP there.
+    // Every AP came up with its own CR4 and had NEITHER bit, so on CPU 1..N the
+    // kernel could execute AND read/write user pages freely while the boot
+    // banner said "SMEP: ENABLED" and "SMAP: ENABLED". Half the cores were
+    // unprotected and nothing said so.
+    //
+    // MEASURED, not inferred: `make SMAPTEST=1` arms a deliberate unsanctioned
+    // Ring-0 read of a user page in exec/elf.c. With SMAP armed and this block
+    // absent, that read SUCCEEDED and printed
+    //   "[SMAPTEST] FAILED: read returned 0xA5"
+    // because the ELF load happened to run on the AP. That is the whole reason
+    // a negative control exists: every positive result before it was consistent
+    // with the guard being off.
+    //
+    // The bits are taken from the BSP's OWN live CR4 rather than re-derived
+    // from CPUID and policy, so an AP can never end up with a bit the BSP
+    // declined (the /NOSMEP.TXT and /NOSMAP.TXT escape hatches and the CR4
+    // readback that gates them keep working, unchanged, for every core).
+    // Read back and report, because a silently-dropped CR4 write on one core is
+    // exactly the failure this comment exists about.
+    {
+        extern uint64_t sec_cr4_read(void);
+        extern void     sec_cr4_write(uint64_t v);
+        extern uint64_t g_bsp_cr4_secbits;          // security.c, BSP-owned
+        const uint64_t want = g_bsp_cr4_secbits;    // (CR4_SMEP|CR4_SMAP) & bsp
+        if (want) {
+            uint64_t cr4 = sec_cr4_read();
+            sec_cr4_write(cr4 | want);
+            uint64_t got = sec_cr4_read() & want;
+            if (got != want) {
+                kprintf("[SECURITY] CPU %u: CR4 security bits NOT taken "
+                        "(wanted 0x%llx, got 0x%llx) - this core runs WITHOUT "
+                        "SMEP/SMAP\n", cpu_id,
+                        (unsigned long long)want, (unsigned long long)got);
+            } else {
+                kprintf("[SECURITY] CPU %u: CR4 SMEP/SMAP armed (0x%llx)\n",
+                        cpu_id, (unsigned long long)got);
+            }
+        }
+    }
+
     // Set CPU state to online
     cpu->state = CPU_STATE_ONLINE;
     atomic_inc32(&cpus_online);
@@ -702,8 +823,17 @@ void ap_entry(void) {
             g_ap_heartbeat[cpu_id]++;
         } else {
             if (g_smp_user_sched) {
-                void *up = smp_ap_take_migratable();
-                if (up) { smp_ap_run_user(up); continue; }
+                // #67 pass 2: become a real scheduler consumer and never come
+                // back. Before this, an AP only ever ran smp_work_* jobs and the
+                // one-shot migq, so anything the scheduler placed on this core's
+                // run queue was never popped and the process silently never ran.
+                // sched_ap_enter() creates this core's own idle process (the
+                // global proc_table[0] fallback is unsafe for two cores),
+                // publishes it, and runs the idle loop; the timer tick on this
+                // core preempts it into work exactly as on the BSP.
+                { extern void sched_ap_enter(uint32_t cpu); sched_ap_enter(cpu_id); }
+                // Only reached if this core could not become a consumer; fall
+                // through to the kernel-job-only loop rather than spinning.
             }
             // No work: sleep at ~0% CPU until a wake IPI (sent by
             // smp_work_submit) kicks us. cli + re-check closes the lost-wakeup
@@ -806,6 +936,149 @@ static volatile uint32_t bkl_word = 0;     // 0 = free, 1 = held
 static volatile int32_t  bkl_owner = -1;   // owning cpu id, -1 = none
 static volatile uint32_t bkl_depth = 0;    // recursion depth
 
+// #67 pass 3: BKL CONTENTION INSTRUMENTATION.
+//
+// Making an AP a real scheduler consumer made the whole guest about 5x slower
+// (MEASURED: build 247, AP started but not scheduling, reached 233 s of guest
+// uptime in a 240 s capture; build 249, AP scheduling, reached 48 s). The
+// obvious suspect is this lock: with g_smp_bkl_full = 1 every kernel entry on
+// either core serialises here, and a second core that actually runs the
+// scheduler enters the kernel constantly. That is a HYPOTHESIS, and #67 has
+// already cost one pass to a plausible-but-wrong story, so it gets measured
+// before anything is narrowed. These counters are reported in [SCHEDCORE].
+//
+// #67 pass 5: THE COUNTERS ARE NOW PER-CPU. Pass 4 already caught the spin
+// counter being 93% of its own reading; the acquire counter had the same defect
+// in a quieter form, because g_bkl_acquires++ ran on EVERY kernel entry on both
+// cores - a read-modify-write on one shared cacheline, bouncing it between cores
+// thousands of times a second. Per-CPU cells are summed only when the report
+// prints, so the measured path touches nothing another core is touching.
+//
+// g_bkl_hold_max/reason answer the question the pass-4 numbers raised but could
+// not settle: ~68 contended acquisitions per window burning ~7.5M pause
+// iterations is roughly 110k spins per wait, which is milliseconds. That is not
+// "the lock is a bit hot", it is "somebody holds it for a whole time slice".
+// This records the LONGEST hold in each window together with a tag saying what
+// was running, so the narrowing can be aimed instead of guessed.
+#define BKL_STAT_CPUS 8
+volatile uint64_t g_bkl_acq_pc[BKL_STAT_CPUS];    // acquires, per cpu
+volatile uint64_t g_bkl_con_pc[BKL_STAT_CPUS];    // contended, per cpu
+volatile uint64_t g_bkl_spin_pc[BKL_STAT_CPUS];   // pause iterations, per cpu
+volatile uint64_t g_bkl_hold_max[BKL_STAT_CPUS];  // longest hold this window, us
+volatile uint32_t g_bkl_hold_reason[BKL_STAT_CPUS]; // tag of that longest hold
+volatile uint64_t g_bkl_hold_sum[BKL_STAT_CPUS];  // total us held, per cpu
+volatile uint64_t g_bkl_long[BKL_STAT_CPUS];      // holds over 1 ms, per cpu
+
+// #67 pass 9: WHICH CORE held the lock longest, and did that hold begin on the
+// far side of a context switch.
+//
+// Pass 8 measured a 2.9-second hold tagged to the SMP wake vector and I very
+// nearly acted on it. No interrupt handler runs for 2.9 seconds; an absurd
+// reading is an instrument fault first and a discovery second. The tag was only
+// ever "whatever entry point was on the stack", which does not identify the
+// core, and the core is the whole question: the BSP has a 250 Hz PIT tick that
+// bounds any hold to a time slice, and an AP has NO periodic timer at all, so a
+// process holding the lock there runs until it voluntarily blocks.
+//
+// hold_from_switch records whether the hold began in bkl_reacquire() (i.e. the
+// far side of a context switch) rather than at a genuine kernel entry, which is
+// exactly the conflation the previous instrument could not express.
+volatile uint32_t g_bkl_hold_cpu = 0;
+volatile uint32_t g_bkl_hold_from_switch = 0;
+static uint8_t bkl_hold_is_switch[BKL_STAT_CPUS];
+
+// What this cpu is currently doing inside the kernel. Set by the two entry
+// points that take the BKL (the ISR wrapper and the syscall dispatcher) so a
+// long hold can be attributed to a VECTOR or a SYSCALL NUMBER rather than to a
+// return address that is always one of the same two wrappers.
+//   0x0100 | vector   - interrupt
+//   0x0200 | syscall  - syscall
+//   0x0300            - kernel thread body / other
+volatile uint32_t g_bkl_reason[BKL_STAT_CPUS];
+void bkl_set_reason(uint32_t r) {
+    uint32_t c = smp_this_cpu();
+    if (c < BKL_STAT_CPUS) g_bkl_reason[c] = r;
+}
+
+// Hold-time bookkeeping, per cpu, touched only on the 0->1 and 1->0 edges.
+static uint64_t bkl_hold_start[BKL_STAT_CPUS];
+
+// Kept as aggregate names so existing readers still link; summed at report time.
+volatile uint64_t g_bkl_acquires   = 0;
+volatile uint64_t g_bkl_contended  = 0;
+volatile uint64_t g_bkl_spins      = 0;
+
+// #67 pass 10: ONE implementation of "wait for the lock and publish ownership".
+//
+// THE BUG THIS DELETES. bkl_acquire() and bkl_reacquire() were near-identical
+// copies of the same wait-and-publish sequence. In #67 pass 5 a mechanical
+// edit that was adding per-cpu counters replaced the contended block in
+// bkl_reacquire() and DROPPED ITS `for (;;)` LOOP. What was left ran the CAS
+// once and then fell straight through to `bkl_owner = cpu; bkl_depth = depth;`
+// - so when the compare-and-swap FAILED, meaning another core held the lock,
+// this core published itself as the owner anyway. bkl_reacquire() is the
+// function every context uses to get the BKL back after a context switch, so
+// the Big Kernel Lock stopped being a lock.
+//
+// It built clean: the `spins` local was still summed, so nothing was unused,
+// and the comment still said "Contended: IRQ-friendly spin", which is why the
+// missing loop read as present for four passes.
+//
+// OBSERVED, and every one of these is this defect: two cores publishing as
+// owner, so bkl_word sticks at 1 and the victim spins in bkl_acquire() forever
+// (~110-115 MILLION pause iterations and a ~3.0 second "hold" in one window of
+// EVERY gate-ON boot, measured identically with the console synchronous and
+// asynchronous, so the console was never involved); ONE PROCESS RUNNING ON TWO
+// CORES from a single proc_create(), its output interleaved character by
+// character with itself; an Invalid Opcode panic at RIP=0x45 with two kfree()s
+// on invalid pointers; and roughly half of all gate-ON boots failing to
+// complete.
+//
+// The fix is not to re-add the loop to the copy. It is to have ONE copy, so a
+// future edit cannot desynchronise them again - blame.md's "a duplicated
+// implementation is usually the INTERFACE's fault, not the author's".
+//
+// Returns with the lock held, bkl_owner == cpu and bkl_depth == depth, IRQs
+// masked. The caller restores its own IF.
+static void bkl_take_locked(int cpu, uint32_t depth, uint8_t from_switch) {
+    if (atomic_cas32(&bkl_word, 0, 1) != 0) {
+        // Contended. CRITICAL (#279): we may have been entered from interrupt
+        // context (idt.c wraps every ISR in bkl_acquire) with IF=0, or from a
+        // Ring-3 syscall/timer with IF=1. Spinning with interrupts masked blocks
+        // ALL IRQ delivery on this CPU, which deadlocks against a holder that is
+        // waiting on an interrupt this CPU would service. So enable interrupts
+        // WHILE waiting, and re-mask before the CAS so the word=1/owner=unset
+        // window can never be observed by a handler on this CPU.
+        if ((uint32_t)cpu < BKL_STAT_CPUS) g_bkl_con_pc[cpu]++;
+        uint64_t spins = 0;                      // LOCAL: a shared counter here
+        for (;;) {                               // would be most of its own cost
+            __asm__ volatile("sti");
+            while (bkl_word) { pause(); spins++; }
+            __asm__ volatile("cli");
+            if (atomic_cas32(&bkl_word, 0, 1) == 0) break;
+        }
+        if ((uint32_t)cpu < BKL_STAT_CPUS) g_bkl_spin_pc[cpu] += spins;
+    }
+
+    // THEFT DETECTOR. Reaching here means OUR compare-and-swap moved bkl_word
+    // 0 -> 1, so no other core can be the owner. If one is, the lock has been
+    // taken without waiting - exactly the defect above - and continuing means
+    // two cores in the kernel believing they are alone. Say so loudly: this
+    // failure is otherwise silent until something far away corrupts.
+    if (bkl_owner != -1 && bkl_owner != cpu) {
+        kprintf("[BKL] THEFT: cpu %d took the lock while cpu %d still owns it "
+                "(depth %u). The BKL is not locking; see #67 pass 10.\n",
+                cpu, (int)bkl_owner, bkl_depth);
+    }
+
+    bkl_owner = cpu;                             // published with IF=0
+    bkl_depth = depth;
+    if ((uint32_t)cpu < BKL_STAT_CPUS) {
+        bkl_hold_start[cpu]    = mono_us();
+        bkl_hold_is_switch[cpu] = from_switch;
+    }
+}
+
 void bkl_acquire(void) {
     int cpu = (int)smp_this_cpu();
     // #264: mask IRQs for the whole acquire so the word=1/owner=unset window can
@@ -814,30 +1087,10 @@ void bkl_acquire(void) {
     // the end. Re-entrant callers (already the owner) are cheap and skip this.
     unsigned long fl; __asm__ volatile("pushfq; pop %0" : "=r"(fl));
     __asm__ volatile("cli");
+    if ((uint32_t)cpu < BKL_STAT_CPUS) g_bkl_acq_pc[cpu]++;
     if (bkl_owner == cpu) { bkl_depth++; if (fl & (1UL << 9)) __asm__ volatile("sti"); return; }
-    // Fast path: take it uncontended. IRQs are masked, so publishing owner/depth
-    // right after the CAS is atomic w.r.t. any handler on this CPU.
-    if (atomic_cas32(&bkl_word, 0, 1) == 0) {
-        bkl_owner = cpu; bkl_depth = 1;
-        if (fl & (1UL << 9)) __asm__ volatile("sti");
-        return;
-    }
-    // Contended. CRITICAL (#279): we may have been entered from interrupt
-    // context (idt.c wraps every ISR in bkl_acquire) with IF=0, or from a Ring-3
-    // syscall/timer with IF=1. Spinning with interrupts masked blocks ALL IRQ
-    // delivery on this CPU, which deadlocks against a holder that is (directly or
-    // indirectly) waiting on an interrupt this CPU would service. So enable
-    // interrupts WHILE waiting, but re-mask + publish owner BEFORE we ever leave
-    // the word=1/owner=unset window, then restore caller IF.
-    for (;;) {
-        __asm__ volatile("sti");
-        while (bkl_word) pause();                     // spin-read with IRQs live
-        __asm__ volatile("cli");
-        if (atomic_cas32(&bkl_word, 0, 1) == 0) break;
-    }
-    bkl_owner = cpu;                                  // published with IF=0
-    bkl_depth = 1;
-    if (fl & (1UL << 9)) __asm__ volatile("sti");     // restore caller IF
+    bkl_take_locked(cpu, 1, 0);
+    if (fl & (1UL << 9)) __asm__ volatile("sti");
 }
 
 void bkl_release(void) {
@@ -848,6 +1101,18 @@ void bkl_release(void) {
     int cpu = (int)smp_this_cpu();
     if (bkl_owner != cpu) { if (fl & (1UL << 9)) __asm__ volatile("sti"); return; }
     if (--bkl_depth == 0) {
+        if ((uint32_t)cpu < BKL_STAT_CPUS && bkl_hold_start[cpu]) {
+            uint64_t held = mono_us() - bkl_hold_start[cpu];
+            bkl_hold_start[cpu] = 0;
+            g_bkl_hold_sum[cpu] += held;
+            if (held > 1000) g_bkl_long[cpu]++;
+            if (held > g_bkl_hold_max[cpu]) {
+                g_bkl_hold_max[cpu]    = held;
+                g_bkl_hold_reason[cpu] = g_bkl_reason[cpu];
+                g_bkl_hold_cpu         = (uint32_t)cpu;
+                g_bkl_hold_from_switch = bkl_hold_is_switch[cpu];
+            }
+        }
         bkl_owner = -1;
         atomic_store32(&bkl_word, 0);
     }
@@ -863,6 +1128,18 @@ uint32_t bkl_release_all(void) {
     int cpu = (int)smp_this_cpu();
     if (bkl_owner != cpu) { if (fl & (1UL << 9)) __asm__ volatile("sti"); return 0; }
     uint32_t d = bkl_depth;
+    if ((uint32_t)cpu < BKL_STAT_CPUS && bkl_hold_start[cpu]) {
+        uint64_t held = mono_us() - bkl_hold_start[cpu];
+        bkl_hold_start[cpu] = 0;
+        g_bkl_hold_sum[cpu] += held;
+        if (held > 1000) g_bkl_long[cpu]++;
+        if (held > g_bkl_hold_max[cpu]) {
+            g_bkl_hold_max[cpu]    = held;
+            g_bkl_hold_reason[cpu] = g_bkl_reason[cpu];
+            g_bkl_hold_cpu         = (uint32_t)cpu;
+            g_bkl_hold_from_switch = bkl_hold_is_switch[cpu];
+        }
+    }
     bkl_depth = 0; bkl_owner = -1;
     atomic_store32(&bkl_word, 0);
     if (fl & (1UL << 9)) __asm__ volatile("sti");
@@ -875,21 +1152,49 @@ void bkl_reacquire(uint32_t depth) {
     // so no nested handler can see word=1 with owner unset.
     unsigned long fl; __asm__ volatile("pushfq; pop %0" : "=r"(fl));
     __asm__ volatile("cli");
-    if (atomic_cas32(&bkl_word, 0, 1) == 0) {
-        bkl_owner = cpu; bkl_depth = depth;
-        if (fl & (1UL << 9)) __asm__ volatile("sti");
-        return;
-    }
-    // Contended: IRQ-friendly spin (see bkl_acquire note).
-    for (;;) {
-        __asm__ volatile("sti");
-        while (bkl_word) pause();
-        __asm__ volatile("cli");
-        if (atomic_cas32(&bkl_word, 0, 1) == 0) break;
-    }
-    bkl_owner = cpu;                                  // published with IF=0
-    bkl_depth = depth;
+    // #67 pass 10: this WAITS now. It used to run the CAS once and publish
+    // ownership regardless of the result. See bkl_take_locked().
+    // from_switch=1: this hold began on the far side of a context switch, which
+    // is what the /swN field in [SCHEDCORE] reports.
+    bkl_take_locked(cpu, depth, 1);
     if (fl & (1UL << 9)) __asm__ volatile("sti");
+}
+
+// #67 pass 9: PROVE THE PROBE READS A KNOWN DURATION.
+//
+// Three instruments in this ticket have misled me: a spin counter on a shared
+// cacheline that was 93% of its own reading, an acquire counter with the same
+// defect, and a hold timer that could not say which core it was timing. The rule
+// now is that a measurement gets validated before it gets believed.
+//
+// This takes the BKL, busies for a known number of microseconds against the
+// SAME clock the probe uses, releases, and prints what the probe recorded. If
+// the reported hold is not close to the requested one the probe is broken and
+// says so on the console, at boot, rather than being trusted for another pass.
+// Runs once, on the BSP, before any AP is scheduling, so it cannot contend.
+void bkl_probe_selftest(void) {
+    const uint64_t want = 5000;   // 5 ms, far above any real hold at boot
+    uint32_t c = smp_this_cpu();
+    if (c >= BKL_STAT_CPUS) { kprintf("[BKLPROBE] SKIPPED (cpu %u out of range)\n", c); return; }
+    uint64_t save_max = g_bkl_hold_max[c];
+    g_bkl_hold_max[c] = 0;
+    bkl_acquire();
+    bkl_set_reason(0x0300u);      // "kernel thread body / other"
+    { uint64_t t0 = mono_us(); while (mono_us() - t0 < want) { /* bounded by the clock */ } }
+    bkl_release();
+    uint64_t got = g_bkl_hold_max[c];
+    // Generous band: this is a correctness check on the probe, not a benchmark.
+    if (got >= (want * 8) / 10 && got <= want * 3) {
+        kprintf("[BKLPROBE] OK: asked %lu us, probe recorded %lu us on cpu %u "
+                "(from_switch=%u reason=0x%x)\n", (unsigned long)want,
+                (unsigned long)got, g_bkl_hold_cpu, g_bkl_hold_from_switch,
+                g_bkl_hold_reason[c]);
+    } else {
+        kprintf("[BKLPROBE] FAILED: asked %lu us, probe recorded %lu us. The BKL "
+                "hold-time probe is WRONG; do not trust maxhold readings from "
+                "this build.\n", (unsigned long)want, (unsigned long)got);
+    }
+    g_bkl_hold_max[c] = save_max;
 }
 
 void kernel_lock_acquire(void) {

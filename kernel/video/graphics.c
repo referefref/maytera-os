@@ -2,6 +2,7 @@
 #include "graphics.h"
 #include "font.h"
 #include "boot_image.h"
+#include "../gui/png.h"
 #include "../fs/fat.h"
 #include "../gui/image.h"
 #include "../serial.h"
@@ -19,8 +20,52 @@ static bool g_disk_boot_image_loaded = false;
 // Track if boot screen needs refresh after image loads
 static bool g_boot_screen_active = false;
 
+// #569 repaint-artifact fix: the boot splash owns the framebuffer ONLY until a
+// real UI takes over. Background workers keep logging long after boot (see
+// drivers/xhci.c: the periodic xhci_rescan_worker calls gfx_boot_log() on every
+// re-enumeration), and each of those calls used to paint the boot-log console
+// into the back buffer and fb_swap_buffers() it to the screen, straight over
+// the login gate or the desktop. That is exactly the reported "glimpse of the
+// boot splash with the verbose boot log" flash. The splash must now OWN the
+// display to draw anything: login_init() and desktop_run() release it, and only
+// an explicit splash call (boot splash, shutdown/restart screen) takes it back.
+// Released calls still record their text and still reach serial + /BOOTLOG.TXT;
+// they simply never touch the framebuffer again.
+static bool g_boot_owns_fb = true;
+
+void gfx_boot_acquire_display(void) { g_boot_owns_fb = true; }
+void gfx_boot_release_display(void) { g_boot_owns_fb = false; }
+bool gfx_boot_owns_display(void)    { return g_boot_owns_fb; }
+
 // External filesystem
 extern fat_fs_t g_fat_fs;
+
+// Block-mosaic a region of the active draw buffer in place (see graphics.h).
+void gfx_mosaic_region(int32_t x, int32_t y, int32_t w, int32_t h, int32_t block) {
+    if (block < 2) block = 2;
+    int32_t fw = (int32_t)fb_get_width();
+    int32_t fh = (int32_t)fb_get_height();
+    if (x < 0) { w += x; x = 0; }
+    if (y < 0) { h += y; y = 0; }
+    if (x + w > fw) w = fw - x;
+    if (y + h > fh) h = fh - y;
+    if (w <= 0 || h <= 0) return;
+
+    for (int32_t by = y; by < y + h; by += block) {
+        int32_t bh = (by + block <= y + h) ? block : (y + h - by);
+        for (int32_t bx = x; bx < x + w; bx += block) {
+            int32_t bw = (bx + block <= x + w) ? block : (x + w - bx);
+            // Sample the cell's center for a slightly more representative tone
+            // than the top-left corner.
+            uint32_t sample = fb_get_pixel(bx + bw / 2, by + bh / 2);
+            for (int32_t yy = 0; yy < bh; yy++) {
+                for (int32_t xx = 0; xx < bw; xx++) {
+                    fb_put_pixel(bx + xx, by + yy, sample);
+                }
+            }
+        }
+    }
+}
 
 // Load boot image from disk (call after filesystem is mounted)
 int gfx_load_boot_image_from_disk(void) {
@@ -338,6 +383,7 @@ void gfx_boot_splash(void) {
     uint32_t h = fb_get_height();
 
     g_boot_splash_shown = 1;
+    g_boot_owns_fb = true;      // #569: an explicit splash takes the screen back
 
     kprintf("[GFX] Boot splash: screen %ux%u\n", w, h);
 
@@ -404,6 +450,7 @@ static int get_boot_bar_y(void) {
 
 // Update boot splash progress (0-100)
 void gfx_boot_progress(int percent) {
+    if (!g_boot_owns_fb) return;   // #569: a real UI owns the screen now
     uint32_t w = fb_get_width();
 
     int bar_y = get_boot_bar_y();
@@ -435,6 +482,7 @@ void gfx_boot_progress(int percent) {
 
 // Update boot status text (shown below loading bar)
 void gfx_boot_status(const char *status) {
+    if (!g_boot_owns_fb) return;   // #569: a real UI owns the screen now
     uint32_t w = fb_get_width();
 
     int bar_y = get_boot_bar_y();
@@ -526,11 +574,21 @@ static void draw_rounded_rect_filled(int x, int y, int w, int h, int radius, uin
     }
 }
 
-// Add message to boot log (scrolling dmesg-style)
-void gfx_boot_log(const char *message) {
+// Add message to boot log (scrolling dmesg-style).
+// #610: `replace` rewrites the LAST line instead of appending one. A live
+// progress readout needs a line that changes in place; appending one line per
+// update would scroll the whole boot log off the screen in a second.
+static void gfx_boot_log_emit(const char *message, int replace);
+void gfx_boot_log(const char *message)         { gfx_boot_log_emit(message, 0); }
+void gfx_boot_log_replace(const char *message) { gfx_boot_log_emit(message, 1); }
+
+static void gfx_boot_log_emit(const char *message, int replace) {
     uint32_t w = fb_get_width();
     uint32_t h = fb_get_height();
 
+    if (replace && boot_log_count > 0) {
+        boot_log_count--;          // overwrite the line we wrote last time
+    }
     // Shift lines up if full
     if (boot_log_count >= BOOT_LOG_MAX_LINES) {
         for (int i = 0; i < BOOT_LOG_MAX_LINES - 1; i++) {
@@ -549,6 +607,10 @@ void gfx_boot_log(const char *message) {
     }
     boot_log_lines[boot_log_count][len] = '\0';
     boot_log_count++;
+
+    // #569: released -> RECORD ONLY. Never paint the boot-log console over
+    // whatever UI now owns the screen (the repaint-artifact fix).
+    if (!g_boot_owns_fb) return;
 
     // Calculate log area position (below loading bar)
     int bar_y = get_boot_bar_y();
@@ -583,6 +645,43 @@ void gfx_boot_log(const char *message) {
     fb_swap_buffers();
 }
 
+// #703: decode the compiled-in splash. Runs at most once, on the first splash
+// draw, which is after heap_init() but deliberately does not depend on it: both
+// buffers are .bss, so this is safe pre-mount and pre-heap. The work itself is
+// the kernel's existing DEFLATE core plus the existing PNG scanline unfilterer
+// (both the Rust ports under -DRUST_INFLATE / -DRUST_PNG), so no new decoder was
+// written for this. Failure is non-fatal: NULL sends the caller to the gradient.
+static uint8_t s_boot_filtered[(BOOT_IMAGE_WIDTH + 1) * BOOT_IMAGE_HEIGHT];
+static uint8_t s_boot_gray[BOOT_IMAGE_WIDTH * BOOT_IMAGE_HEIGHT];
+static int s_boot_gray_state = 0;   // 0 = not tried, 1 = decoded, -1 = failed
+
+const uint8_t *boot_image_gray(void) {
+    if (s_boot_gray_state) {
+        return s_boot_gray_state > 0 ? s_boot_gray : NULL;
+    }
+    s_boot_gray_state = -1;
+
+    if (boot_image_filtered_len != sizeof(s_boot_filtered)) {
+        kprintf("[BootImage] blob geometry mismatch (%u != %u)\n",
+                boot_image_filtered_len, (uint32_t)sizeof(s_boot_filtered));
+        return NULL;
+    }
+    uint32_t got = 0;
+    if (png_inflate_raw(boot_image_deflate, boot_image_deflate_len,
+                        s_boot_filtered, sizeof(s_boot_filtered), &got) != PNG_SUCCESS
+        || got != boot_image_filtered_len) {
+        kprintf("[BootImage] inflate failed (got %u of %u)\n", got, boot_image_filtered_len);
+        return NULL;
+    }
+    if (png_defilter(s_boot_filtered, got, BOOT_IMAGE_WIDTH, BOOT_IMAGE_HEIGHT, 1,
+                     s_boot_gray, sizeof(s_boot_gray)) != PNG_SUCCESS) {
+        kprintf("[BootImage] defilter failed\n");
+        return NULL;
+    }
+    s_boot_gray_state = 1;
+    return s_boot_gray;
+}
+
 // Draw boot image (BOOT.BMP from disk, or gradient fallback)
 // This is the SINGLE source of truth for boot background
 void gfx_draw_boot_image(void) {
@@ -599,14 +698,17 @@ void gfx_draw_boot_image(void) {
     // Fallback (before BOOT.BMP is loaded from disk): the embedded boot splash
     // image (boot-splash-1), scaled fullscreen with nearest-neighbor. This is the
     // very first screen, shown before the filesystem is mounted.
-    if (boot_image_size >= (uint32_t)(BOOT_IMAGE_WIDTH * BOOT_IMAGE_HEIGHT * 3)) {
+    // #703: the embed is now a compressed 8-bit grey plane (see boot_image.h);
+    // boot_image_gray() decodes it once. NULL means the blob did not decode, in
+    // which case we fall through to the gradient below exactly as before.
+    const uint8_t *gray = boot_image_gray();
+    if (gray) {
         for (uint32_t y = 0; y < screen_h; y++) {
             uint32_t sy = y * BOOT_IMAGE_HEIGHT / screen_h;
-            const uint8_t *srow = boot_image_data + (uint64_t)sy * BOOT_IMAGE_WIDTH * 3;
+            const uint8_t *srow = gray + (uint64_t)sy * BOOT_IMAGE_WIDTH;
             for (uint32_t x = 0; x < screen_w; x++) {
-                uint32_t sx = x * BOOT_IMAGE_WIDTH / screen_w;
-                const uint8_t *p = srow + (uint64_t)sx * 3;
-                fb_put_pixel(x, y, FB_COLOR(p[0], p[1], p[2]));
+                uint8_t v = srow[x * BOOT_IMAGE_WIDTH / screen_w];
+                fb_put_pixel(x, y, FB_COLOR(v, v, v));
             }
         }
         return;
@@ -630,6 +732,7 @@ void gfx_boot_simple(void) {
     uint32_t h = fb_get_height();
 
     g_boot_screen_active = true;
+    g_boot_owns_fb = true;      // #569: an explicit splash takes the screen back
 
     // Draw the boot image (BOOT.BMP if loaded, gradient otherwise)
     gfx_draw_boot_image();
@@ -662,6 +765,7 @@ void gfx_boot_simple(void) {
 // Refresh boot screen after BOOT.BMP is loaded
 // Call this after gfx_load_boot_image_from_disk() succeeds
 void gfx_boot_refresh(void) {
+    if (!g_boot_owns_fb) return;   // #569: a real UI owns the screen now
     if (!g_boot_screen_active) return;
 
     // Redraw the entire boot screen with BOOT.BMP background
@@ -674,6 +778,7 @@ void gfx_boot_spinner(int frame) {
     // Once the graphical boot splash has been shown, never redraw the spinner
     // over it (the progress bar + log text remain fine).
     if (g_boot_splash_shown) return;
+    if (!g_boot_owns_fb) return;   // #569: a real UI owns the screen now
 
     uint32_t w = fb_get_width();
     uint32_t h = fb_get_height();
@@ -712,15 +817,17 @@ void gfx_boot_spinner(int frame) {
     } else {
         // Redraw from the embedded boot splash so the spinner shows the actual
         // image behind it (transparent look) instead of a gradient patch.
-        for (int y = clear_y1; y < clear_y1 + clear_h && y < (int)h; y++) {
+        // #703: same decoded grey plane as gfx_draw_boot_image(); already cached
+        // by the time the spinner animates, so this costs one pointer test.
+        const uint8_t *gray = boot_image_gray();
+        for (int y = clear_y1; gray && y < clear_y1 + clear_h && y < (int)h; y++) {
             if (y < 0) continue;
             uint32_t sy = (uint32_t)y * BOOT_IMAGE_HEIGHT / h;
-            const uint8_t *srow = boot_image_data + (uint64_t)sy * BOOT_IMAGE_WIDTH * 3;
+            const uint8_t *srow = gray + (uint64_t)sy * BOOT_IMAGE_WIDTH;
             for (int x = clear_x1; x < clear_x1 + clear_w && x < (int)w; x++) {
                 if (x < 0) continue;
-                uint32_t sx = (uint32_t)x * BOOT_IMAGE_WIDTH / w;
-                const uint8_t *p = srow + (uint64_t)sx * 3;
-                fb_put_pixel(x, y, FB_COLOR(p[0], p[1], p[2]));
+                uint8_t v = srow[(uint32_t)x * BOOT_IMAGE_WIDTH / w];
+                fb_put_pixel(x, y, FB_COLOR(v, v, v));
             }
         }
     }

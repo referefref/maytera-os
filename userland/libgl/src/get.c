@@ -152,21 +152,17 @@ const GLubyte* extensions_string =
 																						 "TGL_SELECT "
 #endif
 																						 "TGL_SOFTWARE_ACCELERATED";
-const GLubyte* glGetString(GLenum name) {
-	switch (name) {
-	case GL_VENDOR:
-		return vendor_string;
-	case GL_RENDERER:
-		return renderer_string;
-	case GL_VERSION:
-		return version_string;
-	case GL_EXTENSIONS:
-		return extensions_string;
-	case GL_LICENSE:
-		return license_string;
-	}
-	return NULL;
-}
+// AssaultCube port phase 3 (docs/ASSAULTCUBE_PORT_PLAN.md): this file's own
+// glGetString(), pre-existing, was a SECOND definition of a symbol phase 2
+// already added for real in state_ext.c (see that file's own "glGetString:
+// real, static strings" comment), a genuine pre-existing duplicate-symbol
+// bug in this shared tree that only surfaced once something (this port)
+// finally linked far enough to pull in both state_ext.o and get.o. Removed
+// here rather than in state_ext.c because state_ext.c's version is the one
+// PORT-STATUS.md documents as the real implementation; the
+// vendor_string/renderer_string/version_string/extensions_string/
+// license_string globals above are left in place (harmless, and something
+// else in this file may still reference them).
 
 
 

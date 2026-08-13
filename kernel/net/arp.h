@@ -79,6 +79,12 @@ void arp_request(uint32_t ip);
 // Resolve IP to MAC (returns 1 if found, 0 if pending)
 int arp_resolve(uint32_t ip, uint8_t *mac);
 
+// #745 (task #62): CACHE-ONLY lookup. arp_resolve() SENDS an ARP request on a
+// miss, which makes it unusable from a diagnostic or any read-only path (and
+// on a shared LAN, #380, an unintended transmit is a real hazard). Returns 1
+// and fills mac if the entry is cached, 0 otherwise. Never transmits.
+int arp_lookup_cached(uint32_t ip, uint8_t *mac);
+
 // #333: hold a packet whose next-hop MAC is not yet resolved; it is flushed
 // by arp_flush_ready() (called from net_poll) once the ARP reply lands. type is
 // the ethertype.

@@ -11,6 +11,7 @@
 #include "vfs.h"
 #include "ext2.h"
 #include "../string.h"
+#include "../security/uaccess_smap.h"  // #19/#645: AC bracket on the caller-buffer copy
 
 extern void *kmalloc(unsigned long size);
 extern void  kfree(void *ptr);
@@ -31,7 +32,10 @@ static int64_t e2v_read(file_t *f, void *buf, size_t count) {
     if (v->pos >= v->size) return 0;
     uint32_t avail = v->size - v->pos;
     uint32_t n = (count < (size_t)avail) ? (uint32_t)count : avail;
-    memcpy(buf, v->buf + v->pos, n);
+    // #19/#645: `buf` is the caller's buffer (Ring-3 via sys_read).
+    {   uaccess_ac_t __ac = uaccess_begin();
+        memcpy(buf, v->buf + v->pos, n);
+        uaccess_end(__ac); }
     v->pos += n;
     return (int64_t)n;
 }
@@ -53,7 +57,10 @@ static int64_t e2v_write(file_t *f, const void *buf, size_t count) {
     if (!v || !v->writable) return -1;
     if (count == 0) return 0;
     if (e2v_grow(v, v->pos + (uint32_t)count) != 0) return -1;
-    memcpy(v->buf + v->pos, buf, count);
+    // #19/#645: `buf` is the caller's buffer (Ring-3 via sys_write).
+    {   uaccess_ac_t __ac = uaccess_begin();
+        memcpy(v->buf + v->pos, buf, count);
+        uaccess_end(__ac); }
     v->pos += (uint32_t)count;
     if (v->pos > v->size) v->size = v->pos;
     v->dirty = 1;
@@ -73,15 +80,37 @@ static int64_t e2v_seek(file_t *f, int64_t offset, int whence) {
     return np;
 }
 
-static void e2v_release(file_t *f) {
+// #695 Phase 1: THE ext2 flush. There is exactly one, and release() is defined
+// as flush() + teardown below, so an fsync and a close cannot report different
+// things about the same buffer.
+//
+// Idempotent by construction: a successful commit clears `dirty`, so a second
+// fsync, and the close that follows, do nothing and return 0. That is what lets
+// a caller write -> fsync -> check -> clear its own dirty flag, and still close
+// afterwards without writing the bytes a second time.
+static int e2v_flush(file_t *f) {
     ext2_vfile_t *v = (ext2_vfile_t *)f->priv;
-    if (!v) return;
-    if (v->dirty && v->writable) {
-        ext2_write_file(v->path, v->buf ? (const void *)v->buf : (const void *)"", v->size);
-    }
+    if (!v) return 0;
+    if (!v->dirty || !v->writable) return 0;
+    // Negative EXT2_E_* on failure (#695 Phase 0 split IO -4 from NOSPC -5).
+    // The destination is now EMPTY or ABSENT and is NEVER the old contents:
+    // ext2_write_file() frees the old data blocks before writing the new ones,
+    // and its ENOSPC rollback leaves a valid ZERO-BYTE file.
+    int rc = ext2_write_file(v->path, v->buf ? (const void *)v->buf : (const void *)"", v->size);
+    if (rc != 0) return rc;
+    v->dirty = 0;
+    return 0;
+}
+
+static int e2v_release(file_t *f) {
+    ext2_vfile_t *v = (ext2_vfile_t *)f->priv;
+    if (!v) return 0;
+    int rc = e2v_flush(f);
+    // Teardown is unconditional. A failed flush must never leak the buffer.
     if (v->buf) kfree(v->buf);
     kfree(v);
     f->priv = NULL;
+    return rc;
 }
 
 static const file_ops_t ext2_vfs_ops = {
@@ -89,6 +118,7 @@ static const file_ops_t ext2_vfs_ops = {
     .write   = e2v_write,
     .seek    = e2v_seek,
     .ioctl   = NULL,
+    .flush   = e2v_flush,
     .release = e2v_release,
     .poll    = NULL,
 };

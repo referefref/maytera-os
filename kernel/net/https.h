@@ -57,6 +57,9 @@ const char *https_strerror(int error);
 // body_len_out: Receives body length
 // status_out: Receives HTTP status code
 int https_get(const char *url, uint8_t **body_out, uint32_t *body_len_out, int *status_out);
+// #576: header/Range-capable GET over the same TLS transport.
+int https_get_hdr(const char *url, const char *extra_headers,
+                  uint8_t **body_out, uint32_t *body_len_out, int *status_out);
 
 // HTTPS POST: send `body` with caller-supplied extra `headers` (CRLF-terminated
 // lines, e.g. "Authorization: Bearer X\r\nContent-Type: application/json\r\n").

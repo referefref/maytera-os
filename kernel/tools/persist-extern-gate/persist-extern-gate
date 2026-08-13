@@ -1,0 +1,180 @@
+#!/usr/bin/env python3
+"""persist-extern-gate - FAIL THE BUILD on a private `extern` re-declaration of
+a guarded persistence symbol.
+
+WHY THIS EXISTS
+---------------
+#693 put warn_unused_result (MUST_CHECK) on the persistence primitives, which
+with -Werror is a compiler-enforced control and cannot drift the way a lint can.
+It has ONE hole, and the hole is not theoretical: it cost that pass real
+coverage twice in a row.
+
+    A .c file that declares the function ITSELF, instead of including the header
+    that owns it, does not see the attribute. The whole file is silently opted
+    out, permanently, and nothing says so.
+
+MEASURED on gcc 12.2, in this tree:
+
+  * #695 found three `extern void file_put(struct file*)` declarations that did
+    not fail to compile even though file_put returns int, because void and int
+    are ABI-compatible on x86-64 SysV.
+  * #693's first attribute build flagged 41 sites. The truth was 57. Sixteen
+    hid in gui/terminal.c, net/ssh/ssh2.c and net/ssh/ssh2_server.c behind
+    exactly this pattern. One of them declared file_write as (void*, long)
+    against the real (file_t*, int64_t) - wrong pointer type, wrong width - and
+    compiled AND linked with no diagnostic at all.
+  * #742 changed bootlog_write() from void to int while 46 private externs of
+    it existed, two of which also had the wrong VARIADIC-ness. Every one of
+    them would have compiled and linked against the old signature.
+
+So the corollary that makes this a gate and not a style rule: CHANGING A GUARDED
+FUNCTION'S RETURN TYPE WHILE A PRIVATE EXTERN OF IT EXISTS COMPILES AND LINKS
+SILENTLY. The attribute cannot defend itself. This can.
+
+The guarded set is deliberately NARROW (persistence primitives, listed in
+persist-extern.manifest), not "all 963 private externs in the kernel". A gate
+that fails on things nobody intends to fix gets disabled, and then it is #514
+all over again.
+
+Placement follows rust-symbol-gate and syscall-dispatch-gate: the tool lives
+INSIDE kernel/ so it runs wherever the kernel is actually built.
+
+Exit 0 clean, 1 violation, 2 cannot run (fail closed).
+"""
+import os, re, sys
+
+def load_manifest(path):
+    syms = []
+    try:
+        for line in open(path):
+            line = line.split('#', 1)[0].strip()
+            if line:
+                syms.append(line)
+    except OSError as e:
+        print("persist-extern-gate: CANNOT READ manifest %s: %s" % (path, e))
+        print("       A gate that skips silently is how the hole reopens.")
+        sys.exit(2)
+    if not syms:
+        print("persist-extern-gate: manifest %s is EMPTY - refusing to pass" % path)
+        sys.exit(2)
+    return syms
+
+def scan(root, syms, require=True):
+    # FAIL CLOSED on a root that is not there. Without this the gate reports a
+    # confident GREEN after scanning nothing, which is precisely how #514's
+    # concurrency lint spent months "passing": it was invoked with a path that
+    # did not exist on the build container. A wrong --root must be an ERROR,
+    # never a pass.
+    if require and not os.path.isdir(root):
+        print("persist-extern-gate: --root %r is not a directory. Refusing to"
+              " report a result: a gate that scans nothing and says OK is worse"
+              " than no gate (#514)." % root)
+        sys.exit(2)
+    return _scan(root, syms)
+
+def _scan(root, syms):
+    # `extern` at statement or file scope, followed anywhere before the ';' by
+    # the symbol name immediately preceding a '('. Matches both the file-scope
+    # form and the inside-a-function form, which is the one that hides best.
+    pat = re.compile(r'\bextern\b[^;{}]*?\b(' + '|'.join(re.escape(s) for s in syms) + r')\s*\(')
+    hits = []
+    for dp, dn, fn in os.walk(root):
+        for f in sorted(fn):
+            if not (f.endswith('.c') or f.endswith('.h')):
+                continue
+            p = os.path.join(dp, f)
+            for i, line in enumerate(open(p, errors='replace'), 1):
+                s = line.strip()
+                if s.startswith('//') or s.startswith('*'):
+                    continue
+                m = pat.search(line)
+                if m:
+                    hits.append((p, i, m.group(1), s))
+    return hits
+
+def main():
+    a = sys.argv[1:]
+    root = 'kernel'
+    manifest = 'persist-extern.manifest'
+    selftest = False
+    i = 0
+    while i < len(a):
+        if a[i] == '--root':     root = a[i+1]; i += 2
+        elif a[i] == '--manifest': manifest = a[i+1]; i += 2
+        elif a[i] == '--self-test': selftest = True; i += 1
+        else:
+            print("persist-extern-gate: unknown argument %r" % a[i]); sys.exit(2)
+
+    syms = load_manifest(manifest)
+
+    if selftest:
+        # PROVE the gate is trustworthy: RED on a synthetic violation of EVERY
+        # guarded symbol, GREEN on the real tree. A gate never seen to fail is
+        # not a gate.
+        import tempfile, shutil
+        tmp = tempfile.mkdtemp(prefix='pegate-selftest-')
+        try:
+            bad = 0
+            for s in syms:
+                d = os.path.join(tmp, s)
+                os.makedirs(d)
+                # the file-scope form
+                open(os.path.join(d, 'a.c'), 'w').write(
+                    '#include "x.h"\nextern int %s(int a);\nint f(void){return 0;}\n' % s)
+                # the inside-a-function form, which is the one that hides
+                open(os.path.join(d, 'b.c'), 'w').write(
+                    'int g(void) {\n    extern void %s(const char *fmt, ...);\n    return 0;\n}\n' % s)
+            h = scan(tmp, syms)   # the planted-violation tree
+            got = set(x[2] for x in h)
+            missing = [s for s in syms if s not in got]
+            if missing:
+                print("persist-extern-gate SELF-TEST FAILED: did NOT detect a planted")
+                print("  private extern of: %s" % ', '.join(missing))
+                sys.exit(1)
+            if len(h) != 2 * len(syms):
+                print("persist-extern-gate SELF-TEST FAILED: planted %d, detected %d"
+                      % (2 * len(syms), len(h)))
+                sys.exit(1)
+            print("persist-extern-gate SELF-TEST: RED on %d planted violations "
+                  "(both the file-scope and the inside-a-function form) for all "
+                  "%d guarded symbols." % (len(h), len(syms)))
+            bad = len(scan(root, syms))
+            if bad:
+                print("persist-extern-gate SELF-TEST: but the REAL tree is RED too "
+                      "(%d), so GREEN was not demonstrated. Fix the tree." % bad)
+                sys.exit(1)
+            print("persist-extern-gate SELF-TEST: GREEN on the real tree (%s). "
+                  "The gate distinguishes the two. PASS." % root)
+            sys.exit(0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    hits = scan(root, syms)
+    if not hits:
+        print("persist-extern-gate: OK - no private extern of any of the %d "
+              "guarded persistence symbols." % len(syms))
+        sys.exit(0)
+
+    print("persist-extern-gate: FAILED - %d private extern declaration(s) of a "
+          "guarded persistence symbol.\n" % len(hits))
+    for p, i, s, txt in hits:
+        print("  %s:%d  [%s]\n      %s" % (p, i, s, txt))
+    print("""
+A private extern does TWO harmful things at once:
+
+  1. It opts this whole .c file out of the owning header's MUST_CHECK
+     (warn_unused_result), so a discarded persistence result in this file will
+     never fail the build again. That is not a hypothetical: it is how #693's
+     first count came out at 41 when the truth was 57.
+
+  2. It compiles and links against a signature YOU wrote rather than the real
+     one. void vs int is ABI-compatible on x86-64 SysV, and so is a wrong
+     pointer type, so the mismatch is SILENT.
+
+FIX: delete the declaration and include the owning header instead. Every kernel
+.c file is compiled with -I. from kernel/, so `#include "fs/bootlog.h"` (or
+"fs/vfs.h", "fs/fat.h", ...) works from anywhere in the tree.
+""")
+    sys.exit(1)
+
+main()

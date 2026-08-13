@@ -160,151 +160,16 @@ void console_puts(const char *str) {
 
 // Printf-style printing
 void console_printf(const char *fmt, ...) {
+    // #672: was a private parser with no flag or width support. Routed through
+    // the one shared parser (vsnprintf -> kvformat). Buffered, unlike kprintf,
+    // because console_puts() is this console's only entry point.
     char buf[1024];
     va_list args;
-
     va_start(args, fmt);
-
-    // Simple format string parsing
-    char *out = buf;
-    char *end = buf + sizeof(buf) - 1;
-
-    while (*fmt && out < end) {
-        if (*fmt != '%') {
-            *out++ = *fmt++;
-            continue;
-        }
-
-        fmt++;  // Skip '%'
-
-        // Handle format specifier
-        switch (*fmt) {
-            case 'd':
-            case 'i': {
-                int val = va_arg(args, int);
-                char num[32];
-                int negative = 0;
-                if (val < 0) {
-                    negative = 1;
-                    val = -val;
-                }
-                int i = 0;
-                do {
-                    num[i++] = '0' + (val % 10);
-                    val /= 10;
-                } while (val > 0);
-                if (negative) num[i++] = '-';
-                while (i > 0 && out < end) {
-                    *out++ = num[--i];
-                }
-                break;
-            }
-
-            case 'u': {
-                unsigned int val = va_arg(args, unsigned int);
-                char num[32];
-                int i = 0;
-                do {
-                    num[i++] = '0' + (val % 10);
-                    val /= 10;
-                } while (val > 0);
-                while (i > 0 && out < end) {
-                    *out++ = num[--i];
-                }
-                break;
-            }
-
-            case 'x':
-            case 'X': {
-                unsigned int val = va_arg(args, unsigned int);
-                const char *hex_chars = (*fmt == 'X') ? "0123456789ABCDEF" : "0123456789abcdef";
-                char num[32];
-                int i = 0;
-                do {
-                    num[i++] = hex_chars[val & 0xF];
-                    val >>= 4;
-                } while (val > 0);
-                while (i > 0 && out < end) {
-                    *out++ = num[--i];
-                }
-                break;
-            }
-
-            case 'l': {
-                fmt++;
-                if (*fmt == 'u' || *fmt == 'x') {
-                    uint64_t val = va_arg(args, uint64_t);
-                    const char *hex_chars = "0123456789abcdef";
-                    char num[32];
-                    int i = 0;
-                    if (*fmt == 'u') {
-                        do {
-                            num[i++] = '0' + (val % 10);
-                            val /= 10;
-                        } while (val > 0);
-                    } else {
-                        do {
-                            num[i++] = hex_chars[val & 0xF];
-                            val >>= 4;
-                        } while (val > 0);
-                    }
-                    while (i > 0 && out < end) {
-                        *out++ = num[--i];
-                    }
-                }
-                break;
-            }
-
-            case 's': {
-                const char *s = va_arg(args, const char *);
-                if (!s) s = "(null)";
-                while (*s && out < end) {
-                    *out++ = *s++;
-                }
-                break;
-            }
-
-            case 'c': {
-                char c = (char)va_arg(args, int);
-                if (out < end) *out++ = c;
-                break;
-            }
-
-            case 'p': {
-                uint64_t val = (uint64_t)va_arg(args, void *);
-                if (out + 2 < end) {
-                    *out++ = '0';
-                    *out++ = 'x';
-                }
-                char num[32];
-                int i = 0;
-                do {
-                    num[i++] = "0123456789abcdef"[val & 0xF];
-                    val >>= 4;
-                } while (val > 0);
-                while (i > 0 && out < end) {
-                    *out++ = num[--i];
-                }
-                break;
-            }
-
-            case '%':
-                if (out < end) *out++ = '%';
-                break;
-
-            default:
-                if (out < end) *out++ = '%';
-                if (out < end) *out++ = *fmt;
-                break;
-        }
-
-        fmt++;
-    }
-
-    *out = '\0';
+    vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
-
     console_puts(buf);
+
 }
 
 // Set text colors

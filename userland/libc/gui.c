@@ -1,8 +1,13 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // gui.c - GUI library implementation for MayteraOS user-space applications
 // Provides high-level GUI wrappers around window syscalls
 #include "gui.h"
 #include "syscall.h"
 #include "string.h"
+#include "gui_scroll.h"   // gui_scroll_thumb_ink: ONE scrollbar contrast rule
 
 // ============================================================================
 // Window Protocol Client Implementation
@@ -202,9 +207,16 @@ void gui_draw_scrollbar_v(int handle, int x, int y, int height,
     // Background
     win_draw_rect(handle, x, y, scroll_width, height, bg_color);
 
-    // Thumb
-    win_draw_rect(handle, x + 2, y + thumb_pos, scroll_width - 4, thumb_size, 0x00808080);
-    gui_draw_rect(handle, x + 2, y + thumb_pos, scroll_width - 4, thumb_size, 0x00404040);
+    // Thumb. These were two hardcoded greys, which is theme-blind by
+    // construction: 0x808080 on a dark theme's dark gutter is the same class
+    // of invisible thumb that #745 item 77 fixed in the shared widget. This
+    // predates gui_scroll.c and the installer still calls it, so it is routed
+    // through the SAME rule rather than given its own second-best fix.
+    uint32_t thumb_c = gui_scroll_thumb_ink(theme_color(THEME_COLOR_SCROLLBAR_THUMB),
+                                            bg_color, bg_color);
+    win_draw_rect(handle, x + 2, y + thumb_pos, scroll_width - 4, thumb_size, thumb_c);
+    gui_draw_rect(handle, x + 2, y + thumb_pos, scroll_width - 4, thumb_size,
+                  gui_scroll_thumb_ink(thumb_c, thumb_c, bg_color));
 }
 
 // ============================================================================
@@ -311,10 +323,20 @@ void fb_set_exclusive(int enable) {
 // ============================================================================
 #include "gui_style.h"
 
-static ui_style_t   g_style = { GUI_STYLE_MODERN, GUI_RADIUS, true, true };
+// #711: GUI_RADIUS is a theme read now, not an integer constant expression,
+// so the static initialiser carries the fallback and gui_set_style() /
+// gui_style_sync_from_theme() replace it with the file value.
+static ui_style_t   g_style = { GUI_STYLE_MODERN, GUI_RADIUS_FALLBACK, true, true };
+// (#745) The FALLBACK palette, used by every GUI app that never calls
+// gui_set_palette(). Its old focus/boundary story measured, on its own
+// surface #252525: accent-as-focus-ring 2.89:1, border 1.90:1, track 1.48:1,
+// all below the 3:1 non-text floor. focus #5C9BD6 (5.19:1) and edge_strong
+// #7A7A7A (3.57:1) are stated here rather than left to the repair pass so the
+// static initialiser is correct on its own terms and readable as a spec.
 static gui_palette_t g_pal = {
     0x00252525, 0x002A2A2A, 0x00FFFFFF, 0x00AAAAAA,
-    0x003A6EA5, 0x004A7EB5, 0x00505050, 0x00333333, 0x00505050, 0x00404040
+    0x003A6EA5, 0x004A7EB5, 0x00505050, 0x00333333, 0x00505050, 0x00404040,
+    0x005C9BD6, 0x007A7A7A
 };
 
 void gui_set_style(gui_base_style_t base) {
@@ -322,8 +344,63 @@ void gui_set_style(gui_base_style_t base) {
     if (base == GUI_STYLE_MODERN) { g_style.radius = GUI_RADIUS; g_style.gradients = true; g_style.shadows = true; }
     else { g_style.radius = 0; g_style.gradients = false; g_style.shadows = false; } // classic + flat
 }
+
+// #711: the family used to be a compiled choice with a compiled radius/gradient
+// /shadow triple baked into gui_set_style() above. This reads the same three
+// decisions out of the ACTIVE .mtheme file instead (decor.style, radius.card),
+// so a theme can ask for beveled/flat/gradient chrome without an app rebuild.
+// Shadows stay OFF unconditionally: window shadows were removed by explicit
+// user decision (#189) and the renderer has no soft-shadow primitive, so the
+// elevation model is (surface token, border token) pairs, never a shadow.
+void gui_style_sync_from_theme(void) {
+    int d = theme_metric(THEME_METRIC_DECOR_STYLE);
+    g_style.base      = (d == THEME_DECOR_BEVELED) ? GUI_STYLE_CLASSIC
+                      : (d == THEME_DECOR_FLAT)    ? GUI_STYLE_FLAT
+                                                   : GUI_STYLE_MODERN;
+    g_style.radius    = GUI_RADIUS;
+    g_style.gradients = (d == THEME_DECOR_GRADIENT);
+    g_style.shadows   = false;
+}
 ui_style_t gui_active_style(void) { return g_style; }
-void gui_set_palette(const gui_palette_t *p) { if (p) g_pal = *p; }
+// (#745) A palette is DATA, most of it read out of a .mtheme file, and a theme
+// file cannot be trusted to clear an accessibility floor: measured across the
+// 14 shipped themes, color.focus_ring was below 3:1 against its own surface in
+// 3 of them. So the engine REPAIRS rather than trusts, the same belt-and-braces
+// shape the kernel already uses (theme_ensure_contrast() at load time, checked
+// again at commit time by build/assets/theme-scale-lint.sh).
+//
+// focus and edge_strong are derived here and NEVER read from *p: see the
+// comment on those fields in gui_style.h. The theme's authored ring is picked
+// up by libc itself via theme_color(), not passed in by the caller, so no app
+// has to be edited for this to take effect and no app can half-adopt it. An
+// older kernel that does not know the id falls through to window_bg; that is
+// detected below and replaced by accent before the repair runs, so the ring
+// degrades to the app's own accent raised to floor, never to invisible.
+void gui_set_palette(const gui_palette_t *p) {
+    if (!p) return;
+    g_pal = *p;
+    uint32_t ring = theme_color(THEME_COLOR_FOCUS_RING);
+    // An older kernel that does not know this id falls through to window_bg.
+    // Detect that by the property that makes the answer useless rather than by
+    // the floor: an echoed background is INDISTINGUISHABLE from the surface.
+    // Testing the 3:1 floor here would have been wrong, because a theme is
+    // allowed to author a weak ring (3 of the 14 shipped ones did) and the
+    // repair below is what fixes those; throwing the hue away as well would
+    // lose the theme's identity for no reason. Every one of the 14 shipped
+    // rings clears 1.2:1 against its own surface, the weakest being Dark's
+    // pre-#745 1.76:1.
+    if (gui_contrast_x100(ring, g_pal.surface) < 120) ring = g_pal.accent;
+    g_pal.focus = gui_ensure_contrast2(ring, g_pal.surface, g_pal.surface_raised,
+                                       GUI_FLOOR_NONTEXT);
+    g_pal.edge_strong = gui_ensure_contrast(g_pal.border, g_pal.surface,
+                                            GUI_FLOOR_NONTEXT);
+    // field_border is repaired IN PLACE rather than replaced: an input's fill
+    // sits within ~1.3:1 of the surface on every dark theme, so the outline is
+    // the whole boundary. p->border is deliberately left alone, because it also
+    // draws dividers and hairlines where a quiet line is the correct design.
+    g_pal.field_border = gui_ensure_contrast(g_pal.field_border, g_pal.surface,
+                                             GUI_FLOOR_NONTEXT);
+}
 gui_palette_t *gui_pal(void) { return &g_pal; }
 
 uint32_t gui_mix(uint32_t a, uint32_t b, int t) {
@@ -344,6 +421,97 @@ uint32_t gui_ink_on(uint32_t bg) {
     return lum > 140 ? 0x00141414 : 0x00F4F4F4;
 }
 
+// --- (#745) WCAG contrast, integer-only. See gui_style.h for the contract. ---
+// sRGB -> linear, scaled to 0..65535. Generated, not typed: see the generator
+// in the #745 patch script. Table (512 bytes) not powf() because the freestanding
+// libc has no float runtime it can rely on.
+static const uint16_t gs_srgb_lin[256] = {
+        0,    20,    40,    60,    80,    99,   119,   139,
+      159,   179,   199,   219,   241,   264,   288,   313,
+      340,   367,   396,   427,   458,   491,   526,   562,
+      599,   637,   677,   718,   761,   805,   851,   898,
+      947,   997,  1048,  1101,  1156,  1212,  1270,  1330,
+     1391,  1453,  1517,  1583,  1651,  1720,  1790,  1863,
+     1937,  2013,  2090,  2170,  2250,  2333,  2418,  2504,
+     2592,  2681,  2773,  2866,  2961,  3058,  3157,  3258,
+     3360,  3464,  3570,  3678,  3788,  3900,  4014,  4129,
+     4247,  4366,  4488,  4611,  4736,  4864,  4993,  5124,
+     5257,  5392,  5530,  5669,  5810,  5953,  6099,  6246,
+     6395,  6547,  6700,  6856,  7014,  7174,  7335,  7500,
+     7666,  7834,  8004,  8177,  8352,  8528,  8708,  8889,
+     9072,  9258,  9445,  9635,  9828, 10022, 10219, 10417,
+    10619, 10822, 11028, 11235, 11446, 11658, 11873, 12090,
+    12309, 12530, 12754, 12980, 13209, 13440, 13673, 13909,
+    14146, 14387, 14629, 14874, 15122, 15371, 15623, 15878,
+    16135, 16394, 16656, 16920, 17187, 17456, 17727, 18001,
+    18277, 18556, 18837, 19121, 19407, 19696, 19987, 20281,
+    20577, 20876, 21177, 21481, 21787, 22096, 22407, 22721,
+    23038, 23357, 23678, 24002, 24329, 24658, 24990, 25325,
+    25662, 26001, 26344, 26688, 27036, 27386, 27739, 28094,
+    28452, 28813, 29176, 29542, 29911, 30282, 30656, 31033,
+    31412, 31794, 32179, 32567, 32957, 33350, 33745, 34143,
+    34544, 34948, 35355, 35764, 36176, 36591, 37008, 37429,
+    37852, 38278, 38706, 39138, 39572, 40009, 40449, 40891,
+    41337, 41785, 42236, 42690, 43147, 43606, 44069, 44534,
+    45002, 45473, 45947, 46423, 46903, 47385, 47871, 48359,
+    48850, 49344, 49841, 50341, 50844, 51349, 51858, 52369,
+    52884, 53401, 53921, 54445, 54971, 55500, 56032, 56567,
+    57105, 57646, 58190, 58737, 59287, 59840, 60396, 60955,
+    61517, 62082, 62650, 63221, 63795, 64372, 64952, 65535,
+};
+
+uint32_t gui_luma_wcag(uint32_t rgb) {
+    uint32_t r = gs_srgb_lin[(rgb >> 16) & 0xFF];
+    uint32_t g = gs_srgb_lin[(rgb >> 8)  & 0xFF];
+    uint32_t b = gs_srgb_lin[ rgb        & 0xFF];
+    // 0.2126/0.7152/0.0722 in ten-thousandths. Max value 10000*65535 fits u32.
+    return (2126u * r + 7152u * g + 722u * b) / 10000u;
+}
+
+// (L_hi + 0.05) / (L_lo + 0.05), x100. 0.05 * 65535 = 3277.
+int gui_contrast_x100(uint32_t a, uint32_t b) {
+    uint32_t la = gui_luma_wcag(a) + 3277u;
+    uint32_t lb = gui_luma_wcag(b) + 3277u;
+    if (la < lb) { uint32_t t = la; la = lb; lb = t; }
+    return (int)((la * 100u) / lb);
+}
+
+// Below this background luminance, mixing toward white beats mixing toward
+// black. Solving (L+0.05)^2 == 1.05*0.05 gives L = 0.1791 -> 11738/65535.
+#define GS_WHITE_WINS 11738u
+
+uint32_t gui_ensure_contrast(uint32_t fg, uint32_t bg, int min_x100) {
+    if (gui_contrast_x100(fg, bg) >= min_x100) return fg;
+    uint32_t target = (gui_luma_wcag(bg) < GS_WHITE_WINS) ? 0x00FFFFFF : 0x00000000;
+    for (int t = 8; t < 256; t += 8) {
+        uint32_t c = gui_mix(fg, target, t);
+        if (gui_contrast_x100(c, bg) >= min_x100) return c;
+    }
+    return target;
+}
+
+uint32_t gui_ensure_contrast2(uint32_t fg, uint32_t bg1, uint32_t bg2, int min_x100) {
+    int c1 = gui_contrast_x100(fg, bg1), c2 = gui_contrast_x100(fg, bg2);
+    int worst = (c1 < c2) ? c1 : c2;
+    if (worst >= min_x100) return fg;
+    // Try both directions and keep the SMALLER mix that clears, so the theme's
+    // hue is disturbed as little as the floor allows. If neither direction can
+    // satisfy both backgrounds (they would have to straddle the whole range),
+    // keep whichever candidate maximised the worse of the two.
+    uint32_t best = fg; int best_worst = worst, best_t = 256; uint32_t best_clear = 0;
+    for (int d = 0; d < 2; d++) {
+        uint32_t target = d ? 0x00000000 : 0x00FFFFFF;
+        for (int t = 8; t < 256; t += 8) {
+            uint32_t k = gui_mix(fg, target, t);
+            int k1 = gui_contrast_x100(k, bg1), k2 = gui_contrast_x100(k, bg2);
+            int kw = (k1 < k2) ? k1 : k2;
+            if (kw > best_worst) { best_worst = kw; best = k; }
+            if (kw >= min_x100) { if (t < best_t) { best_t = t; best_clear = k; } break; }
+        }
+    }
+    return best_t < 256 ? best_clear : best;
+}
+
 static int gs_isqrt(int n) { if (n<=0) return 0; int x=n, y=(x+1)/2; while (y<x){ x=y; y=(x+n/x)/2; } return x; }
 static int gs_corner_inset(int r, int d) {
     if (r <= 0) return 0;
@@ -351,7 +519,13 @@ static int gs_corner_inset(int r, int d) {
     int dx = r - gs_isqrt(r*r - dy*dy);
     return dx < 0 ? 0 : dx;
 }
-static void gs_line(int handle, int x0, int y0, int x1, int y1, uint32_t col) {
+// #306: exported (was gs_line, file-static). Any arbitrary-angle stroke is a
+// primitive every app needs (gui_checkbox's tick was the only caller and had
+// no way to hand it out), so this is promoted into the shared API in
+// gui_style.h rather than forking a private Bresenham copy into a new app.
+// gs_line kept as a macro alias so the two pre-existing in-file callers below
+// do not need touching.
+void gui_line(int handle, int x0, int y0, int x1, int y1, uint32_t col) {
     int dx = x1>x0?x1-x0:x0-x1, sx = x0<x1?1:-1;
     int dy = y1>y0?y1-y0:y0-y1, sy = y0<y1?1:-1;
     int err = (dx>dy?dx:-dy)/2, e2;
@@ -363,6 +537,22 @@ static void gs_line(int handle, int x0, int y0, int x1, int y1, uint32_t col) {
         if (e2 <  dy) { err += dx; y0 += sy; }
     }
 }
+#define gs_line gui_line
+
+// Draw an arbitrary-angle stroke with approximate thickness (odd px, small).
+// Bundles gui_line() copies offset by -(t/2)..+(t/2) in BOTH axes (a small
+// "plus" of parallel copies) so the visual thickness holds up at any angle,
+// unlike offsetting a single axis (which thins out near 45 degrees). Used by
+// the installer's done-screen check/X result glyph (#306), which is drawn as
+// real strokes rather than a font character so it is guaranteed present at
+// size regardless of font coverage (see docs/INSTALLER_UI_DESIGN.html 4/9).
+void gui_thick_line(int handle, int x0, int y0, int x1, int y1, int thickness, uint32_t col) {
+    int half = thickness / 2;
+    for (int oy = -half; oy <= half; oy++)
+        gui_line(handle, x0, y0 + oy, x1, y1 + oy, col);
+    for (int ox = -half; ox <= half; ox++)
+        gui_line(handle, x0 + ox, y0, x1 + ox, y1, col);
+}
 
 int gui_ttf_width(const char *s, int size) {
     if (!s || !*s) return 0;
@@ -370,11 +560,61 @@ int gui_ttf_width(const char *s, int size) {
     if (w <= 0) { int n=0; while (s[n]) n++; w = n * (size*6/10); }
     return w;
 }
+
+// #B3 (UI/UX): width EXACTLY as win_draw_text_ttf() will actually draw it -
+// each glyph's own advance, default face/style, with NO inter-glyph kerning.
+//
+// gui_ttf_width() above (and the raw ttf_measure() syscall it wraps) goes
+// through the kernel's ttf_measure_string(), which DOES sum kerning between
+// every adjacent pair. win_draw_text_ttf()'s render loop (sys_win_draw_text_ttf
+// in kernel/gui/ttf.c / proc/syscall.c) does NOT apply kerning at all - it
+// just walks cx += glyph->advance. That is a genuine mismatch between the
+// kernel's two TTF code paths (measure vs. draw), and since most kerning
+// pairs are negative (tightening), the measured width UNDERSHOOTS the actual
+// rendered spread: any label centered with gui_ttf_width() as the reference
+// width ends up drawn wider than predicted, drifting right of true center
+// (this is what made the App Store's type-filter pills look badly
+// off-center - see #B3 report). The correct long-term fix is in the kernel
+// (either make the renderer apply kerning too, or drop kerning from
+// ttf_measure_string to match the renderer); until then this is the
+// userland-only workaround, matching the renderer glyph-for-glyph via the
+// font_glyph() syscall (returns the same stbtt advance win_draw_text_ttf
+// uses internally).
+//
+// COST: one syscall per glyph, vs. gui_ttf_width()'s single whole-string
+// syscall - fine for the short button/pill/tab labels this is meant for
+// (a handful of glyphs), but NOT a drop-in replacement for gui_ttf_width()
+// in a hot wrap/truncate loop over long strings (trunc_fit-style code
+// should keep using gui_ttf_width()).
+int gui_ttf_render_width(const char *s, int size) {
+    // #575: the kernel renderer (sys_win_draw_text_ttf, behind win_draw_text_ttf)
+    // now applies inter-glyph kerning exactly like ttf_measure_string(), so the
+    // kerning-inclusive gui_ttf_width() once again matches the renderer
+    // glyph-for-glyph. The old per-glyph, kerning-free #B3 workaround is obsolete;
+    // defer to the single-syscall gui_ttf_width() (one syscall, not one-per-glyph).
+    return gui_ttf_width(s, size);
+}
+
 void gui_text_ttf_centered(int handle, int x, int y, int w, int h,
                            const char *s, uint32_t color, int size) {
-    int tw = gui_ttf_width(s, size);
+    // #B3: center using the RENDERED width (see gui_ttf_render_width above),
+    // not the kerning-inclusive gui_ttf_width(), so the glyphs actually land
+    // centered instead of drifting toward one edge.
+    int tw = gui_ttf_render_width(s, size);
     int tx = x + (w - tw)/2; if (tx < x) tx = x;
-    int ty = y + (h - size)/2; if (ty < y) ty = y;
+    // Vertical centering: win_draw_text_ttf's y is the TOP of the text line
+    // (baseline = y + ascent); the true line height is ascent - descent
+    // (descent negative), which stbtt's pixel-height scale keeps close to
+    // `size` but not exact. Ask the real metrics instead of assuming the
+    // line is exactly `size` px tall, so short numeral/label strings land in
+    // the visual middle of the box instead of a few px high or low.
+    int asc = size, desc = 0, gap = 0;
+    int mret[3] = { size, 0, 0 };
+    if (font_metrics(0, size, mret) == 0) { asc = mret[0]; desc = mret[1]; gap = mret[2]; }
+    (void)gap;
+    int line_h = asc - desc;
+    if (line_h <= 0) line_h = size;
+    int ty = y + (h - line_h) / 2; if (ty < y) ty = y;
     win_draw_text_ttf(handle, tx, ty, s, size, color);
 }
 
@@ -447,6 +687,67 @@ void gui_fill_rounded_aa(int handle, int x, int y, int w, int h, int r, uint32_t
 void gui_fill_circle_aa(int handle, int x, int y, int d, uint32_t color, uint32_t bg) {
     gui_fill_rounded_aa(handle, x, y, d, d, d/2, color, bg);
 }
+
+// --- Star rating icon (#B2 app store: shared primitive so no app hand-rolls
+// its own star shape) -------------------------------------------------------
+// A regular 5-point star polygon, described once as 10 unit-circle direction
+// vectors (outer point / inner notch, alternating), scaled to the caller's
+// radius. Point-in-polygon uses the standard even-odd ray-casting test; edges
+// get a cheap 2x2 supersample so small icon sizes (10-24px, as used for
+// ratings) don't look jagged without the cost of the 4x4 grid the rounded-rect
+// helpers above use for much larger shapes.
+static const int GS_STAR_OX[5] = { 0, 951, 588, -588, -951 };   // outer, angles -90,-18,54,126,198
+static const int GS_STAR_OY[5] = { -1000, -309, 809, 809, -309 };
+static const int GS_STAR_IX[5] = { 588, 951, 0, -951, -588 };   // inner, angles -54,18,90,162,234
+static const int GS_STAR_IY[5] = { -809, 309, 1000, 309, -809 };
+
+static int gs_star_inside(int fx, int fy, int cx, int cy, int outerR, int innerR) {
+    int vx[10], vy[10];
+    for (int k = 0; k < 5; k++) {
+        vx[2*k]     = cx + GS_STAR_OX[k] * outerR / 1000;
+        vy[2*k]     = cy + GS_STAR_OY[k] * outerR / 1000;
+        vx[2*k + 1] = cx + GS_STAR_IX[k] * innerR / 1000;
+        vy[2*k + 1] = cy + GS_STAR_IY[k] * innerR / 1000;
+    }
+    int inside = 0;
+    for (int i = 0, j = 9; i < 10; j = i++) {
+        if (((vy[i] > fy) != (vy[j] > fy)) &&
+            (fx < (int)((long)(vx[j] - vx[i]) * (fy - vy[i]) / (vy[j] - vy[i]) + vx[i])))
+            inside = !inside;
+    }
+    return inside;
+}
+
+// Draw one star icon in a d x d box. fill_pct (0..100) is the fraction of the
+// star's WIDTH (left to right) painted with fill_color; the rest gets
+// empty_color. Callers building a 1..5 rating row pass 100 for a fully-earned
+// star, 0 for an unearned one, and an in-between value for the star that
+// straddles a fractional average (e.g. a 4.3 average: stars 1-4 at 100, star
+// 5 at 30) - so partial stars read correctly instead of only whole/empty.
+void gui_fill_star_aa(int handle, int x, int y, int d, int fill_pct,
+                      uint32_t fill_color, uint32_t empty_color, uint32_t bg) {
+    if (d <= 0) return;
+    if (fill_pct < 0) fill_pct = 0;
+    if (fill_pct > 100) fill_pct = 100;
+    int cx = x + d / 2, cy = y + d / 2;
+    int outerR = d / 2;
+    int innerR = outerR * 45 / 100;
+    int fillx = x + d * fill_pct / 100;
+    for (int j = 0; j < d; j++) {
+        int py = y + j;
+        for (int i = 0; i < d; i++) {
+            int px = x + i;
+            int cnt = 0;
+            for (int sy = 0; sy < 2; sy++)
+                for (int sx = 0; sx < 2; sx++)
+                    cnt += gs_star_inside(px * 2 + sx, py * 2 + sy, cx * 2, cy * 2, outerR * 2, innerR * 2);
+            if (cnt == 0) continue;
+            uint32_t col = (px < fillx) ? fill_color : empty_color;
+            if (cnt >= 4) win_draw_pixel(handle, px, py, col);
+            else win_draw_pixel(handle, px, py, gui_mix(bg, col, cnt * 255 / 4));
+        }
+    }
+}
 void gui_rounded_border(int handle, int x, int y, int w, int h, int r, uint32_t color) {
     if (w <= 0 || h <= 0) return;
     if (r*2 > w) r = w/2;
@@ -478,8 +779,9 @@ void gui_button(int handle, int x, int y, int w, int h, const char *label,
     bool disabled = (st == GUI_ST_DISABLED);
     uint32_t base, ink, bord;
     if (variant == GUI_BTN_PRIMARY)      { base = p->accent; ink = gui_ink_on(p->accent); bord = gui_darken(p->accent, 40); }
-    else if (variant == GUI_BTN_GHOST)   { base = p->surface; ink = p->accent; bord = p->border; }
-    else                                 { base = gui_mix(p->surface_raised, p->ink, 8); ink = p->ink; bord = p->border; }
+    else if (variant == GUI_BTN_GHOST)   { base = p->surface; ink = p->accent; bord = p->edge_strong; }
+    else if (variant == GUI_BTN_SUCCESS) { base = 0x003FA34D; ink = gui_ink_on(0x003FA34D); bord = gui_darken(0x003FA34D, 40); }
+    else                                 { base = gui_mix(p->surface_raised, p->ink, 8); ink = p->ink; bord = p->edge_strong; }
     if (!disabled) {
         if (st == GUI_ST_HOVER)        base = (variant==GUI_BTN_PRIMARY) ? p->accent_hover : gui_lighten(base, 18);
         else if (st == GUI_ST_PRESSED) base = gui_darken(base, 18);
@@ -498,7 +800,15 @@ void gui_button(int handle, int x, int y, int w, int h, const char *label,
         win_draw_rect(handle, x, y, w, h, base);
         gui_draw_rect_outline(handle, x, y, w, h, bord);
     } else { // modern
-        int r = g_style.radius;
+        // #612: square-edge buttons (GUI_BTN_RADIUS == 0), not g_style.radius.
+        // The old h/2 capsule blended its AA edge toward p->surface regardless
+        // of what the button actually sat on (e.g. a coloured card or a hero
+        // banner), which is exactly the "stray white pixels around the
+        // curves" fringe reported against the App Store's Get button - a
+        // shared-engine bug, not an app-local one, since every app using
+        // gui_button() inherited it. r=0 takes gui_fill_rounded_aa's exact
+        // win_draw_rect fallback, so there is no blend left to get wrong.
+        int r = GUI_BTN_RADIUS;
         if (g_style.shadows && !disabled) gui_soft_shadow(handle, x, y, w, h, r, p->surface);
         gui_fill_rounded_aa(handle, x, y, w, h, r, bord, p->surface);
         uint32_t top = gui_lighten(base, g_style.gradients ? 16 : 0);
@@ -506,8 +816,14 @@ void gui_button(int handle, int x, int y, int w, int h, const char *label,
         gui_fill_rounded_grad(handle, x+1, y+1, w-2, h-2, r>0?r-1:0, top, bot);
     }
     if (st == GUI_ST_FOCUS) {
-        if (g_style.base == GUI_STYLE_MODERN) gui_rounded_border(handle, x, y, w, h, g_style.radius, p->accent);
-        else gui_draw_rect_outline(handle, x, y, w, h, p->accent);
+        // (#745) p->focus, not p->accent. accent stays the SELECTION/VALUE
+        // colour (primary fill, checked box, toggle-on, slider and progress
+        // fill); focus is the KEYBOARD POSITION colour and is the one that has
+        // to clear 3:1, because on this OS pointer input is unreliable (#334)
+        // and the keyboard is the primary path. Sharing one colour for both
+        // meanings is what made the ring 2.89:1 on the default surface.
+        if (g_style.base == GUI_STYLE_MODERN) gui_rounded_border(handle, x, y, w, h, GUI_BTN_RADIUS, p->focus);
+        else gui_draw_rect_outline(handle, x, y, w, h, p->focus);
     }
     if (label && *label) gui_text_ttf_centered(handle, x, y, w, h, label, ink, GUI_TTF_SIZE);
 }
@@ -573,15 +889,19 @@ void gui_slider(int handle, int x, int y, int w, int value, int max_val, gui_sta
     if (max_val <= 0) max_val = 1;
     int fillw = value * w / max_val; if (fillw < 0) fillw = 0; if (fillw > w) fillw = w;
     if (g_style.base == GUI_STYLE_CLASSIC) {
-        win_draw_rect(handle, x, y+5, w, 6, p->track);
-        if (fillw > 0) win_draw_rect(handle, x, y+5, fillw, 6, p->accent);
+        gui_draw_rect_outline(handle, x, y+5, w, 6, p->edge_strong);
+        win_draw_rect(handle, x+1, y+6, w-2, 4, p->track);
+        if (fillw > 2) win_draw_rect(handle, x+1, y+6, fillw-2, 4, p->accent);
         int tx = x + fillw - 7; if (tx < x) tx = x;
         win_draw_rect(handle, tx, y, 14, 16, p->surface_raised);
         gui_draw_rect_outline(handle, tx, y, 14, 16, p->border);
     } else {
-        int th = 4, ty = y + 6;
-        gui_fill_rounded_aa(handle, x, ty, w, th, th/2, p->track, p->surface);
-        if (fillw > 0) gui_fill_rounded_aa(handle, x, ty, fillw, th, th/2, p->accent, p->surface);
+        // 4px -> 6px so a 1px boundary ring still leaves a readable 4px well.
+        // Same vertical centre (y+8) as before, so the thumb still lines up.
+        int th = 6, ty = y + 5;
+        gui_fill_rounded_aa(handle, x, ty, w, th, th/2, p->edge_strong, p->surface);
+        gui_fill_rounded(handle, x+1, ty+1, w-2, th-2, (th-2)/2, p->track);
+        if (fillw > 2) gui_fill_rounded(handle, x+1, ty+1, fillw-2, th-2, (th-2)/2, p->accent);
         int td = 14, tx = x + fillw - td/2;
         if (tx < x) tx = x; if (tx > x + w - td) tx = x + w - td;
         if (g_style.shadows) gui_fill_circle_aa(handle, tx+1, y+1, td, gui_mix(p->surface, 0x00000000, 45), p->surface);
@@ -600,7 +920,7 @@ void gui_textfield2(int handle, int x, int y, int w, int h, const char *text, bo
         win_draw_rect(handle, x+w-1, y, 1, h, gui_lighten(p->surface,80));
     } else {
         int r = (g_style.base == GUI_STYLE_MODERN) ? GUI_RADIUS : 0;
-        gui_fill_rounded(handle, x, y, w, h, r, focused ? p->accent : p->field_border);
+        gui_fill_rounded(handle, x, y, w, h, r, focused ? p->focus : p->field_border);
         gui_fill_rounded(handle, x+1, y+1, w-2, h-2, r>0?r-1:0, p->field_bg);
     }
     if (text && *text) win_draw_text_ttf(handle, x+8, y + (h-GUI_TTF_SIZE)/2, text, GUI_TTF_SIZE, p->ink);
@@ -611,9 +931,14 @@ void gui_progress(int handle, int x, int y, int w, int h, int pct) {
     if (pct < 0) pct = 0;
     if (pct > 100) pct = 100;
     int r = (g_style.base == GUI_STYLE_MODERN) ? h/2 : 0;
-    gui_fill_rounded_aa(handle, x, y, w, h, r, p->track, p->surface);
-    int fw = w * pct / 100;
-    if (fw > 0) gui_fill_rounded_aa(handle, x, y, fw, h, r, p->accent, p->surface);
+    // (#745) track #404040 on surface #252525 measured 1.48:1, so at 0% the
+    // control had no visible extent at all. The well keeps its quiet fill and
+    // gains a 1px edge_strong boundary, which is the thing the 3:1 floor is
+    // actually about.
+    gui_fill_rounded_aa(handle, x, y, w, h, r, p->edge_strong, p->surface);
+    gui_fill_rounded(handle, x+1, y+1, w-2, h-2, r>0?r-1:0, p->track);
+    int fw = (w-2) * pct / 100;
+    if (fw > 0) gui_fill_rounded(handle, x+1, y+1, fw, h-2, r>0?r-1:0, p->accent);
 }
 
 void gui_card(int handle, int x, int y, int w, int h) {
@@ -627,7 +952,7 @@ void gui_card(int handle, int x, int y, int w, int h) {
     } else {
         int r = (g_style.base == GUI_STYLE_MODERN) ? GUI_RADIUS : 0;
         if (g_style.base == GUI_STYLE_MODERN && g_style.shadows) gui_soft_shadow(handle, x, y, w, h, r, p->surface);
-        gui_fill_rounded_aa(handle, x, y, w, h, r, p->border, p->surface);
+        gui_fill_rounded_aa(handle, x, y, w, h, r, p->edge_strong, p->surface);
         gui_fill_rounded(handle, x+1, y+1, w-2, h-2, r>0?r-1:0, p->surface_raised);
     }
 }

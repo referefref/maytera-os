@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // dirent.c - userland directory traversal via SYS_READDIR
 // Uses the kernel fd-based convention: open dir with SYS_OPEN, read with SYS_READDIR.
 #include "dirent.h"
@@ -47,6 +51,21 @@ struct dirent *readdir(DIR *dirp) {
     dirp->cur.d_reclen = sizeof(struct dirent);
     dirp->cur.d_type   = (kd.type == 1) ? DT_DIR : DT_REG;
     return &dirp->cur;
+}
+
+// AssaultCube port phase 3 (docs/ASSAULTCUBE_PORT_PLAN.md): real readdir_r,
+// a genuinely missing generic POSIX primitive (only plain readdir() existed
+// before), needed for directory listing (stream.cpp's listsubdir/listdir,
+// used for map/mod/package directory scanning). Deprecated in modern POSIX
+// in favor of plain readdir() (not thread-unsafe here: MayteraOS's readdir()
+// above already returns a per-DIR* buffer, not a shared global one), but
+// callers that still call it directly need the symbol to exist.
+int readdir_r(DIR *dirp, struct dirent *entry, struct dirent **result) {
+    struct dirent *e = readdir(dirp);
+    if (!e) { if (result) *result = 0; return 0; }
+    if (entry) *entry = *e;
+    if (result) *result = entry;
+    return 0;
 }
 
 int closedir(DIR *dirp) {

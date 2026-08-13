@@ -3,8 +3,10 @@
 #include "../../libc/maytera.h"
 #include "../../libc/gui.h"
 #include "../../libc/theme.h"
+#include "../../libc/gui_scroll.h"   // shared scrollbar contrast rule (#745 item 77)
 #include "../../libc/dirent.h"
 #include "../../libc/sys/stat.h"
+#include "../../libc/unistd.h"   // #742: fsync - a copy is not a copy until it is durable
 
 static int g_win_w = 500, g_win_h = 400;  // #89: live window size (EVENT_RESIZE)
 #define WIN_W g_win_w
@@ -51,7 +53,22 @@ static void rb_join(char *out, int outsz, const char *dir, const char *name) {
     for (int i = 0; name[i] && j < outsz - 1; i++) out[j++] = name[i];
     out[j] = 0;
 }
+// #742 failure reporting. The disk is what failed, so the report lives in RAM
+// and is drawn in the window; printf/notify_post are extras.
+static char g_err[192];
+static void rb_err_clear(void) { g_err[0] = 0; }
+static void rb_error(const char *what) {
+    int o = 0;
+    for (int i = 0; what && what[i] && o < (int)sizeof(g_err) - 1; i++) g_err[o++] = what[i];
+    g_err[o] = 0;
+    printf("[recyclebin] %s\n", g_err);
+}
+
 // (#239) ext2 rename() is unreliable, so restore falls back to copy+unlink.
+// #742: returns 0 ONLY if every byte is on the medium. The caller unlinks the
+// SOURCE on a 0, so an unchecked close() here is a delete of the only copy: on
+// a full volume ext2_write_file truncates the destination before it discovers
+// there is no room and leaves a valid ZERO-BYTE file behind.
 static int rb_copy_file(const char *src, const char *dst) {
     int in = open(src, 0); if (in < 0) return -1;
     int out = open(dst, 0x41); if (out < 0) { close(in); return -1; }
@@ -61,7 +78,9 @@ static int rb_copy_file(const char *src, const char *dst) {
         if (rc) break;
     }
     if (n < 0) rc = -1;
-    close(in); close(out); return rc;
+    if (rc == 0 && fsync(out) != 0) rc = -1;
+    if (close(out) != 0) rc = -1;
+    close(in); return rc;
 }
 
 static char idx_buf[8192];
@@ -93,7 +112,10 @@ static int idx_lookup(const char *name, char *out, int outsz) {
     return 0;
 }
 
-static void idx_remove(const char *name) {
+// #742: returns 0 only if the rewritten index is on the medium. It used to
+// unlink(TRASH_INDEX) first and then hope the create worked; if it did not, the
+// restore information for EVERY item in the bin was gone and nothing said so.
+static int idx_remove(const char *name) {
     char nb[8192]; int nl = 0; int i = 0;
     while (i < idx_len) {
         int ls = i; while (i < idx_len && idx_buf[i] != '\n') i++;
@@ -103,11 +125,16 @@ static void idx_remove(const char *name) {
         if (bar < le) { int k = ls, t = 0, m = 1; while (k < bar) { if (idx_buf[k] != name[t]) { m = 0; break; } k++; t++; } if (m && name[t] == 0) match = 1; }
         if (!match) { for (int j = ls; j < le && nl < (int)sizeof(nb) - 1; j++) nb[nl++] = idx_buf[j]; if (nl < (int)sizeof(nb) - 1) nb[nl++] = '\n'; }
     }
-    unlink(TRASH_INDEX);
-    int fd = open(TRASH_INDEX, 0x41);
-    if (fd >= 0) { if (nl) write(fd, nb, nl); close(fd); }
+    int fd = open(TRASH_INDEX, 0x241);   // O_WRONLY|O_CREAT|O_TRUNC, no gap
+    if (fd < 0) return -1;
+    int rc = 0;
+    if (nl && write(fd, nb, nl) != nl) rc = -1;
+    if (rc == 0 && fsync(fd) != 0) rc = -1;
+    if (close(fd) != 0) rc = -1;
+    if (rc != 0) return rc;
     for (int j = 0; j < nl; j++) idx_buf[j] = nb[j];
     idx_len = nl; idx_buf[nl] = 0;
+    return 0;
 }
 
 static void load_trash(void) {
@@ -286,8 +313,11 @@ static void draw_items(void) {
         if (thumb_h < 20) thumb_h = 20;
         int thumb_y = list_y + (scroll_offset * (sb_h - thumb_h)) / (item_count - visible_rows);
         
-        win_draw_rect(win, WIN_W - 12, list_y, 12, sb_h, THEME_SCROLLBAR_BG);
-        win_draw_rect(win, WIN_W - 12, thumb_y, 12, thumb_h, THEME_SCROLLBAR_THUMB);
+        // Colours via the shared rule (#745 item 77), geometry unchanged.
+        uint32_t sb_track, sb_thumb;
+        gui_scroll_colors(0, THEME_BG_PRIMARY, &sb_track, &sb_thumb);
+        win_draw_rect(win, WIN_W - 12, list_y, 12, sb_h, sb_track);
+        win_draw_rect(win, WIN_W - 12, thumb_y, 12, thumb_h, sb_thumb);
     }
 }
 
@@ -295,6 +325,13 @@ static void draw_items(void) {
 static void draw_status(void) {
     int y = WIN_H - STATUS_H;
     win_draw_rect(win, 0, y, WIN_W, STATUS_H, THEME_BG_TERTIARY);
+    if (g_err[0]) {
+        // #742: takes over the whole status bar and stays until the next action.
+        // A failed delete or restore that scrolls away has not been reported.
+        win_draw_rect(win, 0, y, WIN_W, STATUS_H, 0x00A02020);
+        win_draw_text(win, 8, y + 6, g_err, 0x00FFFFFF);
+        return;
+    }
     
     // Item count and size
     char status[64];
@@ -331,39 +368,67 @@ static void draw_all(void) {
     win_invalidate(win);
 }
 
-// Restore selected items
+// Restore selected items. #742: an item whose restore FAILED keeps its index
+// entry, so it stays in the bin and stays visible. The previous code dropped
+// the entry unconditionally, which made a failed restore look identical to a
+// successful one while leaving the file in /CONFIG/RECYCLE with no record of
+// where it came from.
 static void restore_selected(void) {
+    int failed = 0, done = 0;
+    rb_err_clear();
     for (int i = item_count - 1; i >= 0; i--) {
         if (!items[i].selected) continue;
         char src[200]; rb_join(src, sizeof(src), TRASH_DIR, items[i].name);
+        int ok = 0;
         if (items[i].original_path[0] && !rb_streq(items[i].original_path, "(unknown)")) {
-            if (rename(src, items[i].original_path) != 0) {
-                if (rb_copy_file(src, items[i].original_path) == 0) unlink(src);
-            }
+            if (rename(src, items[i].original_path) == 0) ok = 1;
+            else if (rb_copy_file(src, items[i].original_path) == 0) ok = (unlink(src) == 0);
         }
-        idx_remove(items[i].name);
+        if (!ok) { failed++; continue; }
+        if (idx_remove(items[i].name) != 0) failed++; else done++;
     }
+    if (failed)
+        rb_error(done ? "Some items could not be restored and are still here"
+                      : "Could not restore; the item is still in the Recycle Bin");
     load_trash();
 }
 
-// Permanently delete selected items
+// Permanently delete selected items. #742: a failed unlink used to still drop
+// the index entry, so the file stayed on disk forever, invisible and
+// unrestorable, and the user was shown a successful delete.
 static void delete_selected(void) {
+    int failed = 0;
+    rb_err_clear();
     for (int i = item_count - 1; i >= 0; i--) {
         if (!items[i].selected) continue;
         char p[200]; rb_join(p, sizeof(p), TRASH_DIR, items[i].name);
-        unlink(p);
-        idx_remove(items[i].name);
+        if (unlink(p) != 0) { failed++; continue; }   // keep the index entry
+        if (idx_remove(items[i].name) != 0) failed++;
     }
+    if (failed) rb_error("Some items could not be deleted and are still here");
     load_trash();
 }
 
 // Empty the recycle bin
 static void empty_bin(void) {
+    int failed = 0;
+    rb_err_clear();
     for (int i = 0; i < item_count; i++) {
         char p[200]; rb_join(p, sizeof(p), TRASH_DIR, items[i].name);
-        unlink(p);
+        if (unlink(p) != 0) failed++;
     }
-    unlink(TRASH_INDEX);
+    if (failed) {
+        // #742: do NOT wipe the index while files remain. Their entries are the
+        // only record of where they came from.
+        rb_error("Could not empty the Recycle Bin; some items remain");
+    } else {
+        int fd = open(TRASH_INDEX, 0x241);
+        int rc = (fd < 0) ? -1 : 0;
+        if (rc == 0 && fsync(fd) != 0) rc = -1;
+        if (fd >= 0 && close(fd) != 0) rc = -1;
+        if (rc != 0) rb_error("Emptied, but the index could not be cleared");
+        else { idx_len = 0; idx_buf[0] = 0; }
+    }
     load_trash();
 }
 

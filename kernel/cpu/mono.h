@@ -38,18 +38,20 @@
 //
 // PRINTING: uint64_t is `unsigned long long` in this kernel, so use %llu.
 //
-// DO NOT hand-roll another clock. drivers/xhci.c (private PIT-latch spin),
+// DO NOT hand-roll another clock. drivers/xhci.c (a private PIT-latch spin, and it got the
+// PIT mode-3 factor wrong - #507),
 // drivers/ata.c (private rdtsc), net/url.c / crypto/sha512.c / media/aac.c /
 // gui/jpeg.c (private rdtsc bench helpers) each grew their own before this
 // existed, which is exactly how the tick-deadline bug family spread. Subsystems
 // still on tick deadlines that can adopt this: net/tls, sync/futex, ipc/msg,
-// net/smb, net/ftp, proc/cron.
+// net/smb, proc/cron. (net/ftp adopted it in #499/#604.)
 
 uint64_t mono_init_rs(uint32_t timer_hz);
 int32_t  mono_ready_rs(void);
 uint64_t mono_ms_rs(void);
 uint64_t mono_us_rs(void);
 uint64_t mono_tsc_khz_rs(void);
+void     mono_busy_delay_us_rs(uint64_t us);
 
 // Rust u64/u32/i32 must match this kernel's uint64_t/uint32_t/int32_t exactly
 // across the FFI. Lock it in rather than trusting it (the tree's sizeof-lock
@@ -65,5 +67,30 @@ static inline int      mono_ready(void)             { return (int)mono_ready_rs(
 static inline uint64_t mono_ms(void)                { return mono_ms_rs(); }
 static inline uint64_t mono_us(void)                { return mono_us_rs(); }
 static inline uint64_t mono_tsc_khz(void)           { return mono_tsc_khz_rs(); }
+
+// #507 - THE shared short busy-delay: spin for at least this many REAL
+// microseconds. Works with interrupts off and before the scheduler exists, so
+// it is the right primitive for device bring-up (bus resets, spec-mandated
+// recovery gaps). Prefers the calibrated TSC; falls back to reading PIT channel
+// 0 directly before calibration.
+//
+// THIS IS NOT A SLEEP. It BURNS the core for the whole duration. Use it only
+// for hardware-mandated sub-millisecond-to-few-millisecond gaps where there is
+// nothing to wait ON. To wait for an EVENT, use sync/waitq.h
+// (wait_event/wait_event_timeout) - a busy-delay poll loop is the #426
+// anti-pattern that caused the freeze/hang bug family.
+//
+// Do NOT re-derive this from the PIT yourself. drivers/xhci.c did, and its
+// private copy omitted the PIT MODE 3 factor of two, so every USB enumeration
+// delay in the kernel ran for HALF its nominal duration (#507).
+static inline void mono_busy_delay_us(uint64_t us) { mono_busy_delay_us_rs(us); }
+static inline void mono_busy_delay_ms(uint64_t ms) { mono_busy_delay_us_rs(ms * 1000ull); }
+
+// #483/#499: THE shared sleep/alarm/timed-wait DEADLINE clock, in milliseconds.
+// Defined in proc/process.c. Reads mono_ms() (never timer_ticks) so a KVM
+// tick BURST cannot collapse a deadline; falls back to tick-derived ms only
+// before the monotonic clock is calibrated at boot, so it is never worse than
+// the old tick deadlines. Use this for every sleep/alarm/wait deadline.
+uint64_t sched_now_ms(void);
 
 #endif // MONO_H

@@ -255,6 +255,31 @@ int wallpaper_current(void)
     return g_current_wallpaper;
 }
 
+// Case-sensitive exact match; local to this file, freestanding (no libc string.h).
+static bool wp_name_eq(const char *a, const char *b)
+{
+    int i = 0;
+    for (; a[i] && b[i]; i++) if (a[i] != b[i]) return false;
+    return a[i] == b[i];
+}
+
+// The out-of-box default wallpaper (#745, second pass). Before #517 the default
+// was whichever entry a hardcoded array put first; #517 made the list itself
+// data-driven but left the default AS index 0 of wp_enumerate()'s scan order,
+// which is the ext2 directory's raw on-disk entry order (creation/deletion
+// history, NOT alphabetical - see blame.md, "debugfs order and Linux readdir
+// order are DIFFERENT ORDERS"). That was an invisible dependency on write
+// order for as long as the shipped set never changed; the 2026-08-11 library
+// reset changed it, and index 0 became whatever wallpaper happened to land
+// first in the rebuilt directory, not a deliberate choice. This name is the
+// direct successor of the old default's spirit (MAYTERA.BMP / "Maytera
+// Modern" was the first, primary entry in wp_pretty()'s now-removed curated
+// table) and is what kernel/gui/login.c and kernel/gui/desktop.c also try
+// first for their own BACK.BMP-shaped defaults, so all three surfaces agree
+// on one wallpaper rather than each falling back to gradient or to whatever
+// directory order gives them independently.
+#define WP_DEFAULT_FILE "ABSTRACT_13.BMP"
+
 void wallpaper_init(void)
 {
     g_wp_loaded         = false;
@@ -268,8 +293,20 @@ void wallpaper_init(void)
     // Settings so indices agree). Always returns >= 1 (the gradient entry).
     g_wallpaper_count = wp_enumerate(g_wallpapers, WP_MAX_ENTRIES);
 
+    // Prefer the deliberate default (see WP_DEFAULT_FILE above) if it is on
+    // the image; fall back to index 0 (old behaviour) if it has been removed
+    // or renamed, so this degrades gracefully instead of failing to load
+    // anything.
+    int default_index = 0;
+    for (int i = 0; i < g_wallpaper_count; i++) {
+        if (wp_name_eq(g_wallpapers[i].file, WP_DEFAULT_FILE)) {
+            default_index = i;
+            break;
+        }
+    }
+
     // Attempt to load the default wallpaper; if it fails the gradient is used.
-    wallpaper_load(0);
+    wallpaper_load(default_index);
 }
 
 // ============================================================================
@@ -336,6 +373,14 @@ void wallpaper_render_background(void)
 
 void wallpaper_picker_open(void)
 {
+    // #B2 app store: wallpaper_init() enumerates once at compositor boot, so a
+    // wallpaper the App Store installs after boot (a fresh BMP dropped at "/")
+    // was invisible here until the compositor restarted, even though the file
+    // was already on disk and Settings (a short-lived process) would see it on
+    // its next launch. Re-scan every time the picker opens: wp_enumerate() is
+    // a cheap directory read (#517), so doing it on open (not every frame) is
+    // free in practice and keeps this picker's index agreeing with Settings'.
+    g_wallpaper_count       = wp_enumerate(g_wallpapers, WP_MAX_ENTRIES);
     g_wallpaper_picker_open = true;
     g_picker_scroll         = 0;
     g_picker_hover          = -1;

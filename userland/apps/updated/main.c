@@ -16,18 +16,30 @@
 #include "../../libc/string.h"
 #include "../../libc/stdlib.h"
 #include "../../libc/stdio.h"
+#include <stdarg.h>
 #include "../../libc/fcntl.h"
 #include "../../libc/unistd.h"
 #include "../../libc/notify.h"
 #include "arc.h"
+#include "../../libc/pkgsig.h"
+#include "../../libc/startmenu_reg.h"   // #<startmenu-rust> live Start-menu registration
 
-#define REPO_HOST     "<UPDATE_SERVER>"
-#define MANIFEST_URL  "http://<UPDATE_SERVER>/manifest.json"
+/* Hostname, not a LAN IP: see the note in appstore/main.c. HTTP is
+ * deliberate; integrity is a package-signature property, not a transport one. */
+#define REPO_HOST     "updates.maytera.net"
 
-#ifndef SYS_DESKTOP_MENU_RELOAD
-#define SYS_DESKTOP_MENU_RELOAD 300
-#endif
-static inline void menu_reload(void) { syscall0(SYS_DESKTOP_MENU_RELOAD); }
+/* #559: detached signature over manifest.json. The manifest is the TRUST
+ * ANCHOR (the Debian apt model): this signature authenticates the manifest,
+ * and the manifest's per-package sha256 then covers every .mpkg, so one
+ * signature protects many artifacts. Verified in the kernel against a public
+ * key compiled into the kernel image, so Ring-3 cannot swap the key out.
+ * Fail closed at every step: there is no unverified fallback. */
+
+// #<startmenu-rust>: SYS_DESKTOP_MENU_RELOAD used to be called here after a
+// background auto-update. It resolves to a documented kernel no-op (see
+// userland/apps/appstore/main.c's identical note) - the userland compositor
+// has never listened for it. startmenu_register_app() below writes into the
+// live config directory the compositor throttle-polls instead.
 
 // Package-manager write to the FAT ESP (userland cannot open /APPS files for
 // writing; the kernel does it via fat_write_file). Returns 0 on success.
@@ -40,6 +52,72 @@ static inline int pkg_write(const char *path, const void *data, unsigned len) {
 
 static char    g_manifest[128 * 1024];
 static uint8_t g_dl[3 * 1024 * 1024];
+static uint8_t g_sig[1024];   // detached manifest signature (#559)
+
+// ---------------------------------------------------------------------------
+// #559: persistent audit log. Cron-launched processes have no stdout that
+// reaches the console, so every trust decision is appended here and flushed to
+// /APPS/UPD.LOG. This is the record that says WHY an update was or was not
+// applied, which is exactly what a silent auto-updater otherwise hides.
+// ---------------------------------------------------------------------------
+static char g_log[4096];
+static int  g_loglen = 0;
+
+static void ulog(const char *fmt, ...) {
+    if (g_loglen > (int)sizeof(g_log) - 256) return;
+    va_list ap;
+    va_start(ap, fmt);
+    int k = vsnprintf(g_log + g_loglen, sizeof(g_log) - g_loglen - 2, fmt, ap);
+    va_end(ap);
+    if (k > 0) {
+        g_loglen += k;
+        if (g_loglen < (int)sizeof(g_log) - 1) g_log[g_loglen++] = '\n';
+        g_log[g_loglen] = 0;
+    }
+    // Flush every time: if this run dies mid-way, the log must still explain
+    // how far it got. Cheap (a few KB) and worth it for an audit trail.
+    pkg_write("/APPS/UPD.LOG", g_log, (unsigned)g_loglen);
+}
+
+// ---------------------------------------------------------------------------
+// #559: repository source. Defaults to the public repo, overridable by a single
+// line in /APPS/STORE.SRC (e.g. "http://192.0.2.1:8559"). This is apt's
+// sources.list idea: WHERE packages come from is configuration, WHETHER they
+// are trusted is decided by the signature over the manifest. A redirected
+// client still refuses anything the signing key did not sign, so making the
+// source configurable adds no trust surface, and it lets the shipping binary
+// be verified against a controlled test repo.
+// ---------------------------------------------------------------------------
+#define REPO_DEFAULT "http://updates.maytera.net"
+static char g_repo[160] = REPO_DEFAULT;
+
+static void repo_load(void) {
+    int fd = sys_open("/APPS/STORE.SRC", O_RDONLY);
+    if (fd < 0) return;
+    char b[192];
+    int n = sys_read(fd, b, (int)sizeof(b) - 1);
+    sys_close(fd);
+    if (n <= 0) return;
+    b[n] = 0;
+    int i = 0;
+    while (b[i] && b[i] != '\n' && b[i] != '\r' && b[i] != ' ') i++;
+    b[i] = 0;
+    // Only an http:// base is accepted, and it must fit; anything else leaves
+    // the compiled-in default in place rather than half-applying.
+    if (strncmp(b, "http://", 7) == 0 && i > 7 && i < (int)sizeof(g_repo))
+        strcpy(g_repo, b);
+}
+
+// Join the repo base and a relative path into `out`, with exactly one slash.
+static void repo_url(const char *rel, char *out, int cap) {
+    int o = 0;
+    for (const char *p = g_repo; *p && o < cap - 1; p++) out[o++] = *p;
+    if (o > 0 && out[o - 1] == '/') o--;
+    if (o < cap - 1) out[o++] = '/';
+    while (*rel == '/') rel++;
+    while (*rel && o < cap - 1) out[o++] = *rel++;
+    out[o] = 0;
+}
 
 enum { POL_OFF = 0, POL_NOTIFY = 1, POL_AUTO = 2 };
 
@@ -135,35 +213,10 @@ static void reg_set(const char *id, const char *ver) {
     pkg_write("/APPS/STORE.DB", out, o);
 }
 
-static void regini_register(const char *name, const char *path) {
-    static char buf[16384]; int len = 0;
-    int fd = sys_open("/APPS/REGINI.CFG", O_RDONLY);
-    if (fd >= 0) { len = sys_read(fd, buf, sizeof(buf) - 1); sys_close(fd); if (len < 0) len = 0; }
-    buf[len] = 0;
-    static char out[16384]; int o = 0; char *p = buf;
-    while (*p) {
-        char *ls = p; while (*p && *p != '\n') p++; int ll = p - ls; if (*p == '\n') p++;
-        int drop = 0;
-        if (ll > 4 && strncmp(ls, "APP=", 4) == 0) {
-            const char *nm = ls + 4; int nl = strlen(name);
-            if (strncmp(nm, name, nl) == 0 && nm[nl] == ',') drop = 1;
-        }
-        if (!drop) { for (int i = 0; i < ll && o < (int)sizeof(out) - 2; i++) out[o++] = ls[i];
-                     if (o < (int)sizeof(out) - 2) out[o++] = '\n'; }
-    }
-    if (!strstr(out, "CATEGORY=Installed")) {
-        const char *h = "CATEGORY=Installed\n";
-        for (int i = 0; h[i] && o < (int)sizeof(out) - 2; i++) out[o++] = h[i];
-    }
-    const char *pre = "APP=";
-    for (int i = 0; pre[i]; i++) out[o++] = pre[i];
-    for (const char *a = name; *a && o < (int)sizeof(out) - 2; a++) out[o++] = *a;
-    const char *mid = ",terminal,";
-    for (int i = 0; mid[i]; i++) out[o++] = mid[i];
-    for (const char *a = path; *a && o < (int)sizeof(out) - 2; a++) out[o++] = *a;
-    if (o < (int)sizeof(out) - 2) out[o++] = '\n';
-    pkg_write("/APPS/REGINI.CFG", out, o);
-}
+// regini_register() (the /APPS/REGINI.CFG writer) is GONE: it was a
+// byte-for-byte duplicate of appstore/main.c's copy of the same dead code
+// (see the #<startmenu-rust> note above). Both now share
+// startmenu_register_app() (userland/libc/startmenu_reg.c).
 
 static void mkparents(const char *dest) {
     char tmp[128]; int n = strlen(dest); if (n > 127) n = 127;
@@ -180,13 +233,29 @@ static int find_entry(arc_entry *e, int n, const char *id, const char *rel) {
 }
 
 // Download + install package "id" version "ver" at manifest path "path".
-static int apply_update(const char *id, const char *name, const char *ver, const char *path) {
-    static char url[160];
-    strcpy(url, "http://" REPO_HOST "/");
-    strncat(url, path, sizeof(url) - strlen(url) - 1);
+static int apply_update(const char *id, const char *name, const char *ver, const char *path,
+                        const char *sha256hex) {
+    static char url[224];
+    repo_url(path, url, (int)sizeof(url));
     int n = http_get(url, g_dl, sizeof(g_dl));
     printf("[upd] download %s -> %d bytes\n", url, n);
-    if (n <= 0) return -1;
+    ulog("download %s -> %d bytes", url, n);
+    if (n <= 0) { ulog("ABORT: download failed"); return -1; }
+
+    // #559: the downloaded package must match the sha256 in the signed manifest
+    // before it is unpacked. Headless path: refuse and log, never apply.
+    {
+        int vrc = pkgsig_verify_package(g_dl, (size_t)n, sha256hex);
+        if (vrc != PKGSIG_OK) {
+            printf("[upd] REFUSED %s: %s\n", id, pkgsig_strerror(vrc));
+            ulog("REFUSED package %s: %s (rc=%d, not unpacked, fail closed)",
+                 id, pkgsig_strerror(vrc), vrc);
+            notify_post("Update refused", name, NOTIFY_ERROR);
+            return -1;
+        }
+        ulog("package %s sha256 VERIFIED against signed manifest (%d bytes)", id, n);
+    }
+
     int count = 0;
     arc_entry *ents = arc_targz_extract(g_dl, (size_t)n, &count);
     printf("[upd] targz_extract -> count=%d ents=%p\n", count, (void*)ents);
@@ -223,25 +292,49 @@ static int apply_update(const char *id, const char *name, const char *ver, const
     arc_free_entries(ents, count);
     if (!wrote) return -1;
     reg_set(id, ver);
-    if (launch[0]) regini_register(name, launch);
-    menu_reload();
+    if (launch[0]) startmenu_register_app(id, name, launch, 0);  /* #745 (#77): the updater never parses a category; NULL keeps its historical "Installed" group */
     return 0;
 }
 
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
+    repo_load();                 // #559: repo source before any fetch
     int policy = read_policy();
+    ulog("=== updated run start ===");
+    ulog("repo=%s policy=%d", g_repo, policy);
     printf("[upd] policy=%d\n", policy);
     if (policy == POL_OFF) return 0;
 
     // Wait for the network, then fetch the manifest.
     for (int w = 0; w < 20 && !sys_net_is_up(); w++) usleep(500000);
+    ulog("net_up=%d", sys_net_is_up());
     int n = -1;
-    for (int a = 0; a < 4 && n <= 0; a++) { if (a) usleep(1000000); n = http_get(MANIFEST_URL, (uint8_t *)g_manifest, sizeof(g_manifest) - 1); }
-    if (n <= 0) return 1;
+    for (int a = 0; a < 4 && n <= 0; a++) { if (a) usleep(1000000); char murl[224]; repo_url("manifest.json", murl, (int)sizeof(murl));
+        n = http_get(murl, (uint8_t *)g_manifest, sizeof(g_manifest) - 1); }
+    ulog("manifest fetch -> %d bytes", n);
+    if (n <= 0) { ulog("ABORT: manifest fetch failed"); return 1; }
     g_manifest[n] = 0;
 
+    // #559: authenticate the manifest before trusting any version or hash in it.
+    {
+        int sn = -1;
+        for (int a = 0; a < 3 && sn <= 0; a++) { if (a) usleep(500000);
+            char surl[224]; repo_url("manifest.json.sig", surl, (int)sizeof(surl));
+            sn = http_get(surl, g_sig, (int)sizeof(g_sig)); }
+        ulog("signature fetch -> %d bytes", sn);
+        if (sn <= 0) { printf("[upd] REFUSED: no repo signature\n");
+            ulog("REFUSED: no repo signature (fail closed)"); return 1; }
+        int vrc = pkgsig_verify_manifest(g_manifest, (size_t)n, g_sig, (size_t)sn);
+        if (vrc != PKGSIG_OK) {
+            printf("[upd] REFUSED: manifest signature: %s\n", pkgsig_strerror(vrc));
+            ulog("REFUSED: manifest signature: %s (rc=%d, fail closed)", pkgsig_strerror(vrc), vrc);
+            return 1;
+        }
+    }
+
+    ulog("manifest signature VERIFIED against baked-in kernel pubkey");
     load_reg();
+    ulog("installed apps in registry: %d", g_nreg);
     if (g_nreg == 0) return 0;
 
     char *pk = strstr(g_manifest, "\"packages\"");
@@ -256,21 +349,23 @@ int main(int argc, char **argv) {
         char *obj = p; int depth = 0; char *q = p;
         while (q < end) { if (*q == '{') depth++; else if (*q == '}') { depth--; if (!depth) { q++; break; } } q++; }
         char *oe = q;
-        char id[32], name[48], ver[16], path[96];
+        char id[32], name[48], ver[16], path[96], shahex[65];
         jstr(obj, oe, "id", id, sizeof(id));
         jstr(obj, oe, "name", name, sizeof(name));
         jstr(obj, oe, "version", ver, sizeof(ver));
         jstr(obj, oe, "path", path, sizeof(path));
+        jstr(obj, oe, "sha256", shahex, sizeof(shahex));
         p = oe;
         if (!id[0]) continue;
         // installed?
         for (int r = 0; r < g_nreg; r++) {
             if (strcmp(g_rid[r], id) == 0) {
                 printf("[upd] installed %s: have=%s avail=%s\n", id, g_rver[r], ver);
+                ulog("installed %s: have=%s avail=%s", id, g_rver[r], ver);
                 if (strcmp(g_rver[r], ver) != 0 && ver[0]) {
                     // newer version available
                     if (policy == POL_AUTO) {
-                        if (apply_update(id, name, ver, path) == 0) {
+                        if (apply_update(id, name, ver, path, shahex) == 0) {
                             char body[96]; strcpy(body, name);
                             strncat(body, " updated to v", sizeof(body)-strlen(body)-1);
                             strncat(body, ver, sizeof(body)-strlen(body)-1);

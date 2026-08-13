@@ -13,6 +13,7 @@
 #include "../mm/heap.h"
 #include "../fs/fat.h"
 #include "../gui/image.h"
+#include "../cpu/mono.h"   // #499: sched_now_ms() - THE shared real-elapsed-ms clock
 
 extern fat_fs_t g_fat_fs;
 extern void proc_sleep(uint32_t ms);
@@ -144,12 +145,11 @@ static void ipp_warm_arp(const char *host) {
     uint32_t ip = wget_parse_ip(host);
     if (!ip) return;
     uint8_t mac[6];
-    uint64_t start = timer_ticks;
-    uint64_t hz = g_timer_hz ? g_timer_hz : 250;
+    uint64_t start = sched_now_ms();
     while (!arp_resolve(ip, mac)) {
         net_poll();
         tcp_timer();
-        if (timer_ticks - start > hz * 4) {
+        if (sched_now_ms() - start > 4000) {
             kprintf("[IPP] ARP warm-up for %s timed out\n", host);
             return;
         }
@@ -163,18 +163,17 @@ static void ipp_warm_arp(const char *host) {
 static int ipp_send_all(int sock, const void *data, uint32_t len) {
     const uint8_t *p = (const uint8_t *)data;
     uint32_t sent = 0;
-    uint64_t hz = g_timer_hz ? g_timer_hz : 250;
-    uint64_t start = timer_ticks;
+    uint64_t start = sched_now_ms();
     while (sent < len) {
         uint32_t want = len - sent;
         if (want > 16384) want = 16384;
         net_lock();
         int s = tcp_send(sock, p + sent, (uint16_t)want);
         net_unlock();
-        if (s > 0) { sent += s; start = timer_ticks; }
+        if (s > 0) { sent += s; start = sched_now_ms(); }
         else if (s == TCP_ERR_WOULD_BLOCK || s == 0) { net_poll(); tcp_timer(); proc_sleep(2); }
         else return -1;
-        if (timer_ticks - start > hz * 10) return -1;
+        if (sched_now_ms() - start > 10000) return -1;
     }
     net_poll(); tcp_timer();
     return (int)sent;
@@ -190,7 +189,6 @@ static int ipp_exchange(const char *host, uint16_t port, const char *resource,
     if (resp_len_out) *resp_len_out = 0;
     uint32_t ip = wget_parse_ip(host);
     if (!ip) { kprintf("[IPP] cannot parse host '%s'\n", host); return -1; }
-    uint64_t hz = g_timer_hz ? g_timer_hz : 250;
 
     ipp_warm_arp(host);
     kprintf("[IPP] POST http://%s:%u%s (%u byte IPP body)\n",
@@ -210,9 +208,9 @@ static int ipp_exchange(const char *host, uint16_t port, const char *resource,
         }
 
         // Wait for the 3-way handshake.
-        uint64_t start = timer_ticks;
+        uint64_t start = sched_now_ms();
         int connected = 0;
-        while (timer_ticks - start < hz * 5) {
+        while (sched_now_ms() - start < 5000) {
             net_poll(); tcp_timer();
             if (tcp_is_connected(sock)) { connected = 1; break; }
             if (tcp_get_state(sock) == TCP_STATE_CLOSED) break;
@@ -247,16 +245,16 @@ static int ipp_exchange(const char *host, uint16_t port, const char *resource,
 
         // Receive the whole HTTP response until the peer closes (or timeout).
         uint32_t total = 0;
-        uint64_t rstart = timer_ticks;
+        uint64_t rstart = sched_now_ms();
         int got_close = 0;
-        while (timer_ticks - rstart < hz * 20 && total < resp_cap - 1) {
+        while (sched_now_ms() - rstart < 20000 && total < resp_cap - 1) {
             net_poll(); tcp_timer();
             uint32_t space = resp_cap - 1 - total;
             if (space > 16384) space = 16384;
             net_lock();
             int n = tcp_recv(sock, resp_buf + total, (uint16_t)space);
             net_unlock();
-            if (n > 0) { total += n; rstart = timer_ticks; continue; }
+            if (n > 0) { total += n; rstart = sched_now_ms(); continue; }
             if (n == TCP_ERR_CLOSED) { got_close = 1; break; }
             tcp_state_t st = tcp_get_state(sock);
             if (st == TCP_STATE_CLOSED || st == TCP_STATE_TIME_WAIT) { got_close = 1; break; }

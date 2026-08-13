@@ -5,6 +5,7 @@
 #include "../mm/heap.h"
 #include "../string.h"
 #include "../serial.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // #404 Phase V: Rust PNG parse seams (rustkern.rs). Same signatures as the C
 // references png_parse_ihdr_c / png_defilter_c below; a signature mismatch here
@@ -360,6 +361,15 @@ static int inflate(const uint8_t *src, uint32_t src_len,
 #else
     return inflate_c(src, src_len, dst, dst_cap, dst_len);
 #endif
+}
+
+// #703: the same dispatcher, exported for the compiled-in boot splash (see
+// video/boot_image.h). Deliberately a one-line forwarder rather than a second
+// implementation, so there is exactly one DEFLATE core in the kernel and the
+// #404 Rust strangler seam covers both callers.
+int png_inflate_raw(const uint8_t *src, uint32_t src_len,
+                    uint8_t *dst, uint32_t dst_cap, uint32_t *dst_len) {
+    return inflate(src, src_len, dst, dst_cap, dst_len);
 }
 
 // Paeth predictor for PNG filtering
@@ -816,7 +826,6 @@ static void png_wr_be32(uint8_t *b, uint32_t v) {
 }
 
 void png_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     // color_type -> bpp map for the generator (0/2/4/6 valid).
     static const int ctype_tab[4] = { PNG_COLOR_GRAYSCALE, PNG_COLOR_RGB,
                                       PNG_COLOR_GRAYSCALE_A, PNG_COLOR_RGBA };
@@ -971,7 +980,6 @@ void png_rust_selftest(void) {
 #include "inflate_vectors.h"
 
 void inflate_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     // Force-reference inflate_rs so its archive member always links (matches the
     // png/jpeg pattern), regardless of -DRUST_INFLATE.
     { uint8_t d[1] = {0}; uint32_t ol = 0; inflate_rs(d, 0, d, 0, &ol); }

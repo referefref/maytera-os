@@ -17,8 +17,12 @@
 #define MAYTERA_VERSION_STRING "1.26.0"
 
 // Build date (set at compile time)
+#ifndef MAYTERA_BUILD_DATE
 #define MAYTERA_BUILD_DATE       __DATE__
+#endif
+#ifndef MAYTERA_BUILD_TIME
 #define MAYTERA_BUILD_TIME       __TIME__
+#endif
 
 // Full version string
 #define MAYTERA_FULL_VERSION     "MayteraOS v" MAYTERA_VERSION_STRING

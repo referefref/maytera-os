@@ -31,7 +31,7 @@ The wallpaper picker in the settings app walks the table in
 `kernel/gui/desktop.c` (look for `g_wallpapers[]`). The current set is:
 
 ```
-EBERG01.BMP .. EBERG13.BMP
+EBERG01.BMP, EBERG03.BMP .. EBERG13.BMP
 EBERG15.BMP .. EBERG22.BMP
 EBERG25.BMP .. EBERG30.BMP
 OCEAN01.BMP .. OCEAN08.BMP

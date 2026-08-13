@@ -8,7 +8,7 @@ LIBC_DIR = ../../libc
 BUILD_DIR = build
 
 # Compiler flags for user-space
-CFLAGS = -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=large \
+CFLAGS = -ffreestanding -fstack-protector-strong -mstack-protector-guard=global -fPIE -mno-red-zone \
          -nostdlib -nostdinc -fno-builtin -Wall -Wextra -O2 -g \
          -I$(LIBC_DIR) -isystem /usr/lib/gcc/x86_64-linux-gnu/12/include
 
@@ -16,7 +16,7 @@ CFLAGS = -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=lar
 # (the compositor and calc use this). Without it the ELF links at the default
 # 0x400000 low base, whose page tables fall in a region that faults when a
 # user process is created early at boot (see #95 notes).
-LDFLAGS = -T ../../user.ld -nostdlib -z max-page-size=0x1000
+LDFLAGS = -pie --no-dynamic-linker -z notext -T ../../user-pie.ld -nostdlib -z max-page-size=0x1000
 
 # Output
 TARGET = haservice

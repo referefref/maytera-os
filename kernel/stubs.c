@@ -8,9 +8,8 @@ extern void kprintf(const char *fmt, ...);
 extern uint8_t *fat_read_file(void *fs, const char *path, uint32_t *size);
 extern void *g_fat_fs;
 
-// Correct signature matching process.h
-extern int proc_create_user(const char *name, void *elf_data, uint64_t elf_size,
-                           char **argv, char **envp);
+// #692: the proc_create_user() extern that used to live here is gone with
+// the function itself. It had no caller in this file; it was a leftover.
 
 // ELF validation
 extern int elf_validate(const void *data, uint64_t size);

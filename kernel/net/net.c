@@ -21,6 +21,8 @@
 #include "../fs/fat.h"
 #include "../mm/heap.h"
 #include "../proc/process.h"   // #381: proc_create/proc_sleep/PRIO_* for net worker
+#include "../cpu/dlprof.h"
+#include "../cpu/mono.h"   // #549: mono_ms() paces the FAULTY re-probe
 
 static int net_initialized = 0;
 static net_driver_type_t active_driver = NET_DRIVER_NONE;
@@ -35,7 +37,7 @@ int g_net_static_configured = 0;
 //
 // THE BUG (golden 860, measured on the real iMac): a BARE desktop burned ~60% of
 // core 0. The iMac's DHCP found no server, so net_worker adopted the static
-// fallback <LAB_HOST> / gw <LAB_GATEWAY> (that exact pair == the .200-.209 /
+// fallback 192.0.2.1 / gw 192.0.2.1 (that exact pair == the .200-.209 /
 // gw .1 fallback below, NOT a lease). That gateway resolves at L2 but nothing
 // beyond it answers - the real internet is only via a different ICS box. The two
 // autostarted background fetchers (haservice polling Home Assistant every 10s,
@@ -43,7 +45,7 @@ int g_net_static_configured = 0;
 // failed fetch drives DNS/SYN retransmits; on the iMac's USB Ethernet dongle
 // every single send busy-polls the xHCI up to 40ms (usbnet_bulk_out), so the
 // retry storm pegged a core. (On an e1000 VM the same sends are cheap MMIO, which
-// is why VM 2200 and an e1000 repro stay idle - the spin is USB-amplified.)
+// is why a test VM and an e1000 repro stay idle - the spin is USB-amplified.)
 //
 // THE FIX (the user's stated design): DETECT persistent unreachability, then
 // FAIL SAFE AND QUIET - mark the interface NET_STATE_FAULTY, make net_is_up()
@@ -64,34 +66,87 @@ int g_net_static_configured = 0;
 // - a Rust port here would buy nothing and cross the FFI on every fetch.
 // ---------------------------------------------------------------------------
 #define NET_FAIL_STREAK_MAX 6      // consecutive transport failures -> FAULTY
+
+// #549 (recovery fixed 2026-08-10): while FAULTY, exactly ONE fetch per this
+// interval is let onto the wire as a re-probe. See net_fetch_probe_take().
+#define NET_PROBE_INTERVAL_MS 30000
+
 static volatile net_conn_state_t g_net_conn_state = NET_STATE_UP;
 static volatile uint32_t g_net_fail_streak = 0;
+static volatile uint64_t g_net_probe_next_ms = 0;   // earliest permitted re-probe
 
 void net_report_reach_ok(void) {
     g_net_fail_streak = 0;
+    g_net_probe_next_ms = 0;
     if (g_net_conn_state != NET_STATE_UP) {
         g_net_conn_state = NET_STATE_UP;
-        kprintf("[NET] connectivity restored; interface re-enabled (was FAULTY)\n");
+        kprintf("[NET] a transfer completed; interface re-enabled (was NET_FAULTY)\n");
     }
 }
 
 void net_report_reach_fail(void) {
     if (g_net_conn_state == NET_STATE_FAULTY) return;   // already tripped; stay quiet
+    // #549 FIX (2026-08-10): only count a failure that actually REACHED THE WIRE.
+    // wget_fetch()/https_connect() return WGET_ERR_NO_NETWORK the instant
+    // net_is_up() is false (no carrier, no address yet, stack not initialised),
+    // and net_fetch_report() turned that r<0 into a reach-failure. That is
+    // evidence about US, not about the remote: it let a box accumulate the whole
+    // trip streak during the pre-DHCP window without ever emitting a packet, and
+    // the resulting FAULTY state then outlived the condition that caused it.
+    if (!net_wire_usable()) return;
     if (g_net_fail_streak < 0xFFFFFFFFu) g_net_fail_streak++;
     if (g_net_fail_streak >= NET_FAIL_STREAK_MAX) {
         g_net_conn_state = NET_STATE_FAULTY;
+        g_net_probe_next_ms = mono_ms() + NET_PROBE_INTERVAL_MS;
         kprintf("[NET] %u consecutive unreachable-remote failures: marking interface "
-                "NET_FAULTY (manual configuration required). Retries stopped; "
-                "net_is_up() now reports DOWN so background fetchers quiesce.\n",
-                (unsigned)g_net_fail_streak);
+                "NET_FAULTY. Bulk traffic stopped; one re-probe every %ums until a "
+                "transfer completes.\n",
+                (unsigned)g_net_fail_streak, (unsigned)NET_PROBE_INTERVAL_MS);
     }
 }
 
 net_conn_state_t net_get_conn_state(void) { return g_net_conn_state; }
 int net_is_faulty(void) { return g_net_conn_state == NET_STATE_FAULTY; }
 
+// #549 FIX (2026-08-10): the one way out of NET_FAULTY that needs no human.
+//
+// THE BUG THIS CLOSES. The FAULTY gate in sys_http_fetch*/sys_http_post* refused
+// every fetch before it started, but the only automatic clear
+// (net_report_reach_ok) fires when a fetch COMPLETES. The gate therefore
+// suppressed the only evidence that could clear the gate: the state was
+// SELF-LATCHING. With the link continuously up, no path back existed short of a
+// reboot or a manual Settings reconfigure, even though the header comment above
+// claimed "any fetch that actually completes" would clear it. That claim was
+// false by construction. Meanwhile ICMP and cached DNS were never gated, so the
+// box looked healthy (link, IP, gateway, DNS all green) while every HTTP request
+// was refused: exactly the first-boot wizard report that prompted this fix.
+//
+// THIS IS NOT "A TIMER THAT HOPES". The timer paces only how often we are
+// allowed to GATHER evidence. The fault clears solely in net_report_reach_ok(),
+// i.e. only when a transfer actually completed. A probe that fails changes
+// nothing and the interface stays FAULTY, so a genuinely dead uplink still
+// stays quiesced forever.
+//
+// IT KEEPS #549's PROTECTION. What #549 fixed was a RETRY STORM: background
+// pollers retrying continuously, where every send busy-polls the iMac dongle's
+// xHCI up to 40ms in usbnet_bulk_out and pegged a core. One probe per 30s is a
+// ~1000x smaller duty cycle than that storm, so the CPU win is preserved while
+// the dead end is removed.
+//
+// Returns 1 if the caller may put this request on the wire (consuming the probe
+// budget when FAULTY), 0 if it must be refused.
+int net_fetch_probe_take(void) {
+    if (g_net_conn_state != NET_STATE_FAULTY) return 1;
+    uint64_t now = mono_ms();
+    if (now < g_net_probe_next_ms) return 0;
+    g_net_probe_next_ms = now + NET_PROBE_INTERVAL_MS;
+    kprintf("[NET] NET_FAULTY: allowing one re-probe onto the wire\n");
+    return 1;
+}
+
 void net_clear_fault(void) {
     g_net_fail_streak = 0;
+    g_net_probe_next_ms = 0;
     if (g_net_conn_state != NET_STATE_UP) {
         g_net_conn_state = NET_STATE_UP;
         kprintf("[NET] fault cleared; interface re-enabled (manual reconnect)\n");
@@ -245,6 +300,10 @@ int net_init(void) {
     kprintf_set_dual_output(1);
     kprintf("\n[NET] Initializing network stack...\n");
 
+    // #524: initialize the BSD socket layer (wait queue + descriptor table).
+    extern void socket_init(void);
+    socket_init();
+
     // PCI is already initialized by main.c
 
     // Try VirtIO-net first (preferred for VMs)
@@ -337,7 +396,7 @@ int net_init(void) {
     kprintf("[NET] Sending test ARP packet...\n");
     uint8_t test_mac[6];
     nic_get_mac(test_mac);
-    uint32_t test_ip = 0xC0A80101;  // 192.0.2.1
+    uint32_t test_ip = 0xC0000201;  // 192.0.2.1
     arp_request(test_ip);
     kprintf("[NET] Test ARP request sent for 192.0.2.1\n");
     kprintf("[NET] net_init complete, disabling dual output\n");
@@ -376,34 +435,186 @@ static volatile uint64_t g_net_lock_saved_flags = 0;
 // preemptible, or a single-CPU spinner (or another CPU) waiting on it would
 // deadlock while the holder sits preempted. The ring busy-waits inside are
 // bounded (microseconds), so masking IRQs briefly is safe.
+// #745 (task #62) INSTRUMENTATION. How long does a context spend SPINNING for
+// this lock with interrupts already off? That number is the direct measure of
+// "the network stalled something else", and until now nothing recorded it.
+volatile uint64_t g_net_lock_wait_max_cyc = 0;   // longest blocking acquire spin
+volatile uint64_t g_net_lock_wait_tot_cyc = 0;   // total blocking acquire spin
+volatile uint64_t g_net_lock_contended    = 0;   // net_trylock() refusals
+
+// ---------------------------------------------------------------------------
+// #745 (task #69): HOW LONG IS THE LOCK **HELD**, AND BY WHOM.
+//
+// task #62 measured the WAIT (g_net_lock_wait_max_cyc: how long a loser spins).
+// That is the wrong half of the problem, and measuring it alone is why the
+// answer to "why did the machine stop for 30 seconds" still had to be argued
+// from source. A waiter's spin is bounded BY THE HOLDER: nothing can spin for
+// 30s unless something HELD it for 30s. The hold is the primary quantity and
+// nothing recorded it.
+//
+// Worse, on a single core the wait counter cannot even see the fault. net_lock
+// keeps IF clear for the whole hold, so the holder is not preemptible; a second
+// thread on the same core can therefore never be running to spin, and lockwait=
+// reads 0 while the machine is frozen solid. lockwait= is a MULTI-CORE
+// contention metric. holdmax= is the freeze metric.
+//
+// holdra= is the part that makes this actionable on a machine with no serial
+// console: the return address of whoever took the lock for holdmax. addr2line
+// that against the build's kernel.elf and the offending call site names itself,
+// instead of a reader having to re-derive the whole net_lock caller table.
+//
+// Budget: a hold longer than NET_LOCK_HOLD_BUDGET_US is a defect by definition,
+// because for that whole window the timer tick cannot fire, so THE SCHEDULER
+// DOES NOT RUN and no priority scheme in the kernel can preempt it. 2 ms is
+// half a tick at 250 Hz - generous for a ring drain and a TRB write, and far
+// under anything a user could perceive.
+#define NET_LOCK_HOLD_BUDGET_US 2000ULL
+
+volatile uint64_t g_net_lock_hold_max_cyc = 0;   // longest single hold (read+reset by [NETSTARVE])
+volatile uint64_t g_net_lock_hold_max_hb  = 0;   // same, second owner, for the [HB] record
+volatile uint64_t g_net_lock_hold_max_ra  = 0;   // caller RA that produced hold_max_hb
+volatile uint64_t g_net_lock_hold_tot_cyc = 0;   // total time the lock was held
+volatile uint64_t g_net_lock_holds        = 0;   // outermost acquisitions
+volatile uint64_t g_net_lock_over_budget  = 0;   // holds beyond NET_LOCK_HOLD_BUDGET_US
+
+// Per-hold state. Written only by the owner, between its outermost acquire and
+// its outermost release, so no lock is needed to protect it.
+static volatile uint64_t g_net_lock_t0 = 0;
+static volatile uint64_t g_net_lock_ra = 0;
+
+static inline uint64_t net_rdtsc(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
 void net_lock(void) {
     uint64_t flags;
     __asm__ volatile("pushfq; pop %0" : "=r"(flags));
     __asm__ volatile("cli");
     uint32_t cpu = smp_this_cpu();
     if (g_net_lock_owner == cpu) { g_net_lock_depth++; return; }  // recursive re-entry
+    uint64_t _w0 = net_rdtsc();
     spinlock_acquire(&g_net_lock);
+    uint64_t _w = net_rdtsc() - _w0;
+    g_net_lock_wait_tot_cyc += _w;
+    if (_w > g_net_lock_wait_max_cyc) g_net_lock_wait_max_cyc = _w;
     g_net_lock_owner = cpu;
     g_net_lock_depth = 1;
     g_net_lock_saved_flags = flags;   // remember caller IF for the outermost release
+    g_net_lock_t0 = net_rdtsc();      // #745 (task #69): hold clock starts here
+    g_net_lock_ra = (uint64_t)__builtin_return_address(0);
+}
+
+// ---------------------------------------------------------------------------
+// #745 (task #62): THE COMPOSITOR MUST NEVER BLOCK ON THE NETWORK.
+//
+// net_lock() does `cli` BEFORE it spins on the global spinlock, so a context
+// that loses the race waits with interrupts DISABLED and cannot even be
+// preempted out of the wait. sys_fb_flip() - the compositor's frame present,
+// the syscall that literally puts pixels on the screen - called net_poll(),
+// which takes this lock. That made the compositor's worst-case frame time the
+// worst case of EVERY network context in the kernel: every client pump loop
+// (kernel/net/https.c's https_tcp_send has NO deadline at all and retries
+// forever - see the [DEBT]/HARMFUL entry in tools/concurrency-lint/
+// allowlist.txt), the net worker, the SSH server, and every TX. Those loops run
+// HARDEST when the network is failing, which is exactly when the desktop must
+// stay responsive. A user on the real iMac saw the cursor move one frame every
+// few seconds while the App Store and example.com both failed to load.
+//
+// net_trylock() is the SAME lock with the SAME recursion semantics, except it
+// never waits: if another CPU/context owns it we restore the caller's IF and
+// return 0. Built on the existing spinlock_try_acquire() primitive - no new
+// locking scheme, per the "reuse the shared primitive" rule.
+//
+// Kept in C rather than Rust: this is the hottest path in the kernel (every
+// frame present and every packet), it is pure `cli`/`pushfq`/spinlock
+// manipulation that must stay inlined next to the existing net_lock() it is a
+// variant of, and an FFI crossing per present is exactly the cost this change
+// exists to remove. Same justification the #549 breaker in this file already
+// carries.
+// ---------------------------------------------------------------------------
+int net_trylock(void) {
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0" : "=r"(flags));
+    __asm__ volatile("cli");
+    uint32_t cpu = smp_this_cpu();
+    if (g_net_lock_owner == cpu) { g_net_lock_depth++; return 1; }  // recursive
+    if (!spinlock_try_acquire(&g_net_lock)) {
+        g_net_lock_contended++;
+        if (flags & 0x200) __asm__ volatile("sti");   // restore caller IF
+        return 0;
+    }
+    g_net_lock_owner = cpu;
+    g_net_lock_depth = 1;
+    g_net_lock_saved_flags = flags;
+    g_net_lock_t0 = net_rdtsc();      // #745 (task #69): trylock holds too
+    g_net_lock_ra = (uint64_t)__builtin_return_address(0);
+    return 1;
 }
 
 void net_unlock(void) {
     uint32_t cpu = smp_this_cpu();
     if (g_net_lock_owner != cpu) return;   // defensive: not the owner
     if (--g_net_lock_depth > 0) return;
+    // #745 (task #69): close the hold measurement BEFORE releasing, so the
+    // number covers exactly the interrupts-off window and nothing else.
+    {
+        uint64_t _h = net_rdtsc() - g_net_lock_t0;
+        uint64_t _ra = g_net_lock_ra;
+        g_net_lock_hold_tot_cyc += _h;
+        g_net_lock_holds++;
+        if (_h > g_net_lock_hold_max_cyc) g_net_lock_hold_max_cyc = _h;
+        if (_h > g_net_lock_hold_max_hb) {
+            g_net_lock_hold_max_hb = _h;
+            g_net_lock_hold_max_ra = _ra;   // paired: the RA always describes hb
+        }
+        uint64_t _khz = mono_tsc_khz();
+        uint64_t _us  = _khz ? (_h * 1000ULL / _khz) : 0;
+        if (_us >= NET_LOCK_HOLD_BUDGET_US) {
+            g_net_lock_over_budget++;
+            // ONE loud line per boot, naming the caller. Serial only and
+            // rate-limited to a single occurrence: we are still inside the
+            // cli region here, and a report that can storm is a second
+            // source of the stall it is reporting (#373's lesson).
+            static int _told = 0;
+            if (!_told) {
+                _told = 1;
+                kprintf("[NETHOLD] #745/#69: net_lock held %luus with IRQs OFF "
+                        "(ra=%p). The scheduler could not run for that whole "
+                        "window, so no priority can preempt it. addr2line this "
+                        "address against this build's kernel.elf.\n",
+                        (unsigned long)_us, (void *)_ra);
+            }
+#ifdef NET_LOCK_HOLD_PANIC
+            // make NETHOLDPANIC=1: turn the first over-budget hold into a
+            // panic, so the offending stack is captured instead of inferred.
+            extern void kpanic(const char *msg);
+            kpanic("#745/#69: net_lock held past its interrupts-off budget");
+#endif
+        }
+    }
     uint64_t flags = g_net_lock_saved_flags;
     g_net_lock_owner = 0xFFFFFFFF;
     spinlock_release(&g_net_lock);
     if (flags & 0x200) __asm__ volatile("sti");
 }
 
+// #615: RX drain accounting, so "how many packets did one poll actually get?"
+// is a measured number instead of an assumption. Serial-reported by the HTTP
+// profile line; no cost beyond two increments.
+uint64_t g_net_poll_calls = 0, g_net_poll_pkts = 0, g_net_poll_max = 0;
+
 void net_poll(void) {
     if (!net_initialized) return;
+    uint64_t _dp_t0 = dp_tsc();
 
     net_lock();
     // Drain up to 64 packets per poll (bounded to prevent desktop starvation)
-    for (int i = 0; i < 64; i++) { if (!eth_receive()) break; }
+    uint32_t _got = 0;
+    for (int i = 0; i < 64; i++) { if (!eth_receive()) break; _got++; }
+    g_net_poll_calls++; g_net_poll_pkts += _got;
+    if (_got > g_net_poll_max) g_net_poll_max = _got;
     // #333/#747: now that the RX drain has cached any freshly resolved MACs,
     // flush packets held for cold LAN hosts. Runs HERE (top level), not from the
     // ARP receive callback, so the send is never nested inside eth_receive.
@@ -431,6 +642,41 @@ void net_poll(void) {
         arp_announce();
     }
     net_unlock();
+    g_dp_poll_cyc += dp_tsc() - _dp_t0; g_dp_poll_calls++;
+}
+
+// ---------------------------------------------------------------------------
+// #745 (task #62): the NON-BLOCKING, BOUNDED pump, for callers that must never
+// wait on the network - today exactly one: the compositor's sys_fb_flip().
+//
+// Returns 1 if it serviced the stack, 0 if it DECLINED because another context
+// held net_lock. Declining is correct and cheap: the dedicated net pump thread
+// (net_pump_worker, below) is the always-armed service source, so a skipped
+// frame costs the network at most one pump interval, while a blocked frame
+// costs the user a visible freeze.
+//
+// The work it does is a strict SUBSET of net_poll(): the same RX drain (with a
+// caller-supplied smaller bound), the same arp_flush_ready(), the same
+// dhcp_poll() state machine. It deliberately does NOT carry net_poll()'s
+// 180-second gratuitous-ARP announce - that is a TX on a shared LAN (#380) and
+// has no business on the frame path; net_poll() on the pump thread still does
+// it on schedule.
+// ---------------------------------------------------------------------------
+int net_poll_try(int max_pkts) {
+    if (!net_initialized) return 0;
+    if (max_pkts <= 0 || max_pkts > 64) max_pkts = 64;
+    uint64_t _dp_t0 = dp_tsc();
+    if (!net_trylock()) return 0;          // contended: skip, never wait
+    uint32_t _got = 0;
+    for (int i = 0; i < max_pkts; i++) { if (!eth_receive()) break; _got++; }
+    g_net_poll_calls++; g_net_poll_pkts += _got;
+    if (_got > g_net_poll_max) g_net_poll_max = _got;
+    extern void arp_flush_ready(void);
+    arp_flush_ready();
+    dhcp_poll();
+    net_unlock();
+    g_dp_poll_cyc += dp_tsc() - _dp_t0; g_dp_poll_calls++;
+    return 1;
 }
 
 // Start DHCP discovery
@@ -478,9 +724,27 @@ int net_adopt_static(uint32_t ip, uint32_t gateway, uint32_t netmask) {
                 p[3], p[2], p[1], p[0]);
         return -1;
     }
+    // #504: arp_ip_in_use() above ran RFC 5227 DAD, which PUMPS the RX/DHCP path
+    // for seconds; a concurrent DHCP DORA (whose OFFER/ACK were already in flight)
+    // can reach BOUND during that window and commit its lease via ip_set_address()
+    // from dhcp_poll(). Without this guard the static fallback then OVERWROTE the
+    // fresh lease (observed: "Bound to 192.0.2.1" immediately followed by
+    // "adopted static 192.0.2.1"), which made the DHCP fix look broken.
+    // dhcp_poll() commits under net_lock (net_poll holds it), so take net_lock here
+    // to make "did DHCP bind?" and "commit the static IP" ATOMIC against it: if a
+    // lease landed during DAD, abandon the static adoption and keep the lease. The
+    // static fallback must never clobber a DHCP lease.
+    net_lock();
+    if (dhcp_is_bound() || ip_get_address() != 0) {
+        net_unlock();
+        kprintf("[NET] DHCP lease acquired during DAD; keeping it, not adopting "
+                "static %d.%d.%d.%d\n", p[3], p[2], p[1], p[0]);
+        return -1;
+    }
     ip_set_address(ip);
     ip_set_gateway(gateway);
     ip_set_netmask(netmask);
+    net_unlock();
     kprintf("[NET] DAD OK: adopted static %d.%d.%d.%d (verified unique)\n",
             p[3], p[2], p[1], p[0]);
     // Announce our now-verified-unique address a couple of times (RFC 5227).
@@ -542,10 +806,28 @@ void nic_get_mac(uint8_t *mac) {
     }
 }
 
+// #745 (task #62) INSTRUMENTATION: per-packet TRANSMIT COST, the number the
+// #549 investigation had to infer. On the real iMac dongle the old
+// usbnet_bulk_out() busy-polled the xHCI up to ~40ms PER PACKET; #549 made TX
+// fire-and-forget, but nothing ever measured the result on the hardware where
+// the cost lived. g_nic_tx_max_cyc answers it directly and is reported on the
+// [NETSTARVE] serial line: tens of MICROseconds means TX is async as intended,
+// tens of MILLIseconds means something reintroduced a wait on the wire.
+uint64_t g_nic_tx_ok = 0, g_nic_tx_fail = 0;
+// Two owners, same rule as the present gap above: g_nic_tx_max_cyc is read and
+// reset by [NETSTARVE], g_nic_tx_max_hb by the /HEARTBEAT.TXT record.
+uint64_t g_nic_tx_tot_cyc = 0, g_nic_tx_max_cyc = 0, g_nic_tx_max_hb = 0;
+
 int nic_send(const void *data, uint16_t length) {
     if (driver_send) {
         net_lock();
+        uint64_t _t0 = net_rdtsc();
         int r = driver_send(data, length);
+        uint64_t _d = net_rdtsc() - _t0;
+        g_nic_tx_tot_cyc += _d;
+        if (_d > g_nic_tx_max_cyc) g_nic_tx_max_cyc = _d;
+        if (_d > g_nic_tx_max_hb)  g_nic_tx_max_hb  = _d;
+        if (r < 0) g_nic_tx_fail++; else g_nic_tx_ok++;
         net_unlock();
         return r;
     }
@@ -602,10 +884,19 @@ static int nic_refresh_link(void) {
 // machine with no working NIC (stack not initialised, link down, or no IP) never
 // starts a call that would burn a multi-second connect/resolve timeout and freeze
 // the desktop. Requires: stack initialised AND link carrier AND a configured IP.
-int net_is_up(void) {
+// "Could a packet actually have left the box?" This is net_is_up() WITHOUT the
+// FAULTY clause: it answers about the hardware and configuration, not about
+// whether policy currently lets us try. Exported because the transport clients
+// (wget/https/dns) must ask THIS, not net_is_up() - see net.h.
+int net_wire_usable(void) {
     if (!net_initialized) return 0;
     if (!nic_link_up()) return 0;
     if (ip_get_address() == 0) return 0;
+    return 1;
+}
+
+int net_is_up(void) {
+    if (!net_wire_usable()) return 0;
     // #549: a persistently-unreachable interface reports DOWN so every client
     // that gates on net_is_up() (haservice, netinfo, browser) stops retrying.
     if (g_net_conn_state == NET_STATE_FAULTY) return 0;
@@ -654,7 +945,25 @@ static void net_worker(void *arg) {
             // action - clear any NET_FAULTY so a genuinely-restored uplink comes
             // back without needing a manual reconfigure.
             net_clear_fault();
-            if (!dhcp_is_bound() && !g_net_static_configured && ip_get_address() == 0) {
+            if (g_net_static_configured) {
+                // File-provided static config persists across link changes;
+                // nothing to re-acquire on a relink.
+            } else if (prev_link == 0) {
+                // #431: a GENUINE carrier down->up transition (cable replug or a
+                // move to a different network). prev_link==0 means we actually
+                // saw the link go down first; the first-ever boot observation is
+                // prev_link==-1 and is handled by the branch below. Re-run DHCP
+                // from scratch even if we still hold an old lease, so a network
+                // change re-acquires a fresh lease WITHOUT a reboot. dhcp_reset()
+                // clears the BOUND state that would otherwise make dhcp_discover()
+                // an early-return no-op; both run here on the worker thread (top
+                // level, never a receive callback) and dhcp_discover() drops the
+                // stale IP itself (ip_set_address(0)).
+                kprintf("[NET] carrier relink (down->up); re-running DHCP for a fresh lease\n");
+                dhcp_reset();
+                dhcp_discover();
+            } else if (!dhcp_is_bound() && ip_get_address() == 0) {
+                // First observation at boot with nothing acquired yet.
                 kprintf("[NET] carrier up; starting DHCP (background)\n");
                 dhcp_discover();
             }
@@ -671,7 +980,17 @@ static void net_worker(void *arg) {
             // (.200-.209), exactly like the old boot path but async and only
             // while the carrier is actually up (net_adopt_static is carrier-gated
             // too, so this can never probe/claim on a dead link).
-            if (!dad_done && up_secs >= 12) {
+            //
+            // #504: RE-CHECK dhcp_is_bound()/ip_get_address() HERE, not just at the
+            // loop-top gate. net_poll() above drives the DHCP state machine, so DORA
+            // can reach BOUND within THIS SAME iteration (the offer/ack landed during
+            // the 4x net_poll drain). The outer gate was evaluated BEFORE that drain
+            // and is now stale: without this re-check the static fallback fired right
+            // after a successful bind and OVERWROTE the good DHCP lease with .200
+            // (observed: "Bound to 192.0.2.1" immediately followed by "adopted
+            // static 192.0.2.1"), making the DHCP fix look broken. The static
+            // fallback must apply ONLY when DHCP genuinely did not succeed.
+            if (!dad_done && up_secs >= 12 && !dhcp_is_bound() && ip_get_address() == 0) {
                 dad_done = 1;
                 // #522: DHCP failed to bind in 12s. Dump the lock-free DHCP event
                 // ring HERE, from the net worker thread (top-level, allowed to be
@@ -683,16 +1002,82 @@ static void net_worker(void *arg) {
 
                 int adopted = 0;
                 for (uint32_t h = 200; h <= 209; h++) {
-                    if (net_adopt_static(0xC0A80100u | h, 0xC0A80101u,
+                    // #504: bail the instant DHCP wins, so a lease landing mid-
+                    // sweep is never clobbered and we run no pointless DAD.
+                    if (dhcp_is_bound() || ip_get_address() != 0) break;
+                    if (net_adopt_static(0xC0000201u | h, 0xC0000201u,
                                          0xFFFFFF00u) == 0) { adopted = 1; break; }
                 }
-                if (!adopted)
-                    kprintf("[NET] static fallback .200-.209 all taken; "
-                            "interface left unconfigured\n");
+                if (!adopted) {
+                    if (dhcp_is_bound() || ip_get_address() != 0) {
+                        // #504: DHCP won during the sweep; the interface IS
+                        // configured (a real lease, not the static fallback). This
+                        // is the SUCCESS path, not "unconfigured" - say so, so the
+                        // log never misreads a good DHCP lease as a failure.
+                        kprintf("[NET] DHCP configured the interface during the "
+                                "static-fallback window; keeping the lease\n");
+                    } else {
+                        kprintf("[NET] static fallback .200-.209 all taken; "
+                                "interface left unconfigured\n");
+                    }
+                }
             }
         }
 
         proc_sleep(1000);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// #745 (task #62): DEDICATED NETWORK SERVICE THREAD.
+//
+// Before this, sys_fb_flip() was the ONLY thing pumping net_poll() once the
+// userland compositor owned the screen. #632 MEASURED that and recorded this
+// exact end state as work still owed: "take net_poll() off the frame path
+// entirely ... then the compositor's frame rate and the network's service rate
+// stop being the same variable". It had two bad consequences, one in each
+// direction: network throughput was a function of frame rate (measured at
+// ~31-46 pps with presents stalled versus ~500 pps with them running), and
+// frame rate was a function of network cost.
+//
+// This thread breaks both. It is the always-armed service source. The flip pump
+// stays as a cheap REDUNDANT second source - CLAUDE.md's preference-1 shape
+// (the hda_space_wq pattern: two independent sources, so starving either one
+// cannot stop the work) - but it is now non-blocking via net_poll_try(), so it
+// can never cost the compositor a frame.
+//
+// PACED ON mono_ms(), NOT ON THE SLEEP RETURNING. timer_ticks is not a wall
+// clock: KVM replays lost ticks in bursts, so proc_sleep(N) can return
+// immediately under vCPU starvation and a naive `for(;;){ work(); sleep(N); }`
+// collapses into a net_lock storm - the exact residual risk #577 left open.
+// Gating the WORK on real elapsed monotonic milliseconds makes a collapsed
+// sleep cost one compare instead of a lock acquisition.
+// ---------------------------------------------------------------------------
+#ifndef FLIP_NET_BLOCKING
+#define FLIP_NET_BLOCKING 0
+#endif
+
+#define NET_PUMP_INTERVAL_MS 10
+
+uint64_t g_net_pump_runs = 0;    // pumps actually performed
+uint64_t g_net_pump_early = 0;   // wakeups that were too early to do work
+
+static void net_pump_worker(void *arg) __attribute__((unused));
+static void net_pump_worker(void *arg) {
+    (void)arg;
+    uint64_t last = 0;
+    kprintf("[NET] net pump thread running (%ums cadence, mono-paced)\n",
+            (unsigned)NET_PUMP_INTERVAL_MS);
+    for (;;) {
+        uint64_t now = mono_ms();
+        if (now - last >= NET_PUMP_INTERVAL_MS) {
+            last = now;
+            net_poll();
+            g_net_pump_runs++;
+        } else {
+            g_net_pump_early++;
+        }
+        proc_sleep(NET_PUMP_INTERVAL_MS);
     }
 }
 
@@ -701,6 +1086,63 @@ static void net_worker(void *arg) {
 void net_start_worker(void) {
     int pid = proc_create("netmon", net_worker, NULL, PRIO_NORMAL);
     kprintf("[NET] background net worker started, pid=%d\n", pid);
+#if FLIP_NET_BLOCKING
+    // #745 (task #62) A/B arm: the pre-fix build has no dedicated pump thread,
+    // because before this change sys_fb_flip() was the only thing pumping the
+    // stack once the compositor owned the screen (#632).
+    (void)net_pump_worker;
+    kprintf("[NET] net pump thread DISABLED (FLIP_NET_BLOCKING measurement arm)\n");
+#else
+    int ppid = proc_create("netpump", net_pump_worker, NULL, PRIO_NORMAL);
+    kprintf("[NET] net pump thread started, pid=%d\n", ppid);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// #745 (task #62): net_diag_line - ONE LINE that says WHY the network is down.
+//
+// The four candidate explanations for "no network on the real iMac" (no
+// carrier, DHCP never bound, the dongle never enumerated, a route/DNS failure)
+// are distinguishable from facts the kernel already holds, but nothing ever
+// printed them together, so every report had to be re-diagnosed from scratch.
+// This is the instrument: driver+carrier answers "dongle enumerated / cable
+// in", dhcp= answers "did DORA complete", ip/gw/dns answer "is it configured",
+// gwarp= answers "does the gateway exist at layer 2" (CACHE-ONLY lookup: it
+// must not transmit), and rx/tx answer "did anything ever reach the wire".
+// Written into a caller-supplied buffer so the heartbeat owns the printing.
+// ---------------------------------------------------------------------------
+int net_diag_line(char *buf, unsigned long len) {
+    extern int arp_lookup_cached(uint32_t ip, uint8_t *mac);
+    if (!buf || len < 96) return 0;
+    if (!net_initialized) return snprintf(buf, len, "stack=NOT-INITIALISED");
+
+    uint32_t ip = ip_get_address(), gw = ip_get_gateway(), ds = dns_get_server();
+    uint8_t *pi = (uint8_t *)&ip;
+    uint8_t *pg = (uint8_t *)&gw;
+    uint8_t *pd = (uint8_t *)&ds;
+    uint8_t gwmac[6];
+    int gwarp = (gw != 0) ? arp_lookup_cached(gw, gwmac) : 0;
+    net_driver_type_t dt = net_get_driver_type();
+    const char *drv = (dt == NET_DRIVER_E1000)  ? "e1000"  :
+                      (dt == NET_DRIVER_VIRTIO) ? "virtio" :
+                      (dt == NET_DRIVER_USB)    ? usb_eth_name() : "NONE";
+    int carrier = nic_link_up() ? 1 : 0;
+    const char *state = (g_net_conn_state == NET_STATE_FAULTY) ? "FAULTY" :
+                        !carrier  ? "NO-CARRIER" :
+                        (ip == 0) ? "NO-ADDRESS" : "UP";
+    return snprintf(buf, len,
+        "drv=%s carrier=%d state=%s cfg=%s dhcp=%s ip=%d.%d.%d.%d "
+        "gw=%d.%d.%d.%d gwarp=%s dns=%d.%d.%d.%d rx=%lu tx=%lu txfail=%lu",
+        drv, carrier, state,
+        g_net_static_configured ? "static" : "dhcp",
+        dhcp_is_bound() ? "BOUND" : "unbound",
+        pi[3], pi[2], pi[1], pi[0],
+        pg[3], pg[2], pg[1], pg[0],
+        gwarp ? "RESOLVED" : "UNRESOLVED",
+        pd[3], pd[2], pd[1], pd[0],
+        (unsigned long)g_net_poll_pkts,
+        (unsigned long)g_nic_tx_ok,
+        (unsigned long)g_nic_tx_fail);
 }
 
 // ---------------------------------------------------------------------------

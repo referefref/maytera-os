@@ -3,6 +3,9 @@
 #include "../string.h"
 #include "../serial.h"
 #include "../mm/heap.h"
+#include "../mm/vmm.h"      // #642: PAT / write-combining front buffer
+#include "../cpu/dlprof.h"    // #642: dp_tsc() - the shared rdtsc helper
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // Framebuffer state
 static uint32_t *fb_front = NULL;      // Front buffer (actual display)
@@ -86,6 +89,135 @@ static void fb_fix_bochs_alignment(void) {
     fb_dump_vga_crtc();
 }
 
+// ===========================================================================
+// #642: give the FRONT buffer a real write-combining memory type.
+//
+// The back buffer is kmalloc'd RAM and must stay write-back: the compositor
+// draws into it through sys_fb_map, read-modify-writes it constantly, and WC
+// reads are uncached. It is the FRONT buffer, the GOP framebuffer BAR, that is
+// the problem. Firmware maps that BAR UC in the MTRRs, so the present copy
+// issues one uncached PCIe transaction per 16-byte movdqu store.
+//
+// MTRR is deliberately NOT touched, and that is a checked claim rather than an
+// optimistic one. Intel SDM Vol 3A "Effective Page-Level Memory Types" (Table
+// 12-7 in current editions) and AMD APM Vol 2 Table 7-9 both give: MTRR=UC with
+// PAT=WB yields UC, which is the state we are in, but MTRR=UC with PAT=WC
+// yields WC. WC in the PAT is the single type no MTRR type downgrades. Linux
+// relies on exactly this: ioremap_wc() touches no MTRR, and arch_phys_wc_add()
+// is documented as "a no-op on PAT enabled systems". So a PAT slot plus the
+// right PTE bits is sufficient, and MTRR programming would add risk for nothing.
+//
+// MEASURED, NOT ASSERTED, AND WITH A CONTROL. fb_enable_write_combining() times
+// three full presents: a cold one, a second one with NOTHING changed (the
+// control), and one after the switch. The headline ratio is control-vs-after, so
+// ordinary cache/TLB warm-up cannot be miscredited to the memory type; the
+// cold-vs-control ratio is printed alongside precisely so the size of that
+// artifact is visible rather than hidden.
+//
+// THIS CANNOT BE VALIDATED IN A VM, and the numbers a VM prints must not be
+// quoted as evidence for the fix. QEMU's framebuffer is ordinary host RAM, and
+// KVM forces WB for guest RAM in EPT regardless of the guest PAT, so the guest
+// memory type is not honoured at all. A VM boot proves the PAT write lands, the
+// PTEs carry the right bits, and nothing regresses. It cannot prove the win.
+// The number that matters is the one this prints on the real iMac.
+// ===========================================================================
+static int      fb_wc_active     = 0;
+uint64_t        g_fb_wc_pre_cyc  = 0;   // cycles for one full present, before
+uint64_t        g_fb_wc_pre2_cyc = 0;   // CONTROL: a second present, still before
+uint64_t        g_fb_wc_post_cyc = 0;   // cycles for one full present, after
+
+int fb_wc_is_active(void) { return fb_wc_active; }
+
+// Time one full back->front copy. At this point in fb_init the back buffer has
+// just been zeroed and the front buffer has just been cleared, so this writes
+// black over black: measurable, and invisible on screen. Interrupts are masked
+// so a timer tick cannot land inside the sample.
+static uint64_t fb_time_one_present(void) {
+    uint64_t sz = (uint64_t)fb_height * fb_pitch;
+    uint64_t rflags;
+    __asm__ volatile("pushfq; pop %0" : "=r"(rflags));
+    __asm__ volatile("cli");
+    uint64_t t0 = dp_tsc();
+    memcpy(fb_front, fb_back, sz);
+    __asm__ volatile("sfence" ::: "memory");
+    uint64_t d = dp_tsc() - t0;
+    if (rflags & (1ULL << 9)) __asm__ volatile("sti");
+    return d;
+}
+
+static void fb_enable_write_combining(void) {
+    if (!fb_front) return;
+
+    uint64_t sz = (uint64_t)fb_height * fb_pitch;
+    sz = (sz + 0xFFF) & ~0xFFFULL;
+
+    // TWO "before" samples, not one. The first present of a boot is cold in
+    // every sense (source not in cache, TLB unwarmed), so a naive
+    // before-then-after pair credits ordinary warm-up to the memory type and
+    // reports a speedup that would appear even if the PAT write did nothing.
+    // pre2 is the control: it is measured under IDENTICAL conditions to pre,
+    // with nothing changed in between. Any improvement from pre to pre2 is
+    // warm-up. Only the pre2 -> post difference can be attributed to WC.
+    if (fb_back) {
+        g_fb_wc_pre_cyc  = fb_time_one_present();
+        g_fb_wc_pre2_cyc = fb_time_one_present();
+    }
+
+    if (!vmm_pat_init()) {
+        kprintf("[FB] #642: no PAT, front buffer keeps its firmware memory type\n");
+        return;
+    }
+
+    extern uint64_t g_kernel_cr3;
+    uint64_t cr3 = g_kernel_cr3 ? g_kernel_cr3 : (read_cr3() & VMM_ADDR_MASK);
+
+    int64_t wc_bytes = vmm_set_memtype_range(cr3, (uint64_t)fb_front, sz,
+                                             VMM_PAT_IDX_WC);
+    if (wc_bytes <= 0) {
+        kprintf("[FB] #642: WC re-type covered nothing (%ld), front buffer unchanged\n",
+                (long)wc_bytes);
+        return;
+    }
+    fb_wc_active = 1;
+    // Coverage is NOT assumed to be 100%. vmm_set_memtype_range only re-types
+    // whole 2MB/1GB granules, so a framebuffer whose size is not a multiple of
+    // the granule keeps its tail at the firmware type. Report the real figure,
+    // because a speedup measured over a partially-converted buffer is a
+    // partially-converted speedup and saying otherwise would overstate it.
+    uint64_t pct = (uint64_t)wc_bytes * 100 / sz;
+
+    if (fb_back) g_fb_wc_post_cyc = fb_time_one_present();
+
+    // Report cycles per byte rather than MB/s: it needs no TSC calibration
+    // (mono_tsc_khz_rs() is not necessarily up this early) and it is the metric
+    // that actually characterises the copy. Scaled by 1000 for integer output.
+    uint64_t pre2_mcpb = g_fb_wc_pre2_cyc ? (g_fb_wc_pre2_cyc * 1000) / sz : 0;
+    uint64_t post_mcpb = g_fb_wc_post_cyc ? (g_fb_wc_post_cyc * 1000) / sz : 0;
+    // The headline ratio is CONTROL vs after, never cold-first vs after.
+    uint64_t ratio_x100  = g_fb_wc_post_cyc ? (g_fb_wc_pre2_cyc * 100) / g_fb_wc_post_cyc : 0;
+    // How much of a naive pre-vs-post "speedup" was really just warm-up.
+    uint64_t warm_x100   = g_fb_wc_pre2_cyc ? (g_fb_wc_pre_cyc  * 100) / g_fb_wc_pre2_cyc : 0;
+
+    kprintf("[FB] #642 WC ACTIVE on 0x%lx..0x%lx: %lu of %lu KB re-typed (%lu%%)\n",
+            (uint64_t)fb_front, (uint64_t)fb_front + sz,
+            (uint64_t)wc_bytes / 1024, sz / 1024, pct);
+    kprintf("[FB] #642 present: cold=%lu  CONTROL=%lu cyc (%lu.%03lu cyc/byte)  "
+            "wc=%lu cyc (%lu.%03lu cyc/byte)\n",
+            g_fb_wc_pre_cyc, g_fb_wc_pre2_cyc, pre2_mcpb / 1000, pre2_mcpb % 1000,
+            g_fb_wc_post_cyc, post_mcpb / 1000, post_mcpb % 1000);
+    kprintf("[FB] #642 speedup=%lu.%02lux (control vs wc); warmup alone was "
+            "%lu.%02lux (cold vs control)\n",
+            ratio_x100 / 100, ratio_x100 % 100, warm_x100 / 100, warm_x100 % 100);
+
+    // Durable copy: this is the number the next real-hardware boot has to
+    // report, and serial is silent in GUI mode.
+    bootlog_write("[FB] #642 WC: base=0x%lx size=%lu covered=%lu (%lu%%) "
+                  "cold=%lu control=%lu wc=%lu cyc speedup=%lu.%02lux warmup=%lu.%02lux",
+                  (uint64_t)fb_front, sz, (uint64_t)wc_bytes, pct,
+                  g_fb_wc_pre_cyc, g_fb_wc_pre2_cyc, g_fb_wc_post_cyc,
+                  ratio_x100 / 100, ratio_x100 % 100, warm_x100 / 100, warm_x100 % 100);
+}
+
 // Initialize framebuffer
 void fb_init(framebuffer_info_t *info) {
     if (!info || info->address == 0) {
@@ -128,6 +260,11 @@ void fb_init(framebuffer_info_t *info) {
 
     kprintf("[FB] Framebuffer initialized: %ux%u pitch=%u ppsl=%u @ 0x%lx\n",
             fb_width, fb_height, fb_pitch, fb_pitch/4, (uint64_t)fb_front);
+
+    // #642: re-type the front buffer as write-combining. Must run AFTER
+    // fb_front/fb_back/fb_pitch are set (it sizes and times a real present) and
+    // after pmm/vmm/heap are up (main.c orders console_init after all three).
+    fb_enable_write_combining();
 
     // Fix Bochs VGA display alignment (prevents left-side content appearing on right)
     fb_fix_bochs_alignment();
@@ -314,6 +451,12 @@ void fb_swap_buffers(void) {
     // Copy back buffer to front buffer
     uint32_t buffer_size = fb_height * fb_pitch;
     memcpy(fb_front, fb_back, buffer_size);
+    // #642: WC stores are weakly ordered and sit in the write-combining buffers
+    // until a line fills or a fence drains them. Without this the last partial
+    // line of a present can still be in a buffer when the caller assumes the
+    // frame is on screen, which shows up as an intermittent torn/partial frame
+    // and reads exactly like a compositor bug. Cheap, and a no-op on WB.
+    __asm__ volatile("sfence" ::: "memory");
 }
 
 // Swap only dirty rectangles (optimized partial update)
@@ -326,6 +469,7 @@ void fb_swap_dirty_rects(const void *dirty_rects, uint32_t count, bool full_redr
     if (full_redraw || count == 0 || dirty_rects == NULL) {
         uint32_t buffer_size = fb_height * fb_pitch;
         memcpy(fb_front, fb_back, buffer_size);
+        __asm__ volatile("sfence" ::: "memory");   // #642, see fb_swap_buffers
         return;
     }
     
@@ -356,6 +500,11 @@ void fb_swap_dirty_rects(const void *dirty_rects, uint32_t count, bool full_redr
             memcpy((uint8_t*)fb_front + offset, (uint8_t*)fb_back + offset, bytes_per_row);
         }
     }
+    // #642: drain the write-combining buffers once for the whole partial
+    // present. This path matters MORE than the full-copy one: a damage rect is
+    // usually a few hundred bytes per row, so most rows END mid-line and leave a
+    // partially-filled WC buffer behind. See fb_swap_buffers.
+    __asm__ volatile("sfence" ::: "memory");
 }
 
 // Set direct mode - draw directly to front buffer (for boot splash)

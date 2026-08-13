@@ -1,8 +1,8 @@
-// syslog.h - System Log and Log Viewer for MayteraOS
+// syslog.h - the kernel-wide system log ring (see syslog.c, #703).
 #ifndef SYSLOG_H
 #define SYSLOG_H
 
-#include "window.h"
+#include "../types.h"
 
 // Maximum log entries
 #define SYSLOG_MAX_ENTRIES  256
@@ -27,19 +27,6 @@ typedef struct {
     bool valid;
 } log_entry_t;
 
-// Log viewer window state
-typedef struct {
-    window_t *window;
-
-    int scroll_offset;          // Scroll position
-    int selected;               // Selected line (-1 = none)
-
-    log_level_t filter_level;   // Minimum level to show
-    bool auto_scroll;           // Auto-scroll to bottom
-
-    uint64_t last_update;       // Last refresh time
-} syslog_viewer_t;
-
 // Global log functions (called from anywhere in kernel)
 
 // Initialize system log
@@ -62,21 +49,7 @@ log_entry_t *syslog_get_entry(int index);
 // Clear all logs
 void syslog_clear(void);
 
-// Log viewer functions
-
-// Create log viewer window
-syslog_viewer_t *syslog_viewer_create(void);
-
-// Destroy log viewer
-void syslog_viewer_destroy(syslog_viewer_t *sv);
-
-// Event handling
-void syslog_viewer_handle_event(syslog_viewer_t *sv, gui_event_t *event);
-
-// Drawing
-void syslog_viewer_draw(syslog_viewer_t *sv);
-
-// Launch log viewer
-void syslog_viewer_launch(void);
+// #703: the in-kernel log VIEWER (syslog_viewer_*) is gone; the shipping log
+// viewer is the userland /APPS/SYSLOG. Only the ring survives here.
 
 #endif // SYSLOG_H

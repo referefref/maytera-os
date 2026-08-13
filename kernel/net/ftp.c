@@ -9,15 +9,32 @@
 #include "../serial.h"
 #include "../string.h"
 #include "../mm/heap.h"
+#include "../cpu/mono.h"        // #499: sched_now_ms() - THE shared real-elapsed-ms clock
+#include "../proc/process.h"   // #604: proc_sleep() instead of a PAUSE burn
 
 // External declarations
 extern void net_poll(void);
-extern volatile uint64_t timer_ticks;
 
-// Timeout values (in timer ticks, ~18.2 ticks/sec)
-#define FTP_CONNECT_TIMEOUT     200     // ~10 seconds
-#define FTP_RESPONSE_TIMEOUT    400     // ~20 seconds
-#define FTP_DATA_TIMEOUT        600     // ~30 seconds
+// #499: timeouts are MILLISECONDS of REAL time on sched_now_ms(), because
+// timer_ticks counts ticks DELIVERED, not time ELAPSED (a KVM tick burst used
+// to expire every FTP deadline instantly).
+//
+// #604: the VALUES are now the INTENDED ones. They were written as tick counts
+// (200/400/600) against a comment claiming "~10/20/30 seconds", which assumed
+// the legacy 18.2 Hz PC timer. This kernel's PIT has run at 250 Hz for a long
+// time (main.c: pit_init(250)), so those counts were really 0.8/1.6/2.4 s:
+// 12.5x shorter than the stated intent, and 13.7x shorter than 18.2 Hz would
+// actually have given. #499 converted the CLOCK but deliberately preserved
+// those effective durations to keep that change behaviour-free; this restores
+// the intent.
+//
+// 1.6 s is shorter than a single TCP SYN retransmit on many servers, and 2.4 s
+// of data-channel idle would abort any large RETR over a congested link. The
+// new values line up with the rest of the stack: wget connect 16 s
+// (net/wget.c #420, the same bug fixed there), https recv 30 s, smb 5 s.
+#define FTP_CONNECT_TIMEOUT_MS  10000   // was 800  (tick-era), intent ~10s
+#define FTP_RESPONSE_TIMEOUT_MS 20000   // was 1600 (tick-era), intent ~20s
+#define FTP_DATA_TIMEOUT_MS     30000   // was 2400 (tick-era), intent ~30s
 
 // Byte swap functions (same as in tcp.c)
 static inline uint16_t htons(uint16_t h) {
@@ -71,22 +88,32 @@ void ftp_session_destroy(ftp_session_t *session) {
     kfree(session);
 }
 
-// Small delay helper
+// #604/#426: this used to be a raw PAUSE burn:
+//     for (int i = 0; i < count; i++) __asm__ volatile("pause");
+// which pegs a core for the whole timeout and, worse, never yields - so it can
+// starve the very RX processing the caller is waiting for. Every other net
+// client already learned this: net/wget.c uses proc_sleep(2) with the comment
+// "busy-spinning froze the OS", and net/smb.c's smb_net_pump() is
+// net_poll(); tcp_timer(); proc_sleep(1). Match them.
+//
+// RX in this stack is POLL-DRIVEN, not IRQ-driven, so the callers must keep
+// calling net_poll()/tcp_timer() around this; a plain wait_event would park
+// forever with nothing to fill the buffer (see the note at the top of
+// net/socket.c). This is a cooperative yield between poll slices, not a wait.
 static void ftp_delay(int count) {
-    for (int i = 0; i < count; i++) {
-        __asm__ volatile("pause");
-    }
+    (void)count;   // the old per-call spin counts had no wall-clock meaning
+    proc_sleep(1); // one tick; the enclosing loops own the real deadline
 }
 
 // Wait for TCP connection to establish
-static int ftp_wait_connect(int sock, uint64_t timeout_ticks) {
-    uint64_t start = timer_ticks;
+static int ftp_wait_connect(int sock, uint64_t timeout_ms) {
+    uint64_t start = sched_now_ms();
 
     while (!tcp_is_connected(sock)) {
         net_poll();
         tcp_timer();
 
-        if (timer_ticks - start > timeout_ticks) {
+        if (sched_now_ms() - start > timeout_ms) {
             return -1;
         }
 
@@ -106,7 +133,16 @@ static int ftp_send_string(int sock, const char *str) {
     int len = strlen(str);
     int sent = 0;
 
+    // #604: this loop previously had NO deadline whatsoever - a peer that
+    // never drained its receive window left it spinning forever. Every other
+    // wait in this file is bounded; this one is now too.
+    uint64_t send_start = sched_now_ms();
+
     while (sent < len) {
+        if (sched_now_ms() - send_start > FTP_RESPONSE_TIMEOUT_MS) {
+            kprintf("[FTP] Send timeout\n");
+            return FTP_ERR_TIMEOUT;
+        }
         int s = tcp_send(sock, str + sent, len - sent);
         if (s < 0) {
             if (s == TCP_ERR_WOULD_BLOCK) {
@@ -127,8 +163,8 @@ static int ftp_send_string(int sock, const char *str) {
 
 // Receive line from TCP socket (up to newline)
 // Returns number of bytes received, or negative on error
-static int ftp_recv_line(int sock, char *buffer, int max_len, uint64_t timeout_ticks) {
-    uint64_t start = timer_ticks;
+static int ftp_recv_line(int sock, char *buffer, int max_len, uint64_t timeout_ms) {
+    uint64_t start = sched_now_ms();
     int pos = 0;
 
     while (pos < max_len - 1) {
@@ -136,7 +172,7 @@ static int ftp_recv_line(int sock, char *buffer, int max_len, uint64_t timeout_t
         tcp_timer();
 
         // Check timeout
-        if (timer_ticks - start > timeout_ticks) {
+        if (sched_now_ms() - start > timeout_ms) {
             kprintf("[FTP] Receive timeout\n");
             return FTP_ERR_TIMEOUT;
         }
@@ -146,7 +182,7 @@ static int ftp_recv_line(int sock, char *buffer, int max_len, uint64_t timeout_t
         int r = tcp_recv(sock, &c, 1);
 
         if (r > 0) {
-            start = timer_ticks;  // Reset timeout on data
+            start = sched_now_ms();  // Reset timeout on data
             if (c == '\n') {
                 buffer[pos] = '\0';
                 // Strip trailing CR
@@ -200,7 +236,7 @@ static int ftp_recv_response(ftp_session_t *session) {
     session->response_buffer[0] = '\0';
 
     while (1) {
-        int r = ftp_recv_line(session->ctrl_sock, line, sizeof(line), FTP_RESPONSE_TIMEOUT);
+        int r = ftp_recv_line(session->ctrl_sock, line, sizeof(line), FTP_RESPONSE_TIMEOUT_MS);
         if (r < 0) {
             session->last_error = r;
             return r;
@@ -343,7 +379,7 @@ static int ftp_enter_pasv(ftp_session_t *session) {
     }
 
     // Wait for connection
-    if (ftp_wait_connect(session->data_sock, FTP_CONNECT_TIMEOUT) < 0) {
+    if (ftp_wait_connect(session->data_sock, FTP_CONNECT_TIMEOUT_MS) < 0) {
         kprintf("[FTP] Data connection timeout\n");
         tcp_close(session->data_sock);
         session->data_sock = -1;
@@ -403,7 +439,7 @@ int ftp_connect(ftp_session_t *session, uint32_t server_ip, uint16_t port) {
     }
 
     // Wait for connection
-    if (ftp_wait_connect(session->ctrl_sock, FTP_CONNECT_TIMEOUT) < 0) {
+    if (ftp_wait_connect(session->ctrl_sock, FTP_CONNECT_TIMEOUT_MS) < 0) {
         kprintf("[FTP] Connection timeout\n");
         tcp_close(session->ctrl_sock);
         session->ctrl_sock = -1;
@@ -446,8 +482,10 @@ void ftp_disconnect(ftp_session_t *session) {
         kprintf("[FTP] > QUIT\n");
 
         // Brief wait for response
-        uint64_t start = timer_ticks;
-        while (timer_ticks - start < 20) {  // ~1 second
+        uint64_t start = sched_now_ms();
+        while (sched_now_ms() - start < 1000) {  // #604: was 80ms; the
+                                                // "~1 second" intent assumed
+                                                // 18.2Hz (see the note above)
             net_poll();
             tcp_timer();
             ftp_delay(500);
@@ -640,13 +678,13 @@ int ftp_ls(ftp_session_t *session, const char *path, ftp_list_callback_t callbac
     // Receive listing data
     char line[512];
     int line_pos = 0;
-    uint64_t start = timer_ticks;
+    uint64_t start = sched_now_ms();
 
     while (1) {
         net_poll();
         tcp_timer();
 
-        if (timer_ticks - start > FTP_DATA_TIMEOUT) {
+        if (sched_now_ms() - start > FTP_DATA_TIMEOUT_MS) {
             kprintf("[FTP] Data receive timeout\n");
             break;
         }
@@ -655,7 +693,7 @@ int ftp_ls(ftp_session_t *session, const char *path, ftp_list_callback_t callbac
         int r = tcp_recv(session->data_sock, &c, 1);
 
         if (r > 0) {
-            start = timer_ticks;
+            start = sched_now_ms();
 
             if (c == '\n') {
                 line[line_pos] = '\0';
@@ -752,14 +790,14 @@ int ftp_get(ftp_session_t *session, const char *remote_path, uint8_t **data_out,
     }
 
     uint32_t received = 0;
-    uint64_t start = timer_ticks;
+    uint64_t start = sched_now_ms();
 
     // Receive file data
     while (1) {
         net_poll();
         tcp_timer();
 
-        if (timer_ticks - start > FTP_DATA_TIMEOUT) {
+        if (sched_now_ms() - start > FTP_DATA_TIMEOUT_MS) {
             kprintf("[FTP] Data receive timeout\n");
             break;
         }
@@ -781,7 +819,7 @@ int ftp_get(ftp_session_t *session, const char *remote_path, uint8_t **data_out,
         int r = tcp_recv(session->data_sock, buffer + received, buffer_size - received);
 
         if (r > 0) {
-            start = timer_ticks;
+            start = sched_now_ms();
             received += r;
             // Progress indication
             if ((received % 4096) == 0) {
@@ -850,13 +888,13 @@ int ftp_put(ftp_session_t *session, const char *remote_path, const uint8_t *data
 
     // Send file data
     uint32_t sent = 0;
-    uint64_t start = timer_ticks;
+    uint64_t start = sched_now_ms();
 
     while (sent < size) {
         net_poll();
         tcp_timer();
 
-        if (timer_ticks - start > FTP_DATA_TIMEOUT) {
+        if (sched_now_ms() - start > FTP_DATA_TIMEOUT_MS) {
             kprintf("[FTP] Data send timeout\n");
             ftp_close_data(session);
             return FTP_ERR_TIMEOUT;
@@ -868,7 +906,7 @@ int ftp_put(ftp_session_t *session, const char *remote_path, const uint8_t *data
         int s = tcp_send(session->data_sock, data + sent, chunk);
 
         if (s > 0) {
-            start = timer_ticks;
+            start = sched_now_ms();
             sent += s;
             // Progress indication
             if ((sent % 4096) == 0) {

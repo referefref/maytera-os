@@ -4,8 +4,12 @@
 #include "../../libc/gui.h"
 #include "../../libc/gui_font.h"
 #include "../../libc/gui_scroll.h"   // (#291/#438) shared scrollable-viewport primitive
+#include "../../libc/gui_list.h"     // (#512) shared scrollable-listbox primitive
 #include "../../libc/syscall.h"
 #include "../../libc/wallpapers.h"   // (#517) shared wallpaper enumeration (same as compositor)
+#include "../../libc/gui_theme.h"    // (#565) file-based theme loader (same as compositor/App Store)
+#include "../../libc/gui_dock.h"     // (#745) THE dock-style name list, shared with the OOBE wizard
+#include "../../libc/theme.h"        // theme_color()/THEME_COLOR_* + get_theme()/set_theme()
 #include "../../libc/assoc.h"
 #include "../../libc/devinfo.h"      // (#382) real CPU/RAM (SYS_SYSINFO) + PCI (SYS_DEV_PCI_LIST)
 #include "../../libhelp/help_ui.h"   // (#267) help subsystem: tooltips, "?" icon, F1
@@ -13,6 +17,24 @@
 #include "../../libc/bt_client.h"    // (#372) Bluetooth client API + mock
 #define WIFI_MOCK_IMPL               // (#384) this TU owns the Wi-Fi mock state
 #include "../../libc/wifi_client.h"  // (#384) Wi-Fi client API + mock
+#include "userconf.h"   // #683: per-user preference paths
+#include "../../libc/tz.h"        // #49/#50: THE timezone list, setting and clock
+
+// #745: the length of an option array, derived FROM the array. Every dropdown
+// count, every "is this index valid" clamp and every option-button count in
+// this file goes through this macro or a *_COUNT built from it. They used to
+// be hand-written literals kept in step by hand, and DOCK_OPTS had already
+// fallen out of step: the clamp said 3 and the dropdown count said 4 while the
+// array held 5, so the fifth dock style could not be displayed, could not be
+// picked, and was silently reset to 0 by a mere repaint of the Appearance
+// panel. Adding a sixth entry to any list below must not be able to do that
+// again, so nothing here counts an array by eye.
+#define ARRAY_COUNT(a) ((int)(sizeof(a) / sizeof((a)[0])))
+// Is `i` a valid index into option array `a`? Use this instead of writing the
+// upper bound out as a number.
+#define OPT_OK(i, a) ((i) >= 0 && (i) < ARRAY_COUNT(a))
+// Clamp `i` to a valid index into `a`, falling back to 0.
+#define OPT_CLAMP(i, a) (OPT_OK((i), (a)) ? (i) : 0)
 
 // #127: route all in-window text through the antialiased TrueType path (app-font
 // test). All win_draw_text(...) calls below render in TTF instead of the bitmap font.
@@ -90,6 +112,8 @@ enum {
     PANEL_BLUETOOTH,     // (#372) Bluetooth devices panel (index 14)
     PANEL_WIFI,          // (#384) Wi-Fi panel (index 15)
     PANEL_EXTSVC,        // (#414) External Services (Home Assistant)
+    PANEL_STARTMENU,     // (#: Start Menu uplift) layout/search/favorites/recents prefs
+    PANEL_DOCK,          // (#745 task #67 "dockpanel") dock behaviour + contents
     PANEL_COUNT
 };
 
@@ -111,7 +135,9 @@ static const char* panel_names[PANEL_COUNT] = {
     "Devices",
     "Bluetooth",
     "Wi-Fi",
-    "External Services"
+    "External Services",
+    "Start Menu",
+    "Dock"
 };
 
 // Panel icons
@@ -132,7 +158,9 @@ static const char* panel_icons[PANEL_COUNT] = {
     "[R]",  // Devices / Printers
     "[B]",  // Bluetooth
     "[W]",  // Wi-Fi
-    "[X]"   // External Services
+    "[X]",  // External Services
+    "[Y]",  // Start Menu
+    "[Z]"   // Dock
 };
 
 // =============================================================================
@@ -141,6 +169,18 @@ static const char* panel_icons[PANEL_COUNT] = {
 
 // Dark theme (default)
 static uint32_t COL_SIDEBAR_BG;
+// (#745) Ink for the taskbar SURFACE. The sidebar is filled with
+// THEME_COLOR_TASKBAR_BG, but its labels/icons/version used COL_TEXT_PRIMARY
+// (label_text, contracted against window_bg), COL_TEXT_DISABLED
+// (button_disabled, against button_bg) and COL_TEXT_SECONDARY
+// (menu_text_disabled, against menu_bg). On a theme with a light window and a
+// dark bar - Ocean, Forest, Sunset - that is dark ink on a dark surface, and
+// nothing caught it because the kernel's runtime contrast floor only ever
+// checks label_text against window_bg. These three bind to tokens whose
+// contract IS the surface they are painted on.
+static uint32_t COL_SIDEBAR_TEXT;
+static uint32_t COL_SIDEBAR_MUTED;
+static uint32_t COL_SIDEBAR_SEL_TEXT;
 static uint32_t COL_CONTENT_BG;
 static uint32_t COL_PANEL_NORMAL;
 static uint32_t COL_PANEL_HOVER;
@@ -164,6 +204,13 @@ static uint32_t COL_CHECKBOX_BG;
 static uint32_t COL_CARD_BG;
 
 // Accent color presets
+// (#704) INTENTIONALLY NOT themed: this IS the palette the user picks
+// COL_ACCENT (a theme token, applied via apply_theme() below) FROM. Swapping
+// these swatches for theme colors would be circular - the user could no
+// longer see or choose a fixed "Blue"/"Red"/etc, only whatever the current
+// theme's accent already is. Same reasoning applies to avatar_palette()
+// below (per-account identity tint) and to wp_fill_fallback()'s per-index
+// gradient colors (fallback WALLPAPER thumbnail content, not chrome).
 static const uint32_t ACCENT_COLORS[] = {
     0x00569CD6,  // Blue
     0x0066BB66,  // Green
@@ -174,7 +221,7 @@ static const uint32_t ACCENT_COLORS[] = {
     0x00DDAA33,  // Gold
     0x00FF6699   // Pink
 };
-#define NUM_ACCENT_COLORS 8
+#define NUM_ACCENT_COLORS ARRAY_COUNT(ACCENT_COLORS)   /* #745: was a literal 8 */
 
 // =============================================================================
 // State Variables
@@ -215,9 +262,9 @@ static int dropdown_hover_item = -1;
 // =============================================================================
 // Settings State - Appearance
 // =============================================================================
-static int current_theme = 0;       // 0=Dark, 1=Light, 2=Classic, 3=Ocean, 4=Nord
+static int current_theme = 0;       // (#565) index into g_th[]/g_th_names[] (file-based, see th_init())
 static int screensaver_idx = 1;     // 0=Off,1=Starfield,2=Flux,3=Lines,4=Bubbles
-static int screensaver_delay_min = 2;   // (#115) activation delay, minutes (custom steps)
+static int screensaver_delay_min = 10;  // (#115/#652) activation delay, minutes; MUST match kernel g_screensaver_delay (600s) and compositor SS_DEFAULT_TIMEOUT
 static const int SS_DELAY_STEPS[] = {1, 2, 5, 10, 15, 20, 30, 45, 60};
 #define SS_DELAY_NSTEPS ((int)(sizeof(SS_DELAY_STEPS)/sizeof(SS_DELAY_STEPS[0])))
 static int  ss_delay_index(void);
@@ -235,8 +282,36 @@ static int icon_size = 1;           // 0=Small, 1=Medium, 2=Large
 static bool animations_enabled = true;
 static int animation_speed = 1;     // 0=Slow, 1=Normal, 2=Fast
 static int transparency_level = 80; // 0-100%
-static int cursor_theme = 0;        // 0=Default, 1=Dark, 2=Light, 3=Large
-static int dock_style = 0;          // #387 0=Default 1=Lumina 2=Classic UNIX 3=Retro Bench
+// (#745) Dock/chrome glass opacity, percent OPAQUE, 70..100. SAME SENSE as
+// transparency_level above: the subsection is titled "Transparency" but it
+// stores OPACITY (transparency_level = get_win_opacity() * 100 / 255), so
+// inverting this one because the heading says Transparency would make the
+// two rows mean opposite things while both looked correct.
+// (#745 dockgrey, 2026-08-12) Floor 60->70 and default 90->75: see
+// userland/apps/compositor/draw.c glass_render()'s floor comment for why the
+// two moved together (the glass tint got lighter, which trades away
+// low-opacity margin against a bright wallpaper). This copy MUST stay in
+// sync with the compositor's - there is no shared constant ACROSS the two
+// apps, only matching literals (see #745 blame.md: two files that each
+// believe they own the same setting). WITHIN this file, though, every site
+// that used to spell the floor/default as a bare 60/70/75/90 now goes
+// through these two, so this file cannot drift internally the way it did
+// before (#745 task #67 "dockpanel": the click-drag handler for this same
+// slider still clamped to the old 60 floor after the draw-time clamp and
+// the CFG-read clamp had both already moved to 70 - a fourth copy the
+// original dockgrey sweep's `grep -rn "< 60\|>= 60"` missed because it
+// spelled the comparison as a bare `60`, not `< 60`).
+#define DOCK_OPACITY_FLOOR   70   // must match draw.c glass_render()'s floor
+#define DOCK_OPACITY_DEFAULT 75   // must match draw.c's g_dock_opacity init
+static int dock_opacity = DOCK_OPACITY_DEFAULT;   // floor is a contrast derivation
+// (#116) 0=Light 1=Dark 2=Glow. SAME index space as the compositor's
+// UIPROFIL.YML curstyle and the kernel's SYS_SET_CURSOR, not a private one.
+// #745: synced FROM the kernel at startup, never pushed INTO it; the only
+// fallback is 0, the normal arrow. The old comment here still described the
+// pre-#116 "Default/Dark/Light/Large" list that has not existed for months.
+static int cursor_theme = 0;
+static int dock_style = 0;          // #387 0=Default 1=Lumina 2=Classic UNIX 3=Retro Bench 4=Marble
+                                    // (#26 internal enum stays DOCK_XFCE; #745 relabel only)
 static int appearance_needs_restart = 0; // 1 if font/icon size changed
 
 // Wallpaper selector (#517). Previously two hardcoded arrays (names + files) that
@@ -250,6 +325,30 @@ static int        g_wp_count = 0;
 static void wp_init(void) { if (!g_wp_count) g_wp_count = wp_enumerate(g_wp, WP_MAX_ENTRIES); }
 #define WALLPAPER_NAMES_COUNT g_wp_count
 static int wallpaper_idx = 0;
+
+// Theme picker (#565): the same pattern as the wallpaper picker above, and
+// for the same reason - themes now live as files (/THEMES/*.mtheme, listed
+// by /THEMES/INDEX.TXT), built-ins and anything the App Store installs
+// alike, so a hardcoded name table can never drift from what actually
+// exists on disk. gui_theme_list() is the single enumeration both Settings
+// and (indirectly, via the same /THEMES/INDEX.TXT) the kernel's boot loader
+// agree on.
+static gui_theme_entry_t g_th[GUI_THEME_MAX_ENTRIES];
+static int               g_th_count = 0;
+static const char        *g_th_names[GUI_THEME_MAX_ENTRIES];
+static void th_init(void) {
+    if (!g_th_count) {
+        g_th_count = gui_theme_list(g_th, GUI_THEME_MAX_ENTRIES);
+        for (int i = 0; i < g_th_count; i++) g_th_names[i] = g_th[i].name;
+    }
+    if (g_th_count == 0) {
+        // No /THEMES/INDEX.TXT (a golden built before #565, or FAT-only with
+        // no ext2 root) - degrade to a single "System Default" placeholder
+        // rather than an empty, unusable dropdown.
+        g_th_names[0] = "System Default";
+        g_th_count = 1;
+    }
+}
 
 // =============================================================================
 // Settings State - Display
@@ -314,6 +413,41 @@ typedef struct { int dir; int action; int proto; int port; } fw_rule_t;
 static fw_rule_t fw_rules[MAX_FW_RULES];
 static int fw_rule_count = 0;
 
+// #743: RECORDING A FAILED SAVE.
+//
+// Every save below used to be written as unlink-then-open-then-discard-both-
+// results. Three separate defects lived in that one idiom:
+//
+//   * the unlink ALWAYS ran and the open might not, so a refused or failed open
+//     DESTROYED the user's existing configuration and returned silently;
+//   * sys_write()'s result was discarded; and
+//   * sys_close()'s result was discarded, which on this kernel is the worst of
+//     the three. For an ext2-backed fd the bytes are buffered and the REAL
+//     write happens inside close()/fsync() (kernel/proc/syscall.c: the e2fd
+//     family calls ext2_write_file() from sys_close and returns its rc). So the
+//     discarded close() result was not a minor omission: it was the ONLY error
+//     report that ever existed, thrown away.
+//
+// They now all go through userconf_write_all() / userconf_finish_write(), which
+// never unlinks and returns 0 only if the bytes actually reached the medium.
+//
+// WHERE A FAILURE IS REPORTED. Most Settings panels have no on-screen error
+// surface, and inventing a modal for each one is a bigger change than this
+// ticket should make. So a failed save is recorded in the breadcrumb log the
+// app already maintains (/SETLOG.TXT), which makes it diagnosable instead of
+// invisible. The panels that DO have a status line (External Services, AI
+// Services) additionally stop claiming "Saved" when the save failed.
+static void setlog(const char *msg);
+static void save_failed(const char *what) {
+    char line[96];
+    int k = 0;
+    const char *pfx = "SAVE FAILED: ";
+    for (int i = 0; pfx[i] && k < (int)sizeof(line) - 1; i++) line[k++] = pfx[i];
+    for (int i = 0; what[i] && k < (int)sizeof(line) - 1; i++) line[k++] = what[i];
+    line[k] = 0;
+    setlog(line);
+}
+
 static void fw_add(int dir, int action, int proto, int port) {
     if (fw_rule_count >= MAX_FW_RULES) return;
     fw_rules[fw_rule_count].dir = dir; fw_rules[fw_rule_count].action = action;
@@ -348,16 +482,19 @@ static void fw_save(void) {
         line[li++] = '\n'; line[li] = 0;
         const char *s = line; while (*s) *p++ = *s++;
     }
-    sys_unlink("FWRULES.CFG");
-    int fd = sys_open("FWRULES.CFG", 0x41);   // O_WRONLY|O_CREAT
-    if (fd < 0) return;
-    sys_write(fd, buf, (unsigned long)(p - buf));
-    sys_close(fd);
+    // #743: was sys_unlink("FWRULES.CFG") then a bare relative open, so (a) a
+    // failed open left the rules DELETED, and (b) the file landed wherever cwd
+    // pointed. Now a per-user path (#683) and a write that reports failure.
+    int fd = userconf_open_write("FWRULES.CFG");
+    if (userconf_finish_write(fd, buf, (unsigned long)(p - buf)) != 0)
+        save_failed("FWRULES.CFG (firewall rules)");
 }
 
 static void fw_load(void) {
     fw_rule_count = 0;
-    int fd = sys_open("FWRULES.CFG", 0);
+    // #743: read the per-user copy, falling back to the legacy relative name so
+    // an existing install keeps its rules on upgrade (the #683 asymmetry).
+    int fd = userconf_open_read("FWRULES.CFG", "FWRULES.CFG");
     if (fd < 0) {
         // Sensible defaults: deny inbound by default, allow common services.
         fw_pol_in = 1; fw_pol_out = 0;
@@ -451,65 +588,100 @@ static bool scroll_inertia = true;
 #define MODAL_ADD_FWRULE      7
 #define MODAL_ADD_PRINTER     8   // (#318) name/host/queue/port/default
 #define MODAL_WIFI_PASSWORD   9   // (#384) single password field to join a secured SSID
+#define MODAL_AUTOLOGIN_PW    10  // (#566) confirm password before enabling/disabling autologin
 #define MODAL_MAX_FIELDS      5
 static int modal_mode = MODAL_NONE;
 static int modal_num_fields = 3;
 static char modal_field[MODAL_MAX_FIELDS][64];
 static int  modal_cursor[MODAL_MAX_FIELDS];  // field LENGTH (kept for existing logic)
 static int  modal_caret[MODAL_MAX_FIELDS];   // caret index into modal_field (task #244)
+// (#745) MODAL_EDIT_PROFILE's picture picker: an index into avatar_palette
+// (0..7), the chosen monogram color override. Written as "mono:RRGGBB" on
+// Save (see do_modal_submit()). The default picture (design doc section 10)
+// is the uid-keyed palette entry with no CFG line at all, so opening the
+// modal seeds this from the account's CURRENT color, not from a fixed slot -
+// picking the swatch that already matches just re-writes the same value.
+static int modal_avatar_idx = 0;
 static int  modal_active_field = 0;
 static char modal_error[64];
 // Extra status variables
 static int ntp_status = 0;      // 0=idle, 1=synced ok, -1=failed
 static int about_status = 0;    // 0=idle, 1=up-to-date, 2=debug exported
 static int sound_test_status = 0; // 0=idle, 1=no output, 2=no input
-static int timezone_offset_minutes = 0;
 
 // =============================================================================
 // Settings State - Date & Time
 // =============================================================================
-static int timezone_idx = 12;
+// #50: the picker's CURRENT ROW in the shared list (libc/tz.h). It is NOT the
+// stored setting and is never persisted here: /CONFIG/TZ.CFG holds the zone ID
+// string and tz_index() is the reader. Seeded from tz_index() at startup.
+static int timezone_idx = 0;
 static bool use_24hour = true;
 static bool auto_time = true;
 static int date_format = 0;     // 0=YYYY-MM-DD, 1=MM/DD/YYYY, 2=DD/MM/YYYY
 static int first_day_of_week = 0;  // 0=Sunday, 1=Monday
 
-static const char* timezones[] = {
-    "UTC-12:00 Baker Island",
-    "UTC-11:00 Samoa",
-    "UTC-10:00 Hawaii",
-    "UTC-09:00 Alaska",
-    "UTC-08:00 Pacific (LA)",
-    "UTC-07:00 Mountain",
-    "UTC-06:00 Central",
-    "UTC-05:00 Eastern (NY)",
-    "UTC-04:00 Atlantic",
-    "UTC-03:00 Buenos Aires",
-    "UTC-02:00 Mid-Atlantic",
-    "UTC-01:00 Azores",
-    "UTC+00:00 London/GMT",
-    "UTC+01:00 Paris/Berlin",
-    "UTC+02:00 Cairo",
-    "UTC+03:00 Moscow",
-    "UTC+04:00 Dubai",
-    "UTC+05:00 Karachi",
-    "UTC+05:30 Mumbai",
-    "UTC+06:00 Dhaka",
-    "UTC+07:00 Bangkok",
-    "UTC+08:00 Singapore",
-    "UTC+09:00 Tokyo",
-    "UTC+10:00 Sydney",
-    "UTC+11:00 Solomon Is.",
-    "UTC+12:00 Auckland"
+// #50: Settings' own 26-entry timezone array USED TO LIVE HERE. It has been
+// deleted, not merely stopped being read. It had diverged from the first-run
+// wizard's list (no +09:30 Adelaide, no +12:45 Chatham, no +05:45 Kathmandu, no
+// +13:00/+14:00, no -03:30/-09:30), and it indexed a private 't' key in
+// SETTINGS.CFG that nothing else in the OS could see. One list now: ZONES[] in
+// userland/libc/tz.c. Do not add a local copy back, not even "just the labels".
+
+// ONE-TIME MIGRATION ONLY. These are the offsets of that deleted 26-entry
+// array, in its order, so a user who had already picked a zone in Settings
+// keeps it when TZ.CFG does not yet exist. This is a migration table, not a
+// second timezone list: nothing reads it after the first run, and it must never
+// gain an entry. See settings_tz_init().
+static const int LEGACY_SETTINGS_TZ_OFF[26] = {
+    -720, -660, -600, -540, -480, -420, -360, -300, -240, -180, -120, -60,
+    0, 60, 120, 180, 240, 300, 330, 360, 420, 480, 540, 600, 660, 720
 };
-#define NUM_TIMEZONES 26
+static int legacy_tz_idx = -1;   // set by settings_load() if the old 't' key exists
 
 // =============================================================================
 // Settings State - Users & Accounts
 // =============================================================================
 static int current_user_idx = 0;
-static bool auto_login = false;
+// #785: the account THIS SESSION is logged in as, resolved from sys_getuid()
+// against the kernel account table in users_refresh(). Kept separate from
+// current_user_idx on purpose: current_user_idx is an index into the DISPLAY
+// list, which is capped at 4 rows, and whose password the Change Password
+// modal targets must never depend on how many rows the panel happens to draw.
+// Empty means "not resolved", and the modal refuses rather than guessing.
+static char g_session_user[32] = "";
 static bool guest_enabled = true;
+
+// (#566) Real autologin state, mirrored from the kernel (sys_get_autologin())
+// rather than a per-launch cosmetic bool. "" = disabled; else the username
+// currently configured to autologin. al_target_user/al_target_enable hold the
+// pending request while MODAL_AUTOLOGIN_PW collects the confirming password.
+static char autologin_user[32] = {0};
+static char al_target_user[32] = {0};
+static int  al_target_enable = 0;
+
+static void autologin_refresh(void) {
+    char buf[32];
+    int n = sys_get_autologin(buf, sizeof(buf));
+    if (n > 0) {
+        if (n > 31) n = 31;
+        int i = 0;
+        for (; i < n; i++) autologin_user[i] = buf[i];
+        autologin_user[i] = '\0';
+    } else {
+        autologin_user[0] = '\0';
+    }
+}
+
+// Root may set autologin for ANY account with no password (the kernel ABI:
+// "Root sets for anyone"); a non-root caller may only target their own
+// account and must supply its current password (kernel-checked). See
+// SYS_SET_AUTOLOGIN in userland/libc/syscall.h.
+static int settings_is_root(void) { return sys_getuid() == 0; }
+// Defined later (after draw_all()'s own forward declaration) - opens the
+// MODAL_AUTOLOGIN_PW confirm-password modal for a non-root session, or
+// applies directly for root.
+static void autologin_request(const char *user, int enable);
 
 typedef struct {
     char username[32];
@@ -518,13 +690,15 @@ typedef struct {
     int role;           // 0=Admin, 1=User, 2=Guest
     bool password_set;
     uint32_t avatar_color;
+    unsigned int uid;   // #745: identity-color key (design doc section 8.2) -
+                         // stable across list reordering, unlike list position
 } user_account_t;
 
 static user_account_t users[4] = {
-    {"admin", "Administrator", "admin@mayteraos.local", 0, true, 0x00569CD6},
-    {"user", "Standard User", "user@mayteraos.local", 1, true, 0x0066BB66},
-    {"guest", "Guest Account", "", 2, false, 0x00888888},
-    {"", "", "", 0, false, 0}
+    {"admin", "Administrator", "admin@mayteraos.local", 0, true, 0x00569CD6, 0},
+    {"user", "Standard User", "user@mayteraos.local", 1, true, 0x0066BB66, 0},
+    {"guest", "Guest Account", "", 2, false, 0x00888888, 0},
+    {"", "", "", 0, false, 0, 0}
 };
 static int user_count = 3;
 
@@ -647,10 +821,14 @@ static void setlog(const char *msg) {
     for (int i = 0; msg[i] && g_setlog_len < (int)sizeof(g_setlog_buf) - 2; i++)
         g_setlog_buf[g_setlog_len++] = msg[i];
     g_setlog_buf[g_setlog_len++] = '\n';
-    int fd = sys_open("/SETLOG.TXT", 0x0001 | 0x0040 | 0x0200);  // O_WRONLY|O_CREAT|O_TRUNC
-    if (fd < 0) return;
-    sys_write(fd, g_setlog_buf, (unsigned long)g_setlog_len);
-    sys_close(fd);
+    // #743: a diagnostic breadcrumb. The result is consumed rather than
+    // discarded (userconf_write_all is warn_unused_result), but deliberately
+    // NOT acted on: there is no fallback for a breadcrumb, nothing the user
+    // needs told about one, and reporting it through save_failed() would
+    // recurse straight back into here.
+    int rc = userconf_write_all("/SETLOG.TXT", g_setlog_buf,
+                                (unsigned long)g_setlog_len);
+    (void)rc;
 }
 // Log "<msg> <n>" as one breadcrumb line (for sizes, framebuffer WxH, handles).
 static void setlog_n(const char *msg, long n) {
@@ -675,172 +853,67 @@ static void draw_extsvc_panel(void);   // #414
 // Theme Application
 // =============================================================================
 
+// (#565) apply_theme() used to be a hardcoded 8-case switch of literal
+// colors for Settings' own chrome, PLUS a second hardcoded index-remap table
+// (kernel_theme_map[]) to push one of the kernel's 12 compiled-in palettes
+// system-wide. Both are gone: theme_id now indexes the FILE-based list
+// (g_th[], from /THEMES/INDEX.TXT, see th_init()). gui_theme_activate()
+// loads the theme's /THEMES/<slug>.mtheme into the kernel's live table and
+// applies it system-wide (every process's theme_color()/theme_color_of()
+// call reflects it on its next redraw - no polling, no IPC); Settings then
+// derives its OWN chrome colors from the SAME live palette via theme_color(),
+// so a brand new App-Store-installed theme recolors Settings exactly as
+// well as it recolors the compositor and every other app, with no per-theme
+// literal table to keep in sync.
 static void apply_theme(int theme_id) {
-    switch (theme_id) {
-        case 0:  // Dark (default)
-            COL_SIDEBAR_BG = 0x001E1E1E;
-            COL_CONTENT_BG = 0x00252525;
-            COL_PANEL_NORMAL = 0x001E1E1E;
-            COL_PANEL_HOVER = 0x002D2D2D;
-            COL_PANEL_ACTIVE = 0x00383838;
-            COL_SEPARATOR = 0x00404040;
-            COL_TEXT_PRIMARY = 0x00FFFFFF;
-            COL_TEXT_SECONDARY = 0x00AAAAAA;
-            COL_TEXT_DISABLED = 0x00666666;
-            COL_INPUT_BG = 0x00333333;
-            COL_INPUT_BORDER = 0x00505050;
-            COL_SLIDER_TRACK = 0x00404040;
-            COL_BUTTON_BG = 0x00404040;
-            COL_BUTTON_HOVER = 0x00505050;
-            COL_CHECKBOX_BG = 0x00333333;
-            COL_CARD_BG = 0x002A2A2A;
-            break;
-        case 1:  // Light
-            COL_SIDEBAR_BG = 0x00F0F0F0;
-            COL_CONTENT_BG = 0x00FFFFFF;
-            COL_PANEL_NORMAL = 0x00F0F0F0;
-            COL_PANEL_HOVER = 0x00E0E0E0;
-            COL_PANEL_ACTIVE = 0x00D0D0D0;
-            COL_SEPARATOR = 0x00CCCCCC;
-            COL_TEXT_PRIMARY = 0x00202020;
-            COL_TEXT_SECONDARY = 0x00606060;
-            COL_TEXT_DISABLED = 0x00999999;
-            COL_INPUT_BG = 0x00FFFFFF;
-            COL_INPUT_BORDER = 0x00CCCCCC;
-            COL_SLIDER_TRACK = 0x00DDDDDD;
-            COL_BUTTON_BG = 0x00E8E8E8;
-            COL_BUTTON_HOVER = 0x00D8D8D8;
-            COL_CHECKBOX_BG = 0x00FFFFFF;
-            COL_CARD_BG = 0x00F8F8F8;
-            break;
-        case 2:  // Classic (Win95 style)
-            COL_SIDEBAR_BG = 0x00C0C0C0;
-            COL_CONTENT_BG = 0x00C0C0C0;
-            COL_PANEL_NORMAL = 0x00C0C0C0;
-            COL_PANEL_HOVER = 0x00D0D0D0;
-            COL_PANEL_ACTIVE = 0x00000080;
-            COL_SEPARATOR = 0x00808080;
-            COL_TEXT_PRIMARY = 0x00000000;
-            COL_TEXT_SECONDARY = 0x00404040;
-            COL_TEXT_DISABLED = 0x00808080;
-            COL_INPUT_BG = 0x00FFFFFF;
-            COL_INPUT_BORDER = 0x00000000;
-            COL_SLIDER_TRACK = 0x00808080;
-            COL_BUTTON_BG = 0x00C0C0C0;
-            COL_BUTTON_HOVER = 0x00D0D0D0;
-            COL_CHECKBOX_BG = 0x00FFFFFF;
-            COL_CARD_BG = 0x00D0D0D0;
-            break;
-        case 3:  // Ocean
-            COL_SIDEBAR_BG = 0x001A3A4A;
-            COL_CONTENT_BG = 0x00224455;
-            COL_PANEL_NORMAL = 0x001A3A4A;
-            COL_PANEL_HOVER = 0x00254555;
-            COL_PANEL_ACTIVE = 0x00305060;
-            COL_SEPARATOR = 0x00406070;
-            COL_TEXT_PRIMARY = 0x00E0F0FF;
-            COL_TEXT_SECONDARY = 0x0090B0C0;
-            COL_TEXT_DISABLED = 0x00607080;
-            COL_INPUT_BG = 0x00183040;
-            COL_INPUT_BORDER = 0x00406070;
-            COL_SLIDER_TRACK = 0x00305060;
-            COL_BUTTON_BG = 0x00305060;
-            COL_BUTTON_HOVER = 0x00406070;
-            COL_CHECKBOX_BG = 0x00183040;
-            COL_CARD_BG = 0x001E4050;
-            break;
-        case 4:  // Nord
-            COL_SIDEBAR_BG = 0x002E3440;
-            COL_CONTENT_BG = 0x003B4252;
-            COL_PANEL_NORMAL = 0x002E3440;
-            COL_PANEL_HOVER = 0x00434C5E;
-            COL_PANEL_ACTIVE = 0x004C566A;
-            COL_SEPARATOR = 0x004C566A;
-            COL_TEXT_PRIMARY = 0x00ECEFF4;
-            COL_TEXT_SECONDARY = 0x00D8DEE9;
-            COL_TEXT_DISABLED = 0x00616E88;
-            COL_INPUT_BG = 0x003B4252;
-            COL_INPUT_BORDER = 0x004C566A;
-            COL_SLIDER_TRACK = 0x004C566A;
-            COL_BUTTON_BG = 0x004C566A;
-            COL_BUTTON_HOVER = 0x005E6A82;
-            COL_CHECKBOX_BG = 0x003B4252;
-            COL_CARD_BG = 0x00434C5E;
-            break;
-        case 5:  // Sunset (warm cream / peach) (#282)
-            COL_SIDEBAR_BG = 0x00FFF0E8;
-            COL_CONTENT_BG = 0x00FFF8F0;
-            COL_PANEL_NORMAL = 0x00FFF0E8;
-            COL_PANEL_HOVER = 0x00F8E0D0;
-            COL_PANEL_ACTIVE = 0x00E0A080;
-            COL_SEPARATOR = 0x00E8C8B0;
-            COL_TEXT_PRIMARY = 0x00402010;
-            COL_TEXT_SECONDARY = 0x00805840;
-            COL_TEXT_DISABLED = 0x00B09080;
-            COL_INPUT_BG = 0x00FFFFF8;
-            COL_INPUT_BORDER = 0x00C0A080;
-            COL_SLIDER_TRACK = 0x00E8C8B0;
-            COL_BUTTON_BG = 0x00E0A080;
-            COL_BUTTON_HOVER = 0x00F0B090;
-            COL_CHECKBOX_BG = 0x00FFFFF8;
-            COL_CARD_BG = 0x00FFF4EC;
-            break;
-        case 6:  // Forest (light green) (#282)
-            COL_SIDEBAR_BG = 0x00E8F4E8;
-            COL_CONTENT_BG = 0x00F0F8F0;
-            COL_PANEL_NORMAL = 0x00E8F4E8;
-            COL_PANEL_HOVER = 0x00D8ECD8;
-            COL_PANEL_ACTIVE = 0x0080C080;
-            COL_SEPARATOR = 0x00C0DCC0;
-            COL_TEXT_PRIMARY = 0x00203020;
-            COL_TEXT_SECONDARY = 0x00506850;
-            COL_TEXT_DISABLED = 0x0090A890;
-            COL_INPUT_BG = 0x00FFFFFF;
-            COL_INPUT_BORDER = 0x00A0C0A0;
-            COL_SLIDER_TRACK = 0x00C0DCC0;
-            COL_BUTTON_BG = 0x0080C080;
-            COL_BUTTON_HOVER = 0x0090D090;
-            COL_CHECKBOX_BG = 0x00FFFFFF;
-            COL_CARD_BG = 0x00EAF6EA;
-            break;
-        case 7:  // Slate Dark (#282)
-            COL_SIDEBAR_BG = 0x00202020;
-            COL_CONTENT_BG = 0x00282828;
-            COL_PANEL_NORMAL = 0x00202020;
-            COL_PANEL_HOVER = 0x00323232;
-            COL_PANEL_ACTIVE = 0x00484848;
-            COL_SEPARATOR = 0x003A3A3A;
-            COL_TEXT_PRIMARY = 0x00FFFFFF;
-            COL_TEXT_SECONDARY = 0x00B0B0B0;
-            COL_TEXT_DISABLED = 0x00707070;
-            COL_INPUT_BG = 0x00303030;
-            COL_INPUT_BORDER = 0x00484848;
-            COL_SLIDER_TRACK = 0x00404040;
-            COL_BUTTON_BG = 0x00323232;
-            COL_BUTTON_HOVER = 0x003C3C3C;
-            COL_CHECKBOX_BG = 0x00303030;
-            COL_CARD_BG = 0x002E2E2E;
-            break;
+    if (theme_id < 0 || theme_id >= g_th_count) theme_id = 0;
+
+    int kernel_id = gui_theme_activate(g_th[theme_id].slug);
+    if (kernel_id < 0) {
+        setlog("apply_theme: could not load theme file, keeping previous colors");
+        return;
     }
+
+    COL_CONTENT_BG      = theme_color(THEME_COLOR_WINDOW_BG);
+    COL_SIDEBAR_BG      = theme_color(THEME_COLOR_TASKBAR_BG);
+    COL_PANEL_NORMAL    = theme_color(THEME_COLOR_TASKBAR_BG);
+    COL_PANEL_HOVER     = theme_color(THEME_COLOR_TASKBAR_HOVER);
+    COL_PANEL_ACTIVE    = theme_color(THEME_COLOR_TASKBAR_ACTIVE);
+    COL_SIDEBAR_TEXT     = theme_color(THEME_COLOR_TASKBAR_TEXT);          // #745
+    COL_SIDEBAR_MUTED    = theme_color(THEME_COLOR_TASKBAR_TEXT_MUTED);    // #745
+    COL_SIDEBAR_SEL_TEXT = theme_color(THEME_COLOR_TASKBAR_SELECTED_TEXT); // #745
+    COL_SEPARATOR       = theme_color(THEME_COLOR_MENU_SEPARATOR);
+    COL_TEXT_PRIMARY    = theme_color(THEME_COLOR_LABEL_TEXT);
+    COL_TEXT_SECONDARY  = theme_color(THEME_COLOR_MENU_TEXT_DISABLED);
+    COL_TEXT_DISABLED   = theme_color(THEME_COLOR_BUTTON_DISABLED);
+    COL_INPUT_BG        = theme_color(THEME_COLOR_TEXTBOX_BG);
+    COL_INPUT_BORDER    = theme_color(THEME_COLOR_TEXTBOX_BORDER);
+    COL_SLIDER_TRACK    = theme_color(THEME_COLOR_SCROLLBAR_BG);
+    COL_BUTTON_BG       = theme_color(THEME_COLOR_BUTTON_FACE);
+    COL_BUTTON_HOVER    = theme_color(THEME_COLOR_BUTTON_LIGHT);
+    COL_CHECKBOX_BG     = theme_color(THEME_COLOR_CHECKBOX_BG);
+    // A card needs to read as "slightly raised" against the content
+    // background in EITHER a light or a dark theme; blending 10% toward the
+    // ink color does that without a dedicated theme_color_id_t of its own.
+    COL_CARD_BG         = gui_mix(COL_CONTENT_BG, COL_TEXT_PRIMARY, 10);
 
     // Apply accent color
     COL_ACCENT = ACCENT_COLORS[accent_color_idx];
     COL_ACCENT_HOVER = COL_ACCENT + 0x00202020;  // Lighten
     COL_SLIDER_FILL = COL_ACCENT;
-    COL_SUCCESS = 0x0066BB66;
-    COL_WARNING = 0x00DDAA44;
-    COL_ERROR = 0x00DD5555;
-
-    // Map local theme index to kernel theme ID and apply system-wide
-    // Kernel theme IDs: 0=Default(Retro), 1=Dark, 2=Light, 4=Classic, 5=Ocean, 9=Modern Dark
-    static const int kernel_theme_map[] = { 1, 2, 4, 5, 9, 6, 7, 11 };
-    int kernel_id = kernel_theme_map[theme_id];
-    set_theme(kernel_id);
+    // (#704) These three were hardcoded literals even though the kernel
+    // theme_t has carried color_success/warning/error since before #711 (a
+    // .mtheme file could set them, but nothing read them back). Now real
+    // tokens (THEME_COLOR_SUCCESS/WARNING/ERROR, added this ticket).
+    COL_SUCCESS = theme_color(THEME_COLOR_SUCCESS);
+    COL_WARNING = theme_color(THEME_COLOR_WARNING);
+    COL_ERROR = theme_color(THEME_COLOR_ERROR);
 
     // Push the active palette + renderer family into the shared style engine
-    // so all gui_* primitives render in this theme. Classic theme (id 2) uses
-    // the beveled CDE renderer; everything else uses the modern renderer.
-    gui_set_style(theme_id == 2 ? GUI_STYLE_CLASSIC : GUI_STYLE_MODERN);
+    // so all gui_* primitives render in this theme. A "retro"-style theme
+    // file (style=retro, e.g. Classic/Retro UNIX) uses the beveled CDE
+    // renderer; everything else uses the modern renderer.
+    gui_set_style(g_th[theme_id].is_classic ? GUI_STYLE_CLASSIC : GUI_STYLE_MODERN);
     gui_palette_t pal;
     pal.surface        = COL_CONTENT_BG;
     pal.surface_raised = COL_CARD_BG;
@@ -853,15 +926,15 @@ static void apply_theme(int theme_id) {
     pal.field_border   = COL_INPUT_BORDER;
     pal.track          = COL_SLIDER_TRACK;
     gui_set_palette(&pal);
+    (void)kernel_id;
 }
 
-// Theme picker uses a scrollable dropdown (scales to many themes), not buttons.
-// Names match apply_theme's id order.
-/* (#260) Theme labels: the old "Dark" is now "Midnight"; the old "Nord" is now
- * "Dark". Order/indices are unchanged so persisted prefs (saved by index) still
- * resolve to the same theme. */
-static const char *const g_theme_names[] = {"Midnight", "Light", "Classic", "Ocean", "Dark", "Sunset", "Forest", "Slate Dark"};
-#define NUM_THEMES 8
+
+// Theme picker uses a scrollable dropdown (scales to many themes), not
+// buttons. (#565) Names and count now come from th_init()'s file-based
+// g_th_names[]/g_th_count (see the declarations near g_wp[]/wp_init()
+// above), not a hardcoded 8-entry table, so an App-Store-installed theme
+// shows up here with no recompile - same as the wallpaper picker.
 static void theme_dd_changed(void) { apply_theme(current_theme); }
 
 // =============================================================================
@@ -914,12 +987,31 @@ static void format_size(uint64_t bytes, char *buf, int buf_size) {
 // =============================================================================
 
 static void draw_section_header(int x, int y, const char *title) {
-    win_draw_text(window_handle, x, y, title, COL_TEXT_PRIMARY);
+    // #711 loop 2 (B5/D4, typography family): section headers are primary
+    // text at BOLD weight, never accent - accent is reserved for
+    // interactive/selected elements only (director redirect, Section B5).
+    // Size comes from type.title (theme_metric_or, no rebuild needed to
+    // change it); bold is an explicit style bit at this call site, since a
+    // Settings category header is a distinct usage from a window titlebar
+    // (which stays regular per docs/UI_STYLE_GUIDE.md 4.4) even though both
+    // read type.title's SIZE. Real DejaVu Sans Bold face is enrolled (not
+    // faux-bold), see 4.3/4.7. type.title_lineheight (16*1.4=22.4 -> 22)
+    // matches the existing +22 separator offset below exactly, so no layout
+    // constant needed to change.
+    int sz = theme_metric_or(THEME_METRIC_TYPE_TITLE, 16);
+    win_draw_text_ttf_ex(window_handle, x, y, title, 0, sz, FONT_STYLE_BOLD, COL_TEXT_PRIMARY);
     win_draw_rect(window_handle, x, y + 22, CONTENT_WIDTH - 2 * PADDING, 1, COL_SEPARATOR);
 }
 
 static void draw_subsection(int x, int y, const char *title) {
-    win_draw_text(window_handle, x, y, title, COL_ACCENT);
+    // #711 loop 2 (B5/D4, typography family): was COL_ACCENT. This is the
+    // exact defect B5 names: green subsection labels reading as "selected"
+    // when they are structural headings. Now type.body_strong (identical
+    // 14px box as type.body, bold weight, primary text colour) per
+    // docs/UI_STYLE_GUIDE.md 4.4's usage table, not an accent-coloured
+    // heading. Accent stays reserved for interactive/selected elements.
+    int sz = theme_metric_or(THEME_METRIC_TYPE_BODY, 14);
+    win_draw_text_ttf_ex(window_handle, x, y, title, 0, sz, FONT_STYLE_BOLD, COL_TEXT_PRIMARY);
 }
 
 static void draw_label(int x, int y, const char *label) {
@@ -995,32 +1087,125 @@ static void draw_toggle_labeled(int x, int y, int label_width, const char *label
 // dropdown click handler (dropdown_open keeps the pointer while open).
 static const char *const FONT_SIZE_OPTS[] = {"Small", "Medium", "Large", "X-Large"};
 static const char *const ICON_SIZE_OPTS[] = {"Small", "Medium", "Large"};
-static const char *const SS_OPTS[]        = {"Off", "Starfield", "Flux", "Lines", "Bubbles", "Matrix", "Plasma", "GL Cube", "GL Matrix"};
+// #560/#571: the ten new GL screensavers (GL Tunnel..GL Lava, kernel ids
+// 10-19) were gated out of this picker after a 2026-07-21 session measured
+// all ten rendering as a full-screen rainbow gradient instead of their
+// geometry (GLTUNNEL had separately crashed COMPOSIT earlier that session,
+// fixed in f5ee702; GLKALEIDO/GLPLATONIC rendered black from a different
+// bug, fixed in 69072be). #571 (this session) reproduced the gradient bug
+// from screenshots, bisected it on a throwaway TESTHOOK build, and found it
+// does NOT reproduce on current HEAD (most likely fixed incidentally by one
+// of the shared TinyGL bounds-check commits since 07-21). MEASURED: all ten
+// boot-tested via testhook.c SAVER <id>, two screendumps each (differing
+// md5, proving live animation), all rendering correct intended geometry,
+// clean dismiss back to desktop, no crash/hang, CPU sane. The matching
+// refusal in screensaver_set_type() (screensaver.c) has been removed too -
+// see its comment for the full history. Appended at the END (ids 10-19,
+// idx 11-20) so existing saved screensaver_idx values for every earlier
+// entry are unchanged (screensaver_idx is persisted directly, sv_putint
+// 's' below). Category labels follow docs/SCREENSAVER_PSYCHEDELIC_DESIGN.md
+// section 8.1's "Category: Effect" convention.
+// #ssredesign: three entries added for the psychedelic screensaver redesign
+// (docs/SCREENSAVER_PSYCHEDELIC_DESIGN.md), all direct-pixel (NOT TinyGL).
+// "Plasma" is relabeled "Psychedelic: Plasma" because SS_PLASMA (kernel id
+// 7) was replaced in place with "Plasma Reborn" (design doc §4.3, §11 Q2) -
+// same slot/id, a strict superset of the old effect. "Bloom Garden" (§4.1,
+// Fractal Flame) and "Stained Glass" (§4.6, Stained-Glass Warp) are NEW
+// kernel ids (20, 21 - screensaver.c's SS_FLAME/SS_STAINEDGLASS).
+static const char *const SS_OPTS[]        = {"Off", "Starfield", "Flux", "Lines", "Bubbles", "Matrix", "Psychedelic: Plasma", "GL Cube", "GL Matrix", "Psychedelic: Bloom Garden", "Psychedelic: Stained Glass", "Rainbow: Tunnel", "Psychedelic: Kaleidoscope", "Geometric: Platonic Solids", "Geometric: Lorenz Attractor", "Geometric: Mobius Strip", "Geometric: Wave Mesh", "Geometric: Spirograph", "Geometric: Hypercube", "Geometric: Vortex", "Psychedelic: Lava Blobs"};
 static const char *const CURSOR_OPTS[]    = {"Light", "Dark", "Glow"};  // (#116) maps to compositor curstyle 0/1/2
-static const int SS_KERNEL_MAP[]          = {0, 2, 6, 3, 4, 5, 7, 8, 9};   // idx -> kernel screensaver id (#319 8=GL Cube 9=GL Matrix, reconciled #336)
-static const int CURSOR_KERNEL_MAP[]      = {0, 2, 1, 0};      // idx -> kernel cursor theme
+static const int SS_KERNEL_MAP[]          = {0, 2, 6, 3, 4, 5, 7, 8, 9, 20, 21, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
+                                          // idx -> kernel screensaver id (#319 8=GL Cube 9=GL Matrix; 20/21 are the
+                                          // psychedelic-redesign direct-pixel effects, see #ssredesign above; 10-19
+                                          // are the #560/#571 GL effects, un-gated and appended - see comment above)
+#define SS_OPTS_COUNT ARRAY_COUNT(SS_OPTS)   /* #745: was a literal 21 */
+_Static_assert(ARRAY_COUNT(SS_KERNEL_MAP) == ARRAY_COUNT(SS_OPTS),
+               "#745: SS_KERNEL_MAP must have exactly one kernel id per SS_OPTS label");
+// idx -> kernel cursor_theme_t (kernel/gui/cursor.h: RETRO=0, MODERN_LIGHT=1,
+// MODERN_DARK=2). #745: this still had FOUR entries from the pre-#116
+// "Default/Dark/Light/Large" list while CURSOR_OPTS has had THREE
+// (Light/Dark/Glow) since #116, so every index mapped to the wrong theme
+// (Light->RETRO, Dark->MODERN_DARK, Glow->MODERN_LIGHT) and entry 3 was
+// unreachable dead data. Now one entry per CURSOR_OPTS entry.
+static const int CURSOR_KERNEL_MAP[]      = {1, 2, 1};
+_Static_assert(ARRAY_COUNT(CURSOR_KERNEL_MAP) == ARRAY_COUNT(CURSOR_OPTS),
+               "#745: CURSOR_KERNEL_MAP must have exactly one kernel theme per CURSOR_OPTS label"
+               " (it carried a stale 4th entry from the pre-#116 list)");
+#define CURSOR_OPTS_COUNT    ARRAY_COUNT(CURSOR_OPTS)
+#define FONT_SIZE_OPTS_COUNT ARRAY_COUNT(FONT_SIZE_OPTS)
+#define ICON_SIZE_OPTS_COUNT ARRAY_COUNT(ICON_SIZE_OPTS)
 static const char *const DATE_FMT_OPTS[]  = {"YYYY-MM-DD", "MM/DD/YYYY", "DD/MM/YYYY"};
-// #387 Dock / taskbar layouts. Order matches the compositor's DOCK_* enum.
-// Labels are original, non-infringing names (persisted by numeric index in
-// /DOCKSTYL.CFG, so relabeling never changes the applied layout):
-//   1 Lumina      = glass dock + translucent top menu bar (was "macOS Sonoma")
-//   2 Classic UNIX = beveled CDE/Motif-style panel (was "CDE / UNIX")
-//   3 Retro Bench = title-bar-at-top workbench layout (was "Amiga Workbench")
-static const char *const DOCK_OPTS[]      = {"Default (MayteraOS)", "Lumina", "Classic UNIX", "Retro Bench"};
+#define DATE_FMT_OPTS_COUNT  ARRAY_COUNT(DATE_FMT_OPTS)
+// #387 Dock / taskbar layouts, in the compositor's DOCK_* enum order.
+// #745: the names USED to be a private array right here, and a second private
+// array in the first-boot wizard (userland/apps/setup/main.rs). They drifted:
+// this one had been renamed off the third-party desktop names while the wizard
+// still displayed "macOS style", "CDE panel" and "Amiga bar". The user reported
+// it twice. There is now exactly ONE list, in libc (gui_dock.h/.c), read by
+// both apps, so neither owns a list that can diverge. Do not reintroduce a
+// local array here; build/dock-name-gate.sh fails the build if you do.
+#define DOCK_OPTS            gui_dock_style_names()
+#define DOCK_OPTS_COUNT      gui_dock_style_count()
+// DOCK_OPTS is now a `const char *const *`, so ARRAY_COUNT (and therefore
+// OPT_CLAMP / OPT_OK) MUST NOT be used on it: sizeof on a pointer is legal C
+// and would silently clamp every dock index to 0 with no warning. This is the
+// clamp for this one list, and it counts the shared list, not a pointer.
+#define DOCK_CLAMP(i)        (((i) >= 0 && (i) < DOCK_OPTS_COUNT) ? (i) : 0)
 
 // --- Real dropdown widget: opens a scrollable list, current item highlighted ---
+// #560: this widget is shared by every dropdown in Settings (theme, font
+// size, icon size, screensaver, cursor, dock layout, timezone, date format,
+// wallpaper). Long lists (wallpaper up to WP_MAX_ENTRIES, 26 timezones, and
+// now 19 screensaver types after #560 added ten GL effects) already scrolled
+// correctly via wheel/keyboard/scrollbar-drag, but a list longer than
+// DD_VISIBLE gave NO visible signal that more items existed below the fold -
+// the box looked identical whether the list had 3 items or 63. A user
+// clicking "GL Matrix" (item 9 of 19, dropdown_open() centres the scroll on
+// the current selection) saw a box that looked complete and never found the
+// ten new effects sitting just out of view. Same bug class as #533 (font
+// dialog list overflow) and #512 (no shared scrollable-list widget).
+//
+// #512 follow-up: that fix was landed directly in this widget (raised
+// DD_VISIBLE, drew explicit scrollbar chevrons) because there was no shared
+// listbox to reach for yet. There is now (libc/gui_list.h, also what the
+// Editor's menus are built on, #562) so this widget is rebuilt on it here,
+// retiring the hand-rolled row/clip/scrollbar math in favour of the one
+// place that owns it. NO call site changes - dropdown_open/_render/_click
+// keep the same signatures and the same external behaviour (centre-on-open,
+// click-to-select-then-close, arrow keys, Esc/Enter to close), so every
+// caller above (including the screensaver picker) benefits with zero edits
+// of its own. Two small, deliberate behaviour changes come along for the
+// ride, both towards OS-wide consistency rather than away from it: the
+// scrollbar gutter is now 14px (GUI_SCROLL_W, matching Settings' own sidebar
+// and the font dialog) instead of this widget's previous one-off 8px, and
+// the wheel now moves 3 rows per notch (gui_scroll's OS-wide convention,
+// also used by Files) instead of this widget's previous one-off 1 row.
 #define DD_ROW      26
-#define DD_VISIBLE  9
-static int   g_dd_open = 0, g_dd_x, g_dd_y, g_dd_w, g_dd_count, g_dd_scroll;
+#define DD_VISIBLE  12   // rows shown before the popup scrolls (a real
+                         // scrollbar now, via gui_list/gui_scroll - not a
+                         // hard cutoff, so raising or lowering this can no
+                         // longer silently hide items).
+static int   g_dd_open = 0, g_dd_x, g_dd_y, g_dd_w, g_dd_count;
 static int  *g_dd_sel = 0;
 static const char *const *g_dd_items = 0;
 static void (*g_dd_on_change)(void) = 0;
+static gui_list_t g_dd_list;
 
 // Small refined downward chevron (filled triangle) centred at (cx, cy-top).
 static void draw_chevron_down(int cx, int cy, uint32_t col) {
     for (int r = 0; r < 4; r++) {
         int w = 7 - r * 2; if (w < 1) w = 1;
         win_draw_rect(window_handle, cx - w / 2, cy + r, w, 1, col);
+    }
+}
+// Upward-pointing twin of draw_chevron_down(), for the "more items above"
+// scroll cue (#560; kept when this widget moved onto gui_list, #512, since
+// gui_scroll_draw()'s plain thumb alone was exactly the affordance gap #560
+// was fixing).
+static void draw_chevron_up(int cx, int cy, uint32_t col) {
+    for (int r = 0; r < 4; r++) {
+        int w = 1 + r * 2;
+        win_draw_rect(window_handle, cx - w / 2, cy + (3 - r), w, 1, col);
     }
 }
 
@@ -1032,7 +1217,7 @@ static void draw_dropdown_n(int x, int y, int width, const char *value, bool act
     } else {
         uint32_t bg = active ? COL_PANEL_ACTIVE : COL_INPUT_BG;
         win_draw_rect(window_handle, x, y, width, 28, bg);
-        gui_draw_rect_outline(window_handle, x, y, width, 28, active ? COL_ACCENT : COL_INPUT_BORDER);
+        gui_draw_rect_outline(window_handle, x, y, width, 28, active ? gui_pal()->focus : COL_INPUT_BORDER);  // #745
     }
     win_draw_text(window_handle, x + 10, y + 6, value, COL_TEXT_PRIMARY);
     // (#261) item-count badge in small text just left of the chevron, so the
@@ -1049,55 +1234,90 @@ static void draw_dropdown(int x, int y, int width, const char *value, bool activ
     draw_dropdown_n(x, y, width, value, active, 0);
 }
 
+// NOTE on the +2/1px margin below (was +4/2px before #512): gui_list_config()
+// derives its scroll VIEWPORT as h-2 (a 1px inset all round, the same
+// convention gui_font.c's lists use). Keeping this widget's own 2px margin
+// while gui_list computed clamps against h-2 would make gui_scroll_max() 2px
+// short of a whole row - the thumb could never quite reach a clean row
+// boundary and the last row would sometimes be one wheel-notch short of
+// reachable. Matching gui_list's 1px convention exactly (h = vis*DD_ROW+2)
+// fixes that at the source rather than special-casing the clamp here; the
+// visual difference is one pixel of margin, not visible at these sizes.
 static void dropdown_open(int x, int y, int w, const char *const *items,
                           int count, int *sel, void (*on_change)(void)) {
     g_dd_open = 1; g_dd_x = x; g_dd_y = y; g_dd_w = w;
     g_dd_items = items; g_dd_count = count; g_dd_sel = sel; g_dd_on_change = on_change;
     int vis = count < DD_VISIBLE ? count : DD_VISIBLE;
-    g_dd_scroll = *sel - vis / 2;                       // centre the current item
-    if (g_dd_scroll > count - vis) g_dd_scroll = count - vis;
-    if (g_dd_scroll < 0) g_dd_scroll = 0;
+    if (vis < 1) vis = 1;
+    // Seed a real, window-size-independent height so gui_scroll_max() is
+    // already sane if a wheel/key event lands before the next draw calls
+    // dropdown_refresh() with the true, WIN_HEIGHT-clamped geometry.
+    gui_list_config(&g_dd_list, x, y + 28, w, vis * DD_ROW + 2, DD_ROW, count);
+    int centered = *sel - vis / 2;                       // centre the current item
+    if (centered > count - vis) centered = count - vis;
+    if (centered < 0) centered = 0;
+    gui_scroll_set(&g_dd_list.scroll, centered * DD_ROW);
 }
 
-static void dropdown_geom(int *by, int *bh, int *vis) {
+// Recompute this frame's popup geometry into the shared list (flips above the
+// control if it would overflow WIN_HEIGHT, exactly like the old
+// dropdown_geom()) and return the row count shown. gui_list/gui_scroll now
+// own the scroll offset/clamp/thumb math that used to be hand-rolled here.
+static int dropdown_refresh(void) {
     int v = g_dd_count < DD_VISIBLE ? g_dd_count : DD_VISIBLE;
-    int h = v * DD_ROW + 4;
+    if (v < 1) v = 1;
+    int h = v * DD_ROW + 2;
     int y = g_dd_y + 28;
     if (y + h > WIN_HEIGHT - 4 && g_dd_y - h >= 0) y = g_dd_y - h;  // flip above if needed
-    *by = y; *bh = h; *vis = v;
+    gui_list_config(&g_dd_list, g_dd_x, y, g_dd_w, h, DD_ROW, g_dd_count);
+    return v;
 }
 
 static void dropdown_render(void) {
     if (!g_dd_open) return;
-    int by, bh, vis; dropdown_geom(&by, &bh, &vis);
-    int bx = g_dd_x, bw = g_dd_w;
+    int vis = dropdown_refresh();
+    int bx = g_dd_list.x, by = g_dd_list.y, bw = g_dd_list.w, bh = g_dd_list.h;
+    int scroll_row = gui_list_first(&g_dd_list);
     win_draw_rect(window_handle, bx, by, bw, bh, COL_INPUT_BG);
     gui_draw_rect_outline(window_handle, bx, by, bw, bh, COL_ACCENT);
     for (int r = 0; r < vis; r++) {
-        int idx = g_dd_scroll + r;
+        int idx = scroll_row + r;
         if (idx < 0 || idx >= g_dd_count) continue;
-        int ry = by + 2 + r * DD_ROW;
+        int ry = by + 1 + r * DD_ROW;
         if (idx == *g_dd_sel)
-            win_draw_rect(window_handle, bx + 2, ry, bw - 4, DD_ROW, COL_ACCENT);
-        win_draw_text(window_handle, bx + 10, ry + 6, g_dd_items[idx], COL_TEXT_PRIMARY);
+            win_draw_rect(window_handle, bx + 1, ry, bw - 2, DD_ROW, COL_ACCENT);
+        win_draw_text(window_handle, bx + 10, ry + 5, g_dd_items[idx], COL_TEXT_PRIMARY);
     }
     if (g_dd_count > vis) {                              // scrollbar
-        int track_h = bh - 4;
+        // #560: widened 5px->8px and given real contrast (COL_ACCENT
+        // thumb instead of COL_TEXT_SECONDARY) so a long list reads as
+        // scrollable at a glance, plus explicit up/down chevrons at the
+        // track ends whenever there is more content in that direction - the
+        // thumb alone was too easy to miss. Position/limits now come from
+        // the shared gui_scroll_t (g_dd_list.scroll, #512) instead of a
+        // hand-rolled index, but the look is unchanged (see the margin note
+        // above dropdown_open for the one pixel that did move).
+        int track_h = bh - 2;
         int thumb_h = track_h * vis / g_dd_count; if (thumb_h < 12) thumb_h = 12;
         int denom = g_dd_count - vis; if (denom < 1) denom = 1;
-        int thumb_y = by + 2 + (track_h - thumb_h) * g_dd_scroll / denom;
-        win_draw_rect(window_handle, bx + bw - 7, by + 2, 5, track_h, COL_SLIDER_TRACK);
-        win_draw_rect(window_handle, bx + bw - 7, thumb_y, 5, thumb_h, COL_TEXT_SECONDARY);
+        int thumb_y = by + 1 + (track_h - thumb_h) * scroll_row / denom;
+        win_draw_rect(window_handle, bx + bw - 10, by + 1, 8, track_h, COL_SLIDER_TRACK);
+        win_draw_rect(window_handle, bx + bw - 10, thumb_y, 8, thumb_h, COL_ACCENT);
+        if (scroll_row > 0)
+            draw_chevron_up(bx + bw - 6, by + 4, COL_ACCENT);
+        if (scroll_row + vis < g_dd_count)
+            draw_chevron_down(bx + bw - 6, by + bh - 8, COL_ACCENT);
     }
 }
 
 // Returns 1 if the click was consumed by an open dropdown.
 static void dropdown_click(int mx, int my) {
-    int by, bh, vis; dropdown_geom(&by, &bh, &vis);
-    int bx = g_dd_x, bw = g_dd_w;
+    dropdown_refresh();
+    int bx = g_dd_list.x, by = g_dd_list.y, bw = g_dd_list.w, bh = g_dd_list.h;
     if (mx >= bx && mx < bx + bw && my >= by && my < by + bh) {
-        int r = (my - (by + 2)) / DD_ROW;
-        int idx = g_dd_scroll + r;
+        int scroll_row = gui_list_first(&g_dd_list);
+        int r = (my - (by + 1)) / DD_ROW;
+        int idx = scroll_row + r;
         if (idx >= 0 && idx < g_dd_count) {
             *g_dd_sel = idx;
             if (g_dd_on_change) g_dd_on_change();
@@ -1439,11 +1659,124 @@ static void useremail_set(const char *user, const char *email) {
     if (on < (int)sizeof(out) - 1) out[on++] = '=';
     for (int j = 0; email[j] && on < (int)sizeof(out) - 1; j++) out[on++] = email[j];
     if (on < (int)sizeof(out) - 1) out[on++] = '\n';
-    sys_unlink(USEREMAIL_CFG);
-    fd = sys_open(USEREMAIL_CFG, 0x41);   // O_WRONLY|O_CREAT
+    // #743: was unlink-then-open, so a failed open deleted every user's email
+    // mapping. userconf_write_all never unlinks.
+    if (userconf_write_all(USEREMAIL_CFG, out, (unsigned long)on) != 0)
+        save_failed("USEREMAIL.CFG");
+}
+
+// (#745) Per-account avatar, same side-table pattern as USEREMAIL_CFG above -
+// a direct sibling, same "username=value" format, same read-modify-write
+// helper shape (design doc docs/LOGIN_AVATARS_AND_PROFILE.html section 8).
+// The kernel's user_info_t/SYS_LIST_USERS has no picture column and this
+// does not add one; the value grammar is:
+//   (absent)        default: mono, color = avatar_palette[uid % 8]
+//   mono:RRGGBB     monogram, explicit color override (written by the
+//                   swatch picker in the Edit Profile modal below)
+//   stock:NAME      reserved - would reference /AVATARS/NAME.ICN via the
+//                   existing MICO icon loader. No stock set ships yet (see
+//                   design doc 10.2); a value in this shape is currently
+//                   unreachable from this UI and, if ever read back before a
+//                   loader exists, must degrade to the mono default, not
+//                   crash or blank.
+//   custom:PATH     reserved only, never written or read - see design doc
+//                   10.3 for why (no userland image decoder, no file
+//                   browser). Treat exactly like the degraded case above.
+#define USERAVATAR_CFG "/CONFIG/USERAVATAR.CFG"
+
+static void useravatar_get(const char *user, char *out, int cap) {
+    out[0] = 0;
+    int fd = sys_open(USERAVATAR_CFG, 0);
     if (fd < 0) return;
-    sys_write(fd, out, (unsigned long)on);
+    static char b[1024];
+    long n = sys_read(fd, b, sizeof(b) - 1);
     sys_close(fd);
+    if (n <= 0) return;
+    b[n] = 0;
+    int ul = 0; while (user[ul]) ul++;
+    int i = 0;
+    while (b[i]) {
+        int ls = i;
+        while (b[i] && b[i] != '=' && b[i] != '\n') i++;
+        if (b[i] == '=') {
+            int keylen = i - ls;
+            int match = (keylen == ul);
+            for (int j = 0; match && j < keylen; j++) if (b[ls + j] != user[j]) match = 0;
+            i++;   // skip '='
+            int vs = i;
+            while (b[i] && b[i] != '\n') i++;
+            if (match) {
+                int k = 0;
+                for (int j = vs; j < i && k < cap - 1; j++) out[k++] = b[j];
+                out[k] = 0;
+                return;
+            }
+        } else {
+            while (b[i] && b[i] != '\n') i++;
+        }
+        if (b[i] == '\n') i++;
+    }
+}
+
+static void useravatar_set(const char *user, const char *spec) {
+    static char b[1024]; int bn = 0; b[0] = 0;
+    int fd = sys_open(USERAVATAR_CFG, 0);
+    if (fd >= 0) { long n = sys_read(fd, b, sizeof(b) - 1); sys_close(fd);
+                   if (n > 0) { bn = (int)n; b[bn] = 0; } }
+    static char out[1200]; int on = 0;
+    int ul = 0; while (user[ul]) ul++;
+    // Copy every existing line except this user's (which we rewrite below).
+    int i = 0;
+    while (i < bn && b[i]) {
+        int ls = i;
+        while (b[i] && b[i] != '=' && b[i] != '\n') i++;
+        int keylen = i - ls;
+        int match = (keylen == ul);
+        for (int j = 0; match && j < keylen; j++) if (b[ls + j] != user[j]) match = 0;
+        int le = ls;
+        while (b[le] && b[le] != '\n') le++;
+        if (b[le] == '\n') le++;
+        if (!match)
+            for (int j = ls; j < le && on < (int)sizeof(out) - 1; j++) out[on++] = b[j];
+        i = le;
+    }
+    for (int j = 0; user[j] && on < (int)sizeof(out) - 1; j++) out[on++] = user[j];
+    if (on < (int)sizeof(out) - 1) out[on++] = '=';
+    for (int j = 0; spec[j] && on < (int)sizeof(out) - 1; j++) out[on++] = spec[j];
+    if (on < (int)sizeof(out) - 1) out[on++] = '\n';
+    // userconf_write_all never unlinks (#743) - same safety as useremail_set.
+    if (userconf_write_all(USERAVATAR_CFG, out, (unsigned long)on) != 0)
+        save_failed("USERAVATAR.CFG");
+}
+
+// (#704/#745) INTENTIONALLY NOT themed - per-account identity tint, not
+// chrome. Same array, same values, as login.c's g_avatar_id_palette (design
+// doc section 8.2: both index by uid % 8 now, not list position, so an
+// account's color is stable across the list being reordered).
+static const uint32_t avatar_palette[8] = {
+    0x00569CD6, 0x0066BB66, 0x00CC8844, 0x00AA66CC,
+    0x00CC6666, 0x0044AAAA, 0x00888888, 0x00BBAA44
+};
+
+// Parse a USERAVATAR.CFG value into a display color. Only "mono:RRGGBB" is
+// currently produced or read for real; "stock:"/"custom:"/anything else
+// (including an unset/empty spec) degrades to the uid-keyed palette default,
+// per the design doc's forward-compatible grammar (section 8.1/10.3) - this
+// must never blank or crash on a value this UI cannot yet act on.
+static uint32_t avatar_color_from_spec(const char *spec, unsigned int uid) {
+    if (spec[0] == 'm' && spec[1] == 'o' && spec[2] == 'n' && spec[3] == 'o' && spec[4] == ':') {
+        unsigned long v = strtoul(spec + 5, 0, 16);
+        return 0x00FFFFFF & (uint32_t)v;
+    }
+    return avatar_palette[uid % 8];
+}
+
+// Reverse lookup for the Edit Profile swatch picker: which palette slot (if
+// any) an account's current color came from, so opening the modal highlights
+// the color it is ALREADY using rather than always defaulting to slot 0.
+static int avatar_palette_index_for(uint32_t color, unsigned int uid) {
+    for (int i = 0; i < 8; i++) if (avatar_palette[i] == color) return i;
+    return (int)(uid % 8);
 }
 
 // Load the real account list from the kernel so the Users panel reflects the
@@ -1454,10 +1787,20 @@ static void users_refresh(void) {
     user_info_t ui[8];
     int n = sys_list_users(ui, 8);
     if (n <= 0) return;
-    static const uint32_t avatar_palette[8] = {
-        0x00569CD6, 0x0066BB66, 0x00CC8844, 0x00AA66CC,
-        0x00CC6666, 0x0044AAAA, 0x00888888, 0x00BBAA44
-    };
+    // #785: bind the session identity from the FULL list, before the display
+    // cap below truncates it. sys_list_users() returns table order and the
+    // kernel seeds root first, so users[0] is root on every image: taking the
+    // target from current_user_idx (initialised to 0 and never bound to the
+    // session) meant Change Password always aimed at root, whoever was logged
+    // in. A non-root session then got "Current password incorrect" for a
+    // password that was perfectly correct, because the account was wrong.
+    {
+        unsigned int me = (unsigned int)sys_getuid();
+        g_session_user[0] = 0;
+        for (int i = 0; i < n; i++) {
+            if (ui[i].uid == me) { copy_str(g_session_user, ui[i].username, 32); break; }
+        }
+    }
     if (n > 4) n = 4;
     for (int i = 0; i < n; i++) {
         copy_str(users[i].username, ui[i].username, 32);
@@ -1466,10 +1809,25 @@ static void users_refresh(void) {
         useremail_get(users[i].username, users[i].email, 64);   // real stored email, "" if unset
         users[i].role = (ui[i].uid == 0) ? 0 : 1;   // uid 0 = administrator
         users[i].password_set = true;
-        users[i].avatar_color = avatar_palette[i & 7];
+        users[i].uid = ui[i].uid;
+        // (#745) keyed by uid, not list position `i` - design doc section
+        // 8.2: a fixed uid keeps an account's color stable across reboots
+        // even if the table order changes, unlike the old `i & 7`.
+        {
+            char spec[32];
+            useravatar_get(users[i].username, spec, sizeof(spec));
+            users[i].avatar_color = avatar_color_from_spec(spec, users[i].uid);
+        }
     }
     user_count = n;
     if (current_user_idx >= user_count) current_user_idx = 0;
+    // #785: show the account that is actually logged in, when it is on screen.
+    if (g_session_user[0]) {
+        for (int i = 0; i < user_count; i++) {
+            if (strcmp(users[i].username, g_session_user) == 0) { current_user_idx = i; break; }
+        }
+    }
+    autologin_refresh();   // (#566) keep the autologin indicator in sync with the kernel
 }
 
 static void format_hms(char *buf, int h, int m, int s) {
@@ -1485,21 +1843,41 @@ static void format_ymd(char *buf, int y, int mo, int d) {
     buf[8] = '0' + d  / 10; buf[9] = '0' + d  % 10; buf[10] = '\0';
 }
 
-static void update_timezone_offset(void) {
-    // Timezone strings look like "UTC+05:30", "UTC-08:00", "UTC"
-    const char *s = timezones[timezone_idx];
-    int sign = 1, h = 0, m = 0, i = 0;
-    while (s[i] && s[i] != '+' && s[i] != '-') i++;
-    if (!s[i]) { timezone_offset_minutes = 0; return; }
-    sign = (s[i] == '+') ? 1 : -1;
-    i++;
-    if (s[i] >= '0' && s[i] <= '9' && s[i+1] >= '0' && s[i+1] <= '9') {
-        h = (s[i] - '0') * 10 + (s[i+1] - '0');
-        if (s[i+2] == ':' && s[i+3] >= '0' && s[i+3] <= '9' && s[i+4] >= '0' && s[i+4] <= '9') {
-            m = (s[i+3] - '0') * 10 + (s[i+4] - '0');
+// #50: bring Settings onto the shared setting at startup, migrating an install
+// that only ever had the old private index.
+//
+// The migration runs ONLY when TZ.CFG does not yet hold a zone (tz_is_set() is
+// false). That test is not "is the current zone UTC": UTC is a legitimate
+// choice, and treating it as "unset" would let a stale legacy index overwrite a
+// zone the user picked in the first-run wizard five minutes earlier.
+static void settings_tz_init(void) {
+    if (!tz_is_set() && legacy_tz_idx >= 0 &&
+        legacy_tz_idx < (int)ARRAY_COUNT(LEGACY_SETTINGS_TZ_OFF)) {
+        int idx = tz_index_for_offset(LEGACY_SETTINGS_TZ_OFF[legacy_tz_idx]);
+        if (idx >= 0) {
+            // A failed write is not fatal here: the zone simply stays unset and
+            // the user can pick it again. Do not report success either way.
+            int rc = tz_set_index(idx);
+            (void)rc;
         }
     }
-    timezone_offset_minutes = sign * (h * 60 + m);
+    timezone_idx = tz_index();
+}
+
+// #49/#50: the timezone dropdown's on_change. It used to re-parse "UTC+HH:MM"
+// out of Settings' private label array into a private minute count that only
+// Settings' own panel ever consulted. It now COMMITS the choice to the one
+// persisted setting, /CONFIG/TZ.CFG, which is the same file the first-run
+// wizard writes and the same file every clock in the OS reads.
+//
+// NO REBOOT: the compositor re-reads TZ.CFG on its own throttle (TZ_REFRESH_MS,
+// 2s), so the taskbar clock, the desktop clock widget, the calendar and the
+// lock screen follow within about two seconds of the dropdown closing. That
+// needed no new plumbing: the file was already the hand-off channel, it simply
+// had no reader.
+static void update_timezone_offset(void) {
+    if (tz_set_index(timezone_idx) != 0)
+        save_failed("TZ.CFG (time zone)");
 }
 
 static void do_export_debug(void) {
@@ -1635,12 +2013,16 @@ static const char* panel_mico[PANEL_COUNT] = {
     "PRINTER",   // Devices / Printers (falls back to [R])
     "RSS",       // Bluetooth (falls back to [B]; custom glyph drawn in-panel)
     "RSS",       // Wi-Fi (custom glyph drawn in-panel)
-    "RSS"        // External Services (#414). MUST exist: this array is indexed by
+    "RSS",       // External Services (#414). MUST exist: this array is indexed by
                  // PANEL_COUNT and a missing entry left panel_mico[PANEL_EXTSVC]
                  // NULL, which made draw_sidebar() -> draw_mico(NULL) ->
                  // mico_get(NULL) dereference address 0 and crash Settings on
                  // every launch (the window was created then the process killed,
                  // so it "never appeared"). Keep this list length == PANEL_COUNT.
+    "RSS",       // Start Menu (#: uplift). Reuses the same safe fallback as the
+                 // three panels above rather than risking a non-existent /ICONS
+                 // basename (same lesson as the PANEL_EXTSVC crash noted above).
+    "RSS"        // Dock (#745 task #67). Same safe fallback; falls back to [Z].
 };
 
 // (#168) Alerts / notifications prefs. Persisted to /CONFIG/ALERTS.CFG, which
@@ -1712,9 +2094,9 @@ static void draw_sidebar(void) {
     win_draw_rect(window_handle, 0, 0, SIDEBAR_WIDTH, WIN_HEIGHT, COL_SIDEBAR_BG);
 
     // Title area with icon
-    if (!draw_mico("MENU", 13, 9, 22, COL_ACCENT, COL_CARD_BG))
-        win_draw_text(window_handle, 15, 12, "[*]", COL_ACCENT);
-    win_draw_text(window_handle, 45, 12, "Settings", COL_TEXT_PRIMARY);
+    if (!draw_mico("MENU", 13, 9, 22, COL_SIDEBAR_TEXT, COL_SIDEBAR_BG))
+        win_draw_text(window_handle, 15, 12, "[*]", COL_SIDEBAR_TEXT);
+    win_draw_text(window_handle, 45, 12, "Settings", COL_SIDEBAR_TEXT);
     win_draw_rect(window_handle, 10, 38, SIDEBAR_WIDTH - 20, 1, COL_SEPARATOR);
 
     // Panel buttons. Only rows fully inside the viewport are drawn; the viewport
@@ -1743,12 +2125,13 @@ static void draw_sidebar(void) {
         }
 
         // Panel name color (also used to tint the icon so it tracks state)
-        uint32_t text_color = (i == current_panel) ? COL_ACCENT : COL_TEXT_PRIMARY;
+        uint32_t text_color = (i == current_panel) ? COL_SIDEBAR_SEL_TEXT
+                                                   : COL_SIDEBAR_TEXT;
 
         // Icon: real MICO glyph tinted to the row text color; fall back to the
         // letter chip if the icon file is missing so nothing breaks.
         if (!draw_mico(panel_mico[i], 14, y + 7, 20, text_color, bg)) {
-            win_draw_text(window_handle, 15, y + 9, panel_icons[i], COL_TEXT_SECONDARY);
+            win_draw_text(window_handle, 15, y + 9, panel_icons[i], text_color);
         }
 
         win_draw_text(window_handle, 48, y + 9, panel_names[i], text_color);
@@ -1756,7 +2139,9 @@ static void draw_sidebar(void) {
 
     // Scrollbar: themed, and drawn only when the list actually overflows, so on
     // a screen tall enough to show all panels no gutter is spent.
-    gui_scroll_draw(window_handle, &g_side_scroll);
+    // The left nav has its OWN surface (taskbar_bg since #745), so the thumb
+    // is contrasted against that, not against the content panel it is not on.
+    gui_scroll_draw_on(window_handle, &g_side_scroll, COL_SIDEBAR_BG);
 
     // Version at bottom: queried live from the running kernel (SYS_GET_VERSION)
     // rather than baked in. This line used to read a hardcoded "v1.8.0" while
@@ -1779,7 +2164,7 @@ static void draw_sidebar(void) {
         win_draw_rect(window_handle, 10, WIN_HEIGHT - SIDEBAR_FOOTER_H,
                       SIDEBAR_WIDTH - 20, 1, COL_SEPARATOR);
         win_draw_text_small(window_handle, 15, WIN_HEIGHT - SIDEBAR_FOOTER_H + 8,
-                            vline, COL_TEXT_DISABLED);
+                            vline, COL_SIDEBAR_MUTED);
     }
 
     // Separator line between sidebar and content
@@ -1806,7 +2191,10 @@ static char *sv_putint(char *p, char key, int v) {
 }
 static void settings_save(void) {
     char buf[512]; char *p = buf;
-    p = sv_putint(p, 't', timezone_idx);
+    // #50: 't' (the timezone) is DELIBERATELY NOT WRITTEN any more. The timezone
+    // lives in /CONFIG/TZ.CFG, written by tz_set_index(), and a second copy here
+    // is precisely the divergence this ticket removes. The key is still READ
+    // below, once, to migrate an existing install.
     p = sv_putint(p, 'h', use_24hour ? 1 : 0);
     p = sv_putint(p, 'd', date_format);
     p = sv_putint(p, 'a', accent_color_idx);
@@ -1831,14 +2219,16 @@ static void settings_save(void) {
     p = sv_putint(p, 'U', gamma_r);
     p = sv_putint(p, 'V', gamma_g);
     p = sv_putint(p, 'B', gamma_b);
-    sys_unlink("SETTINGS.CFG");
-    int fd = sys_open("SETTINGS.CFG", 0x41);   // O_WRONLY|O_CREAT
-    if (fd < 0) return;
-    sys_write(fd, buf, (unsigned long)(p - buf));
-    sys_close(fd);
+    // #743: was unlink-then-open on a RELATIVE path, so every desktop
+    // preference (font, icon size, screensaver, cursor, dock, gamma, ...) was
+    // deleted by a failed open and otherwise saved to wherever cwd pointed.
+    int fd = userconf_open_write("SETTINGS.CFG");
+    if (userconf_finish_write(fd, buf, (unsigned long)(p - buf)) != 0)
+        save_failed("SETTINGS.CFG (desktop preferences)");
 }
 static void settings_load(void) {
-    int fd = sys_open("SETTINGS.CFG", 0);
+    // #743: per-user path, falling back to the legacy relative name (#683).
+    int fd = userconf_open_read("SETTINGS.CFG", "SETTINGS.CFG");
     if (fd < 0) return;
     static char b[512];
     long n = sys_read(fd, b, sizeof(b) - 1);
@@ -1855,7 +2245,7 @@ static void settings_load(void) {
             while (b[i] >= '0' && b[i] <= '9') { val = val * 10 + (b[i] - '0'); i++; }
             if (neg) val = -val;
             switch (key) {
-                case 't': timezone_idx = val; break;
+                case 't': legacy_tz_idx = val; break;   // #50: migration only
                 case 'h': use_24hour = val ? true : false; break;
                 case 'd': date_format = val; break;
                 case 'a': accent_color_idx = val; break;
@@ -1885,7 +2275,10 @@ static void settings_load(void) {
 }
 static void settings_autosave(void) {
     static int last = -1;
-    int h = timezone_idx*7 + (use_24hour?1:0)*13 + date_format*17 + accent_color_idx*23
+    // #50: timezone_idx is no longer part of this signature, because it is no
+    // longer part of what settings_save() writes. Leaving it in would trigger a
+    // pointless SETTINGS.CFG rewrite every time the zone changed.
+    int h = (use_24hour?1:0)*13 + date_format*17 + accent_color_idx*23
           + cursor_theme*29 + pointer_speed*31 + double_click_speed*37
           + screensaver_idx*41 + screensaver_delay_min*43
           + key_repeat_rate*47 + key_repeat_delay*53 + keyboard_layout*59
@@ -1915,11 +2308,9 @@ static void alerts_save(void) {
     p = a_putkv(p, "sev_error", alerts_error);
     p = a_putkv(p, "duration", alerts_duration);
     p = a_putkv(p, "dnd", alerts_dnd);
-    sys_unlink("/CONFIG/ALERTS.CFG");
-    int fd = sys_open("/CONFIG/ALERTS.CFG", 0x41);
-    if (fd < 0) return;
-    sys_write(fd, buf, (unsigned long)(p - buf));
-    sys_close(fd);
+    // #743: was unlink-then-open. See save_failed() above.
+    if (userconf_write_all("/CONFIG/ALERTS.CFG", buf, (unsigned long)(p - buf)) != 0)
+        save_failed("ALERTS.CFG");
 }
 static int a_kv(const char *b, const char *key, int def) {
     int kl = 0; while (key[kl]) kl++;
@@ -1968,11 +2359,10 @@ static void privacy_save(void) {
     p = a_putkv(p, "location_services", location_services);
     p = a_putkv(p, "diagnostics", diagnostics_enabled);
     p = a_putkv(p, "crash_reports", crash_reports);
-    sys_unlink("/CONFIG/PRIVACY.CFG");
-    int fd = sys_open("/CONFIG/PRIVACY.CFG", 0x41);   // O_WRONLY|O_CREAT
-    if (fd < 0) return;
-    sys_write(fd, buf, (unsigned long)(p - buf));
-    sys_close(fd);
+    // #743: was unlink-then-open. A failed open reset every privacy toggle,
+    // including lock timeout and "require password on wake", to its default.
+    if (userconf_write_all("/CONFIG/PRIVACY.CFG", buf, (unsigned long)(p - buf)) != 0)
+        save_failed("PRIVACY.CFG");
 }
 static void privacy_load(void) {
     int fd = sys_open("/CONFIG/PRIVACY.CFG", 0);
@@ -1989,6 +2379,62 @@ static void privacy_load(void) {
     diagnostics_enabled   = a_kv(b, "diagnostics", 1) ? true : false;
     crash_reports         = a_kv(b, "crash_reports", 1) ? true : false;
 }
+
+// (#: Start Menu uplift) Persisted to /CONFIG/STARTMENU.PREFS as "key=value"
+// lines (same idiom as ALERTS.CFG/PRIVACY.CFG above), polled live by the
+// compositor's startmenu_prefs_poll() (throttled, same cadence idea as
+// main.c's dock_style_poll) so changes apply without reopening the menu.
+// Favorites/Recents themselves are NOT here: those are compositor-owned state
+// (/CONFIG/STARTMENU.CFG, written on pin/unpin/launch) that this panel never
+// touches, so the two files can never race or clobber each other.
+static int sm_view          = 0;   // 0 = Categories accordion, 1 = All Apps
+static bool sm_show_fav      = true;
+static bool sm_show_recent   = true;
+static int  sm_recent_count  = 5;   // 1-10
+static bool sm_focus_search  = true;
+static int  sm_width         = 300; // 220-420
+static int  sm_icon_size     = 20;  // 14-28
+
+static const char *const SM_VIEW_OPTS[] = { "Categories", "All Apps" };
+#define SM_VIEW_OPTS_COUNT ARRAY_COUNT(SM_VIEW_OPTS)
+
+static void sm_save(void) {
+    char buf[256]; char *p = buf;
+    p = a_putkv(p, "view", sm_view);
+    p = a_putkv(p, "show_fav", sm_show_fav ? 1 : 0);
+    p = a_putkv(p, "show_recent", sm_show_recent ? 1 : 0);
+    p = a_putkv(p, "recent_count", sm_recent_count);
+    p = a_putkv(p, "focus_search", sm_focus_search ? 1 : 0);
+    p = a_putkv(p, "width", sm_width);
+    p = a_putkv(p, "icon_size", sm_icon_size);
+    // #743: was unlink-then-open. See save_failed() above.
+    if (userconf_write_all("/CONFIG/STARTMENU.PREFS", buf, (unsigned long)(p - buf)) != 0)
+        save_failed("STARTMENU.PREFS");
+}
+static void sm_load(void) {
+    int fd = sys_open("/CONFIG/STARTMENU.PREFS", 0);
+    if (fd < 0) return;
+    static char b[256];
+    long n = sys_read(fd, b, sizeof(b) - 1);
+    sys_close(fd);
+    if (n <= 0) return;
+    b[n] = 0;
+    sm_view = a_kv(b, "view", 0);
+    if (sm_view < 0 || sm_view > 1) sm_view = 0;
+    sm_show_fav = a_kv(b, "show_fav", 1) ? true : false;
+    sm_show_recent = a_kv(b, "show_recent", 1) ? true : false;
+    sm_recent_count = a_kv(b, "recent_count", 5);
+    if (sm_recent_count < 1) sm_recent_count = 1;
+    if (sm_recent_count > 10) sm_recent_count = 10;
+    sm_focus_search = a_kv(b, "focus_search", 1) ? true : false;
+    sm_width = a_kv(b, "width", 300);
+    if (sm_width < 220) sm_width = 220;
+    if (sm_width > 420) sm_width = 420;
+    sm_icon_size = a_kv(b, "icon_size", 20);
+    if (sm_icon_size < 14) sm_icon_size = 14;
+    if (sm_icon_size > 28) sm_icon_size = 28;
+}
+static void sm_view_changed(void) { sm_save(); }
 
 // --- Wallpaper preview on a little monitor (macOS-style), top-right of the
 //     Appearance tab. Samples the actual BMP into a small thumbnail (cached). ---
@@ -2039,9 +2485,20 @@ static void wp_save_cache(const char *fn) {
     uint8_t hd[8] = {'W','T','H','1',
                       (uint8_t)(WPT_W & 0xFF), (uint8_t)(WPT_W >> 8),
                       (uint8_t)(WPT_H & 0xFF), (uint8_t)(WPT_H >> 8)};
-    sys_write(fd, hd, 8);
-    sys_write(fd, (uint8_t *)s_wp_thumb, WPT_W * WPT_H * 4);
-    sys_close(fd);
+    // #743: header and pixels are one logical record, so they are written as
+    // one call: two unchecked writes could leave an 8-byte header with no
+    // pixels behind it, which the loader would read as a valid-looking thumb.
+    static uint8_t rec[8 + WPT_W * WPT_H * 4];
+    for (int i = 0; i < 8; i++) rec[i] = hd[i];
+    const uint8_t *px = (const uint8_t *)s_wp_thumb;
+    for (int i = 0; i < WPT_W * WPT_H * 4; i++) rec[8 + i] = px[i];
+    if (userconf_finish_write(fd, rec, sizeof(rec)) != 0) {
+        // A thumbnail is a CACHE: the wallpaper picker regenerates it on the
+        // next open. Deleting the partial file is the right recovery, because a
+        // truncated thumb would be decoded as if it were complete.
+        sys_unlink(path);
+        save_failed("wallpaper thumbnail cache");
+    }
 }
 
 // #517: wallpaper BMP filenames now come from the shared enumeration g_wp[] (see
@@ -2161,8 +2618,31 @@ static void draw_appearance_panel(void) {
     y += 25;
 
     // Scrollable dropdown (scales to many themes), not a row of buttons.
-    draw_dropdown_n(x, y, 220, g_theme_names[current_theme],
-                  g_dd_open && g_dd_sel == &current_theme, NUM_THEMES);
+    draw_dropdown_n(x, y, 220,
+                  (current_theme >= 0 && current_theme < g_th_count) ? g_th_names[current_theme] : "",
+                  g_dd_open && g_dd_sel == &current_theme, g_th_count);
+    // #745: live preview of the highlighted theme, drawn by the SAME shared
+    // primitive the first-boot wizard uses (libc gui_theme_win_preview), so the
+    // two surfaces cannot show two different pictures of one theme. A dropdown
+    // naming a theme told the user nothing about what it looks like; this is
+    // the top-right corner of a real window in that theme, at 1:1, from its own
+    // tokens. It sits between the dropdown (ends x+220) and the wallpaper
+    // column (WP_DD_X 545), and the 1px surround is what keeps a dark theme's
+    // near-black frame from vanishing into the panel.
+    if (current_theme >= 0 && current_theme < g_th_count) {
+        // Sits in the gap between the theme dropdown (ends x+220) and the
+        // wallpaper column (WP_DD_X 545, content-local). 100px is the crop the
+        // largest shipped title-bar metric needs for its four buttons; a first
+        // pass used 112 and the on-device screendump showed it running under
+        // the "Wallpaper" label.
+        int pvx = x + 234, pvy = y - 2, pvw = 100, pvh = 44;
+        // Contract the surround against the panel it is ACTUALLY drawn on.
+        gui_draw_rect_outline(window_handle, pvx - 1, pvy - 1, pvw + 2, pvh + 2,
+                              gui_ensure_contrast(theme_color(THEME_COLOR_WINDOW_BORDER),
+                                                  COL_CONTENT_BG, GUI_FLOOR_NONTEXT));
+        gui_theme_win_preview(window_handle, pvx, pvy, pvw, pvh,
+                              g_th[current_theme].index, COL_CONTENT_BG);
+    }
     y += 50;
 
     // Accent color picker
@@ -2179,13 +2659,13 @@ static void draw_appearance_panel(void) {
     y += 25;
 
     draw_label(x, y, "Font Size");
-    draw_dropdown_n(x + 120, y - 3, 160, FONT_SIZE_OPTS[font_size],
-                  g_dd_open && g_dd_sel == &font_size, 4);
+    draw_dropdown_n(x + 120, y - 3, 160, FONT_SIZE_OPTS[OPT_CLAMP(font_size, FONT_SIZE_OPTS)],
+                  g_dd_open && g_dd_sel == &font_size, FONT_SIZE_OPTS_COUNT);
     y += 40;
 
     draw_label(x, y, "Icon Size");
-    draw_dropdown_n(x + 120, y - 3, 160, ICON_SIZE_OPTS[icon_size],
-                  g_dd_open && g_dd_sel == &icon_size, 3);
+    draw_dropdown_n(x + 120, y - 3, 160, ICON_SIZE_OPTS[OPT_CLAMP(icon_size, ICON_SIZE_OPTS)],
+                  g_dd_open && g_dd_sel == &icon_size, ICON_SIZE_OPTS_COUNT);
     y += 40;
 
     // UI Font (#351). The button shows the live selection and opens the SHARED
@@ -2206,8 +2686,8 @@ static void draw_appearance_panel(void) {
     // Screensaver
     draw_subsection(x, y, "Screensaver");
     y += 25;
-    draw_dropdown_n(x, y, 160, SS_OPTS[screensaver_idx],
-                  g_dd_open && g_dd_sel == &screensaver_idx, 9);
+    draw_dropdown_n(x, y, 160, SS_OPTS[OPT_CLAMP(screensaver_idx, SS_OPTS)],
+                  g_dd_open && g_dd_sel == &screensaver_idx, SS_OPTS_COUNT);
     /* (#115) no Test button when the screensaver is Off (idx 0) */
     if (screensaver_idx != 0)
         draw_button_small(x + 200, y + 1, 90, "Test", false);
@@ -2224,21 +2704,15 @@ static void draw_appearance_panel(void) {
     }
     y += 36;
 
-    // Cursor theme
-    draw_subsection(x, y, "Cursor");
-    y += 25;
-    if (cursor_theme < 0 || cursor_theme > 2) cursor_theme = 0;  // (#116) 3 styles now
-    draw_dropdown_n(x, y, 160, CURSOR_OPTS[cursor_theme],
-                  g_dd_open && g_dd_sel == &cursor_theme, 3);
-    y += 45;
+    // #745: the Cursor picker MOVED to the Mouse panel (draw_mouse_panel).
+    // It is deliberately not duplicated here: one control, one home.
 
-    // #387 Dock style (taskbar / dock layout) picker.
-    draw_subsection(x, y, "Dock Style");
-    y += 25;
-    if (dock_style < 0 || dock_style > 3) dock_style = 0;
-    draw_dropdown_n(x, y, 220, DOCK_OPTS[dock_style],
-                  g_dd_open && g_dd_sel == &dock_style, 4);
-    y += 45;
+    // #745 task #67 "dockpanel": Dock Style and Dock glass opacity MOVED to
+    // the new Settings > Dock panel (draw_dock_panel), which also owns dock
+    // CONTENTS (pinned favourites - previously nowhere in Settings at all,
+    // see that panel's own header comment). Same precedent as the Cursor
+    // picker above: one control, one home. dock_dd_changed()/
+    // dock_opacity_write() are unchanged and are now called from there.
 
     // Wallpaper selection is the dropdown in the right column
     // (draw_wallpaper_picker above); its click handling lives with the
@@ -2350,6 +2824,9 @@ static void draw_display_panel(void) {
         gui_itoa(night_light_strength, buf, sizeof(buf));
         len = my_strlen(buf);
         buf[len++] = '%'; buf[len] = 0;
+        // (#704) INTENTIONALLY NOT themed: warm-amber is the universal Night
+        // Light / Night Shift affordance color across desktop OSes, meant to
+        // read as "warmth" regardless of the active theme.
         draw_slider(x + 120, y, 200, night_light_strength, 100, 0x00FF9933);
         win_draw_text(window_handle, x + 335, y, buf, COL_TEXT_SECONDARY);
         y += 35;
@@ -2380,6 +2857,10 @@ static void draw_display_panel(void) {
     y += 35;
 
     // Gamma controls
+    // (#704) INTENTIONALLY NOT themed: these three fills identify the R/G/B
+    // color channel each slider controls. A theme cannot legitimately
+    // recolor "the red channel slider" to non-red without making the control
+    // unreadable as what it is.
     draw_label(x, y, "Gamma R");
     draw_slider(x + 80, y, 100, gamma_r, 150, 0x00FF4444);
     draw_label(x + 200, y, "G");
@@ -2390,7 +2871,7 @@ static void draw_display_panel(void) {
     // (#382 pass2) Honest: Brightness and Night Light ARE applied live (SYS_SET_
     // DISPLAY_FX). Scale / Color Temp / Gamma have no compositor or GPU LUT hook
     // in this build, so they are shown for reference and are not applied.
-    draw_hint_ic(x, y, "CMINUS", 0x00A0A0A8,
+    draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_MUTED) /* (#704) was hardcoded 0x00A0A0A8 */,
                  "Scale, Color Temp and Gamma are not applied in this build (no LUT hook).");
     y += 20;
 
@@ -2475,14 +2956,14 @@ static void draw_sound_panel(void) {
     // ---- Input (no capture support) ----
     draw_subsection(x, y, "Input");
     y += 25;                                  // 200
-    draw_hint_ic(x, y, "CMINUS", 0x00A0A0A8,
+    draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_MUTED) /* (#704) was hardcoded 0x00A0A0A8 */,
                  "Audio input (microphone capture) is not supported by this build.");
     y += 40;                                  // 240
 
     // ---- Equalizer (no DSP) ----
     draw_subsection(x, y, "Equalizer");
     y += 25;                                  // 265
-    draw_hint_ic(x, y, "CMINUS", 0x00A0A0A8,
+    draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_MUTED) /* (#704) was hardcoded 0x00A0A0A8 */,
                  "No hardware equalizer or audio DSP is available.");
     y += 40;                                  // 305
 
@@ -2496,7 +2977,7 @@ static void draw_sound_panel(void) {
     draw_button(x, y, 130, "Test Speakers", false, false);
     y += 38;                                  // 408
     if (!g_audio_present)
-        draw_hint_ic(x, y, "CMINUS", 0x00A0A0A8, "No audio output device present.");
+        draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_MUTED) /* (#704) was hardcoded 0x00A0A0A8 */, "No audio output device present.");
     else if (sound_test_status == 3)
         draw_hint(x, y, "Playing test sound...");
 }
@@ -2550,7 +3031,7 @@ static void draw_network_panel(void) {
     draw_subsection(x, y, "VPN");
     y += 25;
 
-    draw_hint_ic(x, y, "CMINUS", 0x00A0A0A8,
+    draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_MUTED) /* (#704) was hardcoded 0x00A0A0A8 */,
                  "VPN is not available (no VPN client in this build).");
     y += 30;
 
@@ -2564,10 +3045,10 @@ static void draw_network_panel(void) {
     if (firewall_enabled) {
         const char *pol[] = {"Allow", "Deny"};
         draw_label(x + 20, y + 6, "Default Inbound");
-        draw_option_buttons(x + 170, y, pol, 2, fw_pol_in);
+        draw_option_buttons(x + 170, y, pol, ARRAY_COUNT(pol), fw_pol_in);
         y += 34;
         draw_label(x + 20, y + 6, "Default Outbound");
-        draw_option_buttons(x + 170, y, pol, 2, fw_pol_out);
+        draw_option_buttons(x + 170, y, pol, ARRAY_COUNT(pol), fw_pol_out);
         y += 34;
 
         draw_label(x + 20, y, "Rules");
@@ -2576,7 +3057,12 @@ static void draw_network_panel(void) {
         for (int i = 0; i < fw_rule_count; i++) {
             fw_rule_t *r = &fw_rules[i];
             int rx = x + 20;
-            uint32_t acol = (r->action == 0) ? 0x00207A20 : 0x008A2020;
+            // (#704) ALLOW/DENY/remove badges: were hardcoded dark green
+            // (0x00207A20) / dark red (0x008A2020) literals, now the theme's
+            // success/error tokens. gui_ink_on() still derives readable text
+            // ink from whatever the token resolves to, so contrast holds
+            // across themes.
+            uint32_t acol = (r->action == 0) ? theme_color(THEME_COLOR_SUCCESS) : theme_color(THEME_COLOR_ERROR);
             gui_fill_rounded(window_handle, rx, y, 56, 20, 5, acol);
             gui_text_ttf_centered(window_handle, rx, y, 56, 20, r->action == 0 ? "ALLOW" : "DENY", gui_ink_on(acol), 11);
             gui_fill_rounded(window_handle, rx + 64, y, 44, 20, 5, COL_BUTTON_BG);
@@ -2586,8 +3072,11 @@ static void draw_network_panel(void) {
             char pbuf[8]; gui_itoa(r->port, pbuf, sizeof(pbuf));
             gui_fill_rounded(window_handle, rx + 168, y, 60, 20, 5, COL_INPUT_BG);
             gui_text_ttf_centered(window_handle, rx + 168, y, 60, 20, pbuf, COL_TEXT_PRIMARY, 11);
-            gui_fill_rounded(window_handle, rx + 240, y, 24, 20, 5, 0x008A2020);
-            gui_text_ttf_centered(window_handle, rx + 240, y, 24, 20, "X", gui_ink_on(0x008A2020), 11);
+            {
+                uint32_t rcol = theme_color(THEME_COLOR_ERROR);
+                gui_fill_rounded(window_handle, rx + 240, y, 24, 20, 5, rcol);
+                gui_text_ttf_centered(window_handle, rx + 240, y, 24, 20, "X", gui_ink_on(rcol), 11);
+            }
             y += 26;
         }
         if (fw_rule_count < MAX_FW_RULES)
@@ -2672,7 +3161,7 @@ static void draw_keyboard_panel(void) {
     y += 50;
     // (#382 pass2) Honest: these persist to SETTINGS.CFG but the current build
     // does not apply repeat rate/delay or layout live to the keyboard driver.
-    draw_hint_ic(x, y, "CMINUS", 0x00A0A0A8,
+    draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_MUTED) /* (#704) was hardcoded 0x00A0A0A8 */,
                  "Repeat rate/delay and layout are saved preferences; not yet applied live.");
 }
 
@@ -2680,76 +3169,109 @@ static void draw_keyboard_panel(void) {
 // Panel: Mouse/Touchpad
 // =============================================================================
 
+// #745: ONE source of truth for the Mouse panel's row positions, consumed by
+// BOTH draw_mouse_panel() and the PANEL_MOUSE branch of handle_content_click().
+// Those two used to carry independent arithmetic chains down the same column
+// and had ALREADY drifted before this change: the click handler placed Scroll
+// Speed and Natural Scrolling 20px (25px with trails on) above where the draw
+// pass painted them, leaving a 24px toggle with ~4px of live hit box. Inserting
+// the Cursor row by hand would have widened that silently. A shared geometry
+// pass makes the two structurally unable to disagree.
+#define MG_SUBSECTION 25   /* vertical cost of one draw_subsection() heading */
+typedef struct {
+    int sens, dbl, psize, trails, traillen, cursor, scrollspd, natural, inertia, lefthand;
+} mouse_geom_t;
+static void mouse_geom(mouse_geom_t *m) {
+    int y = PADDING;
+    y += 40;                                  /* section header */
+    y += MG_SUBSECTION;                       /* "Pointer" */
+    m->sens      = y; y += 35;
+    m->dbl       = y; y += 45;
+    m->psize     = y; y += 45;
+    m->trails    = y; y += 35;
+    m->traillen  = pointer_trails ? y : -1;   /* -1 = row not present */
+    if (pointer_trails) y += 40;
+    y += MG_SUBSECTION;                       /* "Cursor" (#745) */
+    m->cursor    = y; y += 45;
+    y += MG_SUBSECTION;                       /* "Scrolling" */
+    m->scrollspd = y; y += 35;
+    m->natural   = y; y += 55;                /* toggle + its hint line */
+    m->inertia   = y; y += 45;
+    y += MG_SUBSECTION;                       /* "Buttons" */
+    m->lefthand  = y;
+}
+
 static void draw_mouse_panel(void) {
     int x = CONTENT_X + PADDING;
-    int y = PADDING;
     char buf[32];
+    mouse_geom_t m; mouse_geom(&m);
 
-    draw_section_header(x, y, "Mouse & Touchpad");
-    y += 40;
+    draw_section_header(x, PADDING, "Mouse & Touchpad");
 
-    // Pointer speed
-    draw_subsection(x, y, "Pointer");
-    y += 25;
+    // Pointer
+    draw_subsection(x, m.sens - MG_SUBSECTION, "Pointer");
 
-    draw_label(x, y, "Mouse Sensitivity");
+    draw_label(x, m.sens, "Mouse Sensitivity");
     gui_itoa(pointer_speed, buf, sizeof(buf));
-    draw_slider(x + 140, y, 250, pointer_speed, 100, COL_SLIDER_FILL);
-    win_draw_text(window_handle, x + 405, y, buf, COL_TEXT_SECONDARY);
-    y += 35;
+    draw_slider(x + 140, m.sens, 250, pointer_speed, 100, COL_SLIDER_FILL);
+    win_draw_text(window_handle, x + 405, m.sens, buf, COL_TEXT_SECONDARY);
 
-    draw_label(x, y, "Double-click Speed");
+    draw_label(x, m.dbl, "Double-click Speed");
     gui_itoa(double_click_speed, buf, sizeof(buf));
-    draw_slider(x + 160, y, 230, double_click_speed, 100, COL_SLIDER_FILL);
-    win_draw_text(window_handle, x + 405, y, buf, COL_TEXT_SECONDARY);
-    y += 45;
+    draw_slider(x + 160, m.dbl, 230, double_click_speed, 100, COL_SLIDER_FILL);
+    win_draw_text(window_handle, x + 405, m.dbl, buf, COL_TEXT_SECONDARY);
 
     // Pointer appearance
-    draw_label(x, y, "Pointer Size");
-    const char* ptr_sizes[] = {"Small", "Normal", "Large", "XL"};
-    draw_option_buttons(x + 140, y - 3, ptr_sizes, 4, pointer_size);
-    y += 45;
+    draw_label(x, m.psize, "Pointer Size");
+    {
+        const char* ptr_sizes[] = {"Small", "Normal", "Large", "XL"};
+        draw_option_buttons(x + 140, m.psize - 3, ptr_sizes, ARRAY_COUNT(ptr_sizes), pointer_size);
+    }
 
-    draw_toggle_labeled(x, y, 300, "Pointer Trails", pointer_trails);
-    y += 35;
+    draw_toggle_labeled(x, m.trails, 300, "Pointer Trails", pointer_trails);
 
-    if (pointer_trails) {
-        draw_label(x + 20, y, "Trail Length");
-        draw_slider(x + 140, y, 150, pointer_trail_length, 10, COL_SLIDER_FILL);
-        y += 40;
+    if (m.traillen >= 0) {
+        draw_label(x + 20, m.traillen, "Trail Length");
+        draw_slider(x + 140, m.traillen, 150, pointer_trail_length, 10, COL_SLIDER_FILL);
+    }
+
+    // Cursor (#745: moved here from Appearance - the pointer's look belongs
+    // with the pointer's behaviour, and it is NOT left behind on Appearance).
+    // Same shared dropdown widget, same label column and same 140px control
+    // offset as the rows above, per docs/UI_STYLE_GUIDE.md.
+    draw_subsection(x, m.cursor - MG_SUBSECTION, "Cursor");
+    draw_label(x, m.cursor + 6, "Cursor Style");
+    {
+        /* read-only clamp: a draw pass must never write app state (#745) */
+        int ci = OPT_CLAMP(cursor_theme, CURSOR_OPTS);
+        draw_dropdown_n(x + 140, m.cursor, 160, CURSOR_OPTS[ci],
+                        g_dd_open && g_dd_sel == &cursor_theme, CURSOR_OPTS_COUNT);
     }
 
     // Scrolling
-    draw_subsection(x, y, "Scrolling");
-    y += 25;
+    draw_subsection(x, m.scrollspd - MG_SUBSECTION, "Scrolling");
 
-    draw_label(x, y, "Scroll Speed");
+    draw_label(x, m.scrollspd, "Scroll Speed");
     gui_itoa(scroll_speed, buf, sizeof(buf));
-    draw_slider(x + 140, y, 200, scroll_speed, 100, COL_SLIDER_FILL);
-    win_draw_text(window_handle, x + 355, y, buf, COL_TEXT_SECONDARY);
-    y += 35;
+    draw_slider(x + 140, m.scrollspd, 200, scroll_speed, 100, COL_SLIDER_FILL);
+    win_draw_text(window_handle, x + 355, m.scrollspd, buf, COL_TEXT_SECONDARY);
 
-    draw_toggle_labeled(x, y, 300, "Natural Scrolling", natural_scrolling);
-    y += 10;
-    draw_hint(x, y + 20, "Content moves in the direction of your fingers");
-    y += 45;
+    draw_toggle_labeled(x, m.natural, 300, "Natural Scrolling", natural_scrolling);
+    draw_hint(x, m.natural + 30, "Content moves in the direction of your fingers");
 
-    draw_toggle_labeled(x, y, 300, "Scroll Inertia", scroll_inertia);
-    y += 45;
+    draw_toggle_labeled(x, m.inertia, 300, "Scroll Inertia", scroll_inertia);
 
     // Button configuration
-    draw_subsection(x, y, "Buttons");
-    y += 25;
-
-    draw_toggle_labeled(x, y, 300, "Left-handed Mode", left_handed);
-    y += 10;
-    draw_hint(x, y + 20, "Swap primary and secondary mouse buttons");
-    y += 45;
+    draw_subsection(x, m.lefthand - MG_SUBSECTION, "Buttons");
+    draw_toggle_labeled(x, m.lefthand, 300, "Left-handed Mode", left_handed);
+    draw_hint(x, m.lefthand + 30, "Swap primary and secondary mouse buttons");
     // Honest: Mouse Sensitivity IS applied live (set_mouse_speed) and persisted
-    // to UIPROFIL by the compositor. The other controls persist to SETTINGS.CFG
-    // but have no live driver effect yet.
-    draw_hint_ic(x, y, "CMINUS", 0x00A0A0A8,
-                 "Saved preferences; Mouse Sensitivity is applied live and persists across reboots.");
+    // to UIPROFIL by the compositor. Cursor Style is applied live via
+    // set_cursor() and persisted by the compositor to UIPROFIL.YML's curstyle.
+    // The other controls persist to SETTINGS.CFG but have no live driver
+    // effect yet.
+    draw_hint_ic(x, m.lefthand + 55, "CMINUS", theme_color(THEME_COLOR_MUTED) /* (#704) was hardcoded 0x00A0A0A8 */,
+                 "Saved preferences; Mouse Sensitivity and Cursor Style apply live and persist across reboots.");
 }
 
 // =============================================================================
@@ -2766,16 +3288,16 @@ static void draw_datetime_panel(void) {
     // Current time display (large)
     draw_card(x, y, CONTENT_WIDTH - 2 * PADDING, 100);
 
-    // Read real time and date from RTC
-    int rtc_hour = 0, rtc_min = 0, rtc_sec = 0;
-    int rtc_day = 1, rtc_month = 1, rtc_year = 2026;
-    get_rtc_time(&rtc_hour, &rtc_min, &rtc_sec);
-    get_rtc_date(&rtc_day, &rtc_month, &rtc_year);
-
-    // Apply timezone offset for display
-    int total_m = rtc_hour * 60 + rtc_min + timezone_offset_minutes;
-    int display_h = ((total_m / 60) % 24 + 24) % 24;
-    int display_m = ((total_m % 60) + 60) % 60;
+    // #49: the shared local-clock helper, so this panel and the taskbar cannot
+    // disagree. It also rolls the DATE across the offset, which the old private
+    // arithmetic here did not: at 08:00 UTC on the 1st, an Auckland user was
+    // shown 20:00 on the 1st instead of 20:00 on the 2nd.
+    tz_time_t lt;
+    tz_local_now(&lt);
+    int rtc_sec = lt.sec;
+    int rtc_day = lt.day, rtc_month = lt.month, rtc_year = lt.year;
+    int display_h = lt.hour;
+    int display_m = lt.min;
 
     // Format HH:MM:SS
     char time_str[12];
@@ -2827,9 +3349,9 @@ static void draw_datetime_panel(void) {
     y += 30;
     // NTP status feedback
     if (ntp_status == 1)
-        draw_hint_ic(x + 20, y + 20, "CCHECK", 0x0044B860, "Time synchronized successfully.");
+        draw_hint_ic(x + 20, y + 20, "CCHECK", theme_color(THEME_COLOR_SUCCESS), "Time synchronized successfully.");
     else if (ntp_status == -1)
-        win_draw_text(window_handle, x + 20, y + 20, "NTP sync failed (no network?).", 0x00CC3333);
+        win_draw_text(window_handle, x + 20, y + 20, "NTP sync failed (no network?).", theme_color(THEME_COLOR_ERROR));
     y += 20;
 
     // Time format
@@ -2840,21 +3362,21 @@ static void draw_datetime_panel(void) {
     draw_subsection(x, y, "Time Zone");
     y += 25;
 
-    draw_dropdown(x, y, 350, timezones[timezone_idx], false);
+    draw_dropdown(x, y, 350, tz_label(timezone_idx), false);
     y += 50;
 
     // Date format
     draw_subsection(x, y, "Date Format");
     y += 25;
 
-    draw_dropdown(x, y, 160, DATE_FMT_OPTS[date_format],
+    draw_dropdown(x, y, 160, DATE_FMT_OPTS[OPT_CLAMP(date_format, DATE_FMT_OPTS)],
                   g_dd_open && g_dd_sel == &date_format);
     y += 45;
 
     // First day of week
     draw_label(x, y, "Week starts on");
     const char* week_days[] = {"Sunday", "Monday"};
-    draw_option_buttons(x + 140, y - 3, week_days, 2, first_day_of_week);
+    draw_option_buttons(x + 140, y - 3, week_days, ARRAY_COUNT(week_days), first_day_of_week);
     y += 50;
 
     // Manual time setting button
@@ -2867,6 +3389,34 @@ static void draw_datetime_panel(void) {
 // Panel: Users & Accounts
 // =============================================================================
 
+// (#745) Antialiased avatar badge - the design doc's fix for two separate
+// bugs at once: the swatch was a hard-edged SQUARE (a third, inconsistent
+// avatar treatment alongside the login screen's circle and the kernel/lock
+// screens' none-at-all), and the initial letter was drawn in a FIXED
+// COL_TEXT_PRIMARY straight on top of whichever saturated identity color the
+// account got - measured against the dark theme, 4 of the 8 palette colors
+// fail 4.5:1 outright (design doc section 9). Both fixed by construction
+// here: `bg` is the REAL surface this badge is composited over (the card),
+// and `ink` (ring + letter) is derived from it via gui_ensure_contrast(),
+// which is guaranteed to clear the floor rather than merely observed to on
+// the colors someone happened to check by eye.
+//
+// The app toolkit (gui_style.h) has no dedicated AA ring primitive; this
+// reuses the "bigger AA circle behind, smaller AA circle on top" technique
+// already shipping in setup/main.rs's radio buttons and install/main.c's
+// completion dots (grep gui_fill_circle_aa) rather than adding a new one.
+static void draw_avatar_badge(int x, int y, int d, uint32_t fill, uint32_t bg, char letter_ch) {
+    uint32_t ink = gui_ensure_contrast(gui_ink_on(bg), bg, GUI_FLOOR_TEXT);
+    int ring_w = (d >= 48) ? 2 : 1;
+    gui_fill_circle_aa(window_handle, x - ring_w, y - ring_w, d + ring_w * 2, ink, bg);
+    gui_fill_circle_aa(window_handle, x, y, d, fill, ink);
+
+    char letter[2] = { letter_ch, 0 };
+    if (letter[0] >= 'a' && letter[0] <= 'z') letter[0] -= 32;
+    int fs = (d >= 48) ? 22 : 13;
+    gui_text_ttf_centered(window_handle, x, y, d, d, letter, ink, fs);
+}
+
 static void draw_users_panel(void) {
     int x = CONTENT_X + PADDING;
     int y = PADDING;
@@ -2878,9 +3428,8 @@ static void draw_users_panel(void) {
     draw_card(x, y, CONTENT_WIDTH - 2 * PADDING, 100);
 
     // Avatar
-    win_draw_rect(window_handle, x + 15, y + 20, 60, 60, users[current_user_idx].avatar_color);
-    char initial[2] = {users[current_user_idx].fullname[0], 0};
-    win_draw_text(window_handle, x + 37, y + 40, initial, COL_TEXT_PRIMARY);
+    draw_avatar_badge(x + 15, y + 20, 60, users[current_user_idx].avatar_color,
+                      COL_CARD_BG, users[current_user_idx].fullname[0]);
 
     // User info
     win_draw_text(window_handle, x + 90, y + 20, users[current_user_idx].fullname, COL_TEXT_PRIMARY);
@@ -2900,9 +3449,28 @@ static void draw_users_panel(void) {
     draw_subsection(x, y, "Account Settings");
     y += 25;
 
-    draw_toggle_labeled(x, y, 300, "Auto-login on startup", auto_login);
+    // (#566) Real per-account autologin, mirrored from the kernel
+    // (sys_get_autologin()) - not a per-launch cosmetic bool. Toggling opens a
+    // password-confirm modal for a non-root session (see autologin_request());
+    // root can toggle any account's without one (kernel ABI: "Root sets for
+    // anyone").
+    {
+        int is_al_cur = (autologin_user[0] &&
+                         strcmp(autologin_user, users[current_user_idx].username) == 0);
+        char al_label[80];
+        {
+            const char *pre = "Automatically log in as ";
+            const char *u = users[current_user_idx].username;
+            int k = 0;
+            while (pre[k] && k < (int)sizeof(al_label) - 1) { al_label[k] = pre[k]; k++; }
+            int j = 0;
+            while (u[j] && k < (int)sizeof(al_label) - 1) { al_label[k++] = u[j++]; }
+            al_label[k] = '\0';
+        }
+        draw_toggle_labeled(x, y, 340, al_label, is_al_cur);
+    }
     y += 10;
-    draw_hint(x, y + 20, "Skip the login screen at boot");
+    draw_hint(x, y + 20, "Skips the login screen at boot for this account only.");
     y += 45;
 
     draw_button(x, y, 160, "Change Password", false, false);
@@ -2919,12 +3487,19 @@ static void draw_users_panel(void) {
         draw_card(x, y, CONTENT_WIDTH - 2 * PADDING, 50);
 
         // Avatar
-        win_draw_rect(window_handle, x + 15, y + 10, 30, 30, users[i].avatar_color);
-        char init[2] = {users[i].fullname[0], 0};
-        win_draw_text(window_handle, x + 25, y + 17, init, COL_TEXT_PRIMARY);
+        draw_avatar_badge(x + 15, y + 10, 30, users[i].avatar_color,
+                          COL_CARD_BG, users[i].fullname[0]);
 
         win_draw_text(window_handle, x + 60, y + 10, users[i].fullname, COL_TEXT_PRIMARY);
         win_draw_text(window_handle, x + 60, y + 28, roles[users[i].role], COL_TEXT_SECONDARY);
+
+        // (#566) Only root can set autologin for an account that is not its
+        // own, per the kernel ABI - so this control only appears for a root
+        // Settings session.
+        if (settings_is_root()) {
+            int is_al = (autologin_user[0] && strcmp(autologin_user, users[i].username) == 0);
+            draw_button_small(x + 290, y + 13, 100, is_al ? "Auto-login: ON" : "Auto-login", is_al);
+        }
 
         draw_button_small(x + 400, y + 13, 80, "Remove", false);
 
@@ -2971,7 +3546,10 @@ static void draw_privacy_panel(void) {
         y += 40;
 
         draw_toggle_labeled(x + 20, y, 280, "Require password on wake", require_password_wake);
-        y += 40;
+        y += 10;
+        draw_hint(x + 20, y + 20, "(#566) MayteraOS's lock always requires a password to "
+                                   "unlock; this toggle has no bypass to disable.");
+        y += 30;
     }
 
     // Privacy. These persist to /CONFIG/PRIVACY.CFG (real stored settings); the
@@ -2996,7 +3574,7 @@ static void draw_privacy_panel(void) {
     // so instead of a fabricated allow/deny matrix we state that honestly.
     draw_subsection(x, y, "App Permissions");
     y += 25;
-    draw_hint_ic(x, y, "CMINUS", 0x00A0A0A8,
+    draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_MUTED) /* (#704) was hardcoded 0x00A0A0A8 */,
                  "Per-app permission enforcement is not implemented in this build.");
     y += 18;
     draw_hint(x, y, "All apps run with the user's full rights (capability tokens are planned).");
@@ -3197,6 +3775,155 @@ static void draw_defaults_panel(void) {
 // any theme. Replaces the old "M/OS" placeholder box.
 static unsigned char s_logo[80 * 80 * 4];
 static int s_logo_w = 0, s_logo_h = 0, s_logo_state = -1; // -1 untried, 0 fail, 1 ok
+// =============================================================================
+// Credits (#745, local queue item 71)
+// =============================================================================
+// WHY THIS EXISTS. TinyGL's licence (userland/libgl/src/LICENSE) is a MODIFIED
+// zlib licence. Clause 1 reads "If you use this software in a product, an
+// acknowledgment in the product and its documentation *is* required" (upstream's
+// own emphasis), where stock zlib says "would be appreciated but is not
+// required". ATTRIBUTION.md satisfies the documentation half; this screen is the
+// product half. The CC BY 4.0 icon sets (CoreUI Icons Free, Boxicons) and the
+// CC BY SVG Repo icons create the same in-product attribution obligation, which
+// a file in the source tree does not discharge for a user who only ever runs
+// the binary.
+//
+// THE LIST IS NOT IN THIS FILE, ON PURPOSE. It is read from /CONFIG/CREDITS.DAT,
+// which build/build-golden.sh generates from ATTRIBUTION.md on every build via
+// tools/attribution/gen-credits.py. A credits list typed into an app would be a
+// second source of truth for what we ship, and a divergent second copy is this
+// project's most repeated failure (two g_wallpapers[] arrays, two Task Managers,
+// two Settings implementations). This app parses nothing but "<style>|<text>":
+// adding a component to ATTRIBUTION.md needs no change here and no rebuild of
+// this binary.
+#define CREDITS_PATH    "/CONFIG/CREDITS.DAT"
+#define CREDITS_BUF     12288
+#define CREDITS_MAXLN   400
+#define CREDITS_LINE_H  18
+
+// y of the About panel's button row, PUBLISHED BY THE DRAW and read by the
+// hit-test (#745, local queue item 71).
+//
+// THE BUG THIS ENDS. handle_content_click() computed the row as
+// "base_y + 40 + 115 + 155 + 25 + 25 + 35", a hand-added chain of the panel's
+// section heights. draw_about_panel() then grew a Features block of eight text
+// lines (7 x 18px + 35px), which moved the real buttons 126px down and left the
+// chain untouched. Measured on a booted VM at build 1867: the buttons draw at
+// y=541 and the hit-test accepted only y=415..445, so Check Updates, Export
+// Debug and Credits were all DEAD, by mouse and by keyboard alike. Nothing
+// reported it because a button that does nothing looks exactly like a button
+// nobody pressed.
+//
+// Correcting the literal would only reset the clock: the next line added to
+// Features breaks it again, silently, in the same way. So the draw now records
+// where it actually put the row and the hit-test reads that, which is the same
+// discipline modal_dh()/modal_dw() and sidebar_row_y() already use. 0 means
+// "this panel has not been drawn yet", and the hit-test then matches nothing.
+static int   g_about_btn_y = 0;
+
+static char  credits_buf[CREDITS_BUF];
+static char *credits_text[CREDITS_MAXLN];
+static char  credits_style[CREDITS_MAXLN];
+static int   credits_n = 0;
+static int   credits_loaded = 0;
+static int   credits_truncated = 0;
+static gui_scroll_t g_credits_scroll;   // shared primitive; see gui_scroll.h
+
+// The ONLY hardcoded acknowledgment in this file, and why it is allowed to be
+// here: if /CONFIG/CREDITS.DAT is missing (an image assembled without the
+// generator, or an older image), a Credits screen showing nothing would fail
+// the very obligation it was built to meet. gen-credits.py refuses to generate
+// output that has no TinyGL entry, so the generated list and this fallback
+// cannot disagree about whether TinyGL ships. Everything else is deliberately
+// absent from the fallback rather than half-copied.
+static const char *const CREDITS_FALLBACK[] = {
+    "T|MayteraOS",
+    "B|Attribution data was not installed on this image",
+    "B|(/CONFIG/CREDITS.DAT is missing). The full text is",
+    "B|ATTRIBUTION.md in the MayteraOS source distribution.",
+    "R|",
+    "N|TinyGL",
+    "L|zlib-style licence, in-product acknowledgment required",
+    "D|(C) 1997-2021 Fabrice Bellard, Gek (DMHSW), C-Chads",
+};
+
+// Register one display record. A line this does not understand is IGNORED
+// rather than guessed at: a malformed record must not be able to render as a
+// component with the wrong licence next to it.
+static void credits_add(char *line) {
+    if (credits_n >= CREDITS_MAXLN) { credits_truncated = 1; return; }
+    if (!line[0] || line[0] == '#') return;
+    if (line[1] != '|') return;
+    credits_style[credits_n] = line[0];
+    credits_text[credits_n]  = line + 2;
+    credits_n++;
+}
+
+static void credits_load(void) {
+    if (credits_loaded) return;
+    credits_loaded = 1;
+    credits_n = 0;
+    credits_truncated = 0;
+
+    long total = 0;
+    int fd = sys_open(CREDITS_PATH, 0);
+    if (fd >= 0) {
+        long n;
+        // Loop rather than assume one read returns the file: this is a plain
+        // file read, not a wait, so there is no wait-queue question here.
+        while (total < (long)sizeof(credits_buf) - 1 &&
+               (n = sys_read(fd, credits_buf + total,
+                             (long)sizeof(credits_buf) - 1 - total)) > 0)
+            total += n;
+        sys_close(fd);
+        if (total >= (long)sizeof(credits_buf) - 1) credits_truncated = 1;
+    }
+    if (total <= 0) {
+        // Same buffer, same splitter, one code path. Copying the fallback in
+        // rather than pointing at the const strings keeps credits_text[]
+        // uniformly owned by credits_buf.
+        for (unsigned i = 0; i < ARRAY_COUNT(CREDITS_FALLBACK); i++) {
+            const char *q = CREDITS_FALLBACK[i];
+            while (*q && total < (long)sizeof(credits_buf) - 2)
+                credits_buf[total++] = *q++;
+            credits_buf[total++] = '\n';
+        }
+    }
+    credits_buf[total] = 0;
+
+    char *q = credits_buf;
+    while (*q) {
+        char *e = q;
+        while (*e && *e != '\n') e++;
+        int last = (*e == 0);
+        *e = 0;
+        credits_add(q);
+        if (last) break;
+        q = e + 1;
+    }
+}
+
+// Every ink drawn on the About/Credits surface is floored through the SHARED
+// gui_ensure_contrast(), instead of being trusted to pass. The screen this
+// replaces is exactly why: it drew its heading in COL_ACCENT and two of its
+// five lines in COL_TEXT_SECONDARY / COL_TEXT_DISABLED, which against
+// COL_CONTENT_BG on retro_unix (THEME.CFG active=retro_unix, the theme the
+// machine ships on) measure 1.42:1 and 1.90:1. Flooring here rather than
+// picking per-theme literals means a theme added later cannot reintroduce the
+// same defect: it is a property of the code, not of a review.
+//
+// THE FLOOR IS 5:1, NOT THE 4.5:1 MINIMUM. gui_ensure_contrast() walks toward
+// black or white in 8/255 steps and returns the FIRST step that clears, so a
+// floor of 450 lands at 4.50 to 4.74:1 on every theme: a pass with no headroom,
+// the state blame.md warns about. 500 costs one or two extra mix steps, moves
+// the theme's hue no further than that, and leaves real margin. Measure any
+// change to this number with tools/attribution/credits-contrast.sh, which reads
+// the constant out of this very line so the two cannot drift apart.
+#define CREDITS_CONTRAST_X100 500
+static uint32_t credits_ink(uint32_t want) {
+    return gui_ensure_contrast(want, COL_CONTENT_BG, CREDITS_CONTRAST_X100);
+}
+
 static int draw_about_logo(int dx, int dy_card_top, int card_h) {
     if (s_logo_state < 0) {
         s_logo_state = 0;
@@ -3258,6 +3985,479 @@ static void draw_notifications_panel(void) {
     draw_hint_ic(x, y, alerts_dnd ? "CMINUS" : "INFO", COL_TEXT_SECONDARY,
                  alerts_dnd ? "Do Not Disturb: toasts hidden, still logged in the bell"
                             : "Toasts slide in top-right, stack, and auto-dismiss");
+}
+
+// (#: Start Menu uplift) Layout, Favorites/Recent visibility, search-focus,
+// menu width and item icon size. Favorites/Recents CONTENT is managed from the
+// Start Menu itself (right-click an item -> Pin/Unpin, or launch it to grow
+// Recents) - this panel only controls whether those sections show and how
+// many recents to keep, never the app.
+static void draw_startmenu_panel(void) {
+    int x = CONTENT_X + PADDING;
+    int y = PADDING;
+    char buf[16];
+
+    draw_section_header(x, y, "Start Menu"); y += 40;
+
+    draw_label(x, y, "Layout");
+    draw_dropdown_n(x + 120, y - 3, 160, SM_VIEW_OPTS[OPT_CLAMP(sm_view, SM_VIEW_OPTS)],
+                     g_dd_open && g_dd_sel == &sm_view, 2);
+    y += 40;
+
+    draw_toggle_labeled(x, y, 220, "Show Favorites section", sm_show_fav); y += 40;
+    draw_toggle_labeled(x, y, 220, "Show Recent section", sm_show_recent); y += 40;
+
+    draw_label(x, y, "Recent items to show");
+    gui_itoa(sm_recent_count, buf, sizeof(buf));
+    draw_slider(x + 180, y, 160, sm_recent_count - 1, 9, COL_ACCENT);
+    win_draw_text(window_handle, x + 350, y, buf, COL_TEXT_SECONDARY);
+    y += 40;
+
+    draw_toggle_labeled(x, y, 260, "Focus search box when menu opens", sm_focus_search); y += 40;
+
+    draw_label(x, y, "Menu width");
+    gui_itoa(sm_width, buf, sizeof(buf));
+    draw_slider(x + 180, y, 160, sm_width - 220, 200, COL_ACCENT);
+    win_draw_text(window_handle, x + 350, y, buf, COL_TEXT_SECONDARY);
+    y += 40;
+
+    draw_label(x, y, "Item icon size");
+    gui_itoa(sm_icon_size, buf, sizeof(buf));
+    draw_slider(x + 180, y, 160, sm_icon_size - 14, 14, COL_ACCENT);
+    win_draw_text(window_handle, x + 350, y, buf, COL_TEXT_SECONDARY);
+    y += 44;
+
+    draw_hint_ic(x, y, "INFO", COL_TEXT_SECONDARY,
+                 "Favorites are also the dock's pinned apps; manage them from the Start "
+                 "Menu itself (right-click an item to Pin/Unpin) or from Settings > Dock. "
+                 "Recent items track automatically as you launch apps. A Grid layout and "
+                 "a custom menu screen position are not implemented yet.");
+}
+
+// =============================================================================
+// Panel: Dock (#745 task #67 "dockpanel")
+// =============================================================================
+//
+// USER-REPORTED GAP THIS PANEL CLOSES: the first-boot wizard offers a dock
+// style, but writes it into UIPROFIL.YML via the compositor (see below) and
+// has a Skip button - a user who skips, or who picks one style then later
+// changes their mind, previously had NO WAY BACK: nothing in Settings could
+// touch dock style, opacity, or WHICH apps are pinned. This panel is that
+// way back, covering both BEHAVIOUR (style, opacity - moved here from
+// Appearance, see its own "#745 task #67" comment) and CONTENTS (pinned
+// favourites: view, add, remove).
+//
+// ONE WRITER FOR THE FAVOURITES LIST. startmenu.c (compositor) owns
+// /CONFIG/STARTMENU.CFG and is the ONLY thing that ever writes it
+// (sm_save_state()); the dock's own right-click Pin/Unpin (#44) and the
+// wizard's apps page both drive that SAME writer, one straight (same
+// process, direct call), one through a channel (FAVCH.CFG, #745 task #63/
+// P1). Settings is a SEPARATE PROCESS and cannot call sm_save_state()
+// directly, so this panel is a THIRD caller of the SAME FAVCH.CFG channel,
+// never a second writer of STARTMENU.CFG. Read side: this panel parses
+// STARTMENU.CFG's "FAV|<path>" lines directly (read-only) to display what
+// is actually pinned, the same file format sm_save_state() writes, never a
+// second on-disk copy of the list.
+//
+// FAVCH.CFG WAS ADD-ONLY BEFORE THIS CHANGE (dockfav channel, startmenu.c
+// sm_load_favs_channel()): a line was "pin this path if not already
+// pinned", by design (see its own header comment - toggle semantics would
+// have unpinned an app the user pinned by hand before the wizard ran). A
+// Settings panel needs REMOVE too, so sm_load_favs_channel() gained a
+// leading '-' prefix meaning "unpin this path if currently pinned" (a
+// no-op otherwise, never a toggle here either - this panel already knows
+// whether a row is pinned before it offers a Remove button on it). See
+// startmenu.c for the exact diff; reported to the compositor owner rather
+// than folded into their concurrent main.c work, per this ticket's scope.
+//
+// CONTENTS CATALOG: "which apps could I pin" is read from the SAME
+// data-driven source the compositor itself merges into the Start Menu -
+// build/assets/startmenu/system.d/*.MENU fragments, shipped at
+// /CONFIG/STARTMENU/SYSTEM.D/*.MENU (or /ext2/... on the ext2-root golden),
+// PLUS the session user's own <home>/CONFIG/STARTMENU/*.MENU (App Store
+// installs, startmenu_reg.c). This is a THIRD reader of that data, never a
+// hand-maintained duplicate app list: a golden that ships without one of
+// these apps, or that gains a new one via the App Store, is reflected here
+// with no code change, the same defensive shape sm_seed_default_favorites()
+// already uses against a missing shipped app.
+//
+// A CONTROL THAT DOES NOTHING IS WORSE THAN NO CONTROL. Reordering pinned
+// items (drag-to-reorder) is NOT offered here: startmenu.c's favourites
+// list has no reorder primitive (FAVCH.CFG only adds/removes by path, and
+// the dock always renders g_fav_paths in array order), so a drag handle
+// would be pure decoration. Renaming a pinned item's dock label is not
+// offered either: the dock draws whatever name resolves from
+// g_menu_items/g_menu_items-equivalent lookup, not a per-favourite label,
+// so a rename control here would have nothing to write.
+
+// Must equal startmenu.c's MAX_FAVORITES. Settings cannot #include
+// compositor.h (its unguarded `typedef int bool` collides with
+// libc/types.h, see gui_dock.h's own comment on the same class of problem),
+// so this is a matching literal, not a shared constant - same tradeoff
+// gui_dock.h documents for GUI_DOCK_COUNT, without that file's build-time
+// gate (out of scope to add one for a single int here; if this ever drifts
+// the failure mode is cosmetic - a few pinned apps invisible in this list -
+// not a crash, unlike the PANEL_EXTSVC-class array-length bugs above).
+#define DOCKFAV_MAX 12
+
+// ---- Contents: catalog of pinnable apps, read from the *.MENU fragments ----
+#define DOCKFAV_CATALOG_MAX 80
+typedef struct { char name[40]; char path[128]; } dockfav_cat_t;
+static dockfav_cat_t g_dockfav_catalog[DOCKFAV_CATALOG_MAX];
+static int g_dockfav_catalog_n = 0;
+
+static void dockfav_catalog_add(const char *name, const char *path) {
+    for (int i = 0; i < g_dockfav_catalog_n; i++)
+        if (!strcmp(g_dockfav_catalog[i].path, path)) return;   // de-dup by path
+    if (g_dockfav_catalog_n >= DOCKFAV_CATALOG_MAX) return;      // silently drop past the cap
+    copy_str(g_dockfav_catalog[g_dockfav_catalog_n].name, name, sizeof(g_dockfav_catalog[0].name));
+    copy_str(g_dockfav_catalog[g_dockfav_catalog_n].path, path, sizeof(g_dockfav_catalog[0].path));
+    g_dockfav_catalog_n++;
+}
+
+// Parse one *.MENU fragment's text (already read into a NUL-terminated
+// buffer) for "item: <name> | <path> | icon=... [| type=...]" lines. Ignores
+// "category:" headers, blank lines and "#" comments - the same grammar
+// startmenu_model.rs documents, read only for the two fields this panel
+// needs. A leading/trailing space around a field is trimmed; a malformed
+// line (no '|') is skipped, not fatal.
+static void dockfav_parse_menu_text(char *text) {
+    char *p = text;
+    while (*p) {
+        char *line = p;
+        while (*p && *p != '\n') p++;
+        if (*p) { *p = 0; p++; }
+        char *t = line;
+        while (*t == ' ' || *t == '\t') t++;
+        if (t[0] == 0 || t[0] == '#') continue;
+        if (t[0] != 'i' || strncmp(t, "item:", 5) != 0) continue;
+
+        char *f1 = t + 5;
+        char *bar1 = strchr(f1, '|');
+        if (!bar1) continue;
+        *bar1 = 0;
+        char *f2 = bar1 + 1;
+        char *bar2 = strchr(f2, '|');
+        if (bar2) *bar2 = 0;   // drop icon=/type= fields, not needed here
+
+        // Trim both fields in place.
+        char *ne = f1 + strlen(f1); while (ne > f1 && (ne[-1] == ' ' || ne[-1] == '\t')) *--ne = 0;
+        while (*f1 == ' ' || *f1 == '\t') f1++;
+        char *pe = f2 + strlen(f2); while (pe > f2 && (pe[-1] == ' ' || pe[-1] == '\t')) *--pe = 0;
+        while (*f2 == ' ' || *f2 == '\t') f2++;
+
+        if (f1[0] && f2[0]) dockfav_catalog_add(f1, f2);
+    }
+}
+
+// Read every *.MENU file directly inside `dir` (non-recursive, same
+// dir_size_bytes()-style readdir loop already used elsewhere in this file)
+// and feed it to the parser above. Suffix match is case-insensitive: the
+// repo source is lowercase ("00-internet.MENU"); FAT upper-cases on write,
+// ext2 preserves exactly what shipped.
+static void dockfav_feed_dir(const char *dir) {
+    dirent_t e;
+    for (int i = 0; i < 64; i++) {
+        if (sys_readdir(dir, i, &e) != 0) break;
+        if (DIRENT_IS_DIR(e)) continue;
+        int L = 0; while (e.name[L]) L++;
+        if (L < 6) continue;
+        const char *s = e.name + L - 5;
+        int ok = (s[0] == '.') &&
+                 (s[1] == 'M' || s[1] == 'm') && (s[2] == 'E' || s[2] == 'e') &&
+                 (s[3] == 'N' || s[3] == 'n') && (s[4] == 'U' || s[4] == 'u');
+        if (!ok) continue;
+
+        char full[300]; int k = 0;
+        for (int j = 0; dir[j] && k < 255; j++) full[k++] = dir[j];
+        if (k && full[k-1] != '/') full[k++] = '/';
+        for (int j = 0; e.name[j] && k < 299; j++) full[k++] = e.name[j];
+        full[k] = 0;
+
+        int fd = sys_open(full, 0);
+        if (fd < 0) continue;
+        static char text[8192];
+        long n = sys_read(fd, text, sizeof(text) - 1);
+        sys_close(fd);
+        if (n <= 0) continue;
+        text[n] = 0;
+        dockfav_parse_menu_text(text);
+    }
+}
+
+// Same three directories startmenu.c's sm_feed_system_layer()/
+// sm_feed_user_layer() read, in the same order: the all-users system layer
+// (build-time + App-Store-at-install-time), then the session user's own
+// per-user layer (an unprivileged App Store install), so a self-installed
+// app is offered for pinning exactly like a built-in one.
+static void dockfav_catalog_build(void) {
+    g_dockfav_catalog_n = 0;
+    dockfav_feed_dir("/CONFIG/STARTMENU/SYSTEM.D");
+    dockfav_feed_dir("/ext2/CONFIG/STARTMENU/SYSTEM.D");
+    {
+        char hdir[192];
+        if (userhome_path("CONFIG", "STARTMENU", hdir, sizeof(hdir)) == 0)
+            dockfav_feed_dir(hdir);
+    }
+}
+
+// ---- Contents: currently-pinned favourites, read-only mirror of STARTMENU.CFG ----
+static char g_dockfav_pinned[DOCKFAV_MAX][128];
+static int  g_dockfav_pinned_n = 0;
+static int  g_dockfav_cached = 0;
+
+static void dockfav_refresh_pinned(void) {
+    g_dockfav_pinned_n = 0;
+    int fd = sys_open("/CONFIG/STARTMENU.CFG", 0);
+    if (fd >= 0) {
+        static char buf[4096];
+        long n = sys_read(fd, buf, sizeof(buf) - 1);
+        sys_close(fd);
+        if (n > 0) {
+            buf[n] = 0;
+            char *p = buf;
+            while (*p && g_dockfav_pinned_n < DOCKFAV_MAX) {
+                char *line = p;
+                while (*p && *p != '\n') p++;
+                if (*p) { *p = 0; p++; }
+                if (strncmp(line, "FAV|", 4) == 0) {
+                    copy_str(g_dockfav_pinned[g_dockfav_pinned_n], line + 4, sizeof(g_dockfav_pinned[0]));
+                    g_dockfav_pinned_n++;
+                }
+            }
+        }
+    }
+    // #63: an absent STARTMENU.CFG (never configured) and a present-but-empty
+    // one (deliberately unpinned everything) both read as g_dockfav_pinned_n
+    // == 0 here, which is CORRECT for display purposes - this panel only
+    // ever shows what is actually pinned, right now, and never re-seeds
+    // defaults itself (that stays sm_seed_default_favorites()'s job, in the
+    // one process that owns the write). Nothing here decides "should
+    // defaults exist"; it only ever reflects reality.
+    g_dockfav_cached = 1;
+}
+
+static void dockfav_invalidate_cache(void) { g_dockfav_cached = 0; }
+
+static int dockfav_is_pinned(const char *path) {
+    for (int i = 0; i < g_dockfav_pinned_n; i++)
+        if (!strcmp(g_dockfav_pinned[i], path)) return 1;
+    return 0;
+}
+
+// Display name for a pinned path: looked up in the catalog; a path that
+// resolves to no known catalog entry (a renamed/removed app - the dock
+// itself would also silently skip such a favourite, see startmenu.c's own
+// comment on that) falls back to showing the raw path so the row is never
+// blank.
+static const char *dockfav_name_for_path(const char *path) {
+    for (int i = 0; i < g_dockfav_catalog_n; i++)
+        if (!strcmp(g_dockfav_catalog[i].path, path)) return g_dockfav_catalog[i].name;
+    return path;
+}
+
+// ---- Contents: "Add to dock" candidates = catalog minus already-pinned ----
+static char g_dockfav_cand_name[DOCKFAV_CATALOG_MAX][40];
+static char g_dockfav_cand_path[DOCKFAV_CATALOG_MAX][128];
+static int  g_dockfav_cand_n = 0;
+// index 0 is always the sentinel "Choose an app..."; indices 1..n map to
+// g_dockfav_cand_name/path[i-1]. A stateless action list, not a persisted
+// selection - every successful add resets this back to 0.
+static int  g_dockfav_add_sel = 0;
+static const char *g_dockfav_dd_items[DOCKFAV_CATALOG_MAX + 1];
+
+static void dockfav_rebuild_candidates(void) {
+    g_dockfav_cand_n = 0;
+    for (int i = 0; i < g_dockfav_catalog_n; i++) {
+        if (dockfav_is_pinned(g_dockfav_catalog[i].path)) continue;
+        if (g_dockfav_cand_n >= DOCKFAV_CATALOG_MAX) break;
+        copy_str(g_dockfav_cand_name[g_dockfav_cand_n], g_dockfav_catalog[i].name, sizeof(g_dockfav_cand_name[0]));
+        copy_str(g_dockfav_cand_path[g_dockfav_cand_n], g_dockfav_catalog[i].path, sizeof(g_dockfav_cand_path[0]));
+        g_dockfav_cand_n++;
+    }
+    g_dockfav_dd_items[0] = "Choose an app...";
+    for (int i = 0; i < g_dockfav_cand_n; i++) g_dockfav_dd_items[i + 1] = g_dockfav_cand_name[i];
+    if (g_dockfav_add_sel > g_dockfav_cand_n) g_dockfav_add_sel = 0;
+}
+
+static void dockfav_refresh_all(void) {
+    dockfav_catalog_build();
+    dockfav_refresh_pinned();
+    dockfav_rebuild_candidates();
+    g_dockfav_add_sel = 0;
+}
+
+// ---- Contents: writing through the FAVCH.CFG live-apply channel ----
+// userconf_open_write() always O_TRUNCs (see userconf.c), so a plain write
+// would destroy any line the compositor's ~1s poll has not yet consumed.
+// Read-modify-write against whatever is already queued instead - the same
+// shape as every other read-then-append config edit in this file, applied
+// to a channel a live sibling process also reads.
+static void dockfav_write_channel_line(const char *line) {
+    char buf[2048];
+    int n = 0;
+    int rfd = userconf_open_read("FAVCH.CFG", 0);   // no legacy: brand-new channel (startmenu.c)
+    if (rfd >= 0) {
+        long rn = sys_read(rfd, buf, sizeof(buf) - 130);
+        sys_close(rfd);
+        if (rn > 0) n = (int)rn;
+    }
+    int o = n;
+    for (const char *s = line; *s && o < (int)sizeof(buf) - 2; s++) buf[o++] = *s;
+    buf[o++] = '\n';
+    int fd = userconf_open_write("FAVCH.CFG");
+    if (fd < 0) { save_failed("FAVCH.CFG"); return; }
+    if (userconf_finish_write(fd, buf, (unsigned long)o) != 0) save_failed("FAVCH.CFG");
+}
+
+// Pin `path`. Optimistically updates the local display list too, rather
+// than waiting up to ~1s for the compositor's poll and this panel's own
+// next refresh - see the panel-open poll below for the eventual
+// reconciliation against the real, compositor-owned list.
+static void dockfav_add(const char *path) {
+    dockfav_write_channel_line(path);
+    if (!dockfav_is_pinned(path) && g_dockfav_pinned_n < DOCKFAV_MAX) {
+        copy_str(g_dockfav_pinned[g_dockfav_pinned_n], path, sizeof(g_dockfav_pinned[0]));
+        g_dockfav_pinned_n++;
+    }
+    dockfav_rebuild_candidates();
+}
+
+// Unpin `path`. The '-' prefix is the removal half of the FAVCH.CFG channel
+// added for this panel; see the panel header comment and startmenu.c.
+static void dockfav_remove(const char *path) {
+    char line[130];
+    line[0] = '-';
+    copy_str(line + 1, path, sizeof(line) - 1);
+    dockfav_write_channel_line(line);
+    for (int i = 0; i < g_dockfav_pinned_n; i++) {
+        if (!strcmp(g_dockfav_pinned[i], path)) {
+            for (int j = i; j < g_dockfav_pinned_n - 1; j++)
+                copy_str(g_dockfav_pinned[j], g_dockfav_pinned[j + 1], sizeof(g_dockfav_pinned[0]));
+            g_dockfav_pinned_n--;
+            break;
+        }
+    }
+    dockfav_rebuild_candidates();
+}
+
+static void dockfav_add_dd_changed(void) {
+    if (g_dockfav_add_sel > 0 && g_dockfav_add_sel <= g_dockfav_cand_n)
+        dockfav_add(g_dockfav_cand_path[g_dockfav_add_sel - 1]);
+    g_dockfav_add_sel = 0;
+    draw_all();
+}
+
+// Shared geometry: EVERY y-coordinate the draw function and the click
+// handler both need to agree on comes from here, computed once. This is
+// the fix for the exact "two arithmetic chains, one column" hit-box-drift
+// bug class already recorded in blame.md for this file's Mouse panel -
+// Contents has a variable number of rows (0..DOCKFAV_MAX), which is exactly
+// the shape that bites hardest when geometry is hand-duplicated.
+typedef struct {
+    int style_y;      // Dock Style dropdown row
+    int opacity_y;     // Dock Opacity slider row
+    int contents_y;    // "Contents" subsection header
+    int hint_y;        // hint line under the subsection header
+    int row0_y;         // first pinned-item row
+    int row_h;           // pinned-item row height
+    int add_y;            // "Add app" dropdown row (only meaningful if !full && has_candidates)
+    int full;               // dock is at DOCKFAV_MAX: no Add row
+    int has_candidates;      // catalog has at least one un-pinned app: only meaningful if !full
+} dock_layout_t;
+
+static dock_layout_t dock_panel_layout(void) {
+    dock_layout_t L;
+    int y = PADDING + 40;   // after "Dock" section header (y += 40)
+    y += 25;                 // after "Behaviour" subsection header (y += 25)
+    L.style_y = y; y += 45;
+    L.opacity_y = y; y += 45;
+    y += 12;                  // breathing room before the next subsection
+    L.contents_y = y; y += 25;
+    L.hint_y = y; y += 24;
+    L.row0_y = y;
+    L.row_h = 30;
+    y += g_dockfav_pinned_n * L.row_h;
+    y += 8;
+    L.full = (g_dockfav_pinned_n >= DOCKFAV_MAX);
+    L.has_candidates = (g_dockfav_cand_n > 0);
+    L.add_y = y;
+    return L;
+}
+
+static void draw_dock_panel(void) {
+    int x = CONTENT_X + PADDING;
+    char buf[8];
+
+    if (!g_dockfav_cached) dockfav_refresh_all();
+    dock_layout_t L = dock_panel_layout();
+
+    draw_section_header(x, PADDING, "Dock");
+
+    // ---- Behaviour ----
+    draw_subsection(x, PADDING + 40, "Behaviour");
+
+    draw_label(x, L.style_y + 4, "Style");
+    draw_dropdown_n(x + 120, L.style_y - 3, 220, DOCK_OPTS[DOCK_CLAMP(dock_style)],
+                     g_dd_open && g_dd_sel == &dock_style, DOCK_OPTS_COUNT);
+
+    draw_label(x, L.opacity_y + 4, "Opacity");
+    {
+        if (dock_opacity < DOCK_OPACITY_FLOOR) dock_opacity = DOCK_OPACITY_FLOOR;
+        if (dock_opacity > 100) dock_opacity = 100;
+        gui_itoa(dock_opacity, buf, sizeof(buf));
+        int len = my_strlen(buf);
+        buf[len++] = '%'; buf[len] = 0;
+        draw_slider(x + 120, L.opacity_y, 170, dock_opacity, 100, COL_SLIDER_FILL);
+        // The 0..FLOOR span is DISALLOWED, drawn as a hatch (not merely
+        // clamped) so a user who drags into it can see why the knob stops.
+        {
+            int tx = x + 120, tw = 170 * DOCK_OPACITY_FLOOR / 100;
+            for (int i = 0; i < tw; i += 6) {
+                int seg = (tw - i) < 3 ? (tw - i) : 3;
+                win_draw_rect(window_handle, tx + i,     L.opacity_y + 5, seg, 6, 0x00BFC4CC);
+                int seg2 = (tw - i - 3) < 3 ? (tw - i - 3) : 3;
+                if (seg2 > 0)
+                    win_draw_rect(window_handle, tx + i + 3, L.opacity_y + 5, seg2, 6, 0x00B2B7C0);
+            }
+        }
+        win_draw_text(window_handle, x + 300, L.opacity_y, buf, COL_TEXT_SECONDARY);
+    }
+    {
+        char hb[80];
+        snprintf(hb, sizeof(hb), "Below %d%% chrome labels stop meeting the contrast minimum.",
+                 DOCK_OPACITY_FLOOR);
+        win_draw_text(window_handle, x + 120, L.opacity_y + 22, hb, COL_TEXT_SECONDARY);
+    }
+
+    // ---- Contents ----
+    draw_subsection(x, L.contents_y, "Contents");
+    if (g_dockfav_pinned_n == 0) {
+        draw_hint(x, L.hint_y, "No apps are pinned to the dock.");
+    } else {
+        draw_hint(x, L.hint_y, "Apps pinned to the dock. Drag-to-reorder is not supported yet.");
+    }
+
+    for (int i = 0; i < g_dockfav_pinned_n; i++) {
+        int ry = L.row0_y + i * L.row_h;
+        draw_card(x, ry, CONTENT_WIDTH - 2 * PADDING, L.row_h - 4);
+        win_draw_text(window_handle, x + 12, ry + 8, dockfav_name_for_path(g_dockfav_pinned[i]), COL_TEXT_PRIMARY);
+        draw_button_small(x + CONTENT_WIDTH - 2 * PADDING - 82, ry + 1, 74, "Remove", false);
+    }
+
+    if (L.full) {
+        char fb[64];
+        snprintf(fb, sizeof(fb), "Dock is full (%d/%d). Remove one to add another.",
+                 g_dockfav_pinned_n, DOCKFAV_MAX);
+        win_draw_text(window_handle, x, L.add_y + 4, fb, COL_TEXT_SECONDARY);
+    } else if (!L.has_candidates) {
+        win_draw_text(window_handle, x, L.add_y + 4, "All available apps are already pinned.", COL_TEXT_SECONDARY);
+    } else {
+        draw_label(x, L.add_y + 4, "Add app");
+        draw_dropdown_n(x + 120, L.add_y - 3, 220,
+                         g_dockfav_dd_items[(g_dockfav_add_sel >= 0 && g_dockfav_add_sel <= g_dockfav_cand_n) ? g_dockfav_add_sel : 0],
+                         g_dd_open && g_dd_sel == &g_dockfav_add_sel, g_dockfav_cand_n + 1);
+    }
 }
 
 static void draw_about_panel(void) {
@@ -3396,21 +4596,39 @@ static void draw_about_panel(void) {
     win_draw_text(window_handle, x, y, "Apps: terminal, files, editor, browser, RSS, IRC, DOOM, Python; HD Audio; themes", COL_TEXT_SECONDARY);
     y += 35;
 
-    // Actions
+    // Actions. Record the row before drawing it: handle_content_click() reads
+    // g_about_btn_y rather than recomputing the panel's height, so the two
+    // cannot drift apart again (see the declaration for what happened when
+    // they could).
+    g_about_btn_y = y;
     draw_button(x, y, 130, "Check Updates", true, false);
     draw_button(x + 145, y, 130, "Export Debug", false, false);
     draw_button(x + 290, y, 100, "Credits", false, false);
     y += 35;
     if (about_status == 1)
-        draw_hint_ic(x, y, "CCHECK", 0x0044B860, "System is up to date.");
+        draw_hint_ic(x, y, "CCHECK", theme_color(THEME_COLOR_SUCCESS), "System is up to date.");
     else if (about_status == 2)
         draw_hint(x, y, "Debug info written to /DEBUG.TXT");
     y += 15;
 
-    // Legal
-    win_draw_text(window_handle, x, y, "Copyright 2024-2026 MayteraOS Project", COL_TEXT_DISABLED);
+    // Legal. (local 71) Three corrections here, all factual:
+    //  1. "Licensed under MIT License" was simply wrong. The kernel statically
+    //     links GPLv2 components (libmad, faad2), so the combined MayteraOS
+    //     binary is GPLv2-or-later; MIT covers userland/libc/ only. See
+    //     ATTRIBUTION.md, "Vendored open-source libraries".
+    //  2. COL_TEXT_DISABLED on COL_CONTENT_BG is 1.88:1 on retro_unix, the
+    //     shipped default theme. Floored through the shared primitive.
+    //  3. TinyGL's licence requires its acknowledgment "in the product", not
+    //     "in a dialog the user may choose to open", so it is stated here on
+    //     the always-visible panel as well as inside Credits. The wording is
+    //     upstream's own copyright line from userland/libgl/src/LICENSE.
+    uint32_t legal = credits_ink(COL_TEXT_SECONDARY);
+    win_draw_text(window_handle, x, y, "Copyright 2024-2026 MayteraOS Project", legal);
     y += 18;
-    win_draw_text(window_handle, x, y, "Licensed under MIT License", COL_TEXT_DISABLED);
+    win_draw_text(window_handle, x, y, "GPLv2-or-later; userland/libc/ is MIT. See Credits.", legal);
+    y += 18;
+    win_draw_text(window_handle, x, y,
+                  "Includes TinyGL (C) 1997-2021 Fabrice Bellard, Gek (DMHSW), C-Chads", legal);
 }
 
 // =============================================================================
@@ -4094,6 +5312,8 @@ static void draw_content(void) {
         case PANEL_BLUETOOTH:   draw_bluetooth_panel(); break;
         case PANEL_WIFI:        draw_wifi_panel(); break;
         case PANEL_EXTSVC:      draw_extsvc_panel(); break;
+        case PANEL_STARTMENU:   draw_startmenu_panel(); break;
+        case PANEL_DOCK:        draw_dock_panel(); break;
     }
 }
 
@@ -4102,9 +5322,62 @@ static void draw_content(void) {
 // =============================================================================
 
 // Dialog height: scales with field count so 4/5-field forms (Add Printer) fit.
+// (#745) Extra row height reserved for MODAL_EDIT_PROFILE's picture picker
+// (avatar preview + 8 swatches), drawn below the two text fields. Kept as
+// its own constant so draw_modal() and the click hit-test below cannot drift
+// apart the way a hand-copied number in each would risk.
+#define MODAL_AVATAR_ROW_H 56
+
 static int modal_dh(void) {
-    if (modal_mode == MODAL_CREDITS) return 200;
-    return 92 + modal_num_fields * 44;
+    if (modal_mode == MODAL_CREDITS) {
+        // Credits is a document, not a 5-line notice: give it the window.
+        int h = WIN_HEIGHT - 100;
+        if (h > 460) h = 460;
+        if (h < 200) h = 200;
+        return h;
+    }
+    int dh = 92 + modal_num_fields * 44;
+    if (modal_mode == MODAL_EDIT_PROFILE) dh += MODAL_AVATAR_ROW_H;
+    return dh;
+}
+
+// Dialog WIDTH. 360 was a literal in both draw_modal() and the click hit-test;
+// Credits needs a wider box (the generated lines wrap at 62 characters, which is
+// ~496px in the 8x16 bitmap font), so the number becomes shared for the same
+// reason modal_dh() already is: a hand-copied literal in each is how a dialog's
+// draw and its hit-test drift apart.
+static int modal_dw(void) {
+    if (modal_mode != MODAL_CREDITS) return 360;
+    int w = WIN_WIDTH - 60;
+    if (w > 620) w = 620;
+    if (w < 360) w = 360;
+    if (w > WIN_WIDTH - 20) w = WIN_WIDTH - 20;
+    return w;
+}
+
+// THE credits viewport, window-local. One definition, called by the draw and by
+// every input path, so a scroll offset can never be applied to one and not the
+// other. That is not hypothetical: the comment at sidebar_hit() records the same
+// bug being fixed for the panel list.
+static void credits_layout(void) {
+    int dw = modal_dw(), dh = modal_dh();
+    int dx = (WIN_WIDTH - dw) / 2, dy = (WIN_HEIGHT - dh) / 2;
+    int avail = dh - 44 - 46;                 // below the title bar, above Close
+    // Floor to whole rows. With snap, this is what guarantees a row is never
+    // left half-drawn across the viewport edge, which matters because a
+    // userland app has no clip region: a partial row's text would spill over
+    // the dialog title bar above it.
+    int vh = (avail / CREDITS_LINE_H) * CREDITS_LINE_H;
+    if (vh < CREDITS_LINE_H) vh = CREDITS_LINE_H;
+    gui_scroll_config(&g_credits_scroll, dx + 14, dy + 44, dw - 28, vh,
+                      credits_n * CREDITS_LINE_H, CREDITS_LINE_H);
+    g_credits_scroll.snap = 1;   // a list of fixed-height rows; see gui_scroll.h
+}
+
+// y of the top of the picture-picker row, shared by draw_modal() and the
+// click handler.
+static int modal_avatar_row_y(int dy) {
+    return dy + 46 + modal_num_fields * 44;
 }
 
 static void draw_modal(void) {
@@ -4113,11 +5386,15 @@ static void draw_modal(void) {
     // Dim (not black-out) the background: a cheap interlaced scrim. Apps have no
     // framebuffer read-back, so we draw a dark line on every other scanline -
     // the panel behind stays visible through the gaps but reads as darkened.
+    // (#704) INTENTIONALLY NOT themed: this is pure black used as a dimming
+    // agent, not a style color. A themed value here (e.g. WINDOW_BG) would
+    // defeat the effect entirely on a light theme, where the background IS
+    // white/near-white and "dimming" toward it does nothing.
     for (int yy = 0; yy < WIN_HEIGHT; yy += 2)
         win_draw_rect(window_handle, 0, yy, WIN_WIDTH, 1, 0x00000000);
 
     // Dialog dimensions vary by type
-    int dw = 360;
+    int dw = modal_dw();
     int dh = modal_dh();
     int dx = (WIN_WIDTH  - dw) / 2;
     int dy = (WIN_HEIGHT - dh) / 2;
@@ -4137,15 +5414,78 @@ static void draw_modal(void) {
     else if (modal_mode == MODAL_SET_NETWORK) title = "Network Configuration";
     else if (modal_mode == MODAL_ADD_PRINTER) title = "Add Printer";
     else if (modal_mode == MODAL_WIFI_PASSWORD) title = "Connect to Wi-Fi";
-    win_draw_text(window_handle, dx + 14, dy + 10, title, COL_TEXT_PRIMARY);
+    else if (modal_mode == MODAL_AUTOLOGIN_PW) title = "Confirm Password";
+    win_draw_text(window_handle, dx + 14, dy + 10, title, COL_SIDEBAR_TEXT);
 
     if (modal_mode == MODAL_CREDITS) {
-        // Credits text
-        win_draw_text(window_handle, dx + 14, dy + 50, "MayteraOS", COL_ACCENT);
-        win_draw_text(window_handle, dx + 14, dy + 72, "The first LLM-native operating system.", COL_TEXT_PRIMARY);
-        win_draw_text(window_handle, dx + 14, dy + 92, "Designed and built with Claude Code.", COL_TEXT_SECONDARY);
-        win_draw_text(window_handle, dx + 14, dy + 114, "Copyright 2024-2026 MayteraOS Project.", COL_TEXT_SECONDARY);
-        win_draw_text(window_handle, dx + 14, dy + 134, "Licensed under MIT License.", COL_TEXT_DISABLED);
+        credits_load();
+        credits_layout();
+        gui_scroll_t *sc = &g_credits_scroll;
+        int cw  = gui_scroll_needed(sc) ? sc->w - GUI_SCROLL_W - 6 : sc->w;
+        int vy0 = sc->y, vy1 = sc->y + sc->h;
+        // Inks are floored against the surface they land on, not assumed.
+        uint32_t ink = credits_ink(COL_TEXT_PRIMARY);
+        uint32_t dim = credits_ink(COL_TEXT_SECONDARY);
+        uint32_t lic = credits_ink(COL_ACCENT);
+        int title_sz = theme_metric_or(THEME_METRIC_TYPE_TITLE, 16);
+        int body_sz  = theme_metric_or(THEME_METRIC_TYPE_BODY, 14);
+
+        // Live version, from the SAME call the desktop's version string uses
+        // (SYS_GET_VERSION via get_version()), so this screen cannot report a
+        // different build number from the one on the desktop. Drawn here rather
+        // than baked into CREDITS.DAT for the same one-source-of-truth reason
+        // the component list is not baked into this file.
+        char vb[64]; char vline[80]; int vn = 0;
+        vb[0] = 0; get_version(vb, sizeof(vb));
+        for (const char *q = "Version "; *q; q++) vline[vn++] = *q;
+        if (!vb[0]) { vb[0] = '?'; vb[1] = 0; }
+        for (int k = 0; vb[k] && vn < (int)sizeof(vline) - 1; k++) vline[vn++] = vb[k];
+        vline[vn] = 0;
+
+        for (int i = 0; i < credits_n; i++) {
+            int ly = sc->y + i * CREDITS_LINE_H - sc->offset;
+            // A userland app has NO clip region (gui_scroll.h / draw_sidebar()),
+            // so a row that is not FULLY inside the viewport is skipped rather
+            // than half-drawn: otherwise its text spills over the title bar.
+            if (ly < vy0 || ly + CREDITS_LINE_H > vy1) continue;
+            const char *t = credits_text[i];
+            switch (credits_style[i]) {
+                case 'T':
+                    win_draw_text_ttf_ex(window_handle, sc->x, ly, t, 0,
+                                         title_sz, FONT_STYLE_BOLD, ink);
+                    break;
+                case 'H':
+                    win_draw_text_ttf_ex(window_handle, sc->x, ly + 2, t, 0,
+                                         body_sz, FONT_STYLE_BOLD, ink);
+                    break;
+                case 'N':
+                    win_draw_text(window_handle, sc->x + 8, ly + 1, t, ink);
+                    break;
+                case 'L':
+                    win_draw_text(window_handle, sc->x + 24, ly + 1, t, lic);
+                    break;
+                case 'D':
+                    win_draw_text_small(window_handle, sc->x + 24, ly + 5, t, dim);
+                    break;
+                case 'R':
+                    win_draw_rect(window_handle, sc->x,
+                                  ly + CREDITS_LINE_H / 2, cw, 1, COL_SEPARATOR);
+                    break;
+                default:
+                    win_draw_text(window_handle, sc->x, ly + 1, t, ink);
+                    break;
+            }
+        }
+        // The dialog body is filled with COL_CONTENT_BG, so say so rather than
+        // leaning on the default: the default happens to be the same colour
+        // today, and a dialog restyle would silently make it the wrong one.
+        gui_scroll_draw_on(window_handle, sc, COL_CONTENT_BG);
+        // Version and any truncation notice sit on the footer row, outside the
+        // scrolled region, so they are readable at any scroll position.
+        win_draw_text_small(window_handle, dx + 14, dy + dh - 30,
+                            credits_truncated
+                              ? "Attribution list truncated; see ATTRIBUTION.md"
+                              : vline, dim);
         draw_button(dx + dw - 96, dy + dh - 40, 80, "Close", true, false);
         return;
     }
@@ -4187,6 +5527,9 @@ static void draw_modal(void) {
     } else if (modal_mode == MODAL_WIFI_PASSWORD) {
         labels[0] = "Password:";
         use_stars[0] = 1;
+    } else if (modal_mode == MODAL_AUTOLOGIN_PW) {
+        labels[0] = "Your account password:";
+        use_stars[0] = 1;
     }
 
     for (int i = 0; i < modal_num_fields; i++) {
@@ -4220,12 +5563,40 @@ static void draw_modal(void) {
         }
     }
 
+    // (#745) Picture picker: avatar preview + an 8-swatch monogram-color row,
+    // MODAL_EDIT_PROFILE only. Custom photo upload is deferred (design doc
+    // section 10.3 - no userland image decoder, no file-browser surface in
+    // Settings), so this IS the "assigned a default picture, configurable in
+    // the user profile settings" surface: pick which of the 8 identity
+    // colors this account's monogram uses. The unselected ring is drawn in
+    // the same color as its own background, which is the double-AA-circle
+    // trick's cheap way to make a ring invisible without a third primitive.
+    if (modal_mode == MODAL_EDIT_PROFILE) {
+        int ay = modal_avatar_row_y(dy);
+        win_draw_text(window_handle, dx + 14, ay, "Picture:", COL_TEXT_SECONDARY);
+        char pletter = modal_field[0][0] ? modal_field[0][0]
+                                          : users[current_user_idx].username[0];
+        draw_avatar_badge(dx + 14, ay + 16, 32, avatar_palette[modal_avatar_idx],
+                          COL_CONTENT_BG, pletter);
+        uint32_t sel_ring = gui_ensure_contrast(gui_ink_on(COL_CONTENT_BG),
+                                                COL_CONTENT_BG, GUI_FLOOR_NONTEXT);
+        int sx = dx + 60;
+        for (int i = 0; i < 8; i++) {
+            int cx = sx + i * 30, cy = ay + 32;
+            uint32_t ring = (i == modal_avatar_idx) ? sel_ring : COL_CONTENT_BG;
+            gui_fill_circle_aa(window_handle, cx - 13, cy - 13, 26, ring, COL_CONTENT_BG);
+            gui_fill_circle_aa(window_handle, cx - 11, cy - 11, 22, avatar_palette[i], ring);
+        }
+    }
+
     // Error message
     int err_y = dy + 46 + modal_num_fields * 44;
+    if (modal_mode == MODAL_EDIT_PROFILE) err_y += MODAL_AVATAR_ROW_H;
     if (err_y > dy + dh - 50) err_y = dy + dh - 50;
     if (modal_error[0]) {
-        draw_mico("CIRCX", dx + 14, err_y - 2, 14, 0x00CC3333, COL_CARD_BG);
-        win_draw_text(window_handle, dx + 32, err_y, modal_error, 0x00CC3333);
+        uint32_t errc = theme_color(THEME_COLOR_ERROR);
+        draw_mico("CIRCX", dx + 14, err_y - 2, 14, errc, COL_CARD_BG);
+        win_draw_text(window_handle, dx + 32, err_y, modal_error, errc);
     }
 
     draw_button(dx + dw - 184, dy + dh - 40, 80, "Cancel", false, false);
@@ -4258,14 +5629,52 @@ static void net_write_cfg(const char *ip, const char *mask,
     if (mask && mask[0]) net_append_kv(&p, "mask", mask);
     if (gw   && gw[0])   net_append_kv(&p, "gw",   gw);
     if (dns  && dns[0])  net_append_kv(&p, "dns",  dns);
-    sys_unlink("/CONFIG/NETIP.CFG");
-    int fd = sys_open("/CONFIG/NETIP.CFG", 0x41);   // O_WRONLY|O_CREAT
-    if (fd < 0) return;
-    sys_write(fd, buf, (unsigned long)(p - buf));
-    sys_close(fd);
+    // #743: was unlink-then-open. This one could leave a machine with NO static
+    // network configuration at all after a failed save.
+    if (userconf_write_all("/CONFIG/NETIP.CFG", buf, (unsigned long)(p - buf)) != 0)
+        save_failed("NETIP.CFG (static network config)");
+}
+
+// (#566) See the forward declaration + settings_is_root()/autologin_refresh()
+// near the Users & Accounts globals. Root sets autologin for anyone with no
+// password (kernel ABI); a non-root caller can only target their OWN account
+// and the kernel requires their current password, so open a one-field modal
+// to collect it rather than acting on a bare toggle click.
+static void autologin_request(const char *user, int enable) {
+    if (settings_is_root()) {
+        int rc = sys_set_autologin(user, "", enable);
+        if (rc == 0) autologin_refresh();
+        draw_all();
+        return;
+    }
+    copy_str(al_target_user, user, sizeof(al_target_user));
+    al_target_enable = enable;
+    modal_mode = MODAL_AUTOLOGIN_PW;
+    modal_num_fields = 1;
+    modal_field[0][0] = '\0';
+    modal_cursor[0] = 0;
+    modal_caret[0]  = 0;
+    modal_active_field = 0;
+    modal_error[0] = '\0';
+    draw_all();
 }
 
 static void do_modal_submit(void) {
+    if (modal_mode == MODAL_AUTOLOGIN_PW) {
+        int rc = sys_set_autologin(al_target_user, modal_field[0], al_target_enable);
+        if (rc != 0) {
+            const char *msg = "Incorrect password.";
+            int i = 0;
+            while (msg[i] && i < 63) { modal_error[i] = msg[i]; i++; }
+            modal_error[i] = '\0';
+            draw_all();
+            return;
+        }
+        autologin_refresh();
+        modal_mode = MODAL_NONE;
+        draw_all();
+        return;
+    }
     if (modal_mode == MODAL_WIFI_PASSWORD) {
         // (#384) join the pending SSID with the entered key (mock accepts any).
         if (modal_field[0][0] == '\0') { copy_str(modal_error, "Enter the network password", sizeof(modal_error)); return; }
@@ -4297,10 +5706,27 @@ static void do_modal_submit(void) {
             modal_error[i] = '\0';
             draw_all(); return;
         }
-        int res = passwd_change(users[current_user_idx].username,
-                                modal_field[0], modal_field[1]);
+        // #785: target the SESSION account, not users[current_user_idx].
+        // The display list is capped at 4 rows and ordered by the kernel table,
+        // so that index is a row number, not an identity. If we could not
+        // resolve who is logged in, REFUSE rather than guess: silently changing
+        // some other account's password is exactly the "reported one thing,
+        // did another" class this codebase has shipped before.
+        if (!g_session_user[0]) {
+            const char *msg = "Cannot determine the logged-in account.";
+            int i = 0;
+            while (msg[i] && i < 63) { modal_error[i] = msg[i]; i++; }
+            modal_error[i] = '\0';
+            draw_all(); return;
+        }
+        int res = passwd_change(g_session_user, modal_field[0], modal_field[1]);
         if (res < 0) {
-            const char *msg = "Current password incorrect.";
+            // Report the reason the kernel actually gave. -2 is the #566
+            // escalating lockout; calling that "incorrect password" sends the
+            // user off retyping a password that was already right.
+            const char *msg = (res == -2)
+                ? "Account locked out. Wait and try again."
+                : "Current password incorrect.";
             int i = 0;
             while (msg[i] && i < 63) { modal_error[i] = msg[i]; i++; }
             modal_error[i] = '\0';
@@ -4332,19 +5758,31 @@ static void do_modal_submit(void) {
             modal_error[i] = '\0';
             draw_all(); return;
         }
-        // Determine next UID (struct has no uid field, use count-based assignment)
-        int next_uid = 1000 + user_count;
-        // Build home path
-        char home[64] = "/HOME/";
-        int hi = 6, fi = 0;
-        while (modal_field[0][fi] && hi < 62) { home[hi++] = modal_field[0][fi++]; }
-        home[hi] = '\0';
-        long r = adduser(modal_field[0], next_uid, next_uid, home, "/APPS/MSH");
-        if (r == 0) {
+        // #745 TWO BUGS FIXED HERE, and the account was unusable either way.
+        //
+        // 1. THE PASSWORD WAS DISCARDED. The two password fields were checked
+        //    against each other and then thrown away: adduser() has no password
+        //    parameter and never wrote a shadow record, so every account created
+        //    through this dialog could never authenticate. The `ref` account
+        //    shipped at uid 1002 in every golden is exactly that account.
+        //    sys_user_create_pw() sets the password in the SAME call and rolls
+        //    the account back if it cannot, so the half-created state this
+        //    produced is no longer expressible.
+        //
+        // 2. THE UID WAS COUNTED, NOT ALLOCATED. `1000 + user_count` collides
+        //    the moment an account is deleted: with root(0) and ref(1002) left,
+        //    it returns 1002, user_create refuses, and the user gets "Failed to
+        //    add user" with no way forward. Passing uid 0 asks the KERNEL to
+        //    allocate, which is where the account table actually is.
+        //
+        // Home is left to the kernel too (NULL), so the /HOME/<NAME8> rule lives
+        // in one place instead of being re-derived, slightly differently, here.
+        long r = sys_user_create_pw(modal_field[0], modal_field[1], 0, 0, 0);
+        if (r >= 0) {
             modal_mode = MODAL_NONE;
             users_refresh();
         } else {
-            const char *msg = "Failed to add user.";
+            const char *msg = "Could not create the account.";
             int i = 0;
             while (msg[i] && i < 63) { modal_error[i] = msg[i]; i++; }
             modal_error[i] = '\0';
@@ -4431,6 +5869,21 @@ static void do_modal_submit(void) {
         copy_str(users[current_user_idx].email,    modal_field[1], 64);
         // Persist the edited email to the real per-account store.
         useremail_set(users[current_user_idx].username, users[current_user_idx].email);
+        // (#745) Persist the picked monogram color the same way - a sibling
+        // side-table, /CONFIG/USERAVATAR.CFG, written as "mono:RRGGBB" (six
+        // raw hex digits, no "0x" - gui_itoa_hex() always prepends "0x", the
+        // wrong shape for this grammar, so this is formatted by hand).
+        {
+            static const char hexd[] = "0123456789ABCDEF";
+            char spec[16];
+            uint32_t c = avatar_palette[modal_avatar_idx] & 0x00FFFFFF;
+            spec[0]='m'; spec[1]='o'; spec[2]='n'; spec[3]='o'; spec[4]=':';
+            for (int i = 0; i < 6; i++)
+                spec[5 + i] = hexd[(c >> (20 - i * 4)) & 0xF];
+            spec[11] = '\0';
+            useravatar_set(users[current_user_idx].username, spec);
+            users[current_user_idx].avatar_color = avatar_palette[modal_avatar_idx];
+        }
         modal_mode = MODAL_NONE;
         draw_all();
         return;
@@ -4453,6 +5906,12 @@ static void do_modal_submit(void) {
             mo = (df[5]-'0')*10 + (df[6]-'0');
             d  = (df[8]-'0')*10 + (df[9]-'0');
         }
+        // #49: THE RTC HOLDS UTC (that is what NTP writes into it, and what
+        // every reader now assumes). The user typed a LOCAL wall-clock time, so
+        // convert back by shifting by the negated offset before storing. Without
+        // this, setting the clock by hand in a +09:30 zone would store 09:30
+        // ahead of UTC and every clock would then add another 09:30 on display.
+        tz_shift(-tz_offset_minutes(), &h, &m, &s, &d, &mo, &y);
         set_rtc_time(h, m, s);
         set_rtc_date(y, mo, d);
         modal_mode = MODAL_NONE;
@@ -4476,8 +5935,15 @@ static void draw_all(void) {
     if (g_focus_on && g_focus_n > 0 && modal_mode == MODAL_NONE) {
         if (g_focus_idx >= g_focus_n) g_focus_idx = 0;
         focus_rect_t *fr = &g_focus[g_focus_idx];
-        gui_draw_rect_outline(window_handle, fr->x - 2, fr->y - 2, fr->w + 4, fr->h + 4, COL_ACCENT);
-        gui_draw_rect_outline(window_handle, fr->x - 1, fr->y - 1, fr->w + 2, fr->h + 2, COL_ACCENT);
+        // (#745) THE keyboard focus ring for the whole app, and the one a
+        // live screendump caught still drawing in COL_ACCENT: measured on the
+        // running machine under Retro UNIX it was accent #66BB66 on surface
+        // #B4B4B4 = 1.14:1, effectively invisible, on the app people navigate
+        // by Tab more than any other. gui_pal()->focus is repaired to the 3:1
+        // non-text floor by gui_set_palette().
+        uint32_t ring = gui_pal()->focus;
+        gui_draw_rect_outline(window_handle, fr->x - 2, fr->y - 2, fr->w + 4, fr->h + 4, ring);
+        gui_draw_rect_outline(window_handle, fr->x - 1, fr->y - 1, fr->w + 2, fr->h + 2, ring);
     }
     if (modal_mode != MODAL_NONE) draw_modal();
     dropdown_render();                 // overlay: open dropdown list on top of all
@@ -4519,6 +5985,12 @@ static void handle_sidebar_click(int local_x, int local_y) {
                 // (#262) Re-read the Default Apps state once on panel entry (picks
                 // up external /ASSOC.CFG changes) instead of per redraw frame.
                 if (i == PANEL_DEFAULTS) defaults_invalidate_cache();
+                // (#745 task #67) Re-read pinned favourites + rebuild the
+                // pinnable-apps catalog once on entering Dock, same idiom as
+                // Default Apps above (picks up a dock right-click Pin/Unpin
+                // or an App Store install that happened while this panel was
+                // closed).
+                if (i == PANEL_DOCK) dockfav_invalidate_cache();
                 // (#318) On entering Devices, load printers (seed the Brother
                 // example once if nothing is configured).
                 if (i == PANEL_DEVICES) { printers_seed_once(); printers_refresh(); g_print_status[0] = '\0'; }
@@ -4562,13 +6034,32 @@ static void icon_dd_changed(void)      { set_icon_size(icon_size); }
 // #387: publish the chosen dock layout via /DOCKSTYL.CFG; the compositor polls
 // the file and applies + persists it live (no restart).
 static void dock_dd_changed(void) {
-    if (dock_style < 0 || dock_style > 3) dock_style = 0;
-    int fd = sys_open("/DOCKSTYL.CFG", 0x41 | 0x200 /*O_WRONLY|O_CREAT|O_TRUNC*/);
+    dock_style = DOCK_CLAMP(dock_style);   // #745: derived, not a literal bound
+    int fd = userconf_open_write("DOCKSTYL.CFG");   // #683: per-user, see compositor main.c
     if (fd < 0) return;
     char c = (char)('0' + dock_style);
-    sys_write(fd, &c, 1);
-    sys_close(fd);
+    // #743: the compositor POLLS this file and applies what it finds, so a
+    // silently failed write left the dock disagreeing with the control.
+    if (userconf_finish_write(fd, &c, 1) != 0) save_failed("DOCKSTYL.CFG");
 }
+// (#745) Publish the chosen glass opacity via /CONFIG/DOCKOPAC.CFG; the
+// compositor polls the file (same site and cadence as DOCKSTYL.CFG) and applies
+// it live, then persists it into UIPROFIL.YML. Same userconf pair, so the #683
+// per-user path and its legacy-root read fallback both come along unchanged.
+static void dock_opacity_write(void) {
+    if (dock_opacity < DOCK_OPACITY_FLOOR) dock_opacity = DOCK_OPACITY_FLOOR;
+    if (dock_opacity > 100) dock_opacity = 100;
+    int fd = userconf_open_write("DOCKOPAC.CFG");
+    if (fd < 0) { save_failed("DOCKOPAC.CFG"); return; }
+    char b[4];
+    int n = 0;
+    if (dock_opacity >= 100) { b[n++] = '1'; b[n++] = '0'; b[n++] = '0'; }
+    else { b[n++] = (char)('0' + dock_opacity / 10); b[n++] = (char)('0' + dock_opacity % 10); }
+    // #743: the compositor POLLS this file and applies what it finds, so a
+    // silently failed write leaves the dock disagreeing with the control.
+    if (userconf_finish_write(fd, b, (unsigned long)n) != 0) save_failed("DOCKOPAC.CFG");
+}
+
 static int ss_delay_index(void) {
     int best = 0;
     for (int i = 0; i < SS_DELAY_NSTEPS; i++)
@@ -4587,7 +6078,19 @@ static void ss_set_delay_index(int di) {
     set_ss_delay(screensaver_delay_min * 60);
 }
 static void ss_dd_changed(void)        { set_screensaver(SS_KERNEL_MAP[screensaver_idx]); }
-static void cursor_dd_changed(void)    { set_cursor_theme(CURSOR_KERNEL_MAP[cursor_theme]); set_cursor(cursor_theme, 100); }  /* (#116) live cursor: 0/1/2 = Light/Dark/Glow */
+/* (#116) live cursor: 0/1/2 = Light/Dark/Glow. This is the ONLY place Settings
+ * is allowed to write the cursor: a real user selection in the picker.
+ * #745: the size argument was a hardcoded 100, so choosing a style also threw
+ * away whatever cursor SIZE the compositor had persisted in UIPROFIL.YML's
+ * cursize. Read the live size back out of the kernel and preserve it. */
+static void cursor_dd_changed(void) {
+    cursor_theme = OPT_CLAMP(cursor_theme, CURSOR_OPTS);
+    int pk = get_cursor();                       /* packed style | size<<8 */
+    int sz = (pk >= 0) ? ((pk >> 8) & 0xFFFF) : 100;
+    if (sz < 50 || sz > 250) sz = 100;
+    set_cursor_theme(CURSOR_KERNEL_MAP[cursor_theme]);
+    set_cursor(cursor_theme, sz);
+}
 static void wallpaper_dd_changed(void) { set_wallpaper(wallpaper_idx); }
 
 // =============================================================================
@@ -4628,15 +6131,26 @@ static void ext_load_cfg(void){
     }
 }
 static void ext_save_cfg(void){
-    int fd = sys_open("/CONFIG/EXTSVC.CFG", 0x0001|0x0040);   // O_WRONLY|O_CREAT
-    if (fd < 0) fd = sys_open("/EXTSVC.CFG", 0x0001|0x0040);
-    if (fd < 0) { ex_set_status("Could not write config"); return; }
+    // #743: three faults here. (a) The buffer was built AFTER the open, so the
+    // fallback could not be retried with it. (b) Neither open carried O_TRUNC,
+    // which on a FAT-backed path leaves the tail of a longer previous config
+    // behind (on ext2 the write replaces the file regardless, so this was
+    // filesystem-dependent, not universal). (c) It reported "Saved" without
+    // ever looking at the write or the close, and on an ext2 fd the close IS
+    // the write, so a full volume produced a cheerful success message and no
+    // config. Build first, then write, then tell the truth.
     static char out[700]; int o=0;
     const char *k1="url="; for(int j=0;k1[j];j++) out[o++]=k1[j]; for(int j=0;g_ext_url[j];j++) out[o++]=g_ext_url[j]; out[o++]='\n';
     const char *k2="token="; for(int j=0;k2[j];j++) out[o++]=k2[j]; for(int j=0;g_ext_token[j];j++) out[o++]=g_ext_token[j]; out[o++]='\n';
     const char *k3="refresh="; for(int j=0;k3[j];j++) out[o++]=k3[j]; for(int j=0;g_ext_refresh[j];j++) out[o++]=g_ext_refresh[j]; out[o++]='\n';
-    sys_write(fd,out,o); sys_close(fd);
-    ex_set_status("Saved to /CONFIG/EXTSVC.CFG");
+    if (userconf_write_all("/CONFIG/EXTSVC.CFG", out, (unsigned long)o) == 0) {
+        ex_set_status("Saved to /CONFIG/EXTSVC.CFG");
+    } else if (userconf_write_all("/EXTSVC.CFG", out, (unsigned long)o) == 0) {
+        ex_set_status("Saved to /EXTSVC.CFG");
+    } else {
+        save_failed("EXTSVC.CFG");
+        ex_set_status("Could not write config - NOT saved");
+    }
 }
 // Blocking, user-initiated connectivity test (not on the draw path).
 static void ext_test_connection(void){
@@ -4715,14 +6229,19 @@ static void ai_match_preset(void){
 }
 static void ai_load_cfg(void){
     g_ai_loaded = 1;
-    int fd = sys_open("/CONFIG/AISVC.CFG", 0);
-    if (fd < 0) fd = sys_open("/AISVC.CFG", 0);
+    // #684: the user's own protected copy only. No /CONFIG fallback and no
+    // KIMI.KEY read: the seed reaches this file via the kernel provisioner.
+    int fd = userconf_open_read("AISVC.CFG", 0);
     if (fd < 0){
         // No config yet: default to Moonshot(Kimi); surface an existing KIMI.KEY masked.
         ai_apply_preset(2);
-        int kf = sys_open("/CONFIG/KIMI.KEY", 0);
-        if(kf>=0){ char kb[300]; long n=sys_read(kf,kb,sizeof(kb)-1); sys_close(kf);
-            if(n>0){ kb[n]=0; int e=(int)n-1; while(e>=0&&(kb[e]=='\n'||kb[e]=='\r'||kb[e]==' '||kb[e]=='\t')) kb[e--]=0; ai_cpy(g_ai_key,sizeof(g_ai_key),kb); } }
+        // #684: Settings no longer reads /CONFIG/KIMI.KEY to pre-fill the key
+        // field. That read was the last userland opener of the seed, and it is
+        // exactly what the user's decision removes. On a machine that HAS a
+        // seed, the kernel provisioner has already written it into this user's
+        // AISVC.CFG before the desktop starts, so the branch above finds it and
+        // this one is not reached. On a machine with no seed the field is
+        // correctly empty and the user types their own key.
         return;
     }
     static char b[1200]; int got=0;
@@ -4742,8 +6261,9 @@ static void ai_load_cfg(void){
     ai_match_preset();
 }
 static void ai_save_cfg(void){
-    int fd = sys_open("/CONFIG/AISVC.CFG", 0x0001|0x0040);   // O_WRONLY|O_CREAT
-    if (fd < 0) fd = sys_open("/AISVC.CFG", 0x0001|0x0040);
+    // #684: write the user's own copy (O_TRUNC too: the old open lacked it,
+    // so a shorter config left a stale tail behind).
+    int fd = userconf_open_write("AISVC.CFG");
     if (fd < 0){ ai_set_status("Could not write config"); return; }
     static char out[900]; int o=0;
     const char *pn=(g_ai_preset>=0&&g_ai_preset<AI_NPRESET)?g_ai_presets[g_ai_preset].name:"Custom";
@@ -4752,8 +6272,15 @@ static void ai_save_cfg(void){
     const char *k2="model=";     for(int j=0;k2[j];j++) out[o++]=k2[j]; for(int j=0;g_ai_model[j];j++)    out[o++]=g_ai_model[j];    out[o++]='\n';
     const char *k3="api_key=";   for(int j=0;k3[j];j++) out[o++]=k3[j]; for(int j=0;g_ai_key[j];j++)      out[o++]=g_ai_key[j];      out[o++]='\n';
     const char *k4="api_style="; for(int j=0;k4[j];j++) out[o++]=k4[j]; const char *st=g_ai_style?"anthropic":"bearer"; for(int j=0;st[j];j++) out[o++]=st[j]; out[o++]='\n';
-    sys_write(fd,out,o); sys_close(fd);
-    ai_set_status("Saved to /CONFIG/AISVC.CFG");
+    // #743: said "Saved" without checking anything. On an ext2 fd the close is
+    // where the bytes are actually written, so this claimed success on exactly
+    // the failures it should have reported.
+    if (userconf_finish_write(fd, out, (unsigned long)o) == 0) {
+        ai_set_status("Saved to your account settings");
+    } else {
+        save_failed("AISVC.CFG");
+        ai_set_status("Could not write config - NOT saved");
+    }
 }
 // Real, user-initiated minimal POST to the configured provider (not on draw path).
 static void ai_test(void){
@@ -4793,7 +6320,12 @@ static void draw_extsvc_panel(void){
         int fx,fy,fw; ext_field_rect(i,&fx,&fy,&fw);
         win_draw_text(window_handle, fx, fy-14, labels[i], COL_TEXT_SECONDARY);
         win_draw_rect(window_handle, fx, fy, fw, 24, COL_INPUT_BG);
-        gui_draw_rect_outline(window_handle, fx, fy, fw, 24, (g_ext_focus==i)?COL_ACCENT:COL_INPUT_BORDER);
+        // (#745) gui_pal()->focus, not COL_ACCENT. This field is hand-drawn
+        // rather than a gui_textfield2(), so it did not inherit the shared
+        // engine's focus token and kept drawing the ring in the theme accent:
+        // 1.76:1 on the Dark theme's surface, below the 3:1 non-text floor.
+        // gui_pal()->focus is repaired to the floor by gui_set_palette().
+        gui_draw_rect_outline(window_handle, fx, fy, fw, 24, (g_ext_focus==i)?gui_pal()->focus:COL_INPUT_BORDER);
         char disp[64]; int di=0;
         const char *src = (i==0)?g_ext_url : (i==1)?g_ext_token : g_ext_refresh;
         if(i==1){ int L=ex_len(src); int show=L>24?24:L; for(int j=0;j<show;j++) disp[di++]='*'; }
@@ -4825,7 +6357,8 @@ static void draw_extsvc_panel(void){
         int fx,fy,fw; ai_field_rect(i,&fx,&fy,&fw);
         win_draw_text(window_handle, fx, fy-14, ailabels[i], COL_TEXT_SECONDARY);
         win_draw_rect(window_handle, fx, fy, fw, 24, COL_INPUT_BG);
-        gui_draw_rect_outline(window_handle, fx, fy, fw, 24, (g_ai_focus==i)?COL_ACCENT:COL_INPUT_BORDER);
+        // (#745) see the note on the External-services field above.
+        gui_draw_rect_outline(window_handle, fx, fy, fw, 24, (g_ai_focus==i)?gui_pal()->focus:COL_INPUT_BORDER);
         char disp[80]; int di=0;
         const char *src=(i==0)?g_ai_endpoint : (i==1)?g_ai_model : g_ai_key;
         if(i==2){ int L=ex_len(src); int show=L>24?24:L; for(int j=0;j<show;j++) disp[di++]='*'; }
@@ -5045,12 +6578,89 @@ static void handle_content_click(int local_x, int local_y) {
             if (local_x >= x + 220 && local_x < x + 268 && local_y >= dnd_y && local_y < dnd_y + 24) {
                 alerts_dnd = !alerts_dnd; alerts_save(); draw_all(); return; }
         } break;
+        case PANEL_STARTMENU: {
+            int layout_y = base_y + 40;
+            if (local_y >= layout_y && local_y < layout_y + 28 &&
+                local_x >= x + 120 && local_x < x + 120 + 160) {
+                dropdown_open(x + 120, layout_y - 3, 160, SM_VIEW_OPTS, SM_VIEW_OPTS_COUNT, &sm_view, sm_view_changed);
+                draw_all(); return;
+            }
+            int fav_y = base_y + 80;
+            if (local_x >= x + 220 && local_x < x + 268 && local_y >= fav_y && local_y < fav_y + 24) {
+                sm_show_fav = !sm_show_fav; sm_save(); draw_all(); return; }
+            int rec_y = base_y + 120;
+            if (local_x >= x + 220 && local_x < x + 268 && local_y >= rec_y && local_y < rec_y + 24) {
+                sm_show_recent = !sm_show_recent; sm_save(); draw_all(); return; }
+            int rc_y = base_y + 160;
+            if (local_y >= rc_y && local_y < rc_y + 16 && local_x >= x + 180 && local_x < x + 340) {
+                int v = ((local_x - (x + 180)) * 9) / 160 + 1;
+                if (v < 1) v = 1; if (v > 10) v = 10;
+                sm_recent_count = v; sm_save(); draw_all(); return; }
+            int fs_y = base_y + 200;
+            if (local_x >= x + 260 && local_x < x + 308 && local_y >= fs_y && local_y < fs_y + 24) {
+                sm_focus_search = !sm_focus_search; sm_save(); draw_all(); return; }
+            int w_y = base_y + 240;
+            if (local_y >= w_y && local_y < w_y + 16 && local_x >= x + 180 && local_x < x + 340) {
+                int v = ((local_x - (x + 180)) * 200) / 160 + 220;
+                if (v < 220) v = 220; if (v > 420) v = 420;
+                sm_width = v; sm_save(); draw_all(); return; }
+            int is_y = base_y + 280;
+            if (local_y >= is_y && local_y < is_y + 16 && local_x >= x + 180 && local_x < x + 340) {
+                int v = ((local_x - (x + 180)) * 14) / 160 + 14;
+                if (v < 14) v = 14; if (v > 28) v = 28;
+                sm_icon_size = v; sm_save(); draw_all(); return; }
+        } break;
+        case PANEL_DOCK: {
+            // Every y here comes from dock_panel_layout(), the SAME helper
+            // draw_dock_panel() calls - one geometry function, not two
+            // arithmetic chains that can drift (see this file's own "hit
+            // boxes that drift away from their controls" lesson, Mouse panel).
+            dock_layout_t L = dock_panel_layout();
+
+            if (local_y >= L.style_y - 3 && local_y < L.style_y - 3 + 28 &&
+                local_x >= x + 120 && local_x < x + 120 + 220) {
+                dropdown_open(x + 120, L.style_y - 3, 220, DOCK_OPTS, DOCK_OPTS_COUNT,
+                              &dock_style, dock_dd_changed);
+                draw_all(); return;
+            }
+
+            if (local_y >= L.opacity_y - 4 && local_y < L.opacity_y + 18 &&
+                local_x >= x + 120 && local_x < x + 120 + 170) {
+                int pct = ((local_x - (x + 120)) * 100) / 170;
+                if (pct < DOCK_OPACITY_FLOOR) pct = DOCK_OPACITY_FLOOR;
+                if (pct > 100) pct = 100;
+                pct = ((pct + 2) / 5) * 5;    // snap to 5 on release
+                if (pct < DOCK_OPACITY_FLOOR) pct = DOCK_OPACITY_FLOOR;
+                if (pct > 100) pct = 100;
+                dock_opacity = pct;
+                dock_opacity_write();
+                draw_all();
+                return;
+            }
+
+            for (int i = 0; i < g_dockfav_pinned_n; i++) {
+                int ry = L.row0_y + i * L.row_h;
+                int bx = x + CONTENT_WIDTH - 2 * PADDING - 82, by = ry + 1, bw = 74;
+                if (local_x >= bx && local_x < bx + bw && local_y >= by && local_y < by + 24) {
+                    dockfav_remove(g_dockfav_pinned[i]);
+                    draw_all(); return;
+                }
+            }
+
+            if (!L.full && L.has_candidates &&
+                local_y >= L.add_y - 3 && local_y < L.add_y - 3 + 28 &&
+                local_x >= x + 120 && local_x < x + 120 + 220) {
+                dropdown_open(x + 120, L.add_y - 3, 220, g_dockfav_dd_items, g_dockfav_cand_n + 1,
+                              &g_dockfav_add_sel, dockfav_add_dd_changed);
+                draw_all(); return;
+            }
+        } break;
         case PANEL_APPEARANCE: {
             // Theme dropdown (y ~ 65)
             int theme_y = base_y + 65;
             if (local_y >= theme_y && local_y < theme_y + 28 &&
                 local_x >= x && local_x < x + 220) {
-                dropdown_open(x, theme_y, 220, g_theme_names, NUM_THEMES,
+                dropdown_open(x, theme_y, 220, g_th_names, g_th_count,
                               &current_theme, theme_dd_changed);
                 draw_all();
                 return;
@@ -5073,7 +6683,7 @@ static void handle_content_click(int local_x, int local_y) {
             int font_y = color_y + 80;
             if (local_y >= font_y && local_y < font_y + 28 &&
                 local_x >= x + 120 && local_x < x + 120 + 160) {
-                dropdown_open(x + 120, font_y, 160, FONT_SIZE_OPTS, 4,
+                dropdown_open(x + 120, font_y, 160, FONT_SIZE_OPTS, FONT_SIZE_OPTS_COUNT,
                               &font_size, font_dd_changed);
                 draw_all(); return;
             }
@@ -5082,7 +6692,7 @@ static void handle_content_click(int local_x, int local_y) {
             int icon_y = font_y + 40;
             if (local_y >= icon_y && local_y < icon_y + 28 &&
                 local_x >= x + 120 && local_x < x + 120 + 160) {
-                dropdown_open(x + 120, icon_y, 160, ICON_SIZE_OPTS, 3,
+                dropdown_open(x + 120, icon_y, 160, ICON_SIZE_OPTS, ICON_SIZE_OPTS_COUNT,
                               &icon_size, icon_dd_changed);
                 draw_all(); return;
             }
@@ -5104,7 +6714,7 @@ static void handle_content_click(int local_x, int local_y) {
             int ss_y = icon_y + 115;
             if (local_y >= ss_y && local_y < ss_y + 28) {
                 if (local_x >= x && local_x < x + 160) {
-                    dropdown_open(x, ss_y, 160, SS_OPTS, 9,
+                    dropdown_open(x, ss_y, 160, SS_OPTS, SS_OPTS_COUNT,
                                   &screensaver_idx, ss_dd_changed);
                     draw_all(); return;
                 }
@@ -5123,23 +6733,11 @@ static void handle_content_click(int local_x, int local_y) {
                 draw_all(); return;
             }
 
-            // Cursor theme dropdown
-            int ctheme_y = ss_y + 95;
-            if (local_y >= ctheme_y && local_y < ctheme_y + 28 &&
-                local_x >= x && local_x < x + 160) {
-                dropdown_open(x, ctheme_y, 160, CURSOR_OPTS, 3,
-                              &cursor_theme, cursor_dd_changed);
-                draw_all(); return;
-            }
-
-            // #387 Dock style dropdown (below Cursor).
-            int dock_y = ctheme_y + 70;
-            if (local_y >= dock_y && local_y < dock_y + 28 &&
-                local_x >= x && local_x < x + 220) {
-                dropdown_open(x, dock_y, 220, DOCK_OPTS, 4,
-                              &dock_style, dock_dd_changed);
-                draw_all(); return;
-            }
+            // #745 task #67 "dockpanel": Dock Style dropdown and Dock glass
+            // opacity slider MOVED to PANEL_DOCK (see its own click-handler
+            // case below) along with their draw code. Transparency (the
+            // WINDOW opacity row, unrelated to the dock) now sits directly
+            // below the screensaver block with no dock row in between.
 
             // Wallpaper dropdown (right column, mirrors the other
             // setting dropdowns above rather than a per-cell thumbnail grid).
@@ -5156,8 +6754,9 @@ static void handle_content_click(int local_x, int local_y) {
 
             // Transparency slider (#112): click anywhere on the 200px track to set
             // the global window opacity. Applied live; the compositor persists it.
-            // #387: shifted down by the Dock Style row (dock_y + its 70px block).
-            int tr_y = dock_y + 70;
+            // #745 task #67: now directly below the screensaver block (the Dock
+            // Style row that used to sit between them is gone from this panel).
+            int tr_y = ss_y + 95;
             if (local_y >= tr_y - 4 && local_y < tr_y + 18 &&
                 local_x >= x + 120 && local_x < x + 120 + 170) {
                 int pct = ((local_x - (x + 120)) * 100) / 170;
@@ -5398,9 +6997,12 @@ static void handle_content_click(int local_x, int local_y) {
         }
 
         case PANEL_MOUSE: {
+            // #745: every hit box below comes from the SAME mouse_geom() the
+            // draw pass uses, so a control and its hit box cannot drift apart.
+            mouse_geom_t m; mouse_geom(&m);
+
             // Pointer speed slider
-            int speed_y = base_y + 65;
-            if (local_y >= speed_y && local_y < speed_y + 16 &&
+            if (local_y >= m.sens && local_y < m.sens + 16 &&
                 local_x >= x + 140 && local_x < x + 390) {
                 pointer_speed = ((local_x - x - 140) * 100) / 250;
                 if (pointer_speed < 0) pointer_speed = 0;
@@ -5411,8 +7013,7 @@ static void handle_content_click(int local_x, int local_y) {
             }
 
             // Double-click speed slider
-            int dbl_y = speed_y + 35;
-            if (local_y >= dbl_y && local_y < dbl_y + 16 &&
+            if (local_y >= m.dbl && local_y < m.dbl + 16 &&
                 local_x >= x + 160 && local_x < x + 390) {
                 double_click_speed = ((local_x - x - 160) * 100) / 230;
                 if (double_click_speed < 0) double_click_speed = 0;
@@ -5422,42 +7023,43 @@ static void handle_content_click(int local_x, int local_y) {
             }
 
             // Pointer trails toggle
-            int trails_y = dbl_y + 90;
-            if (local_y >= trails_y && local_y < trails_y + 24 &&
+            if (local_y >= m.trails && local_y < m.trails + 24 &&
                 local_x >= x + 300 && local_x < x + 348) {
                 pointer_trails = !pointer_trails;
                 draw_all();
                 return;
             }
 
-            // Trail length slider (only when pointer_trails enabled)
-            if (pointer_trails) {
-                int trl_y = trails_y + 35;
-                if (local_y >= trl_y && local_y < trl_y + 16 &&
-                    local_x >= x + 140 && local_x < x + 290) {
-                    pointer_trail_length = ((local_x - x - 140) * 10) / 150;
-                    if (pointer_trail_length < 1) pointer_trail_length = 1;
-                    if (pointer_trail_length > 10) pointer_trail_length = 10;
-                    draw_all(); return;
-                }
+            // Trail length slider (only present when pointer_trails is on)
+            if (m.traillen >= 0 &&
+                local_y >= m.traillen && local_y < m.traillen + 16 &&
+                local_x >= x + 140 && local_x < x + 290) {
+                pointer_trail_length = ((local_x - x - 140) * 10) / 150;
+                if (pointer_trail_length < 1) pointer_trail_length = 1;
+                if (pointer_trail_length > 10) pointer_trail_length = 10;
+                draw_all(); return;
+            }
+
+            // Cursor style dropdown (#745: moved here from Appearance).
+            // cursor_dd_changed() is the ONLY writer of the live cursor.
+            if (local_y >= m.cursor && local_y < m.cursor + 28 &&
+                local_x >= x + 140 && local_x < x + 300) {
+                dropdown_open(x + 140, m.cursor, 160, CURSOR_OPTS, CURSOR_OPTS_COUNT,
+                              &cursor_theme, cursor_dd_changed);
+                draw_all(); return;
+            }
+
+            // Scroll speed slider
+            if (local_y >= m.scrollspd && local_y < m.scrollspd + 16 &&
+                local_x >= x + 140 && local_x < x + 340) {
+                scroll_speed = ((local_x - x - 140) * 100) / 200;
+                if (scroll_speed < 0) scroll_speed = 0;
+                if (scroll_speed > 100) scroll_speed = 100;
+                draw_all(); return;
             }
 
             // Natural scrolling toggle
-            int nat_y = trails_y + (pointer_trails ? 110 : 75);
-
-            // Scroll speed slider (section before natural scrolling)
-            {
-                int scroll_spd_y = nat_y - 35;
-                if (local_y >= scroll_spd_y && local_y < scroll_spd_y + 16 &&
-                    local_x >= x + 140 && local_x < x + 340) {
-                    scroll_speed = ((local_x - x - 140) * 100) / 200;
-                    if (scroll_speed < 0) scroll_speed = 0;
-                    if (scroll_speed > 100) scroll_speed = 100;
-                    draw_all(); return;
-                }
-            }
-
-            if (local_y >= nat_y && local_y < nat_y + 24 &&
+            if (local_y >= m.natural && local_y < m.natural + 24 &&
                 local_x >= x + 300 && local_x < x + 348) {
                 natural_scrolling = !natural_scrolling;
                 draw_all();
@@ -5465,8 +7067,7 @@ static void handle_content_click(int local_x, int local_y) {
             }
 
             // Scroll inertia toggle
-            int inert_y = nat_y + 55;
-            if (local_y >= inert_y && local_y < inert_y + 24 &&
+            if (local_y >= m.inertia && local_y < m.inertia + 24 &&
                 local_x >= x + 300 && local_x < x + 348) {
                 scroll_inertia = !scroll_inertia;
                 draw_all();
@@ -5474,8 +7075,7 @@ static void handle_content_click(int local_x, int local_y) {
             }
 
             // Left-handed toggle
-            int left_y = inert_y + 70;
-            if (local_y >= left_y && local_y < left_y + 24 &&
+            if (local_y >= m.lefthand && local_y < m.lefthand + 24 &&
                 local_x >= x + 300 && local_x < x + 348) {
                 left_handed = !left_handed;
                 draw_all();
@@ -5511,7 +7111,7 @@ static void handle_content_click(int local_x, int local_y) {
             int tz_y = fmt_y + 70;
             if (local_y >= tz_y && local_y < tz_y + 28 &&
                 local_x >= x && local_x < x + 350) {
-                dropdown_open(x, tz_y, 350, timezones, NUM_TIMEZONES,
+                dropdown_open(x, tz_y, 350, tz_labels(), tz_count(),
                               &timezone_idx, update_timezone_offset);
                 draw_all(); return;
             }
@@ -5520,7 +7120,7 @@ static void handle_content_click(int local_x, int local_y) {
             int dfmt_y = fmt_y + 95;
             if (local_y >= dfmt_y && local_y < dfmt_y + 28 &&
                 local_x >= x && local_x < x + 160) {
-                dropdown_open(x, dfmt_y, 160, DATE_FMT_OPTS, 3, &date_format, 0);
+                dropdown_open(x, dfmt_y, 160, DATE_FMT_OPTS, DATE_FMT_OPTS_COUNT, &date_format, 0);
                 draw_all(); return;
             }
 
@@ -5543,12 +7143,12 @@ static void handle_content_click(int local_x, int local_y) {
                     local_x >= x && local_x < x + 160) {
                     modal_mode = MODAL_SET_DATETIME;
                     modal_num_fields = 2;
-                    int rh = 0, rm = 0, rs = 0;
-                    int rd = 1, rmo = 1, ry = 2026;
-                    get_rtc_time(&rh, &rm, &rs);
-                    get_rtc_date(&rd, &rmo, &ry);
-                    format_hms(modal_field[0], rh, rm, rs);
-                    format_ymd(modal_field[1], ry, rmo, rd);
+                    // #49: seed with LOCAL time. The field is what the user
+                    // reads off their wall, so it must match the taskbar; the
+                    // commit path below converts it back to UTC for the RTC.
+                    tz_time_t nowl; tz_local_now(&nowl);
+                    format_hms(modal_field[0], nowl.hour, nowl.min, nowl.sec);
+                    format_ymd(modal_field[1], nowl.year, nowl.month, nowl.day);
                     modal_cursor[0] = 8;
                     modal_cursor[1] = 10;
                     modal_cursor[2] = 0;
@@ -5570,17 +7170,22 @@ static void handle_content_click(int local_x, int local_y) {
                 modal_num_fields = 2;
                 copy_to_modal_field(0, users[current_user_idx].fullname);
                 copy_to_modal_field(1, users[current_user_idx].email);
+                modal_avatar_idx = avatar_palette_index_for(
+                    users[current_user_idx].avatar_color, users[current_user_idx].uid);
                 modal_active_field = 0;
                 modal_error[0] = '\0';
                 draw_all(); return;
             }
 
-            // Auto-login toggle
+            // Auto-login toggle (#566: real, targets the CURRENT user's own
+            // account - always allowed, but a non-root session still needs
+            // that account's password, collected via MODAL_AUTOLOGIN_PW).
             int al_y = base_y + 180;
             if (local_y >= al_y && local_y < al_y + 24 &&
-                local_x >= x + 300 && local_x < x + 348) {
-                auto_login = !auto_login;
-                draw_all();
+                local_x >= x + 340 && local_x < x + 388) {
+                int is_al_cur = (autologin_user[0] &&
+                                 strcmp(autologin_user, users[current_user_idx].username) == 0);
+                autologin_request(users[current_user_idx].username, !is_al_cur);
                 return;
             }
 
@@ -5598,13 +7203,24 @@ static void handle_content_click(int local_x, int local_y) {
                 return;
             }
 
-            // Per-user "Remove" buttons in the Other Users list. Mirrors the
-            // row layout in draw_users_panel (rows from base_y+310, 60px pitch).
+            // Per-user "Remove" buttons (+ root-only Auto-login toggle) in the
+            // Other Users list. Mirrors the row layout in draw_users_panel
+            // (rows from base_y+310, 60px pitch).
             {
                 int row_y = base_y + 310;
                 for (int i = 0; i < user_count; i++) {
                     if (i == current_user_idx) continue;
                     if (users[i].username[0] == 0) continue;
+                    // (#566) Root-only: set/clear autologin for this OTHER
+                    // account (kernel ABI - "root sets for anyone", no
+                    // password needed since Settings cannot know it).
+                    if (settings_is_root() &&
+                        local_x >= x + 290 && local_x < x + 390 &&
+                        local_y >= row_y + 13 && local_y < row_y + 37) {
+                        int is_al = (autologin_user[0] && strcmp(autologin_user, users[i].username) == 0);
+                        autologin_request(users[i].username, !is_al);
+                        return;
+                    }
                     if (local_x >= x + 400 && local_x < x + 480 &&
                         local_y >= row_y + 13 && local_y < row_y + 37) {
                         if (users[i].role == 0) {
@@ -5768,9 +7384,13 @@ static void handle_content_click(int local_x, int local_y) {
         }
 
         case PANEL_ABOUT: {
-            // Button row: Check Updates, Export Debug, Credits
-            int about_btn_y = base_y + 40 + 115 + 155 + 25 + 25 + 35;
-            if (local_y >= about_btn_y && local_y < about_btn_y + 30) {
+            // Button row: Check Updates, Export Debug, Credits. The y comes
+            // from the draw (g_about_btn_y), never from a re-derived section
+            // total; see that variable's declaration for the 126px drift this
+            // replaces. draw_button() uses a fixed height of 30.
+            int about_btn_y = g_about_btn_y;
+            if (about_btn_y > 0 &&
+                local_y >= about_btn_y && local_y < about_btn_y + 30) {
                 // Check Updates
                 if (local_x >= x && local_x < x + 130) {
                     about_status = 1; draw_all(); return;
@@ -5896,16 +7516,29 @@ static void write_setvals(void) {
     { int h=0,m=0,s=0,d=1,mo=1,yr=2026; get_rtc_time(&h,&m,&s); get_rtc_date(&d,&mo,&yr);
       char tb[12]; format_hms(tb,h,m,s); sv_kvs("rtc_time_utc", tb);
       char db[12]; format_ymd(db,yr,mo,d); sv_kvs("rtc_date", db); }
-    sv_kvs("timezone", timezones[timezone_idx]);
-    sv_kvi("tz_offset_min", timezone_offset_minutes);
+    // #49: the ID string is what is actually on disk in TZ.CFG; publish that
+    // (not the pretty label) so a support dump can be compared to the file.
+    sv_kvs("timezone", tz_id(tz_index()));
+    sv_kvs("timezone_label", tz_label(tz_index()));
+    sv_kvi("tz_offset_min", tz_offset_minutes());
+    sv_kvi("tz_is_set", tz_is_set() ? 1 : 0);
+    { tz_time_t lt2; tz_local_now(&lt2);
+      char lb[12]; format_hms(lb, lt2.hour, lt2.min, lt2.sec); sv_kvs("local_time", lb);
+      char ld[12]; format_ymd(ld, lt2.year, lt2.month, lt2.day); sv_kvs("local_date", ld); }
 
     // ---- Appearance ----
     sv_raw("\n[Appearance]\n");
-    sv_kvs("theme", g_theme_names[current_theme]);
+    sv_kvs("theme", (current_theme >= 0 && current_theme < g_th_count) ? g_th[current_theme].slug : "");
     sv_kvi("accent_idx", accent_color_idx);
-    sv_kvs("dock_style", DOCK_OPTS[dock_style]);
+    sv_kvs("dock_style", DOCK_OPTS[DOCK_CLAMP(dock_style)]);
+    // #745: publish both the picker's index and the kernel's live value so
+    // "did opening Settings change the cursor?" can be answered from a file
+    // over serial/SSH, with no mouse and no screenshot (#334).
+    sv_kvs("cursor_style", CURSOR_OPTS[OPT_CLAMP(cursor_theme, CURSOR_OPTS)]);
+    { int _pk = get_cursor(); sv_kvi("cursor_style_kernel", (_pk >= 0) ? (_pk & 0xFF) : -1); }
     sv_kvi("wallpaper_idx", wallpaper_idx);
     sv_kvi("transparency_pct", transparency_level);
+    sv_kvi("dock_opacity_pct", dock_opacity);   // #745
 
     // ---- Users ----
     sv_raw("\n[Users]\n");
@@ -5935,10 +7568,10 @@ static void write_setvals(void) {
         sv_raw(" @ "); sv_raw(g_printers[i].host); sv_raw("\n");
     }
 
-    int fd = sys_open("/SETVALS.TXT", 0x0001 | 0x0040 | 0x0200);  // O_WRONLY|O_CREAT|O_TRUNC
-    if (fd < 0) return;
-    sys_write(fd, g_sv_buf, (unsigned long)g_sv_len);
-    sys_close(fd);
+    // #743: diagnostic dump. Result consumed, and reported through the
+    // breadcrumb log (unlike setlog() itself, this one cannot recurse).
+    if (userconf_write_all("/SETVALS.TXT", g_sv_buf, (unsigned long)g_sv_len) != 0)
+        save_failed("SETVALS.TXT (diagnostic dump)");
 }
 
 // =============================================================================
@@ -5950,6 +7583,7 @@ int main(int argc, char **argv) {
     (void)argv;
 
     wp_init();   // #517: enumerate wallpapers from the image (shared with compositor)
+    th_init();   // #565: enumerate themes from /THEMES/INDEX.TXT
 
     // #3: startup breadcrumbs. If the next iMac boot fails to show the Settings
     // window, /SETLOG.TXT will end at the last step reached.
@@ -6014,17 +7648,19 @@ int main(int argc, char **argv) {
         set_settings_tab(-1);
     }
 
-    // Sync current_theme from the actual running kernel theme so buttons
-    // highlight the correct selection when the window opens.
+    // (#565) Sync current_theme from /CONFIG/THEME.CFG's active slug so the
+    // dropdown highlights the correct selection when the window opens. This
+    // replaces a hardcoded kernel-index switch (dark=1/light=2/classic=4/...)
+    // that only knew about the 12 themes that used to be compiled into the
+    // kernel; a file-based/App-Store-installed theme has no fixed index, so
+    // slug is the only stable identity now.
     {
-        int kt = get_theme();
-        switch (kt) {
-            case 1: current_theme = 0; break;  // Dark
-            case 2: current_theme = 1; break;  // Light
-            case 4: current_theme = 2; break;  // Classic
-            case 5: current_theme = 3; break;  // Ocean
-            case 9: current_theme = 4; break;  // Nord
-            default: current_theme = 0; break;
+        char active_slug[GUI_THEME_SLUG_MAX];
+        current_theme = 0;
+        if (gui_theme_get_active_slug(active_slug, sizeof(active_slug)) && active_slug[0]) {
+            for (int i = 0; i < g_th_count; i++) {
+                if (strcmp(g_th[i].slug, active_slug) == 0) { current_theme = i; break; }
+            }
         }
     }
 
@@ -6033,30 +7669,100 @@ int main(int argc, char **argv) {
     settings_load();
     alerts_load();
     privacy_load();          // (#382 pass2) restore persisted privacy settings
+    sm_load();               // (#: Start Menu uplift) restore persisted Start Menu prefs
     setlog("SET: settings_load done");
     // #387: read the compositor's current dock style so the picker shows it.
     {
-        int fd = sys_open("/DOCKSTYL.CFG", 0 /*O_RDONLY*/);
+        int fd = userconf_open_read("DOCKSTYL.CFG", "/DOCKSTYL.CFG");  // #683
         if (fd >= 0) {
             char c = 0;
-            if (sys_read(fd, &c, 1) == 1 && c >= '0' && c <= '3') dock_style = c - '0';
+            // #745: the accepted digit range comes from DOCK_OPTS_COUNT. It used
+            // to be a literal '4', a third place that had to be edited by hand
+            // whenever a dock style was added.
+            if (sys_read(fd, &c, 1) == 1 &&
+                c >= '0' && c < (char)('0' + DOCK_OPTS_COUNT)) dock_style = c - '0';
             sys_close(fd);
+        }
+    }
+    // #745-rootcause: this was an unconditional set_cursor() call, a
+    // PUSH of Settings' own last-persisted index into the kernel
+    // on every launch - the identical anti-pattern #560 fixed for the
+    // screensaver a few lines below, and left flagged in blame.md as an
+    // unfixed follow-up. It bit for real because the shipped asset base
+    // carries a stale /SETTINGS.CFG containing `c=2` (Glow) while
+    // /UIPROFIL.YML carries `curstyle: 0`, so merely OPENING Settings, for any
+    // reason, replaced the user's arrow with the pulsing Glow disc - nobody
+    // ever touched the picker. Now a READ-ONLY sync FROM live kernel state
+    // (same shape as the current_theme and screensaver syncs): opening
+    // Settings cannot mutate the cursor, the picker shows what is actually
+    // running, and an out-of-range kernel value falls back to 0, the normal
+    // Light arrow. Glow is never a fallback, only an explicit choice.
+    {
+        int pk = get_cursor();                        /* style | size<<8 */
+        int kstyle = (pk >= 0) ? (pk & 0xFF) : 0;
+        cursor_theme = OPT_CLAMP(kstyle, CURSOR_OPTS);
+    }
+    setlog("SET: cursor synced from kernel (read-only)");
+    // (#745) Same for the glass opacity, so the slider opens showing what the
+    // compositor is ACTUALLY using rather than whatever Settings last wrote.
+    // The CFG file stays authoritative on load; the SETTINGS.CFG mirror is for
+    // Settings' own restore only, so the two can never fight.
+    {
+        int fd = userconf_open_read("DOCKOPAC.CFG", "/DOCKOPAC.CFG");  // #683
+        if (fd >= 0) {
+            char b[8];
+            long n = sys_read(fd, b, sizeof(b) - 1);
+            sys_close(fd);
+            if (n > 0) {
+                b[n] = 0;
+                int v = 0, any = 0;
+                for (long i = 0; i < n && b[i] >= '0' && b[i] <= '9'; i++) {
+                    v = v * 10 + (b[i] - '0'); any = 1;
+                }
+                if (any && v >= DOCK_OPACITY_FLOOR && v <= 100) dock_opacity = v;
+            }
         }
     }
     if (cursor_theme < 0 || cursor_theme > 2) cursor_theme = 0;
     set_cursor(cursor_theme, 100);   // (#116) sync kernel cursor with loaded pref
     setlog("SET: cursor applied");
-    if (screensaver_idx < 0 || screensaver_idx > 8) screensaver_idx = 1;
-    set_screensaver(SS_KERNEL_MAP[screensaver_idx]);   // (#115) sync saver type
-    if (screensaver_delay_min < 1) screensaver_delay_min = 2;
-    set_ss_delay(screensaver_delay_min * 60);           // (#115) sync activation delay
+    // #560-rootcause: SYNC FROM the live kernel state instead of pushing
+    // Settings' own last-persisted idx/delay INTO the kernel unconditionally.
+    // Settings keeps its own copy of "which screensaver" in SETTINGS.CFG (a
+    // different file, a different index space, from the compositor's
+    // UIPROFIL.YML/set_screensaver() kernel state). The old code pushed that
+    // stale local copy into the kernel on EVERY Settings launch, so merely
+    // opening Settings for any reason (not touching the screensaver picker at
+    // all) silently reverted whatever type/delay had been set through
+    // UIPROFIL.YML, the tray menu, or AI chat back to whatever Settings last
+    // remembered. Read-only sync here (same pattern as the current_theme sync
+    // above) so opening Settings can never change what is currently running;
+    // the type/delay only change when the user actually picks a new one in
+    // this session (ss_dd_changed / the Apply Delay button).
+    {
+        int kss = get_screensaver();
+        int found = -1;
+        for (int i = 0; i < SS_OPTS_COUNT; i++) {
+            if (SS_KERNEL_MAP[i] == kss) { found = i; break; }
+        }
+        screensaver_idx = (found >= 0) ? found : 1;   // 1=Starfield if unmapped
+    }
+    {
+        int kdelay = get_ss_delay();
+        // #652: fallback was 2 minutes while the kernel default is now 600s.
+        // A fallback that disagrees with the real default silently shows the
+        // user a number the system is not using.
+        screensaver_delay_min = (kdelay >= 5) ? ((kdelay + 59) / 60) : 10;
+    }
 
     // Apply initial theme colors (also calls set_theme to confirm kernel state)
     apply_theme(current_theme);
     setlog("SET: theme applied");
 
-    // Initialize timezone offset from current selection
-    update_timezone_offset();
+    // #49/#50: adopt THE shared setting. Order matters: settings_load() has
+    // already run, so legacy_tz_idx is populated if this install had a zone
+    // stored under the old private 't' key.
+    settings_tz_init();
 
     // Populate initial network data
     setlog("SET: net probe begin");
@@ -6150,6 +7856,52 @@ int main(int argc, char **argv) {
 
         settings_autosave();   // persist Settings-app prefs when they change
 
+        // (#704) Settings caches theme colors into COL_* globals inside
+        // apply_theme(), set once at startup and on an explicit user action
+        // (theme dropdown, accent swatch). Unlike an app that calls
+        // theme_color() live from its draw function, Settings will NOT pick
+        // up a live .mtheme file edit just because the compositor's poll
+        // reloaded the kernel's live table and forced an EVENT_REDRAW
+        // (SYS_WM_FORCE_REDRAW_ALL): fb_redraw() would just repaint the same
+        // stale COL_* values. So Settings needs its own copy of the same
+        // throttled poll (dock_style_poll()/startmenu_prefs_poll() idiom,
+        // ~2s) to notice the file changed and re-run apply_theme(). Cheap:
+        // gui_theme_poll_reload() is a content-hash compare against a small
+        // buffer, not a redraw, and no-ops when nothing changed.
+        {
+            static uint64_t s_theme_poll_due = 0;
+            uint64_t now_tp = uptime_ms();
+            if (now_tp >= s_theme_poll_due) {
+                s_theme_poll_due = now_tp + 2000;
+                if (gui_theme_poll_reload()) {
+                    apply_theme(current_theme);
+                    draw_all();
+                }
+            }
+        }
+
+        // (#745 task #67) While the Dock panel is open, re-read the pinned
+        // favourites every ~2s (same throttled idiom as the theme poll just
+        // above) so a right-click Pin/Unpin done directly in the live dock
+        // is reflected here without the user having to leave and re-enter
+        // the panel. Cheap: a small STARTMENU.CFG read, not a full redraw,
+        // unless the pinned set actually changed.
+        if (current_panel == PANEL_DOCK) {
+            static uint64_t s_dockfav_poll_due = 0;
+            uint64_t now_df = uptime_ms();
+            if (now_df >= s_dockfav_poll_due) {
+                s_dockfav_poll_due = now_df + 2000;
+                int old_n = g_dockfav_pinned_n;
+                char old_paths[DOCKFAV_MAX][128];
+                for (int i = 0; i < old_n; i++) copy_str(old_paths[i], g_dockfav_pinned[i], sizeof(old_paths[0]));
+                dockfav_refresh_pinned();
+                int changed = (g_dockfav_pinned_n != old_n);
+                if (!changed) for (int i = 0; i < old_n; i++)
+                    if (strcmp(old_paths[i], g_dockfav_pinned[i]) != 0) { changed = 1; break; }
+                if (changed) { dockfav_rebuild_candidates(); draw_all(); }
+            }
+        }
+
         // #74/#382: honour a live tab-switch request even while already open, so
         // the desktop context menu (or a repeated "Display Settings") retargets
         // this window's panel instead of doing nothing. One-shot; -1 = no request.
@@ -6206,6 +7958,19 @@ int main(int argc, char **argv) {
             case EVENT_KEY_DOWN:
                 // Route all keypresses to the modal dialog if one is active
                 if (modal_mode != MODAL_NONE) {
+                    // (local 71) Credits is a scrollable document, so the shared
+                    // scroll primitive gets first refusal on the navigation
+                    // keys. This is the ONLY route to the rest of the list
+                    // wherever the pointer has no wheel (the Magic Mouse on the
+                    // iMac14,4 target, #438) or the mouse is dead. It returns 0
+                    // for keys it does not own, so ESC/Tab/Enter still work.
+                    if (modal_mode == MODAL_CREDITS) {
+                        credits_layout();
+                        if (gui_scroll_key(&g_credits_scroll, event.keycode)) {
+                            draw_all();
+                            break;
+                        }
+                    }
                     if (event.key_char == 27) {  // ESC: cancel
                         modal_mode = MODAL_NONE;
                         draw_all();
@@ -6247,16 +8012,17 @@ int main(int argc, char **argv) {
                 // preview via on_change, like clicking), and Enter/Space/Esc close it.
                 // Previously Up/Down moved the focus ring instead, so list keys did nothing.
                 if (g_dd_open && g_dd_sel) {
-                    int vis = g_dd_count < DD_VISIBLE ? g_dd_count : DD_VISIBLE;
                     if (event.keycode == 0x80) {                 // Up
+                        dropdown_refresh();
                         if (*g_dd_sel > 0) (*g_dd_sel)--;
-                        if (*g_dd_sel < g_dd_scroll) g_dd_scroll = *g_dd_sel;
+                        gui_scroll_reveal(&g_dd_list.scroll, *g_dd_sel * DD_ROW, DD_ROW);
                         if (g_dd_on_change) g_dd_on_change();
                         draw_all(); break;
                     }
                     if (event.keycode == 0x81) {                 // Down
+                        dropdown_refresh();
                         if (*g_dd_sel < g_dd_count - 1) (*g_dd_sel)++;
-                        if (*g_dd_sel >= g_dd_scroll + vis) g_dd_scroll = *g_dd_sel - vis + 1;
+                        gui_scroll_reveal(&g_dd_list.scroll, *g_dd_sel * DD_ROW, DD_ROW);
                         if (g_dd_on_change) g_dd_on_change();
                         draw_all(); break;
                     }
@@ -6322,8 +8088,9 @@ int main(int argc, char **argv) {
 
                 // If modal is open, only handle modal clicks
                 if (modal_mode != MODAL_NONE) {
-                    // dh MUST match draw_modal exactly or the button hit-test misses.
-                    int dw = 360;
+                    // dw/dh MUST match draw_modal exactly or the button
+                    // hit-test misses; both now come from the shared helpers.
+                    int dw = modal_dw();
                     int dh = modal_dh();
                     int dx = (WIN_WIDTH  - dw) / 2;
                     int dy = (WIN_HEIGHT - dh) / 2;
@@ -6333,7 +8100,13 @@ int main(int argc, char **argv) {
                         if (local_y >= by && local_y < by + 30 &&
                             local_x >= dx + dw - 96 && local_x < dx + dw - 16) {
                             modal_mode = MODAL_NONE; draw_all();
+                            break;
                         }
+                        // A press in the scrollbar gutter belongs to the
+                        // scrollbar: grab the thumb, or page toward the click.
+                        credits_layout();
+                        if (gui_scroll_press(&g_credits_scroll, local_x, local_y))
+                            draw_all();
                         break;
                     }
                     // Field click: select field
@@ -6347,6 +8120,24 @@ int main(int argc, char **argv) {
                             draw_all();
                             hit_field = 1;
                             break;
+                        }
+                    }
+                    // (#745) Picture picker swatch click, MODAL_EDIT_PROFILE
+                    // only - geometry MUST match draw_modal()'s swatch row
+                    // exactly (same reason the dh comment above gives for the
+                    // OK/Cancel buttons), so it reuses modal_avatar_row_y().
+                    if (!hit_field && modal_mode == MODAL_EDIT_PROFILE) {
+                        int ay = modal_avatar_row_y(dy);
+                        int sx = dx + 60;
+                        for (int i = 0; i < 8; i++) {
+                            int cx = sx + i * 30, cy = ay + 32;
+                            int ddx = local_x - cx, ddy = local_y - cy;
+                            if (ddx * ddx + ddy * ddy <= 15 * 15) {
+                                modal_avatar_idx = i;
+                                draw_all();
+                                hit_field = 1;
+                                break;
+                            }
                         }
                     }
                     if (!hit_field) {
@@ -6386,6 +8177,15 @@ int main(int argc, char **argv) {
                 int local_x = event.mouse_x;
                 int local_y = event.mouse_y;
 
+                // (local 71) A modal owns the pointer. Route the drag to the
+                // credits scrollbar and do not also run the hover tracker for
+                // controls that are behind the dialog.
+                if (modal_mode == MODAL_CREDITS) {
+                    if (gui_scroll_motion(&g_credits_scroll, local_x, local_y))
+                        draw_all();
+                    break;
+                }
+
                 // (#267) feed the hover-tooltip tracker (window-relative coords).
                 g_help_lx = local_x; g_help_ly = local_y;
                 help_ui_tick(local_x, local_y, uptime_ms());
@@ -6409,15 +8209,34 @@ int main(int argc, char **argv) {
             // stay stuck to the pointer. Any future drag interaction needs this.
             case EVENT_MOUSE_UP:
                 gui_scroll_release(&g_side_scroll);
+                gui_scroll_release(&g_credits_scroll);   // (local 71)
                 break;
 
             case EVENT_MOUSE_SCROLL: {
-                // An open dropdown scrolls its list
+                // (local 71) A modal owns the wheel. Before this, wheel events
+                // fell straight through to the sidebar and content branches
+                // while a dialog was up, scrolling what was behind it.
+                if (modal_mode == MODAL_CREDITS) {
+                    credits_layout();
+                    if (gui_scroll_wheel(&g_credits_scroll, event.scroll_delta))
+                        draw_all();
+                    break;
+                }
+                if (modal_mode != MODAL_NONE) break;
+
+                // An open dropdown scrolls its list. Uses gui_scroll_by()
+                // directly rather than gui_scroll_wheel() (#512) to keep this
+                // widget's established one-row-per-notch feel; gui_scroll_by
+                // still owns the clamp against gui_scroll_max() instead of
+                // the hand-rolled "vis"/count clamp this used to do.
+                // Root-cause fix (shared gui_list primitive): gate on
+                // gui_list_hit() - anywhere over the popup's full box,
+                // scrollbar gutter included - instead of applying to the
+                // popup no matter where the cursor is in the whole window.
                 if (g_dd_open) {
-                    int vis = g_dd_count < DD_VISIBLE ? g_dd_count : DD_VISIBLE;
-                    g_dd_scroll -= event.scroll_delta;
-                    if (g_dd_scroll > g_dd_count - vis) g_dd_scroll = g_dd_count - vis;
-                    if (g_dd_scroll < 0) g_dd_scroll = 0;
+                    dropdown_refresh();
+                    if (gui_list_hit(&g_dd_list, event.mouse_x, event.mouse_y))
+                        gui_scroll_by(&g_dd_list.scroll, -event.scroll_delta * DD_ROW);
                     draw_all();
                     break;
                 }

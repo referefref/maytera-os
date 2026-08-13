@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // textfield.h - Reusable cursor-aware single-line text input field for
 // MayteraOS user-space applications.
 //

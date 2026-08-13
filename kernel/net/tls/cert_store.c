@@ -1,7 +1,13 @@
-#pragma GCC diagnostic ignored "-Wunused-variable"
-#pragma GCC diagnostic ignored "-Wunused-parameter"
-#pragma GCC diagnostic ignored "-Wunused-const-variable"
-#pragma GCC diagnostic ignored "-Wimplicit-function-declaration"
+// #tls-suppressfix: this file used to open with four blanket suppressions:
+//     -Wunused-variable  -Wunused-parameter
+//     -Wunused-const-variable  -Wimplicit-function-declaration
+// They are gone, and they are not coming back at file scope. A file-wide
+// suppression in the code that decides whether a certificate is genuine is a
+// standing agreement not to be told about a whole class of mistake in the one
+// place it matters most. -Wunused-const-variable is what would have reported
+// that the keyUsage OIDs were referenced by nothing (the keyUsage hole), and
+// -Wunused-parameter is what reported that cert_parse_pem() accepted a length
+// bound and then ignored it (fixed below). Both were being silenced.
 // cert_store.c - X.509 Certificate Store for MayteraOS
 // Provides certificate storage, parsing, and chain validation
 
@@ -15,6 +21,7 @@
 #include "../../fs/netfs.h"   // vfs_open/vfs_read/vfs_close (#fix-tls-certverify: was
                               // implicitly declared with a bogus vfs_open(path,0) call)
 #include "../../fs/fat.h"     // fat_read_file(&g_fat_fs, path, ...): the actual
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
                               // boot-root reader used throughout the kernel
                               // (desktop.c, editor.c, services.c, perms.c) -
                               // transparently redirects to the ext2 root when
@@ -28,6 +35,45 @@
 
 // RTC read (gui/clock.c) - used for real notBefore/notAfter validity checks
 // instead of the old hardcoded "2026-01-15" placeholder clock.
+// ---------------------------------------------------------------------------
+// #tls-certfix: name matching, usage and constraint policy live in Rust
+// (rustkern/certname.rs). See that file for what was wrong and why it is one
+// module. This is NEW code with no C twin and no -DRUST_* fallback: a second,
+// weaker way to decide whether a certificate authorises a hostname is exactly
+// what we are removing.
+// ---------------------------------------------------------------------------
+typedef struct {
+    int is_ca;
+    int path_len;       // -1 when pathLenConstraint is absent
+    uint32_t key_usage;
+    uint32_t eku;
+    int ku_present;
+    int eku_present;
+} cert_node_t;
+
+extern int cert_hostname_match_rs(const cert_san_t *sans, uint32_t san_count,
+                                  int dns_san_present,
+                                  const uint8_t *cn, uint32_t cn_len,
+                                  const uint8_t *host, uint32_t host_len);
+extern int cert_san_parse_rs(const uint8_t *der, uint32_t len,
+                             cert_san_t *out, uint32_t cap, int *dns_seen);
+extern int cert_ku_parse_rs(const uint8_t *der, uint32_t len, uint32_t *out);
+extern int cert_eku_parse_rs(const uint8_t *der, uint32_t len, uint32_t *out);
+extern int cert_chain_policy_rs(const cert_node_t *nodes, uint32_t count);
+
+#define CERT_POLICY_OK           0
+#define CERT_POLICY_BAD_USAGE   -1
+#define CERT_POLICY_BAD_PATHLEN -2
+#define CERT_POLICY_NOT_CA      -3
+
+// The FFI is only as good as the layouts agreeing. A silent divergence here
+// would not crash; it would read the wrong field and quietly authorise the
+// wrong hostname, which is the failure mode worth spending a static assert on.
+_Static_assert(sizeof(cert_san_t) == 8 + CERT_MAX_CN_LENGTH,
+               "cert_san_t must match CertSan in rustkern/certname.rs");
+_Static_assert(sizeof(cert_node_t) == 24,
+               "cert_node_t must match CertNode in rustkern/certname.rs");
+
 extern void rtc_read_time(int *hour, int *minute, int *second);
 extern void rtc_read_date(int *day, int *month, int *year, int *weekday);
 
@@ -102,8 +148,7 @@ static int asn1_skip(asn1_ctx_t *ctx) {
 static int asn1_enter_sequence(asn1_ctx_t *ctx, asn1_ctx_t *inner) {
     uint8_t tag;
     size_t len;
-    size_t start = ctx->pos;
-    
+
     if (asn1_get_tag_len(ctx, &tag, &len) < 0) return -1;
     if (tag != ASN1_SEQUENCE && tag != ASN1_SET) return -1;
     if (ctx->pos + len > ctx->len) return -1;
@@ -171,9 +216,22 @@ static int asn1_get_string(asn1_ctx_t *ctx, char *buf, size_t buf_len) {
         return -1;
     }
     
-    size_t copy_len = (len < buf_len - 1) ? len : buf_len - 1;
-    memcpy(buf, ctx->data + ctx->pos, copy_len);
-    buf[copy_len] = '\0';
+    // #tls-sanfix: REJECT an embedded NUL rather than truncating at it. These
+    // bytes become cert->subject.common_name, whose length is later recovered
+    // with a C string length. A CN of "target.example\0.attacker.example"
+    // therefore presented as exactly "target.example" to the matcher: the
+    // attacker picks a name they control, and the part that made it theirs is
+    // deleted before anyone compares it. The SAN path is length-delimited and
+    // already immune; this is the same defect on the path that survives when
+    // the CN is consulted at all. A name we cannot represent faithfully must
+    // not become a name we can match loosely.
+    const uint8_t *src = ctx->data + ctx->pos;
+    for (size_t i = 0; i < len; i++) {
+        if (src[i] == 0) return -1;
+    }
+    if (len >= buf_len) return -1;   // do not silently truncate a long name
+    memcpy(buf, src, len);
+    buf[len] = '\0';
     ctx->pos += len;
     return 0;
 }
@@ -256,6 +314,10 @@ static const uint8_t OID_BASIC_CONSTRAINTS[] = {0x55, 0x1D, 0x13};
 static const uint8_t OID_KEY_USAGE[] = {0x55, 0x1D, 0x0F};
 static const uint8_t OID_EXT_KEY_USAGE[] = {0x55, 0x1D, 0x25};
 static const uint8_t OID_SAN[] = {0x55, 0x1D, 0x11};  // Subject Alternative Name
+// #tls-certfix NOTE: OID_KEY_USAGE and OID_EXT_KEY_USAGE above were already
+// here, and were referenced by NOTHING. The file-wide
+// -Wunused-const-variable suppression at the top of this file is why nobody
+// ever saw the warning that would have said so. They are used now.
 
 // Compare OIDs
 static int oid_compare(const uint8_t *oid1, size_t len1, const uint8_t *oid2, size_t len2) {
@@ -402,42 +464,62 @@ static int cert_parse_sig_algorithm(asn1_ctx_t *ctx, cert_sig_alg_t *alg) {
     return 0;
 }
 
-// Parse Subject Alternative Name extension
+// Parse Subject Alternative Name extension.
+//
+// #tls-certfix: the whole body moved to cert_san_parse_rs (rustkern/certname.rs).
+// The old code did:
+//     size_t copy_len = (entry_len < sizeof(san->value.dns_name) - 1) ? ... ;
+//     memcpy(san->value.dns_name, ..., copy_len);
+//     san->value.dns_name[copy_len] = '\0';
+// which is the embedded-NUL truncation in three lines. It also accepted an
+// iPAddress of any length by clamping to 16 rather than requiring exactly 4
+// or 16. Both are gone: the Rust parser is length-delimited throughout and
+// bounds every entry against the buffer it was handed.
 static int cert_parse_san(const uint8_t *data, size_t len, cert_x509_t *cert) {
-    asn1_ctx_t ctx = { data, len, 0 };
-    asn1_ctx_t san_seq;
-    
-    if (asn1_enter_sequence(&ctx, &san_seq) < 0) return -1;
-    
-    cert->san_count = 0;
-    
-    while (san_seq.pos < san_seq.len && cert->san_count < CERT_MAX_SAN_ENTRIES) {
-        uint8_t tag;
-        size_t entry_len;
-        if (asn1_get_tag_len(&san_seq, &tag, &entry_len) < 0) break;
-        if (san_seq.pos + entry_len > san_seq.len) break;
-        
-        cert_san_t *san = &cert->san[cert->san_count];
-        
-        // Context-specific tags: [2] = dNSName, [7] = iPAddress
-        if (tag == 0x82) {  // dNSName
-            san->type = SAN_DNS_NAME;
-            size_t copy_len = (entry_len < sizeof(san->value.dns_name) - 1) 
-                             ? entry_len : sizeof(san->value.dns_name) - 1;
-            memcpy(san->value.dns_name, san_seq.data + san_seq.pos, copy_len);
-            san->value.dns_name[copy_len] = '\0';
-            cert->san_count++;
-        } else if (tag == 0x87) {  // iPAddress
-            san->type = SAN_IP_ADDRESS;
-            san->ip_len = (entry_len == 4) ? 4 : 16;
-            memcpy(san->value.ip_addr, san_seq.data + san_seq.pos, 
-                   (entry_len <= 16) ? entry_len : 16);
-            cert->san_count++;
-        }
-        
-        san_seq.pos += entry_len;
+    // #tls-sanfix: the CN fallback is suppressed by `san_dns_present`, so ANY
+    // route that leaves that flag 0 on a certificate which does carry SANs
+    // hands the name decision back to the CN. There were four, and all four
+    // are closed here rather than in the matcher, because this is the one
+    // place that knows a subjectAltName extension was present at all.
+    //
+    //  (a) MALFORMED EXTENSION ERASED ITS OWN EVIDENCE. The Rust parser zeroes
+    //      *dns_seen and returns -1 when the outer GeneralNames SEQUENCE is bad.
+    //      This function stored that 0 and returned -1, and the ONE caller
+    //      ignored the return value, so a certificate with a deliberately
+    //      corrupt SAN extension became indistinguishable from a SAN-less one
+    //      and was matched on its CN. That is the exact attack this subsystem
+    //      claims to have removed, expressed through the error path.
+    //  (b) NON-DNS SANs DID NOT COUNT. *dns_seen is set only for dNSName, so a
+    //      certificate carrying only iPAddress or rfc822Name SANs fell back to
+    //      the CN. RFC 2818 3.1 says the CN must not be consulted when the
+    //      subject alternative name extension is present, not merely when it
+    //      contains a dNSName.
+    //  (c) SLOT EXHAUSTION. Non-DNS entries consume output slots, so 32
+    //      iPAddress SANs followed by a dNSName fill the array and the dNSName
+    //      is never parsed, clearing the flag on a cert that plainly has one.
+    //  (d) DUPLICATE EXTENSION. The flag was ASSIGNED, not accumulated, so a
+    //      second subjectAltName extension carrying no dNSName overwrote the
+    //      finding of the first.
+    //
+    // The rule enforced now: if a subjectAltName extension was parsed at all,
+    // the CN is out of the decision, whatever the extension turned out to say.
+    int dns_seen = 0;
+    int n = cert_san_parse_rs(data, (uint32_t)len, cert->san,
+                              CERT_MAX_SAN_ENTRIES, &dns_seen);
+    if (n < 0) {
+        // (a) FAIL CLOSED. A SAN extension we could not parse still means the
+        // issuer expressed the names in the SAN, so the CN is not a substitute
+        // for it. Suppressing the fallback here makes such a certificate fail
+        // to match any hostname, which is the correct outcome for a cert whose
+        // name extension is unreadable.
+        cert->san_dns_present = 1;
+        cert->san_count = 0;
+        return -1;
     }
-    
+    // (b), (c), (d): any SAN extension at all suppresses the CN, and the flag
+    // accumulates across repeated extensions rather than being overwritten.
+    cert->san_dns_present = (cert->san_dns_present || dns_seen || n > 0) ? 1 : 0;
+    cert->san_count = n;
     return 0;
 }
 
@@ -515,6 +597,22 @@ static int cert_parse_extensions(asn1_ctx_t *ctx, cert_x509_t *cert) {
             }
         } else if (oid_compare(oid, oid_len, OID_SAN, sizeof(OID_SAN))) {
             cert_parse_san(ext_data, ext_len, cert);
+        } else if (oid_compare(oid, oid_len, OID_KEY_USAGE, sizeof(OID_KEY_USAGE))) {
+            // #tls-certfix: keyUsage had NO parser at all. cert->key_usage was
+            // a field that kzalloc set to 0 and nothing ever wrote or read.
+            uint32_t ku = 0;
+            if (cert_ku_parse_rs(ext_data, (uint32_t)ext_len, &ku)) {
+                cert->key_usage = (int)ku;
+                cert->ku_present = 1;
+            }
+        } else if (oid_compare(oid, oid_len, OID_EXT_KEY_USAGE, sizeof(OID_EXT_KEY_USAGE))) {
+            // #tls-certfix: likewise extendedKeyUsage. A certificate issued
+            // for clientAuth only was indistinguishable from a server one.
+            uint32_t eku = 0;
+            if (cert_eku_parse_rs(ext_data, (uint32_t)ext_len, &eku)) {
+                cert->ext_key_usage = (int)eku;
+                cert->eku_present = 1;
+            }
         }
     }
     
@@ -779,7 +877,6 @@ static void cert_b64_perf(const char *b64, int len) {
 }
 
 void cert_b64_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     static const uint8_t PLAIN[48] = {
         0x30,0x82,0x01,0x0a,0x02,0x82,0x01,0x01,0x00,0xd5,0xa1,0x7e,
         0x00,0x11,0x22,0x33,0x44,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb,
@@ -813,20 +910,58 @@ void cert_b64_selftest(void) {
     cert_b64_perf(b64, o);
 }
 
+// ---------------------------------------------------------------------------
+// #tls-suppressfix: bounded substring search.
+//
+// Every PEM scan in this file used strstr(), which stops only at a NUL and so
+// reads for as long as it takes to find one. That is safe only if the buffer is
+// NUL-terminated, and the CA trust bundle is NOT: /CONFIG/CACERTS.PEM is read
+// through fat_read_file(), which on the shipping two-partition image routes to
+// ext2_read_whole() for anything under /CONFIG. fat_read_file() kmalloc's
+// size+1 and writes a terminator; ext2_read_whole() kmalloc'd exactly i_size
+// and wrote none. The two halves of one interface disagreed, so the trust-store
+// loader scanned off the end of its allocation into adjacent heap on every
+// boot of the ext2-root golden, and a "-----BEGIN CERTIFICATE-----" occurring
+// in that adjacent heap would have been base64-decoded into a TRUST ANCHOR.
+//
+// ext2_read_whole() is fixed to terminate as well, but this code no longer
+// depends on that: the length is the authority, and a caller that passes a
+// length is entitled to have it honoured.
+// ---------------------------------------------------------------------------
+static const char *mem_find(const char *hay, size_t hay_len, const char *needle)
+{
+    if (!hay || !needle) return NULL;
+    size_t n = strlen(needle);
+    if (n == 0) return hay;
+    if (hay_len < n) return NULL;
+    for (size_t i = 0; i + n <= hay_len; i++) {
+        if (memcmp(hay + i, needle, n) == 0) return hay + i;
+    }
+    return NULL;
+}
+
 // Parse PEM-encoded certificate
 cert_x509_t *cert_parse_pem(const char *data, size_t len) {
     // Find BEGIN marker
     const char *begin = "-----BEGIN CERTIFICATE-----";
     const char *end = "-----END CERTIFICATE-----";
-    
-    const char *start = strstr(data, begin);
+
+    if (!data || len == 0) return NULL;
+    const char *limit = data + len;
+
+    // #tls-suppressfix: every scan below is bounded by `len`. `len` was
+    // previously accepted and never read; -Wunused-parameter said so and was
+    // suppressed.
+    const char *start = mem_find(data, len, begin);
     if (!start) return NULL;
     start += strlen(begin);
-    
-    // Skip whitespace
-    while (*start == '\n' || *start == '\r') start++;
-    
-    const char *finish = strstr(start, end);
+    if (start > limit) return NULL;
+
+    // Skip whitespace, without running off the end
+    while (start < limit && (*start == '\n' || *start == '\r')) start++;
+    if (start >= limit) return NULL;
+
+    const char *finish = mem_find(start, (size_t)(limit - start), end);
     if (!finish) return NULL;
     
     // Decode base64
@@ -896,10 +1031,17 @@ int cert_store_load_bundle(const char *pem_data, size_t len) {
     int loaded = 0;
     
     while (pos < end_data) {
-        const char *cert_start = strstr(pos, begin);
-        if (!cert_start || cert_start >= end_data) break;
-        
-        const char *cert_end = strstr(cert_start + 1, begin);
+        // #tls-suppressfix: was strstr(pos, begin) with the bounds test applied
+        // AFTERWARDS (`cert_start >= end_data`). Checking a pointer after the
+        // scan that produced it does not prevent the scan from reading past the
+        // buffer; it only notices sometimes, once the damage is done.
+        const char *cert_start = mem_find(pos, (size_t)(end_data - pos), begin);
+        if (!cert_start) break;
+
+        const char *after = cert_start + 1;
+        const char *cert_end = (after < end_data)
+                             ? mem_find(after, (size_t)(end_data - after), begin)
+                             : NULL;
         size_t cert_len = cert_end ? (size_t)(cert_end - cert_start) : (size_t)(end_data - cert_start);
         
         if (cert_add_trusted_pem(cert_start, cert_len) == CERT_SUCCESS) {
@@ -1039,35 +1181,43 @@ int cert_is_trusted(const cert_x509_t *cert) {
 // Certificate Validation
 // =============================================================================
 
-// Wildcard hostname matching
-static int hostname_match(const char *pattern, const char *hostname) {
-    // Check for wildcard
-    if (pattern[0] == '*' && pattern[1] == '.') {
-        // Find first dot in hostname
-        const char *dot = strchr(hostname, '.');
-        if (!dot) return 0;
-        // Compare rest
-        return strcasecmp(pattern + 2, dot + 1) == 0;
-    }
-    return strcasecmp(pattern, hostname) == 0;
+// #tls-certfix: hostname authorisation moved to cert_hostname_match_rs
+// (rustkern/certname.rs). Two defects lived in the code this replaces.
+//
+// FIRST, the CN fallback ran unconditionally:
+//     for (each SAN) if (hostname_match(san.dns_name, hostname)) return OK;
+//     if (hostname_match(cert->subject.common_name, hostname)) return OK;
+// RFC 6125 section 6.4.4 says a certificate carrying subjectAltName must be
+// matched on SANs ONLY. A certificate legitimately issued for other.example
+// whose CN read target.example was accepted for target.example.
+//
+// SECOND, the matcher was strcasecmp on NUL-terminated buffers, so an embedded
+// NUL truncated the name. The buffers are length-delimited now (see cert_san_t)
+// and no byte of a certificate name reaches a str* function.
+//
+// The old wildcard rule went with them: it tested only `pattern[0]=='*' &&
+// pattern[1]=='.'` and then compared everything after the FIRST dot in the
+// hostname, so "*.com" matched every .com name. The replacement requires a
+// full leftmost label and at least two labels behind the wildcard.
+static size_t cstr_len(const char *s) {
+    size_t n = 0;
+    while (s && s[n]) n++;
+    return n;
 }
 
 int cert_verify_hostname(const cert_x509_t *cert, const char *hostname) {
-    // Check Subject Alternative Names first
-    for (int i = 0; i < cert->san_count; i++) {
-        if (cert->san[i].type == SAN_DNS_NAME) {
-            if (hostname_match(cert->san[i].value.dns_name, hostname)) {
-                return CERT_SUCCESS;
-            }
-        }
-    }
-    
-    // Fall back to Common Name
-    if (hostname_match(cert->subject.common_name, hostname)) {
-        return CERT_SUCCESS;
-    }
-    
-    return CERT_ERR_NAME_MISMATCH;
+    if (!cert || !hostname) return CERT_ERR_NAME_MISMATCH;
+
+    size_t cn_len = cstr_len(cert->subject.common_name);
+    size_t host_len = cstr_len(hostname);
+
+    int ok = cert_hostname_match_rs(cert->san, (uint32_t)cert->san_count,
+                                    cert->san_dns_present,
+                                    (const uint8_t *)cert->subject.common_name,
+                                    (uint32_t)cn_len,
+                                    (const uint8_t *)hostname,
+                                    (uint32_t)host_len);
+    return ok ? CERT_SUCCESS : CERT_ERR_NAME_MISMATCH;
 }
 
 int cert_time_compare(const cert_time_t *a, const cert_time_t *b) {
@@ -1355,31 +1505,89 @@ static cert_x509_t *cert_next_issuer_candidate(const cert_x509_t *cert, int *ite
     return NULL;
 }
 
+// #tls-certfix: run the whole verified path through ONE policy call.
+//
+// The shape of the old loop is why the checks went missing. It returned
+// CERT_SUCCESS from three different places the moment it found a trusted
+// issuer, so there was no point at which the complete path existed in one
+// place to be judged. Any check added to it would have had to be repeated at
+// each exit, and the next check after that would have been added at two of the
+// three. So the walk now only DISCOVERS the path and the anchor; the verdict is
+// taken once, afterwards, by cert_chain_policy_rs().
+static int cert_run_chain_policy(const cert_chain_t *chain, int used,
+                                 const cert_x509_t *anchor) {
+    cert_node_t nodes[CERT_MAX_CHAIN_DEPTH + 1];
+    int n = 0;
+
+    for (int i = 0; i < used && i < chain->count && n < CERT_MAX_CHAIN_DEPTH + 1; i++) {
+        const cert_x509_t *x = chain->certs[i];
+        nodes[n].is_ca       = x->is_ca;
+        nodes[n].path_len    = x->path_length;
+        nodes[n].key_usage   = (uint32_t)x->key_usage;
+        nodes[n].eku         = (uint32_t)x->ext_key_usage;
+        nodes[n].ku_present  = x->ku_present;
+        nodes[n].eku_present = x->eku_present;
+        n++;
+    }
+
+    // Append the anchor unless the walk already ended ON it (a peer that sent
+    // its own trusted root, or a self-signed pinned cert). Counting it twice
+    // would add a phantom intermediate and reject legal chains.
+    if (anchor && (n == 0 || chain->certs[n - 1] != anchor) &&
+        n < CERT_MAX_CHAIN_DEPTH + 1) {
+        nodes[n].is_ca       = anchor->is_ca;
+        nodes[n].path_len    = anchor->path_length;
+        nodes[n].key_usage   = (uint32_t)anchor->key_usage;
+        nodes[n].eku         = (uint32_t)anchor->ext_key_usage;
+        nodes[n].ku_present  = anchor->ku_present;
+        nodes[n].eku_present = anchor->eku_present;
+        n++;
+    }
+
+    int p = cert_chain_policy_rs(nodes, (uint32_t)n);
+    switch (p) {
+        case CERT_POLICY_OK:           return CERT_SUCCESS;
+        case CERT_POLICY_BAD_PATHLEN:
+            kprintf("[CERT] rejected: pathLenConstraint violated\n");
+            return CERT_ERR_SIGNATURE;
+        case CERT_POLICY_NOT_CA:
+            kprintf("[CERT] rejected: issuer is not a CA\n");
+            return CERT_ERR_SIGNATURE;
+        case CERT_POLICY_BAD_USAGE:
+        default:
+            kprintf("[CERT] rejected: keyUsage/extendedKeyUsage forbids this use\n");
+            return CERT_ERR_SIGNATURE;
+    }
+}
+
 int cert_verify_chain(const cert_chain_t *chain, const char *hostname) {
     if (!chain || chain->count == 0) return CERT_ERR_INVALID_FORMAT;
-    
+
     // Verify end-entity certificate hostname
     if (hostname) {
         int ret = cert_verify_hostname(chain->certs[0], hostname);
         if (ret != CERT_SUCCESS) return ret;
     }
-    
-    // Verify each certificate in chain
+
+    // Validity window for every certificate the peer presented.
+    for (int i = 0; i < chain->count; i++) {
+        int ret = cert_verify_validity(chain->certs[i]);
+        if (ret != CERT_SUCCESS) return ret;
+    }
+
+    const cert_x509_t *anchor = NULL;
+    int used = 0;   // how many of chain->certs[] are part of the verified path
+
     for (int i = 0; i < chain->count; i++) {
         cert_x509_t *cert = chain->certs[i];
-
-        // Check validity period
-        int ret = cert_verify_validity(cert);
-        if (ret != CERT_SUCCESS) return ret;
 
         if (i + 1 < chain->count) {
             // Issuer is the next certificate the server presented.
             cert_x509_t *issuer = chain->certs[i + 1];
             if (!issuer->is_ca) return CERT_ERR_SIGNATURE;
-            ret = cert_verify_signature(cert, issuer);
+            int ret = cert_verify_signature(cert, issuer);
             if (ret != CERT_SUCCESS) return ret;
-            // Reached a trusted root?
-            if (cert_is_trusted(issuer)) return CERT_SUCCESS;
+            if (cert_is_trusted(issuer)) { anchor = issuer; used = i + 2; break; }
             continue;
         }
 
@@ -1394,17 +1602,20 @@ int cert_verify_chain(const cert_chain_t *chain, const char *hostname) {
         while ((ca = cert_next_issuer_candidate(cert, &iter)) != NULL) {
             saw_candidate = 1;
             if (cert_verify_signature(cert, ca) == CERT_SUCCESS && cert_is_trusted(ca)) {
-                return CERT_SUCCESS;
+                anchor = ca; used = i + 1; break;
             }
         }
+        if (anchor) break;
         // Self-signed and directly trusted (a pinned root presented by the peer).
-        if (cert_is_trusted(cert)) return CERT_SUCCESS;
+        if (cert_is_trusted(cert)) { anchor = cert; used = i + 1; break; }
         // A candidate existed but none verified: the chain does not actually
         // chain to anything we trust.
         return saw_candidate ? CERT_ERR_SIGNATURE : CERT_ERR_NO_TRUST_ANCHOR;
     }
 
-    return CERT_ERR_NO_TRUST_ANCHOR;
+    if (!anchor) return CERT_ERR_NO_TRUST_ANCHOR;
+
+    return cert_run_chain_policy(chain, used, anchor);
 }
 
 // Parse certificate chain from server
@@ -1465,9 +1676,13 @@ void cert_print_info(const cert_x509_t *cert) {
     if (cert->san_count > 0) {
         kprintf("  SANs:\n");
         for (int i = 0; i < cert->san_count; i++) {
-            if (cert->san[i].type == SAN_DNS_NAME) {
-                kprintf("    DNS: %s\n", cert->san[i].value.dns_name);
-            }
+            if (cert->san[i].type != SAN_DNS_NAME) continue;
+            // Length-delimited now, so print byte by byte rather than handing a
+            // non-terminated buffer to a %s that would run off the end.
+            kprintf("    DNS: ");
+            for (uint32_t j = 0; j < cert->san[i].len; j++)
+                kprintf("%c", cert->san[i].val[j]);
+            kprintf("\n");
         }
     }
 }

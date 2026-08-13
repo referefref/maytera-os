@@ -5,6 +5,14 @@
 // TLS 1.3: X25519 key exchange with AES-128-GCM-SHA256 / AES-256-GCM-SHA384
 
 #include "tls.h"
+#include "../../crypto/csprng.h"   // #tls-rngfix
+
+// #tls-suitefix: the offered cipher suite list and the acceptance test, both
+// from rustkern/tls_suite.rs. ONE definition, read by both the ClientHello
+// builder and the ServerHello check.
+extern uint32_t tls_suite_offered_count_rs(void);
+extern uint16_t tls_suite_offered_at_rs(uint32_t i);
+extern int tls13_suite_acceptable_rs(uint16_t suite);
 #include "tls13.h"
 #include "cert_store.h"
 #include "../../crypto/crypto.h"
@@ -14,7 +22,8 @@
 #include "../../string.h"
 #include "../../mm/heap.h"
 #include "../../serial.h"
-int g_tls_force_h1_alpn = 0;  // #185: when set, ClientHello advertises http/1.1-only ALPN (no h2) so https_post gets an HTTP/1.1 connection (our h2 client has no POST)
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
+int g_tls_force_h1_alpn = 1;  // #185/#333: DEFAULT 1 = ClientHello advertises http/1.1-only ALPN (no h2). The in-kernel h2 client (net/http2.c) is single-stream and unreliable ("[HTTP2] failed: no status (len=0)" for some hosts, e.g. musicbrainz.org / archive.org CDN, #333). Advertising only http/1.1 makes h2-capable servers negotiate DOWN to HTTP/1.1, which the reliable 1.1 client parses. The h2 client code is RETAINED but DORMANT (never negotiated). Set to 0 only to experimentally re-enable h2 advertisement.
 
 extern void net_poll(void);
 extern void proc_sleep(uint32_t ms);
@@ -995,7 +1004,9 @@ static int tls13_process_handshake(tls_context_t *ctx) {
 
 static int tls_send_client_hello(tls_context_t *ctx) {
     // Generate client random
-    rng_get_bytes(ctx->client_random, 32);
+    // #tls-rngfix: ClientHello.random is an anti-replay nonce that also
+    // feeds the TLS 1.2 master secret. Audited DRBG, not the old pool.
+    csprng_bytes(ctx->client_random, 32);
 
     // Generate X25519 keypair for TLS 1.3 key_share
     x25519_keypair_t kp;
@@ -1030,7 +1041,7 @@ static int tls_send_client_hello(tls_context_t *ctx) {
 
     // Session ID: 32 random bytes (TLS 1.3 middlebox compatibility)
     hello[pos++] = 32;
-    rng_get_bytes(hello + pos, 32);
+    csprng_bytes(hello + pos, 32);   // #tls-rngfix: see above
     pos += 32;
 
     // Cipher suites: leading GREASE + Chrome's TLS1.3 and TLS1.2 suites.
@@ -1040,22 +1051,26 @@ static int tls_send_client_hello(tls_context_t *ctx) {
     // TLS1.2 suites are never selected because we force TLS1.3 via key_share +
     // supported_versions.
     {
-        static const uint16_t suites[] = {
-            0x1301, 0x1302, 0x1303,
-            0xc02b, 0xc02f, 0xc02c, 0xc030,
-            0xcca9, 0xcca8,
-            0xc013, 0xc014,
-            0x009c, 0x009d, 0x002f, 0x0035,
-        };
-        int nsuites = (int)(sizeof(suites) / sizeof(suites[0]));
+        // #tls-suitefix: the offered list is no longer a private array here.
+        // It lives in rustkern/tls_suite.rs and the ServerHello check reads
+        // THE SAME array, so "what we offered" and "what we will accept" cannot
+        // drift apart. A whitelist in the ServerHello handler would have been
+        // the smaller change and would have created exactly the two-lists-that-
+        // must-agree problem this tree keeps rediscovering.
+        //
+        // GREASE stays OUT of the shared array and is emitted separately here,
+        // on purpose: it must never be acceptable, and putting it in the array
+        // would make it acceptable by construction.
+        int nsuites = (int)tls_suite_offered_count_rs();
         int cs_bytes = (nsuites + 1) * 2;  // +1 for leading GREASE
         hello[pos++] = (cs_bytes >> 8) & 0xff;
         hello[pos++] = cs_bytes & 0xff;
         hello[pos++] = (GREASE >> 8) & 0xff;
         hello[pos++] = GREASE & 0xff;
         for (int i = 0; i < nsuites; i++) {
-            hello[pos++] = (suites[i] >> 8) & 0xff;
-            hello[pos++] = suites[i] & 0xff;
+            uint16_t s = tls_suite_offered_at_rs((uint32_t)i);
+            hello[pos++] = (s >> 8) & 0xff;
+            hello[pos++] = s & 0xff;
         }
     }
 
@@ -1134,12 +1149,15 @@ static int tls_send_client_hello(tls_context_t *ctx) {
     hello[pos++] = 0x00;
     hello[pos++] = 0x00;
 
-    // --- Extension: ALPN (type 16): h2 + http/1.1 ---
-    // Advertise HTTP/2 first, then HTTP/1.1 as a fallback. The server-selected
-    // protocol is parsed from EncryptedExtensions (see tls_alpn_is_h2). When the
-    // server picks h2 the caller (https_get) routes through the HTTP/2 client.
-    // ALPN proto list = [0x02 'h' '2'][0x08 "http/1.1"] = 14 bytes.
-    // list length = 14, ext data length = 16.
+    // --- Extension: ALPN (type 16) ---
+    // #333: g_tls_force_h1_alpn DEFAULTS TO 1, so the normal path advertises
+    // http/1.1 ONLY (no h2). This is deliberate: the in-kernel h2 client is
+    // unreliable ("no status len=0" for some hosts), so we let h2-capable
+    // servers negotiate DOWN to HTTP/1.1 rather than take the flaky h2 path.
+    // The h2 branch below (advertise "h2" first, then "http/1.1") is retained
+    // for experiments but is DORMANT by default; when it is used the server-
+    // selected protocol is parsed from EncryptedExtensions (see tls_alpn_is_h2)
+    // and https_get routes h2 responses through the HTTP/2 client.
     hello[pos++] = 0x00;
     hello[pos++] = 0x10;
     if (g_tls_force_h1_alpn) {
@@ -1948,6 +1966,24 @@ static int tls_process_server_hello(tls_context_t *ctx,
         }
     }
 
+    // #tls-suitefix: THE SELECTED SUITE WAS NEVER CHECKED AGAINST THE OFFER.
+    // The next line used to be, in full, `ctx->tls13_cipher_suite =
+    // ctx->cipher_suite;` with nothing between it and the wire. A server could
+    // name any 16-bit value:
+    //   * a TLS 1.2 code point such as 0x002f, which every downstream test in
+    //     tls13.c reads as "not 0x1302, not 0x1303, so AES-128-GCM", silently
+    //     keying a suite that is neither AEAD nor forward-secret as if it were;
+    //   * the GREASE value we emit for fingerprint shape, whose entire purpose
+    //     is to be ignored;
+    //   * a 1.3 suite we deliberately did not offer.
+    // Checked here rather than inside the got_x25519_key branch below so that
+    // EVERY TLS 1.3 path is covered, not just the one that also got a key share.
+    if (ctx->is_tls13 && !tls13_suite_acceptable_rs(ctx->cipher_suite)) {
+        kprintf("[TLS1.3] server selected cipher suite 0x%04x, which we did not "
+                "offer for TLS 1.3 - rejecting\n", ctx->cipher_suite);
+        return TLS_ERR_HANDSHAKE;
+    }
+
     if (ctx->is_tls13 && got_x25519_key) {
         ctx->tls13_cipher_suite = ctx->cipher_suite;
 
@@ -2087,8 +2123,22 @@ tls_context_t *tls_create(void) {
 
     ctx->state = TLS_STATE_INIT;
     ctx->version = TLS_VERSION_1_2;
-    ctx->verify_cert = 0;
-    ctx->allow_self_signed = 1;
+    // #tls-sanfix: FAIL CLOSED. This used to be verify_cert = 0 /
+    // allow_self_signed = 1, so a TLS context verified nothing until a caller
+    // remembered to ask. `if (!ctx->verify_cert) return TLS_SUCCESS;` in
+    // tls_verify_chain() disables, in one branch, the chain check, the
+    // Certificate-parse-failure rejection, the CertificateVerify check (the
+    // #510 on-path-MITM fix) and the Finished gate. Every certificate control
+    // in this subsystem rested on a flag that defaulted to off.
+    //
+    // The single shipping caller (net/https.c) does call tls_set_verify(1,0),
+    // so this is not a live bypass today; it is the same shape as the RNG
+    // defect, where the fix was to stop the wrong option existing rather than
+    // to correct each caller. A caller that writes no code at all now gets
+    // verification, and one that genuinely wants an unverified channel has to
+    // say so explicitly.
+    ctx->verify_cert = 1;
+    ctx->allow_self_signed = 0;
 
     ctx->handshake_hash_cap = 4096;
     ctx->handshake_hash_data = kmalloc(ctx->handshake_hash_cap);
@@ -2653,7 +2703,6 @@ static int tlsp_cert_walk_eq(const uint8_t *buf, uint32_t len, int is13) {
 }
 
 void tls_parse_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     static uint8_t buf[512];
     uint32_t seed = 0x7f1c9a3b;
     uint32_t vectors = 0, mismatches = 0;

@@ -18,6 +18,7 @@
 #include "../../libc/aiclient.h"
 #include "../../libc/syscall.h"
 #include "../../libc/theme.h"
+#include "../../libc/gui_theme.h"
 #include "../../libc/gui_style.h"
 #include "rss_rs.h"
 
@@ -115,7 +116,7 @@ static inline unsigned int rss_on(unsigned int fg, unsigned int bg) {
 // primitives (buttons, fields) match the active theme and render modern
 // (rounded/AA) or classic (beveled) exactly like Files and Settings.
 static void rss_apply_style(void) {
-    gui_set_style(theme_get_active() == 4 ? GUI_STYLE_CLASSIC : GUI_STYLE_MODERN);
+    gui_set_style(gui_theme_is_classic() ? GUI_STYLE_CLASSIC : GUI_STYLE_MODERN);
     gui_palette_t p;
     p.surface        = fp_content();
     p.surface_raised = fp_toolbar();
@@ -560,7 +561,7 @@ static void start_summarize(void) {
     if (g_sel_item < 0 || g_sel_item >= g_item_count) return;
     if (!aiclient_have_key()) {
         g_show_summary = 1; g_ai_state = AI_ERROR;
-        scpy(g_ai_result, "No AI key found at /CONFIG/KIMI.KEY. Add your Moonshot key to enable summaries.",
+        scpy(g_ai_result, "Set your API key in Settings > AI.",
              sizeof(g_ai_result));
         return;
     }
@@ -724,7 +725,7 @@ static int url_is_http(const char *u) {
 // This is a partial control and worth being precise about: the kernel's SSRF
 // gate in net/wget.c only covers REDIRECTS (wget_redirect_allowed), so the
 // FIRST hop of any fetch is ungated by design, to keep Home Assistant on
-// 192.168.x.x working. A hostile feed carrying <img src="http://<private-ip>/">
+// a private LAN address working. A hostile feed carrying <img src="http://192.0.2.1/">
 // would otherwise be fetched with no click at all. This blocks the literal
 // form; a HOSTNAME that resolves to a private address is NOT blocked here,
 // because Ring 3 cannot see the resolution. Closing that needs a first-hop
@@ -1626,6 +1627,16 @@ int main(int argc, char **argv) {
             }
         }
 
+        // #548: this tail used to run poll_*()+draw_all()+win_invalidate()
+        // UNCONDITIONALLY every 50ms tick forever, even with the feed already
+        // loaded, no fetch/image job in flight and no AI summary running -
+        // the same idle-CPU anti-pattern fixed in weather (commit 1c03653).
+        // Capture "is anything async in flight" BEFORE polling it (so the
+        // exact tick a fetch/image/AI job finishes is still redrawn, same
+        // rationale as weather's was_fetching), then gate the repaint on a
+        // real UI event OR genuine async activity.
+        int was_busy = (g_state == ST_FETCHING || g_state == ST_WAIT_NET ||
+                        g_img_job >= 0 || g_ai_state == AI_RUNNING);
         poll_net_wait();   // re-arm the startup fetch once DHCP binds
         poll_fetch();
         poll_img();        // inline images: fetch + decode, never blocking
@@ -1637,8 +1648,10 @@ int main(int argc, char **argv) {
         } else if (g_ai_state == AI_ERROR && g_show_summary) {
             g_ai_state = AI_IDLE;
         }
-        draw_all();
-        win_invalidate(win);
+        if (ret > 0 || was_busy) {
+            draw_all();
+            win_invalidate(win);
+        }
     }
 
     if (g_job >= 0) http_fetch_cancel(g_job);

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // termios.h - POSIX terminal control for MayteraOS userland
 // Must match kernel drivers/tty.h
 #ifndef LIBC_TERMIOS_H

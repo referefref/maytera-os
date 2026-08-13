@@ -157,6 +157,37 @@ typedef struct {
     int      open;
     uint32_t dirent_lba;        // absolute LBA of the sector holding this file's
     uint32_t dirent_off;        // directory entry, and byte offset within it (0=unknown)
+    // #725 ext2-root backing. A non-zero ext2_ino means this handle is served
+    // from the ext2 ROOT volume, not from a FAT cluster chain: first_cluster,
+    // current_cluster, dirent_lba and dirent_off are then meaningless and must
+    // not be used. Only fat_open() sets this, and every handle operation
+    // (fat_read/fat_seek/fat_readdir_n/fat_write) branches on it. See the
+    // "ONE PLACE" comment above fat_open() in fat.c for why the redirect lives
+    // there and not in each caller.
+    uint32_t ext2_ino;
+    uint32_t ext2_dirpos;       // ext2 readdir byte cursor (directories only)
+    // #196 disk-image backing, the THIRD backing this handle can have. Non-zero
+    // img_drive (an uppercase drive letter, A or E) means this handle is served
+    // from the disk IMAGE mounted on that removable drive, not from a FAT
+    // cluster chain and not from ext2: first_cluster/current_cluster/dirent_*
+    // and ext2_ino are then all meaningless. img_rel is the path INSIDE the
+    // image. Set ONLY by fat_open(), for exactly the same reason the ext2
+    // redirect lives there (see the "ONE PLACE" comment in fat.c): putting it
+    // anywhere else means some caller forgets it. #725 is the cautionary tale,
+    // and #196 shipped the identical defect in miniature - the image was hooked
+    // into fat_read_file() but NOT fat_open(), so a whole-file read of a file on
+    // a mounted CD worked while INT 21h 3Dh open + 3Fh read of the same file saw
+    // nothing at all.
+    char     img_drive;
+    char     img_rel[128];
+    // #739 MOUNT GENERATION. Which disc-in-this-drive the handle was opened
+    // against. diskimg re-resolves img_rel on every read, so without this a
+    // disc SWAP would silently serve the new disc's file of the same name: both
+    // Red Alert discs contain \MAIN.MIX, and the wrong 500 MB archive comes
+    // back with no error anywhere. Stamped by fat_open(), checked by fat_read()
+    // and fat_readdir_n(), cleared by fat_close(). 0 means "unstamped", which
+    // only a handle that was never image-backed can be.
+    uint32_t img_gen;
 } fat_file_t;
 
 // Directory iteration
@@ -166,6 +197,28 @@ typedef struct {
     uint32_t entry_index;
     uint32_t sector_in_cluster;
 } fat_dir_iter_t;
+
+// ===========================================================================
+// #725 SHARED ext2-ROOT ROUTING PREDICATE.
+//
+// When ext2 is the root filesystem (g_root_ext2 != 0) a normal "/" path must be
+// served from the ext2 volume, not from the FAT ESP. Historically EACH fat_*
+// entry point carried its own copy of that decision, and the copies drifted:
+// fat_read_file() had the redirect while fat_open() (the streaming open behind
+// INT 21h 3Dh) did not, so on an ext2-root build a DOS program's .EXE loaded
+// and every data file it opened failed (#725, Commander Keen 5 EGAGRAPH.CK5).
+//
+// There is now exactly ONE predicate and ONE path mapper, and they are exported
+// so nothing has to hand-roll a third copy. Use these; do not re-derive them.
+//   fat_path_on_ext2(fs, path) -> 1 if `path` should be served from ext2.
+//     /boot and /EFI are NEVER redirected (UEFI loads the kernel from the ESP).
+//   fat_ext2_vol_path(path)    -> the same path as the ext2 volume sees it
+//     (strips a "/ext2" mount prefix; everything else passes through).
+// Callers keep the ext2-first-then-FAT fallback order: a file that is not on
+// ext2 may still be ESP-only, so a miss falls through to FAT.
+// ===========================================================================
+int         fat_path_on_ext2(fat_fs_t *fs, const char *path);
+const char *fat_ext2_vol_path(const char *path);
 
 // Initialize FAT driver
 void fat_init(void);
@@ -194,8 +247,22 @@ uint32_t fat_size(fat_file_t *file);
 // Seek in file
 int fat_seek(fat_file_t *file, uint32_t position);
 
-// Read directory entry
-int fat_readdir(fat_file_t *dir, fat_dir_entry_t *entry, char *name_out);
+// Read directory entry (bounded). #591: name_out is filled with the entry's
+// reconstructed VFAT long name (up to 255 chars) OR its 8.3 name, TRUNCATED to
+// name_cap-1 chars + NUL. It NEVER writes past name_cap regardless of the LFN
+// length, so no caller buffer can overflow. name_cap == 0 writes nothing.
+int fat_readdir_n(fat_file_t *dir, fat_dir_entry_t *entry, char *name_out, size_t name_cap);
+
+// Read directory entry (convenience wrapper). #591 STRUCTURAL GUARD: name MUST
+// be a real array of >= 256 bytes. The negative-array-size check turns a smaller
+// buffer, or a decayed char * (sizeof == 8), into a COMPILE error - closing the
+// recurrence class behind #404 (fat_delete 64->256) and #490 (dosexec 16->256):
+// a length cap only protects the SMALLEST downstream buffer, so a sub-256 sink
+// must never compile silently. For a deliberately smaller/bounded buffer, call
+// fat_readdir_n(dir, entry, buf, sizeof buf) explicitly (it truncates, safely).
+#define FAT_READDIR_REQUIRE_256(name) ((void)sizeof(char[(sizeof(name) >= 256) ? 1 : -1]))
+#define fat_readdir(dir, entry, name) \
+    (FAT_READDIR_REQUIRE_256(name), fat_readdir_n((dir), (entry), (name), sizeof(name)))
 
 // Check if entry is directory
 int fat_is_dir(fat_file_t *file);
@@ -240,11 +307,16 @@ int fat_rename(fat_fs_t *fs, const char *old_path, const char *new_path);
 
 // Write data to a file at current position
 // Returns bytes written, -1 on failure
-int fat_write(fat_file_t *file, const void *buffer, uint32_t size);
+MUST_CHECK int fat_write(fat_file_t *file, const void *buffer, uint32_t size);
+// #746: empty an open FAT file (O_TRUNC). Frees the cluster chain and persists
+// size 0 / cluster 0 to the directory entry. Returns 0, or -1 if the file is
+// still not empty on disk - which the caller MUST treat as a failed open, since
+// the caller asked for an empty file and did not get one.
+MUST_CHECK int fat_truncate(fat_file_t *file);
 
 // Write entire buffer to a file (creates/overwrites)
 // Returns 0 on success, -1 on failure
-int fat_write_file(fat_fs_t *fs, const char *path, const void *data, uint32_t size);
+MUST_CHECK int fat_write_file(fat_fs_t *fs, const char *path, const void *data, uint32_t size);
 
 // Copy a file from src_path to dst_path
 // Returns 0 on success, -1 on failure
@@ -271,6 +343,29 @@ void fat_cache_stats(void);
 // `sector` is partition-relative (same units as fat_read_sector() internally
 // uses, i.e. fs->part_start_lba has not been added yet).
 uint32_t fat_cluster_to_sector(fat_fs_t *fs, uint32_t cluster);
-int fat_write_sector(fat_fs_t *fs, uint32_t sector, const void *buffer);
+// RETURNS 0 ON SUCCESS, negative on failure - the SAME polarity as every other
+// status-returning fat_* entry point in this header.
+//
+// #742: it used to return blk_write()'s SECTOR COUNT (1 = success, <= 0 =
+// failure) while fat_write_file() two screens up returned 0 = success. Two
+// polarities behind one MUST_CHECK attribute in one header is not a naming
+// nit: fs/panic.c wrote `if (fat_write_sector(...) != 0) kprintf("FAILED")`
+// and so printed a disk-failure alarm on every SUCCESSFUL panic-slot write,
+// six or more times per boot, which is how a real alarm gets trained out of
+// people. The attribute forced the call sites to LOOK at the value; it could
+// not tell them which way round it was. Normalising the polarity removes the
+// choice. All call sites are in fs/fat.c and fs/panic.c.
+MUST_CHECK int fat_write_sector(fat_fs_t *fs, uint32_t sector, const void *buffer);
+
+// #554: genuine FAT (ESP: /boot, /EFI) permission/attribute support. FAT has
+// no uid/gid/mode - these operate on the real on-disk FAT_ATTR_* byte in the
+// directory entry, unlike perms.c's path-keyed overlay (which is what backs
+// ext2/POSIX paths). Both operate against the single mounted g_fat_fs.
+// fat_set_readonly: toggle FAT_ATTR_READ_ONLY on disk. Returns 0 on success.
+int fat_set_readonly(const char *path, int readonly);
+// fat_get_attr_info: read back the raw attribute byte + directory bit for
+// display (Files Properties, details columns, ls-style tools). Returns 0 on
+// success, -1 if the path does not exist on the FAT volume.
+int fat_get_attr_info(const char *path, uint8_t *attr_out, int *is_dir_out);
 
 #endif // FAT_H

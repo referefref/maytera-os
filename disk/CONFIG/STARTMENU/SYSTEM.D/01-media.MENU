@@ -1,0 +1,9 @@
+# Media - all-users Start-menu default fragment. Migrated verbatim from the
+# old hardcoded startmenu_init().
+category: Media
+item: Paint | /APPS/PAINT | icon=paint
+item: Image Viewer | /APPS/IMAGEVIEWER | icon=image
+item: Gallery | /APPS/GALLERY | icon=gallery
+item: Media Player | /APPS/MEDIAPLAYER | icon=video
+item: Music Player | /APPS/MUSICPLR | icon=music
+item: Snapshot | /APPS/SNAPSHOT | icon=snapshot

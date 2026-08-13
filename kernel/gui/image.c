@@ -7,6 +7,7 @@
 #include "../mm/heap.h"
 #include "../string.h"
 #include "../video/framebuffer.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // #404 Phase U: Rust BMP decode port (rustkern.rs). Same signature as
 // bmp_decode_c; a mismatch here fails the C compile (the FFI "lock"). Live under
@@ -487,7 +488,6 @@ static uint32_t bmp_build(uint8_t*buf, int32_t w, int32_t h_signed, uint16_t bpp
 }
 
 void bmp_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     // Max generated image 40x40 -> 1600 px. Static (no kernel-stack pressure).
     static uint8_t inbuf[8192];
     static uint32_t pc[1600], pr[1600];

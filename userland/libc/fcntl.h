@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // fcntl.h - POSIX file control for MayteraOS userland
 #ifndef LIBC_FCNTL_H
 #define LIBC_FCNTL_H

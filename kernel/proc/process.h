@@ -94,13 +94,25 @@ typedef struct process {
     process_priority_t priority;    // Priority level
     uint64_t time_slice;            // Remaining time slice (in ticks)
     uint64_t total_time;            // Total CPU time used
-    uint64_t wake_time;             // Tick count to wake up (for sleeping)
-    // #513: absolute tick at which to raise SIGALRM, 0 = no alarm armed. Set by
+    uint64_t wake_time;             // #483/#499: absolute mono_ms() deadline (ms) to wake a sleeper
+    // #513/#499: absolute mono_ms() deadline (ms) at which to raise SIGALRM, 0 = no alarm armed. Set by
     // sys_alarm(); swept by wake_sleeping_procs() in process.c. Distinct from
     // wake_time: an alarm must fire whatever the process is doing (running,
     // ready, or blocked), whereas wake_time only ends a sleep. proc_create()
     // memsets the whole PCB, so a recycled slot starts disarmed.
     uint64_t alarm_time;
+
+    // ---- #254/#601 scheduler anti-starvation ----
+    //
+    // ready_since: the sched tick at which this PCB was last placed on the
+    // ready queue. The aging sweep uses it to find processes that have been
+    // passed over. prio_boost: ONE-SHOT promotion flag. While set, the
+    // process's EFFECTIVE priority is priority + SCHED_BOOST (above
+    // PRIO_REALTIME), so it sorts to the front of the ready queue; it is
+    // cleared the instant the process is selected to run, so a boost buys
+    // exactly one turn and can never become a permanent priority change.
+    uint64_t ready_since;
+    uint8_t  prio_boost;
 
     // Privilege level
     uint8_t privilege;              // PRIV_KERNEL (0) or PRIV_USER (3)
@@ -110,6 +122,28 @@ typedef struct process {
     uint32_t gid;       // Real group ID
     uint32_t euid;      // Effective user ID (for setuid binaries)
     uint32_t egid;      // Effective group ID
+
+    // #745 ELEVATION (proc/elevate.h). Three fields Ring 3 has NO syscall to
+    // write, which is the whole point of putting them here rather than in a
+    // userland state file:
+    //   elev_grant_until_ms  absolute deadline of a system-wide install grant,
+    //                        0 = none. Written ONLY by SYS_ELEV_RESOLVE, which
+    //                        is gated on is_compositor().
+    //   elev_grant_prefix    the ONE path prefix that grant covers, a kernel
+    //                        constant, never anything the requesting app said.
+    //   elev_last_input_ms   when the window manager last delivered a real
+    //                        input event (key down, button down/up) to a window
+    //                        this process owns. A prompt may only be raised in
+    //                        response to recent input; see sys_elev_request().
+    // memset(proc, 0, sizeof(process_t)) in proc_create() zeroes all three, so
+    // a new or re-exec'd process starts with no grant and no input credit.
+    uint64_t elev_grant_until_ms;
+    // TWO prefixes, because a system-wide install writes in exactly two places
+    // and nowhere else: the application directory and the SYSTEM Start-menu
+    // layer. Measured, not designed in the abstract: with one prefix the
+    // install landed on disk and reported "(not added to the Start menu)".
+    char     elev_grant_prefix[2][40];
+    uint64_t elev_last_input_ms;
 
     // Memory - kernel mode
     void *stack_base;               // Kernel stack base address
@@ -207,7 +241,12 @@ typedef struct process {
 
     // ---- Per-process heap / mmap state ----
     uint64_t brk;                   // Current program break (heap top)
-    uint64_t mmap_next;             // Next anonymous mmap address
+    // #636: uint64_t mmap_next was DELETED here. The mmap placement cursor
+    // is per-ADDRESS-SPACE, not per-thread: two CLONE_VM threads share one
+    // mm_struct_t, so a per-thread cursor hands both of them the same
+    // address. It lives on mm_struct_t now. This field had zero readers
+    // left in kernel/, and leaving a per-thread field named exactly what
+    // the bug was named is a trap for the next person.
 
     // ---- #429: demand-paging memory map ----
     // Per-process mm_struct (mm/demand.h). Lazily created by sys_mmap to hold
@@ -216,6 +255,21 @@ typedef struct process {
     // on fork (mm_dup), freed on exit. Typed void* to avoid dragging demand.h
     // into every process.h consumer.
     void *mm;
+
+    // ---- #25: async HTTP fetch progress ----
+    // Set by proc/syscall.c's async_fetch_worker for the duration of one
+    // background page/resource fetch: points at the http_progress_t (see
+    // net/http_progress.h) embedded in that fetch's job slot. https.c/wget.c
+    // call net_progress_current() (which just reads this field off
+    // proc_current()) to publish real phase/byte-count updates as they work,
+    // with zero new parameters threaded through the connect/receive call
+    // chains. NULL for every process that is not running an instrumented
+    // fetch (i.e. everything except the browser's async worker thread), so
+    // existing callers (HA widget, App Store, pip, sync sys_http_fetch, ...)
+    // pay one NULL-check branch and nothing else. Typed void* for the same
+    // reason as mm above: net/http_progress.h stays out of every process.h
+    // consumer that does not need it.
+    void *net_progress;
 
     // ---- #95: Background services subsystem ----
     //
@@ -233,16 +287,118 @@ typedef struct process {
     int running_cpu;
     int migratable;
 
+    // ---- #67: SMP context-switch ownership ----
+    // Non-zero means "a core is between deciding to switch away from this
+    // process and the switch asm having saved its context". While it is set,
+    // this process_t's `rsp` still holds the value from the PREVIOUS deschedule,
+    // so switching to it would put two cores on one kernel stack at two
+    // different RIPs - the #421 "hand off a half-saved context" livelock.
+    // SET by sched_schedule() before the switch; CLEARED by
+    // context_switch/context_start themselves (proc/context_switch.asm) after
+    // the rsp store, the fxsave64 and the stack change; TESTED by
+    // sched_rq_pop(), which skips any queued entry that still has it set.
+    // Zero on every process created by proc_create()'s memset, and explicitly
+    // re-zeroed on the fork/clone children that are built by struct copy.
+    volatile int32_t sched_on_cpu;
+
+    // ---- #75: SELECTION PIN ----
+    // Non-zero (cpu id + 1) from the instant a core POPS this task off a run
+    // queue until it has switched to it. sched_on_cpu covers the mid-switch
+    // window; this covers the window immediately BEFORE it, between selection
+    // and the switch, which is where the task was being torn down under a core
+    // that had already committed to running it (CANDIDATE 2, measured 4 of 4).
+    //
+    // Set under the run-queue lock by sched_rq_pop_locked(); cleared by the
+    // selecting core once the switch is done or abandoned. Read by the EXIT
+    // path, which waits for it to clear. A test cannot substitute: the state
+    // being valid at the moment of selection is exactly what made this bug
+    // invisible - the property decays between the check and the use, so it has
+    // to be pinned rather than tested.
+    volatile int32_t sched_pinned;
+
+    // ---- #75: enqueue/pop forensics ----
+    // reason 3 says the incoming task was not RUNNING at the pre-switch check,
+    // and the pin proves it is not dying between pop and switch. Exactly two
+    // possibilities remain and nothing measured so far separates them:
+    //   (a) it was VALID at the pop and changed under us, by some path that is
+    //       not exit; or
+    //   (b) IT WAS ALREADY WRONG WHEN WE TOOK IT - something queued a task in a
+    //       state that should never have been queueable, which would mean the
+    //       run queue itself can hold invalid entries.
+    // These three fields answer that in one log line, and record WHO queued it
+    // so that if (b) is the answer the next question ("which enqueue site")
+    // does not cost another pass.
+    // #75: a wake arrived for this task while it was still executing on a core,
+    // so the enqueue was REFUSED and is owed. Drained by the next scheduler
+    // entry on the core that was running it, once it has actually left.
+    uint8_t  rq_wanted;
+
+    // #75 evidence: how this task's LAST enqueue reached the run queue.
+    //   1 = through add_to_ready_queue(), the intended funnel
+    //   2 = straight into sched_rq_push(), bypassing the funnel (a side door)
+    // and whether the funnel ALLOWED it while it was still executing.
+    uint8_t  enq_route;
+    uint8_t  enq_allowed_hot;   // 1 = funnel let it through with sched_on_cpu set
+
+    uint32_t sched_state_at_enq;   // state on entry to add_to_ready_queue()
+    uint32_t sched_state_at_pop;   // state when a core popped it
+    void    *sched_enq_ra;         // return address of add_to_ready_queue's caller
+
+    // ---- #67 pass 2: run-queue membership ----
+    // 1 while this PCB is linked into some core's run queue. Set and cleared
+    // ONLY under g_rq_lock, and checked by sched_rq_push() before inserting.
+    //
+    // It exists because wake_sleeping_procs() walks the whole process table
+    // WITHOUT the run-queue lock, and once two cores run the scheduler both can
+    // see the same expired sleeper in the same instant and both call
+    // add_to_ready_queue() on it. Inserting one PCB into two lists through a
+    // single intrusive `next` pointer corrupts both queues. A state test cannot
+    // substitute: add_to_ready_queue() SETS the state as a side effect, so by
+    // the time the second core looks the state already says READY.
+    uint8_t rq_queued;
+
+    // 1 for a per-core idle process. The BSP's idle is pid 0 and always has
+    // been; the APs' idle processes have ordinary pids, so "pid == 0" stopped
+    // being the same question as "is this the idle process" the moment a second
+    // core got one. Every scheduler test that means the latter now asks this.
+    uint8_t is_idle;
+
     // ---- #430: threads (clone/futex/pthread) ----
     // A "thread" here is a process_t that shares its parent's address space
     // (same cr3). shares_vm marks such a task so cleanup_proc_slot does NOT
     // destroy the shared address space or free the shared user stack when the
     // thread exits (that memory belongs to the thread group leader).
     uint8_t   shares_vm;            // 1 = shares another proc's cr3 (a thread)
+
+    // ---- #745 (task 37): DETACHED KERNEL WORKER ----
+    // Set by proc_create_ex() on every process it creates. init_proc() takes
+    // ppid from current_proc, so a kernel worker started from inside a syscall
+    // (the "httpfetch"/"httppost" async transfer workers are the ones that
+    // matter) became the CHILD of whichever Ring 3 process happened to enter
+    // that syscall. That process never learns the worker's pid, never wait()s
+    // for it, and so its zombie was immortal: 41 fetches after boot the
+    // 64-entry table was full and every further fetch failed to start. See
+    // rustkern/procreap.rs for the measured failure. A detached process is
+    // NOT a wait()-able child (same treatment as a #430 thread), and its
+    // zombie is reclaimable by reap_orphan_zombies().
+    uint8_t   detached;
     uint32_t  tgid;                 // thread-group id (leader pid); 0 = self
     // CLONE_CHILD_CLEARTID: on thread exit, zero *clear_child_tid and
     // futex-wake it so pthread_join() unblocks. NULL for ordinary processes.
     uint32_t *clear_child_tid;
+
+    // #446: per-process FXSAVE image for context_switch/context_start.
+    // #588 carved this 512-byte area off the kernel stack, aligned the base
+    // down with "and rsp,-16" and stashed a pointer to the saved RFLAGS at
+    // [base+512] so the restore side could find the GPR frame across the
+    // resulting variable gap. Whenever the outgoing and incoming procs'
+    // switch frames landed on the SAME kernel stack, the outgoing fxsave64
+    // wrote straight through the incoming proc's stashed pointer and
+    // "mov rsp,[rsp+512]" loaded XMM bytes as RSP -> double fault at
+    // context_switch (~1 boot in 9). Keeping the image here removes the
+    // carve, the alignment slack and the stash. MUST stay 16-byte aligned:
+    // fxsave64/fxrstor64 #GP on a misaligned operand.
+    uint8_t fpu_area[512] __attribute__((aligned(16)));
 } process_t;
 
 // Snapshot record for SYS_PROC_LIST (Task Manager). Layout MUST match the
@@ -273,6 +429,99 @@ typedef struct {
 // Fill `out` (up to `max` entries) with a snapshot of all live processes.
 // Returns the number of entries written. Used by SYS_PROC_LIST.
 int proc_snapshot(proc_info_t *out, int max);
+
+// #446: seed an FXSAVE area with a sane default FPU env (FCW=0x037F,
+// MXCSR=0x1F80). fpu_area_init() takes a raw 16-byte-aligned 512-byte buffer
+// so threads and per-CPU scratch areas share the one implementation.
+void fpu_area_init(void *area);
+void proc_init_fpu_area(struct process *p);
+
+// #446: stamp a proc's kernel stack with its own pid so the scheduler can
+// detect two live procs sharing one kernel stack.
+void proc_stack_tag(struct process *p);
+
+// #446: FXSAVE scratch used when there is no outgoing proc to save into.
+extern uint8_t g_dummy_fpu_area[512];
+
+// #421 phase 5 (AssaultCube port): SMP process-teardown-vs-snapshot race fix.
+//
+// BACKGROUND: proc_snapshot() (and proc_mem_info(), procmem.c) read a live
+// process's p->mm and then walk mm->vma_list via proc_mem_fill_in() +
+// proc_mem_account() with NO locking. cleanup_proc_slot() (process.c), which
+// runs when a zombie process's slot is reclaimed (proc_reap /
+// reap_orphan_zombies / proc_wait), calls mm_destroy(proc->mm) to free that
+// exact vma_list and then sets proc->mm = NULL. On SMP these can run on
+// different cores at the same instant: proc_snapshot() captures a valid
+// mm/vma_head pointer, cleanup_proc_slot() frees the vma nodes out from under
+// it on another core, and the walk dereferences freed memory. This is exactly
+// what killed a whole VM during AssaultCube phase 4 bring-up: a recoverable
+// user-process GPF was correctly caught and the process killed, but the
+// heartbeat's concurrent proc_snapshot() then panicked for real inside
+// proc_mem_account_rs (kernel/proc/procmem.c), turning one crashing app into
+// a full system halt.
+//
+// FIX: a dedicated spinlock (g_proc_mm_lock, process.c, static) serializes
+// the two sides of this race:
+//   - cleanup_proc_slot() holds it across "read proc->mm, mm_destroy it if
+//     owned, then null it" (process.c);
+//   - proc_snapshot() and proc_mem_info() hold it across
+//     "proc_mem_fill_in() + proc_mem_account()" for a single process, i.e.
+//     across the entire capture-and-walk of that process's mm (process.c,
+//     procmem.c).
+// Neither side can observe (or free) a vma_list the other side is using.
+// Both critical sections are short and non-sleeping (bounded VMA walk,
+// bounded VMA free, no allocation that can block), so holding a plain
+// spinlock across them is safe under the "never hold a lock across
+// something that might sleep" rule. This is intentionally a NEW, narrowly
+// scoped lock rather than the existing (dead: zero real callers besides its
+// own accessors) `kernel_lock` BKL in cpu/smp.h, to avoid entangling this
+// fix with a different, untested, much coarser-grained mechanism.
+//
+// Exposed as two plain functions rather than `extern spinlock_t
+// g_proc_mm_lock` so that process.h (included very widely: fs/, gui/,
+// drivers/, io/, ipc/, net/...) does NOT have to pull in sync/spinlock.h.
+// That was tried first and broke the build: io/io_ring.h #defines its own
+// zero-arg `compiler_barrier()` macro before including process.h, which
+// collides with spinlock.h's real `compiler_barrier(void)` inline function
+// of the same name. Keeping the lock itself private to process.c and
+// exporting only these two calls avoids the collision entirely.
+void proc_mm_lock(void);
+void proc_mm_unlock(void);
+
+// #421 phase 5 FOLLOW-UP: the g_proc_mm_lock fix above was verified
+// correct-as-far-as-it-goes (it does serialize a single process_t's mm
+// against its own teardown) but was NOT sufficient on its own: it still
+// panicked at the exact same proc_mem_account_rs address on a real,
+// reproduced AssaultCube crash. Root cause of the remaining gap: a CLONE_VM
+// thread (shares_vm=1, process.c proc_clone()) shares its group leader's mm
+// pointer, but cleanup_proc_slot() decided "am I the one who frees this mm"
+// from a single process_t's OWN shares_vm flag, not from whether anyone else
+// was still using it. When the LEADER crashed and was reaped while a
+// just-cloned sibling thread was still alive and running, the leader's
+// cleanup (shares_vm==0, so "yes, free it") freed the shared mm out from
+// under the still-live sibling, whose own p->mm field kept pointing at now-
+// freed memory; the next heartbeat's proc_snapshot() walked THAT sibling and
+// panicked. The lock above did not help because each side's critical
+// section was individually correct, just about the wrong condition: "am I
+// shares_vm" says nothing about whether anyone else is still referencing the
+// same mm.
+//
+// REAL FIX: `mm_users` (mm/demand.h), a plain refcount on the mm itself, not
+// on any one process_t. mm_create() seeds it at 1; proc_clone() calls
+// mm_get() (under this same lock) when a new thread starts sharing an
+// existing mm; cleanup_proc_slot() calls mm_put() (also under this lock)
+// instead of mm_destroy() directly, which only actually frees once the count
+// reaches 0, i.e. once EVERY process_t that ever referenced this mm -
+// leader or thread, in whatever order they exit - has released it. A still-
+// running sibling can never be left holding a dangling pointer no matter
+// which member of the group dies first. See demand.h for the field and
+// mm_get()/mm_put() themselves.
+//
+// Verification: reproduced the panic on the pre-refcount tree (crash
+// AssaultCube -> its own recoverable GPF -> a SECOND, fatal kernel GPF at
+// the same proc_mem_account_rs RIP, same throwaway VM 2601, build 910). See
+// PORT-STATUS.md / CHANGELOG.md for the measured before/after boot logs
+// proving whether mm_users actually closes the gap.
 
 // #404/#349 Task Manager: number of threads in `pid`'s thread group (>=1).
 uint32_t proc_thread_count(uint32_t pid);
@@ -327,6 +576,11 @@ void proc_exit(int exit_code);
  * @return       PID of exited child, or -1 on error
  */
 int proc_wait(int pid, int *status);
+
+// #230: wake every parent parked in proc_wait(). Called at every transition to
+// PROC_STATE_ZOMBIE and, redundantly, from sched_tick(). Safe from IRQ context
+// and with interrupts already off.
+void proc_child_exit_notify(void);
 
 /**
  * Yield CPU to another process
@@ -407,18 +661,64 @@ void proc_wake(struct process *p);
 // User-mode process support
 // ============================================================================
 
+// ---------------------------------------------------------------------------
+// #692: THE IDENTITY A NEW RING-3 PROCESS RUNS AS.
+//
+// There is no default and no silent inheritance. proc_create_user() used to
+// give the child whatever uid/gid init_proc() had copied from proc_current(),
+// and at three of the eight user-spawn sites the "parent" is a KERNEL THREAD
+// whose uid is 0 by definition (the cron worker, and the two in-kernel
+// launchers in apps/). While the desktop autologs in as root that grants
+// nothing; the moment the session is not root, a USER-CREATED CRON JOB RUNS AS
+// ROOT. The session flip does not merely fail to prevent that, it creates it,
+// by being the thing that makes root mean something.
+//
+// So this is not three patched call sites. proc_create_user() is DELETED, and
+// its replacement takes a proc_ident_t that cannot be omitted:
+//
+//   * a forgotten spawn site is a COMPILE ERROR, not a uid-0 child;
+//   * PROC_AS_INVALID is 0, so a zero-initialised or memset identity is
+//     REFUSED by the resolver rather than meaning root;
+//   * PROC_AS_CALLER is refused unless the caller really is a Ring-3 process,
+//     so "inherit" can never again silently mean "inherit from a kernel
+//     thread".
+//
+// The policy itself lives in rustkern/spawnid.rs (new kernel code, so Rust per
+// the 2026-07-16 rule), including the single gid-follows-uid rule that fixes
+// the incoherent uid 0 / gid 1000 pair services.c used to produce.
+// ---------------------------------------------------------------------------
+#define PROC_AS_INVALID  0u   // never valid; the resolver refuses it
+#define PROC_AS_CALLER   1u   // run as the CALLING Ring-3 process (exec)
+#define PROC_AS_SESSION  2u   // run as the logged-in desktop session user
+#define PROC_AS_UID      3u   // run as an explicit uid; gid from /CONFIG/PASSWD
+
+typedef struct {
+    uint32_t kind;   // PROC_AS_*
+    uint32_t uid;    // PROC_AS_UID only; ignored otherwise
+} proc_ident_t;
+
+// FFI layout lock: rustkern/spawnid.rs takes these two fields as scalars.
+_Static_assert(sizeof(proc_ident_t) == 8, "proc_ident_t must stay 2x u32 for the Rust FFI");
+
+// Constructors. Call sites read as an English sentence, which is the point:
+// the identity is visible at the spawn, not buried in a post-hoc fixup.
+static inline proc_ident_t proc_as_caller(void)  { proc_ident_t i = { PROC_AS_CALLER,  0 };   return i; }
+static inline proc_ident_t proc_as_session(void) { proc_ident_t i = { PROC_AS_SESSION, 0 };   return i; }
+static inline proc_ident_t proc_as_uid(uint32_t uid) { proc_ident_t i = { PROC_AS_UID, uid }; return i; }
+
 /**
- * Create a user-mode process from an ELF binary
+ * Create a user-mode process from an ELF binary, running as `ident`.
  * @param name      Process name
  * @param elf_data  Pointer to ELF binary data
  * @param elf_size  Size of ELF binary
  * @param argv      Command line arguments (NULL-terminated array)
  * @param envp      Environment variables (NULL-terminated array)
+ * @param ident     MANDATORY identity; an unresolvable one fails the spawn
  * @return          Process ID, or -1 on failure
  */
 void proc_set_next_migratable(int v);  // #279: route next launched user proc to an AP
-int proc_create_user(const char *name, void *elf_data, uint64_t elf_size,
-                     char **argv, char **envp);
+int proc_create_user_as(const char *name, void *elf_data, uint64_t elf_size,
+                        char **argv, char **envp, proc_ident_t ident);
 
 /**
  * Phase J: create a user process with /dev/pts/N pre-wired as stdio.
@@ -426,9 +726,10 @@ int proc_create_user(const char *name, void *elf_data, uint64_t elf_size,
  * Spawns the ELF with fds 0/1/2 bound to the pty slave at index `pts_idx`
  * instead of /dev/console. The caller must have opened /dev/ptmx first
  * (so the slave slot exists). Returns PID on success, -1 on failure.
+ * `ident` is mandatory, exactly as for proc_create_user_as().
  */
-int proc_create_user_tty(const char *name, void *elf_data, uint64_t elf_size,
-                         int pts_idx);
+int proc_create_user_tty_as(const char *name, void *elf_data, uint64_t elf_size,
+                            int pts_idx, proc_ident_t ident);
 
 /**
  * Fork the current process
@@ -505,12 +806,47 @@ uint64_t proc_get_cr3(void);
  * Switch from one process to another
  * Saves current context to old_rsp, loads new context from new_rsp
  */
-extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp);
+extern void context_switch(uint64_t *old_rsp, uint64_t new_rsp,
+                           void *old_fpu, void *new_fpu,
+                           volatile int32_t *old_release,
+                           volatile int32_t *new_unpin);
 
 /**
  * Start running a new process for the first time
  * Called after creating a process to jump into it
  */
-extern void context_start(uint64_t *old_rsp, uint64_t new_rsp, uint64_t new_cr3);
+extern void context_start(uint64_t *old_rsp, uint64_t new_rsp, uint64_t new_cr3,
+                          void *old_fpu, volatile int32_t *old_release,
+                          volatile int32_t *new_unpin);
+
+// #67 SMP scheduler diagnostic + policy self-test (proc/process.c).
+void sched_smp_selftest(void);
+
+// #67 pass 2: turn THIS application processor into a real scheduler consumer.
+// Creates the core's own idle process, publishes it as the core's current
+// process, advertises the core in g_rq_consumers, and never returns: the core
+// runs the idle loop and is preempted into work by its own timer tick, exactly
+// like the BSP. Called once per AP from the SMP work loop.
+void sched_ap_enter(uint32_t cpu);
+
+// #75: remove a process from every run queue. Call before it stops being a
+// thing that may be run. See the comment on the definition.
+void sched_rq_remove(void *vp);
+
+// #75: report whether this task is already SELECTED by some core. Call from the
+// exit path before the task stops being runnable.
+void sched_note_exit(void *vp);
+
+// #75: mark THIS task as about to stop running. Arms scheduler ownership and
+// writes the new state as ONE operation, in that order, so no other core can
+// observe a blocked/sleeping task that is still executing. Use these instead of
+// assigning to ->state directly in any path where a task blocks itself.
+void sched_self_block(void *vp, uint32_t new_state);
+void sched_self_running(void *vp);
+
+// #67 pass 2: cross-core preemption request. Marks `cpu` as needing to
+// reschedule and pokes it with an IPI so a halted core wakes; the target
+// consumes the flag in its own sched_tick().
+void sched_request_resched(uint32_t cpu);
 
 #endif // PROCESS_H

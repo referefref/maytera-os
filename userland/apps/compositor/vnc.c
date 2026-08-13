@@ -401,6 +401,39 @@ static void vnc_inject_pointer(int x, int y, int mask) {
     set_mouse_pos(x, y);
     sys_inject_mouse(x, y, MOUSE_EVENT_MOVE, 0);
 
+    // #443 completion: sys_inject_mouse() only drives the kernel window
+    // manager's click path for APP windows. The compositor's OWN
+    // desktop-icon/taskbar/start-menu hit-testing (main.c) reads
+    // g_mouse_buttons, which is populated every frame from get_mouse()
+    // (SYS_GET_MOUSE, the PHYSICAL mouse_buttons global) - a path a remote
+    // VNC click never touched, so a VNC click could move/click INSIDE an
+    // app window but could never register on the desktop itself (documented
+    // limitation in the #440 CHANGELOG entry, "(2) HONEST LIMITATIONS").
+    // #443 added SYS_SET_MOUSE_BUTTONS/set_mouse_buttons() to close exactly
+    // this gap but nothing ever called it from here. Set the same physical
+    // mouse_buttons global the PS/2 path sets, so the desktop/taskbar/start
+    // menu's own hit-test sees the button state a VNC click produced.
+    //
+    // BUT: `mask` is in RFB PointerEvent bit order (RFC 6143 7.5.5) -
+    // bit0=left, bit1=middle, bit2=right. The physical mouse_buttons global
+    // is in PS/2 packet bit order - kernel/drivers/mouse.c
+    // mouse_process_packet() does `g_mouse.buttons = flags & 0x07` straight
+    // from PS/2 packet byte 0, whose convention is bit0=left, bit1=right,
+    // bit2=middle (matching main.c's own `buttons & 2` right-button check).
+    // Right and middle are on DIFFERENT bits in the two conventions. Passing
+    // `mask` straight through set a real VNC right-click's bit2 into the
+    // physical global, which nothing checks for "right" (bit1 is what
+    // main.c/taskbar.c/widgets.c/desktop.c all test) - every VNC right-click
+    // was therefore invisible to the compositor's own desktop/taskbar/tray/
+    // widget-menu right-click handling. It only ever appeared to work for a
+    // click landing INSIDE an app window's content, because that path is
+    // driven by the hardcoded `2` literal in the sys_inject_mouse() calls
+    // below, not by this value at all - never remapped, never noticed.
+    unsigned int physical_mask = (unsigned int)(mask & 0x01)          // left: same bit
+                                | (unsigned int)((mask & 0x04) >> 1)  // RFB right(bit2) -> PS/2 right(bit1)
+                                | (unsigned int)((mask & 0x02) << 1); // RFB middle(bit1) -> PS/2 middle(bit2)
+    set_mouse_buttons(physical_mask);
+
     int left = mask & 0x01, pleft = g_last_button_mask & 0x01;
     int right = mask & 0x04, pright = g_last_button_mask & 0x04;
     if (left && !pleft) sys_inject_mouse(x, y, MOUSE_EVENT_DOWN, 1);
@@ -438,6 +471,27 @@ static void vnc_inject_key(unsigned int keysym, int down) {
             case 0xFFC9: mkey = MK_F12; is_special = 1; break;
             default: return;   // unmapped keysym: ignore rather than misinject
         }
+    }
+
+    // #745 (task #68) THE SECOND FORWARD PATH, which had NO gate at all.
+    // main.c's process_input() is not the only caller of sys_inject_key():
+    // this one is, and it never consulted the session lock, the elevation
+    // prompt, or any other modal. A remote RFB viewer could therefore type
+    // straight into the focused app window while the LOCK SCREEN was up,
+    // which defeats #566's stated guarantee ("a locked session must not leak
+    // ANY keystroke to an app window") from a completely different direction,
+    // and could read an elevation prompt's password the same way the local
+    // path could. modal_key_grab() is the single definition of who owns a key
+    // (g_modal_grabs[] in main.c), so this path asks the same question the
+    // hardware path asks rather than growing its own copy of the list.
+    //
+    // HONEST LIMIT: RFB keys are injected into the KWM window queue, never
+    // into the compositor's own sys_get_keyboard() stream, so a remote viewer
+    // cannot drive a compositor modal at all - suppression here means the key
+    // is dropped, not redirected. Unlocking over VNC was never possible and
+    // still is not.
+    if (modal_key_grab(mkey)) {
+        return;
     }
 
     if (down) {

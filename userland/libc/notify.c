@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 #include "notify.h"
 #include "syscall.h"
 // MayteraOS notifications producer API (#168).
@@ -8,7 +12,15 @@
 // fixed-file read/write is the same mechanism background services already use to
 // feed the compositor, so an external producer reaches the compositor. The
 // compositor resets the spool at session start, so old records never replay.
-#define SPOOL "/CONFIG/NOTIFY.TXT"
+// #683: the spool is per-SESSION, not system state: it holds the notifications
+// being shown to the logged-in user. It lives in that user's home so the
+// compositor can drain (read AND truncate) it without write access to /etc.
+// The Ring-0 poster (kernel/security/seclog.c) resolves the SAME path via
+// fs/userconf.c, so there is exactly one spool and no split-brain.
+// No legacy fallback here: a spool is drained and rewritten, and reading an old
+// one we cannot truncate would replay its records on every poll.
+#include "userconf.h"
+#define SPOOL_NAME "NOTIFY.TXT"
 #define SPOOL_CAP 8000
 static void ns_sani(char *d, const char *s, int max) {
     int i = 0;
@@ -26,7 +38,7 @@ int notify_post(const char *title, const char *body, int severity) {
     ns_sani(b, body  ? body  : "", sizeof(b));
     static char buf[SPOOL_CAP + 280];
     int blen = 0;
-    int rfd = sys_open(SPOOL, 0);
+    int rfd = userconf_open_read(SPOOL_NAME, 0);
     if (rfd >= 0) {
         long n = sys_read(rfd, buf, SPOOL_CAP);
         if (n > 0) blen = (int)n;
@@ -40,7 +52,7 @@ int notify_post(const char *title, const char *body, int severity) {
     for (int i = 0; b[i]; i++) *p++ = b[i];
     *p++ = '\n';
     blen = (int)(p - buf);
-    int wfd = sys_open(SPOOL, 0x41);          /* O_WRONLY|O_CREAT (rewrites) */
+    int wfd = userconf_open_write(SPOOL_NAME);   /* #683: per-user spool */
     if (wfd < 0) return -1;
     sys_write(wfd, buf, blen);
     sys_close(wfd);

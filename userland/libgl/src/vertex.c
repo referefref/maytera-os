@@ -220,6 +220,24 @@ void glopVertex(GLParam* p) {
 	cnt++;
 	c->vertex_cnt = cnt;
 
+	/* #560 defensive bounds fix, same class as the ZB_copyBuffer/ZB_plot
+	   fixes: c->vertex[] is a fixed POLYGON_MAX_VERTEX-slot array (4 slots
+	   when TGL_FEATURE_GL_POLYGON==0, per zgl.h), and every primitive case
+	   below is responsible for resetting/bounding n before it can reach
+	   POLYGON_MAX_VERTEX. That held for every primitive already exercised,
+	   but a primitive type whose case is compiled out here (e.g.
+	   GL_LINE_LOOP when TGL_FEATURE_GL_POLYGON==0 - see the real bug this
+	   closed in gldemo.c's draw_tunnel) falls into `default: break;` and
+	   does not bound n at all, so repeated glVertex() calls walk n past the
+	   end of vertex[] and overflow into the rest of GLContext (notably
+	   matrix_stack_ptr[], corrupting it with stray vertex data - the
+	   original #560 GLTUNNEL crash). Clamp here so NO caller, in any build
+	   configuration, can ever index vertex[] out of bounds; this is a no-op
+	   for every already-correct primitive path since none of them reach the
+	   clamp in normal operation.
+	*/
+	if (n >= POLYGON_MAX_VERTEX) n = POLYGON_MAX_VERTEX - 1;
+
 	/* new vertex entry */
 	v = &c->vertex[n];
 	n++;

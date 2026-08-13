@@ -3,6 +3,7 @@
 #include "ip.h"
 #include "../serial.h"
 #include "../string.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 #define MAX_UDP_BINDINGS 16
 
@@ -104,7 +105,6 @@ static inline uint32_t udp_rustdiff_rng(uint32_t *s) {
 }
 
 void udp_checksum_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     static uint8_t buf[1500];
 
     uint32_t seed = 0x51fa6d33;
@@ -150,8 +150,8 @@ void udp_checksum_rust_selftest(void) {
     {
         // 8-byte UDP header (src 0x0044=68, dst 0x0043=67, len, cksum=0) + body.
         int sizes[6] = { 8, 9, 20, 53, 300, 576 };
-        uint32_t s = udp_htonl(0xC0A80102); // a private-range test address
-        uint32_t d = udp_htonl(0xC0A80101); // a private-range test gateway
+        uint32_t s = udp_htonl(0xC0000201); // 192.0.2.1
+        uint32_t d = udp_htonl(0xC0000201); // 192.0.2.1
         for (int k = 0; k < 6; k++) {
             int len = sizes[k];
             buf[0] = 0x00; buf[1] = 0x44; buf[2] = 0x00; buf[3] = 0x43;
@@ -275,6 +275,13 @@ void udp_handle(uint32_t src_ip, const void *data, uint16_t length) {
             bindings[i].callback(src_ip, src_port, payload, data_len);
             return;
         }
+    }
+
+    // #524: deliver to a bound BSD DGRAM socket, if any (these do not use the
+    // udp_bind() callback table above).
+    extern int socket_udp_input(uint32_t, uint16_t, uint16_t, const void *, uint16_t);
+    if (socket_udp_input(src_ip, src_port, dest_port, payload, data_len)) {
+        return;
     }
 
     // No handler for this port - silently drop

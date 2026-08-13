@@ -11,7 +11,11 @@
 
 extern int g_draw_blend;   // draw.c global alpha (0-255) for translucent overlays
 
-#define SPOOL       "/CONFIG/NOTIFY.TXT"    /* fixed-file notification spool */
+/* #683: per-user spool, resolved through libc/userconf.c. The Ring-0 poster
+   (kernel/security/seclog.c) and every app poster (libc/notify.c) resolve the
+   same path, so there is one spool. */
+#include "userconf.h"
+#define SPOOL_NAME  "NOTIFY.TXT"
 #define ALERTS_CFG  "/CONFIG/ALERTS.CFG"
 
 #define NTF_INFO     0
@@ -28,7 +32,8 @@ typedef struct {
     char     title[NTITLE];
     char     body[NBODY];
     uint64_t born_ms;
-    int      rx, ry, rw, rh;   // last drawn rect (for hit-testing)
+    int      rx, ry, rw, rh;   // last drawn rect (for hit-testing AND #585 damage tracking)
+    int      settled;         // #585: 1 once the slide-in animation has finished
 } toast_t;
 #define MAX_TOASTS 4
 static toast_t g_toasts[MAX_TOASTS];
@@ -168,6 +173,10 @@ static void push_notification(int sev,const char*title,const char*body){
     if(slot<0)slot=oi;
     toast_t*t=&g_toasts[slot]; t->used=1; t->severity=sev; t->born_ms=uptime_ms();
     ncpy(t->title,title,NTITLE); ncpy(t->body,body,NBODY);
+    // #585: rw=0 tells notif_collect_damage() this slot has no "last drawn"
+    // rect yet, so its very first damage covers only the new position (no
+    // stale union from whatever toast previously occupied this slot).
+    t->rx=t->ry=t->rw=t->rh=0; t->settled=0;
 }
 
 // Consume the fixed spool: read the whole file, process complete "\n"-terminated
@@ -177,11 +186,12 @@ static void push_notification(int sev,const char*title,const char*body){
 // records never replay across reboots.
 static long g_off = 0;
 void notif_init(void) {
-    sys_unlink(SPOOL);     // fresh spool each session; old records already shown
+    { char _sp[256];       // fresh spool each session; old records already shown
+      if (userconf_path(SPOOL_NAME, _sp, sizeof(_sp)) == 0) sys_unlink(_sp); }
     g_off = 0;
 }
 static void poll_spool(void) {
-    int fd = sys_open(SPOOL, 0);
+    int fd = userconf_open_read(SPOOL_NAME, 0);   // #683: no legacy fallback, see notify.c
     if (fd < 0) return;
     static char buf[8200];
     long n = sys_read(fd, buf, sizeof(buf) - 1);
@@ -214,26 +224,164 @@ static void poll_spool(void) {
     if (added) g_needs_redraw = true;
 }
 
+// #585: notif_tick() used to force a FULL-screen g_needs_redraw on every
+// single tick for as long as ANY toast was on screen ("if(active||...)
+// g_needs_redraw=true"), regardless of whether the toast was actually
+// animating. On a weak/high-res target (real iMac, 1920x1080, ~10ms/frame
+// software compositor) that made a long-lived toast (e.g. a persistent
+// network-fault warning) pin the compositor to a full-screen composite every
+// tick for as long as it stayed up - the dominant real-hardware lag cause.
+// Fixed: a toast merely SITTING on screen, unchanged, now forces nothing at
+// all (the idle gate, #564, stays engaged). Only genuine STATE CHANGES get a
+// one-shot g_needs_redraw (new arrival in poll_spool() above, a toast
+// finishing its slide-in here, or a toast expiring/vacating its rect here) -
+// these are rare, one-time events, not a per-tick cost. While the toast is
+// merely animating (still sliding) or static, notif_collect_damage() (called
+// from main's idle path alongside widgets_collect_damage()/
+// taskbar_collect_damage(), same #379 mechanism) marks damage for ONLY the
+// toast's own rect, so the composite+present stays scoped to that small
+// region instead of the whole screen.
+#define TOAST_W 320
+#define TOAST_H 64
+#define TOAST_MARGIN 12
+#define TOAST_GAP 8
+#define TOAST_LINE_H 16
+#define TOAST_MAX_LINES 3
+
+// #762: word-wrap `body` into up to `max_lines` lines that each fit `max_w`
+// pixels at TTF size `size`, measured with the REAL glyph metrics
+// (text_width_ttf) - a proportional TTF face has no fixed char width, so
+// guessing "N chars per line" is wrong for any string with wide glyphs (this
+// is what let "N color pair(s) were too low-contrast..." run off the right
+// edge of the toast). Breaks at the last space that still fits; a single
+// word wider than max_w is hard-broken so it can never leave the box. Any
+// text left over once max_lines is reached is dropped and the last line
+// ellipsized (real-measured, not a fixed suffix count) so it still fits.
+static int wrap_text_ttf(const char *body, int size, int max_w, int max_lines,
+                         char out[][NBODY]) {
+    int nlines = 0;
+    const char *p = body;
+    while (*p && nlines < max_lines) {
+        int len = 0, last_space = -1;
+        char probe[NBODY];
+        while (p[len]) {
+            if (p[len] == ' ' && len > 0) last_space = len;
+            int pl = len + 1; if (pl > NBODY - 1) pl = NBODY - 1;
+            memcpy(probe, p, pl); probe[pl] = 0;
+            if (text_width_ttf(probe, size) > max_w) break;
+            if (pl >= NBODY - 1) { len = pl; break; }
+            len++;
+        }
+        int cut;
+        if (!p[len]) {
+            cut = len;                 // rest of the string fits on this line
+        } else if (last_space > 0) {
+            cut = last_space;          // break at the last word boundary that fit
+        } else {
+            cut = (len > 0) ? len : 1; // single word wider than max_w: hard-break it
+        }
+        int cl = cut; if (cl > NBODY - 1) cl = NBODY - 1;
+        memcpy(out[nlines], p, cl); out[nlines][cl] = 0;
+        nlines++;
+        p += cut;
+        while (*p == ' ') p++;
+    }
+    if (*p && nlines > 0) {
+        // Text remains beyond max_lines: ellipsize the last line, measuring
+        // the actual "..." glyph width rather than assuming a fixed suffix.
+        char *last = out[nlines - 1];
+        int ellw = text_width_ttf("...", size);
+        int l = (int)strlen(last);
+        while (l > 0 && text_width_ttf(last, size) + ellw > max_w) last[--l] = 0;
+        if (l + 3 < NBODY) { last[l]='.'; last[l+1]='.'; last[l+2]='.'; last[l+3]=0; }
+    }
+    if (nlines < 1) nlines = 1, out[0][0] = 0;
+    return nlines;
+}
+
+// Truncate a single line to fit max_w, appending a real-measured ellipsis.
+// Used where growing the box is not an option (fixed-height history rows).
+static void ellipsize_ttf(const char *src, int size, int max_w, char *out, int outcap) {
+    int n = 0; while (src[n] && n < outcap - 1) { out[n] = src[n]; n++; } out[n] = 0;
+    if (text_width_ttf(out, size) <= max_w) return;
+    int ellw = text_width_ttf("...", size);
+    while (n > 0 && text_width_ttf(out, size) + ellw > max_w) out[--n] = 0;
+    if (n + 3 < outcap) { out[n]='.'; out[n+1]='.'; out[n+2]='.'; out[n+3]=0; }
+}
+
+// Available width for toast body text: box width minus the left icon/text
+// inset (matches the x+50 draw origin in draw_toast()) and a right margin
+// clear of the close "x" glyph.
+#define TOAST_BODY_MAXW (TOAST_W - 50 - 16)
+
+// Wrapped line count -> resulting box height for a toast's body. Called from
+// notif_render()/notif_collect_damage()/draw_toast() so the three can never
+// disagree about how tall a given toast is (same mirroring discipline as the
+// existing tx/ty stacking formula these functions already share, #585).
+static int toast_height_for(const char *body) {
+    char lines[TOAST_MAX_LINES][NBODY];
+    int n = wrap_text_ttf(body, 13, TOAST_BODY_MAXW, TOAST_MAX_LINES, lines);
+    int h = 33 + n * TOAST_LINE_H + 12;   // body-start y + lines + bottom pad
+    return h > TOAST_H ? h : TOAST_H;
+}
+
 void notif_tick(void){
     unsigned long now=(unsigned long)sys_clock();
     static unsigned long last=0, plast=0;
     if(now-plast>250){ load_prefs(); plast=now; }     // reload prefs ~1s
     if(now-last>=12){ last=now; poll_spool(); }        // poll spool ~50ms
-    // expire toasts; keep redrawing while any are visible (smooth slide/fade)
     uint64_t t=uptime_ms(); uint64_t life=(uint64_t)p_duration*1000;
-    int active=0;
     for(int i=0;i<MAX_TOASTS;i++) if(g_toasts[i].used){
-        if(t-g_toasts[i].born_ms>life){ g_toasts[i].used=0; g_needs_redraw=true; }
-        else active=1;
+        toast_t*ts=&g_toasts[i];
+        if(t-ts->born_ms>life){
+            // Expiring: the slot goes unused, so notif_collect_damage()'s
+            // per-toast layout loop will never revisit it to erase the rect
+            // it vacates (and the remaining stacked toasts above the gap need
+            // to be recomposited to reflow into it too). One-shot only.
+            ts->used=0; g_needs_redraw=true;
+        } else if(!ts->settled && t-ts->born_ms>=220){
+            // Slide-in just finished. One more forced frame guarantees the
+            // toast reaches its true resting position even when nothing else
+            // is triggering a render this tick (e.g. an app window is open
+            // and idle, so the #379 idle dirty-rect path below is not
+            // reached at all - see main.c's "Pure idle" branch, #564).
+            ts->settled=1; g_needs_redraw=true;
+        }
     }
-    if(active||g_center_open) g_needs_redraw=true;
+    if(g_center_open) g_needs_redraw=true;   // open modal panel: same as any other menu
+}
+
+// #585: per-toast damage for the idle dirty-rect path (#379). Mirrors
+// notif_render()'s own stacking layout exactly (same tx/ty formula, same
+// `shown` bookkeeping) so the two can never disagree about where a toast
+// belongs. A toast that has not moved since notif_render() last actually drew
+// it (t->rx/ry) contributes NO damage at all - this is what lets a long-lived
+// STATIC toast sit on screen at zero per-tick cost, instead of the old "any
+// toast visible -> full-screen redraw every tick" behavior.
+void notif_collect_damage(void){
+    uint64_t now=uptime_ms();
+    int y_off=TOAST_MARGIN;
+    for(int i=0;i<MAX_TOASTS;i++){
+        if(!g_toasts[i].used) continue;
+        toast_t*t=&g_toasts[i];
+        int th=toast_height_for(t->body);
+        int tx=g_fb_width-TOAST_W-TOAST_MARGIN;
+        int ty=y_off;
+        uint64_t age=now-t->born_ms;
+        if(age<220){ int off=(int)((220-age)*(TOAST_W+TOAST_MARGIN)/220); tx+=off; }
+        int have_prev = t->rw>0;
+        if(have_prev && tx==t->rx && ty==t->ry && th==t->rh){ y_off+=th+TOAST_GAP; continue; }  // static: nothing changed
+        int ux0 = have_prev ? (tx<t->rx?tx:t->rx) : tx;
+        int uy0 = have_prev ? (ty<t->ry?ty:t->ry) : ty;
+        int ux1 = have_prev ? ((tx+TOAST_W)>(t->rx+t->rw)?(tx+TOAST_W):(t->rx+t->rw)) : (tx+TOAST_W);
+        int uy1 = have_prev ? ((ty+th)>(t->ry+t->rh)?(ty+th):(t->ry+t->rh)) : (ty+th);
+        damage_add(ux0,uy0,ux1-ux0,uy1-uy0);
+        y_off+=th+TOAST_GAP;
+    }
 }
 
 // ---- rendering ------------------------------------------------------------
-#define TOAST_W 320
-#define TOAST_H 64
-#define TOAST_MARGIN 12
-#define TOAST_GAP 8
+// (TOAST_W/H/MARGIN/GAP now defined above, ahead of notif_collect_damage())
 static void draw_toast(toast_t*t){
     int x=t->rx, y=t->ry, w=t->rw, h=t->rh;
     uint32_t acc=sev_color(t->severity);
@@ -244,22 +392,28 @@ static void draw_toast(toast_t*t){
     draw_fill_rect(x,y,4,h,acc);                          // severity color bar
     if(!mico_blit(sev_icon(t->severity),x+14,y+(h-26)/2,26,acc,CLR_MENU_BG))
         draw_circle_filled(x+27,y+h/2,11,acc);
-    draw_text_ttf(x+50,y+9,t->title[0]?t->title:sev_word(t->severity),15,ink);
-    draw_text_ttf(x+50,y+33,t->body,13,dim);
+    char title_line[NTITLE];
+    ellipsize_ttf(t->title[0]?t->title:sev_word(t->severity), 15, w-50-16, title_line, sizeof(title_line));
+    draw_text_ttf(x+50,y+9,title_line,15,ink);
+    char body_lines[TOAST_MAX_LINES][NBODY];
+    int body_n = wrap_text_ttf(t->body, 13, TOAST_BODY_MAXW, TOAST_MAX_LINES, body_lines);
+    for (int li = 0; li < body_n; li++)
+        draw_text_ttf(x+50, y+33+li*TOAST_LINE_H, body_lines[li], 13, dim);
     draw_text_ttf(x+w-15,y+5,"x",13,dim);
 }
 void notif_render(void){
-    int shown=0; uint64_t now=uptime_ms();
+    int y_off=TOAST_MARGIN; uint64_t now=uptime_ms();
     for(int i=0;i<MAX_TOASTS;i++){
         if(!g_toasts[i].used) continue;
         toast_t*t=&g_toasts[i];
+        int th=toast_height_for(t->body);
         int tx=g_fb_width-TOAST_W-TOAST_MARGIN;
-        int ty=TOAST_MARGIN+shown*(TOAST_H+TOAST_GAP);
+        int ty=y_off;
         uint64_t age=now-t->born_ms;
         if(age<220){ int off=(int)((220-age)*(TOAST_W+TOAST_MARGIN)/220); tx+=off; }
-        t->rx=tx; t->ry=ty; t->rw=TOAST_W; t->rh=TOAST_H;
+        t->rx=tx; t->ry=ty; t->rw=TOAST_W; t->rh=th;
         draw_toast(t);
-        shown++;
+        y_off+=th+TOAST_GAP;
     }
     if(g_center_open){
         int w=360, x=g_fb_width-w-6;
@@ -284,8 +438,11 @@ void notif_render(void){
             draw_fill_rect(x+8,ry,3,rh-6,acc);
             if(!mico_blit(sev_icon(hh->severity),x+16,ry+(rh-6-20)/2,20,acc,CLR_MENU_ITEM_HOVER))
                 draw_circle_filled(x+26,ry+(rh-6)/2,8,acc);
-            draw_text_ttf(x+46,ry+4,hh->title[0]?hh->title:sev_word(hh->severity),13,ink);
-            draw_text_ttf(x+46,ry+22,hh->body,12,dim);
+            char hist_title[NTITLE], hist_body[NBODY];
+            ellipsize_ttf(hh->title[0]?hh->title:sev_word(hh->severity), 13, (x+w-16)-(x+46), hist_title, sizeof(hist_title));
+            ellipsize_ttf(hh->body, 12, (x+w-16)-(x+46), hist_body, sizeof(hist_body));
+            draw_text_ttf(x+46,ry+4,hist_title,13,ink);
+            draw_text_ttf(x+46,ry+22,hist_body,12,dim);
             ry+=rh;
         }
         if(g_hist_n==0) draw_text_ttf(x+16,top+46,"No notifications",13,dim);

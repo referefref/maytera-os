@@ -221,7 +221,7 @@ ssize_t xattr_get(const char *path, const char *name, void *value, size_t size);
  * @param flags     XATTR_CREATE, XATTR_REPLACE, or 0
  * @return          0 on success, negative error code on failure
  */
-int xattr_set(const char *path, const char *name, const void *value, size_t size, int flags);
+MUST_CHECK int xattr_set(const char *path, const char *name, const void *value, size_t size, int flags);
 
 /**
  * Remove an extended attribute

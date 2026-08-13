@@ -11,6 +11,9 @@
 #include "../string.h"
 #include "../mm/heap.h"
 #include "../gui/syslog.h"
+#include "../cpu/mono.h"   // #499: sched_now_ms() - THE shared real-elapsed-ms clock
+#include "../cpu/dlprof.h"
+#include "http_progress.h"   // #25: real per-fetch progress for the browser chrome
 
 // External declarations
 extern void net_poll(void);
@@ -93,15 +96,31 @@ static int find_free_slot(void) {
     return -1;
 }
 
-// Get a connection from the pool or create a new one
-int http_get_connection(const char *host, uint16_t port, uint32_t ip) {
+// #615: force-close any pooled connection to host:port (used to retry a failed
+// request on a genuinely fresh connection).
+void http_drop_pooled(const char *host, uint16_t port) {
     init_connection_pool();
+    for (int i = 0; i < HTTP_MAX_CONNECTIONS; i++) {
+        if (connection_pool[i].active && connection_pool[i].port == port &&
+            strcmp(connection_pool[i].host, host) == 0) {
+            tcp_close(connection_pool[i].socket);
+            connection_pool[i].active = 0;
+            connection_pool[i].socket = -1;
+        }
+    }
+}
+
+// Get a connection from the pool or create a new one. *reused (optional) is set
+// to 1 when an existing pooled connection was handed back.
+int http_get_connection_ex(const char *host, uint16_t port, uint32_t ip, int *reused) {
+    init_connection_pool();
+    if (reused) *reused = 0;
 
     // Look for existing connection
     int idx = find_connection(host, port);
     if (idx >= 0) {
-        kprintf("[HTTP] Reusing connection to %s:%d\n", host, port);
         connection_pool[idx].last_used = timer_ticks;
+        if (reused) *reused = 1;
         return connection_pool[idx].socket;
     }
 
@@ -124,14 +143,15 @@ int http_get_connection(const char *host, uint16_t port, uint32_t ip) {
     // idle timeout above -- at the kernel's real 250Hz PIT rate that macro is
     // only ~1.2s, which can spuriously fail a slow-but-fine connect under
     // load. Recompute the intended ~16s from the real tick rate instead.
-    uint64_t start_time = timer_ticks;
-    uint32_t conn_hz = g_timer_hz ? g_timer_hz : 250;
-    uint64_t conn_timeout_ticks = conn_hz * 16;
+    // #499: and it must be measured on the REAL clock, not timer_ticks, or a
+    // KVM tick burst collapses the whole 16s budget to nothing.
+    uint64_t start_time_ms = sched_now_ms();
+    uint64_t conn_timeout_ms = 16000;
     while (!tcp_is_connected(sock)) {
         net_poll();
         tcp_timer();
 
-        if (timer_ticks - start_time > conn_timeout_ticks) {
+        if (sched_now_ms() - start_time_ms > conn_timeout_ms) {
             tcp_close(sock);
             return WGET_ERR_TIMEOUT;
         }
@@ -163,6 +183,10 @@ int http_get_connection(const char *host, uint16_t port, uint32_t ip) {
     return sock;
 }
 
+int http_get_connection(const char *host, uint16_t port, uint32_t ip) {
+    return http_get_connection_ex(host, port, ip, (int *)0);
+}
+
 // Release connection back to pool or close it
 void http_release_connection(int sock, bool keep_alive) {
     for (int i = 0; i < HTTP_MAX_CONNECTIONS; i++) {
@@ -171,7 +195,7 @@ void http_release_connection(int sock, bool keep_alive) {
                 // Keep the connection in the pool
                 connection_pool[i].last_used = timer_ticks;
                 connection_pool[i].keep_alive = keep_alive;
-                kprintf("[HTTP] Keeping connection alive\n");
+                /* #615: silent - this fires on every chunk of a large download */
             } else {
                 // Close and remove from pool
                 tcp_close(sock);
@@ -568,7 +592,7 @@ static int wget_ip_is_private(uint32_t ip) {
     if (a == 127) return 1;                         // 127.0.0.0/8 (loopback)
     if (a == 169 && b == 254) return 1;              // 169.254.0.0/16 (link-local/metadata)
     if (a == 172 && b >= 16 && b <= 31) return 1;    // 172.16.0.0/12
-    if (a == 192 && b == 168) return 1;              // 192.168.0.0/16
+    if (a == 192 && b == 168) return 1;              // 192.0.2.1/16
     return 0;
 }
 
@@ -592,7 +616,7 @@ static int wget_url_is_https(const char *url) {
 // #fix-ssrf-contentlength: gate a redirect target before following it.
 // `orig_is_private` reflects the ORIGINAL request (set once, at redirect
 // depth 0): if the caller already opted into a private/LAN destination
-// (e.g. Home Assistant on 192.168.x.x), redirects among private hosts stay
+// (e.g. Home Assistant on a private LAN address), redirects among private hosts stay
 // allowed; a public-origin request must never be redirected onto an
 // internal address. A redirect from https to http is always refused
 // (protocol downgrade), regardless of host.
@@ -1059,32 +1083,62 @@ static int send_all(int sock, const void *data, size_t len) {
 //     time data arrives, so a large response that keeps trickling in (chunked
 //     HA/API bodies under CPU load, slow LAN peers, etc.) is never punished
 //     just for taking a while overall.
-//   - overall_deadline: an absolute timer_ticks value bounding the WHOLE
+//   - overall_deadline_ms: an absolute sched_now_ms() value bounding the WHOLE
 //     fetch (headers+body) even if data keeps trickling in just under the
 //     idle gap forever. 0 = no overall cap (caller doesn't want one).
+// #499: both bounds are REAL milliseconds from sched_now_ms(), not ticks.
 static int recv_with_timeout(int sock, uint8_t *buf, size_t max_len, size_t *received,
-                             uint64_t idle_timeout_ticks, uint64_t overall_deadline) {
-    uint64_t start_time = timer_ticks;
+                             uint64_t idle_timeout_ms, uint64_t overall_deadline_ms) {
+    uint64_t start_time_ms = sched_now_ms();
     *received = 0;
 
+    // #615: THIS LOOP WAS THE DOWNLOAD BOTTLENECK. It ended every iteration with
+    // an unconditional proc_sleep(2) - and proc_sleep cannot sleep for less than
+    // one PIT tick, which at the kernel's real 250Hz rate is 4ms. So the receive
+    // path advanced by at most one drained batch per ~4.7ms no matter how fast
+    // the wire delivered, which is exactly what the packet capture showed: one
+    // 536-byte segment acknowledged every 4.7ms = ~110 KB/s on an idle gigabit
+    // LAN, independent of the peer, the link, or the response size.
+    //
+    // The fix is to make this behave like a real read(): drain everything that
+    // is already buffered WITHOUT sleeping, and only sleep when there is nothing
+    // to do AND nothing to hand back. One sleep per drain cycle instead of one
+    // sleep per segment. It is not a busy-wait: the moment the socket runs dry
+    // with bytes in hand we return to the caller, and when it runs dry with
+    // nothing in hand we block on the tick like before.
     while (*received < max_len) {
+        g_dp_wg_iter++;
         net_poll();
         tcp_timer();
 
-        int r = tcp_recv(sock, buf + *received, max_len - *received);
+        // #608: pass the FULL remaining space. tcp_recv() takes uint32_t now;
+        // this expression used to be narrowed to uint16_t by the old
+        // prototype, so once (max_len - *received) hit an exact multiple of
+        // 65536 the request became 0 bytes and this loop span on "no data"
+        // until the idle timeout, aborting every body over ~64KB.
+        size_t _want = max_len - *received;
+        if (_want > 0xFFFFFFFFu) _want = 0xFFFFFFFFu;
+        int r = tcp_recv(sock, buf + *received, (uint32_t)_want);
         if (r > 0) {
             *received += r;
-            start_time = timer_ticks;  // Reset idle-gap timer on data
+            g_dp_wg_bytes += (uint64_t)r;
+            start_time_ms = sched_now_ms();  // Reset idle-gap timer on data
+            // Keep draining at wire speed: no sleep while bytes are flowing.
+            continue;
         } else if (r == TCP_ERR_CLOSED) {
             return 0;  // Connection closed normally
         } else if (r < 0 && r != TCP_ERR_WOULD_BLOCK) {
             return r;  // Error
-        } else {
-            proc_sleep(1);  // no data yet: yield instead of busy-spinning
+        }
+
+        // Socket is dry. If we already have bytes, hand them to the caller now
+        // rather than sleeping on more; the caller loops straight back in.
+        if (*received > 0) {
+            return 0;
         }
 
         // Idle-gap timeout: only fires after a real stretch of total silence.
-        if (timer_ticks - start_time > idle_timeout_ticks) {
+        if (sched_now_ms() - start_time_ms > idle_timeout_ms) {
             return WGET_ERR_TIMEOUT;
         }
 
@@ -1092,7 +1146,7 @@ static int recv_with_timeout(int sock, uint8_t *buf, size_t max_len, size_t *rec
         // keeps trickling in just under the idle gap, so a live-but-glacial
         // peer can't hold the fetch open forever. Keep whatever we already
         // received rather than discarding a mostly-complete body.
-        if (overall_deadline && (int64_t)(timer_ticks - overall_deadline) >= 0) {
+        if (overall_deadline_ms && (int64_t)(sched_now_ms() - overall_deadline_ms) >= 0) {
             return (*received > 0) ? 0 : WGET_ERR_TIMEOUT;
         }
 
@@ -1103,19 +1157,46 @@ static int recv_with_timeout(int sock, uint8_t *buf, size_t max_len, size_t *rec
             return 0;  // Connection closed
         }
 
-        proc_sleep(2);  // #212 yield during net wait (was busy pause-spin)
+        g_dp_wg_sleep++;
+        proc_sleep(1);  // nothing buffered and nothing in hand: yield a tick
     }
 
     return 0;
 }
 
-// Perform HTTP request with full control
+// #615: a pooled keep-alive connection can be closed by the peer between
+// requests (nginx keepalive_timeout / keepalive_requests), and we only find out
+// when the request on it fails. Do the request; if it failed AND it ran on a
+// REUSED connection, drop that connection and try exactly once more on a fresh
+// one. A first-attempt failure on a fresh connection is a real failure and is
+// returned unchanged.
+static int http_request_once(http_request_t *req, http_response_t *resp,
+                             uint8_t *body_buf, size_t body_buf_size,
+                             size_t *body_len_out, int allow_reuse, int *reused);
+
 int http_request(http_request_t *req, http_response_t *resp,
                  uint8_t *body_buf, size_t body_buf_size, size_t *body_len_out) {
+    int reused = 0;
+    int r = http_request_once(req, resp, body_buf, body_buf_size, body_len_out,
+                              1, &reused);
+    if (r != WGET_SUCCESS && reused) {
+        kprintf("[HTTP] pooled connection failed (%d); retrying on a fresh one\n", r);
+        reused = 0;
+        r = http_request_once(req, resp, body_buf, body_buf_size, body_len_out,
+                              0, &reused);
+    }
+    return r;
+}
+
+static int http_request_once(http_request_t *req, http_response_t *resp,
+                             uint8_t *body_buf, size_t body_buf_size,
+                             size_t *body_len_out, int allow_reuse, int *reused) {
     int result = WGET_ERR_CONNECT_FAILED;
     int sock = -1;
     bool pool_connection = false;
     uint8_t *recv_buf = NULL;
+    uint64_t _rq_t0 = sched_now_ms();
+    if (reused) *reused = 0;
 
     // Initialize response
     http_response_init(resp);
@@ -1127,7 +1208,9 @@ int http_request(http_request_t *req, http_response_t *resp,
         return WGET_ERR_NO_NETWORK;
     }
 
-    // Resolve hostname. IP literals (LAN repo at 192.168.x.x) are used directly
+    net_progress_phase(HTTP_PHASE_RESOLVING);   // #25
+
+    // Resolve hostname. IP literals (LAN repo at a private LAN address) are used directly
     // so HTTP works without DNS (apt-style local repos).
     uint32_t ip = 0;
     int is_ip = (req->host[0] != 0);
@@ -1147,17 +1230,23 @@ int http_request(http_request_t *req, http_response_t *resp,
     kprintf("[HTTP] %s %s://%s:%d%s\n", req->method,
            (req->port == 443) ? "https" : "http", req->host, req->port, req->path);
 
+    net_progress_phase(HTTP_PHASE_CONNECTING);   // #25
+
     // Get connection from pool
-    sock = http_get_connection(req->host, req->port, ip);
+    if (!allow_reuse) http_drop_pooled(req->host, req->port);
+    int was_reused = 0;
+    sock = http_get_connection_ex(req->host, req->port, ip, &was_reused);
     if (sock < 0) {
         return sock;  // Error code
     }
+    if (reused) *reused = was_reused;
     pool_connection = true;
 
     // Build request
     static char request_buf[4096];
     int req_len = build_http_request(req, request_buf, sizeof(request_buf));
 
+    net_progress_phase(HTTP_PHASE_SENDING);   // #25
     kprintf("[HTTP] Sending request (%d bytes)\n", req_len);
 
     // Send request headers
@@ -1196,10 +1285,10 @@ int http_request(http_request_t *req, http_response_t *resp,
     // PIT at 250Hz -- so the "idle" gap was really only ~1.6s, aborting large
     // responses (HA /api/states ~991KB, big browser pages) that stall briefly
     // between chunks under load, well before headers/body ever finished.
-    uint32_t hz = g_timer_hz ? g_timer_hz : 250;
-    uint64_t idle_ticks = req->timeout_ms > 0
-        ? ((uint64_t)req->timeout_ms * hz / 1000)
-        : (uint64_t)hz * 60;                       // ~60 sec idle-gap default: a
+    // #499: REAL milliseconds on sched_now_ms(), not tick counts.
+    uint64_t idle_ms = req->timeout_ms > 0
+        ? (uint64_t)req->timeout_ms
+        : 60000ULL;                                // ~60 sec idle-gap default: a
                                                      // large REST response (e.g. HA
                                                      // rendering ~2000 entities) can
                                                      // take a long time to even start
@@ -1214,15 +1303,17 @@ int http_request(http_request_t *req, http_response_t *resp,
     // download fix is chunked in-regime Range requests streamed to disk (each
     // chunk is a small fetch well inside this budget), so no single fetch needs a
     // 10-minute ceiling. The 60s idle-gap above still aborts a stalled peer.
-    uint64_t overall_deadline = timer_ticks + (uint64_t)hz * 90;
+    uint64_t overall_deadline_ms = sched_now_ms() + 90000ULL;
 
     int header_end = -1;
+
+    net_progress_phase(HTTP_PHASE_RECEIVING);   // #25
 
     // Receive headers first
     while (header_end < 0) {
         size_t chunk_received = 0;
         int r = recv_with_timeout(sock, recv_buf + recv_len, recv_buf_size - recv_len - 1,
-                                  &chunk_received, idle_ticks, overall_deadline);
+                                  &chunk_received, idle_ms, overall_deadline_ms);
         if (r < 0) {
             result = r;
             goto cleanup;
@@ -1246,6 +1337,8 @@ int http_request(http_request_t *req, http_response_t *resp,
         result = WGET_ERR_HTTP_ERROR;
         goto cleanup;
     }
+    if (resp->content_length != (size_t)-1)
+        net_progress_content_len((uint32_t)resp->content_length);   // #25
 
     kprintf("[HTTP] Status: %d %s\n", resp->status_code, resp->status_text);
     if (resp->content_type[0]) {
@@ -1256,10 +1349,29 @@ int http_request(http_request_t *req, http_response_t *resp,
         kprintf("\n");
     }
     if (resp->content_length != (size_t)-1) {
-        kprintf("[HTTP] Content-Length: %zu\n", resp->content_length);
+        kprintf("[HTTP] Content-Length: %u\n", (unsigned)resp->content_length);
     }
     if (resp->chunked) {
         kprintf("[HTTP] Transfer-Encoding: chunked\n");
+    }
+
+    // #608: a 206 must actually deliver the range that was ASKED for. The
+    // App Store streams a >100MB package as a sequence of Range chunks written
+    // straight to disk at the requested offset; a server/proxy that answers a
+    // different range with 206 would put the wrong bytes at that offset. The
+    // signed-manifest sha256 still catches that (fail-closed, unchanged), but
+    // only after the whole package has been transferred. Reject the framing
+    // error here instead. The check is in Rust (rustkern/http.rs) and is
+    // fail-open: it can only reject a provable mismatch.
+    if (resp->status_code == 206 && req->headers[0]) {
+        extern int http_range_check_rs(const uint8_t *, uint32_t, const uint8_t *, uint32_t);
+        uint32_t _hl = 0; while (req->headers[_hl]) _hl++;
+        if (!http_range_check_rs((const uint8_t *)req->headers, _hl,
+                                 recv_buf, (uint32_t)header_end)) {
+            kprintf("[HTTP] 206 Content-Range does not satisfy the requested Range; refusing\n");
+            result = WGET_ERR_HTTP_ERROR;
+            goto cleanup;
+        }
     }
 
     // Calculate body already received
@@ -1279,11 +1391,12 @@ int http_request(http_request_t *req, http_response_t *resp,
             size_t space = recv_buf_size - recv_len - 1;
             if (space == 0) break;  // Buffer full
             int r = recv_with_timeout(sock, recv_buf + recv_len, space,
-                                      &chunk_received, idle_ticks, overall_deadline);
+                                      &chunk_received, idle_ms, overall_deadline_ms);
             if (chunk_received == 0 || r < 0) {
                 break;  // Connection closed or error
             }
             recv_len += chunk_received;
+            net_progress_bytes((uint32_t)(recv_len - header_end));   // #25
         }
         if (cc != 1) {
             kprintf("[HTTP] Truncated/malformed chunked body (ended before terminating chunk)\n");
@@ -1307,11 +1420,12 @@ int http_request(http_request_t *req, http_response_t *resp,
             size_t space = recv_buf_size - recv_len - 1;
             if (space == 0) break;  // Buffer full
 
-            int r = recv_with_timeout(sock, recv_buf + recv_len, space, &chunk_received, idle_ticks, overall_deadline);
+            int r = recv_with_timeout(sock, recv_buf + recv_len, space, &chunk_received, idle_ms, overall_deadline_ms);
             if (chunk_received == 0 || r < 0) {
                 break;
             }
             recv_len += chunk_received;
+            net_progress_bytes((uint32_t)(recv_len - header_end));   // #25
             body_in_buffer = recv_len - header_end;
         }
 
@@ -1321,8 +1435,8 @@ int http_request(http_request_t *req, http_response_t *resp,
         // Returning that as WGET_SUCCESS silently corrupted JSON callers
         // (HA /api/states, pip metadata) that only check the status code.
         if (body_in_buffer < resp->content_length) {
-            kprintf("[HTTP] Truncated body: got %zu of %zu advertised bytes\n",
-                    body_in_buffer, resp->content_length);
+            kprintf("[HTTP] Truncated body: got %u of %u advertised bytes\n",
+                    (unsigned)body_in_buffer, (unsigned)resp->content_length);
             result = WGET_ERR_TRUNCATED;
             goto cleanup;
         }
@@ -1334,11 +1448,12 @@ int http_request(http_request_t *req, http_response_t *resp,
             size_t space = recv_buf_size - recv_len - 1;
             if (space == 0) break;
 
-            int r = recv_with_timeout(sock, recv_buf + recv_len, space, &chunk_received, idle_ticks, overall_deadline);
+            int r = recv_with_timeout(sock, recv_buf + recv_len, space, &chunk_received, idle_ms, overall_deadline_ms);
             if (chunk_received == 0 || r < 0) {
                 break;
             }
             recv_len += chunk_received;
+            net_progress_bytes((uint32_t)(recv_len - header_end));   // #25
             body_in_buffer = recv_len - header_end;
         }
     }
@@ -1351,7 +1466,16 @@ int http_request(http_request_t *req, http_response_t *resp,
         if (body_len_out) *body_len_out = body_in_buffer;
     }
 
-    kprintf("[HTTP] Received %zu bytes body\n", body_in_buffer);
+    {
+        extern uint64_t g_net_poll_calls, g_net_poll_pkts, g_net_poll_max;
+        static uint64_t pc0 = 0, pp0 = 0;
+        kprintf("[HTTPPROF] http body=%u ms=%u reused=%d polls=%u pkts=%u maxpkts=%u\n",
+                (unsigned)body_in_buffer, (unsigned)(sched_now_ms() - _rq_t0),
+                was_reused,
+                (unsigned)(g_net_poll_calls - pc0), (unsigned)(g_net_poll_pkts - pp0),
+                (unsigned)g_net_poll_max);
+        pc0 = g_net_poll_calls; pp0 = g_net_poll_pkts; g_net_poll_max = 0;
+    }
     result = WGET_SUCCESS;
 
 cleanup:
@@ -1559,8 +1683,13 @@ static int wget_fetch_internal(const char *url, uint8_t **body_out, uint32_t *bo
 
     // #374: hard network-up gate - do not attempt DNS/ARP/TCP when the link is
     // down; return immediately so the caller (and any UI it feeds) never blocks.
-    extern int net_is_up(void);
-    if (!net_is_up()) return WGET_ERR_NO_NETWORK;
+    // #549: ask net_wire_usable(), NOT net_is_up(). #374's intent is "is there a
+    // carrier and an address", and that is exactly what net_wire_usable() means.
+    // net_is_up() additionally reports DOWN while NET_FAULTY, and using it here
+    // re-applied the breaker policy below the gate that owns it, killing the
+    // paced re-probe before it could put a single packet on the wire.
+    extern int net_wire_usable(void);
+    if (!net_wire_usable()) return WGET_ERR_NO_NETWORK;
 
     http_request_t req;
     http_request_init(&req);
@@ -1688,14 +1817,19 @@ static int wget_request_hdr(const char *method, const char *url,
     if (body_len_out) *body_len_out = 0;
     if (status_out) *status_out = 0;
 
-    extern int net_is_up(void);
-    if (!net_is_up()) return WGET_ERR_NO_NETWORK;
+    extern int net_wire_usable(void);   // #549: see wget_fetch above
+    if (!net_wire_usable()) return WGET_ERR_NO_NETWORK;
 
     http_request_t req;
     http_request_init(&req);
     if (http_parse_url(url, &req) < 0) return WGET_ERR_INVALID_URL;
 
-    req.keep_alive = false;
+    // #615: keep-alive. Each Range chunk of a package download used to open a
+    // brand-new TCP connection (and, over https, a whole new TLS handshake:
+    // measured 473ms of every 3.3s chunk). http_request() below retries once on
+    // a fresh connection if a pooled one turns out to have been closed by the
+    // peer, so reuse can only ever cost a retry, never a failed download.
+    req.keep_alive = true;
     strcpy(req.method, method);
 
     if (extra_headers && extra_headers[0]) {

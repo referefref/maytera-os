@@ -7,13 +7,24 @@
 //       is one Ethernet frame; ASIX transfers can carry several framed
 //       packets), then resubmits. The net stack's nic_receive() pops frames
 //       from the FIFO, exactly like e1000_receive() pops its RX ring.
-//   TX: copy the frame into a DMA bounce buffer, submit one TD on the bulk
-//       OUT ring and wait (bounded, ~40ms) on the same completion table.
-//       On timeout the frame is dropped - Ethernet is lossy, TCP retransmits.
+//   TX: copy the frame into the next slot of a small DMA bounce-buffer RING,
+//       submit one TD (plus a terminating ZLP TD when the frame is an exact
+//       multiple of the endpoint max packet size) on the bulk OUT ring, and
+//       RETURN immediately. TX is fire-and-forget: the completion is reaped
+//       lazily off the shared event ring by the RX poll path / HID worker, and
+//       the ring keeps a frame's buffer from being reused while its TD is still
+//       in flight. Ethernet is lossy and TCP retransmits, so an un-acked frame
+//       simply drops.
 //
-// All waits use xhci_delay() (PIT-calibrated, works with interrupts off), so
-// TX is safe both before the scheduler starts (DHCP during boot) and inside
-// the net_lock()/cli critical section later on.
+// #549: TX does NOT wait. nic_send() calls the driver under net_lock() (cli:
+// interrupts OFF + a spinlock held), and TX also runs before the scheduler
+// exists (DHCP during boot), so a blocking primitive (wait_event/proc_sleep)
+// would deadlock here. The old code instead busy-polled xhci_delay_ms(1) up to
+// ~40ms per send, pegging a core (and holding interrupts off for that whole
+// window) on the iMac USB-Ethernet path. The CLAUDE.md no-block-context rule
+// ("do async-fetch-then-cache, never block") applies to TX: submit and return.
+// This also makes a dead/unplugged dongle an instant no-op (#381) rather than a
+// 40ms spin.
 #include "usb_net.h"
 #include "../serial.h"
 #include "../string.h"
@@ -58,14 +69,27 @@ static int usbnet_fifo_pop(uint8_t *out, uint32_t out_size) {
 // Shared helpers
 // =============================================================================
 
+// #549: number of DMA slots in the TX ring. Fire-and-forget TX cycles through
+// these so a frame's buffer is not overwritten while its bulk-OUT TD may still
+// be in flight. 8 is far deeper than any realistic in-flight TX depth through
+// this stack (a bulk-OUT completes in microseconds on a healthy link), so a
+// reuse-while-in-flight collision is effectively impossible; even if one did
+// occur the worst case is a single dropped frame, which Ethernet tolerates.
+#define USBNET_TX_RING_SLOTS 8
+
 int usbnet_alloc_buffers(usbnet_dev_t *d, uint32_t rx_len, uint32_t tx_len) {
     // Page allocations are identity-mapped (phys == virt). One page each is
     // enough for ECM/AX88772 (<= 2KB per transfer); AX88179 asks for more.
     uint32_t rx_pages = (rx_len + PAGE_SIZE - 1) / PAGE_SIZE;
     uint32_t tx_pages = (tx_len + PAGE_SIZE - 1) / PAGE_SIZE;
+    // #549: the TX DMA ring is the source handed to the HC; tx_buf stays as the
+    // staging buffer where the ASIX vendor header is built.
+    uint32_t ring_bytes = tx_len * USBNET_TX_RING_SLOTS;
+    uint32_t ring_pages = (ring_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
     uint64_t rx_phys = pmm_alloc_pages(rx_pages);
     uint64_t tx_phys = pmm_alloc_pages(tx_pages);
-    if (!rx_phys || !tx_phys) {
+    uint64_t ring_phys = pmm_alloc_pages(ring_pages);
+    if (!rx_phys || !tx_phys || !ring_phys) {
         kprintf("[USB-NET] DMA buffer allocation failed\n");
         return -1;
     }
@@ -73,6 +97,9 @@ int usbnet_alloc_buffers(usbnet_dev_t *d, uint32_t rx_len, uint32_t tx_len) {
     d->rx_buf_len = rx_len;
     d->tx_buf = (uint8_t *)tx_phys;
     d->tx_buf_len = tx_len;
+    d->tx_ring = (uint8_t *)ring_phys;
+    d->tx_ring_slots = USBNET_TX_RING_SLOTS;
+    d->tx_ring_next = 0;
     return 0;
 }
 
@@ -93,67 +120,73 @@ int usbnet_config_bulk_eps(usbnet_dev_t *d, int ep_in, int in_mps,
 
 // Diagnostics: log the outcome of the first few TX/RX transfers to the boot
 // log (real-hardware debugging aid; silent afterwards).
-static uint32_t g_tx_diag = 0;
-static uint32_t g_rx_diag = 0;
+// #745 (task #69): g_tx_diag / g_rx_diag are gone with the bootlog_write()
+// calls they throttled. Both of those lines were emitted from under net_lock()
+// (usbnet_bulk_out on the TX side, usb_eth_receive on the RX drain), where a
+// device write is a machine-wide stall.
 
+// #745 (task #69): TX diagnostics as COUNTERS, not as log lines. usbnet_bulk_out
+// runs under net_lock (interrupts off) and must not enter the storage stack; see
+// the comment at the failure path below. Read off-path by [NETSTARVE] / [HB].
+uint64_t g_usbnet_tx_submits      = 0;
+uint64_t g_usbnet_tx_submit_fails = 0;
+uint64_t g_usbnet_rx_completions  = 0;
+
+// #549: ASYNCHRONOUS (fire-and-forget). Submit the frame's TD onto the bulk-OUT
+// ring and RETURN, without waiting for the completion. See the file header for
+// why waiting here is impossible (net_lock == interrupts off + pre-scheduler
+// boot DHCP: a blocking wait would deadlock, a busy-poll pegs a core and holds
+// interrupts off for its whole budget). timeout_ms is retained only for
+// call-site/ABI compatibility; there is no wait.
 int usbnet_bulk_out(usbnet_dev_t *d, const void *data, uint32_t len,
                     uint32_t timeout_ms, int send_zlp) {
+    (void)timeout_ms;
     if (!d->active) return -1;
     if (len > d->tx_buf_len) return -1;
+    if (!d->tx_ring || d->tx_ring_slots <= 0) return -1;
 
-    // Consume any stale completion left on the OUT DCI (e.g. a previous
-    // timed-out TX that completed late) so it can't satisfy this wait.
+    // Non-blocking reap of any finished TX completion so neither the shared
+    // event ring nor the OUT transfer ring backs up. This does NOT wait: it
+    // drains whatever has already landed and returns at once.
     uint32_t scrap = 0;
     (void)xhci_int_in_poll(d->xhc, d->slot_id, d->out_dci, &scrap, 0);
 
-    if (data != d->tx_buf) memcpy(d->tx_buf, data, len);
+    // Rotate to the next DMA slot so this frame does not clobber a buffer whose
+    // TD may still be in flight. usb_eth_send builds ASIX headers into d->tx_buf
+    // (staging); ECM passes the raw frame. Either way we copy into the ring slot
+    // that becomes the HC's DMA source, then advance.
+    uint8_t *slot = d->tx_ring + (uint32_t)d->tx_ring_next * d->tx_buf_len;
+    d->tx_ring_next = (d->tx_ring_next + 1) % d->tx_ring_slots;
+    memcpy(slot, data, len);
+
     if (xhci_int_in_submit(d->xhc, d->slot_id, d->out_dci,
-                           (uint64_t)d->tx_buf, len) != 0) {
+                           (uint64_t)slot, len) != 0) {
+        // #745 (task #69): DO NOT LOG FROM HERE. This function runs under
+        // net_lock() (interrupts off), and bootlog_write()'s flush goes
+        // through fat/ext2 -> blk_write -> usb_msc_transport -> msc_cmd_lock,
+        // whose no-block fallback is an UNBOUNDED wait that a cli'd context
+        // cannot be preempted out of: one TX failure could stop the machine.
+        // bootlog.c now refuses the device write from a no-block context
+        // (the mechanism fix), and this call site records a COUNTER instead
+        // of a line (the instance fix), so the net_lock hold stays a memcpy
+        // and a TRB write. The count is the information; it is reported off
+        // this path on the [NETSTARVE] serial line and the [HB] record.
+        g_usbnet_tx_submit_fails++;
         return -1;
     }
-    // Wait using the PIT-calibrated wall-clock delay (same discipline as
-    // xhci_wait_transfer): 1ms per iteration, timeout_ms iterations.
-    for (uint32_t i = 0; i < timeout_ms; i++) {
-        uint32_t done = 0;
-        int r = xhci_int_in_poll(d->xhc, d->slot_id, d->out_dci, &done, len);
-        if (r > 0) {
-            if (g_tx_diag < 3) {
-                g_tx_diag++;
-                bootlog_write("[USB-NET] TX #%u OK (%u bytes, ~%ums)",
-                              g_tx_diag, len, i);
-            }
-            if (send_zlp) {
-                // Terminating zero-length packet (ECM frames that are an
-                // exact multiple of the endpoint max packet size).
-                if (xhci_int_in_submit(d->xhc, d->slot_id, d->out_dci,
-                                       (uint64_t)d->tx_buf, 0) != 0) return -1;
-                for (uint32_t j = 0; j < timeout_ms; j++) {
-                    int rz = xhci_int_in_poll(d->xhc, d->slot_id, d->out_dci,
-                                              &done, 0);
-                    if (rz > 0) return 0;
-                    if (rz < 0) return -1;
-                    xhci_delay_ms(1);
-                }
-                return -1;
-            }
-            return 0;
-        }
-        if (r < 0) {
-            if (g_tx_diag < 6) {
-                g_tx_diag++;
-                bootlog_write("[USB-NET] TX ERROR on DCI %d (%u bytes)",
-                              d->out_dci, len);
-            }
-            return -1;   // STALL/error
-        }
-        xhci_delay_ms(1);
+    if (send_zlp) {
+        // Terminating zero-length packet for frames that are an exact multiple
+        // of the endpoint max packet size. Queue it right behind the data TD on
+        // the same ring; the HC processes both in order. Fire-and-forget.
+        (void)xhci_int_in_submit(d->xhc, d->slot_id, d->out_dci,
+                                 (uint64_t)slot, 0);
     }
-    if (g_tx_diag < 6) {
-        g_tx_diag++;
-        bootlog_write("[USB-NET] TX TIMEOUT on DCI %d (%u bytes, %ums budget)",
-                      d->out_dci, len, timeout_ms);
-    }
-    return -1;   // timeout: drop the frame
+    // #745 (task #69): the old "TX #n submitted async" lines are removed for
+    // the same reason as the failure line above, and they carried no
+    // information that g_nic_tx_ok (net/net.c, already counted and already on
+    // the heartbeat) does not carry more cheaply.
+    g_usbnet_tx_submits++;
+    return 0;   // submitted; completion is reaped lazily (Ethernet is lossy)
 }
 
 static int usbnet_rx_submit(usbnet_dev_t *d) {
@@ -286,10 +319,12 @@ int usb_eth_receive(void *buffer, uint16_t buffer_size) {
     uint32_t got = 0;
     int r = xhci_int_in_poll(d->xhc, d->slot_id, d->in_dci, &got, d->rx_buf_len);
     if (r > 0) {
-        if (g_rx_diag < 3 && got > 0) {
-            g_rx_diag++;
-            bootlog_write("[USB-NET] RX #%u completed (%u bytes)", g_rx_diag, got);
-        }
+        // #745 (task #69): counter, not a log line. usb_eth_receive() runs
+        // inside net_poll()'s RX drain, which holds net_lock() with interrupts
+        // off; a bootlog_write() here is a synchronous write to the SAME USB
+        // stack the frame just arrived on, from a context that cannot be
+        // preempted. See usbnet_bulk_out() above.
+        if (got > 0) g_usbnet_rx_completions++;
         if (got > 0) {
             switch (d->type) {
                 case USBNET_TYPE_ECM:

@@ -1,0 +1,12 @@
+# Private upstream stage created by fetch-upstream.sh (a full git clone; it is
+# per-checkout on purpose, see the header comment in that script). Never commit.
+.upstream-stage/
+
+# Build outputs
+*.o
+*.a
+
+# The staged engine copy + objects (make clean removes it) and the linked ELF.
+# Anchored with a leading / so this cannot reach the repo-root build/ tree.
+/build/
+/CLASSICUBE

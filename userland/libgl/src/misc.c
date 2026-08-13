@@ -114,6 +114,30 @@ void glopEnableDisable(GLParam* p) {
 	case GL_DEPTH_TEST:
 		c->zb->depth_test = v;
 		break;
+	case GL_ALPHA_TEST:
+		/* AssaultCube port phase 2: real (primitive-granularity, see
+		   clip.c gl_draw_triangle). */
+		c->alpha_test_enabled = v;
+		break;
+	case GL_SCISSOR_TEST:
+		/* AssaultCube port phase 2: real (bbox-granularity, see
+		   clip.c gl_draw_triangle). */
+		c->scissor_enabled = v;
+		break;
+	case GL_FOG:
+	case GL_STENCIL_TEST:
+	case GL_CLIP_PLANE0:
+	case GL_CLIP_PLANE1:
+	case GL_CLIP_PLANE2:
+	case GL_CLIP_PLANE3:
+	case GL_CLIP_PLANE4:
+	case GL_CLIP_PLANE5:
+		/* AssaultCube port phase 2: STUBBED. Silently accepted (no
+		   tgl_warning spam from real game code that legitimately toggles
+		   these every frame) but has no rendering effect. See
+		   PORT-STATUS.md gap list: fog / stencil / clip planes are not
+		   implemented. */
+		break;
 	case GL_POLYGON_OFFSET_FILL:
 		if (v)
 			c->offset_states |= TGL_OFFSET_FILL;

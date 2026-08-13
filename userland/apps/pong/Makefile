@@ -7,12 +7,12 @@ LD = ld
 LIBC_DIR = ../../libc
 
 # Compiler flags
-CFLAGS = -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=large \
+CFLAGS = -ffreestanding -fstack-protector-strong -mstack-protector-guard=global -fPIE -mno-red-zone \
          -nostdlib -nostdinc -fno-builtin -Wall -Wextra -O2 -g \
          -I$(LIBC_DIR) -isystem /usr/lib/gcc/x86_64-linux-gnu/12/include
 
 # Linker flags
-LDFLAGS = -nostdlib -z max-page-size=0x1000 -T ../../user.ld
+LDFLAGS = -pie --no-dynamic-linker -z notext -nostdlib -z max-page-size=0x1000 -T ../../user-pie.ld
 
 # Output
 TARGET = pong

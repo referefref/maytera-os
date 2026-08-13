@@ -17,7 +17,9 @@
  *
  * Art: 24-bit BMPs under /SQUADRON, magenta (#FF00FF) colour-key. Every sprite
  * and background has a procedural fallback so the game runs before art is on
- * disk. Backgrounds: L<lvl>BG1..5.BMP (opaque). LOGO.BMP is the title.
+ * disk. Backgrounds: procedural pixel art (pxbg_draw, #562) drawn behind
+ * everything - see Part C below; L<lvl>BG1..5.BMP loading is dormant code
+ * kept for a possible future authored-pixel-art pass. LOGO.BMP is the title.
  *
  * HUD (#475): 6 readout boxes baked into each side-panel's art (SIDEBARL/R.BMP,
  * measured at 400x900 art px; see SB_BOX_L/SB_BOX_R below) hold the live stats,
@@ -56,6 +58,43 @@
  * sq_text_stylized() itself (outline + glow halo + gradient text) is kept
  * below for that fallback and for the pause/stage-clear/menu screens it
  * still renders (no AI art was requested for those).
+ *
+ * Part C (2026-07-21, #562, pixel-art backdrop): the whole backdrop was
+ * photoreal AI photography and it clashed with the flat-shaded, glow-bloom
+ * look of everything else in the game - two separate things, both fixed:
+ * (1) the deployed VM/golden turned out to have real L<set>BGx.BMP full-
+ * screen 640x960 photoreal nebula/aurora art on disk (bg_fill_scroll'd as
+ * the base scrolling layer via bgset_load), NEVER checked into git - the
+ * exact same asset-drift gap as #535's "git repo missing source for
+ * shipping apps" - and this, not the smaller far-layer objects, is what a
+ * player actually sees as "the same backgrounds". (2) BG_PLANET/RINGED/
+ * ASTEROID/NEBULA.BMP (the far-layer floating landmark objects) were also
+ * photoreal. Fix: BG_PLANET/RINGED/ASTEROID/NEBULA.BMP were regenerated as
+ * true chunky pixel art (hard blocks + Bayer ordered dithering, see
+ * tools/genart.py), and draw_background() now always renders the base layer
+ * with the new procedural pxbg_draw() (same technique), never bg_fill_scroll
+ * of the old L<set>BGx.BMP art - see the pxbg_draw() and draw_background()
+ * comments below for the full rationale and which level palettes have been
+ * visually verified.
+ *
+ * Part D (2026-07-21, Direction A, user-approved polish pass on the #562
+ * prototype): four fixes. (1) g_neb[]'s lattice interpolation was non-cyclic
+ * ("open ended" across the lattice, see neb_init()'s comment) so wrapping it
+ * with `% NEB_H`/`% NEB_W` stitched two unrelated lattice corners together -
+ * a visible horizontal seam every wrap. Rebuilt as a proper TOROIDAL lattice
+ * (both axes), which is the standard fix for tileable noise: fully seamless
+ * now on every axis, proven with paired screendumps straddling the wrap
+ * boundary (see CHANGELOG). (2) pxbg_draw() gained a second, coarser
+ * toroidal "zone" field (g_nebz/nebz_init) that darkens cells one step in
+ * VOID patches and brightens + hue-shifts them to a neighbouring-hue palette
+ * (g_pxbg_pal2) in CORE patches, so each stage reads as a designed starscape
+ * with depth and adjacent-hue variety, not a monotone wash - still strictly
+ * within each stage's own hue family. (3) Added a 4th, even-further/dimmer/
+ * slower star-CLUSTER layer (clust_init/update/draw) behind the existing
+ * 3-depth starfield for extra depth, deliberately kept dim and sparse so it
+ * never competes with gameplay readability. (4) All of the above is generic
+ * over `set` (0/1/2), so violet/blue-hive/ember-red all get the identical
+ * treatment - see pxbg_draw()'s comment for per-set verification status.
  */
 #include "../../libc/maytera.h"
 #include "../../libc/gui.h"
@@ -346,8 +385,10 @@ static void spr_blit_frame_c(const Sprite *sheet, int fw, int fh, int cols, int 
             if (((p >> 16) & 0xFF) < 24 && ((p >> 8) & 0xFF) < 24 && (p & 0xFF) < 24) continue;
             int px = x0 + x; if ((unsigned)px >= (unsigned)W) continue; drow[px] = p & 0x00FFFFFFu; } }
 }
-/* Vertical-scroll blit of an opaque bg, stretched to fill W and scrolled by `scroll`. */
-static void bg_fill_scroll(const Sprite *s, int scroll) {
+/* Vertical-scroll blit of an opaque bg, stretched to fill W and scrolled by `scroll`.
+ * #562: no longer called (see draw_background) - kept for a possible future
+ * authored-pixel-art L<set>BGx.BMP pass. */
+__attribute__((unused)) static void bg_fill_scroll(const Sprite *s, int scroll) {
     if (!s->ok) return; int ih = s->h;
     int base = ((scroll % ih) + ih) % ih;
     for (int y = 0; y < H; y++) { int sy = (base + y) % ih; const uint32_t *src = s->px + sy * s->w; uint32_t *drow = g_blit + y * W;
@@ -399,8 +440,11 @@ static void assets_load(void) {
  * was the long inter-level freeze on the iMac (5 sequential blocking disk reads
  * + decodes). We keep ALL the new art: which of the 5 backgrounds (across the 3
  * art sets) shows is derived from the stage, so the scenery still changes as you
- * progress, but only ONE BMP is decoded per stage - 5x less load time and I/O. */
-static void bgset_load(int level) {
+ * progress, but only ONE BMP is decoded per stage - 5x less load time and I/O.
+ * #562: no longer called - draw_background() now always uses the procedural
+ * pxbg_draw() instead (see its comment), so nothing decodes L<set>BGx.BMP
+ * today. Kept, unused, for a possible future authored-pixel-art pass. */
+__attribute__((unused)) static void bgset_load(int level) {
     if (level == A_bgset_level) return;
     int set = ((level - 1) % 3) + 1;      /* L1../L2../L3.. art set        */
     int idx = ((level - 1) % 5) + 1;      /* which of the 5 within the set */
@@ -418,6 +462,9 @@ static void bgset_load(int level) {
 #define MAX_PU   12
 #define MAX_EX   48
 #define MAX_STARS 140
+#define MAX_CLUSTERS       5
+#define STARS_PER_CLUSTER  7
+#define MAX_CLUSTSTARS     (MAX_CLUSTERS * STARS_PER_CLUSTER)
 
 /* bullet kinds (shared struct for player + enemy). */
 enum { BK_STRAIGHT, BK_AIMED, BK_WAVE, BK_PLASMA, BK_MISSILE,   /* enemy */
@@ -439,6 +486,7 @@ typedef struct {
 typedef struct { int alive, kind; float x, y, vy; } Powerup;   /* kind: see PUK_ */
 typedef struct { int alive; float x, y; int frame, t, big; unsigned col; } Explosion;
 typedef struct { float x, y, speed; int size; uint32_t col; } Star;
+typedef struct { float x, y, speed; int size; uint32_t col; } ClustStar;   /* see clust_init below */
 
 static Bullet   g_pb[MAX_PB];
 static Bullet   g_eb[MAX_EB];
@@ -446,6 +494,7 @@ static Enemy    g_en[MAX_EN];
 static Powerup  g_pu[MAX_PU];
 static Explosion g_ex[MAX_EX];
 static Star     g_stars[MAX_STARS];
+static ClustStar g_clust[MAX_CLUSTSTARS];
 
 /* ============================================================ game state == */
 enum { GS_MENU, GS_PLAYING, GS_PAUSED, GS_STAGECLEAR, GS_GAMEOVER };
@@ -538,6 +587,44 @@ static void stars_init(void) {
 static void stars_update(void) { for (int i = 0; i < MAX_STARS; i++) { g_stars[i].y += g_stars[i].speed; if (g_stars[i].y >= H) { g_stars[i].y = 0; g_stars[i].x = (float)(rnd() % (uint32_t)(W > 0 ? W : 1024)); } } }
 static void stars_draw(void) { for (int i = 0; i < MAX_STARS; i++) { int s = g_stars[i].size; fill_rect((int)g_stars[i].x, (int)g_stars[i].y, s, s, g_stars[i].col); } }
 
+/* ================================================ distant star-cluster layer
+ * (Direction A, item 3): a FOURTH depth layer, further and slower than every
+ * one of the 3 existing starfield layers, so it reads as a background
+ * star-cluster glimpsed far behind the actual scrolling starfield rather
+ * than "more stars of the same kind". Members of one cluster keep a FIXED
+ * offset from each other (never re-randomised on wrap, unlike stars_update's
+ * per-star respawn) so the cluster shape stays coherent as it drifts - it is
+ * meant to look like one distant structure, not loose scattered points.
+ * Speed (0.06px/frame) is below every stars_init() layer's minimum (0.15) so
+ * the depth ordering holds. Brightness is held deliberately DIM (below the
+ * existing "near" star brightness) and the layer is SPARSE (35 points total
+ * across the whole screen) - gameplay readability over background prettiness
+ * (see #476 depth-ordering rule and the pxbg_draw dark-backdrop rule this
+ * file already documents). Drawn in draw_background() before bgobj/stars. */
+static void clust_init(void) {
+    int ww = W > 0 ? W : 1024, hh = H > 0 ? H : 768;
+    for (int c = 0; c < MAX_CLUSTERS; c++) {
+        float ccx = (float)rndrange(30, ww - 30);
+        float ccy = (float)rndrange(0, hh);
+        for (int i = 0; i < STARS_PER_CLUSTER; i++) {
+            int k = c * STARS_PER_CLUSTER + i;
+            float x = ccx + (float)rndrange(-24, 24); if (x < 1) x = 1; if (x > ww - 2) x = (float)(ww - 2);
+            g_clust[k].x = x;
+            g_clust[k].y = ccy + (float)rndrange(-20, 20);
+            g_clust[k].speed = 0.06f;                              /* slowest of every bg layer */
+            g_clust[k].size = (rnd() % 8 == 0) ? 2 : 1;            /* rare slightly-bigger core star */
+            int b = 95 + rndrange(0, 55);                          /* dim, but brighter than far starfield dust */
+            int hi = b + 25 > 200 ? 200 : b + 25;                  /* capped well below white: stays dim */
+            g_clust[k].col = (uint32_t)((b << 16) | (b << 8) | hi);
+        }
+    }
+}
+static void clust_update(void) {
+    int hh = H > 0 ? H : 768;
+    for (int i = 0; i < MAX_CLUSTSTARS; i++) { g_clust[i].y += g_clust[i].speed; if (g_clust[i].y >= hh) g_clust[i].y -= hh; }
+}
+static void clust_draw(void) { for (int i = 0; i < MAX_CLUSTSTARS; i++) { int s = g_clust[i].size; fill_rect((int)g_clust[i].x, (int)g_clust[i].y, s, s, g_clust[i].col); } }
+
 /* ================================================== nebula wash (cheap) === *
  * A tiny lattice-noise "cloud" field is baked ONCE at startup (neb_init) into
  * a small buffer via bilinear upsampling of a coarse random grid - there is
@@ -552,19 +639,63 @@ static void stars_draw(void) { for (int i = 0; i < MAX_STARS; i++) { int s = g_s
 #define NEB_LX 6
 #define NEB_LY 10
 static unsigned char g_neb[NEB_H][NEB_W];
+/* #A (2026-07-21, seam fix): the original interpolation spanned the lattice
+ * OPEN-ENDED (row 0 .. row NEB_LY-1 across y 0..NEB_H-1), so g_neb[0] and
+ * g_neb[NEB_H-1] were two INDEPENDENT random lattice corners with no relation
+ * to each other. Every caller then samples this buffer with `% NEB_H` /
+ * `% NEB_W` (nebula_draw, pxbg_draw) to scroll it infinitely, which stitches
+ * row NEB_H-1 directly against row 0 - a hard brightness discontinuity every
+ * NEB_H*block px, visible as the faint horizontal seam lines in the prototype.
+ * Fix: generate the lattice as a TORUS. Both axes map the *whole* output
+ * range across the *whole* lattice cycle (`y * NEB_LY / NEB_H`, no "-1"), and
+ * the neighbour lattice cell wraps with modulo (`(ly + 1) % NEB_LY`) instead
+ * of reading lat[ly+1] off the end. That makes lattice cell NEB_LY-1 blend
+ * back into lattice cell 0 exactly as y completes one full NEB_H cycle, so
+ * g_neb[NEB_H-1] -> g_neb[0] (wrap) is just another interpolated step, not a
+ * seam. Same fix applied on X so horizontal tiling (NEB_W period) is seamless
+ * too. This is the standard "tileable lattice noise" construction. */
 static void neb_init(void) {
     unsigned char lat[NEB_LY][NEB_LX];
     for (int y = 0; y < NEB_LY; y++) for (int x = 0; x < NEB_LX; x++) lat[y][x] = (unsigned char)(rnd() & 0xFF);
     for (int y = 0; y < NEB_H; y++) {
-        int ly = y * (NEB_LY - 1) / (NEB_H - 1); if (ly > NEB_LY - 2) ly = NEB_LY - 2;
-        int fy = (y * (NEB_LY - 1) * 256 / (NEB_H - 1)) & 255;
+        int ly = (y * NEB_LY) / NEB_H, ly2 = (ly + 1) % NEB_LY;
+        int fy = ((y * NEB_LY * 256) / NEB_H) & 255;
         for (int x = 0; x < NEB_W; x++) {
-            int lx = x * (NEB_LX - 1) / (NEB_W - 1); if (lx > NEB_LX - 2) lx = NEB_LX - 2;
-            int fx = (x * (NEB_LX - 1) * 256 / (NEB_W - 1)) & 255;
-            int v00 = lat[ly][lx], v10 = lat[ly][lx + 1], v01 = lat[ly + 1][lx], v11 = lat[ly + 1][lx + 1];
+            int lx = (x * NEB_LX) / NEB_W, lx2 = (lx + 1) % NEB_LX;
+            int fx = ((x * NEB_LX * 256) / NEB_W) & 255;
+            int v00 = lat[ly][lx], v10 = lat[ly][lx2], v01 = lat[ly2][lx], v11 = lat[ly2][lx2];
             int top = v00 + ((v10 - v00) * fx) / 256;
             int bot = v01 + ((v11 - v01) * fx) / 256;
             g_neb[y][x] = (unsigned char)(top + ((bot - top) * fy) / 256);
+        }
+    }
+}
+/* Second, coarser toroidal field: large soft "zones" (voids / brighter
+ * nebula cores, adjacent-hue bands) sampled at PXZ_CELL granularity in
+ * pxbg_draw. Same torus construction as g_neb, just fewer lattice cells over
+ * a bigger on-screen block so patches read as big, slow-moving regions
+ * instead of the fine cloud-shape detail g_neb provides. A different period
+ * (NEBZ_W x NEBZ_H at PXZ_CELL, vs NEB_W x NEB_H at PX_CELL) keeps the two
+ * fields' wrap points decorrelated so they never line up into a moire. */
+#define NEBZ_W 12
+#define NEBZ_H 20
+#define NEBZ_LX 3
+#define NEBZ_LY 5
+#define PXZ_CELL 24
+static unsigned char g_nebz[NEBZ_H][NEBZ_W];
+static void nebz_init(void) {
+    unsigned char lat[NEBZ_LY][NEBZ_LX];
+    for (int y = 0; y < NEBZ_LY; y++) for (int x = 0; x < NEBZ_LX; x++) lat[y][x] = (unsigned char)(rnd() & 0xFF);
+    for (int y = 0; y < NEBZ_H; y++) {
+        int ly = (y * NEBZ_LY) / NEBZ_H, ly2 = (ly + 1) % NEBZ_LY;
+        int fy = ((y * NEBZ_LY * 256) / NEBZ_H) & 255;
+        for (int x = 0; x < NEBZ_W; x++) {
+            int lx = (x * NEBZ_LX) / NEBZ_W, lx2 = (lx + 1) % NEBZ_LX;
+            int fx = ((x * NEBZ_LX * 256) / NEBZ_W) & 255;
+            int v00 = lat[ly][lx], v10 = lat[ly][lx2], v01 = lat[ly2][lx], v11 = lat[ly2][lx2];
+            int top = v00 + ((v10 - v00) * fx) / 256;
+            int bot = v01 + ((v11 - v01) * fx) / 256;
+            g_nebz[y][x] = (unsigned char)(top + ((bot - top) * fy) / 256);
         }
     }
 }
@@ -753,7 +884,13 @@ static void spawn_boss(void) {
     e->alive = 1; e->boss = 1; e->type = ET_DRONE; e->stationary = 0; e->pattern = PT_SINE;
     e->x = (float)(W / 2); e->y = -140.0f; e->basex = e->x; e->basey = 110.0f;
     e->vx = 2.0f * diff_enemy_speed(); e->vy = 1.2f; e->t = 0; e->amp = (float)(W / 2 - 130);
-    e->hp = 340 + g_stage * 130; e->maxhp = e->hp; e->col = 0x00FF60A0;   /* far tankier + steeper scaling */
+    /* Boss HP is balanced against ACTUAL player damage output, which is low:
+     * pb_damage() gives 1 per shot for the default gun and laser, 2 for wave,
+     * 3 for missiles. The previous 340 + stage*130 meant a stage-1 boss took
+     * 470 hits with the starting weapon, which played as a slog rather than a
+     * fight. A bomb only removes 40 and is clamped so it can never finish a
+     * boss, so it does not shorten this meaningfully either. */
+    e->hp = 110 + g_stage * 90; e->maxhp = e->hp; e->col = 0x00FF60A0;
     e->fire_ms = 500; e->score = 3000 + g_stage * 1000; e->boss_phase = 0;
     g_boss_active = 1; g_banner_until = g_now + 2200;
     g_stage_spawned++;   /* boss counts as the final unit of "% COMPLETE" */
@@ -772,7 +909,7 @@ static void new_game(void) {
     g_rapid_until = 0; g_shield_until = 0;
     g_px = (float)(W / 2); g_py = (float)(H - 90);
     g_invuln_until = g_now + 1500; g_fire_cd = 0; g_wave_delay = g_now + 600; g_boss_active = 0;
-    g_banner_until = g_now + 2000; g_hit_flash = 0; g_bgpos = 0; bgset_load(1);
+    g_banner_until = g_now + 2000; g_hit_flash = 0; g_bgpos = 0;
     g_kills = 0; g_shots_fired = 0; g_shots_hit = 0; g_combo = 0;
     g_stage_spawned = 0; g_stage_killed = 0;   /* g_highscore deliberately NOT reset: it is per-session */
     g_state = GS_PLAYING;
@@ -1098,37 +1235,166 @@ static void draw_explosion(Explosion *e) {
     for (int ang = 0; ang < 360; ang += 20) { float rad = (float)ang * 0.01745f; blend_rect((int)(e->x + fcosf(rad) * r) - 2, (int)(e->y + fsinf(rad) * r) - 2, 4, 4, c, a); }
 }
 
-/* Procedural rainbow / themed background fallback (per level). */
-static void proc_bg(int level, int scroll) {
-    int set = (level - 1) % 3;
-    for (int y = 0; y < H; y++) {
-        int yy = (y + scroll) % (H * 2);
-        uint32_t c;
-        if (set == 0) c = hsv((yy * 300 / H + scroll / 4) % 360, 200, 40 + (yy % 60));       /* rainbow aurora */
-        else if (set == 1) { int t = (yy * 80 / H) % 90; c = (uint32_t)((6) << 16) | ((10 + t / 3) << 8) | (30 + t); }  /* deep blue */
-        else { int t = (yy * 80 / H) % 90; c = (uint32_t)((30 + t) << 16) | ((6 + t / 4) << 8) | (10); }                /* fiery red */
-        fill_rect(0, y, W, 1, c);
-    }
+/* ======================================================= pixel-art backdrop
+ * #562 (2026-07): the base backdrop layer used to be EITHER a bg_fill_scroll
+ * of a per-level L<set>BGx.BMP (640x960 photoreal AI nebula/aurora art, found
+ * live on the deployed VM/golden but never in git - see the Part C file
+ * header comment) OR, if that file were ever absent, a smooth per-pixel
+ * HSV/RGB gradient (proc_bg, removed). Both read as a vector/photo wash,
+ * which is exactly what clashed with the also-photoreal BG_PLANET/RINGED/
+ * ASTEROID/NEBULA.BMP far-layer sprites this task replaces: none of it
+ * matched the flat-shaded, glow-bloom pixel/vector look of the ships,
+ * bullets and enemies (draw_player/draw_enemy/draw_bullet_* below all render
+ * flat-colour shapes with add_glow(), never smooth photoreal shading).
+ * pxbg_draw() replaces BOTH with a genuinely CHUNKY pixel-art look,
+ * built from two textbook pixel-art techniques used throughout this section:
+ *   - hard PX_CELL x PX_CELL blocks: every "pixel" is really a small flat-
+ *     colour square, so scrolling/scaling never introduces a smooth blur.
+ *   - 4x4 ordered (Bayer) dithering at colour-band boundaries: how pixel art
+ *     fakes more gradient steps than a tiny hand-picked palette has, as a
+ *     speckled dither instead of a smooth blend.
+ * It reuses the existing g_neb[] lattice-noise field (baked once in
+ * neb_init(), see the nebula wash above) as its cloud-shape source, sampled
+ * at PX_CELL granularity (nearest, unfiltered) rather than per-pixel, which
+ * is what makes it read as a chunky mosaic instead of nebula_draw's smooth
+ * wash despite sharing the same underlying noise; the two layers use
+ * different scroll-speed factors so they never sit pixel-for-pixel aligned.
+ * The backdrop stays deliberately DARK/desaturated (palette index 0 is near-
+ * black) so it reads behind the saturated neon ships/bullets/enemies without
+ * competing for attention - a bright pixel-art backdrop would look great and
+ * also hide a bullet, which this layer must never do. Landmark sprites
+ * (BG_PLANET/RINGED/ASTEROID/NEBULA.BMP) were regenerated with the identical
+ * hard-block + Bayer-dither technique by tools/genart.py so the whole
+ * backdrop reads as one cohesive pixel-art system, not "3 procedural layers
+ * + 4 photoreal cutouts" (see CHANGELOG).
+ *
+ * Polish pass (2026-07-21, Direction A, user-approved): the prototype was a
+ * single monotone 5-step ramp per set, which read as flat noise rather than
+ * a designed starscape, and shared g_neb[]'s non-toroidal wrap seam (fixed
+ * above in neb_init). Two things were added, both driven by the new coarse
+ * g_nebz[] "zone" field (nebz_init) so they cost one extra array read per
+ * cell, not a second noise evaluation:
+ *   - VOID / CORE banding: where the zone field is low, cells sit ONE step
+ *     darker on the SAME hue ramp (deep void patches); where it is high,
+ *     cells sit ONE step brighter AND swap to the set's neighbouring-hue
+ *     ramp (g_pxbg_pal2) - a brighter nebula core with a slightly different
+ *     tint, exactly like a real emission-nebula core reads against its
+ *     surrounding dust. Normal-zone cells are unchanged from the prototype.
+ *   - g_pxbg_pal2[set] is a hand-authored ADJACENT hue for each family
+ *     (violet leans magenta-pink for its cores; blue-hive leans indigo;
+ *     ember leans crimson), never a different family - stage 1 stays a
+ *     violet-family starscape, just no longer a monotone wash.
+ * All three sets share this exact path (no per-set special-casing beyond the
+ * palette tables themselves and set 1's existing circuit-grid overlay), so
+ * the polish rolls out to every stage theme identically. Visually verified
+ * on VM 2410 for all 3 sets as of this change (see CHANGELOG); stage 2/3
+ * were forced via a temporary g_stage override for the screendump, then
+ * verified again with that override removed before commit. */
+#define PX_CELL 4
+static const unsigned char g_bayer4x4[4][4] = {
+    { 0, 8, 2, 10 }, { 12, 4, 14, 6 }, { 3, 11, 1, 9 }, { 15, 7, 13, 5 }
+};
+/* per-level-set base palettes, darkest..brightest (index 0 near-black). Hues
+ * match the 3 families nebula_draw() already uses (#476) so the translucent
+ * wash layered on top of this never reads as a mismatched colour. Used for
+ * NORMAL and VOID zones (see pxbg_draw). */
+static const uint32_t g_pxbg_pal[3][5] = {
+    { 0x00120A18, 0x00201432, 0x00352050, 0x004E3878, 0x006A50A0 },  /* set 0: violet nebula    */
+    { 0x00080B14, 0x000E1628, 0x00182642, 0x00223A60, 0x002E4E80 },  /* set 1: deep blue / hive */
+    { 0x00180A08, 0x00301210, 0x004E1C18, 0x00702620, 0x00943020 },  /* set 2: ember red        */
+};
+/* Neighbouring-hue palettes, same darkest..brightest brightness ramp as
+ * g_pxbg_pal above (per index, roughly matched value/peak channel) but hue-
+ * shifted within the same family: violet -> magenta-violet, blue-hive ->
+ * indigo-blue, ember -> crimson. Used ONLY for CORE zones (see pxbg_draw),
+ * so bright nebula cores read as a distinct, related colour rather than the
+ * base ramp merely getting brighter. */
+static const uint32_t g_pxbg_pal2[3][5] = {
+    { 0x00180A16, 0x002A1230, 0x0046204C, 0x00663270, 0x008C48A0 },  /* set 0: violet -> magenta core */
+    { 0x000C0916, 0x0014122A, 0x00241E44, 0x00342E62, 0x00463C82 },  /* set 1: blue  -> indigo core   */
+    { 0x001A080C, 0x00320C16, 0x00501224, 0x00721830, 0x00961E3C },  /* set 2: ember -> crimson core  */
+};
+/* Quantise a 0..1023 noise value into one of 5 palette steps, ordered-
+ * dithering the boundary between adjacent steps via the 4x4 Bayer matrix
+ * (indexed by the cell's own integer coords, so the dither pattern is stable
+ * frame to frame instead of flickering). */
+static int pxbg_dither_idx(int v, int lx, int ly) {
+    int steps = 4;                                  /* 5 palette entries -> 4 gaps */
+    int scaled = v * steps;                         /* 0 .. steps*1024 */
+    int idx = scaled >> 10; if (idx >= steps) idx = steps - 1;
+    int frac = (scaled - (idx << 10)) >> 6;          /* 0..15 */
+    int th = g_bayer4x4[ly & 3][lx & 3];
+    return (frac > th) ? idx + 1 : idx;
 }
-__attribute__((unused)) static uint32_t proc_bg_col(int level, int seg) {
+static void pxbg_draw(int level, float scroll) {
     int set = (level - 1) % 3;
-    if (set == 0) return hsv((seg * 72 + 40) % 360, 200, 90);   /* rainbow */
-    if (set == 1) return 0x00102040;                            /* blue */
-    return 0x00401010;                                          /* red */
+    const uint32_t *pal  = g_pxbg_pal[set];
+    const uint32_t *pal2 = g_pxbg_pal2[set];
+    /* base wash: the furthest thing on screen, so it scrolls below every
+     * other layer's minimum speed (nebula wash 0.06x, stars' slowest 0.15,
+     * every enemy pattern's vy - see #476 depth ordering). The zone field
+     * scrolls at the same rate so cores/voids track the cloud shape they
+     * modulate, but samples a differently-sized/periodled array (NEBZ_* vs
+     * NEB_*, see nebz_init) so the two never sit in permanent lock-step. */
+    int nscroll = (int)(scroll * 0.5f);
+    for (int by = 0; by < H; by += PX_CELL) {
+        int ny = ((by + nscroll) / PX_CELL) % NEB_H; if (ny < 0) ny += NEB_H;
+        int nzy = ((by + nscroll) / PXZ_CELL) % NEBZ_H; if (nzy < 0) nzy += NEBZ_H;
+        for (int bx = 0; bx < W; bx += PX_CELL) {
+            int nx = (bx / PX_CELL) % NEB_W; if (nx < 0) nx += NEB_W;
+            int nzx = (bx / PXZ_CELL) % NEBZ_W; if (nzx < 0) nzx += NEBZ_W;
+            int v = (int)g_neb[ny][nx] * 4;                       /* 0..1020 */
+            int idx = pxbg_dither_idx(v, bx / PX_CELL, by / PX_CELL);
+            int zone = g_nebz[nzy][nzx];                          /* 0..255 */
+            const uint32_t *use = pal;
+            if (zone < 70)       { if (idx > 0) idx--; }                       /* deep void: darker, same hue */
+            else if (zone > 190) { if (idx < 4) idx++; use = pal2; }           /* bright core: brighter, adjacent hue */
+            fill_rect(bx, by, PX_CELL, PX_CELL, use[idx]);
+        }
+    }
+    /* sparse bright "dust mote" flecks, far slower than the starfield, purely
+     * for extra far-layer depth texture (deterministic per-index position,
+     * only drifting with the (very slow) scroll so they wrap seamlessly). */
+    int dscroll = (int)(scroll * 0.10f);
+    int hh = H > 0 ? H : 1, ww = W > 0 ? W : 1;
+    for (int i = 0; i < 26; i++) {
+        int bx = (int)(((unsigned)(i * 733 + set * 91)) % (unsigned)ww);
+        int by = (int)(((unsigned)(i * 977 + dscroll)) % (unsigned)hh);
+        fill_rect((bx / PX_CELL) * PX_CELL, (by / PX_CELL) * PX_CELL, PX_CELL, PX_CELL, pal[4]);
+    }
+    /* set 1 ("hive/tech" stage): a faint chunky circuit-grid lattice, dimmer
+     * than the palette's own base band so it reads as distant machinery
+     * rather than competing with gameplay. */
+    if (set == 1) {
+        int gscroll = nscroll % (PX_CELL * 6); if (gscroll < 0) gscroll += PX_CELL * 6;
+        for (int by = -gscroll; by < H; by += PX_CELL * 6) fill_rect(0, by, W, 1, pal[1]);
+        for (int bx = 0; bx < W; bx += PX_CELL * 8) fill_rect(bx, 0, 1, H, pal[1]);
+    }
 }
 static void draw_background(void) {
     int level = g_state == GS_MENU ? 1 : g_stage;
-    bgset_load(level);
-    /* Slow, seamless vertical drift (bg_fill_scroll tiles by modulo). The scroll
-     * is deliberately gentle so it reads as flying over a base / through space,
-     * not a fast rush; the starfield adds the faster parallax layer. */
-    int pos = (int)g_bgpos;
-    if (A_bgset[0].ok) bg_fill_scroll(&A_bgset[0], pos);
-    else proc_bg(level, pos);
-    /* #476 multi-layer parallax, slowest to fastest: nebula wash, far
-     * background art (planets/asteroid/cloud), then the 3-layer starfield.
-     * Everything here is deliberately slower than any enemy's vy. */
+    /* #562: this used to bgset_load() + bg_fill_scroll() a per-level
+     * L<set>BGx.BMP (640x960 photoreal AI nebula/aurora photography). Those
+     * files turned out to be exactly the "same backgrounds" this task
+     * replaces - AND they were never in git (an asset-drift gap, same class
+     * as #535's "git repo missing source for shipping apps"), so relying on
+     * them was fragile as well as visually wrong. The base backdrop now
+     * always draws with the procedural pixel-art pxbg_draw() (see its
+     * comment above), which also sidesteps decoding a ~1.8MB BMP on every
+     * stage transition for no benefit (#444 ext2/DMA-under-load risk with
+     * large assets, watched for on principle even though this VM hasn't hit
+     * it). bg_fill_scroll()/A_bgset/bgset_load() are left defined, unused,
+     * for a future pass that might author real pixel-art L<set>BGx.BMP
+     * replacements instead of (or blended with) the procedural layer. */
+    int pos = (int)g_bgpos; (void)pos;
+    pxbg_draw(level, g_bgpos);
+    /* #476 multi-layer parallax, slowest to fastest: nebula wash, distant
+     * star-cluster layer (Direction A item 3: even further/slower/dimmer
+     * than the 3-layer starfield below), far background art (planets/
+     * asteroid/cloud), then the 3-layer starfield. Everything here is
+     * deliberately slower than any enemy's vy. */
     nebula_draw(level, g_bgpos);
+    clust_draw();
     bgobj_draw_all();
     stars_draw();
 }
@@ -1226,9 +1492,10 @@ static void box_set(HudBox *b, int x, int y, int w, int h) {
 }
 /* Snapshot the panel-art pixels currently under a box (no HUD text on them
  * yet) so the per-frame draw can cheaply restore-then-redraw-text instead of
- * re-blitting the whole (static) panel every frame. Malloc failure degrades
- * gracefully: box_restore() then no-ops and old text may persist under new
- * text rather than crashing - rare (12 small allocations) and non-fatal. */
+ * re-blitting the whole (static) panel every frame. If the clean-snapshot
+ * malloc ever fails, box_restore() below still clears the box procedurally
+ * before text is drawn (#hud-smear investigation), so a bad allocation can
+ * never leave stale digits visible under new ones. */
 static void box_snapshot(HudBox *b) {
     if (!b->clean) return;
     for (int y = 0; y < b->h; y++) {
@@ -1238,8 +1505,14 @@ static void box_snapshot(HudBox *b) {
         for (int x = 0; x < b->w; x++) { int px = b->x + x; dst[x] = ((unsigned)px < (unsigned)FBW) ? src[px] : 0; }
     }
 }
+/* Restore a box to its clean (textless) state before the caller redraws its
+ * label/value. If no clean snapshot exists (the malloc in box_set() failed,
+ * or box_snapshot() was never able to run), fall back to painting the same
+ * recessed dark slot the procedural sidebar fallback uses (hud_slot()) so the
+ * box is still cleared before new text lands, rather than silently no-op'ing
+ * and letting the old digits show through the new ones (#hud-smear). */
 static void box_restore(HudBox *b) {
-    if (!b->clean) return;
+    if (!b->clean) { hud_slot(b->x, b->y, b->w, b->h); return; }
     for (int y = 0; y < b->h; y++) {
         int py = b->y + y; if ((unsigned)py >= (unsigned)FBH) continue;
         uint32_t *dst = g_present + (long)py * FBW; const uint32_t *src = b->clean + (long)y * b->w;
@@ -1275,12 +1548,22 @@ static int fit_scale(const char *s, int maxw, int prefer) {
     for (int sc = prefer; sc > 1; sc--) if (text_w(s, sc) <= maxw) return sc;
     return 1;
 }
-/* label (small, top) + value (larger, auto-fit) centered in a box. */
+/* label (small, top) + value (larger, auto-fit), vertically CENTERED as a
+ * block in the box rather than riding high near the top. LABEL_H/GAP are the
+ * fixed 8px glyph height (scale 1) and the small breathing room between the
+ * label and the value; VH is the value's glyph height at whatever scale
+ * fit_scale() picked, so the centering offset is derived from the box's
+ * actual height and the actual text metrics, not a magic constant. */
 static void box_label_value(HudBox *b, const char *label, const char *value, uint32_t lcol, uint32_t vcol) {
     int cx = b->x + b->w / 2;
-    sq_text_abs_center(cx, b->y + 5, label, lcol, 1);
     int sc = fit_scale(value, b->w - 8, 2);
-    sq_text_abs_center(cx, b->y + 5 + 10 + (sc == 2 ? 3 : 1), value, vcol, sc);
+    const int LABEL_H = 8, GAP = 3;
+    int VH = 8 * sc;
+    int block_h = LABEL_H + GAP + VH;
+    int top = b->y + (b->h - block_h) / 2;
+    if (top < b->y + 2) top = b->y + 2;   /* never clip above the box */
+    sq_text_abs_center(cx, top, label, lcol, 1);
+    sq_text_abs_center(cx, top + LABEL_H + GAP, value, vcol, sc);
 }
 static Enemy *find_boss(void) { for (int i = 0; i < MAX_EN; i++) if (g_en[i].alive && g_en[i].boss) return &g_en[i]; return 0; }
 
@@ -1315,18 +1598,30 @@ static void draw_side_hud(int lw, int rx, int rw) {
       num_to_str(pct, buf); strcat(buf, "%"); box_label_value(&g_boxL[5], "COMPLETE", buf, 0x0090C0FF, 0x0060FF90); }
 
     /* -------- RIGHT: LIVES / BOMBS / FPS / MULTIPLIER / ACCURACY / BOSS-SHIELD */
+    /* LIVES/BOMBS have a 3rd row (ship icons / the [RMB]/B hint) pinned to the
+     * bottom of the box, so the label+value pair is centered in the area
+     * ABOVE that reserved bottom row rather than in the full box height -
+     * same "derive from box height + text metrics" approach as
+     * box_label_value(), just with a bottom row carved out first (#hud-smear
+     * centering pass). */
     box_restore(&g_boxR[0]);
     { int cx = g_boxR[0].x + g_boxR[0].w / 2;
-      sq_text_abs_center(cx, g_boxR[0].y + 5, "LIVES", 0x0090C0FF, 1);
+      int bottom_reserve = 18;   /* ship-icon row */
+      int avail_h = g_boxR[0].h - bottom_reserve; int block_h = 8 + 3 + 16;
+      int top = g_boxR[0].y + (avail_h - block_h) / 2; if (top < g_boxR[0].y + 2) top = g_boxR[0].y + 2;
+      sq_text_abs_center(cx, top, "LIVES", 0x0090C0FF, 1);
       num_to_str(g_lives, buf); strcpy(val, "x "); strcat(val, buf);
-      sq_text_abs_center(cx, g_boxR[0].y + 18, val, 0x00FFFFFF, 2);
+      sq_text_abs_center(cx, top + 11, val, 0x00FFFFFF, 2);
       int n = g_lives > 6 ? 6 : (g_lives < 0 ? 0 : g_lives);
       for (int i = 0; i < n; i++) ship_icon_abs(cx - n * 8 + i * 16 + 8, g_boxR[0].y + g_boxR[0].h - 12, 0x0080C8FF); }
     box_restore(&g_boxR[1]);
     { int cx = g_boxR[1].x + g_boxR[1].w / 2;
-      sq_text_abs_center(cx, g_boxR[1].y + 5, "BOMBS", 0x0090C0FF, 1);
+      int bottom_reserve = 16;   /* [RMB]/B hint row */
+      int avail_h = g_boxR[1].h - bottom_reserve; int block_h = 8 + 3 + 16;
+      int top = g_boxR[1].y + (avail_h - block_h) / 2; if (top < g_boxR[1].y + 2) top = g_boxR[1].y + 2;
+      sq_text_abs_center(cx, top, "BOMBS", 0x0090C0FF, 1);
       num_to_str(g_bombs, buf); strcpy(val, "x "); strcat(val, buf);
-      sq_text_abs_center(cx, g_boxR[1].y + 18, val, 0x00FF80FF, 2);
+      sq_text_abs_center(cx, top + 11, val, 0x00FF80FF, 2);
       /* discoverability: the actual trigger, right under the count (#475) */
       sq_text_abs_center(cx, g_boxR[1].y + g_boxR[1].h - 12, "[RMB]/B", 0x0090A0B0, 1); }
     box_restore(&g_boxR[2]);
@@ -1340,18 +1635,24 @@ static void draw_side_hud(int lw, int rx, int rw) {
       num_to_str(acc, buf); strcat(buf, "%"); box_label_value(&g_boxR[4], "ACCURACY", buf, 0x0090C0FF, 0x0080D0FF); }
     box_restore(&g_boxR[5]);
     { Enemy *boss = find_boss(); int cx = g_boxR[5].x + g_boxR[5].w / 2;
-      int bw = g_boxR[5].w - 16, bx = g_boxR[5].x + 8, by = g_boxR[5].y + g_boxR[5].h / 2;
+      int bw = g_boxR[5].w - 16, bx = g_boxR[5].x + 8;
+      /* label (8px) + gap + a fixed-height bar/value row, centered as a block
+       * the same way box_label_value() centers label+value (#hud-smear
+       * centering pass); the bar/value row's own height stands in for VH. */
+      int label_top = g_boxR[5].y + (g_boxR[5].h - (8 + 3 + 10)) / 2;
+      if (label_top < g_boxR[5].y + 2) label_top = g_boxR[5].y + 2;
+      int by = label_top + 8 + 3 + 5;   /* vertical center of the 10px-tall bar row */
       if (boss) {
-          sq_text_abs_center(cx, g_boxR[5].y + 5, "BOSS", 0x00FF9090, 1);
+          sq_text_abs_center(cx, label_top, "BOSS", 0x00FF9090, 1);
           fill_rect_abs(bx - 1, by - 1, bw + 2, 10, 0x00202028);
           int fillw = boss->maxhp > 0 ? bw * (boss->hp > 0 ? boss->hp : 0) / boss->maxhp : 0;
           fill_rect_abs(bx, by, fillw, 8, 0x00FF4060);
       } else if (g_now < g_shield_until) {
-          sq_text_abs_center(cx, g_boxR[5].y + 5, "SHIELD", 0x0090C0FF, 1);
+          sq_text_abs_center(cx, label_top, "SHIELD", 0x0090C0FF, 1);
           num_to_str((g_shield_until - g_now) / 1000 + 1, buf); strcat(buf, "s");
-          sq_text_abs_center(cx, g_boxR[5].y + 18, buf, 0x0040C0FF, 2);
+          sq_text_abs_center(cx, label_top + 11, buf, 0x0040C0FF, 2);
       } else {
-          sq_text_abs_center(cx, g_boxR[5].y + 5, "HULL", 0x0090C0FF, 1);
+          sq_text_abs_center(cx, label_top, "HULL", 0x0090C0FF, 1);
           int frac = g_lives > 6 ? 6 : (g_lives < 0 ? 0 : g_lives);
           fill_rect_abs(bx - 1, by - 1, bw + 2, 10, 0x00202028);
           fill_rect_abs(bx, by, bw * frac / 6, 8, 0x0060FF90);
@@ -1521,7 +1822,7 @@ int main(int argc, char *argv[]) {
         g_blit_cap   = (long)W   * H;   g_blit   = (uint32_t *)malloc((unsigned long)g_blit_cap   * 4);
         if (!g_present || !g_blit) { win_destroy(g_win); return 1; }
     }
-    assets_load(); bgset_load(1); stars_init(); neb_init(); bgobj_init(); g_now = (unsigned)uptime_ms();
+    assets_load(); stars_init(); neb_init(); nebz_init(); clust_init(); bgobj_init(); g_now = (unsigned)uptime_ms();
     gui_event_t ev; int running = 1;
     while (running) {
         /* Keep this fullscreen game frontmost + keyboard-focused every frame: a
@@ -1561,10 +1862,11 @@ int main(int argc, char *argv[]) {
         default: break;
         }
         stars_update();
+        clust_update();
         bgobj_update();
         g_bgpos += 0.35f;    /* slow, seamless background drift */
         if (g_state == GS_PLAYING) { update_input(); update_world(16); update_waves(); }
-        else if (g_state == GS_STAGECLEAR) { update_world(16); if (g_now >= g_stageclear_until) { g_stage++; g_wave = 0; g_boss_active = 0; reset_entities(); bgset_load(g_stage); g_px = (float)(W / 2); g_py = (float)(H - 90); g_invuln_until = g_now + 1500; g_wave_delay = g_now + 800; g_banner_until = g_now + 2000; g_stage_spawned = 0; g_stage_killed = 0; g_state = GS_PLAYING; } }
+        else if (g_state == GS_STAGECLEAR) { update_world(16); if (g_now >= g_stageclear_until) { g_stage++; g_wave = 0; g_boss_active = 0; reset_entities(); g_px = (float)(W / 2); g_py = (float)(H - 90); g_invuln_until = g_now + 1500; g_wave_delay = g_now + 800; g_banner_until = g_now + 2000; g_stage_spawned = 0; g_stage_killed = 0; g_state = GS_PLAYING; } }
         switch (g_state) {
         case GS_MENU: draw_menu(); break; case GS_PLAYING: draw_playfield(); break; case GS_PAUSED: draw_pause(); break;
         case GS_STAGECLEAR: draw_stageclear(); break; case GS_GAMEOVER: draw_gameover(); break;

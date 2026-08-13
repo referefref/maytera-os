@@ -3,22 +3,37 @@
 #include "validate.h"
 #include "../serial.h"
 #include "../string.h"
+#include "uaccess_smap.h"  // #19/#645: the terminator scan reads USER memory
+
+// #509 TOCTOU keystone. Fault-safe primitives implemented in mm/uaccess.asm.
+// Each returns 0 / a length on success, or bytes-not-done / -1 if a #PF hit a
+// user page mid-copy that mm_fault() could not resolve as a lazy/COW page (a
+// racing thread unmapped it). mm/fault.c's exception table redirects such a
+// fault to the routine's fixup so the copy fails gracefully instead of panicking
+// or scribbling on a freed/remapped frame. This is what makes copy_*_user an
+// atomic check-AND-use rather than the old check-THEN-memcpy (a TOCTOU hole).
+extern size_t  __uaccess_copy(void *dst, const void *src, size_t n);
+extern size_t  __uaccess_set(void *dst, int val, size_t n);
+extern ssize_t __uaccess_strncpy(char *dst, const char *src, size_t max_len);
+extern ssize_t __uaccess_strnlen(const char *src, size_t max_len);
 
 // ============================================================================
 // Module State
 // ============================================================================
 
-static bool g_validate_initialized = false;
+// #646: g_validate_initialized is GONE. It was set by validate_init() and read
+// by nothing, so it guarded nothing; and validate_init() itself had ZERO
+// callers, so its "[VALIDATE] Pointer validation subsystem initialized" line
+// never printed on any build. Nothing in this file needs initialising: every
+// validator is pure with respect to module state except the failure counter,
+// which starts at zero because it is a static.
 static uint64_t g_validation_failures = 0;
 
-// ============================================================================
-// Initialization
-// ============================================================================
-
-void validate_init(void) {
-    g_validate_initialized = true;
-    g_validation_failures = 0;
-    kprintf("[VALIDATE] Pointer validation subsystem initialized\n");
+// #646: the counter is incremented at ~30 sites and, until now, READ NOWHERE.
+// A rejection counter nobody can read is not telemetry. security_print_status()
+// prints it via this accessor.
+uint64_t validate_failure_count(void) {
+    return g_validation_failures;
 }
 
 // ============================================================================
@@ -39,10 +54,11 @@ bool is_user_address(uint64_t addr) {
     return (addr >= NULL_PAGE_END) && (addr <= USER_SPACE_END);
 }
 
-bool is_kernel_address(uint64_t addr) {
-    // Kernel addresses: 0xFFFF800000000000 - 0xFFFFFFFFFFFFFFFF
-    return (addr >= KERNEL_SPACE_START);
-}
+// #646: is_kernel_address() DELETED. Zero callers, and it was actively
+// misleading on this OS: the kernel is identity-mapped LOW (0x400000), it never
+// runs on the upper half, so "addr >= KERNEL_SPACE_START" would have answered
+// false for every real kernel address. validate_kernel_ptr() correctly does not
+// use it; it walks the live CR3 instead.
 
 // ============================================================================
 // Error Strings
@@ -72,21 +88,9 @@ const char *validate_error_string(validate_error_t error) {
 // Core Validation Functions
 // ============================================================================
 
-validate_error_t validate_alignment(const void *ptr, size_t type_size) {
-    if (type_size == 0 || type_size == 1) {
-        return VALIDATE_OK;  // No alignment required
-    }
-
-    // Type size should be power of 2 for natural alignment
-    size_t alignment = type_size;
-    if (alignment > 16) alignment = 16;  // Cap at 16-byte alignment
-
-    if (!is_aligned(ptr, alignment)) {
-        return VALIDATE_UNALIGNED;
-    }
-
-    return VALIDATE_OK;
-}
+// #646: validate_alignment() and the is_aligned() inline it used are DELETED.
+// Zero callers. Alignment is not a memory-safety property on x86-64 (unaligned
+// access is legal), so this was never part of the syscall trust boundary.
 
 validate_error_t validate_user_ptr(const void *ptr, size_t size, uint32_t access) {
     uint64_t addr = (uint64_t)ptr;
@@ -242,7 +246,7 @@ validate_error_t validate_user_string(const char *str, size_t max_len) {
         return VALIDATE_OK;  // Empty string is valid
     }
 
-    if (max_len > 1024 * 1024) {  // 1MB max string length
+    if (max_len > USER_STRING_MAX) {  // #616: THE ceiling, shared with callers
         g_validation_failures++;
         return VALIDATE_ARRAY_TOO_LARGE;
     }
@@ -299,8 +303,19 @@ validate_error_t validate_user_string(const char *str, size_t max_len) {
             return VALIDATE_KERNEL_SPACE;
         }
 
-        // Check for null terminator
-        if (str[i] == '\0') {
+        // Check for null terminator.
+        // #19/#645: THIS IS A RING-0 READ OF USER MEMORY, and it is the one the
+        // lint can never flag, because validate_user_string() is itself on the
+        // lint's VALIDATORS list and a validator's own dereference is excluded
+        // by construction. It was the SECOND fault an armed kernel took
+        // (RIP in validate_user_string, CR2 in the user window, err=0x1), after
+        // the ELF loader. The page has just been proven PRESENT and USER, which
+        // is exactly the condition SMAP traps on, so the load needs AC.
+        char c;
+        {   uaccess_ac_t __ac = uaccess_begin();
+            c = str[i];
+            uaccess_end(__ac); }
+        if (c == '\0') {
             return VALIDATE_OK;
         }
     }
@@ -310,34 +325,10 @@ validate_error_t validate_user_string(const char *str, size_t max_len) {
     return VALIDATE_STRING_UNTERMINATED;
 }
 
-validate_error_t validate_user_array(const void *arr, size_t count, size_t elem_size, uint32_t access) {
-    // Check for null pointer
-    if (arr == NULL && count > 0) {
-        g_validation_failures++;
-        return VALIDATE_NULL;
-    }
-
-    // Check for empty array (valid)
-    if (count == 0 || elem_size == 0) {
-        return VALIDATE_OK;
-    }
-
-    // Check for integer overflow in total size
-    size_t total_size;
-    if (__builtin_mul_overflow(count, elem_size, &total_size)) {
-        g_validation_failures++;
-        return VALIDATE_OVERFLOW;
-    }
-
-    // Reasonable limit check (1GB max array)
-    if (total_size > 1024 * 1024 * 1024) {
-        g_validation_failures++;
-        return VALIDATE_ARRAY_TOO_LARGE;
-    }
-
-    // Validate as pointer with calculated size
-    return validate_user_ptr(arr, total_size, access);
-}
+// #646: validate_user_array() DELETED. Zero callers. Its count*elem_size
+// overflow check is the useful part, and callers that need it should use
+// __builtin_mul_overflow() then validate_user_ptr() on the product, which is
+// exactly what proc/procinfo.c already does inline.
 
 validate_error_t validate_kernel_ptr(const void *ptr, size_t size) {
     uint64_t addr = (uint64_t)ptr;
@@ -390,6 +381,71 @@ validate_error_t validate_kernel_ptr(const void *ptr, size_t size) {
 }
 
 // ============================================================================
+// #509: entry gate for the fault-safe copy primitives
+// ============================================================================
+
+// Unlike validate_user_ptr(), a NOT-PRESENT page is NOT rejected here: it may be
+// a legitimately lazy demand page (see #511), and __uaccess_copy()'s fault path
+// in mm/fault.c will either demand-page it (mm_fault) or, if it is genuinely
+// bad, redirect to the -EFAULT fixup. What we MUST still reject at entry is the
+// confused-deputy: a user-supplied address that names PRESENT kernel memory. The
+// kernel is identity-mapped at LOW addresses on this OS, so a range check cannot
+// catch it - only the U/S bit can. We walk every page and reject any PRESENT
+// page lacking U/S (or, for a write, R/W). NULL/MMIO/canonical/range checks
+// mirror validate_user_ptr(). Correctness for a page that goes bad AFTER this
+// check comes from the copy fault-fixup, not from this walk.
+static validate_error_t validate_user_copy_range(const void *ptr, size_t size,
+                                                  bool need_write) {
+    uint64_t addr = (uint64_t)ptr;
+    uint64_t end_addr;
+
+    if (ptr == NULL)  { g_validation_failures++; return VALIDATE_NULL; }
+    if (size == 0)    { return VALIDATE_OK; }
+    if (__builtin_add_overflow(addr, size - 1, &end_addr)) {
+        g_validation_failures++; return VALIDATE_OVERFLOW;
+    }
+    if (!is_canonical_address(addr) || !is_canonical_address(end_addr)) {
+        g_validation_failures++; return VALIDATE_NON_CANONICAL;
+    }
+    if (!is_user_address(addr) || !is_user_address(end_addr)) {
+        g_validation_failures++; return VALIDATE_KERNEL_SPACE;
+    }
+    if (addr < NULL_PAGE_END) { g_validation_failures++; return VALIDATE_NULL; }
+    if (addr >= MMIO_REGION_START && addr < MMIO_REGION_END) {
+        g_validation_failures++; return VALIDATE_MMIO;
+    }
+    if (end_addr >= MMIO_REGION_START && end_addr < MMIO_REGION_END) {
+        g_validation_failures++; return VALIDATE_MMIO;
+    }
+
+    uint64_t cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));
+    cr3 &= VMM_ADDR_MASK;
+
+    uint64_t page_addr = ALIGN_DOWN(addr, PAGE_SIZE);
+    uint64_t page_end  = ALIGN_UP(end_addr + 1, PAGE_SIZE);
+    while (page_addr < page_end) {
+        uint64_t eff = vmm_get_effective_flags_in(cr3, page_addr);
+        if (eff & VMM_FLAG_PRESENT) {
+            // A PRESENT page that Ring 3 could not reach with a plain mov is
+            // kernel memory whatever its numeric address looks like. Reject it
+            // so a Ring-3 pointer cannot make the kernel read/write its own
+            // memory via a copy_*_user (the confused deputy).
+            if (!(eff & VMM_FLAG_USER)) {
+                g_validation_failures++; return VALIDATE_NO_USER;
+            }
+            if (need_write && !(eff & VMM_FLAG_WRITABLE)) {
+                g_validation_failures++; return VALIDATE_NO_WRITE;
+            }
+        }
+        // Not present: permitted. Lazy demand page (resolved by mm_fault during
+        // the copy) or genuinely bad (caught by the copy fault-fixup -> EFAULT).
+        page_addr += PAGE_SIZE;
+    }
+    return VALIDATE_OK;
+}
+
+// ============================================================================
 // Safe Copy Functions
 // ============================================================================
 
@@ -401,21 +457,29 @@ int copy_from_user(void *dest, const void *src, size_t size) {
         return -14;  // EFAULT
     }
 
-    // Validate source (user pointer, read access)
-    err = validate_user_ptr(src, size, ACCESS_READ_USER);
+    // Validate source (user pointer, read access). #509: use the copy-range
+    // gate so a lazy demand page is not falsely rejected - the fault-safe copy
+    // below resolves it (or -EFAULTs a genuinely bad page).
+    err = validate_user_copy_range(src, size, false);
     if (err != VALIDATE_OK) {
         kprintf("[VALIDATE] copy_from_user: invalid src - %s\n", validate_error_string(err));
         return -14;  // EFAULT
     }
 
-    // Perform the copy
-    memcpy(dest, src, size);
+    // #509 TOCTOU-safe copy. If a sibling thread unmapped `src` between the
+    // check above and here, __uaccess_copy faults through mm/fault.c's fixup
+    // and returns non-zero, so we return -EFAULT instead of reading a freed
+    // frame or looping forever.
+    if (__uaccess_copy(dest, src, size) != 0) {
+        return -14;  // EFAULT (page went bad mid-copy)
+    }
     return 0;
 }
 
 int copy_to_user(void *dest, const void *src, size_t size) {
-    // Validate destination (user pointer, write access)
-    validate_error_t err = validate_user_ptr(dest, size, ACCESS_WRITE_USER);
+    // Validate destination (user pointer, write access). #509: copy-range gate
+    // permits a lazy demand page (the #511 case) instead of falsely rejecting.
+    validate_error_t err = validate_user_copy_range(dest, size, true);
     if (err != VALIDATE_OK) {
         kprintf("[VALIDATE] copy_to_user: invalid dest - %s\n", validate_error_string(err));
         return -14;  // EFAULT
@@ -428,8 +492,12 @@ int copy_to_user(void *dest, const void *src, size_t size) {
         return -14;  // EFAULT
     }
 
-    // Perform the copy
-    memcpy(dest, src, size);
+    // #509 TOCTOU-safe copy. A racing unmap/remap of `dest` after the check
+    // faults through mm/fault.c's fixup; we then return -EFAULT rather than
+    // performing an arbitrary Ring-0 write to a freed/remapped frame.
+    if (__uaccess_copy(dest, src, size) != 0) {
+        return -14;  // EFAULT (page went bad mid-copy)
+    }
     return 0;
 }
 
@@ -440,20 +508,19 @@ ssize_t strncpy_from_user(char *dest, const char *src, size_t max_len) {
         return -14;  // EFAULT
     }
 
-    // Validate source string
+    // Validate source string (present-page U/S walk, cheap fast-fail).
     err = validate_user_string(src, max_len);
     if (err != VALIDATE_OK) {
         return -14;  // EFAULT
     }
 
-    // Copy the string
-    size_t i;
-    for (i = 0; i < max_len - 1 && src[i] != '\0'; i++) {
-        dest[i] = src[i];
-    }
-    dest[i] = '\0';
+    if (max_len == 0) return 0;
 
-    return (ssize_t)i;
+    // #509 TOCTOU-safe copy: faults through mm/fault.c's fixup and returns -1
+    // if the user string page goes bad mid-copy.
+    ssize_t n = __uaccess_strncpy(dest, src, max_len);
+    if (n < 0) return -14;  // EFAULT
+    return n;
 }
 
 ssize_t strnlen_user(const char *str, size_t max_len) {
@@ -463,23 +530,22 @@ ssize_t strnlen_user(const char *str, size_t max_len) {
         return -14;  // EFAULT
     }
 
-    // Count the length
-    size_t len = 0;
-    while (len < max_len && str[len] != '\0') {
-        len++;
-    }
-
-    return (ssize_t)len;
+    // #509 TOCTOU-safe scan: -1 if the string page goes bad mid-scan.
+    ssize_t len = __uaccess_strnlen(str, max_len);
+    if (len < 0) return -14;  // EFAULT
+    return len;
 }
 
 int clear_user(void *dest, size_t size) {
-    // Validate destination (user pointer, write access)
-    validate_error_t err = validate_user_ptr(dest, size, ACCESS_WRITE_USER);
+    // Validate destination (user pointer, write access). #509 copy-range gate.
+    validate_error_t err = validate_user_copy_range(dest, size, true);
     if (err != VALIDATE_OK) {
         return -14;  // EFAULT
     }
 
-    // Clear the memory
-    memset(dest, 0, size);
+    // #509 TOCTOU-safe clear.
+    if (__uaccess_set(dest, 0, size) != 0) {
+        return -14;  // EFAULT (page went bad mid-clear)
+    }
     return 0;
 }

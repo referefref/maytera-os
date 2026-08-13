@@ -16,6 +16,13 @@ size_t strnlen(const char *s, size_t maxlen);
 char *strcpy(char *dest, const char *src);
 char *strncpy(char *dest, const char *src, size_t n);
 int strcmp(const char *s1, const char *s2);
+// #tls-suppressfix: strcasecmp has been DEFINED in string.c since forever and
+// declared in no header, so every caller called it implicitly. fs/exfat.c
+// silenced the resulting -Wimplicit-function-declaration file-wide rather than
+// adding this one line. An implicit declaration compiles to a call the compiler
+// guessed the prototype for; here the guess (int, no arg checking) happened to
+// match, so nothing broke, but nothing was checking either.
+int strcasecmp(const char *s1, const char *s2);
 int strncmp(const char *s1, const char *s2, size_t n);
 char *strcat(char *dest, const char *src);
 char *strncat(char *dest, const char *src, size_t n);
@@ -39,6 +46,20 @@ unsigned long long strtoull(const char *nptr, char **endptr, int base);
 // Formatted output
 int snprintf(char *buf, size_t size, const char *fmt, ...);
 int vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap);
+
+// #672: THE shared format parser. One definition of the printf format language
+// for the whole kernel; the DESTINATION is the caller's, supplied as a sink.
+// This exists because five independent hand-rolled parsers had drifted apart,
+// and four of them consumed no argument for a specifier they did not recognise,
+// which shifts every later argument in the line (see the long comment in
+// string.c). Do not add a sixth: pass a sink.
+typedef void (*kfmt_sink_t)(void *ctx, char c);
+void kvformat(kfmt_sink_t sink, void *ctx, const char *fmt, __builtin_va_list ap);
+
+// #672 boot self-test. Formats known width/flag/precision vectors and compares
+// against expected output, including the exact SMAP pre-flight format string
+// whose argument shift was the reported symptom. Logs [KFMT-SELFTEST].
+void kformat_selftest(void);
 
 // Character functions
 static inline int isdigit(int c) { return c >= '0' && c <= '9'; }

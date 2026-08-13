@@ -17,16 +17,15 @@ int main(int argc, char **argv) {
     // Modern chrome: gradients + soft elevation + antialiased TTF, matching the
     // Settings/Files design language.
     gui_set_style(GUI_STYLE_MODERN);
-    ui_splash(win, win_w, win_h);   // brief branded splash before first frame
-
-    // Build the initial document (one opaque white layer). ui_init draws.
-    if (doc_new(STUDIO_DEF_W, STUDIO_DEF_H, argb(255, 255, 255, 255)) != 0) {
+    // #472: the splash IS the real startup - it builds the initial document
+    // (one opaque white layer) and registers every Colors/Filters op itself,
+    // interleaved with the steps that say it is doing so, instead of running
+    // that work silently after a canned animation.
+    if (ui_splash(win, win_w, win_h) != 0) {
         printf("studio: doc alloc failed\n");
         win_destroy(win);
         return 1;
     }
-
-    studio_register_all();   // register all Colors/Filters ops
     ui_init(win, win_w, win_h);
 
     // If launched with a file path (Files "Open with", or a shell arg), open it

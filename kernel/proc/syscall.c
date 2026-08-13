@@ -1,5 +1,8 @@
 // syscall.c - System call implementation for MayteraOS
 #include "syscall.h"
+#include "../dos/diskimg.h"   // #739 SYS_DISKIMG
+#include "../fs/graphfs/journal.h"   // #711 SYS_GFS_VERIFY
+#include "../fs/graphfs/fold.h"      // #711 slice 2 SYS_GFS_QUERY
 #include "procinfo.h"   // #487: Ring-3 process introspection backends
 #include "syscall_argtab.h"  // #503: central pointer-arg validation
 #ifdef SECTEST_SYSCALL
@@ -10,8 +13,11 @@ extern int64_t validate_selftest(void *ubuf, uint64_t ubuf_len);
 int64_t sys_decode_image(const void *, uint32_t, uint32_t, void *, uint32_t, int *);
 int64_t sys_win_draw_image(int, int, int, int, int, uint32_t *);
 #include "process.h"
+#include "../net/http_progress.h"   // #25: real fetch progress
 #include "../sync/waitq.h"   // #453: wait-queue for win_get_event blocking
 #include "../drivers/audio_pcm.h"  // Ring-3 PCM push (Ring-0 media exit, phase 1)
+#include "../security/validate.h" // #500: spawn_impl argv two-level deref + SYS_IOCTL boundary
+#include "../security/aiguard.h"  // #745: LLM prompt-injection screen (nova.c + aiguard.rs)
 #include "../version.h"
 #include "../serial.h"
 #include "../string.h"
@@ -19,12 +25,17 @@ int64_t sys_win_draw_image(int, int, int, int, int, uint32_t *);
 #include "../cpu/isr.h"
 #include "../mm/vmm.h"
 #include "../mm/heap.h"
+#include "../mm/demand.h"   // #510/#511: mm_prefault_range() for sys_read
 #include "../sync/spinlock.h"
 #include "../fs/fat.h"
 #include "../fs/ext2.h"
 #include "../fs/perms.h"
+#include "../fs/guestfs.h"   // #708: DOS/Win16 guest fs gate
 #include "../fs/bootlog.h"
 #include "users.h"
+#include "elevate.h"   // #745 elevation syscall bodies
+#include "fetchown.h"  // #745 (task #36): async HTTP job slot ownership (rustkern/fetchown.rs)
+#include "pwpolicy.h"
 #include "../gui/window.h"
 #include "../gui/ttf.h"
 #include "../gui/syslog.h"
@@ -34,21 +45,73 @@ int64_t sys_win_draw_image(int, int, int, int, int, uint32_t *);
 #include "../net/dhcp.h"
 #include "../net/udp.h"
 #include "../net/tcp.h"
+#include "../net/socket.h"   // #524 BSD sockets
 #include "../net/icmp.h"
+#include "../net/sntp.h"   // #797: SNTP client (validation lives in rustkern/sntp.rs)
 #include "../net/smb.h"
 #include "../net/nfs.h"
 #include "../ipc/msg.h"
 #include "../ipc/shm.h"
 #include "../gui/fb_syscall.h"
+#include "../gui/installer.h"
 #include "../exec/elf.h"
 #include "../exec/ne.h"
 #include "../fs/vfs.h"
 #include "services.h"
 #include "cron.h"
 #include "../devinfo.h"
+#include "../cpu/dlprof.h"
+#include "../security/seclog.h"   /* #653: security event producer */
+#include "syscall_path.h"  // #746b: SC_PATH_MAX + the shared path predicates
+#include "../security/uaccess_smap.h"  // #19/#645: uaccess_begin/end for the copy-engine calls
+#include "fdlayer.h"       // #746b: the legacy fd layer (proc/fdlayer.c)
 
 // WM blit debug log toggle (see user_window_draw_handler). Default OFF.
 volatile int g_wm_blit_debug = 0;
+
+// ============================================================================
+// #567: fault-safe (#509) user<->kernel copy helpers used by the handlers this
+// task drained off the copy-user-lint KNOWN_GAP ledger. Every one routes the
+// actual user access through strncpy_from_user / strnlen_user / copy_*_user,
+// which do an ATOMIC entry-check-AND-copy with an exception-table fixup
+// (mm/fault.c): a sibling thread that remaps the page mid-copy faults to
+// -EFAULT instead of the kernel dereferencing a freed/remapped frame. They
+// never raw-deref the destination kernel buffer, so they stay lint-clean.
+// Justified-C (not Rust): these are in-place conversions of existing C handlers
+// to the existing C copy_*_user primitives; no new subsystem, no hot FP path.
+// ============================================================================
+// #745: the bound on a bounced Ring-3 CREDENTIAL. sys_authenticate() had
+// this inlined as a bare 128; sys_su()/sys_passwd_change() now bounce too,
+// and three copies of an unnamed 128 is how they drift apart.
+#define SC_PASSWORD_MAX 128
+// #745: lock elevate.h's copy of the password bound to the real one. See the
+// comment on ELEV_PASSWORD_MAX; this is the only translation unit where both
+// names are visible, so it is the only place the duplication CAN be checked.
+_Static_assert(ELEV_PASSWORD_MAX == SC_PASSWORD_MAX,
+               "#745: ELEV_PASSWORD_MAX (proc/elevate.h) must equal SC_PASSWORD_MAX");
+
+
+// Bounce a user C string into the fixed kernel buffer `dst` (cap bytes).
+// strncpy_from_user always NUL-terminates within [0,cap-1]. Returns 0 on
+// success, -14 (EFAULT) on a NULL/bad user pointer or a mid-copy fault.
+static int sc_bounce_str(const char *usrc, char *dst, size_t cap) {
+    if (!usrc || cap == 0) return -14;
+    return (strncpy_from_user(dst, usrc, cap) < 0) ? -14 : 0;
+}
+
+// Duplicate a user C string into a freshly kmalloc'd kernel buffer (up to
+// maxcap+1 bytes incl. NUL; caller kfree's). Returns NULL on NULL/bad pointer,
+// a mid-copy fault, or OOM.
+static char *sc_dup_user_str(const char *usrc, size_t maxcap) {
+    if (!usrc) return 0;
+    ssize_t n = strnlen_user(usrc, maxcap);
+    if (n < 0) return 0;
+    char *k = (char *)kmalloc((size_t)n + 1);
+    if (!k) return 0;
+    if (strncpy_from_user(k, usrc, (size_t)n + 1) < 0) { kfree(k); return 0; }
+    return k;
+}
+
 static int64_t sys_spawn_args(const char *path, char **argv, int argc);
 static int64_t sys_spawn_redir(const char *path, char **argv, int argc,
                                const char *infile, const char *outfile, int append);
@@ -57,9 +120,6 @@ static int64_t sys_spawn_redir(const char *path, char **argv, int argc,
 extern file_t *fat_vfs_open(const char *path, int flags);
 extern file_t *ext2_vfs_open(const char *path, int flags);
 // ext2 root-cutover path helpers (defined alongside sys_open below).
-static int         path_is_ext2(const char *p);
-static const char *ext2_relpath(const char *p);
-static int         path_root_ext2(const char *p);
 // #317 pass 2: SMB network mount control syscalls (defined below).
 int64_t sys_net_mount(const char *server, const char *share,
                       const char *user, const char *pass);
@@ -78,6 +138,24 @@ extern volatile uint64_t timer_ticks;
 #define MSR_LSTAR           0xC0000082
 #define MSR_CSTAR           0xC0000083  // 32-bit SYSCALL (not used)
 #define MSR_SFMASK          0xC0000084
+
+// #668: IA32_FMASK selects which RFLAGS bits SYSCALL CLEARS on entry. Two bits
+// beyond IF/TF matter and were both missing.
+//
+//   DF - THE LIVE BUG. The SysV ABI requires DF=0 on entry and gcc emits
+//        `rep movsb`/`rep stosb` on that assumption. DF is freely writable from
+//        CPL 3, so Ring 3 could execute `std` and then issue a syscall (or just
+//        wait for a timer interrupt) and kernel string operations would run
+//        BACKWARDS from there. Ring-3-triggerable Ring-0 memory corruption, no
+//        SMAP involved. An IDT gate does not clear DF either, which is why
+//        cpu/idt.asm also gets a `cld` at isr_common.
+//   AC - the SMAP override, also writable from CPL 3. Latent while SMAP is off,
+//        but without this bit `pushfq; or $1<<18; popfq; syscall` would run a
+//        whole syscall with SMAP disabled, making SMAP worthless (#645).
+#define SFMASK_TF           0x100      // trap flag
+#define SFMASK_IF           0x200      // interrupts
+#define SFMASK_DF           0x400      // direction
+#define SFMASK_AC           0x40000    // alignment check == SMAP override
 
 // EFER bits
 #define EFER_SCE            (1 << 0)    // SYSCALL enable
@@ -116,9 +194,9 @@ void syscall_init(void) {
     // Set LSTAR to syscall entry point (64-bit)
     wrmsr(MSR_LSTAR, (uint64_t)syscall_entry);
 
-    // Set SFMASK - flags to clear on syscall
-    // Clear IF (disable interrupts) and TF (trap flag)
-    wrmsr(MSR_SFMASK, 0x200 | 0x100);  // IF | TF
+    // Set SFMASK - flags to clear on syscall. #668: DF and AC added; see the
+    // comment on the SFMASK_* defines for why omitting DF was exploitable.
+    wrmsr(MSR_SFMASK, SFMASK_IF | SFMASK_TF | SFMASK_DF | SFMASK_AC);
 
     kprintf("[SYSCALL] SYSCALL/SYSRET enabled\n");
     kprintf("[SYSCALL] LSTAR = 0x%lx\n", (uint64_t)syscall_entry);
@@ -194,7 +272,14 @@ static int g_nightlight = 0;
 // System font size index (0=Small,1=Medium,2=Large,3=X-Large); compositor polls. (#58)
 static int g_font_size = 1;
 static int g_screensaver_type = 2;
-static int g_screensaver_delay = 120;  // (#115) screensaver activation delay, seconds
+// #652: 600, not 120. This is the AUTHORITATIVE default: get_ss_delay() returns
+// it on a fresh boot, and because 120 >= 5 the compositor's own
+// SS_DEFAULT_TIMEOUT fallback never fired, so anyone "fixing" the default in
+// compositor.h alone changed nothing observable. Two minutes also sat at the
+// very bottom of the Settings slider's 1-60 minute range. There are THREE
+// copies of this default (here, userland/apps/compositor/compositor.h, and
+// userland/apps/settings/main.c); they must agree.
+static int g_screensaver_delay = 600;  // (#115/#652) activation delay, seconds
 int g_win_blit_suppressed = 0;   // set by compositor while the screensaver owns the FB
 // (#116) Live mouse-cursor style/size. Settings sets these via SYS_SET_CURSOR; the
 // compositor reads them every frame via SYS_GET_CURSOR (same live-apply pattern as
@@ -213,6 +298,15 @@ static char         g_win16_path[128];
 static void win16_proc_entry(void *arg) {
     (void)arg;
     win16_run_file(g_win16_path);
+    // #708: disarm the Win16 slot HERE, not in win16_api_end(). MEASURED: ne.c
+    // calls win16_api_end() only "if (is_ne)", so after a .COM run through the
+    // Win16 layer the teardown never fired and the slot stayed ARMED with the
+    // last guest's identity. Nothing could exploit that today (every launch
+    // re-arms, and re-arming disarms first), but "disarmed at teardown" has to
+    // be TRUE, not nearly true. This is the single place every Win16 run
+    // returns to, whatever the binary format, which is the same reason the DOS
+    // side disarms in dos_proc_entry() rather than inside dos_run_file().
+    guestfs_finish(GUESTFS_SLOT_WIN16);
     g_win16_busy = 0;
 }
 // Defined in dos/dosexec.c: launch an MS-DOS program in its own kernel proc +
@@ -220,16 +314,25 @@ static void win16_proc_entry(void *arg) {
 // can call it without pulling in dos/dosexec.h.
 int dos_launch(const char *path);
 
-int win16_launch(const char *path) {
+int win16_launch(const char *upath) {
     if (g_win16_busy) return -1;
-    if (!path || !path[0]) return -1;
-    int i = 0;
-    for (; i < (int)sizeof(g_win16_path) - 1 && path[i]; i++)
-        g_win16_path[i] = path[i];
-    g_win16_path[i] = '\0';
+    // #567: bounce the user path fault-safe into the kernel g_win16_path buffer.
+    if (sc_bounce_str(upath, g_win16_path, sizeof(g_win16_path)) != 0) return -1;
+    if (!g_win16_path[0]) return -1;
+    // #708: capture the guest's identity HERE, while we are still on the
+    // calling process's syscall stack. Once win16_proc_entry is running,
+    // proc_current() is a kernel thread whose uid is 0 by construction, which
+    // is exactly the identity a guest must not get. Fail the launch outright
+    // rather than starting a guest that would be denied every file it opens.
+    if (guestfs_arm_caller(GUESTFS_SLOT_WIN16) != 0) {
+        kprintf("[win16] launch of '%s' REFUSED: no usable identity for the guest\n",
+                g_win16_path);
+        return -1;
+    }
     g_win16_busy = 1;
     if (proc_create("win16", win16_proc_entry, NULL, PRIO_NORMAL) < 0) {
         g_win16_busy = 0;
+        guestfs_disarm_rs(GUESTFS_SLOT_WIN16);
         return -1;
     }
     return 0;
@@ -262,22 +365,67 @@ int64_t sys_list_users(sc_user_info_t *ubuf, int max) {
     int out = 0;
     for (int i = 0; i < n && out < max; i++) {
         if (!t[i].active) continue;
+        // #567: build each entry in a kernel-local struct (zeroed, so no kernel
+        // stack bytes leak into userland) then copy it out fault-safe.
+        sc_user_info_t ke;
+        memset(&ke, 0, sizeof(ke));
         int k;
-        for (k = 0; k < 63 && t[i].username[k]; k++) ubuf[out].username[k] = t[i].username[k];
-        ubuf[out].username[k] = '\0';
-        for (k = 0; k < 63 && t[i].display_name[k]; k++) ubuf[out].display_name[k] = t[i].display_name[k];
-        ubuf[out].display_name[k] = '\0';
-        ubuf[out].uid = t[i].uid;
-        ubuf[out].gid = t[i].gid;
-        ubuf[out].active = 1;
+        for (k = 0; k < 63 && t[i].username[k]; k++) ke.username[k] = t[i].username[k];
+        ke.username[k] = '\0';
+        for (k = 0; k < 63 && t[i].display_name[k]; k++) ke.display_name[k] = t[i].display_name[k];
+        ke.display_name[k] = '\0';
+        ke.uid = t[i].uid;
+        ke.gid = t[i].gid;
+        ke.active = 1;
+        if (copy_to_user(&ubuf[out], &ke, sizeof(ke)) != 0) return -14;
         out++;
     }
     return out;
 }
 
-int64_t sys_authenticate(const char *uname, const char *upass) {
-    if (!uname || !upass) return -1;
-    if (user_verify_password(uname, upass) != 0) return -1;
+// #745 followup (Security): an authentication ATTEMPT against an account
+// must not be mountable by a THIRD party. sys_su()/sys_authenticate() route
+// through the shared per-account lockout inside users_authenticate(), and the
+// kernel login gate (gui/login.c), the lock screen and the SSH server all read
+// and enforce that SAME shadow_entry_t.failed_attempts/lockout_until_ms. So an
+// unprivileged process calling these syscalls for an account that is NOT its
+// own could (a) use the syscall as a slow password oracle and, worse, (b) drive
+// the victim's failed-attempt counter and lock the real owner out of login,
+// unlock and ssh: a no-privilege denial of service against the machine owner.
+//
+// The boundary is the one this file already uses for sys_passwd_change() and
+// login_cfg_authorize(): root (the login authority) may authenticate anyone; a
+// non-root caller may authenticate ONLY its own account. The test is by NAME
+// against the caller's OWN record and never looks up the requested name, so it
+// discloses nothing about which accounts exist. Callers must return BEFORE
+// users_authenticate() on a deny so the victim's lockout counter is untouched.
+static int caller_may_authenticate(const char *target) {
+    process_t *p = proc_current();
+    if (!p) return 0;                       // no caller identity: deny
+    if (p->euid == 0) return 1;             // root: may authenticate anyone
+    user_entry_t *self = user_lookup_uid(p->euid);
+    if (!self) return 0;                    // caller has no account: deny
+    return (strcmp(target, self->username) == 0) ? 1 : 0;
+}
+
+int64_t sys_authenticate(const char *u_uname, const char *u_upass) {
+    // #567: bounce both credentials fault-safe into kernel buffers before the
+    // (rate-limited) authenticator ever reads them.
+    char uname[USERNAME_MAX], upass[SC_PASSWORD_MAX];
+    if (sc_bounce_str(u_uname, uname, sizeof(uname)) != 0) return -1;
+    if (sc_bounce_str(u_upass, upass, sizeof(upass)) != 0) return -1;
+    if (upass[0] == '\0') return -1;   // #566: empty password never authenticates
+    // #745 followup: non-root may authenticate only its OWN account. Deny
+    // BEFORE users_authenticate() so a cross-account guess never touches the
+    // victim's shared lockout counter (Claim 1 oracle + Claim 2 login DoS).
+    if (!caller_may_authenticate(uname)) {
+        process_t *pa = proc_current();
+        bootlog_write("[AUTH] authenticate DENIED (not own account): uid=%u -> '%s' (#745)",
+                      (unsigned)(pa ? pa->euid : 0), uname);
+        return -1;   // EPERM; victim's lockout state untouched
+    }
+    int r = users_authenticate(uname, upass);  // rate-limited + escalating lockout
+    if (r != 0) return r;               // -1 bad credentials, -2 locked out
     user_entry_t *u = user_lookup_name(uname);
     return u ? (int64_t)u->uid : -1;
 }
@@ -289,15 +437,356 @@ int64_t sys_delete_user(const char *uname) {
     return user_delete_by_name(uname);
 }
 
+// ============================================================================
+// #566 Secure session lock / unlock and autologin policy.
+// The kernel is the sole authority for "is this session locked" (gui/desktop.c
+// g_session_locked). A Ring-3 app can only READ it and can only CLEAR it via
+// SYS_SESSION_UNLOCK, which itself runs the rate-limited users_authenticate().
+// ============================================================================
+extern fat_fs_t g_fat_fs;
+extern void desktop_set_locked(int locked);
+extern int  desktop_is_locked(void);
+extern uint32_t desktop_get_session_uid(void);
+
+// Bounded copy of a userspace C string into a fixed kernel buffer (NUL-safe).
+static void sc_copy_str(const char *usrc, char *dst, int cap) {
+    int i = 0;
+    if (usrc) { for (; i < cap - 1 && usrc[i]; i++) dst[i] = usrc[i]; }
+    dst[i] = '\0';
+}
+
+// #19/#645: the USER-POINTER twin of sc_copy_str(). sc_copy_str() reads its
+// source byte-by-byte with a plain Ring-0 load, which is a #PF under CR4.SMAP
+// and, worse, was the tree's documented "GAP-2" hole: a Ring-3 string read two
+// call levels below a dispatcher case, with no validation at all. It is kept
+// (one caller still passes a KERNEL string, session_user()->username) and every
+// call whose source is a Ring-3 pointer now goes through this one, which is a
+// thin wrapper over the canonical strncpy_from_user primitive: U/S-checked,
+// fault-fixed-up and AC-bracketed. A NULL or unreadable source yields "",
+// preserving sc_copy_str()'s contract exactly.
+static void sc_copy_str_user(const char *usrc, char *dst, int cap) {
+    if (!dst || cap <= 0) return;
+    dst[0] = '\0';
+    if (!usrc) return;
+    if (strncpy_from_user(dst, usrc, (size_t)cap) < 0) dst[0] = '\0';
+}
+
+// Read the configured boot-autologin username from /CONFIG/LOGIN.CFG into `out`
+// (empty string if none / unreadable). Extracted so the LOGIN.CFG parse lives in
+// exactly ONE place, shared by sys_get_autologin() and the session-lock policy.
+static void autologin_configured_user(char *out, int cap) {
+    if (out && cap > 0) out[0] = '\0';
+    if (!out || cap <= 0 || !g_fat_fs.mounted) return;
+    uint32_t size = 0;
+    void *data = fat_read_file(&g_fat_fs, "/CONFIG/LOGIN.CFG", &size);
+    if (!data || size == 0) { if (data) kfree(data); return; }
+    const char *src = (const char *)data; const char *end = src + size;
+    while (src < end) {
+        while (src < end && (*src==' '||*src=='\n'||*src=='\r'||*src=='\t')) src++;
+        if (src >= end) break;
+        if (strncmp(src, "autologin=", 10) == 0) {
+            src += 10; int i = 0;
+            while (src < end && *src!='\n' && *src!='\r' && i < cap-1)
+                out[i++] = *src++;
+            out[i] = '\0';
+            break;
+        }
+        while (src < end && *src != '\n') src++;
+    }
+    kfree(data);
+}
+
+// #566/macOS-style autologin: is boot autologin enabled FOR THE CURRENT SESSION
+// USER? Used to keep an auto-logged-in session from locking itself out on idle.
+// Returns 0 for any non-autologin session (autologin disabled entirely, or a
+// Switch-User to a DIFFERENT account than the configured autologin one), so a
+// real multi-user login box is never bypassed.
+static int session_autologin_active(void) {
+    char name[USERNAME_MAX];
+    autologin_configured_user(name, sizeof(name));
+    if (!name[0]) return 0;
+    user_entry_t *su = user_lookup_uid(desktop_get_session_uid());
+    if (!su) return 0;
+    return strcmp(name, su->username) == 0 ? 1 : 0;
+}
+
+// #745: resolve the CURRENT SESSION's account. The kernel owns this fact
+// (gui/desktop.c g_session_uid, set by the login gate); nothing in Ring 3 gets
+// to name it. Every session-scoped operation below goes through here, so the
+// session identity has exactly one definition.
+static user_entry_t *session_user(void) {
+    return user_lookup_uid(desktop_get_session_uid());
+}
+
+// #745 lock policy decision, in rustkern/sessionid.rs. Returns 0 = allow,
+// 1 = deny (session user cannot authenticate), 2 = deny (autologin + idle).
+extern uint32_t session_lock_decide_rs(uint32_t reason, uint32_t autologin_active,
+                                       uint32_t session_can_auth);
+
+int64_t sys_session_lock(int reason) {
+    // #745. Two things changed here and they are opposites, which is why they
+    // had to land together:
+    //
+    //  - An EXPLICIT lock (Start Menu > Lock, Super+L) is now HONOURED on an
+    //    autologin box. It used to be silently discarded along with the idle
+    //    lock, which meant the entire lock/unlock path was dead code on the
+    //    shipping image and nothing downstream of it had ever been exercised.
+    //
+    //  - A session whose user CANNOT AUTHENTICATE is now never locked, for any
+    //    reason. Making explicit locks work without this would have handed the
+    //    user a way to brick their own session: an account with no usable
+    //    credential (no shadow record, or "*") locks and can never unlock, and
+    //    the only recovery is a power cycle. The shipped `ref` account is such
+    //    an account today.
+    //
+    // The decision itself is in Rust with a boot self-test; this function only
+    // gathers the facts and applies the verdict.
+    user_entry_t *su = session_user();
+    uint32_t can_auth = (su && users_can_authenticate(su->username)) ? 1u : 0u;
+    uint32_t auto_on  = session_autologin_active() ? 1u : 0u;
+    uint32_t verdict  = session_lock_decide_rs((uint32_t)reason, auto_on, can_auth);
+
+    if (verdict != 0) {
+        // Never silent. A refused lock must be visible in the bootlog, because
+        // "I pressed Lock and nothing happened" is otherwise indistinguishable
+        // from a hung compositor.
+        bootlog_write("[SESSION] LOCK DECLINED (reason=%d verdict=%u) uid=%u user='%s' "
+                      "autologin=%u can_auth=%u",
+                      reason, verdict, desktop_get_session_uid(),
+                      su ? su->username : "?", auto_on, can_auth);
+        kprintf("[SESSION] lock declined: %s\n",
+                verdict == 1 ? "session user has no usable password"
+                             : "autologin session, idle lock suppressed");
+        return -1;
+    }
+
+    desktop_set_locked(1);
+    process_t *p = proc_current();
+    bootlog_write("[SESSION] LOCK ok (reason=%d) session uid=%u user='%s', requested by uid=%u",
+                  reason, desktop_get_session_uid(), su ? su->username : "?",
+                  p ? p->euid : 0);
+    return 0;
+}
+
+int64_t sys_session_is_locked(void) {
+    return desktop_is_locked() ? 1 : 0;
+}
+
+int64_t sys_session_unlock(const char *uuser, const char *upass) {
+    if (!desktop_is_locked()) return 0;          // already unlocked
+    char user[USERNAME_MAX]; char pass[128];
+    sc_copy_str_user(uuser, user, sizeof(user));   // #19/#645: Ring-3 strings
+    sc_copy_str_user(upass, pass, sizeof(pass));
+    // Unlock resumes the SAME session: the password must be the session user's.
+    // Switching users is a logout back to the login gate, not an unlock.
+    user_entry_t *su = session_user();
+    // #745: AN EMPTY/NULL USERNAME MEANS "THE SESSION USER", and that is now
+    // the sanctioned way to call this. The compositor used to pass a hardcoded
+    // "root"; at uid 1000 the strcmp below never matched and the session could
+    // not be unlocked except by rebooting. The deeper problem is that the name
+    // was a Ring-3 input at all: the kernel already knows who the session is,
+    // and it checks the supplied name against that, so the name could only ever
+    // agree or cause a failure. Removing it from the caller removes the entire
+    // class, including the next caller that gets it wrong. A non-empty name is
+    // still accepted and still must match, so existing callers keep working.
+    int64_t rc;
+    if (!su) { rc = -1; }
+    else if (user[0] != '\0' && strcmp(user, su->username) != 0) {
+        // Wrong account named: still burn a failed attempt on the session user
+        // so this cannot be used to probe other accounts without penalty.
+        (void)users_authenticate(su->username, pass);
+        rc = -1;
+    } else {
+        int r = users_authenticate(su->username, pass);
+        if (r == 0) {
+            desktop_set_locked(0);
+            bootlog_write("[SESSION] UNLOCK ok for '%s'", su->username);
+            rc = 0;
+        } else {
+            bootlog_write("[SESSION] UNLOCK failed for '%s' (r=%d)", su->username, r);
+            rc = r;                                // -1 bad, -2 locked out
+        }
+    }
+    memset(pass, 0, sizeof(pass));
+    return rc;
+}
+
+int64_t sys_auth_lockout(const char *uuser) {
+    char user[USERNAME_MAX];
+    sc_copy_str_user(uuser, user, sizeof(user));   // #19/#645: Ring-3 string
+    // #745: same rule as sys_session_unlock - empty means the session user, so
+    // the lock screen never has to know a name to report its own lockout.
+    if (user[0] == '\0') {
+        user_entry_t *su = session_user();
+        if (!su) return 0;
+        sc_copy_str(su->username, user, sizeof(user));
+    }
+    return users_get_lockout(user);
+}
+
+// Enable/disable boot autologin for an account (#566 decision 1: secure,
+// macOS-style opt-in). Stored in /CONFIG/LOGIN.CFG, force-set root-only 0600 so
+// a non-root Ring-3 process cannot rewrite it via sys_open(). Authorization:
+// root sets it for anyone; a non-root caller may only set it for THEIR OWN
+// account and must prove the account password.
+// #745: THE ONE AUTHORIZATION GATE for /CONFIG/LOGIN.CFG.
+//
+// Root may set these for anyone; a non-root caller may set them only for THEIR
+// OWN account, and must prove that account's password. This was inline in
+// sys_set_autologin(); it is a function now because a second syscall writes the
+// same file, and two copies of an authorization rule is how one of them ends up
+// weaker than the other after a later edit to only one.
+//
+// Returns the target account, or NULL if the caller is refused. The password
+// copy is scrubbed on every path, including the refusals.
+static user_entry_t *login_cfg_authorize(const char *uuser, const char *upass) {
+    char user[USERNAME_MAX]; char pass[128];
+    sc_copy_str_user(uuser, user, sizeof(user));   // #19/#645: Ring-3 strings
+    sc_copy_str_user(upass, pass, sizeof(pass));
+    process_t *p = proc_current();
+    int is_root = (p && p->euid == 0);
+    user_entry_t *target = user_lookup_name(user);
+    if (!target) { memset(pass, 0, sizeof(pass)); return NULL; }
+    if (!is_root) {
+        if (!p || target->uid != p->euid ||
+            users_authenticate(user, pass) != 0) {
+            memset(pass, 0, sizeof(pass));
+            return NULL;
+        }
+    }
+    memset(pass, 0, sizeof(pass));
+    return target;
+}
+
+// #745 LOGIN.CFG parse + compose live in rustkern/loginmode.rs (new kernel code
+// = Rust per the 2026-07-16 rule). The C below does the FAT I/O and nothing
+// else: it decides no bytes and parses no keys.
+extern uint32_t login_mode_parse_rs(const void *buf, uint32_t len);
+extern int32_t  login_cfg_compose_rs(const void *old, uint32_t old_len,
+                                     const char *autologin, int32_t mode,
+                                     void *out, uint32_t out_cap);
+
+// Whole-file read, bounded-retry (the same primitive gui/login.c uses: real
+// USB-MSC/ATA hardware returns a transient NULL that a plain read would report
+// as "no config"). Caller kfree()s. NULL / *size_out = 0 on any failure.
+static void *login_cfg_read(uint32_t *size_out) {
+    if (size_out) *size_out = 0;
+    if (!g_fat_fs.mounted) return NULL;
+    uint32_t sz = 0;
+    void *d = fat_read_file_retry(&g_fat_fs, "/CONFIG/LOGIN.CFG", &sz);
+    if (!d) return NULL;
+    if (sz == 0) { kfree(d); return NULL; }
+    if (size_out) *size_out = sz;
+    return d;
+}
+
+// #745: the configured sign-in screen mode. NON-STATIC on purpose - the boot
+// gate (gui/login.c) calls it, so this key has ONE file-read path and ONE
+// parse, shared by the kernel reader and by SYS_GET_LOGIN_MODE. Any failure to
+// read resolves to LOGIN_MODE_TYPED, which is the non-disclosing direction.
+int login_mode_configured(void) {
+    uint32_t sz = 0;
+    void *d = login_cfg_read(&sz);
+    if (!d) return LOGIN_MODE_TYPED;
+    int m = (int)login_mode_parse_rs(d, sz);
+    kfree(d);
+    return m;
+}
+
+// Rewrite /CONFIG/LOGIN.CFG. `autologin` NULL preserves the existing autologin
+// line, "" disables it, anything else enables it for that name; `mode` < 0
+// preserves the existing login_mode line. The composer reads the file it is
+// about to replace, so writing one key can never erase the other - that erase
+// is exactly what the previous single-snprintf implementation would have done
+// to login_mode on every startup-mode change.
+static int login_cfg_write(const char *autologin, int mode) {
+    if (!g_fat_fs.mounted) return -1;
+    uint32_t sz = 0;
+    void *old = login_cfg_read(&sz);
+    char buf[192];
+    int32_t n = login_cfg_compose_rs(old, sz, autologin, (int32_t)mode,
+                                     buf, (uint32_t)sizeof(buf));
+    if (old) kfree(old);
+    if (n <= 0) return -1;
+    if (fat_write_file(&g_fat_fs, "/CONFIG/LOGIN.CFG", buf, (int)n) != 0) return -1;
+    // Force root-only 0600 after every write so a non-root Ring-3 process can
+    // never rewrite this file through sys_open().
+    perms_set("/CONFIG/LOGIN.CFG", 0, 0, 0600);
+    if (perms_sync() != 0)
+        kprintf("[SESSION] perms sync failed after LOGIN.CFG write\n");
+    return 0;
+}
+
+int64_t sys_set_autologin(const char *uuser, const char *upass, int enable) {
+    user_entry_t *target = login_cfg_authorize(uuser, upass);
+    if (!target) return -1;
+    process_t *p = proc_current();
+    // #693: a failed persist is reported to Ring 3 in BOTH directions. Enabling
+    // autologin that never reached the disk silently does nothing at the next
+    // boot; DISABLING it that never reached the disk is worse, because the
+    // machine keeps auto-logging in and nobody is told.
+    if (login_cfg_write(enable ? target->username : "", -1) != 0) {
+        kprintf("[SESSION] FAILED to persist /CONFIG/LOGIN.CFG (autologin %s)\n",
+                enable ? "ENABLE" : "DISABLE");
+        return -1;
+    }
+    if (enable)
+        bootlog_write("[SESSION] autologin ENABLED for '%s' by uid=%u",
+                      target->username, p ? p->euid : 0);
+    else
+        bootlog_write("[SESSION] autologin DISABLED by uid=%u", p ? p->euid : 0);
+    return 0;
+}
+
+// #745: the sign-in screen mode. Same file, same gate, same composer as
+// autologin above; the ONLY difference is which key this caller owns.
+int64_t sys_set_login_mode(int mode, const char *uuser, const char *upass) {
+    if (mode != LOGIN_MODE_LIST && mode != LOGIN_MODE_TYPED) return -1;
+    user_entry_t *target = login_cfg_authorize(uuser, upass);
+    if (!target) return -1;
+    process_t *p = proc_current();
+    if (login_cfg_write(NULL, mode) != 0) {
+        kprintf("[SESSION] FAILED to persist /CONFIG/LOGIN.CFG (login_mode)\n");
+        return -1;
+    }
+    bootlog_write("[SESSION] login_mode set to '%s' by uid=%u",
+                  mode == LOGIN_MODE_LIST ? "list" : "typed", p ? p->euid : 0);
+    return 0;
+}
+
+// Report the configured sign-in screen mode. Ungated, exactly as
+// SYS_GET_AUTOLOGIN is: the lock screen runs as the session user (non-root) and
+// has to know which screen to draw, and the answer is not itself a secret - the
+// disclosure is the list of NAMES, which this does not return.
+int64_t sys_get_login_mode(void) {
+    return (int64_t)login_mode_configured();
+}
+
+// Report the configured autologin username (empty -> 0). Not sensitive: the
+// design wants autologin state visible. Kernel reads via fat directly (not
+// perms-gated) so Settings can display it regardless of caller euid.
+int64_t sys_get_autologin(char *ubuf, int cap) {
+    if (!ubuf || cap <= 0) return 0;
+    char name[USERNAME_MAX];
+    autologin_configured_user(name, sizeof(name));   // shared LOGIN.CFG parse
+    if (!name[0]) return 0;
+    // #567: truncate into a kernel buffer, then a single fault-safe copy_to_user.
+    char out[USERNAME_MAX];
+    int i = 0; for (; i < cap-1 && i < (int)sizeof(out)-1 && name[i]; i++) out[i] = name[i];
+    out[i] = '\0';
+    if (copy_to_user(ubuf, out, (size_t)i + 1) != 0) return -14;
+    return i;
+}
+
 int64_t sys_dns_start(const char *uhost, uint32_t *uip) {
     extern int dns_resolve_start(const char *hostname, uint32_t *ip_out);
     extern int dns_resolve_check(uint32_t *ip_out);
     extern void net_poll(void);
     if (!uhost || !uip) return -1;
+    // #567: bounce the hostname fault-safe into a kernel buffer before the
+    // resolver reads it, and write the result back via copy_to_user.
     char host[256];
-    int i = 0;
-    for (; i < 255 && uhost[i]; i++) host[i] = uhost[i];
-    host[i] = '\0';
+    if (sc_bounce_str(uhost, host, sizeof(host)) != 0) return -1;
     uint32_t ip = 0;
     uint64_t flags;
     __asm__ volatile("pushfq; pop %0" : "=r"(flags));
@@ -308,7 +797,7 @@ int64_t sys_dns_start(const char *uhost, uint32_t *uip) {
     if (rc == 0 && dns_resolve_check(&ip) == 1) rc = 1;
     net_cr3_exit(saved);
     if (flags & 0x200) __asm__ volatile("sti");
-    if (rc == 1) *uip = ip;
+    if (rc == 1 && copy_to_user(uip, &ip, sizeof(ip)) != 0) return -14;
     return rc;
 }
 
@@ -324,7 +813,8 @@ int64_t sys_dns_poll(uint32_t *uip) {
     int rc = dns_resolve_check(&ip);
     net_cr3_exit(saved);
     if (flags & 0x200) __asm__ volatile("sti");
-    if (rc == 1 && uip) *uip = ip;
+    // #567: fault-safe write-back of the resolved IP.
+    if (rc == 1 && uip && copy_to_user(uip, &ip, sizeof(ip)) != 0) return -14;
     return rc;
 }
 
@@ -372,6 +862,37 @@ static void net_rx_drain_kcr3(void) {
 }
 
 // ---------------------------------------------------------------------------
+// (#745) SYS_NET_PROBE shims. THREE lines of real code; they exist only to own
+// the ADDRESS-SPACE + INTERRUPT window (cli + net_cr3_enter/net_cr3_exit)
+// around NIC MMIO/DMA, which is irreducibly entangled with paging and inline
+// asm and is therefore the stated reason this half stays C while the probe
+// logic itself is Rust (rustkern/netstat.rs). They reuse the two static
+// helpers already written for SYS_PING rather than duplicating a CR3 switch,
+// so the rule has ONE definition.
+//
+// NONE of these blocks. net_probe_tx_c() puts at most one echo request on the
+// wire and returns; net_probe_rx_c() drains the RX ring and returns;
+// net_dhcp_restart_c() kicks a DORA and returns. The deadline lives in the
+// caller, by design.
+int  net_probe_tx_c(uint32_t dest_ip) { return icmp_ping_kcr3(dest_ip); }
+void net_probe_rx_c(void)             { net_rx_drain_kcr3(); }
+
+int net_dhcp_restart_c(void) {
+    extern int dhcp_discover(void);
+    extern void net_clear_fault(void);
+    uint64_t flags;
+    __asm__ volatile("pushfq; pop %0" : "=r"(flags));
+    __asm__ volatile("cli");
+    uint64_t saved = net_cr3_enter();
+    net_clear_fault();               // #549: an explicit retry clears the fault
+    int rc = dhcp_discover();        // non-blocking: sends DISCOVER, returns
+    net_cr3_exit(saved);
+    if (flags & 0x200)
+        __asm__ volatile("sti");
+    return rc;
+}
+
+// ---------------------------------------------------------------------------
 // TCP syscall wrappers (used by userland network apps, e.g. /APPS/irc)
 //
 // Same root cause as ping: a TCP TX from a user-process syscall runs on the
@@ -409,8 +930,10 @@ static int tcp_send_kcr3(int sock, const void *ubuf, uint16_t len) {
     uint8_t kbuf[1600];
     if (len > sizeof(kbuf))
         len = sizeof(kbuf);
-    // Copy from user space while the process CR3 is still active.
-    memcpy(kbuf, ubuf, len);
+    // #567: fault-safe copy from user space while the process CR3 is still
+    // active (was a raw memcpy: TOCTOU-unsafe if a sibling remaps the page).
+    if (len && copy_from_user(kbuf, ubuf, len) != 0)
+        return -14;
     uint64_t flags;
     __asm__ volatile("pushfq; pop %0" : "=r"(flags));
     __asm__ volatile("cli");
@@ -436,9 +959,9 @@ static int tcp_recv_kcr3(int sock, void *ubuf, uint16_t len) {
     net_cr3_exit(saved);
     if (flags & 0x200)
         __asm__ volatile("sti");
-    // Copy to user space after the process CR3 is restored.
-    if (rc > 0)
-        memcpy(ubuf, kbuf, rc);
+    // #567: fault-safe copy to user space after the process CR3 is restored.
+    if (rc > 0 && copy_to_user(ubuf, kbuf, (size_t)rc) != 0)
+        return -14;
     return rc;
 }
 
@@ -567,9 +1090,259 @@ extern uint32_t proc_set_tid_address(uint32_t *tidptr);
 extern int64_t sys_futex(uint32_t *addr, int op, uint32_t val, uint64_t timeout,
                          uint32_t *addr2, uint32_t val3);
 
+// ===========================================================================
+// #700 B1: SYS_PKG_WRITE authorization. THE decision, in ONE place.
+//
+// WHAT WAS WRONG. SYS_PKG_WRITE (301) took an arbitrary path and an arbitrary
+// buffer and wrote them, with no check of any kind. Measured on golden 1025
+// from a Ring-3 process at uid 1000: pkg_write("/CONFIG/AUTHKEYS", ...) returned
+// 0 and the root-owned 0600 SSH authorized-keys file came off the disk holding
+// the caller's 29 chosen bytes. The same call on "/boot/kernel.elf" defeats the
+// entire signed-OTA design in selfupdate.c: an attacker who can replace the
+// kernel image never needs a signature, a capability, or Win16.
+//
+// TWO INDEPENDENT CONTROLS, deliberately, because either one alone has a way to
+// fail:
+//
+//  1. A HARD REFUSAL of the boot paths for EVERY Ring-3 caller including root.
+//     Not a permission decision: there is no legitimate SYS_PKG_WRITE to the
+//     kernel image (selfupdate.c writes it from Ring 0, after verifying a
+//     signature), so "root asked" is not an argument. This is the control that
+//     still holds when an attacker has become root but not Ring 0. The streaming
+//     path at sys_pkg_write_stream() already excluded /boot and /EFI; that
+//     exclusion existed only because those paths are not on ext2, and the
+//     buffered fallback, which IS the FAT ESP writer, excluded nothing at all.
+//
+//  2. THE ORDINARY POSIX RULE, the same shape sys_open_k() and
+//     open_redir_file() already use (#676): creating a NAME is a write to the
+//     PARENT DIRECTORY; overwriting an EXISTING file is a write to that file.
+//     Same helper (sc_parent_of), same access bits (W_OK|X_OK on the parent),
+//     so there is one rule for "may this uid put bytes at this path", not a
+//     second one that lives only in the package manager.
+//
+// Neither control is applied to Ring-0 callers: perms_check() is consulted only
+// for PRIV_USER, exactly as everywhere else in this file.
+// ===========================================================================
+
+// Case-insensitive match of `pfx` at the head of `p`, requiring the match to end
+// on a path boundary ('/' or end of string) so "/BOOTLOG.TXT" is not read as a
+// hit on "/BOOT". FAT is case-insensitive and both spellings reach this syscall
+// ("/boot/kernel.elf" from the OTA client, "/BOOT/KERNEL.ELF" from the deploy),
+// so a case-sensitive compare would be a bypass by typing.
+static int pkg_pfx_ci(const char *p, const char *pfx) {
+    unsigned i = 0;
+    for (; pfx[i]; i++) {
+        char a = p[i], b = pfx[i];
+        if (a >= 'a' && a <= 'z') a = (char)(a - 32);
+        if (b >= 'a' && b <= 'z') b = (char)(b - 32);
+        if (a != b) return 0;
+    }
+    return (p[i] == 0 || p[i] == '/');
+}
+
+// Control 1. Boot-critical paths, refused for every Ring-3 caller.
+static int pkg_path_is_boot(const char *kp) {
+    if (pkg_pfx_ci(kp, "/BOOT")) return 1;          // /boot, /BOOT/..., /boot/kernel.elf
+    if (pkg_pfx_ci(kp, "/EFI"))  return 1;          // /EFI/BOOT/BOOTX64.EFI and siblings
+    if (pkg_pfx_ci(kp, "/KERNEL.ELF")) return 1;    // the ESP-root copy
+    return 0;
+}
+
+// Controls 1 + 2 together. Returns 0 to allow, -1 to refuse.
+//
+// ARRAY parameter, not a pointer, for the same two reasons as
+// sys_pkg_write_stream(): it says in the type that this takes a full-size
+// KERNEL buffer and never the caller's pointer, and it keeps copy-user-lint's
+// "every pointer param of a function a dispatcher case calls is a user pointer"
+// default from firing on a path that has already been bounced.
+static int pkg_write_permit(const char kp[SC_PATH_MAX]) {
+    if (!kp || kp[0] != '/') return -1;
+
+    process_t *p = proc_current();
+    if (!p || p->privilege != PRIV_USER) return 0;   // Ring 0: unchanged
+
+    if (pkg_path_is_boot(kp)) {
+        kprintf("[PKGWRITE] DENIED uid=%u path=%s (boot path is never writable "
+                "via SYS_PKG_WRITE; the signed OTA path in selfupdate.c is)\n",
+                p->euid, kp);
+        return -1;
+    }
+
+    extern fat_fs_t g_fat_fs;
+    if (!fat_exists(&g_fat_fs, kp)) {
+        char parent[SC_PATH_MAX];
+        sc_parent_of(kp, parent, sizeof(parent));
+        if (perms_check(parent, p->euid, p->egid, W_OK | X_OK) != 0) return -1;
+    } else if (perms_check(kp, p->euid, p->egid, W_OK) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+// #689: after a successful install, give the file a DELIBERATE owner and mode
+// instead of leaving it with no PERMS.DB entry at all (which is how a file the
+// caller had just created came back root-owned and un-chmod-able: measured, the
+// probe's own staged copy could not chmod itself).
+//
+// An ELF gets 0555. The installing user owns it and can delete and replace it
+// (that is a write to the parent directory, which they already passed), but
+// cannot MUTATE IN PLACE the bytes of a binary that may already have been
+// launched and blessed. Root is unaffected: perms_check() short-circuits on
+// uid 0, so a root-run App Store re-installs over it normally.
+// perms_on_create() never overwrites an existing entry, so an operator chmod
+// and the perms_system_seed[] pins both survive a rewrite.
+static void pkg_write_stamp(const char kp[SC_PATH_MAX], int is_elf) {
+    process_t *p = proc_current();
+    if (!p || p->privilege != PRIV_USER) return;
+    uint32_t u = 0, g = 0; uint16_t m = 0;
+    int had_entry = (perms_get(kp, &u, &g, &m) == 0);
+    perms_on_create(kp, p->euid, p->egid, 0);
+    if (!had_entry && is_elf) perms_set(kp, p->euid, p->egid, 0555);
+}
+
+// #572: stream a SYS_PKG_WRITE payload straight to the ext2 root in bounded,
+// block-flushed chunks instead of one giant kmalloc + whole-file write, so a
+// 100MB+ package payload needs only ~block_size of kernel heap. Returns 0 on
+// success, or -1 if the target is not an ext2-root path (caller then falls back
+// to the whole-buffer path) or on a write error. `udata` is a user pointer and
+// is read exclusively through copy_from_user (this function is defined in
+// syscall.c so copy-user-lint traces into it from the case).
+//
+// #700 B1: `kp` is now a KERNEL copy made by the caller, not a user pointer.
+// The authorization decision moved to the SYS_PKG_WRITE case so that it runs
+// once, before EITHER path. It could not stay here: this function returns -1
+// both for "not an ext2 target, use the other path" and for a hard error, so a
+// refusal expressed as -1 would have fallen straight through to the buffered
+// writer, which is the one that had no checks at all.
+//
+// The path parameter is declared as an ARRAY, not a pointer, and that is
+// deliberate on two counts. It states in the signature that the caller must
+// hand over a full-size KERNEL buffer, not a Ring-3 string; and copy-user-lint
+// treats every pointer parameter of a function reached from a dispatcher case
+// as a user pointer, which is the right default and the wrong answer here. The
+// alternative was a manifest exemption for the whole syscall, which would have
+// switched the lint off for the data buffer too. Making the type say what is
+// true beats annotating around it. Re-copying the path inside would have been
+// worse still: the path authorized in the case and the path written here would
+// then be two separate reads of Ring-3 memory, which is the #509 check-and-use
+// hazard the bounce exists to remove.
+static int64_t sys_pkg_write_stream(const char kp[SC_PATH_MAX], const void *udata, uint32_t len) {
+    extern int g_root_ext2;
+    if (!kp || !g_root_ext2 || kp[0] != '/') return -1;
+    // /boot and /EFI live on the FAT ESP, never on ext2.
+    if (kp[1]=='b'&&kp[2]=='o'&&kp[3]=='o'&&kp[4]=='t'&&(kp[5]=='/'||kp[5]==0)) return -1;
+    if (kp[1]=='E'&&kp[2]=='F'&&kp[3]=='I'&&(kp[4]=='/'||kp[4]==0)) return -1;
+    // Strip an explicit "/ext2" mount prefix (kernel-internal callers may pass it).
+    const char *rel = kp;
+    if (kp[1]=='e'&&kp[2]=='x'&&kp[3]=='t'&&kp[4]=='2'&&(kp[5]=='/'||kp[5]==0))
+        rel = (kp[5]==0) ? "/" : (kp+5);
+    uint32_t bs = ext2_block_size();
+    if (!bs) return -1;
+    ext2_wstream_t ws;
+    if (ext2_wstream_begin(rel, &ws) != 0) return -1;
+    uint8_t *sb = (uint8_t *)kmalloc(bs);
+    if (!sb) { ext2_wstream_abort(&ws); return -1; }
+    uint32_t off = 0; int rc = 0;
+    while (off < len) {
+        uint32_t take = (len - off < bs) ? (len - off) : bs;   // final chunk may be < bs
+        if (copy_from_user(sb, (const uint8_t *)udata + off, take) != 0) { rc = -1; break; }
+        if (ext2_wstream_block(&ws, sb, take) != 0) { rc = -1; break; }
+        off += take;
+    }
+    kfree(sb);
+    if (rc != 0) { ext2_wstream_abort(&ws); return -1; }
+    return (ext2_wstream_finish(&ws) == 0) ? 0 : -1;
+}
+
+
+// ===========================================================================
+// #739 SYS_DISKIMG: mount / eject / query a disk image on a DOS drive letter.
+//
+// ONE multiplexer rather than three syscalls because the three share one
+// permission story and one table, and because a number is the scarcest thing
+// in this file: 300-360 is contiguous and nothing in the build fails for a
+// duplicate.
+//
+// PERMISSION. Mounting names a PATH and makes the kernel read it, which is the
+// same shape as sys_print_image() (#700 B3), where the measured finding was
+// that the kernel had already read /CONFIG/KIMI.KEY before the decode failed.
+// Here the read would be worse than a failed decode: a mounted image is a
+// browsable filesystem. So:
+//
+//   * the path is bounced into a KERNEL buffer first, and every later use is of
+//     that copy. Checking the user copy and then opening the user copy again is
+//     a time-of-check/time-of-use gap; rustkern/argtab.rs is explicit that its
+//     entry validation is not TOCTOU-safe.
+//   * perms_check(kpath, euid, egid, R_OK) must pass for a Ring-3 caller. Fail
+//     closed: any non-zero answer refuses.
+//   * drvmap_path_ok_rs() (called inside diskimg_mount_idx) rejects relative
+//     paths, "..", backslashes and control characters, so the string
+//     perms_check() approved and the string that gets opened are provably the
+//     same string rather than arguably the same path.
+//
+// HONEST LIMIT, because it should be written down rather than discovered:
+// perms_check()'s no-entry default is world-readable (fs/perms.c
+// perms_check_leaf), so this gate means "the caller may read this file" and NOT
+// "this file is not a secret". That is the right gate for the requirement (a
+// user may mount what they may read), and /CONFIG is protected two ways (per
+// file 0600 seeds plus the directory at 0711), but do not read more into it.
+//
+// EJECT AND QUERY take no path and no privilege beyond being able to call it:
+// they only affect drives this machine's own user mounted, and query is the
+// information the UI is for.
+// ===========================================================================
+#define DIMG_CMD_INFO   0   // letter -> *out
+#define DIMG_CMD_MOUNT  1   // path, letter (or -1 auto) -> letter index
+#define DIMG_CMD_EJECT  2   // letter -> 0
+#define DIMG_CMD_MAX_MOUNTS 3   // -> DISKIMG_MAX_MOUNTS
+
+static int64_t sys_diskimg(long cmd, const char *upath, void *uout, long letter) {
+    switch (cmd) {
+    case DIMG_CMD_MAX_MOUNTS:
+        return DISKIMG_MAX_MOUNTS;
+
+    case DIMG_CMD_INFO: {
+        diskimg_info_t info;
+        if (diskimg_query((int)letter, &info) != 0) return -1;
+        if (!uout) return -1;
+        // #567/#509: copy_to_user, never a direct deref. The argtab-361 entry
+        // check proved the address at entry; only copy_to_user is atomic
+        // check-and-use against a sibling thread remapping the page.
+        if (copy_to_user(uout, &info, sizeof(info)) != 0) return -14;
+        return 0;
+    }
+
+    case DIMG_CMD_MOUNT: {
+        char kpath[SC_PATH_MAX];
+        if (sc_bounce_str(upath, kpath, sizeof(kpath)) != 0) return -14;
+        process_t *p = proc_current();
+        if (p && p->privilege == PRIV_USER &&
+            perms_check(kpath, p->euid, p->egid, R_OK) != 0) {
+            kprintf("[diskimg] mount of %s refused: uid %u may not read it\n",
+                    kpath, (unsigned)p->euid);
+            return -13;   // EACCES. MOS_EACCES is #defined further down this file, after this handler.
+        }
+        int want = (letter < 0) ? DISKIMG_LETTER_AUTO : (int)letter;
+        return diskimg_mount_idx(want, kpath);
+    }
+
+    case DIMG_CMD_EJECT: {
+        if (letter < 0 || letter > 25) return -1;
+        if (!diskimg_is_mounted((char)('A' + letter))) return -1;
+        diskimg_eject_idx((int)letter);
+        return 0;
+    }
+
+    default:
+        return -1;
+    }
+}
+
 int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
                          uint64_t arg3, uint64_t arg4, uint64_t arg5,
                          uint64_t arg6) {
+    // #67 pass 5: tag the in-kernel reason for BKL hold attribution.
+    { extern void bkl_set_reason(uint32_t r); bkl_set_reason(0x0200u | (uint32_t)(num & 0xFF)); }
 
     // #503 / MAYTERA-SEC-2026-0016: THE CHOKE POINT.
     //
@@ -597,6 +1370,51 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
         int64_t vrc = (int64_t)syscall_validate_args(num, arg1, arg2, arg3,
                                                      arg4, arg5, arg6);
         if (vrc != 0) {
+            // #616: a silently-rejected syscall argument cost two separate
+            // multi-hour investigations (#615, #616). Say so on serial, bounded
+            // so a misbehaving app cannot flood the console.
+            static int sysarg_reports = 0;
+            if (sysarg_reports < 32) {
+                sysarg_reports++;
+                kprintf("[SYSARG] num=%lu REJECTED rc=%ld a1=%lx a2=%lx a3=%lx\n",
+                        (unsigned long)num, (long)vrc, (unsigned long)arg1,
+                        (unsigned long)arg2, (unsigned long)arg3);
+            }
+
+            /* #653: this is a REAL security event - a process handed the kernel
+             * a pointer it is not allowed to name - so record it as one. It
+             * reaches /CONFIG/SECURITY.LOG and, being a WARNING, raises a
+             * desktop notification.
+             *
+             * Before this call security_audit() had ZERO callers anywhere in
+             * the kernel: the audit ring, its severity classification and its
+             * whole API were reachable-but-unreached. A sink with no producer
+             * is decorative (#514/#624/#646 class), so this is the wiring that
+             * makes the security log actually contain something.
+             *
+             * security_audit() is non-blocking by construction (ring + kprintf
+             * + a wake), which is what makes it safe to call from a syscall
+             * entry path. Do NOT put I/O here.
+             *
+             * Rate-limited on the SAME counter as the serial print: a process
+             * spraying bad pointers must not be able to fill the security log
+             * or the notification spool. That bound is the point. */
+            if (sysarg_reports <= 32) {
+                char sd[64];
+                const char *pre = "syscall ";
+                int di = 0;
+                while (*pre) sd[di++] = *pre++;
+                unsigned long n = (unsigned long)num;
+                char nd[24]; int nl = 0;
+                if (n == 0) nd[nl++] = '0';
+                while (n > 0) { nd[nl++] = (char)('0' + (n % 10)); n /= 10; }
+                while (nl > 0) sd[di++] = nd[--nl];
+                const char *suf = " rejected: bad user pointer";
+                while (*suf && di < (int)sizeof(sd) - 1) sd[di++] = *suf++;
+                sd[di] = '\0';
+                seclog_report_bad_user_ptr(
+                    proc_current() ? (unsigned int)proc_current()->pid : 0u, sd);
+            }
             return vrc;   /* -EFAULT */
         }
     }
@@ -637,6 +1455,41 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
         case SYS_PING:
             return sys_ping((uint32_t)arg1, (int)arg2);
 
+        // #524 - BSD sockets (fd-integrated, blocking-capable). Pointer args are
+        // validated by the argtab descriptors (rustkern/argtab.rs) before the
+        // handler runs; handlers copy via copy_*_user. See net/socket.c.
+        case SYS_SOCK_OPEN:
+            return sys_sock_open((int)arg1, (int)arg2, (int)arg3);
+        case SYS_SOCK_BIND:
+            return sys_sock_bind((int)arg1, (const void *)arg2, (int)arg3);
+        case SYS_SOCK_CONNECT:
+            return sys_sock_connect((int)arg1, (const void *)arg2, (int)arg3);
+        case SYS_SOCK_LISTEN:
+            return sys_sock_listen((int)arg1, (int)arg2);
+        case SYS_SOCK_ACCEPT:
+            return sys_sock_accept((int)arg1, (void *)arg2, (void *)arg3);
+        case SYS_SOCK_SEND:
+            return sys_sock_send((int)arg1, (const void *)arg2, (uint64_t)arg3, (int)arg4);
+        case SYS_SOCK_RECV:
+            return sys_sock_recv((int)arg1, (void *)arg2, (uint64_t)arg3, (int)arg4);
+        case SYS_SOCK_SENDTO:
+            return sys_sock_sendto((int)arg1, (const void *)arg2, (uint64_t)arg3,
+                                   (int)arg4, (const void *)arg5, (int)arg6);
+        case SYS_SOCK_RECVFROM:
+            return sys_sock_recvfrom((int)arg1, (void *)arg2, (uint64_t)arg3,
+                                     (int)arg4, (void *)arg5, (void *)arg6);
+        case SYS_SOCK_SETOPT:
+            return sys_sock_setsockopt((int)arg1, (int)arg2, (int)arg3,
+                                       (const void *)arg4, (int)arg5);
+        case SYS_SOCK_GETOPT:
+            return sys_sock_getsockopt((int)arg1, (int)arg2, (int)arg3,
+                                       (void *)arg4, (void *)arg5);
+        case SYS_SOCK_SELECT:
+            return sys_sock_select((int)arg1, (void *)arg2, (void *)arg3,
+                                   (void *)arg4, (void *)arg5);
+        case SYS_SOCK_SHUTDOWN:
+            return sys_sock_shutdown((int)arg1, (int)arg2);
+
         // Process control
         case SYS_EXIT:
             return sys_exit((int)arg1);
@@ -654,9 +1507,18 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
         case SYS_WIN16_RUN:
             // Non-blocking launch in a dedicated kernel process (#144).
             return win16_launch((const char *)arg1);
-        case SYS_DOS_RUN:
+        case SYS_DOS_RUN: {
             // Non-blocking MS-DOS launch in its own kernel proc + window (#208).
-            return dos_launch((const char *)arg1);
+            // #692 (found in passing): this used to hand the raw Ring-3
+            // pointer to dos_launch(), which dereferences it immediately, so
+            // Ring 3 could point it at kernel memory. Bounce it fault-safe,
+            // exactly as SYS_WIN16_RUN above already did.
+            char kdospath[256];
+            if (sc_bounce_str((const char *)arg1, kdospath, sizeof(kdospath)) != 0)
+                return -1;
+            if (!kdospath[0]) return -1;
+            return dos_launch(kdospath);
+        }
         case SYS_WIN16_ACTIVE: {
             // (#200 SkiFree) Report whether a Win16 app currently owns the
             // keyboard/foreground. The compositor uses this to treat a running
@@ -696,6 +1558,8 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             return sys_fcntl((int)arg1, (int)arg2, (long)arg3);
         case SYS_CLOSE:
             return sys_close((int)arg1);
+        case SYS_FSYNC:
+            return sys_fsync((int)arg1);
         case SYS_READ:
             return sys_read((int)arg1, (void *)arg2, (size_t)arg3);
         case SYS_WRITE:
@@ -719,8 +1583,12 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             return sys_http_fetch_read((int)arg1, (char *)arg2, (uint32_t)arg3);
         case SYS_HTTP_FETCH_CANCEL:
             return sys_http_fetch_cancel((int)arg1);
+        case SYS_HTTP_FETCH_PROGRESS:
+            return sys_http_fetch_progress((int)arg1, (int *)arg2, (uint32_t *)arg3, (uint32_t *)arg4);
         case SYS_HTTP_POST_START:
             return sys_http_post_start((const char *)arg1, (const char *)arg2, (const char *)arg3);
+        case SYS_AI_SCAN:   // #745
+            return sys_ai_scan((const char *)arg1, (void *)arg2);
         case SYS_HTTP_POST_POLL:
             return sys_http_post_poll((int)arg1, (int *)arg2, (uint32_t *)arg3);
         case SYS_HTTP_POST_READ:
@@ -739,6 +1607,19 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             return sys_readdir((int)arg1, (void *)arg2);
         case SYS_RENAME:
             return sys_rename((const char *)arg1, (const char *)arg2);
+
+        // POSIX process groups / sessions (#745 local 82).
+        case SYS_SETSID:
+            return sys_setsid();
+        case SYS_SETPGID:
+            return sys_setpgid((int64_t)arg1, (int64_t)arg2);
+        case SYS_GETPGID:
+            return sys_getpgid((int64_t)arg1);
+        case SYS_GETSID:
+            return sys_getsid((int64_t)arg1);
+        // POSIX poll(2) (#745 local 82). The handler is Rust.
+        case SYS_POLL:
+            return sys_poll_rs((void *)arg1, (uint64_t)arg2, (int64_t)arg3);
 
         case SYS_GETCWD:
             return sys_getcwd((char *)arg1, (uint64_t)arg2);
@@ -759,9 +1640,38 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
         case SYS_GETCHAR:
             return sys_getchar();
 
+        // #739 disk images
+        case SYS_DISKIMG:
+            return sys_diskimg((long)arg1, (const char *)arg2,
+                               (void *)arg3, (long)arg4);
+
         // Time
+        case SYS_GFS_VERIFY: {
+            // #711: verify the GraphFS journal against its seal AND against
+            // the kernel's own in-memory chain head. arg1 is validated by
+            // syscall_validate_args() (rustkern/argtab.rs descriptor 360,
+            // 80 writable bytes) before we get here.
+            gfsj_verify_t v;
+            int grc = gfs_journal_verify(&v);
+            if (!arg1) return -1;
+            // #567/#509: bounce through copy_to_user, never a direct deref of a
+            // user pointer. The entry check (argtab 360) proves the address was
+            // valid AT ENTRY; only copy_to_user is atomic check-and-use, and a
+            // sibling thread can remap the page in between.
+            if (copy_to_user((void *)arg1, &v, sizeof(v)) != 0) return -14;
+            return grc;
+        }
         case SYS_TIME:
             return sys_time();
+        case SYS_GFS_QUERY:
+            // #711 slice 2: READ-ONLY view of the contract graph. There is
+            // deliberately no mutating counterpart (design section 8). arg4 is
+            // validated by syscall_validate_args() (rustkern/argtab.rs
+            // descriptor 363: arg5 writable bytes) before we get here, and the
+            // handler bounces its result through copy_to_user, which is the
+            // only atomic check-and-use.
+            return sys_gfs_query((int)arg1, (uint32_t)arg2, (uint32_t)arg3,
+                                 (void *)arg4, (int)arg5, (uint32_t)arg6);
         case SYS_GET_TICKS:
             return (int64_t)timer_ticks;   // 250Hz monotonic ticks (4ms each)
         case SYS_UPTIME_MS: {
@@ -772,6 +1682,36 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             uint32_t _hz = g_timer_hz ? g_timer_hz : 250;
             return (int64_t)((uint64_t)timer_ticks * 1000ULL / _hz);
         }
+        case SYS_FSCK: {
+            // #610: the on-device filesystem checker, exposed to userland.
+            // READ-ONLY. It scans the whole ext2 metadata, which costs real
+            // I/O, so it is a deliberate user action (the Terminal `fsck`
+            // command), never something an app does in a loop.
+            extern int      ext2_is_mounted(void);
+            // (declared in fs/ext2.h, included above)
+            extern uint32_t ext2_fsck_needed(void);
+            extern uint16_t ext2_state_at_mount(void);
+            extern uint16_t ext2_mnt_count(void);
+            void *ub = (void *)arg1;
+            uint32_t ulen = (uint32_t)arg2;
+            int mode = (int)arg3;
+            if (!ub || ulen < 200) return -1;
+            if (!ext2_is_mounted()) return -19;
+            if (mode == 1) {
+                // State-only query: no scan, no I/O beyond what mount cached.
+                return (int64_t)((uint32_t)ext2_state_at_mount()
+                                 | ((uint32_t)ext2_mnt_count() << 8)
+                                 | (ext2_fsck_needed() << 24));
+            }
+            // Build in kernel memory then ONE copy_to_user (#509 TOCTOU-safe):
+            // never let the checker write through a user pointer.
+            uint8_t *krep = (uint8_t *)kmalloc(200);
+            if (!krep) return -12;
+            int rc = ext2_fsck_run((ext2_fsck_report_t *)krep);
+            if (rc == 0 && copy_to_user(ub, krep, 200) != 0) rc = -14;
+            kfree(krep);
+            return rc;
+        }
         case SYS_GET_VERSION: {
             // Copy "X.Y.Z (build N)" into the user buffer (arg1=buf, arg2=len).
             #define SYSV_S2(x) #x
@@ -779,8 +1719,12 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             static const char *v = MAYTERA_VERSION_STRING " (build " SYSV_S(MAYTERA_BUILD_NUMBER) ")";
             char *ub = (char *)arg1; int ulen = (int)arg2;
             if (!ub || ulen <= 0) return -1;
-            int i = 0; while (v[i] && i < ulen - 1) { ub[i] = v[i]; i++; }
-            ub[i] = 0;
+            // #566: build in a kernel buffer then copy_to_user once (#509
+            // TOCTOU-safe) instead of writing ub[i] through the user pointer.
+            char vkbuf[96];
+            int i = 0; while (v[i] && i < ulen - 1 && i < (int)sizeof(vkbuf) - 1) { vkbuf[i] = v[i]; i++; }
+            vkbuf[i] = 0;
+            if (copy_to_user(ub, vkbuf, (size_t)i + 1) != 0) return -14;
             return i;
         }
         case SYS_CLOCK:
@@ -837,6 +1781,12 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             return sys_chmod((const char *)arg1, (uint16_t)arg2);
         case SYS_CHOWN:
             return sys_chown((const char *)arg1, (uint32_t)arg2, (uint32_t)arg3);
+        case SYS_FS_PERM_INFO:
+            return sys_fs_perm_info((const char *)arg1, (int)arg2, (void *)arg3);
+        case SYS_THEME_LOAD_FILE:
+            return sys_theme_load_file((const char *)arg1);
+        case SYS_THEME_CONTRAST_CORRECTIONS:
+            return sys_theme_contrast_corrections((int64_t)arg1);
         case SYS_PASSWD_CHANGE:
             return sys_passwd_change((const char *)arg1, (const char *)arg2, (const char *)arg3);
         case SYS_SU:
@@ -844,6 +1794,19 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
         case SYS_ADDUSER:
             return sys_adduser((const char *)arg1, (uint32_t)arg2, (uint32_t)arg3,
                               (const char *)arg4, (const char *)arg5);
+        case SYS_USER_CREATE_PW:
+            return sys_user_create_pw((const char *)arg1, (const char *)arg2,
+                                      (uint32_t)arg3, (uint32_t)arg4,
+                                      (const char *)arg5);
+        case SYS_PW_CHECK:
+            return sys_pw_check((const char *)arg1, (const char *)arg2);
+        case SYS_FIRSTBOOT_ADMIN:
+            return sys_firstboot_admin((const char *)arg1, (const char *)arg2,
+                                       (const char *)arg3);
+        case SYS_INST_ENUM:
+            return sys_inst_enum((void *)arg1, (int)arg2, (int)arg3);
+        case SYS_INST_INSTALL:
+            return sys_inst_install((int)arg1, (int)arg2);
         case SYS_SET_THEME:
             return sys_set_theme((int)arg1);
         case SYS_GET_THEME:
@@ -852,6 +1815,22 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             extern uint32_t theme_get_color_by_id(int theme_id, int color_id);
             return (int64_t)(uint32_t)theme_get_color_by_id((int)arg1, (int)arg2);
         }
+        // (#711) mtheme v2: the same live theme table, read as an INTEGER.
+        // Colours already came from the file via SYS_THEME_COLOR; this is the
+        // metric/radius/decor/type half, so a userland widget's geometry is
+        // data too. Bounds-checked kernel-side (theme_get_metric_by_id).
+        case SYS_THEME_METRIC: {
+            extern int32_t theme_get_metric_by_id(int theme_id, int metric_id);
+            return (int64_t)theme_get_metric_by_id((int)arg1, (int)arg2);
+        }
+        // (#704) See sys_wm_force_redraw_all() for why this exists: neither an
+        // explicit theme switch nor a live .mtheme file reload today reaches
+        // an already-open app's EVENT_REDRAW handler, so its content area
+        // keeps showing stale colours until the window is resized or
+        // recreated. Called by the compositor only, edge-triggered on an
+        // actual theme change.
+        case SYS_WM_FORCE_REDRAW_ALL:
+            return sys_wm_force_redraw_all();
         case SYS_PRINT_LIST:
             return sys_print_list((void *)arg1, (int)arg2);
         case SYS_PRINT_JOB:
@@ -891,6 +1870,53 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
         case SYS_NET_SET_STATIC: return sys_net_set_static((const char *)arg1, (const char *)arg2, (const char *)arg3);
         case SYS_NET_DHCP: { extern int dhcp_discover_blocking(void); extern void net_clear_fault(void); net_clear_fault(); return (int64_t)dhcp_discover_blocking(); }  // #549: renew/reconnect clears fault
         case SYS_NET_IS_UP: { extern int net_is_up(void); return (int64_t)net_is_up(); }  // #374
+        // (#745) Structured live IPv4 status. The Rust builder fills a
+        // KERNEL-LOCAL net_status_t and this does the single fault-safe
+        // copy_to_user, so no user pointer is dereferenced inside the
+        // builder. arg1 is described by Desc { num: 369 } in
+        // rustkern/argtab.rs, so syscall_validate_args() has already proven
+        // it spans 48 writable USER bytes before we get here.
+        case SYS_NET_STATUS: {
+            net_status_t kns;
+            // Parameter left UNNAMED deliberately: smap-uaccess-lint's B3
+            // scan keys on identifiers, and a declaration parameter named
+            // `out` reads to it as a Ring-0 deref of a user pointer. There
+            // is no user pointer here at all - the builder writes `kns`,
+            // which is on this kernel stack frame.
+            extern int net_status_build_rs(void *);
+            if (net_status_build_rs(&kns) != 0) return -1;
+            if (copy_to_user((void *)arg1, &kns, sizeof(kns)) != 0) return -14;
+            return 0;
+        }
+        // (#745) Non-blocking probe (ICMP echo start/poll/cancel, DHCP
+        // restart). No pointer arguments; see NET_PROBE_* in syscall.h.
+        case SYS_NET_PROBE: {
+            extern int64_t net_probe_rs(int op, uint64_t arg);
+            return net_probe_rs((int)arg1, (uint64_t)arg2);
+        }
+        // #745 ELEVATION. Bodies in proc/elevate.c; the trust story is in
+        // proc/elevate.h. Nothing here decides anything.
+        case SYS_ELEV_REQUEST:
+            return sys_elev_request((const elev_request_t *)arg1);
+        case SYS_ELEV_STATUS:
+            return sys_elev_status((uint64_t)arg1);
+        case SYS_ELEV_VIEW:
+            return sys_elev_view((elev_view_t *)arg1);
+        case SYS_ELEV_RESOLVE: {
+            // The credential is bounced HERE, fault-safe, before the
+            // authenticator can ever read Ring-3 memory, and the stack copy is
+            // zeroed on the way out whatever the verdict was.
+            char epw[SC_PASSWORD_MAX];
+            memset(epw, 0, sizeof(epw));
+            if ((int)arg2 == ELEV_ACT_SUBMIT &&
+                sc_bounce_str((const char *)arg3, epw, sizeof(epw)) != 0)
+                return ELEV_EARG;
+            int64_t er = sys_elev_resolve((uint64_t)arg1, (int)arg2, epw);
+            memset(epw, 0, sizeof(epw));
+            return er;
+        }
+        case SYS_ELEV_MAY:
+            return sys_elev_may();
         case SYS_DESKTOP_MENU_RELOAD: { extern void desktop_menu_reload(void); desktop_menu_reload(); return 0; }  // #402
         case SYS_KERNEL_SELFUPDATE: {  // #492 Stage 1b: authenticated brick-safe self-update
             extern int kernel_selfupdate_apply(const void *, uint32_t,
@@ -906,36 +1932,114 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
                 !(ku_cur->svc_perms & SVC_PERM_SELFUPDATE)) {
                 return (int64_t)(-11) /* SELFUPD_ERR_PERM */;
             }
-            const void *ku_img = (const void *)arg1;
             uint32_t ku_len = (uint32_t)arg2;
-            const uint8_t *ku_sha = (const uint8_t *)arg3;
             uint32_t ku_build = (uint32_t)arg4;
-            const uint8_t *ku_sig = (const uint8_t *)arg5;
             uint32_t ku_sig_len = (uint32_t)arg6;
-            return (int64_t)kernel_selfupdate_apply(ku_img, ku_len, ku_sha, ku_build,
-                                                    ku_sig, ku_sig_len);
+            // #19/#645: kernel_selfupdate_apply() hashes and writes the image
+            // through the pointers it is given, and it has a KERNEL caller too
+            // (selfupdate.c's boot resume path), so the bounce belongs here at
+            // the Ring-3 boundary. It also removes a check-and-use race on the
+            // one input whose integrity the whole brick-safe contract rests on:
+            // the image the signature is verified over is now the image that
+            // gets written, because Ring 3 can no longer change it in between.
+            if (ku_len == 0 || ku_len > (32u * 1024u * 1024u)) return (int64_t)(-1);
+            if (ku_sig_len == 0 || ku_sig_len > 512u) return (int64_t)(-1);
+            uint8_t ku_ksha[32], ku_ksig[512];
+            if (copy_from_user(ku_ksha, (const void *)arg3, sizeof(ku_ksha)) != 0)
+                return (int64_t)(-1);
+            if (copy_from_user(ku_ksig, (const void *)arg5, ku_sig_len) != 0)
+                return (int64_t)(-1);
+            void *ku_kimg = kmalloc(ku_len);
+            if (!ku_kimg) return (int64_t)(-1);
+            if (copy_from_user(ku_kimg, (const void *)arg1, ku_len) != 0) {
+                kfree(ku_kimg); return (int64_t)(-1);
+            }
+            int ku_rc = kernel_selfupdate_apply(ku_kimg, ku_len, ku_ksha, ku_build,
+                                                ku_ksig, ku_sig_len);
+            kfree(ku_kimg);
+            return (int64_t)ku_rc;
         }
         case SYS_OTA_VERIFY_SIG: {  // #492 Stage 1b: authenticate a signed manifest
             // Read-only signature check against the baked-in OTA pubkey. Safe for
             // any caller (no privilege needed): it grants no capability, it only
             // tells the client whether a manifest is authentic before it acts.
             extern int kernel_ota_verify_sig(const uint8_t *, const uint8_t *, uint32_t);
-            const uint8_t *ov_dig = (const uint8_t *)arg1;
-            const uint8_t *ov_sig = (const uint8_t *)arg2;
+            // #566: a raced read of the digest or signature would corrupt a trust
+            // decision, so bounce BOTH into kernel buffers via copy_from_user
+            // (#509 atomic check-and-use) before the crypto ever reads them.
             uint32_t ov_len = (uint32_t)arg3;
+            if (ov_len == 0 || ov_len > 512) return -1;
+            uint8_t ov_dig[32], ov_sig[512];
+            if (copy_from_user(ov_dig, (const void *)arg1, sizeof(ov_dig)) != 0) return -1;
+            if (copy_from_user(ov_sig, (const void *)arg2, ov_len) != 0) return -1;
             return (int64_t)kernel_ota_verify_sig(ov_dig, ov_sig, ov_len);
+        }
+        case SYS_APP_VERIFY_SIG: {  // #563 key split: authenticate a signed APP manifest
+            // Domain-separated from SYS_OTA_VERIFY_SIG: checks the baked-in APP
+            // key (kernel_app_verify_sig), which cannot authorize a kernel image.
+            // Read-only, grants no capability, so it needs no privilege.
+            // RESTORED: this case was silently dropped by 68199dd (#565 theme
+            // loader), which defeated the #563 app/kernel signing-key split
+            // (calls fell through, so the App Store client used the OTA-key
+            // fallback and the dedicated app-key path never ran).
+            extern int kernel_app_verify_sig(const uint8_t *, const uint8_t *, uint32_t);
+            // #566: bounce the digest + signature into kernel buffers via
+            // copy_from_user (#509 atomic check-and-use) before the app-key crypto
+            // reads them; a raced read here would corrupt an app-trust decision.
+            uint32_t av_len = (uint32_t)arg3;
+            if (av_len == 0 || av_len > 512) return -1;
+            uint8_t av_dig[32], av_sig[512];
+            if (copy_from_user(av_dig, (const void *)arg1, sizeof(av_dig)) != 0) return -1;
+            if (copy_from_user(av_sig, (const void *)arg2, av_len) != 0) return -1;
+            return (int64_t)kernel_app_verify_sig(av_dig, av_sig, av_len);
         }
         case SYS_PKG_WRITE: {  // #402 package manager writes to the FAT ESP (/APPS ...)
             extern fat_fs_t g_fat_fs;
-            extern int fat_write_file(fat_fs_t *, const char *, const void *, uint32_t);
             const char *pw_path = (const char *)arg1; const void *pw_data = (const void *)arg2;
             uint32_t pw_len = (uint32_t)arg3;
             if (!pw_path || (!pw_data && pw_len)) return -1;
+
+            // #700 B1: bounce the PATH into the kernel before anything looks at
+            // it. The buffered path below used to hand the caller's raw pointer
+            // straight to fat_write_file(), so the filesystem walked a Ring-3
+            // string that the caller could unmap or rewrite between the check
+            // and the use. That is the same #509 check-and-use hazard the data
+            // buffer was already protected against.
+            char pw_kp[SC_PATH_MAX];
+            if (strncpy_from_user(pw_kp, pw_path, sizeof(pw_kp)) < 0) return -14;
+
+            // #700 B1: ONE authorization decision, before EITHER writer.
+            if (pkg_write_permit(pw_kp) != 0) return -1;
+
+            // #689: is the payload an executable? Decided from the first four
+            // bytes of the CALLER'S data (copied in, never dereferenced in
+            // place), not from the path, because "under /APPS" is a convention
+            // and ELF magic is a fact.
+            int pw_is_elf = 0;
+            {
+                uint8_t pw_hdr[4];
+                if (pw_len >= 4 && copy_from_user(pw_hdr, pw_data, 4) == 0)
+                    pw_is_elf = (pw_hdr[0] == 0x7F && pw_hdr[1] == 'E' &&
+                                 pw_hdr[2] == 'L'  && pw_hdr[3] == 'F');
+            }
+
+            // #572: large ext2-root payloads stream to disk in bounded chunks
+            // (no whole-file kmalloc). Falls back to the buffered path below when
+            // the target is not on ext2 or the payload is small.
+            if (pw_len > EXT2_WSPILL_BYTES &&
+                sys_pkg_write_stream(pw_kp, pw_data, pw_len) == 0) {
+                pkg_write_stamp(pw_kp, pw_is_elf);
+                return 0;
+            }
             void *pw_kb = kmalloc(pw_len ? pw_len : 1);
             if (!pw_kb) return -1;
-            if (pw_len) memcpy(pw_kb, pw_data, pw_len);
-            int pw_rc = fat_write_file(&g_fat_fs, pw_path, pw_kb, pw_len);
+            // #566: copy_from_user (#509 atomic check-and-use) instead of a plain
+            // memcpy from the user pointer, so a racing unmap of the package data
+            // faults to EFAULT rather than a Ring-0 read of a freed frame.
+            if (pw_len && copy_from_user(pw_kb, pw_data, pw_len) != 0) { kfree(pw_kb); return -14; }
+            int pw_rc = fat_write_file(&g_fat_fs, pw_kp, pw_kb, pw_len);
             kfree(pw_kb);
+            if (pw_rc >= 0) pkg_write_stamp(pw_kp, pw_is_elf);
             return pw_rc;
         }
         case SYS_NET_MOUNT:
@@ -947,6 +2051,8 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             return sys_net_unmount((const char *)arg1, (const char *)arg2);
         case SYS_GET_DISK_INFO: return sys_get_disk_info((int)arg1, (void *)arg2);
         case SYS_NTP_SYNC:     return sys_ntp_sync();
+        case SYS_NTP_SYNC_SERVER:
+            return sys_ntp_sync_server((const char *)arg1, (uint32_t)arg2);
         case SYS_SET_CURSOR_THEME: {
             extern void cursor_set_theme(int theme);
             cursor_set_theme((int)arg1);
@@ -1002,7 +2108,14 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             extern int ttf_face_name(int, char *, int);
             char *ub = (char *)arg2; int cap = (int)arg3;
             if (!ub || cap <= 0) return -1;
-            return (int64_t)ttf_face_name((int)arg1, ub, cap);
+            // #19/#645: ttf_face_name() writes the name straight through the
+            // Ring-3 pointer. Build in a kernel buffer, then ONE copy_to_user.
+            char fnk[128];
+            if (cap > (int)sizeof(fnk)) cap = (int)sizeof(fnk);
+            int fnr = ttf_face_name((int)arg1, fnk, cap);
+            if (fnr < 0) return (int64_t)fnr;
+            if (copy_to_user(ub, fnk, (size_t)cap) != 0) return -14;
+            return (int64_t)fnr;
         }
         case SYS_FONT_SET_UI: {
             // System-wide UI font. Every legacy (non-_f) text path draws with
@@ -1018,26 +2131,45 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             extern int ttf_face_style(int, char *, int);
             char *ub = (char *)arg2; int cap = (int)arg3;
             if (!ub || cap <= 0) return -1;
-            return (int64_t)ttf_face_style((int)arg1, ub, cap);
+            // #19/#645: same shape as SYS_FONT_NAME above.
+            char fsk[128];
+            if (cap > (int)sizeof(fsk)) cap = (int)sizeof(fsk);
+            int fsr = ttf_face_style((int)arg1, fsk, cap);
+            if (fsr < 0) return (int64_t)fsr;
+            if (copy_to_user(ub, fsk, (size_t)cap) != 0) return -14;
+            return (int64_t)fsr;
         }
         case SYS_FONT_FIND: {
             extern int ttf_face_by_path(const char *);
             const char *up = (const char *)arg1;
             if (!up) return -1;
-            return (int64_t)ttf_face_by_path(up);
+            // #19/#645: the callee walks the Ring-3 string with plain loads.
+            char fpk[SC_PATH_MAX];
+            if (strncpy_from_user(fpk, up, sizeof(fpk)) < 0) return -14;
+            return (int64_t)ttf_face_by_path(fpk);
         }
         // #542 OS-wide system clipboard. Kernel-held bounded store so ANY Ring-3
         // app can copy/paste across apps. Backing buffer + all length clamping
         // live in Rust (rustkern/clipboard.rs); the copy is bounded there.
         case SYS_CLIP_SET: {
             extern long clip_set_rs(const unsigned char *src, unsigned long len);
-            return (int64_t)clip_set_rs((const unsigned char *)arg1,
-                                        (unsigned long)arg2);
+            // #19/#645: clip_set_rs() is this path's copy engine and does its
+            // own length clamping in Rust, so the AC window is around the copy
+            // engine, which is where mm/uaccess.asm puts its own.
+            uaccess_ac_t __ac = uaccess_begin();
+            int64_t __r = (int64_t)clip_set_rs((const unsigned char *)arg1,
+                                               (unsigned long)arg2);
+            uaccess_end(__ac);
+            return __r;
         }
         case SYS_CLIP_GET: {
             extern long clip_get_rs(unsigned char *dst, unsigned long cap);
-            return (int64_t)clip_get_rs((unsigned char *)arg1,
-                                        (unsigned long)arg2);
+            // #19/#645: see SYS_CLIP_SET.
+            uaccess_ac_t __ac = uaccess_begin();
+            int64_t __r = (int64_t)clip_get_rs((unsigned char *)arg1,
+                                               (unsigned long)arg2);
+            uaccess_end(__ac);
+            return __r;
         }
         case SYS_CLIP_LEN: {
             extern long clip_len_rs(void);
@@ -1063,9 +2195,15 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             int cap = (int)arg5;
             ttf_glyph_t *g = ttf_get_glyph_f(face, (int)arg2, size, style);
             if (!g) return -1;
-            if (meta) { meta[0]=g->width; meta[1]=g->height; meta[2]=g->xoff; meta[3]=g->yoff; meta[4]=g->advance; }
-            if (g->bitmap && ubmp && cap >= g->width * g->height && g->width > 0 && g->height > 0)
-                memcpy(ubmp, g->bitmap, (size_t)g->width * g->height);
+            // #566: copy_to_user the metadata + bitmap (#509 TOCTOU-safe) instead
+            // of writing meta[]/ubmp directly through the user pointers.
+            if (meta) {
+                int mk[5] = { g->width, g->height, g->xoff, g->yoff, g->advance };
+                if (copy_to_user(meta, mk, sizeof(mk)) != 0) return -14;
+            }
+            if (g->bitmap && ubmp && cap >= g->width * g->height && g->width > 0 && g->height > 0) {
+                if (copy_to_user(ubmp, g->bitmap, (size_t)g->width * g->height) != 0) return -14;
+            }
             return (int64_t)g->advance;
         }
         case SYS_FONT_METRICS: {
@@ -1076,7 +2214,11 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             if (size > 128) size = 128;
             int *out = (int *)arg2;
             if (!out) return -1;
-            ttf_get_metrics_f(face, size, &out[0], &out[1], &out[2]);
+            // #566: fill a kernel buffer then copy_to_user (#509 TOCTOU-safe)
+            // rather than letting ttf_get_metrics_f write the user pointer.
+            int mk[3] = {0, 0, 0};
+            ttf_get_metrics_f(face, size, &mk[0], &mk[1], &mk[2]);
+            if (copy_to_user(out, mk, sizeof(mk)) != 0) return -14;
             return 0;
         }
         case SYS_FONT_KERN: {
@@ -1220,6 +2362,10 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             wm_toggle_maximize_focused();
             return 0;
         }
+        // (#745) Compositor publishes the dock-style-derived work-area insets.
+        case SYS_WM_SET_WORK_AREA:
+            return sys_wm_set_work_area((int32_t)arg1, (int32_t)arg2,
+                                        (int32_t)arg3, (int32_t)arg4);
         case SYS_RUN_NEXT_ON_AP: {
             // #279: mark the next user process this caller spawns as
             // migratable so the scheduler routes it to an application
@@ -1237,6 +2383,8 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             return sys_get_global_mouse((int32_t *)arg1, (int32_t *)arg2, (uint32_t *)arg3);
         case SYS_WIN_SET_NOCHROME:
             return sys_win_set_nochrome((int)arg1);
+        case SYS_WIN_SET_SHADOW:
+            return sys_win_set_shadow((int)arg1);
         case SYS_DNS_START:
             return sys_dns_start((const char *)arg1, (uint32_t *)arg2);
         case SYS_DNS_POLL:
@@ -1247,6 +2395,24 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             return sys_authenticate((const char *)arg1, (const char *)arg2);
         case SYS_DELETE_USER:
             return sys_delete_user((const char *)arg1);
+        case SYS_SESSION_LOCK:
+            return sys_session_lock((int)arg1);
+        case SYS_SESSION_UNLOCK:
+            return sys_session_unlock((const char *)arg1, (const char *)arg2);
+        case SYS_SESSION_IS_LOCKED:
+            return sys_session_is_locked();
+        case SYS_SET_AUTOLOGIN:
+            return sys_set_autologin((const char *)arg1, (const char *)arg2, (int)arg3);
+        case SYS_GET_AUTOLOGIN:
+            return sys_get_autologin((char *)arg1, (int)arg2);
+        case SYS_SET_LOGIN_MODE:
+            return sys_set_login_mode((int)arg1, (const char *)arg2, (const char *)arg3);
+        case SYS_GET_LOGIN_MODE:
+            return sys_get_login_mode();
+        case SYS_AUTH_LOCKOUT:
+            return sys_auth_lockout((const char *)arg1);
+        case SYS_WM_APPS_DIRTY:
+            return sys_wm_apps_dirty();
 
         // IPC: Message Passing
         case SYS_MSG_CREATE_CHANNEL: return sys_msg_create_channel();
@@ -1307,8 +2473,9 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             extern int pipe_create(int pipefd[2]);
             int ret = pipe_create(pipefd);
             if (ret == 0) {
-                user_pipefd[0] = pipefd[0];
-                user_pipefd[1] = pipefd[1];
+                // #566: copy_to_user the fd pair (#509 TOCTOU-safe) instead of
+                // writing user_pipefd[0]/[1] through the user pointer directly.
+                if (copy_to_user(user_pipefd, pipefd, sizeof(pipefd)) != 0) return -14;
             }
             return ret;
         }
@@ -1319,6 +2486,34 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             file_t *f = fd_get((int)arg1);
             if (!f) return -1;
             extern int file_ioctl(file_t *f, unsigned cmd, void *arg);
+            // #500/#509: THE Ring-3 boundary for ioctl. The arg is a user
+            // pointer whose size is cmd-dependent (termios/winsize/int), which
+            // the flat argtab cannot describe; and file_ioctl also has
+            // kernel-internal callers (gui/terminal.c, net/ssh/ssh2_server.c)
+            // that legitimately pass KERNEL pointers, so the copy cannot live in
+            // tty_ioctl. #509: instead of only U/S-validating at entry (still a
+            // TOCTOU hole - a sibling thread could remap arg before tty_ioctl's
+            // memcpy), we BOUNCE the arg through a kernel buffer here with
+            // copy_*_user, which is atomic check-and-use: a racing unmap faults
+            // through the copy fixup and returns EFAULT, never a Ring-0 deref of
+            // a freed frame. tty_ioctl now always sees a safe kernel buffer.
+            extern size_t tty_ioctl_user_desc(unsigned cmd, int *from_user, int *to_user);
+            int _fu = 0, _tu = 0;
+            size_t _sz = tty_ioctl_user_desc((unsigned)arg2, &_fu, &_tu);
+            if (_sz != 0 && _sz <= 128) {
+                uint8_t _kbuf[128];
+                if (_fu) {
+                    if (copy_from_user(_kbuf, (void *)arg3, _sz) != 0) return -14;
+                } else {
+                    memset(_kbuf, 0, _sz);
+                }
+                int _r = file_ioctl(f, (unsigned)arg2, _kbuf);
+                if (_r == 0 && _tu) {
+                    if (copy_to_user((void *)arg3, _kbuf, _sz) != 0) return -14;
+                }
+                return _r;
+            }
+            // Cmd transfers no user memory: pass the arg through unchanged.
             return file_ioctl(f, (unsigned)arg2, (void *)arg3);
         }
         case SYS_GET_NET_BYTES: {
@@ -1330,8 +2525,17 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             // arg4=(cols<<16)|rows, arg5=port. Bridges the kernel SSH-2 client to
             // this process's stdin (fd0) / stdout (fd1) and blocks until it ends.
             uint32_t ip = (uint32_t)arg1;
-            const char *user = (const char *)arg2;
-            const char *pass = (const char *)arg3;
+            // #19/#645: both are Ring-3 strings the SSH client reads directly.
+            // strncpy_from_user is called INLINE here rather than through the
+            // sc_copy_str_user() helper, because copy-user-lint traces exactly
+            // one call level from a dispatcher case and would otherwise see the
+            // helper's kernel-side `dst[0] = 0` as a raw user deref.
+            char shu[128], shp[128];
+            shu[0] = '\0'; shp[0] = '\0';
+            if (arg2 && strncpy_from_user(shu, (const char *)arg2, sizeof(shu)) < 0) return -14;
+            if (arg3 && strncpy_from_user(shp, (const char *)arg3, sizeof(shp)) < 0) return -14;
+            const char *user = shu;
+            const char *pass = shp;
             int cols = (int)((arg4 >> 16) & 0xffff);
             int rows = (int)(arg4 & 0xffff);
             uint16_t port = (uint16_t)arg5;
@@ -1348,7 +2552,15 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             unsigned long ulen = (unsigned long)arg2;
             if (!ubuf || ulen == 0) return -1;
             extern int net_format_info(char *buf, unsigned long len);
-            return net_format_info(ubuf, ulen);
+            // #19/#645: net_format_info() formats straight into the Ring-3
+            // buffer. Format into kernel memory, then ONE copy_to_user.
+            if (ulen > 4096) ulen = 4096;
+            char *nik = (char *)kmalloc(ulen);
+            if (!nik) return -12;
+            int nir = net_format_info(nik, ulen);
+            if (nir >= 0 && copy_to_user(ubuf, nik, ulen) != 0) nir = -14;
+            kfree(nik);
+            return nir;
         }
         case SYS_SETPRIORITY: {
             // arg1 = pid (<=0 means the calling process), arg2 = level 0..4
@@ -1377,8 +2589,11 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             int n = smp_get_core_count();
             if (n < 1) n = 1;
             if (n > 64) n = 64;
-            buf[0] = (uint32_t)n;
-            for (int i = 0; i < n; i++) buf[1 + i] = (uint32_t)smp_get_core_pct((uint32_t)i);
+            // #566: fill a kernel buffer then copy_to_user once (#509 TOCTOU-safe).
+            uint32_t ck[65];
+            ck[0] = (uint32_t)n;
+            for (int i = 0; i < n; i++) ck[1 + i] = (uint32_t)smp_get_core_pct((uint32_t)i);
+            if (copy_to_user(buf, ck, (size_t)(n + 1) * sizeof(uint32_t)) != 0) return -14;
             return n;
         }
         case SYS_GET_MEM_INFO: {
@@ -1386,13 +2601,34 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             extern uint64_t pmm_get_used_pages(void);
             unsigned long *tp = (unsigned long *)arg1;
             unsigned long *up = (unsigned long *)arg2;
-            if (tp) *tp = (unsigned long)(pmm_get_total_pages() * 4096ULL);
-            if (up) *up = (unsigned long)(pmm_get_used_pages() * 4096ULL);
+            // #566: copy_to_user each out-param (#509 TOCTOU-safe) instead of
+            // writing *tp / *up directly through the user pointers.
+            if (tp) { unsigned long t = (unsigned long)(pmm_get_total_pages() * 4096ULL);
+                      if (copy_to_user(tp, &t, sizeof(t)) != 0) return -14; }
+            if (up) { unsigned long u = (unsigned long)(pmm_get_used_pages() * 4096ULL);
+                      if (copy_to_user(up, &u, sizeof(u)) != 0) return -14; }
             return 0;
         }
 
         case SYS_PROC_LIST:
-            return proc_snapshot((proc_info_t *)arg1, (int)arg2);
+        {
+            // #19/#645: proc_snapshot() fills the caller's array row by row and
+            // takes proc_mm_lock() between rows, so an AC window around it would
+            // hold AC across a lock acquire. Snapshot into kernel memory, then
+            // ONE copy_to_user. Bounded by MAX_PROCESSES (64 rows, ~4KB).
+            int pl_max = (int)arg2;
+            if (pl_max <= 0) return 0;
+            if (pl_max > MAX_PROCESSES) pl_max = MAX_PROCESSES;
+            proc_info_t *plk = (proc_info_t *)kmalloc((size_t)pl_max * sizeof(proc_info_t));
+            if (!plk) return -12;
+            int pln = proc_snapshot(plk, pl_max);
+            if (pln > 0 &&
+                copy_to_user((void *)arg1, plk, (size_t)pln * sizeof(proc_info_t)) != 0) {
+                kfree(plk); return -14;
+            }
+            kfree(plk);
+            return pln;
+        }
 
         // #487/#349 Ring-3 process introspection. Unlike their neighbours here,
         // each of these VALIDATES its user pointer in the backend before any
@@ -1420,6 +2656,12 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             wm_draw_all();
             wm_draw_apps();
             wm_draw_winmenu();   // Task A: decorator popup on top of app content
+            // #564: this composite is now current - clear the dirty flag
+            // SYS_WM_APPS_DIRTY (sys_wm_apps_dirty()) peeks, so the compositor's
+            // idle-CPU render gate stops seeing "dirty" until the next real
+            // change (window move/resize/focus/create/close, or an app's own
+            // win_invalidate()).
+            wm_clear_dirty();
             return 0;
 
         case SYS_GET_KEYBOARD: {
@@ -1438,7 +2680,29 @@ int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
             int key = (int)arg1;
             gui_event_t ev;
             memset(&ev, 0, sizeof(ev));
-            if (key >= 0x90 && key <= 0x98) {
+            // (Word6 divergence catalog #2, Alt-menu) KEY_LSHIFT/KEY_RSHIFT
+            // (0x95/0x96, moved this change off 0x87/0x88 to de-collide from
+            // isr.c's KEY_F10/KEY_F1), KEY_LCTRL (0x99, #386/6a848ae),
+            // KEY_ALT (0x9A, new this change) and KEY_SUPER (0x9B, #552) are
+            // all PRESS codes that live at or above 0x90 because the 0x80-0x8F
+            // press range is fully occupied by arrow/F-keys (see cpu/isr.h).
+            // Without this explicit check they fell into the generic
+            // "0x90-0x98/>0x98 => release" buckets below and were misreported
+            // to non-Win16 apps as a key-UP of an unrelated keycode (e.g. a
+            // Shift press looked like a release of an F-key, a Ctrl press
+            // looked like a release of 0x19). Win16/Word itself never goes
+            // through this path (SYS_GET_KEYBOARD's g_win16_owns_screen gate
+            // above routes it to keyboard_get_char directly instead), so this
+            // only affects native GUI apps reached via the compositor's
+            // hardware-queue forward. The matching _UP release codes already
+            // fall correctly into the buckets below (right TYPE); their
+            // computed keycode does not round-trip back to the press value
+            // here, a pre-existing imprecision in this scheme (true for
+            // KEY_LCTRL_UP before this change too), left alone.
+            if (key == 0x95 || key == 0x96 || key == 0x99 || key == 0x9A || key == 0x9B) {
+                ev.type = EVENT_KEY_DOWN;
+                ev.keycode = key;
+            } else if (key >= 0x90 && key <= 0x98) {
                 ev.type = EVENT_KEY_UP;
                 ev.keycode = key - 0x10;
             } else if (key >= 0x80 && key < 0x90) {
@@ -1536,6 +2800,104 @@ int64_t sys_fork(void) {
     return proc_fork();
 }
 
+// ============================================================================
+// POSIX process groups and sessions (#745 local 82)
+// ============================================================================
+//
+// THIS IS GLUE ONLY. Every rule lives in rustkern/pgrp.rs, which is pure and
+// self-tested at boot. What is here is the part Rust cannot do: walking the
+// process table. The split is deliberate and matches sessionid.rs, and it is
+// what makes the refusals testable without a scheduler.
+//
+// Why these are worth having: drivers/tty.c ALREADY raises SIGINT/SIGQUIT/
+// SIGTSTP at t->fg_pgrp and SIGHUP on hangup, sig_raise_pgrp() ALREADY walks
+// the table matching p->pgrp, and TIOCSPGRP ALREADY sets fg_pgrp. Without
+// setpgid() every process inherits its parent's group forever, so the entire
+// process tree is ONE group and a Ctrl-C reaches everything descended from
+// the shell. These calls are the missing half of a mechanism that is already
+// wired, not a number nobody acts on.
+
+extern int32_t pgrp_setsid_decide_rs(uint32_t caller_pid, uint32_t caller_pgrp);
+extern uint32_t pgrp_resolve_pid_rs(int64_t arg_pid, uint32_t caller_pid);
+extern int64_t pgrp_resolve_pgid_rs(int64_t arg_pgid, uint32_t target_pid);
+extern int32_t pgrp_setpgid_decide_rs(uint32_t caller_pid, uint32_t caller_session,
+                                      uint32_t target_pid, uint32_t target_exists,
+                                      uint32_t target_ppid, uint32_t target_session,
+                                      uint32_t pgid, uint32_t pgid_in_caller_session);
+
+// Rust decision codes (rustkern/pgrp.rs). Mirrored, so a change there that is
+// not mirrored here shows up as a wrong errno rather than a wrong behaviour.
+#define PGRP_SETSID_ALLOW  0
+
+int64_t sys_setsid(void) {
+    process_t *me = proc_current();
+    if (!me) return -1;   // -EPERM: no caller, no session
+    if (pgrp_setsid_decide_rs(me->pid, me->pgrp) != PGRP_SETSID_ALLOW) {
+        return -1;        // -EPERM: already a process group leader
+    }
+    me->session = me->pid;
+    me->pgrp    = me->pid;
+    // POSIX: the new session leader has NO controlling terminal. There is no
+    // per-process controlling-tty pointer in process_t today, so there is
+    // nothing to clear; the TTY's own fg_pgrp is left alone deliberately,
+    // because clearing another session's foreground group from here would be
+    // precisely the reach-across setpgid's rules exist to prevent.
+    return (int64_t)me->pid;
+}
+
+int64_t sys_setpgid(int64_t pid_arg, int64_t pgid_arg) {
+    process_t *me = proc_current();
+    if (!me) return -1;
+    uint32_t target_pid = pgrp_resolve_pid_rs(pid_arg, me->pid);
+    int64_t  pgid_r     = pgrp_resolve_pgid_rs(pgid_arg, target_pid);
+    if (pgid_r < 0) return pgid_r;   // -EINVAL
+    uint32_t pgid = (uint32_t)pgid_r;
+
+    process_t *t = proc_get(target_pid);
+    uint32_t exists = 0, ppid = 0, tsession = 0;
+    if (t && t->state != PROC_STATE_UNUSED) {
+        exists = 1; ppid = t->ppid; tsession = t->session;
+    }
+
+    // Does group `pgid` already exist inside the caller's session? Rust needs
+    // the answer but cannot walk the table. Creating a brand-new group led by
+    // the target is always allowed, which is why that case short-circuits.
+    uint32_t pgid_here = (pgid == target_pid) ? 1u : 0u;
+    if (!pgid_here) {
+        for (uint32_t p = 1; p < MAX_PROCESSES; p++) {
+            process_t *q = proc_get(p);
+            if (q && q->state != PROC_STATE_UNUSED && q->state != PROC_STATE_ZOMBIE &&
+                q->pgrp == pgid && q->session == me->session) {
+                pgid_here = 1; break;
+            }
+        }
+    }
+
+    int32_t rc = pgrp_setpgid_decide_rs(me->pid, me->session, target_pid, exists,
+                                        ppid, tsession, pgid, pgid_here);
+    if (rc != 0) return (int64_t)rc;
+    t->pgrp = pgid;
+    return 0;
+}
+
+int64_t sys_getpgid(int64_t pid_arg) {
+    process_t *me = proc_current();
+    if (!me) return -3;   // -ESRCH
+    uint32_t target = pgrp_resolve_pid_rs(pid_arg, me->pid);
+    process_t *t = proc_get(target);
+    if (!t || t->state == PROC_STATE_UNUSED) return -3;   // -ESRCH
+    return (int64_t)t->pgrp;
+}
+
+int64_t sys_getsid(int64_t pid_arg) {
+    process_t *me = proc_current();
+    if (!me) return -3;   // -ESRCH
+    uint32_t target = pgrp_resolve_pid_rs(pid_arg, me->pid);
+    process_t *t = proc_get(target);
+    if (!t || t->state == PROC_STATE_UNUSED) return -3;   // -ESRCH
+    return (int64_t)t->session;
+}
+
 
 // SYS_SPAWN_ARGS: spawn a new process with argv
 // arg1 = path (user string), arg2 = argv[] (user pointer array), arg3 = argc
@@ -1544,6 +2906,31 @@ int64_t sys_fork(void) {
 // NULL on error.
 static file_t *open_redir_file(const char *path, int flags) {
     if (!path || !path[0]) return NULL;
+
+    // #676 CREATE POINT 3 of 3. Shell redirection ("cmd > file") reaches the
+    // filesystem here, NOT through sys_open, and this function checked nothing
+    // at all: no perms_check, no ownership. A Ring-3 caller that could not
+    // open() a path for writing could still redirect onto it. The rule has to
+    // be the same rule, so it is the same shape as sys_open_k's: creating a
+    // NAME is a write to the parent directory; writing an EXISTING file is a
+    // write to that file.
+    {
+        process_t *rp = proc_current();
+        if (rp && rp->privilege == PRIV_USER) {
+            if (!fat_exists(&g_fat_fs, path)) {
+                if (!(flags & O_CREAT)) return NULL;
+                char parent[SC_PATH_MAX];
+                sc_parent_of(path, parent, sizeof(parent));
+                if (perms_check(parent, rp->euid, rp->egid, W_OK | X_OK) != 0) return NULL;
+            } else if (perms_check(path, rp->euid, rp->egid, W_OK) != 0) {
+                return NULL;
+            }
+            // #679: and the file it creates must belong to its creator, or the
+            // creator cannot write to it a second time.
+            if (flags & O_CREAT) perms_on_create(path, rp->euid, rp->egid, 0);
+        }
+    }
+
     if (path_is_ext2(path)) {
         return ext2_vfs_open(ext2_relpath(path), flags);
     }
@@ -1574,6 +2961,27 @@ static int64_t spawn_impl(const char *path, char **argv, int argc,
     extern fat_fs_t g_fat_fs;
     if (!g_fat_fs.mounted) return -1;
 
+    // #700 B8: EXECUTE PERMISSION, checked for the first time anywhere in this
+    // kernel. Before this, X_OK appeared in exactly two expressions tree-wide,
+    // both of them "W_OK | X_OK" on a PARENT DIRECTORY (search permission), and
+    // no code path had ever asked whether a caller was allowed to RUN a file.
+    // The mode bit was recorded by chmod, reported by the Files properties
+    // panel, and enforced nowhere: an x bit that means nothing is worse than no
+    // x bit, because it is a control everybody believes in.
+    //
+    // The rule is POSIX's: X_OK on the file, and nothing else. Not R_OK, because
+    // reading the image is the kernel's job and an execute-only binary is a
+    // legitimate thing to want. Nothing regresses on the shipped tree:
+    // perms_check()'s no-entry default is root-owned mode 0755, so every file
+    // without an explicit entry (which is nearly all of /APPS) still passes.
+    // Only a file somebody deliberately chmod'ed non-executable is now refused.
+    {
+        process_t *sp = proc_current();
+        if (sp && sp->privilege == PRIV_USER &&
+            perms_check(path, sp->euid, sp->egid, X_OK) != 0)
+            return -1;
+    }
+
     // Read the ELF file from disk
     uint32_t size = 0;
     void *data = fat_read_file(&g_fat_fs, path, &size);
@@ -1601,16 +3009,55 @@ static int64_t spawn_impl(const char *path, char **argv, int argc,
     int kargc = 0;
 
     if (argv && argc > 0) {
+        // #500: argv is a two-level user deref the flat syscall argtab cannot
+        // express. Validate the pointer array itself is user-readable before we
+        // read any argv[i], so a Ring-3 caller cannot point argv at kernel
+        // memory and have the loop below read kernel words as argument pointers.
+        // argc is already clamped to <=64 above, so this range is <=512 bytes.
+        if (validate_user_ptr(argv, (size_t)argc * sizeof(char *),
+                              ACCESS_READ_USER) != VALIDATE_OK) {
+            kfree(kbuf); kfree(data); return -1;
+        }
+        // #19/#645: read the POINTER ARRAY itself into kernel memory in one
+        // shot. The loop below used to re-read argv[i] straight out of Ring-3
+        // memory, which is a #PF under CR4.SMAP and, independently, a
+        // check-and-use gap: validate_user_ptr() above proved the array
+        // readable, then every iteration read it again and a sibling thread
+        // could have rewritten it in between.
+        char *kargp[64];
+        if (copy_from_user(kargp, argv, (size_t)argc * sizeof(char *)) != 0) {
+            kfree(kbuf); kfree(data); return -1;
+        }
         for (int i = 0; i < argc && i < 64; i++) {
-            if (!argv[i]) break;
-            // Copy from user pointer to kernel buffer
-            const char *usrc = argv[i];
-            int j = 0;
-            while (j < 255 && usrc[j]) {
-                kbuf[i][j] = usrc[j];
-                j++;
+            if (!kargp[i]) break;
+            // Copy from user pointer to kernel buffer. Referenced as
+            // kargp[i] throughout rather than via a local `const char *usrc`,
+            // because that declaration is itself what smap-uaccess-lint's B3
+            // `\*\s*usrc` pattern matches, and an EXEMPT entry for a
+            // declaration is a worse answer than not writing the declaration.
+            // #500: validate each element string before dereferencing it. The
+            // copy below reads usrc[0..254], stopping at the first NUL;
+            // validate_user_string proves every scanned byte is present and
+            // user-accessible. UNTERMINATED is NOT a memory fault (all 256
+            // scanned bytes were valid, there was simply no NUL): the copy
+            // truncates at 255 exactly as before, so only a genuine bad page
+            // (kernel/unmapped) rejects the spawn.
+            {
+                validate_error_t _sr = validate_user_string(kargp[i], 256);
+                if (_sr != VALIDATE_OK && _sr != VALIDATE_STRING_UNTERMINATED) {
+                    kfree(kbuf); kfree(data); return -1;
+                }
             }
-            kbuf[i][j] = '\0';
+            // #19/#645: the byte loop was a raw Ring-0 walk of a Ring-3 string.
+            // strncpy_from_user is the canonical primitive for exactly this: it
+            // is AC-bracketed, it carries the exception fixup, and it truncates
+            // at the cap the same way the loop did. An UNTERMINATED string is
+            // still accepted (validate_user_string above already decided that),
+            // because strncpy_from_user stops at the cap and NUL-terminates.
+            if (strncpy_from_user(kbuf[i], kargp[i], 256) < 0) {
+                kfree(kbuf); kfree(data); return -1;
+            }
+            kbuf[i][255] = '\0';
             kargv[i] = kbuf[i];
             kargc++;
         }
@@ -1626,7 +3073,11 @@ static int64_t spawn_impl(const char *path, char **argv, int argc,
     // Create the user process with argv. proc_create_user() (via
     // setup_user_argv) copies the argv strings onto the child's user stack, so
     // the kernel-side string buffer can be released as soon as it returns.
-    int pid = proc_create_user(name, data, size, kargc > 0 ? kargv : NULL, NULL);
+    // #692: exec runs as the CALLING Ring-3 process. proc_as_caller() is
+    // refused outright if the caller is not Ring 3, so this cannot degrade
+    // into inheriting a kernel thread's uid 0.
+    int pid = proc_create_user_as(name, data, size, kargc > 0 ? kargv : NULL, NULL,
+                                  proc_as_caller());
     kfree(data);
     kfree(kbuf);
 
@@ -1642,7 +3093,9 @@ static int64_t spawn_impl(const char *path, char **argv, int argc,
             for (int fi = 0; fi < 3; fi++) {
                 if (parent->fds[fi]) {
                     // Close the /dev/console fd that init_proc opened
-                    if (child->fds[fi]) file_put(child->fds[fi]);
+                    if (child->fds[fi])
+                        IGNORE_RESULT("execve close-on-exec sweep: no recipient exists mid-exec, and failing here would break exec on a full disk (#695)",
+                                      file_put(child->fds[fi]));
                     // Replace with parent's fd (same PTY slave)
                     child->fds[fi] = parent->fds[fi];
                     file_get(parent->fds[fi]);
@@ -1663,14 +3116,18 @@ static int64_t spawn_impl(const char *path, char **argv, int argc,
                 file_t *of = open_redir_file(outfile,
                                  O_WRONLY | O_CREAT | (append ? O_APPEND : O_TRUNC));
                 if (of) {
-                    if (child->fds[1]) file_put(child->fds[1]);
+                    if (child->fds[1])
+                        IGNORE_RESULT("redirect install evicts the replaced description; dup2 and shell redirection must still succeed on a full disk (#695)",
+                                      file_put(child->fds[1]));
                     child->fds[1] = of;
                 }
             }
             if (infile && infile[0]) {
                 file_t *inf = open_redir_file(infile, O_RDONLY);
                 if (inf) {
-                    if (child->fds[0]) file_put(child->fds[0]);
+                    if (child->fds[0])
+                        IGNORE_RESULT("redirect install evicts the replaced description (#695)",
+                                      file_put(child->fds[0]));
                     child->fds[0] = inf;
                 }
             }
@@ -1715,568 +3172,6 @@ int64_t sys_sleep(uint32_t ms) {
     return 0;
 }
 
-// ============================================================================
-// File I/O syscalls (using FAT filesystem)
-// ============================================================================
-
-// Simple file descriptor table (legacy kernel-wide table)
-// NOTE: process.h defines MAX_FDS=64 for the VFS per-process fd table.
-// This legacy table is used for basic FAT file access until full VFS migration.
-#define LEGACY_MAX_FDS 16
-static fat_file_t fd_table[LEGACY_MAX_FDS];
-static int fd_used[LEGACY_MAX_FDS];
-
-// #444: fd_used[]/e2fd[]/smbfd[] above are a SYSTEM-WIDE table (only 16 slots,
-// 13 usable) shared by every process on the box, but sys_open()'s "find a free
-// slot" scan used to be completely unlocked. Two processes calling sys_open()
-// concurrently could both scan, both see the SAME slot as free, and both
-// proceed to populate it (e2fd[fd]/smbfd[fd]) with their OWN file's data -
-// whichever one finished last would silently win, so BOTH callers were handed
-// back the same fd number and the loser's process would from then on read (and
-// on close, free) the WINNER's file content instead of its own. This is a
-// second, independent root cause of the #444 CPython "corrupt reads" symptom
-// on top of the ATA/ext2-cache lazy-lock-init race fixed in drivers/ata.c and
-// fs/ext2.c: proven live by a 4-independent-process concurrent-open hammer
-// test where 3 of 4 processes opening 4 DIFFERENT files ended up reading the
-// 4th process's exact file content byte-for-byte. Fixed by claiming the slot
-// (fd_used[i] = 1) ATOMICALLY under this lock in the same scan that finds it,
-// so no other caller can ever observe it as free once one caller has picked
-// it; every failure path after the claim now releases the slot back
-// (fd_used[fd] = 0) before returning. The lock is held only for the tiny
-// scan+claim, never across the (possibly slow / possibly network-blocking for
-// SMB/NFS) population work that follows, so this cannot turn into a
-// hold-a-spinlock-across-a-blocking-call bug (#426).
-static spinlock_t g_legacy_fd_lock = SPINLOCK_INIT;
-
-// Release a legacy fd slot back to the free pool under g_legacy_fd_lock, so
-// this write can never race with the locked scan-and-claim in sys_open().
-static inline void legacy_fd_release(int fd) {
-    uint64_t fl = spinlock_acquire_irqsave(&g_legacy_fd_lock);
-    fd_used[fd] = 0;
-    spinlock_release_irqrestore(&g_legacy_fd_lock, fl);
-}
-
-// ---- #99 Phase B: additive ext2 mount at the "/ext2" path prefix ------------
-// ext2-backed fds run in parallel with the FAT fd_table (same fd numbers, tagged
-// by e2fd[fd].used). FAT paths never touch this code, so existing behavior is
-// byte-identical. Read opens cache the whole file; create opens buffer writes and
-// flush on close (matches the FAT write-buffer model; no in-place overwrite yet).
-typedef struct {
-    int      used;
-    int      is_dir;
-    char     path[256];        // ext2-relative path (always starts with '/')
-    uint8_t *rbuf; uint32_t rsize, rpos;   // file read cache
-    uint8_t *wbuf; uint32_t wcap, wlen; int writing;  // create-on-close buffer
-    uint32_t dir_ino, dir_pos; // directory iteration cursor
-} ext2_fd_t;
-static ext2_fd_t e2fd[LEGACY_MAX_FDS];
-
-static int path_is_ext2(const char *p) {
-    return p && p[0]=='/' && p[1]=='e' && p[2]=='x' && p[3]=='t' && p[4]=='2' &&
-           (p[5]=='\0' || p[5]=='/');
-}
-
-// ---- #317 pass 2: SMB-backed fds, parallel to the ext2 e2fd table ----------
-// Routes userland open/read/write/close/readdir/stat on "/SMB/<server>/<share>/
-// <path>" through the SMB2 client (net/smb.c). Reads cache the whole file (like
-// ext2); writes buffer and flush-on-close as an SMB upload (smb_vfs_write_whole);
-// directory fds hold an smb dir-handle. FAT/ext2 paths never touch this code.
-typedef struct {
-    int      used;
-    int      is_dir;
-    int      is_nfs;           // #317 pass 4: 0 = SMB share, 1 = NFS export
-    int      dirh;             // smb/nfs dir handle (is_dir)
-    char     path[260];        // full /SMB/... or /NFS/... path
-    uint8_t *rbuf; uint32_t rsize, rpos;            // file read cache
-    uint8_t *wbuf; uint32_t wcap, wlen; int writing; // upload-on-close buffer
-} smb_fd_t;
-static smb_fd_t smbfd[LEGACY_MAX_FDS];
-
-static int path_is_smb(const char *p) {
-    return smb_vfs_is_smb_path(p);
-}
-// #317 pass 4: NFS exports use the same smbfd[] table (read/write/seek are
-// fs-agnostic, operating on the cached rbuf/wbuf); only mount/stat/opendir/
-// readdir/closedir/upload differ and branch on s->is_nfs.
-static int path_is_nfs(const char *p) {
-    return nfs_vfs_is_nfs_path(p) ? 1 : 0;
-}
-// "/ext2" -> "/", "/ext2/a/b" -> "/a/b"
-static const char *ext2_relpath(const char *p) {
-    const char *r = p + 5;
-    return (*r == '\0') ? "/" : r;
-}
-// #99 cutover: true when ext2 is the root fs and `p` is a normal "/" path that
-// should be served from ext2 (the UEFI ESP paths /boot, /EFI are never routed).
-static int path_root_ext2(const char *p) {
-    if (!g_root_ext2 || !p || p[0] != '/') return 0;
-    if (path_is_ext2(p)) return 0;   // explicit /ext2 handled separately
-    if (p[1]=='b'&&p[2]=='o'&&p[3]=='o'&&p[4]=='t'&&(p[5]=='/'||p[5]==0)) return 0;
-    if (p[1]=='E'&&p[2]=='F'&&p[3]=='I'&&(p[4]=='/'||p[4]==0)) return 0;
-    return 1;
-}
-
-/* #359 Phase 2: POSIX errno values so libc open() can set errno correctly
-   (CPython's import machinery needs a missing file to raise FileNotFoundError,
-   i.e. errno==ENOENT, not a bare OSError). sys_open now returns -errno. */
-#ifndef MOS_EOK
-#define MOS_EPERM   1
-#define MOS_ENOENT  2
-#define MOS_EBADF   9
-#define MOS_ENOMEM  12
-#define MOS_EACCES  13
-#define MOS_EINVAL  22
-#define MOS_EMFILE  24
-#define MOS_EOK     0
-#endif
-
-/* #359: fcntl(fd, cmd, arg). CPython needs F_GETFL/F_SETFL/F_GETFD/F_SETFD/
-   F_DUPFD to set up std fds and duplicate descriptors. We do not track a
-   per-fd flags word, so F_GETFL reports O_RDWR and F_SETFL is a no-op; the
-   duplicate commands reuse the existing per-process fd_dup(). */
-int64_t sys_fcntl(int fd, int cmd, long arg) {
-    switch (cmd) {
-        case 0:    /* F_DUPFD          */
-        case 1030: /* F_DUPFD_CLOEXEC  */ {
-            int r = fd_dup(fd, (int)arg);
-            return (r < 0) ? -MOS_EBADF : r;
-        }
-        case 1: return 0;        /* F_GETFD -> no FD_CLOEXEC tracked */
-        case 2: return 0;        /* F_SETFD -> accept, ignore        */
-        case 3: return 0x0002;   /* F_GETFL -> O_RDWR                */
-        case 4: return 0;        /* F_SETFL -> accept, ignore        */
-        default: return 0;       /* be permissive for other probes   */
-    }
-}
-
-// #444: once a legacy fd slot has been eagerly claimed (fd_used[fd] = 1) by
-// the scan in sys_open(), every failure path must release it again before
-// returning, or a run of failed opens (e.g. probing for an optional config
-// file that doesn't exist) permanently leaks slots out of the tiny 13-usable
-// pool. FD_FAIL() is only valid inside sys_open(), after `fd` has been
-// assigned and validated (fd >= 0).
-#define FD_FAIL(x) do { legacy_fd_release(fd); return (x); } while (0)
-
-int64_t sys_open(const char *path, int flags) {
-    // #396: /dev/<name> device nodes (CDC-ACM serial, etc.) resolve through the
-    // in-kernel dev namespace and install a file_t in the per-process fd table.
-    if (path && path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' && path[4]=='/') {
-        extern struct file *dev_open(const char *name, int flags);
-        extern int fd_alloc_install(struct file *f);
-        extern void file_put(struct file *f);
-        struct file *df = dev_open(path + 5, flags);
-        if (!df) return -1;
-        int nfd = fd_alloc_install(df);
-        if (nfd < 0) { file_put(df); return -1; }
-        return nfd;
-    }
-    // Permission check
-    process_t *p = proc_current();
-    if (p && p->privilege == PRIV_USER) {
-        // #95: services are sandboxed to their declared capabilities. A
-        // service without SVC_PERM_FSWRITE may not open files for writing
-        // or create them. No-op for normal processes (is_service == 0).
-        if (p->is_service && (flags & (1 | 2 | 0x40)) &&
-            !(p->svc_perms & SVC_PERM_FSWRITE)) {
-            return -MOS_EPERM;  // service lacks fs-write capability
-        }
-        int access = R_OK;
-        if (flags & 1)  access = W_OK;          // O_WRONLY
-        if (flags & 2)  access = R_OK | W_OK;   // O_RDWR
-        // #317: SMB/NFS shares enforce access server-side (NTLM/RPC auth + share
-        // ACLs); local POSIX perms (which default-deny W_OK to non-root) don't apply.
-        if (!path_is_smb(path) && !path_is_nfs(path) &&
-            perms_check(path, p->euid, p->egid, access) != 0) {
-            return -MOS_EACCES;
-        }
-    }
-
-    (void)flags;
-
-    // Find a free fd and claim it ATOMICALLY (fd_used[i] = 1 while still
-    // holding the lock) so no concurrent sys_open() can observe the same slot
-    // as free (see the #444 comment on g_legacy_fd_lock above). Every failure
-    // path below this point must reset fd_used[fd] = 0 before returning.
-    int fd = -1;
-    {
-        uint64_t __fdfl = spinlock_acquire_irqsave(&g_legacy_fd_lock);
-        for (int i = 3; i < LEGACY_MAX_FDS; i++) {  // 0, 1, 2 reserved for stdin/stdout/stderr
-            if (!fd_used[i]) {
-                fd = i;
-                fd_used[i] = 1;
-                break;
-            }
-        }
-        spinlock_release_irqrestore(&g_legacy_fd_lock, __fdfl);
-    }
-
-    if (fd < 0) {
-        return -MOS_EMFILE;  // no free fd
-    }
-
-    // #317 pass 2: SMB network share. Mount on demand, then open as a directory
-    // (dir handle), a read cache (whole-file), or a write/upload buffer.
-    if (path_is_smb(path)) {
-        smb_fd_t *s = &smbfd[fd];
-        for (uint64_t z = 0; z < sizeof(*s); z++) ((uint8_t *)s)[z] = 0;
-        { int z = 0; while (path[z] && z < 259) { s->path[z] = path[z]; z++; } s->path[z] = 0; }
-        if (smb_vfs_ensure_mount(path) != 0) FD_FAIL(-1);
-
-        smb_dirent_t info;
-        int have = (smb_stat(path, &info) == 0);
-        int want_write = (flags & 0x1) || (flags & 0x2) || (flags & 0x40) || (flags & 0x200);
-
-        if (have && info.is_directory) {
-            int dh = smb_opendir(path);
-            if (dh < 0) FD_FAIL(-1);
-            s->is_dir = 1; s->dirh = dh;
-        } else if (want_write) {
-            // O_WRONLY/O_RDWR/O_CREAT/O_TRUNC: buffer writes, upload on close.
-            s->writing = 1; s->wcap = 4096; s->wlen = 0;
-            s->wbuf = (uint8_t *)kmalloc(s->wcap);
-            if (!s->wbuf) FD_FAIL(-1);
-        } else if (have) {
-            // Read: cache the whole file.
-            uint32_t sz = 0;
-            s->rbuf = (uint8_t *)smb_vfs_read_whole(path, &sz);
-            if (!s->rbuf) FD_FAIL(-1);
-            s->rsize = sz; s->rpos = 0;
-        } else {
-            FD_FAIL(-MOS_ENOENT);  // not found and not creating
-        }
-        s->used = 1;
-        fd_used[fd] = 1;
-        return fd;
-    }
-
-    // #317 pass 4: NFS export. Same smbfd[] slot, is_nfs=1. Mount must exist
-    // (NETMOUNTS.CFG at boot or an explicit SYS_NET_MOUNT). nfs_getattr decides
-    // directory vs file; reads cache the whole file, writes upload on close.
-    if (path_is_nfs(path)) {
-        smb_fd_t *s = &smbfd[fd];
-        for (uint64_t z = 0; z < sizeof(*s); z++) ((uint8_t *)s)[z] = 0;
-        { int z = 0; while (path[z] && z < 259) { s->path[z] = path[z]; z++; } s->path[z] = 0; }
-        s->is_nfs = 1;
-        if (nfs_vfs_ensure_mount(path) != 0) FD_FAIL(-1);
-
-        nfs_fattr3_t attrs;
-        int have = (nfs_getattr(path, &attrs) == 0);
-        int want_write = (flags & 0x1) || (flags & 0x2) || (flags & 0x40) || (flags & 0x200);
-
-        if (have && attrs.type == NF3DIR) {
-            int dh = nfs_opendir(path);
-            if (dh < 0) FD_FAIL(-1);
-            s->is_dir = 1; s->dirh = dh;
-        } else if (want_write) {
-            s->writing = 1; s->wcap = 4096; s->wlen = 0;
-            s->wbuf = (uint8_t *)kmalloc(s->wcap);
-            if (!s->wbuf) FD_FAIL(-1);
-        } else if (have) {
-            uint32_t sz = 0;
-            s->rbuf = (uint8_t *)nfs_vfs_read_whole(path, &sz);
-            if (!s->rbuf) FD_FAIL(-1);
-            s->rsize = sz; s->rpos = 0;
-        } else {
-            FD_FAIL(-1);
-        }
-        s->used = 1;
-        fd_used[fd] = 1;
-        return fd;
-    }
-
-    // #99: serve from the ext2 volume for explicit "/ext2..." paths, and for all
-    // "/" paths once ext2 is the root fs. For root-cutover paths we use ext2 when
-    // the file already exists there or we are creating it; otherwise we fall
-    // through to FAT so files that live only on the ESP still open.
-    const char *rel = 0;
-    // Normalize a bare (root-relative) filename to an absolute path so the
-    // ext2-root redirect can resolve it. Userland apps open assets by bare name
-    // (e.g. the compositor opens wallpapers as "MAYTERA.BMP"); both
-    // path_root_ext2() and ext2_resolve_path() require a leading '/', so without
-    // this a bare name never reaches ext2 and only resolves against the FAT ESP -
-    // which on an ext2-root system holds boot files only, so the open fails and
-    // e.g. the desktop wallpaper silently falls back to a gradient. Only active
-    // when g_root_ext2 is set, so FAT-root behavior is byte-identical.
-    char ext2_npath[260];
-    const char *look = path;
-    if (g_root_ext2 && path && path[0] != '/' && path[0] != '\0') {
-        ext2_npath[0] = '/';
-        int z = 0;
-        while (path[z] && z < 258) { ext2_npath[z + 1] = path[z]; z++; }
-        ext2_npath[z + 1] = '\0';
-        look = ext2_npath;
-    }
-    if (path_is_ext2(path)) {
-        rel = ext2_relpath(path);
-    } else if (path_root_ext2(look)) {
-        if (ext2_resolve_path(look) != 0 || (flags & 0x40)) rel = look;
-    }
-    if (rel) {
-        ext2_fd_t *e = &e2fd[fd];
-        for (uint64_t z = 0; z < sizeof(*e); z++) ((uint8_t *)e)[z] = 0;
-        { int z = 0; while (rel[z] && z < 255) { e->path[z] = rel[z]; z++; } e->path[z] = 0; }
-        uint32_t ino = ext2_resolve_path(rel);
-        if (ino) {
-            ext2_inode_t in;
-            if (ext2_read_inode(ino, &in) != 0) FD_FAIL(-1);
-            if ((in.i_mode & 0xF000) == 0x4000) {       // directory
-                e->is_dir = 1; e->dir_ino = ino; e->dir_pos = 0;
-            } else if ((flags & 0x3) || (flags & 0x200)) { // O_WRONLY/O_RDWR/O_TRUNC: overwrite
-                // Existing regular file opened for writing: buffer the new
-                // contents; ext2_write_file() truncates the inode in place on
-                // close (#99 Phase C overwrite).
-                e->writing = 1; e->wcap = 4096; e->wlen = 0;
-                e->wbuf = (uint8_t *)kmalloc(e->wcap);
-                if (!e->wbuf) FD_FAIL(-1);
-            } else {
-                uint32_t sz = in.i_size;
-                e->rbuf = (uint8_t *)kmalloc(sz ? sz : 1);
-                if (!e->rbuf) FD_FAIL(-1);
-                int64_t n = sz ? ext2_read_file_ino(ino, e->rbuf, sz) : 0;
-                e->rsize = (n > 0) ? (uint32_t)n : 0;
-                e->rpos = 0;
-            }
-        } else if (flags & 0x40) {                       // O_CREAT
-            e->writing = 1; e->wcap = 4096; e->wlen = 0;
-            e->wbuf = (uint8_t *)kmalloc(e->wcap);
-            if (!e->wbuf) FD_FAIL(-1);
-        } else {
-            FD_FAIL(-MOS_ENOENT);
-        }
-        e->used = 1;
-        fd_used[fd] = 1;
-        return fd;
-    }
-
-    // TODO: Validate user pointer
-    // Open the file. If it does not exist and O_CREAT (0x40) is set, create it
-    // first so userland tools (cp, mv, editors, curl -o, ...) can make new files.
-    extern int fat_create(fat_fs_t *fs, const char *path);
-    if (fat_open(&g_fat_fs, path, &fd_table[fd]) != 0) {
-        if ((flags & 0x40) && fat_create(&g_fat_fs, path) == 0 &&
-            fat_open(&g_fat_fs, path, &fd_table[fd]) == 0) {
-            // created and opened successfully
-        } else {
-            FD_FAIL(-MOS_ENOENT);
-        }
-    }
-
-    fd_used[fd] = 1;
-    return fd;
-}
-#undef FD_FAIL
-
-int64_t sys_close(int fd) {
-    if (fd < 0) return -1;
-
-    // First try per-process file descriptors (pipes, PTYs, etc.)
-    process_t *proc = proc_current();
-    if (proc && fd < MAX_FDS && proc->fds[fd]) {
-        return fd_close(fd);
-    }
-
-    // #317: SMB-backed fd. Flush an upload (write-on-close), close dir handle.
-    if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used) {
-        smb_fd_t *s = &smbfd[fd];
-        int rc = 0;
-        if (s->is_nfs) {
-            if (s->is_dir) {
-                nfs_closedir(s->dirh);
-            } else if (s->writing && s->wbuf) {
-                rc = nfs_vfs_write_whole(s->path, s->wbuf, s->wlen);
-            }
-        } else if (s->is_dir) {
-            smb_closedir(s->dirh);
-        } else if (s->writing && s->wbuf) {
-            rc = smb_vfs_write_whole(s->path, s->wbuf, s->wlen);
-        }
-        if (s->rbuf) kfree(s->rbuf);
-        if (s->wbuf) kfree(s->wbuf);
-        for (uint64_t z = 0; z < sizeof(*s); z++) ((uint8_t *)s)[z] = 0;
-        legacy_fd_release(fd);
-        return rc;
-    }
-
-    // ext2-backed fd: flush a buffered create to the ext2 volume, free buffers.
-    if (fd >= 3 && fd < LEGACY_MAX_FDS && e2fd[fd].used) {
-        ext2_fd_t *e = &e2fd[fd];
-        int rc = 0;
-        if (e->writing && e->wbuf) rc = ext2_write_file(e->path, e->wbuf, e->wlen);
-        if (e->rbuf) kfree(e->rbuf);
-        if (e->wbuf) kfree(e->wbuf);
-        for (uint64_t z = 0; z < sizeof(*e); z++) ((uint8_t *)e)[z] = 0;
-        legacy_fd_release(fd);
-        return rc;
-    }
-
-    // Fallback: legacy FAT fd table
-    if (fd >= LEGACY_MAX_FDS || !fd_used[fd]) {
-        return -1;
-    }
-    fat_close(&fd_table[fd]);
-    legacy_fd_release(fd);
-    return 0;
-}
-
-int64_t sys_read(int fd, void *buf, size_t count) {
-    // Route through per-process file descriptors (PTY, pipes, etc.)
-    process_t *proc = proc_current();
-    if (proc && fd >= 0 && fd < 64 && proc->fds[fd]) {
-        extern int64_t file_read(struct file *f, void *buf, size_t count);
-        return file_read(proc->fds[fd], buf, count);
-    }
-
-    // #317: SMB-backed fd: serve from the cached file image.
-    if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used) {
-        smb_fd_t *s = &smbfd[fd];
-        if (s->is_dir || !s->rbuf) return -1;
-        uint32_t avail = (s->rpos < s->rsize) ? (s->rsize - s->rpos) : 0;
-        uint32_t n = (count < avail) ? (uint32_t)count : avail;
-        if (n) { memcpy(buf, s->rbuf + s->rpos, n); s->rpos += n; }
-        return (int64_t)n;
-    }
-
-    // ext2-backed fd: serve from the cached file image.
-    if (fd >= 3 && fd < LEGACY_MAX_FDS && e2fd[fd].used) {
-        ext2_fd_t *e = &e2fd[fd];
-        if (e->is_dir || !e->rbuf) return -1;
-        uint32_t avail = (e->rpos < e->rsize) ? (e->rsize - e->rpos) : 0;
-        uint32_t n = (count < avail) ? (uint32_t)count : avail;
-        if (n) { memcpy(buf, e->rbuf + e->rpos, n); e->rpos += n; }
-        return (int64_t)n;
-    }
-
-    // Fallback: legacy fd table for FAT files
-    if (fd < 0 || fd >= LEGACY_MAX_FDS || !fd_used[fd]) {
-        return -1;
-    }
-
-    return fat_read(&fd_table[fd], buf, count);
-}
-
-int64_t sys_write(int fd, const void *buf, size_t count) {
-    // Route through per-process file descriptors (PTY, pipes, etc.)
-    process_t *proc = proc_current();
-    if (proc && fd >= 0 && fd < 64 && proc->fds[fd]) {
-        extern int64_t file_write(struct file *f, const void *buf, size_t count);
-        return file_write(proc->fds[fd], buf, count);
-    }
-
-    // #317: SMB-backed fd: buffer writes; uploaded to the share on close.
-    if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used) {
-        smb_fd_t *s = &smbfd[fd];
-        if (!s->writing || !s->wbuf) return -1;
-        if (s->wlen + count > s->wcap) {
-            uint32_t ncap = s->wcap ? s->wcap : 4096;
-            while (ncap < s->wlen + count) ncap *= 2;
-            uint8_t *nb = (uint8_t *)kmalloc(ncap);
-            if (!nb) return -1;
-            memcpy(nb, s->wbuf, s->wlen);
-            kfree(s->wbuf); s->wbuf = nb; s->wcap = ncap;
-        }
-        memcpy(s->wbuf + s->wlen, buf, count);
-        s->wlen += (uint32_t)count;
-        return (int64_t)count;
-    }
-
-    // ext2-backed fd: buffer writes; flushed to the ext2 volume on close.
-    if (fd >= 3 && fd < LEGACY_MAX_FDS && e2fd[fd].used) {
-        ext2_fd_t *e = &e2fd[fd];
-        if (!e->writing || !e->wbuf) return -1;
-        if (e->wlen + count > e->wcap) {
-            uint32_t ncap = e->wcap ? e->wcap : 4096;
-            while (ncap < e->wlen + count) ncap *= 2;
-            uint8_t *nb = (uint8_t *)kmalloc(ncap);
-            if (!nb) return -1;
-            memcpy(nb, e->wbuf, e->wlen);
-            kfree(e->wbuf); e->wbuf = nb; e->wcap = ncap;
-        }
-        memcpy(e->wbuf + e->wlen, buf, count);
-        e->wlen += (uint32_t)count;
-        return (int64_t)count;
-    }
-
-    // Fallback: handle stdout/stderr via serial console
-    if (fd == 1 || fd == 2) {
-        const char *p = (const char *)buf;
-
-        for (size_t i = 0; i < count; i++) {
-            kputc(p[i]);
-        }
-
-        if (count > 0 && count < 256) {
-            char msg_buf[256];
-            size_t copy_len = count < 255 ? count : 255;
-            memcpy(msg_buf, p, copy_len);
-            msg_buf[copy_len] = '\0';
-
-            if (copy_len > 0 && msg_buf[copy_len - 1] == '\n') {
-                msg_buf[copy_len - 1] = '\0';
-            }
-
-            syslog_log(1, msg_buf);
-        }
-
-        return (int64_t)count;
-    }
-
-    if (fd < 0 || fd >= LEGACY_MAX_FDS || !fd_used[fd]) {
-        return -1;
-    }
-
-    return fat_write(&fd_table[fd], buf, count);
-}
-
-int64_t sys_seek(int fd, int64_t offset, int whence) {
-    // #317: SMB-backed fd: seek within the cached read image.
-    if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used) {
-        smb_fd_t *s = &smbfd[fd];
-        int64_t np;
-        if (whence == 0) np = offset;
-        else if (whence == 1) np = (int64_t)s->rpos + offset;
-        else if (whence == 2) np = (int64_t)s->rsize + offset;
-        else return -1;
-        if (np < 0) np = 0;
-        if (np > (int64_t)s->rsize) np = s->rsize;
-        s->rpos = (uint32_t)np;
-        return np;
-    }
-    // ext2-backed fd: seek within the cached file image.
-    if (fd >= 3 && fd < LEGACY_MAX_FDS && e2fd[fd].used) {
-        ext2_fd_t *e = &e2fd[fd];
-        int64_t np;
-        if (whence == 0) np = offset;
-        else if (whence == 1) np = (int64_t)e->rpos + offset;
-        else if (whence == 2) np = (int64_t)e->rsize + offset;
-        else return -1;
-        if (np < 0) np = 0;
-        if (np > (int64_t)e->rsize) np = e->rsize;
-        e->rpos = (uint32_t)np;
-        return np;
-    }
-    if (fd < 0 || fd >= LEGACY_MAX_FDS || !fd_used[fd]) {
-        return -1;
-    }
-
-    // Convert whence for FAT driver
-    uint32_t pos;
-    switch (whence) {
-        case 0:  // SEEK_SET
-            pos = offset;
-            break;
-        case 1:  // SEEK_CUR
-            pos = fd_table[fd].position + offset;
-            break;
-        case 2:  // SEEK_END
-            pos = fd_table[fd].file_size + offset;
-            break;
-        default:
-            return -1;
-    }
-
-    if (fat_seek(&fd_table[fd], pos) != 0) return -1;
-    return (int64_t)fd_table[fd].position;  /* POSIX: lseek returns new offset */
-}
 
 // Kernel-side struct stat, byte-for-byte matching userland <sys/stat.h>.
 typedef struct {
@@ -2298,26 +3193,91 @@ typedef struct {
 _Static_assert(sizeof(k_stat_t) == 88,
                "#503 argtab: SZ_K_STAT in rustkern.rs is stale");
 
+// ===========================================================================
+// #745 Stage 3: THE METADATA GATE. One rule, two callers (SYS_STAT and
+// SYS_FS_PERM_INFO), because two copies of a permission rule is how they drift.
+//
+// WHAT WAS WRONG. Neither syscall performed ANY permission check. sys_stat_path
+// took a path and reported existence, type and size; sys_fs_perm_info took a
+// path and reported uid, gid and mode. Both answered for ANY path, from ANY
+// Ring-3 caller, at any uid. #745 Stage 1 recorded this in the /CONFIG comment
+// in fs/perms.c as the known limit of moving that directory to 0711, and left
+// it alone deliberately because adding a check to stat has a far wider blast
+// radius than one directory mode.
+//
+// WHAT THE RULE IS. POSIX, exactly: stat(path) requires SEARCH permission (x)
+// on every directory component of `path`, and NO permission at all on the
+// object itself. So the gate asks perms_check(PARENT, X_OK), and
+// perms_path_check_rs() already walks and requires x on each component above
+// that parent, which is the whole of the POSIX requirement in one call.
+//
+// Asking for R_OK on the object instead would have been the intuitive fix and
+// it is WRONG in both directions: it would deny a file manager the size of a
+// file it can legitimately see listed, and it would still permit stat of a
+// world-readable file inside a directory the caller may not traverse.
+//
+// THE HONEST LIMIT, stated plainly because overstating it would be worse than
+// the gap. This does NOT hide the existence of a KNOWN name under /CONFIG,
+// because /CONFIG is 0711 and 0711 grants x to everyone: that is precisely what
+// "traversable but not listable" means, and real UNIX behaves the same way
+// (stat("/etc/shadow") succeeds for any user). 0711 defeats ENUMERATION, which
+// is what #745 Stage 1 claimed for it, and nothing more. What this gate DOES
+// close is every directory whose mode actually withholds search: another user's
+// home at 0750, any 0700 directory, and any future secrets directory that is
+// not deliberately traversable. Before it, those disclosed file existence,
+// size, owner and mode to any caller who guessed a name. Measured, not
+// theorised: see the nrprobe vectors for this change.
+//
+// The path is bounced by the CALLER before this is consulted, and that is not
+// tidiness. Checking a Ring-3 pointer and then handing the SAME pointer to
+// fat_open() is the #509 check-and-use gap: a sibling thread rewrites the
+// buffer between the two reads and the path that was authorized is not the path
+// that gets opened. Both callers previously passed the raw user pointer all the
+// way down into the filesystem layer, so bouncing is a prerequisite for the
+// gate to mean anything, not a separate cleanup.
+//
+// Ring 0 is unaffected, as everywhere else in this file: perms_check() is
+// consulted only for p->privilege == PRIV_USER.
+// ===========================================================================
+static int sc_meta_permit(const char kpath[SC_PATH_MAX]) {
+    process_t *p = proc_current();
+    if (!p || p->privilege != PRIV_USER) return 0;   // Ring 0: unchanged
+    // SMB/NFS enforce server-side (NTLM/RPC + share ACLs); local POSIX modes do
+    // not describe them. Same carve-out sys_open_k() already makes.
+    if (path_is_smb(kpath) || path_is_nfs(kpath)) return 0;
+    char parent[SC_PATH_MAX];
+    sc_parent_of(kpath, parent, sizeof(parent));
+    return perms_check(parent, p->euid, p->egid, X_OK);
+}
+
 // O(1) stat by path. Reads the file size and type directly from the FAT
 // directory entry (via fat_open, which never walks the file's cluster chain),
 // so stat'ing a directory of large files is cheap. Previously userland stat()
 // sized files with SEEK_END, which made fat_seek walk every cluster: `ls -la /`
 // over the multi-MB kernel.elf/wallpaper files effectively hung the machine.
-int64_t sys_stat_path(const char *path, void *ubuf) {
-    if (!path || !ubuf) return -1;
+int64_t sys_stat_path(const char *u_path, void *ubuf) {
+    if (!u_path || !ubuf) return -1;
+
+    // #745: bounce ONCE, then gate. Every branch below reads `path`, which is
+    // now the kernel copy; the Ring-3 pointer is never dereferenced again.
+    char kpath[SC_PATH_MAX];
+    if (sc_bounce_str(u_path, kpath, sizeof(kpath)) != 0) return -14;
+    const char *path = kpath;
+    if (sc_meta_permit(kpath) != 0) return -13;   // EACCES
 
     // #317: SMB network share. Mount on demand and stat over SMB2.
     if (path_is_smb(path)) {
         if (smb_vfs_ensure_mount(path) != 0) return -1;
         smb_dirent_t info;
         if (smb_stat(path, &info) != 0) return -1;
-        k_stat_t *st = (k_stat_t *)ubuf;
-        memset(st, 0, sizeof(*st));
-        st->st_mode    = info.is_directory ? (0040000u | 0755u) : (0100000u | 0644u);
-        st->st_nlink   = 1;
-        st->st_size    = (long)info.size;
-        st->st_blksize = 512;
-        st->st_blocks  = ((long)info.size + 511) / 512;
+        k_stat_t st;   // #567: fill kernel-local, then one fault-safe copy_to_user
+        memset(&st, 0, sizeof(st));
+        st.st_mode    = info.is_directory ? (0040000u | 0755u) : (0100000u | 0644u);
+        st.st_nlink   = 1;
+        st.st_size    = (long)info.size;
+        st.st_blksize = 512;
+        st.st_blocks  = ((long)info.size + 511) / 512;
+        if (copy_to_user(ubuf, &st, sizeof(st)) != 0) return -14;
         return 0;
     }
 
@@ -2326,14 +3286,15 @@ int64_t sys_stat_path(const char *path, void *ubuf) {
         if (nfs_vfs_ensure_mount(path) != 0) return -1;
         nfs_fattr3_t attrs;
         if (nfs_getattr(path, &attrs) != 0) return -1;
-        k_stat_t *st = (k_stat_t *)ubuf;
-        memset(st, 0, sizeof(*st));
+        k_stat_t st;   // #567
+        memset(&st, 0, sizeof(st));
         int is_dir = (attrs.type == NF3DIR);
-        st->st_mode    = is_dir ? (0040000u | 0755u) : (0100000u | 0644u);
-        st->st_nlink   = (attrs.nlink ? attrs.nlink : 1);
-        st->st_size    = (long)attrs.size;
-        st->st_blksize = 512;
-        st->st_blocks  = ((long)attrs.size + 511) / 512;
+        st.st_mode    = is_dir ? (0040000u | 0755u) : (0100000u | 0644u);
+        st.st_nlink   = (attrs.nlink ? attrs.nlink : 1);
+        st.st_size    = (long)attrs.size;
+        st.st_blksize = 512;
+        st.st_blocks  = ((long)attrs.size + 511) / 512;
+        if (copy_to_user(ubuf, &st, sizeof(st)) != 0) return -14;
         return 0;
     }
 
@@ -2354,14 +3315,15 @@ int64_t sys_stat_path(const char *path, void *ubuf) {
                 ext2_inode_t in;
                 if (ext2_read_inode(ino, &in) == 0) {
                     int is_dir = ((in.i_mode & 0xF000) == 0x4000);
-                    k_stat_t *st = (k_stat_t *)ubuf;
-                    memset(st, 0, sizeof(*st));
-                    st->st_mode    = in.i_mode ? in.i_mode
+                    k_stat_t st;   // #567
+                    memset(&st, 0, sizeof(st));
+                    st.st_mode    = in.i_mode ? in.i_mode
                                      : (is_dir ? (0040000u|0755u) : (0100000u|0644u));
-                    st->st_nlink   = 1;
-                    st->st_size    = is_dir ? 0 : (long)in.i_size;
-                    st->st_blksize = 1024;
-                    st->st_blocks  = ((long)in.i_size + 511) / 512;
+                    st.st_nlink   = 1;
+                    st.st_size    = is_dir ? 0 : (long)in.i_size;
+                    st.st_blksize = 1024;
+                    st.st_blocks  = ((long)in.i_size + 511) / 512;
+                    if (copy_to_user(ubuf, &st, sizeof(st)) != 0) return -14;
                     return 0;
                 }
             }
@@ -2376,13 +3338,14 @@ int64_t sys_stat_path(const char *path, void *ubuf) {
     uint32_t size = is_dir ? 0 : f.file_size;
     if (f.open) fat_close(&f);
 
-    k_stat_t *st = (k_stat_t *)ubuf;   // identity-mapped: user ptr == phys
-    memset(st, 0, sizeof(*st));
-    st->st_mode    = is_dir ? (0040000u | 0755u) : (0100000u | 0644u);
-    st->st_nlink   = 1;
-    st->st_size    = (long)size;
-    st->st_blksize = 512;
-    st->st_blocks  = ((long)size + 511) / 512;
+    k_stat_t st;   // #567: fill kernel-local, then one fault-safe copy_to_user
+    memset(&st, 0, sizeof(st));
+    st.st_mode    = is_dir ? (0040000u | 0755u) : (0100000u | 0644u);
+    st.st_nlink   = 1;
+    st.st_size    = (long)size;
+    st.st_blksize = 512;
+    st.st_blocks  = ((long)size + 511) / 512;
+    if (copy_to_user(ubuf, &st, sizeof(st)) != 0) return -14;
     return 0;
 }
 
@@ -2399,30 +3362,43 @@ int64_t sys_net_mount(const char *server, const char *share,
 
 // sys_net_list_shares: enumerate the shares a server exports (srvsvc/IPC$).
 // Writes share names newline-separated into ubuf; returns the count (>=0) or -1.
-int64_t sys_net_list_shares(const char *server, char *ubuf, uint32_t maxlen) {
-    if (!server || !ubuf || maxlen == 0) return -1;
+int64_t sys_net_list_shares(const char *u_server, char *ubuf, uint32_t maxlen) {
+    if (!u_server || !ubuf || maxlen == 0) return -1;
+    // #567: bounce the server name, build the listing in a kernel buffer, then
+    // one fault-safe copy_to_user (was raw memcpy/ubuf[off++] into user memory).
+    char server[256];
+    if (sc_bounce_str(u_server, server, sizeof(server)) != 0) return -1;
     extern uint32_t smb_resolve_ip(const char *host);
     uint32_t ip = smb_resolve_ip(server);
     if (!ip) return -1;
     int count = 0;
     char **shares = smb_list_shares(ip, &count);
     if (!shares) return -1;
+    char *kbuf = (char *)kmalloc(maxlen);
+    if (!kbuf) { smb_free_shares(shares, count); return -1; }
     uint32_t off = 0;
     for (int i = 0; i < count; i++) {
         const char *nm = shares[i] ? shares[i] : "";
         uint32_t nl = (uint32_t)strlen(nm);
         if (off + nl + 1 >= maxlen) break;
-        memcpy(ubuf + off, nm, nl); off += nl;
-        ubuf[off++] = '\n';
+        memcpy(kbuf + off, nm, nl); off += nl;
+        kbuf[off++] = '\n';
     }
-    ubuf[off < maxlen ? off : maxlen - 1] = 0;
+    uint32_t term = (off < maxlen) ? off : maxlen - 1;
+    kbuf[term] = 0;
     smb_free_shares(shares, count);
-    return count;
+    int rc = (copy_to_user(ubuf, kbuf, term + 1) != 0) ? -14 : count;
+    kfree(kbuf);
+    return rc;
 }
 
 // sys_net_unmount: tear down an SMB share connection.
-int64_t sys_net_unmount(const char *server, const char *share) {
-    if (!server || !share) return -1;
+int64_t sys_net_unmount(const char *u_server, const char *u_share) {
+    if (!u_server || !u_share) return -1;
+    // #567: bounce both user strings fault-safe before building the mount path.
+    char server[256], share[256];
+    if (sc_bounce_str(u_server, server, sizeof(server)) != 0) return -1;
+    if (sc_bounce_str(u_share,  share,  sizeof(share))  != 0) return -1;
     char mp[300];
     snprintf(mp, sizeof(mp), "/SMB/%s/%s", server, share);
     return smb_unmount(mp) == 0 ? 0 : -1;
@@ -2450,15 +3426,28 @@ static void net_fetch_report(int r, int status) {
 // what makes the USB busy-poll storm stop mid-cycle and CPU fall to ~0). Recovery
 // is explicit: Settings apply static / renew DHCP, a carrier replug, or a fresh
 // DHCP bind all clear the fault (see net.c / sys_net_set_static / SYS_NET_DHCP).
-static int net_fetch_blocked(int *ustatus) {
-    extern int net_is_faulty(void);
-    if (net_is_faulty()) { if (ustatus) *ustatus = 0; return 1; }
-    return 0;
+// #567: was net_fetch_blocked(int *ustatus) which raw-wrote *ustatus. The status
+// zeroing is now the caller's job (via copy_to_user) so this never touches a user
+// pointer; it just answers "is the interface tripped NET_FAULTY".
+// #549 FIX (2026-08-10): ask the probe budget, not the raw flag. While the
+// interface is healthy this is net_fetch_probe_take() returning 1 immediately.
+// While NET_FAULTY it refuses everything EXCEPT one re-probe per 30s, so the
+// stack can still obtain the completed transfer that clears the fault. Before
+// this, the gate blocked that transfer too and NET_FAULTY was a one-way door.
+static int net_fetch_blocked(void) {
+    extern int net_fetch_probe_take(void);
+    return net_fetch_probe_take() ? 0 : 1;
 }
 
-int64_t sys_http_fetch(const char *url, char *ubuf, uint32_t max_len, uint32_t *ubytes, int *ustatus) {
-    if (!url || !ubuf || max_len == 0) return -1;
-    if (net_fetch_blocked(ustatus)) return -1;
+int64_t sys_http_fetch(const char *uurl, char *ubuf, uint32_t max_len, uint32_t *ubytes, int *ustatus) {
+    if (!uurl || !ubuf || max_len == 0) return -1;
+    if (net_fetch_blocked()) {
+        if (ustatus) { int z = 0; (void)copy_to_user(ustatus, &z, sizeof(z)); }
+        return -1;
+    }
+    // #567: bounce the url + write results back fault-safe.
+    char *url = sc_dup_user_str(uurl, 8192);
+    if (!url) return -1;
     extern int https_get(const char *url, uint8_t **body_out, uint32_t *body_len_out, int *status_out);
     extern int wget_fetch(const char *url, uint8_t **body_out, uint32_t *body_len_out, int *status_out);
     uint8_t *body = 0; uint32_t blen = 0; int status = 0;
@@ -2466,32 +3455,68 @@ int64_t sys_http_fetch(const char *url, char *ubuf, uint32_t max_len, uint32_t *
     int r = https ? https_get(url, &body, &blen, &status)
                   : wget_fetch(url, &body, &blen, &status);
     net_fetch_report(r, status);
-    if (r < 0 || !body) { if (body) kfree(body); if (ustatus) *ustatus = status; return -1; }
+    kfree(url);
+    if (r < 0 || !body) {
+        if (body) kfree(body);
+        if (ustatus) (void)copy_to_user(ustatus, &status, sizeof(status));
+        return -1;
+    }
     uint32_t n = (blen < max_len) ? blen : max_len;
-    memcpy(ubuf, body, n);
+    int rc = 0;
+    if (n && copy_to_user(ubuf, body, n) != 0) rc = -14;
     kfree(body);
-    if (ubytes) *ubytes = n;
-    if (ustatus) *ustatus = status;
+    if (rc) return rc;
+    if (ubytes  && copy_to_user(ubytes,  &n,      sizeof(n))      != 0) return -14;
+    if (ustatus && copy_to_user(ustatus, &status, sizeof(status)) != 0) return -14;
     return (int64_t)n;
 }
 
 // #414 Home Assistant: blocking GET with an Authorization header. Runs in the
 // background haservice process the same inline way sys_http_fetch does (which
 // netinfo already uses safely from Ring 3); never on the compositor UI thread.
-int64_t sys_http_fetch_hdr(const char *url, const char *headers, char *ubuf,
+static int64_t sys_http_fetch_hdr_inner(const char *uurl, const char *uheaders,
+                                        char *ubuf, uint32_t max_len,
+                                        uint32_t *ubytes, int *ustatus);
+int64_t sys_http_fetch_hdr(const char *uurl, const char *uheaders, char *ubuf,
                            uint32_t max_len, uint32_t *ubytes, int *ustatus) {
-    if (!url || !ubuf || max_len == 0) return -1;
-    if (net_fetch_blocked(ustatus)) return -1;
+    uint64_t _dp_t0 = dp_tsc();
+    int64_t _dp_r = sys_http_fetch_hdr_inner(uurl, uheaders, ubuf, max_len,
+                                             ubytes, ustatus);
+    g_dp_fetch_cyc += dp_tsc() - _dp_t0; g_dp_fetch_calls++;
+    return _dp_r;
+}
+static int64_t sys_http_fetch_hdr_inner(const char *uurl, const char *uheaders,
+                                        char *ubuf, uint32_t max_len,
+                                        uint32_t *ubytes, int *ustatus) {
+    if (!uurl || !ubuf || max_len == 0) return -1;
+    if (net_fetch_blocked()) {
+        if (ustatus) { int z = 0; (void)copy_to_user(ustatus, &z, sizeof(z)); }
+        return -1;
+    }
+    // #567: bounce url + headers, write results back fault-safe.
+    char *url = sc_dup_user_str(uurl, 8192);
+    if (!url) return -1;
+    char *headers = uheaders ? sc_dup_user_str(uheaders, 16384) : 0;
+    if (uheaders && !headers) { kfree(url); return -1; }
     extern int wget_fetch_hdr(const char *, const char *, uint8_t **, uint32_t *, int *);
+    extern int https_get_hdr(const char *, const char *, uint8_t **, uint32_t *, int *);
     uint8_t *body = 0; uint32_t blen = 0; int status = 0;
-    int r = wget_fetch_hdr(url, headers ? headers : "", &body, &blen, &status);
+    // #576: dispatch on the URL scheme, mirroring sys_http_fetch's https_get/
+    // wget_fetch split, so an https:// Range/header fetch goes over the TLS
+    // transport instead of failing on the plaintext-only wget path.
+    int https = (url[0]=='h'&&url[1]=='t'&&url[2]=='t'&&url[3]=='p'&&url[4]=='s');
+    int r = https ? https_get_hdr(url, headers ? headers : "", &body, &blen, &status)
+                  : wget_fetch_hdr(url, headers ? headers : "", &body, &blen, &status);
     net_fetch_report(r, status);
-    if (ustatus) *ustatus = status;
+    kfree(url); if (headers) kfree(headers);
+    if (ustatus && copy_to_user(ustatus, &status, sizeof(status)) != 0) { if (body) kfree(body); return -14; }
     if (r < 0 || !body) { if (body) kfree(body); return -1; }
     uint32_t n = (blen < max_len) ? blen : max_len;
-    memcpy(ubuf, body, n);
+    int rc = 0;
+    if (n && copy_to_user(ubuf, body, n) != 0) rc = -14;
     kfree(body);
-    if (ubytes) *ubytes = n;
+    if (rc) return rc;
+    if (ubytes && copy_to_user(ubytes, &n, sizeof(n)) != 0) return -14;
     return (int64_t)n;
 }
 
@@ -2501,15 +3526,72 @@ int64_t sys_http_fetch_hdr(const char *url, const char *headers, char *ubuf,
 // buffer; the caller POLLs each frame and READs the body when done. =====
 #define ASYNC_FETCH_MAX 6
 typedef struct {
-    volatile int in_use;
     volatile int state;     // 0=running, 1=done, 2=error
     int status;             // HTTP status
     uint8_t *body;
     uint32_t len;
-    volatile int detached;  // caller canceled; worker frees on completion
+    int slot;               // own index; the worker names itself to fetchown with it
     char url[1024];
+    http_progress_t prog;   // #25: live phase/bytes_recv/content_len, read by SYS_HTTP_FETCH_PROGRESS
 } async_fetch_t;
 static async_fetch_t g_async_fetch[ASYNC_FETCH_MAX];
+
+// =========================================================================
+// #745 (task #36): WHO OWNS A JOB SLOT, AND WHEN DOES IT COME BACK.
+//
+// `volatile int in_use` and `volatile int detached` used to live in the two
+// job structs above and below. They are gone, and the slot lifetime is now
+// one atomic word per slot in rustkern/fetchown.rs, because the C had two
+// measured defects that were both properties of that bookkeeping:
+//
+//   * poll/read/cancel/progress checked `id in range && in_use`, and nothing
+//     else. Any Ring 3 process could read another process's response body
+//     (the App Store's signed manifest, every LLM POST reply) or destroy its
+//     transfer by passing an index it never allocated. A missing check on an
+//     INDEX does not care about uid, so autologin-as-root did not mask it.
+//   * nothing released a slot when its owner died, so six crashed fetches
+//     exhausted the six-slot table until reboot.
+//
+// The OWNER is a thread-group id, not a raw pid, so an app that starts a
+// fetch on one pthread and polls it from another still owns it.
+// =========================================================================
+
+// The identity a job is stamped with, and the only identity that may touch it
+// afterwards. 0 means "no process context", which fetchown_claim_rs() refuses
+// outright rather than treating as a wildcard.
+static uint32_t async_owner_id(void) {
+    process_t *p = proc_current();
+    if (!p) return 0;
+    return p->tgid ? p->tgid : p->pid;
+}
+
+// THE ONE REFUSAL VALUE. "no such job", "that job is finished" and "that job
+// belongs to another process" all return -1 to Ring 3, deliberately: a
+// distinct EPERM would itself be an occupancy oracle, telling an attacker
+// exactly which slots are in use by somebody else, which is half of what the
+// ownership check is here to withhold. The kernel keeps the distinction for
+// the audit line below; userland never sees it.
+#define FETCHOWN_EREFUSED (-1)
+
+// Rate-limited so a hostile app cannot turn the audit into a serial-console
+// flood (the log is a shared resource; see blame.md on a rate limit that
+// fixes an oracle and hands you a DoS). The first burst is verbose because
+// that is what makes the guard OBSERVABLE FIRING rather than merely present.
+static uint32_t g_fetchown_refusals;
+static int async_job_auth(uint32_t tab, int id, int max_slots, const char *what) {
+    if (id < 0 || id >= max_slots) return FETCHOWN_EREFUSED;
+    uint32_t owner = async_owner_id();
+    int r = fetchown_check_rs(tab, (uint32_t)id, owner);
+    if (r == 0) return 0;
+    if (r == -2) {
+        uint32_t n = ++g_fetchown_refusals;
+        if (n <= 32u || (n % 64u) == 0u) {
+            kprintf("[FETCHSEC] REFUSED %s tab=%u slot=%d caller=%u owner=%u (n=%u)\n",
+                    what, tab, id, owner, fetchown_owner_rs(tab, (uint32_t)id), n);
+        }
+    }
+    return FETCHOWN_EREFUSED;
+}
 
 extern void thread_exit(int) __attribute__((noreturn));
 static void async_fetch_worker(void *arg) {
@@ -2519,61 +3601,110 @@ static void async_fetch_worker(void *arg) {
     uint8_t *body = 0; uint32_t len = 0; int status = 0;
     int https = (j->url[0]=='h' && j->url[1]=='t' && j->url[2]=='t' &&
                  j->url[3]=='p' && j->url[4]=='s');
+    // #25: opt this worker thread into progress reporting for the duration of
+    // the blocking call below; https.c/wget.c read this back via
+    // net_progress_current() and publish real phase/byte-count transitions.
+    // Cleared before proc_exit so a recycled process_t never inherits it.
+    proc_current()->net_progress = &j->prog;
     int r = https ? https_get(j->url, &body, &len, &status)
                   : wget_fetch(j->url, &body, &len, &status);
+    proc_current()->net_progress = 0;
     net_fetch_report(r, status);   // #549 circuit-breaker
     j->status = status;
     if (r >= 0 && body) { j->body = body; j->len = len; j->state = 1; }
     else { if (body) kfree(body); j->len = 0; j->state = 2; }
-    if (j->detached) { if (j->body) kfree(j->body); j->body = 0; j->in_use = 0; }
+    // #25: the terminal phase reflects the real outcome, set here rather than
+    // inside https.c/wget.c, which have too many internal early-return error
+    // paths to instrument individually.
+    j->prog.phase = (r >= 0 && body) ? HTTP_PHASE_DONE : HTTP_PHASE_ERROR;
+    // task #36: LAST action that touches this record. It clears the "a worker
+    // is still live on this slot" bit, which is what finally returns an
+    // orphaned slot to the pool, and returns 1 iff the owner went away while
+    // we were running, in which case nobody is left to read the body.
+    if (fetchown_worker_done_rs(FETCHOWN_TAB_FETCH, (uint32_t)j->slot)) {
+        if (j->body) kfree(j->body);
+        j->body = 0;
+    }
     { extern void proc_exit(int); proc_exit(0); }
 }
 
-int64_t sys_http_fetch_start(const char *url) {
-    if (!url) return -1;
-    if (net_fetch_blocked(0)) return -1;   // #549: no wire work while NET_FAULTY
-    int slot = -1;
-    for (int i = 0; i < ASYNC_FETCH_MAX; i++)
-        if (!g_async_fetch[i].in_use) { slot = i; break; }
+int64_t sys_http_fetch_start(const char *uurl) {
+    if (!uurl) return -1;
+    // #549: no wire work while NET_FAULTY except the paced re-probe. The refusal
+    // is reported as NET_ERR_FAULTY, not -1, so the caller can say WHY.
+    if (net_fetch_blocked()) return NET_ERR_FAULTY;
+    // task #36: claim-and-stamp in ONE atomic step. The old code scanned for a
+    // slot with in_use==0, then ran a faultable strncpy_from_user, and only
+    // THEN set in_use, so two callers racing here could be handed the SAME
+    // slot. Claiming first also means the slot is unallocatable for the whole
+    // window in which it is half-built.
+    int slot = fetchown_claim_rs(FETCHOWN_TAB_FETCH, async_owner_id());
     if (slot < 0) return -1;
     async_fetch_t *j = &g_async_fetch[slot];
-    j->state = 0; j->status = 0; j->body = 0; j->len = 0; j->detached = 0;
-    int k = 0; for (; url[k] && k < (int)sizeof(j->url) - 1; k++) j->url[k] = url[k];
-    j->url[k] = 0;
-    j->in_use = 1;
+    j->state = 0; j->status = 0; j->body = 0; j->len = 0; j->slot = slot;
+    j->prog.phase = HTTP_PHASE_IDLE; j->prog.bytes_recv = 0; j->prog.content_len = 0;   // #25
+    // #567: fault-safe copy of the url straight into the kernel job buffer.
+    if (strncpy_from_user(j->url, uurl, sizeof(j->url)) < 0) {
+        fetchown_abandon_rs(FETCHOWN_TAB_FETCH, (uint32_t)slot);
+        return -1;
+    }
     extern int proc_create_ex(const char *, void (*)(void *), void *, process_priority_t, uint32_t);
     int tid = proc_create_ex("httpfetch", async_fetch_worker, j, PRIO_NORMAL, 128 * 1024);  // #264 big stack for TLS/HTTPS (#277 was thread_create_kernel)
-    if (tid < 0) { j->in_use = 0; return -1; }
+    if (tid < 0) { fetchown_abandon_rs(FETCHOWN_TAB_FETCH, (uint32_t)slot); return -1; }
     return slot;
 }
 
 int64_t sys_http_fetch_poll(int id, int *ustatus, uint32_t *ulen) {
-    if (id < 0 || id >= ASYNC_FETCH_MAX || !g_async_fetch[id].in_use) return -1;
+    if (async_job_auth(FETCHOWN_TAB_FETCH, id, ASYNC_FETCH_MAX, "poll") != 0) return FETCHOWN_EREFUSED;
     async_fetch_t *j = &g_async_fetch[id];
-    if (ustatus) *ustatus = j->status;
-    if (ulen) *ulen = j->len;
+    // #567: fault-safe out-param writes.
+    if (ustatus) { int s = j->status; if (copy_to_user(ustatus, &s, sizeof(s)) != 0) return -14; }
+    if (ulen)    { uint32_t l = j->len; if (copy_to_user(ulen, &l, sizeof(l)) != 0) return -14; }
     return j->state;
 }
 
 int64_t sys_http_fetch_read(int id, char *ubuf, uint32_t max) {
-    if (id < 0 || id >= ASYNC_FETCH_MAX || !g_async_fetch[id].in_use) return -1;
+    if (async_job_auth(FETCHOWN_TAB_FETCH, id, ASYNC_FETCH_MAX, "read") != 0) return FETCHOWN_EREFUSED;
     async_fetch_t *j = &g_async_fetch[id];
     if (j->state == 0) return -2;   // still running
     uint32_t n = 0;
+    int rc = 0;
     if (j->state == 1 && j->body && ubuf) {
         n = (j->len < max) ? j->len : max;
-        memcpy(ubuf, j->body, n);
+        // #567: fault-safe copy of the response body to userland.
+        if (n && copy_to_user(ubuf, j->body, n) != 0) rc = -14;
     }
     if (j->body) kfree(j->body);
-    j->body = 0; j->in_use = 0;
-    return (int64_t)n;
+    j->body = 0;
+    fetchown_release_rs(FETCHOWN_TAB_FETCH, (uint32_t)id);
+    return rc ? rc : (int64_t)n;
 }
 
 int64_t sys_http_fetch_cancel(int id) {
-    if (id < 0 || id >= ASYNC_FETCH_MAX || !g_async_fetch[id].in_use) return -1;
+    if (async_job_auth(FETCHOWN_TAB_FETCH, id, ASYNC_FETCH_MAX, "cancel") != 0) return FETCHOWN_EREFUSED;
     async_fetch_t *j = &g_async_fetch[id];
-    if (j->state == 0) { j->detached = 1; }       // worker frees on completion
-    else { if (j->body) kfree(j->body); j->body = 0; j->in_use = 0; }
+    // Still running: hand the record to the worker, which frees the body and
+    // releases the slot when it unwinds. Already finished: no worker will ever
+    // touch it again, so free it here and release immediately.
+    if (j->state == 0) { fetchown_orphan_rs(FETCHOWN_TAB_FETCH, (uint32_t)id); }
+    else { if (j->body) kfree(j->body); j->body = 0;
+           fetchown_release_rs(FETCHOWN_TAB_FETCH, (uint32_t)id); }
+    return 0;
+}
+
+// #25: read back the live phase/bytes_recv/content_len for an in-flight (or
+// just-finished) job, so the browser chrome can show real progress instead of
+// a fake animation. Any out pointer may be NULL. Valid for the same id range
+// as poll/read/cancel above (i.e. until READ or CANCEL frees the slot).
+int64_t sys_http_fetch_progress(int id, int *uphase, uint32_t *ubytes, uint32_t *ucontent_len) {
+    if (async_job_auth(FETCHOWN_TAB_FETCH, id, ASYNC_FETCH_MAX, "progress") != 0) return FETCHOWN_EREFUSED;
+    async_fetch_t *j = &g_async_fetch[id];
+    int ph = j->prog.phase;
+    uint32_t br = j->prog.bytes_recv;
+    uint32_t cl = j->prog.content_len;
+    if (uphase       && copy_to_user(uphase, &ph, sizeof(ph)) != 0) return -14;
+    if (ubytes       && copy_to_user(ubytes, &br, sizeof(br)) != 0) return -14;
+    if (ucontent_len && copy_to_user(ucontent_len, &cl, sizeof(cl)) != 0) return -14;
     return 0;
 }
 
@@ -2588,10 +3719,27 @@ int64_t sys_http_fetch_cancel(int id) {
 // async GET never had this because a genuine PRIV_KERNEL worker proc does ALL the
 // net work on a real kernel CR3 while the user app only POLLS (non-blocking).
 static char *kstrdup_opt(const char *src) {
-    uint32_t n = src ? (uint32_t)strlen(src) : 0;
-    char *d = kmalloc(n + 1);
+    // #567: fault-safe copy of a user string (was strlen()+memcpy(): an unbounded
+    // scan of a possibly-unterminated user string plus a TOCTOU-unsafe read).
+    // Every caller is a user-only branch (kernel callers short-circuit before
+    // this), so a strncpy_from_user contract is correct. NULL -> "" (preserved).
+    if (!src) { char *d = (char *)kmalloc(1); if (d) d[0] = 0; return d; }
+    // #616: this asked for 4MB. validate_user_string() REJECTS any max_len over
+    // 1MB outright (VALIDATE_ARRAY_TOO_LARGE), so strnlen_user() returned EFAULT
+    // for EVERY string ever passed here and kstrdup_opt() ALWAYS returned NULL.
+    // #615 correctly identified the 8-byte scheme bounce as the POST killer and
+    // replaced it with this call - swapping a bound that was too small for one
+    // that was too large, so every Ring-3 https POST still failed, still
+    // silently, and so did every other kstrdup_opt() caller (the sync POST path
+    // and sys_print_file's printer/title). MEASURED, not reasoned: an
+    // instrumented build printed "[HTTPPOST] reject: kstrdup_opt(url) failed"
+    // on a real App Store install. Use the shared ceiling so the two can never
+    // disagree again.
+    ssize_t n = strnlen_user(src, USER_STRING_MAX);
+    if (n < 0) return 0;
+    char *d = (char *)kmalloc((size_t)n + 1);
     if (!d) return 0;
-    if (n) memcpy(d, src, n);
+    if (n && strncpy_from_user(d, src, (size_t)n + 1) < 0) { kfree(d); return 0; }
     d[n] = 0;
     return d;
 }
@@ -2601,12 +3749,10 @@ static char *kstrdup_opt(const char *src) {
 // No CR3 juggling on the user side, ever.
 #define ASYNC_POST_MAX 4
 typedef struct {
-    volatile int in_use;
     volatile int state;     // 0=running/queued, 1=done, 2=error
     int status;             // HTTP status
     uint8_t *body;          // response body (kfree'd by READ)
     uint32_t len;
-    volatile int detached;  // caller canceled; worker frees on completion
     char *url;              // kernel copies of the request (kfree'd by worker)
     char *headers;
     char *reqbody;
@@ -2638,7 +3784,10 @@ static wait_queue_head_t g_post_job_wq = { .head = NULL, .lock = SPINLOCK_INIT }
 static int post_job_pending(void) {
     for (int i = 0; i < ASYNC_POST_MAX; i++) {
         async_post_t *j = &g_async_post[i];
-        if (j->in_use && j->state == 0 && j->url) return 1;
+        // task #36: `in_use` is gone; `url` is the same signal it was standing
+        // in for, and is still published LAST by the START handler and cleared
+        // by the worker, so this predicate is unchanged in meaning.
+        if (j->state == 0 && j->url) return 1;
     }
     return 0;
 }
@@ -2657,9 +3806,10 @@ static void async_post_worker(void *arg) {
         int did = 0;
         for (int i = 0; i < ASYNC_POST_MAX; i++) {
             async_post_t *j = &g_async_post[i];
-            // A job needs running iff it is in_use, still state 0, and has a
-            // request buffer (the START handler sets url last under in_use=1).
-            if (!j->in_use || j->state != 0 || !j->url) continue;
+            // A job needs running iff it is still state 0 and has a request
+            // buffer (the START handler publishes url last, after claiming the
+            // slot from fetchown).
+            if (j->state != 0 || !j->url) continue;
             did = 1;
             uint8_t *body = 0; uint32_t len = 0; int status = 0;
             int r = https_post(j->url, j->headers ? j->headers : "",
@@ -2673,7 +3823,12 @@ static void async_post_worker(void *arg) {
             // Publish terminal state LAST so a poller never reads done/error
             // before body/len/status are settled.
             j->state = (r >= 0 && body) ? 1 : 2;
-            if (j->detached) { if (j->body) kfree(j->body); j->body = 0; j->in_use = 0; }
+            // task #36: done with this record. Returns 1 iff the owner went
+            // away while we were running, so nobody is left to read the body.
+            if (fetchown_worker_done_rs(FETCHOWN_TAB_POST, (uint32_t)i)) {
+                if (j->body) kfree(j->body);
+                j->body = 0;
+            }
         }
         // #426: was `if (!did) proc_sleep(10);`, a 10ms idle poll that woke this
         // worker 100 times a second forever to almost always find nothing, and
@@ -2695,30 +3850,99 @@ static void ensure_post_worker(void) {
 // START: copy the request OUT of user memory (we are on the caller's CR3 now, so
 // user pointers are valid) into kernel buffers, queue it, and make sure the
 // persistent worker exists. Returns a job id, or -1. http:// is rejected.
-int64_t sys_http_post_start(const char *url, const char *headers, const char *body) {
-    if (!url) return -1;
-    if (net_fetch_blocked(0)) return -1;   // #549: no wire work while NET_FAULTY
-    int https = (url[0]=='h'&&url[1]=='t'&&url[2]=='t'&&url[3]=='p'&&url[4]=='s');
-    if (!https) return -1;
-    int slot = -1;
-    for (int i = 0; i < ASYNC_POST_MAX; i++)
-        if (!g_async_post[i].in_use) { slot = i; break; }
-    if (slot < 0) return -1;
+int64_t sys_http_post_start(const char *uurl, const char *uheaders, const char *ubody) {
+    if (!uurl) { kprintf("[HTTPPOST] reject: null url\n"); return -1; }
+    if (net_fetch_blocked()) { kprintf("[HTTPPOST] reject: NET_FAULTY\n"); return -1; }
+    // #615: THIS CHECK KILLED EVERY RING-3 HTTPS POST IN THE OS.
+    //
+    // #567 replaced a raw url[0..4] read with a "fault-safe" 8-byte bounce:
+    //     char scheme[8];
+    //     if (strncpy_from_user(scheme, uurl, sizeof(scheme)) < 0) return -1;
+    // but strncpy_from_user() -> validate_user_string() returns
+    // VALIDATE_STRING_UNTERMINATED (i.e. EFAULT) when it does not find a NUL
+    // inside max_len. A real URL is longer than 8 bytes, so this returned -1 for
+    // EVERY well-formed request, before any network I/O and without a single log
+    // line. Measured this pass: a full App Store install completed with ZERO
+    // POSTs on the wire and ZERO POST lines on serial, while the identical POST
+    // issued from inside the kernel (the NETTEST probe, which calls https_post()
+    // directly) returned 200 from the same endpoint on the same boot. That is
+    // the whole "guest-side POST silently fails" bug.
+    //
+    // Copy the URL FIRST with the primitive that is actually built for an
+    // arbitrary-length user string (kstrdup_opt -> strnlen_user with a 4MB
+    // bound), then test the scheme on the kernel copy. The https-only policy is
+    // unchanged and still enforced before anything is queued.
+    char *ku = kstrdup_opt(uurl);
+    if (!ku) { kprintf("[HTTPPOST] reject: kstrdup_opt(url) failed\n"); return -1; }
+    int https = (ku[0]=='h'&&ku[1]=='t'&&ku[2]=='t'&&ku[3]=='p'&&ku[4]=='s'&&ku[5]==':');
+    if (!https) { kprintf("[HTTPPOST] reject: non-https '%s'\n", ku); kfree(ku); return -1; }
+    // task #36: same atomic claim-and-stamp as the GET table.
+    int slot = fetchown_claim_rs(FETCHOWN_TAB_POST, async_owner_id());
+    if (slot < 0) { kfree(ku); return -1; }
     async_post_t *j = &g_async_post[slot];
-    j->state = 0; j->status = 0; j->body = 0; j->len = 0; j->detached = 0;
+    j->state = 0; j->status = 0; j->body = 0; j->len = 0;
     j->url = 0; j->headers = 0; j->reqbody = 0;
-    char *ku = kstrdup_opt(url);
-    char *kh = kstrdup_opt(headers);
-    char *kb = kstrdup_opt(body);
-    if (!ku || !kh || !kb) {
-        if (ku) kfree(ku);
+    char *kh = kstrdup_opt(uheaders);
+    char *kb = kstrdup_opt(ubody);
+    if (!kh || !kb) {
+        fetchown_abandon_rs(FETCHOWN_TAB_POST, (uint32_t)slot);
+        kfree(ku);
         if (kh) kfree(kh);
         if (kb) kfree(kb);
         return -1;
     }
+
+    // =======================================================================
+    // #745 THE PROMPT-INJECTION CHOKEPOINT.
+    //
+    // This is the ONE funnel every LLM client in the tree already passes
+    // through (userland/libc/aiclient.c and the separate userland/apps/paint/
+    // ai.c both call http_post_start), and the request body is sitting in
+    // KERNEL memory here, fully assembled, before anything is queued. Screening
+    // at this single point covers every existing route AND every route that
+    // does not exist yet, which a per-client guard cannot: paint/ai.c is a
+    // second, independent LLM client that would never have known about one.
+    //
+    // aiguard_screen_post_rs() returns ALLOW immediately for any POST that is
+    // not an LLM request, so the App Store, the #294 build service and
+    // ClassiCube pay one substring scan and nothing else.
+    //
+    // POLICY: HIGH severity BLOCKS. Lower severities are allowed and AUDITED.
+    // Nothing here is silent in either direction: a block returns a DISTINCT
+    // code (NET_ERR_AIGUARD, not the generic -1) so the client can say what
+    // happened, and both outcomes write a record naming the actor pid, the
+    // rule, the severity and the literal that matched.
+    // =======================================================================
+    {
+        int blen = 0;
+        while (kb[blen]) blen++;
+        aiguard_verdict_t v;
+        int verdict = aiguard_screen_post_rs(kb, (uint64_t)blen, &v);
+        if (v.llm && verdict != AIGUARD_ALLOW) {
+            process_t *ap = proc_current();
+            unsigned int apid = ap ? (unsigned int)ap->pid : 0u;
+            char det[160];
+            snprintf(det, sizeof(det),
+                     "%s llm-post rule=%s sev=%d matched=%s%s",
+                     verdict == AIGUARD_BLOCK ? "BLOCKED" : "flagged",
+                     v.rule, v.severity, v.matched,
+                     v.truncated ? " (scan truncated)" : "");
+            seclog_report_ai_injection(apid, det);
+            kprintf("[AIGUARD] %s pid=%u rule=%s cat=%s sev=%d matched='%s'\n",
+                    verdict == AIGUARD_BLOCK ? "BLOCK" : "annotate",
+                    apid, v.rule, v.category, v.severity, v.matched);
+            if (verdict == AIGUARD_BLOCK) {
+                fetchown_abandon_rs(FETCHOWN_TAB_POST, (uint32_t)slot);   // task #36
+                kfree(ku); kfree(kh); kfree(kb);
+                return NET_ERR_AIGUARD;
+            }
+        }
+    }
+
+    kprintf("[HTTPPOST] queued slot=%d %s\n", slot, ku);
     j->headers = kh; j->reqbody = kb;
-    j->in_use = 1;               // mark live BEFORE url so the worker only picks
-    j->url = ku;                 // it up once fully populated (url published last)
+    j->url = ku;                 // published LAST: the worker only picks the job
+                                 // up once the record is fully populated
     ensure_post_worker();
     // #426: wake the (now certainly existing) worker. Must come AFTER url is
     // published, or the worker could wake, run post_job_pending(), see an
@@ -2729,64 +3953,193 @@ int64_t sys_http_post_start(const char *url, const char *headers, const char *bo
     return slot;
 }
 
+// #745 SYS_AI_SCAN: screen ONE untrusted string against the kernel-owned
+// ruleset and hand the caller the rule that fired.
+//
+// This is deliberately INFORMATIONAL. It cannot be used to turn screening off
+// and it is not what makes the guard binding: a client that never calls it is
+// still blocked at sys_http_post_start(). It exists because a silent block is
+// its own bug, and a client can only tell the user "a tool observation from
+// files.read matched DirectPromptInjection (HIGH) on 'ignore all previous
+// instructions'" if something gives it those words.
+int64_t sys_ai_scan(const char *utext, void *uout) {
+    if (!utext || !uout) return -1;
+    char *kt = kstrdup_opt(utext);
+    if (!kt) return -14;
+    int len = 0;
+    while (kt[len]) len++;
+
+    aiguard_verdict_t v;
+    int verdict = aiguard_screen_rs(kt, (uint64_t)len, &v);
+    kfree(kt);
+
+    if (verdict != AIGUARD_ALLOW) {
+        process_t *ap = proc_current();
+        unsigned int apid = ap ? (unsigned int)ap->pid : 0u;
+        char det[160];
+        snprintf(det, sizeof(det), "scan %s rule=%s sev=%d matched=%s",
+                 verdict == AIGUARD_BLOCK ? "HIGH" : "low", v.rule,
+                 v.severity, v.matched);
+        seclog_report_ai_injection(apid, det);
+    }
+    if (copy_to_user(uout, &v, sizeof(v)) != 0) return -14;
+    return verdict;
+}
+
 int64_t sys_http_post_poll(int id, int *ustatus, uint32_t *ulen) {
-    if (id < 0 || id >= ASYNC_POST_MAX || !g_async_post[id].in_use) return -1;
+    if (async_job_auth(FETCHOWN_TAB_POST, id, ASYNC_POST_MAX, "post_poll") != 0) return FETCHOWN_EREFUSED;
     async_post_t *j = &g_async_post[id];
-    if (ustatus) *ustatus = j->status;
-    if (ulen) *ulen = j->len;
+    // #567: fault-safe out-param writes.
+    if (ustatus) { int s = j->status; if (copy_to_user(ustatus, &s, sizeof(s)) != 0) return -14; }
+    if (ulen)    { uint32_t l = j->len; if (copy_to_user(ulen, &l, sizeof(l)) != 0) return -14; }
     return j->state;
 }
 
 int64_t sys_http_post_read(int id, char *ubuf, uint32_t max) {
-    if (id < 0 || id >= ASYNC_POST_MAX || !g_async_post[id].in_use) return -1;
+    if (async_job_auth(FETCHOWN_TAB_POST, id, ASYNC_POST_MAX, "post_read") != 0) return FETCHOWN_EREFUSED;
     async_post_t *j = &g_async_post[id];
     if (j->state == 0) return -2;   // still running
     uint32_t n = 0;
+    int rc = 0;
     if (j->state == 1 && j->body && ubuf) {
         n = (j->len < max) ? j->len : max;
-        memcpy(ubuf, j->body, n);
+        // #567: fault-safe copy of the response body to userland.
+        if (n && copy_to_user(ubuf, j->body, n) != 0) rc = -14;
     }
     if (j->body) kfree(j->body);
-    j->body = 0; j->in_use = 0;
-    return (int64_t)n;
+    j->body = 0;
+    fetchown_release_rs(FETCHOWN_TAB_POST, (uint32_t)id);
+    return rc ? rc : (int64_t)n;
 }
 
 int64_t sys_http_post_cancel(int id) {
-    if (id < 0 || id >= ASYNC_POST_MAX || !g_async_post[id].in_use) return -1;
+    if (async_job_auth(FETCHOWN_TAB_POST, id, ASYNC_POST_MAX, "post_cancel") != 0) return FETCHOWN_EREFUSED;
     async_post_t *j = &g_async_post[id];
-    if (j->state == 0) { j->detached = 1; }    // worker frees on completion
-    else { if (j->body) kfree(j->body); j->body = 0; j->in_use = 0; }
+    if (j->state == 0) { fetchown_orphan_rs(FETCHOWN_TAB_POST, (uint32_t)id); }
+    else { if (j->body) kfree(j->body); j->body = 0;
+           fetchown_release_rs(FETCHOWN_TAB_POST, (uint32_t)id); }
     return 0;
+}
+
+// =========================================================================
+// #745 (task #36): PROCESS EXIT HOOK. Every termination path in this kernel
+// funnels through proc_exit() (a voluntary exit, a fatal signal via
+// signal.c's proc_exit(128+signo), and the crash handler in cpu/idt.c all
+// call it), so this is the one place that can close the leak.
+//
+// Runs on the dying process's own stack, under cli(), from proc_exit(). It
+// therefore must not block: it only frees kernel buffers and flips atomics,
+// exactly like cleanup_user_windows_for_process() two lines above the call.
+//
+// A job that is STILL RUNNING cannot be freed here (its worker thread is
+// inside https_get and owns the record), so it is ORPHANED: the worker frees
+// the body and returns the slot when it unwinds. That is the same handover
+// CANCEL has always used. A job that has already finished is freed outright.
+// =========================================================================
+void async_http_proc_exit(uint32_t owner) {
+    if (!owner) return;
+    int nf = 0, np = 0;
+    for (int i = 0; i < ASYNC_FETCH_MAX; i++) {
+        if (!fetchown_owned_by_rs(FETCHOWN_TAB_FETCH, (uint32_t)i, owner)) continue;
+        async_fetch_t *j = &g_async_fetch[i];
+        if (j->state == 0) {
+            fetchown_orphan_rs(FETCHOWN_TAB_FETCH, (uint32_t)i);
+        } else {
+            if (j->body) kfree(j->body);
+            j->body = 0;
+            fetchown_release_rs(FETCHOWN_TAB_FETCH, (uint32_t)i);
+        }
+        fetchown_note_exit_release_rs();
+        nf++;
+    }
+    for (int i = 0; i < ASYNC_POST_MAX; i++) {
+        if (!fetchown_owned_by_rs(FETCHOWN_TAB_POST, (uint32_t)i, owner)) continue;
+        async_post_t *j = &g_async_post[i];
+        if (j->state == 0) {
+            fetchown_orphan_rs(FETCHOWN_TAB_POST, (uint32_t)i);
+        } else {
+            if (j->body) kfree(j->body);
+            j->body = 0;
+            fetchown_release_rs(FETCHOWN_TAB_POST, (uint32_t)i);
+        }
+        fetchown_note_exit_release_rs();
+        np++;
+    }
+    if (nf || np) {
+        fetchown_stats_t sf, sp;
+        fetchown_stats_rs(FETCHOWN_TAB_FETCH, &sf);
+        fetchown_stats_rs(FETCHOWN_TAB_POST, &sp);
+        kprintf("[FETCHSEC] exit owner=%u released fetch=%d post=%d "
+                "(fetch owned=%u orphan=%u, post owned=%u orphan=%u, total=%u)\n",
+                owner, nf, np, sf.owned, sf.orphaned, sp.owned, sp.orphaned,
+                sf.exit_released);
+    }
+}
+
+// Boot check: run the ownership state machine's self-test and prove the Rust
+// module and these C tables agree about how many slots exist. A silent
+// disagreement would make some slots unreachable (Rust smaller) or hand out
+// out-of-range indices (Rust larger), so it is checked rather than commented.
+void fetchown_boot_check(void) {
+    int sf = fetchown_slots_rs(FETCHOWN_TAB_FETCH);
+    int sp = fetchown_slots_rs(FETCHOWN_TAB_POST);
+    int st = fetchown_selftest_rs();
+    kprintf("[RUST-SEC] fetchown selftest=%s slots fetch=%d/%d post=%d/%d\n",
+            st == 0 ? "PASS" : "FAIL", sf, ASYNC_FETCH_MAX, sp, ASYNC_POST_MAX);
+    if (st != 0 || sf != ASYNC_FETCH_MAX || sp != ASYNC_POST_MAX)
+        kprintf("[RUST-SEC] fetchown SELF-TEST FAILED step=%d - async HTTP job "
+                "ownership is NOT trustworthy on this build\n", st);
 }
 
 // HTTPS POST: url, extra headers (CRLF lines), JSON body -> response body into
 // ubuf (cap max_len). Returns bytes written, or -1; *ustatus gets HTTP status.
-int64_t sys_http_post(const char *url, const char *headers, const char *body,
-                      char *ubuf, uint32_t max_len, int *ustatus) {
-    if (!url || !ubuf || max_len == 0) return -1;
-    if (net_fetch_blocked(ustatus)) return -1;   // #549
+// #567: kernel-pointer core for the KERNEL-caller path (RC / shell / in-kernel
+// tools). url/headers/body/kbuf/status_out are all KERNEL pointers and the
+// caller already runs on the kernel CR3, so this runs https_post inline exactly
+// as the old !from_user branch did. It is called only from the wrapper below
+// (copy-user-lint trace depth 2), so its raw pointer use is out of scope; the
+// user-facing wrapper bounces every user pointer before delegating.
+static int64_t sys_http_post_k(const char *url, const char *headers, const char *body,
+                               char *kbuf, uint32_t max_len, int *status_out) {
     extern int https_post(const char *url, const char *headers, const char *body,
                           uint8_t **body_out, uint32_t *body_len_out, int *status_out);
     extern int wget_post_hdr(const char *, const char *, const char *,
                              uint8_t **, uint32_t *, int *);   // #414 plain-HTTP POST
+    if (net_fetch_blocked()) { if (status_out) *status_out = 0; return -1; }   // #549
     int https = (url[0]=='h'&&url[1]=='t'&&url[2]=='t'&&url[3]=='p'&&url[4]=='s');
+    uint8_t *rbody = 0; uint32_t blen = 0; int status = 0;
+    int r = https ? https_post(url, headers, body, &rbody, &blen, &status)
+                  : wget_post_hdr(url, headers ? headers : "", body ? body : "", &rbody, &blen, &status);
+    net_fetch_report(r, status);   // #549
+    if (r < 0) { if (rbody) kfree(rbody); if (status_out) *status_out = status; return -1; }
+    uint32_t n = (blen < max_len) ? blen : max_len;
+    if (rbody && n) memcpy(kbuf, rbody, n);
+    if (rbody) kfree(rbody);
+    if (status_out) *status_out = status;
+    return (int64_t)n;
+}
+
+int64_t sys_http_post(const char *uurl, const char *uheaders, const char *ubody,
+                      char *ubuf, uint32_t max_len, int *ustatus) {
+    if (!uurl || !ubuf || max_len == 0) return -1;
 
     process_t *cur = proc_current();
     int from_user = (cur && cur->privilege == PRIV_USER);
 
-    // Kernel callers (RC, shell, in-kernel tools) already run on the kernel CR3:
-    // run https_post inline (unchanged, proven path).
+    // Kernel callers already run on the kernel CR3 with kernel pointers: delegate
+    // straight to the raw core (#567: its *ustatus write is a kernel write there).
     if (!from_user) {
-        uint8_t *rbody = 0; uint32_t blen = 0; int status = 0;
-        int r = https ? https_post(url, headers, body, &rbody, &blen, &status)
-                      : wget_post_hdr(url, headers ? headers : "", body ? body : "", &rbody, &blen, &status);
-        net_fetch_report(r, status);   // #549
-        if (r < 0) { if (rbody) kfree(rbody); if (ustatus) *ustatus = status; return -1; }
-        uint32_t n = (blen < max_len) ? blen : max_len;
-        if (rbody) memcpy(ubuf, rbody, n);
-        if (rbody) kfree(rbody);
-        if (ustatus) *ustatus = status;
-        return (int64_t)n;
+        return sys_http_post_k(uurl, uheaders, ubody, ubuf, max_len, ustatus);
+    }
+
+    // #567: user caller - fault-safe circuit-breaker status, then bounce inputs.
+    extern int https_post(const char *url, const char *headers, const char *body,
+                          uint8_t **body_out, uint32_t *body_len_out, int *status_out);
+    extern int wget_post_hdr(const char *, const char *, const char *,
+                             uint8_t **, uint32_t *, int *);
+    if (net_fetch_blocked()) {
+        if (ustatus) { int z = 0; (void)copy_to_user(ustatus, &z, sizeof(z)); }
+        return -1;
     }
 
     // User caller: https_post() must run on the KERNEL address space (net_poll /
@@ -2803,15 +4156,47 @@ int64_t sys_http_post(const char *url, const char *headers, const char *body,
     //   - load the kernel CR3 now, run https_post() inline (the proven path; the
     //     #297 net_lock serializes its NIC/TCP-table access against net_poll)
     //   - restore cur->cr3 + the user CR3 before copying the reply back.
-    char *kurl = kstrdup_opt(url);
-    char *khdr = kstrdup_opt(headers);
-    char *kbody = kstrdup_opt(body);
+    char *kurl = kstrdup_opt(uurl);
+    char *khdr = kstrdup_opt(uheaders);
+    char *kbody = kstrdup_opt(ubody);
     if (!kurl || !khdr || !kbody) {
         if (kurl) kfree(kurl);
         if (khdr) kfree(khdr);
         if (kbody) kfree(kbody);
         return -1;
     }
+    // #745: the same screen as the async path, and it is LOAD-BEARING, not
+    // defensive. A first sweep concluded SYS_HTTP_POST had no live userland
+    // caller because the async trio replaced it at #264. That was WRONG:
+    // userland/apps/settings/main.c ai_test() posts
+    // {"model":...,"messages":[{"role":"user","content":"ping"}]} to whichever
+    // provider the user configured, through THIS entry point. Screening only
+    // the async path would have left a real LLM route open while the comment
+    // above it claimed a chokepoint. Same policy, same audit, same code.
+    {
+        int blen = 0;
+        while (kbody[blen]) blen++;
+        aiguard_verdict_t v;
+        int verdict = aiguard_screen_post_rs(kbody, (uint64_t)blen, &v);
+        if (v.llm && verdict != AIGUARD_ALLOW) {
+            unsigned int apid = (unsigned int)cur->pid;
+            char det[160];
+            snprintf(det, sizeof(det), "%s llm-post(sync) rule=%s sev=%d matched=%s",
+                     verdict == AIGUARD_BLOCK ? "BLOCKED" : "flagged",
+                     v.rule, v.severity, v.matched);
+            seclog_report_ai_injection(apid, det);
+            kprintf("[AIGUARD] %s pid=%u rule=%s cat=%s sev=%d matched='%s'\n",
+                    verdict == AIGUARD_BLOCK ? "BLOCK" : "annotate",
+                    apid, v.rule, v.category, v.severity, v.matched);
+            if (verdict == AIGUARD_BLOCK) {
+                kfree(kurl); kfree(khdr); kfree(kbody);
+                return NET_ERR_AIGUARD;
+            }
+        }
+    }
+
+    // Scheme check on the kernel copy (was a raw url[0..4] read).
+    int https = (kurl[0]=='h'&&kurl[1]=='t'&&kurl[2]=='t'&&kurl[3]=='p'&&kurl[4]=='s');
 
     extern uint64_t vmm_get_pml4(void);
     uint64_t user_cr3 = cur->cr3;
@@ -2837,11 +4222,18 @@ int64_t sys_http_post(const char *url, const char *headers, const char *body,
 
     kfree(kurl); kfree(khdr); kfree(kbody);
 
-    if (r < 0) { if (rbody) kfree(rbody); if (ustatus) *ustatus = status; return -1; }
+    // Back on the user CR3: ubuf/ustatus are valid and copy_*_user works. #567.
+    if (r < 0) {
+        if (rbody) kfree(rbody);
+        if (ustatus) (void)copy_to_user(ustatus, &status, sizeof(status));
+        return -1;
+    }
     uint32_t n = (blen < max_len) ? blen : max_len;
-    if (rbody && n) memcpy(ubuf, rbody, n);    // back on user CR3: ubuf valid
+    int rc = 0;
+    if (rbody && n && copy_to_user(ubuf, rbody, n) != 0) rc = -14;
     if (rbody) kfree(rbody);
-    if (ustatus) *ustatus = status;
+    if (rc) return rc;
+    if (ustatus && copy_to_user(ustatus, &status, sizeof(status)) != 0) return -14;
     return (int64_t)n;
 }
 
@@ -2859,17 +4251,43 @@ int64_t sys_print_list(void *out, int max) {
     return print_list(out, max);
 }
 
+// #700 B5: the printer registry is SYSTEM configuration. print_add() and
+// print_remove() both call printers_save(), which rewrites root-owned
+// /CONFIG/PRINTERS.CFG, and neither asked who was calling. Measured on golden
+// 1025: a uid-1000 process added a printer and the file came off the disk
+// holding its entry.
+//
+// It is not merely a file write. A printer entry is a HOST AND PORT the kernel
+// will later open a TCP connection to and POST document bytes at, on behalf of
+// anyone who prints, so an unprivileged write here is an unprivileged
+// redirection of everybody else's print jobs. Root only, like any other
+// system-wide device registration.
+//
+// The remove side gets the same rule, not because deletion leaks anything, but
+// because "add is privileged, remove is not" lets an attacker replace an entry
+// in two steps instead of one.
+static int print_cfg_caller_is_root(const char *what) {
+    process_t *p = proc_current();
+    if (!p || p->privilege != PRIV_USER) return 1;   // Ring 0
+    if (p->euid == 0) return 1;
+    kprintf("[PRINT] DENIED %s: uid=%u is not root; /CONFIG/PRINTERS.CFG is "
+            "system configuration\n", what, p->euid);
+    return 0;
+}
+
 int64_t sys_print_add(const char *name, const char *host, int port,
                       const char *queue, int make_default) {
     extern int print_add(const char *name, const char *host, uint16_t port,
                          const char *queue, int make_default);
     if (!name || !host || !queue) return -1;
+    if (!print_cfg_caller_is_root("print_add")) return -1;
     return print_add(name, host, (uint16_t)port, queue, make_default);
 }
 
 int64_t sys_print_remove(const char *name) {
     extern int print_remove(const char *name);
     if (!name) return -1;
+    if (!print_cfg_caller_is_root("print_remove")) return -1;
     return print_remove(name);
 }
 
@@ -2927,6 +4345,27 @@ int64_t sys_print_image(const char *printer, const char *path) {
     char *kp = kstrdup_opt(printer);
     char *kpath = kstrdup_opt(path);
     if (!kpath) { if (kp) kfree(kp); return -1; }
+
+    // #700 B3: the caller names a PATH and the kernel reads it, in Ring 0, with
+    // no check, and then POSTs the bytes to a network host. That is an arbitrary
+    // read joined to an exfiltration channel, and it is reachable by chaining
+    // B5: add a printer pointing anywhere, then print any file to it. MEASURED
+    // on golden 1025 at uid 1000: "[PRINT] image decode of /CONFIG/KIMI.KEY
+    // failed (-3)" - the decode failed only because a key file is not a JPEG;
+    // fat_read_file() had already handed the kernel its contents, and the
+    // .jpg/.jpeg branch above ships the raw bytes with no decode at all.
+    //
+    // The check is on the KERNEL copy, after kstrdup_opt, so it cannot be raced
+    // with the read that follows it (#509).
+    {
+        process_t *pi = proc_current();
+        if (pi && pi->privilege == PRIV_USER &&
+            perms_check(kpath, pi->euid, pi->egid, R_OK) != 0) {
+            if (kp) kfree(kp);
+            kfree(kpath);
+            return -1;
+        }
+    }
 
     extern uint64_t vmm_get_pml4(void);
     uint64_t user_cr3 = cur->cr3;
@@ -2990,13 +4429,43 @@ int64_t sys_print_screen(const char *printer) {
 // needed since bootlog_write() never touches user memory itself, only the
 // short kernel-side copy made here). Never fails loudly - logging must not
 // be able to crash or block whatever is trying to log.
-int64_t sys_bootlog_write(const char *msg) {
-    if (!msg) return -1;
+//
+// #700 B9: this endpoint stays OPEN to every Ring-3 caller, deliberately, and
+// that is a decision rather than an omission. /BOOTLOG.TXT is the only durable
+// diagnostic channel on the real iMac, the login screen that needs it runs as
+// whoever is logging in, and a log you must be root to write is a log that is
+// empty exactly when it matters. Two things were wrong and both are fixed here:
+//
+//  1. NEWLINE INJECTION. The message was interpolated verbatim, so a caller
+//     could embed "\n" and forge ADDITIONAL log lines that carry no [USERSPACE]
+//     marker at all. MEASURED on golden 1025: a uid-1000 process wrote
+//     "sgp-benign\n[KERNEL] FORGED-BY-UID-1000 all checks passed" and the file
+//     came off the disk with the second line present, indistinguishable from a
+//     kernel line. Every byte below 0x20 and 0x7F is now replaced, so one call
+//     is one line, always.
+//  2. NO ATTRIBUTION. "[USERSPACE]" says a Ring-3 process wrote it and nothing
+//     more. The uid is now stamped by the KERNEL, from the calling process,
+//     where the caller cannot choose it.
+//
+// HONEST LIMIT: this makes forged lines unforgeable and every line attributable.
+// It does NOT stop an unprivileged process from appending to a root-owned file,
+// and it is not a rate limit: a caller can still fill the log.
+int64_t sys_bootlog_write(const char *umsg) {
+    if (!umsg) return -1;
+    // #567: bounce the user message fault-safe into the kernel buffer.
     char buf[200];
-    int i = 0;
-    while (msg[i] && i < (int)sizeof(buf) - 1) { buf[i] = msg[i]; i++; }
-    buf[i] = '\0';
-    bootlog_write("[USERSPACE] %s", buf);
+    if (sc_bounce_str(umsg, buf, sizeof(buf)) != 0) return -1;
+
+    // #700 B9: one call is one line. Control characters (in particular \n and
+    // \r) become '.', so the caller cannot manufacture a record boundary.
+    for (int i = 0; buf[i]; i++) {
+        unsigned char c = (unsigned char)buf[i];
+        if (c < 0x20 || c == 0x7F) buf[i] = '.';
+    }
+
+    process_t *p = proc_current();
+    uint32_t who = (p && p->privilege == PRIV_USER) ? p->euid : 0;
+    bootlog_write("[USERSPACE uid=%u] %s", who, buf);
     return 0;
 }
 
@@ -3014,7 +4483,16 @@ int64_t sys_bootlog_write(const char *msg) {
 // mmap region lives between heap and stack (within PDPT[2], 2-3GB range).
 // Start below the user stack to avoid colliding with kernel PDPT entries
 // above 3GB that share read-only UEFI page directories.
-#define DEFAULT_MMAP_START  0xA0000000ULL
+// #522 stage 2: the anonymous-mmap arena now lives in the DEDICATED USER WINDOW
+// (mm/vmm.h USER_WIN_MMAP_BASE, PML4[1] +4GB), not in PDPT[2].
+//
+// The old value, 0xA0000000, sat 256MB INSIDE libc's declared heap maximum
+// (HEAP_START 0x90000000 + HEAP_MAX_SIZE 512MB reaches 0xB0000000) and grew
+// upward toward the user stack at 0xBFDF0000 with nothing to stop it. It shared
+// that 1GB with the app image and, on real hardware, with the framebuffer.
+// The new arena has 4GB of clear space below the stack arena and no device
+// memory anywhere near it.
+#define DEFAULT_MMAP_START  USER_WIN_MMAP_BASE
 
 int64_t sys_brk(uint64_t addr) {
     process_t *p = proc_current();
@@ -3062,52 +4540,47 @@ int64_t sys_brk(uint64_t addr) {
 #define VMA_ANONYMOUS  (1 << 5)
 #define VMA_LAZY       (1 << 10)
 #endif
-extern void *mm_create(void);
-extern void *vma_create(uint64_t start, uint64_t end, uint32_t flags);
-extern int   vma_add(void *mm, void *vma);
-extern void *vma_find(void *mm, uint64_t addr);
-extern int   do_munmap(void *mm, uint64_t addr, uint64_t length);
+// mm_create/vma_create/vma_add/vma_find/do_munmap: real prototypes now come
+// from mm/demand.h (included above for mm_prefault_range(), #510/#511). This
+// used to locally re-declare all five with loose `void *` signatures because
+// demand.h was not included in this file; that is gone (it conflicts with
+// demand.h's real mm_struct_t*/vma_t* types) rather than kept as dead code.
 
 int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags) {
-    (void)flags;
-
     process_t *p = proc_current();
-    if (!p || p->privilege != PRIV_USER) {
-        return -1;
-    }
+    if (!p || p->privilege != PRIV_USER) return -1;
     if (len == 0) return -1;
 
-    if (p->mmap_next == 0) {
-        p->mmap_next = DEFAULT_MMAP_START;
-    }
-    uint64_t length = (len + 0xFFF) & ~0xFFFULL;
-    if (addr == 0) {
-        addr = p->mmap_next;
-        p->mmap_next += length;
-    }
-    addr &= ~0xFFFULL;
-
     if (!p->mm) p->mm = mm_create();
-    if (p->mm) {
-        uint32_t vflags = VMA_READ | VMA_ANONYMOUS | VMA_PRIVATE | VMA_LAZY;
-        if (prot & 0x2) vflags |= VMA_WRITE;   // PROT_WRITE
-        if (prot & 0x4) vflags |= VMA_EXEC;    // PROT_EXEC
-        if ((prot & 0x7) == 0) vflags |= VMA_WRITE;  // default anon = R/W
-        void *vma = vma_create(addr, addr + length, vflags);
-        if (vma) {
-            if (vma_add(p->mm, vma) == 0) {
-                return (int64_t)addr;   // pages fault in on demand
-            }
-            kfree(vma);
-        }
-    }
+    if (!p->mm) return -1;
 
-    // Fallback: eager commit (keeps mmap working even if VMA setup failed).
-    uint64_t pages = length / VMM_PAGE_SIZE_4K;
-    if (vmm_alloc_user_pages(p->cr3, addr, pages, VMM_USER_RW) != 0) {
-        return -1;
-    }
-    return (int64_t)addr;
+    // #629/#636: ONE implementation, in mm/demand.c. This function used to do
+    // placement, the overlap decision, the VMA insert, the identity punch and
+    // the cursor update HERE, taking mm_lock() TWICE with a kmalloc between the
+    // two halves. Three things followed from that, all Ring-3 reachable:
+    //
+    //   - an explicit `addr` was used exactly as Ring 3 passed it. The ELF
+    //     image, the brk heap and the user stack have no VMAs in this kernel,
+    //     so vma_add() could not see them, and vmm_punch_demand_range() then
+    //     cleared every leaf that is PRESENT and not USER, which is precisely
+    //     what the kernel's own identity mappings are made of. One syscall,
+    //     mmap() at a kernel address, and the next kernel instruction fetch in
+    //     that address space faults.
+    //   - `mmap_next += length` had no ceiling, so after 4GB of cumulative
+    //     anonymous mmap (or one oversized request) the cursor walked out of
+    //     the arena into regions with no VMAs, the insert succeeded, and the
+    //     returned address aliased live memory.
+    //   - placement and insertion sat in different critical sections, so every
+    //     failed insert permanently burned `length` of address space and an
+    //     explicit-address mapping could land inside a range the cursor had
+    //     already promised.
+    //
+    // do_mmap() does all of it in a single mm_lock() critical section, bounds
+    // the cursor to the anonymous arena, and rejects an explicit address that
+    // is not a user address at all.
+    uint64_t r = do_mmap((mm_struct_t *)p->mm, addr, len,
+                         (uint32_t)prot, (uint32_t)flags, NULL, 0);
+    return (r == (uint64_t)-1) ? -1 : (int64_t)r;
 }
 
 int64_t sys_munmap(uint64_t addr, uint64_t len) {
@@ -3116,11 +4589,28 @@ int64_t sys_munmap(uint64_t addr, uint64_t len) {
         return -1;
     }
 
-    // #429: if this range is a demand-mapped VMA, drop the VMA + its pages so a
-    // later access does not silently re-fault a fresh zero page.
-    if (p->mm && vma_find(p->mm, addr)) {
-        return do_munmap(p->mm, addr, len);
-    }
+    if (len == 0) return -1;
+
+    // #629(b): NO vma_find() GATE. It did two wrong things at once. It called
+    // vma_find() WITHOUT the mm lock, which races a CLONE_VM sibling inside
+    // do_munmap() that is kfree()ing the very node this walk is standing on
+    // (interior nodes really do get freed since VMA splitting became real).
+    // And vma_find() returns NULL when `addr` lands in a HOLE, so a range that
+    // merely BEGINS in a hole skipped the VMA path entirely: it freed PTEs with
+    // vmm_free_user_pages() (which is not USER-gated), LEFT the VMAs in the
+    // list, and returned 0. Three calls reproduce it single-threaded: mmap 8
+    // pages, munmap the first 2 (clipping the VMA and creating a hole at the
+    // base), then munmap all 8. The surviving VMA re-faults fresh zero pages
+    // for memory the app was told was unmapped, and any later mmap into that
+    // range fails with "overlaps existing VMA" for the life of the process.
+    //
+    // do_munmap() now clips or removes every overlapping VMA AND tears down
+    // pages across the whole [start, end) under the lock, COW-aware and
+    // USER-gated, so it is correct for holes, for regions no VMA covers, and
+    // for mixed ranges. BEHAVIOUR CHANGE: munmap really unmaps everything in
+    // the requested range now, which is POSIX, but a caller passing an
+    // over-long length destroys more than it used to.
+    if (p->mm) return do_munmap((mm_struct_t *)p->mm, addr, len);
 
     uint64_t pages = (len + VMM_PAGE_SIZE_4K - 1) / VMM_PAGE_SIZE_4K;
     vmm_free_user_pages(p->cr3, addr, pages);
@@ -3135,10 +4625,11 @@ int64_t sys_putchar(int c) {
     // Write to process's stdout fd if available (PTY slave)
     process_t *proc = proc_current();
     if (proc && proc->fds[1]) {
-        extern int64_t file_write(struct file *f, const void *buf, size_t count);
         uint8_t ch = (uint8_t)c;
-        file_write(proc->fds[1], &ch, 1);
-        return c;
+        // #693: if the pty write fails, fall through to the serial console
+        // rather than silently swallowing the character.
+        if (file_write(proc->fds[1], &ch, 1) == 1)
+            return c;
     }
     kputc((char)c);
     return c;
@@ -3161,8 +4652,23 @@ int64_t sys_getchar(void) {
 // ============================================================================
 
 int64_t sys_time(void) {
-    // Return seconds since boot (assuming 100Hz timer)
-    return timer_ticks / 100;
+    // #594: return seconds since boot using the REAL timer rate. This used
+    // to hardcode timer_ticks/100, but the kernel's actual tick rate is
+    // g_timer_hz (250Hz, see SYS_UPTIME_MS/SYS_GET_TICKS/main.c), so the
+    // old code returned a "second" counter running at 100/250 = 40% of
+    // real speed. gettimeofday() (userland/libc/posixextra.c) builds
+    // tv_sec from this syscall but tv_usec from SYS_UPTIME_MS (which
+    // already used the correct g_timer_hz divisor) - the two fields
+    // silently desynced, making the derived millisecond clock (used by
+    // every Sys_Milliseconds()-driven app, e.g. OpenArena's frame timer)
+    // non-monotonic: it could stall for over a second then jump forward
+    // in one burst, exactly the freeze-then-burst symptom MEASURED via
+    // OpenArena screendumps (#594). Match the same divisor SYS_UPTIME_MS
+    // uses so both fields of gettimeofday() derive from one consistent
+    // real-time rate.
+    extern uint32_t g_timer_hz;
+    uint32_t hz = g_timer_hz ? g_timer_hz : 250;
+    return (int64_t)(timer_ticks / hz);
 }
 
 int64_t sys_clock(void) {
@@ -3219,6 +4725,23 @@ static void user_window_queue_event(int handle, gui_event_t *event) {
     uw->event_tail = (uw->event_tail + 1) % USER_EVENT_QUEUE_SIZE;
     uw->event_count++;
     wake_up(&uw->event_wq);   // #453: wake a win_get_event() sleeper (IRQ-safe)
+
+    // #745 ELEVATION, requirement 8: an app may only raise an elevation prompt
+    // in RESPONSE to input the window manager actually delivered to it. This is
+    // the single chokepoint where that delivery happens, so it is the only
+    // place the stamp is written, and sys_elev_request() is the only reader.
+    //
+    // KEY DOWN and BUTTON DOWN/UP only. Pointer MOTION and REDRAW are excluded
+    // deliberately: a cursor resting over a window, or a window simply being
+    // repainted, would otherwise keep it permanently "recently active" with no
+    // user intent behind it, and the property being defended is user intent.
+    if (event->type == EVENT_KEY_DOWN ||
+        event->type == EVENT_MOUSE_DOWN ||
+        event->type == EVENT_MOUSE_UP) {
+        extern uint64_t sched_now_ms(void);
+        process_t *op = proc_get(uw->owner_pid);
+        if (op) op->elev_last_input_ms = sched_now_ms();
+    }
 }
 
 // Event handler for user-space windows - routes events to per-window queue
@@ -3465,6 +4988,38 @@ static void win16_host_close_handler(window_t *win, gui_event_t *event) {
     win16_request_close();
 }
 
+// (#745) Titlebar CLOSE (X) handler for a DOS host window.
+//
+// WHY A SECOND HANDLER EXISTS. win16_host_create() is shared by the Win16
+// interpreter AND the DOS layer, but it installed the WIN16 handler on every
+// window it made, because Win16 was once its only client. So the X on a DOS
+// guest's window latched g_win16_close_requested, which only the Win16 message
+// pump ever reads. The DOS run loop never sees it, so the guest kept
+// interpreting at full speed (measured on VM 2933, golden 1848: the click
+// landed on the button, the window stayed open, and the scheduler still
+// reported top=dos:85,COMPOSIT:13 for the next 12 seconds) until it halted
+// itself or hit the 6-hour DOS_MAX_RUN_MS cap, with g_dos_busy still set so no
+// second DOS program could be launched. The comment on the Win16 install two
+// screens below describes exactly this failure mode, for Win16, while it was
+// live for DOS the whole time.
+//
+// Second defect closed here: the latch is a single global, so with a Win16 app
+// ALSO up, closing the DOS window would have quit the WIN16 app instead.
+static void dos_host_close_handler(window_t *win, gui_event_t *event) {
+    (void)win; (void)event;
+    extern void dos_request_close(void);
+    dos_request_close();
+}
+
+// Re-route an already-created host window's X to the DOS teardown path. A
+// slot-indexed setter rather than a create variant, so the DOS layer needs no
+// window_t of its own and win16_host_create() keeps ONE definition.
+void win16_host_route_close_to_dos(int slot) {
+    if (slot < 0 || slot >= MAX_USER_WINDOWS) return;
+    if (!user_windows[slot].window) return;
+    window_set_close_handler(user_windows[slot].window, dos_host_close_handler);
+}
+
 int win16_host_create(const char *title, int x, int y, int w, int h,
                       uint32_t **out_buf, int *out_w, int *out_h,
                       window_t **out_win) {
@@ -3561,6 +5116,21 @@ void win16_host_destroy(int slot) {
     wm_invalidate_all();
 }
 
+// #745: opt this window in to the compositor-drawn drop shadow. Pure flag set:
+// no buffer, no geometry, no kernel drawing. The shadow lives in pixels OUTSIDE
+// the window rectangle, which the kernel WM never owns; the userland compositor
+// paints that region (wallpaper/icons/widgets) immediately before it calls
+// SYS_COMPOSITOR_RENDER_WINDOWS, so it is the only layer that can darken them.
+// wm_invalidate_all() so the very first composite after the call includes the
+// band, rather than waiting for the next unrelated redraw.
+int64_t sys_win_set_shadow(int handle) {
+    if (handle < 0 || handle >= MAX_USER_WINDOWS || !user_windows[handle].window)
+        return -1;
+    user_windows[handle].window->flags |= WINDOW_FLAG_SHADOW;
+    wm_invalidate_all();
+    return 0;
+}
+
 // #185: mark an existing user window as borderless (no chrome). Sets the flag
 // then reallocates the content buffer to the new (now full-window) content size
 // so the app owns the entire window rectangle.
@@ -3617,7 +5187,15 @@ int64_t wm_focus_user_slot(int slot) {
     return 0;
 }
 
-int64_t sys_win_create(const char *title, int x, int y, int width, int height) {
+int64_t sys_win_create(const char *utitle, int x, int y, int width, int height) {
+    // #567: bounce the user title fault-safe; window_create() and the log
+    // snprintf below then read a kernel pointer. NULL title stays NULL.
+    char ktitle[128];
+    const char *title = 0;
+    if (utitle) {
+        if (strncpy_from_user(ktitle, utitle, sizeof(ktitle)) < 0) return -1;
+        title = ktitle;
+    }
     // Find free window slot
     int slot = -1;
     for (int i = 0; i < MAX_USER_WINDOWS; i++) {
@@ -3772,15 +5350,20 @@ int64_t sys_win_draw_pixel(int handle, int x, int y, uint32_t color) {
     return 0;
 }
 
-int64_t sys_win_draw_text(int handle, int x, int y, const char *text, uint32_t color) {
+int64_t sys_win_draw_text(int handle, int x, int y, const char *utext, uint32_t color) {
     if (handle < 0 || handle >= MAX_USER_WINDOWS || !user_windows[handle].window) {
         return -1;
     }
 
     user_window_t *uw = &user_windows[handle];
-    if (!uw->content_buffer || !text) {
+    if (!uw->content_buffer || !utext) {
         return -1;
     }
+
+    // #567: bounce the user string fault-safe into a kernel buffer before the
+    // per-glyph loop reads it byte-by-byte.
+    char *text = sc_dup_user_str(utext, 4096);
+    if (!text) return -1;
 
     // Render each character into the content_buffer using the full 8x16 bitmap font.
     // font_get_glyph returns a 16-byte array where each byte is one row, MSB = leftmost pixel.
@@ -3803,22 +5386,27 @@ int64_t sys_win_draw_text(int handle, int x, int y, const char *text, uint32_t c
         cx += 8;  // Advance by one character width (8 pixels)
     }
 
+    kfree(text);
     return 0;
 }
 
 // Antialiased TrueType text into a window's content buffer (window-relative,
 // clipped to the content rect). y is the top of the text line. Used by apps
 // that opt into TTF (e.g. Settings) via win_draw_text_ttf().
-int64_t sys_win_draw_text_ttf(int handle, int x, int y, const char *text, uint32_t color, int size) {
+int64_t sys_win_draw_text_ttf(int handle, int x, int y, const char *utext, uint32_t color, int size) {
     if (handle < 0 || handle >= MAX_USER_WINDOWS || !user_windows[handle].window) return -1;
     user_window_t *uw = &user_windows[handle];
-    if (!uw->content_buffer || !text) return -1;
+    if (!uw->content_buffer || !utext) return -1;
+    char *text = sc_dup_user_str(utext, 8192);   // #567: fault-safe bounce
+    if (!text) return -1;
     if (size < 6) size = 6;
     if (size > 64) size = 64;
 
     extern ttf_glyph_t *ttf_get_glyph(int codepoint, int size, int style);
     extern void ttf_get_metrics(int size, int *ascent, int *descent, int *line_gap);
     extern int ttf_get_advance(int codepoint, int size);
+    extern int ttf_get_kerning(int cp1, int cp2, int size);
+    extern int ttf_cursor_step(const ttf_glyph_t *g, int cp, int next_cp, int size);   // #589
 
     int ascent = size, descent = 0, line_gap = 0;
     ttf_get_metrics(size, &ascent, &descent, &line_gap);
@@ -3830,8 +5418,7 @@ int64_t sys_win_draw_text_ttf(int handle, int x, int y, const char *text, uint32
     for (const char *p = text; *p; p++) {
         int c = (unsigned char)*p;
         ttf_glyph_t *g = ttf_get_glyph(c, size, 0);
-        if (!g) { cx += size / 2; continue; }
-        if (g->bitmap) {
+        if (g && g->bitmap) {   // #589: null-glyph handled by the shared step below
             int gx = cx + g->xoff, gy = baseline + g->yoff;
             for (int row = 0; row < g->height; row++) {
                 int py = gy + row; if (py < 0 || py >= ch) continue;
@@ -3848,17 +5435,23 @@ int64_t sys_win_draw_text_ttf(int handle, int x, int y, const char *text, uint32
                 }
             }
         }
-        cx += g->advance ? g->advance : ttf_get_advance(c, size);
+        // #589: advance via the shared cursor-step helper. #575's kerning is now
+        // STRUCTURAL: this same function backs the measure path and every draw
+        // path, so ttf_measure() == win_draw_text_ttf() cannot drift again.
+        cx += ttf_cursor_step(g, c, p[1] ? (unsigned char)p[1] : 0, size);
     }
+    kfree(text);
     return 0;
 }
 
 // Face-aware antialiased TTF into a window (Font Browser previews, Studio text
 // preview). Same as sys_win_draw_text_ttf but with an explicit face + style.
-int64_t sys_win_draw_text_ttf_ex(int handle, int x, int y, const char *text, uint32_t color, int size, int face, int style) {
+int64_t sys_win_draw_text_ttf_ex(int handle, int x, int y, const char *utext, uint32_t color, int size, int face, int style) {
     if (handle < 0 || handle >= MAX_USER_WINDOWS || !user_windows[handle].window) return -1;
     user_window_t *uw = &user_windows[handle];
-    if (!uw->content_buffer || !text) return -1;
+    if (!uw->content_buffer || !utext) return -1;
+    char *text = sc_dup_user_str(utext, 8192);   // #567: fault-safe bounce
+    if (!text) return -1;
     if (size < 6) size = 6;
     if (size > 96) size = 96;
 
@@ -3866,6 +5459,7 @@ int64_t sys_win_draw_text_ttf_ex(int handle, int x, int y, const char *text, uin
     extern void ttf_get_metrics_f(int, int, int *, int *, int *);
     extern int ttf_get_advance_f(int, int, int);
     extern int ttf_get_kerning_f(int, int, int, int);
+    extern int ttf_cursor_step_f(int face, const ttf_glyph_t *g, int cp, int next_cp, int size);   // #589
 
     int ascent = size, descent = 0, line_gap = 0;
     ttf_get_metrics_f(face, size, &ascent, &descent, &line_gap);
@@ -3878,8 +5472,7 @@ int64_t sys_win_draw_text_ttf_ex(int handle, int x, int y, const char *text, uin
         int c = (unsigned char)*p;
         if (c == '\n') { cx = x; baseline += ascent - descent + line_gap; continue; }
         ttf_glyph_t *g = ttf_get_glyph_f(face, c, size, style);
-        if (!g) { cx += size / 2; continue; }
-        if (g->bitmap) {
+        if (g && g->bitmap) {   // #589: null-glyph handled by the shared step below
             int gx = cx + g->xoff, gy = baseline + g->yoff;
             for (int row = 0; row < g->height; row++) {
                 int py = gy + row; if (py < 0 || py >= ch) continue;
@@ -3896,16 +5489,19 @@ int64_t sys_win_draw_text_ttf_ex(int handle, int x, int y, const char *text, uin
                 }
             }
         }
-        cx += g->advance ? g->advance : ttf_get_advance_f(face, c, size);
-        if (p[1]) cx += ttf_get_kerning_f(face, c, (unsigned char)p[1], size);
+        // #589: shared cursor-step (advance + kerning), face-explicit variant.
+        cx += ttf_cursor_step_f(face, g, c, p[1] ? (unsigned char)p[1] : 0, size);
     }
+    kfree(text);
     return 0;
 }
 
-int64_t sys_win_draw_text_small(int handle, int x, int y, const char *text, uint32_t color) {
+int64_t sys_win_draw_text_small(int handle, int x, int y, const char *utext, uint32_t color) {
     if (handle < 0 || handle >= MAX_USER_WINDOWS || !user_windows[handle].window) return -1;
     user_window_t *uw = &user_windows[handle];
-    if (!uw->content_buffer || !text) return -1;
+    if (!uw->content_buffer || !utext) return -1;
+    char *text = sc_dup_user_str(utext, 4096);   // #567: fault-safe bounce
+    if (!text) return -1;
     // ~6x12 "medium" font: nearest-neighbor downscale of the 8x16 glyph, sized
     // between the 4x8 tooltip font and the 8x16 body font (for hints/captions).
     int cx = x;
@@ -3923,6 +5519,7 @@ int64_t sys_win_draw_text_small(int handle, int x, int y, const char *text, uint
         }
         cx += 7;  // 6px glyph + 1px spacing
     }
+    kfree(text);
     return 0;
 }
 
@@ -3970,13 +5567,45 @@ int64_t sys_win_get_event(int handle, void *event_buf, int timeout) {
         }
     }
 
-    // Pop event from queue
-    gui_event_t *out = (gui_event_t *)event_buf;
-    *out = uw->events[uw->event_head];
+    // Pop event from queue. #567: copy the popped event out to userland via a
+    // single fault-safe copy_to_user (was a raw *(gui_event_t *)event_buf write).
+    gui_event_t kout = uw->events[uw->event_head];
     uw->event_head = (uw->event_head + 1) % USER_EVENT_QUEUE_SIZE;
     uw->event_count--;
 
-    return out->type;  // Return event type (non-zero = event received)
+    if (copy_to_user(event_buf, &kout, sizeof(kout)) != 0) return -14;
+    return kout.type;  // Return event type (non-zero = event received)
+}
+
+// Present a KERNEL-OWNED host window (the DOS layer; the Win16 subsystem uses
+// the same slots). The caller has just filled the window's content_buffer and
+// wants it on screen.
+//
+// Why this exists rather than reusing sys_win_invalidate()'s body: a userland
+// app calls win_invalidate() from ITS OWN process, and that path goes through
+// window_invalidate(), which is not a mark at all, it is a synchronous
+// window_draw(). The DOS layer presents from the `dos` proc, and drawing the
+// window frame (titlebar text, so the shared TTF glyph cache) from there races
+// the compositor: the first build that did it took a General Protection Fault
+// in ttf_get_glyph_f(). So this MARKS THE REGION DIRTY AND NOTHING ELSE, and
+// lets the render gate (wm_is_dirty(), read by the kernel desktop loop and by
+// the userland compositor via SYS_WM_APPS_DIRTY) pick the frame up on the
+// thread that owns drawing.
+//
+// Why it was needed AT ALL: the DOS layer painted into the same content_buffer
+// a userland app uses and then called NOTHING, so nothing ever marked the WM
+// dirty on its behalf. The render gate is level-triggered on that flag, so a
+// DOS game's frames only reached the screen when something ELSE dirtied the
+// region, and in practice the only thing that did was an input event. Measured
+// on build 1732: with BATS running its game loop at 18.5 M insn/s and issuing
+// ~1.5 M EGA plane writes a second, the WHOLE 1280x800 framebuffer was
+// byte-identical over 3 seconds, one keystroke changed 27,456 pixels (all
+// inside the DOS window), and then it froze again. The game was never stuck.
+void win16_host_invalidate(int slot) {
+    if (slot < 0 || slot >= MAX_USER_WINDOWS || !user_windows[slot].window) return;
+    // NOT window_invalidate() (draws), NOT redraw_pending (that is the "app,
+    // please repaint" direction and re-arming it is the #564 ping-pong).
+    wm_invalidate_rect_async(&user_windows[slot].window->bounds);
 }
 
 int64_t sys_win_invalidate(int handle) {
@@ -3984,10 +5613,62 @@ int64_t sys_win_invalidate(int handle) {
         return -1;
     }
 
-    user_windows[handle].redraw_pending = 1;   // #453: app explicitly asked to repaint
+    // #564: do NOT set redraw_pending here (removed the #453 line that did).
+    // redraw_pending exists to tell the APP "please repaint" - the KERNEL-
+    // initiated direction, armed only by window create/resize (win_create()/
+    // sys_win_resize(), unaffected by this change). An app calling
+    // win_invalidate() is the OPPOSITE direction: it already repainted and is
+    // presenting the result. Re-arming redraw_pending here queued it ANOTHER
+    // EVENT_REDRAW - and since every app's EVENT_REDRAW handler ends by
+    // calling win_invalidate() again to present THAT repaint, this was an
+    // unconditional, permanent ping-pong for every window that ever calls
+    // win_invalidate() more than once (i.e. every real window): kernel WM
+    // dirty (wm_invalidate_rect below) never actually clears, defeating
+    // #564's whole point (idle CPU with a static window open measured
+    // UNCHANGED from before the #564 render-gate fix, root-caused to this).
+    // Nothing is lost by removing it: wm_draw_apps()'s content_buffer blit
+    // (user_window_draw_handler, unconditional whenever it runs) already
+    // re-presents the fresh pixels on the very next composite via the
+    // wm_invalidate_rect() call below - only the SPURIOUS extra EVENT_REDRAW
+    // notification back to the app is removed.
     window_invalidate(user_windows[handle].window);
     wm_invalidate_rect(&user_windows[handle].window->bounds);
     return 0;
+}
+
+// (#704) Force every open app window to repaint its CONTENT, not merely
+// recomposite whatever is already in its content_buffer.
+//
+// Measured gap this closes: neither path that changes the active theme
+// reaches an app's EVENT_REDRAW handler. sys_set_theme() (explicit switch in
+// Settings) calls wm_invalidate_all(), which only flips wm_state.dirty.
+// full_redraw, consumed by wm_draw_all()/wm_draw_apps() - the kernel-side
+// fallback compositor, which does not run while the real userland /APPS/
+// COMPOSIT is up. And win_invalidate() (SYS_WIN_INVALIDATE) deliberately
+// does NOT arm redraw_pending; see the comment on sys_win_invalidate() above
+// (#564: re-arming it there caused a permanent EVENT_REDRAW ping-pong).
+// redraw_pending was therefore only ever armed at window create and at
+// resize (#453) - which is why, before this change, editing a theme file and
+// waiting out the compositor's poll left every already-open window showing
+// its old colours until it was resized or reopened; only the compositor's
+// OWN chrome (taskbar/menus, restyled directly in compositor_apply_theme())
+// and brand-new windows picked up the change live.
+//
+// This reuses the exact same arming site as create/resize (redraw_pending),
+// so it flows through the existing coalesced "queue at most one EVENT_REDRAW"
+// logic in user_window_draw_handler and cannot reintroduce the #564
+// ping-pong: this function is called once per detected theme change (an
+// edge, not a level) from the compositor's existing ~2s theme poll, never
+// from a per-composite-frame path.
+int64_t sys_wm_force_redraw_all(void) {
+    int n = 0;
+    for (int i = 0; i < MAX_USER_WINDOWS; i++) {
+        if (user_windows[i].window) {
+            user_windows[i].redraw_pending = 1;
+            n++;
+        }
+    }
+    return (int64_t)n;
 }
 
 int64_t sys_win_get_pos(int handle, int *x, int *y) {
@@ -3995,8 +5676,9 @@ int64_t sys_win_get_pos(int handle, int *x, int *y) {
         return -1;
     }
     window_t *win = user_windows[handle].window;
-    if (x) *x = (int)win->bounds.x;
-    if (y) *y = (int)win->bounds.y;
+    // #567: fault-safe out-param writes.
+    if (x) { int kx = (int)win->bounds.x; if (copy_to_user(x, &kx, sizeof(kx)) != 0) return -14; }
+    if (y) { int ky = (int)win->bounds.y; if (copy_to_user(y, &ky, sizeof(ky)) != 0) return -14; }
     return 0;
 }
 
@@ -4010,21 +5692,17 @@ int64_t sys_win_move(int handle, int x, int y) {
     if (handle < 0 || handle >= MAX_USER_WINDOWS || !user_windows[handle].window)
         return -1;
     window_t *win = user_windows[handle].window;
-    extern uint32_t fb_get_width(void);
-    extern uint32_t fb_get_height(void);
     extern void wm_invalidate_all(void);
-    int sw = (int)fb_get_width();
-    int sh = (int)fb_get_height();
-    int w  = (int)win->bounds.width;
-    // Clamp so at least a 48px sliver stays reachable on screen.
-    int min_x = -(w - 48);
-    int max_x = sw - 48;
-    if (x < min_x) x = min_x;
-    if (x > max_x) x = max_x;
-    if (y < 0) y = 0;
-    if (y > sh - 24) y = sh - 24;
-    win->bounds.x = x;
-    win->bounds.y = y;
+    // (#745) One clamp, shared with the title-bar drag path. This used to be a
+    // private copy that clamped to the SCREEN (y >= 0), which let SYS_WIN_MOVE
+    // park a title bar under a top panel that wm_handle_mouse_move() would
+    // have refused: two paths describing the same geometry, disagreeing.
+    {
+        int32_t nx = (int32_t)x, ny = (int32_t)y;
+        wm_clamp_to_work_area(win, &nx, &ny);
+        win->bounds.x = nx;
+        win->bounds.y = ny;
+    }
     wm_invalidate_all();
     return 0;
 }
@@ -4042,8 +5720,9 @@ int64_t sys_win_get_size(int handle, int *width, int *height) {
     }
 
     user_window_t *uw = &user_windows[handle];
-    if (width) *width = uw->content_width;
-    if (height) *height = uw->content_height;
+    // #567: fault-safe out-param writes.
+    if (width)  { int kw = uw->content_width;  if (copy_to_user(width, &kw, sizeof(kw)) != 0) return -14; }
+    if (height) { int kh = uw->content_height; if (copy_to_user(height, &kh, sizeof(kh)) != 0) return -14; }
     return 0;
 }
 
@@ -4125,18 +5804,26 @@ int64_t sys_win_draw_image(int handle, int x, int y, int w, int h, uint32_t *src
     if (handle < 0 || handle >= MAX_USER_WINDOWS || !user_windows[handle].window) return -1;
     user_window_t *uw = &user_windows[handle];
     if (!uw->content_buffer || !src || w <= 0 || h <= 0) return -1;
+    // #567: bounce the whole user pixel buffer into a kernel buffer fault-safe,
+    // then blit from kernel memory (was a raw src[...] read per pixel).
+    if ((uint64_t)w * (uint64_t)h > 67108864ULL) return -1;   // 64M-px sanity guard
+    size_t nbytes = (size_t)w * (size_t)h * 4u;
+    uint32_t *ksrc = (uint32_t *)kmalloc(nbytes);
+    if (!ksrc) return -1;
+    if (copy_from_user(ksrc, src, nbytes) != 0) { kfree(ksrc); return -14; }
     int cw = uw->content_width, ch = uw->content_height;
     for (int ry = 0; ry < h; ry++) {
         int dy = y + ry;
         if (dy < 0 || dy >= ch) continue;
         uint32_t *drow = &uw->content_buffer[(uint32_t)dy * (uint32_t)cw];
-        uint32_t *srow = &src[(uint32_t)ry * (uint32_t)w];
+        uint32_t *srow = &ksrc[(uint32_t)ry * (uint32_t)w];
         for (int rx = 0; rx < w; rx++) {
             int dx = x + rx;
             if (dx < 0 || dx >= cw) continue;
             drow[dx] = srow[rx];
         }
     }
+    kfree(ksrc);
     window_invalidate(uw->window);
     return 0;
 }
@@ -4144,7 +5831,7 @@ int64_t sys_win_draw_image(int handle, int x, int y, int w, int h, uint32_t *src
 // Parallel image downscale (#279 stage 3a). One output-row range per core; the
 // range fn touches only kernel memory (src image + a kernel dst), so it is safe
 // to run on APs (which lack the caller's user mappings).
-struct img_scale_ctx { const uint32_t *src; uint32_t *dst; int sw, sh, dw, dh; };
+struct img_scale_ctx { const uint32_t *src; uint32_t *dst; int sw, sh, dw, dh; int has_alpha; };
 static void img_scale_rows(int y0, int y1, void *vc) {
     struct img_scale_ctx *c = (struct img_scale_ctx *)vc;
     for (int y = y0; y < y1; y++) {
@@ -4154,7 +5841,15 @@ static void img_scale_rows(int y0, int y1, void *vc) {
         for (int x = 0; x < c->dw; x++) {
             uint32_t p = srow[x * c->sw / c->dw];
             uint32_t a = (p >> 24) & 0xFF;
-            if (a < 255) {
+            // #745: only composite when the SOURCE ACTUALLY CARRIES ALPHA. The
+            // BMP decoder documents its output as 0x00RRGGBB - the alpha byte is
+            // deliberately zero, not "transparent" - so treating it as alpha
+            // blended EVERY pixel of EVERY BMP onto white and handed back a pure
+            // white image with a success return. That is why the OOBE wallpaper
+            // grid drew 20 blank cells while open/read/decode/blit all reported
+            // success, and it hits every SYS_DECODE_IMAGE caller with a BMP
+            // (browser <img>, Files thumbnails), not just the wizard.
+            if (c->has_alpha && a < 255) {
                 uint32_t ia = 255u - a;
                 uint32_t r = (((p >> 16) & 0xFF) * a + 255u * ia) / 255u;
                 uint32_t g = (((p >> 8)  & 0xFF) * a + 255u * ia) / 255u;
@@ -4193,25 +5888,36 @@ int64_t sys_decode_image(const void *data, uint32_t len, uint32_t target,
         if (maxrows < 1) { image_free(&img); return -1; }
         dh = maxrows;
     }
-    uint32_t *dst = (uint32_t *)out;
     // #279 stage 3a: scale in parallel across cores. APs cannot write the user
-    //  buffer (no user mappings), so on multi-core scale into a kernel temp
-    // then copy to user here; single-core scales in place.
+    // buffer (no user mappings). #567: always scale into a kernel temp, then do
+    // one fault-safe copy_to_user (removes the single-core in-place raw write to
+    // the user `out` buffer, which was TOCTOU-unsafe).
     extern int smp_get_core_count(void);
     extern void smp_parallel_for(int, int, void (*)(int, int, void *), void *);
     uint32_t outbytes = (uint32_t)dw * (uint32_t)dh * 4u;
-    uint32_t *kdst = (smp_get_core_count() > 1) ? (uint32_t *)kmalloc(outbytes) : 0;
-    if (kdst) {
-        struct img_scale_ctx ctx = { img.pixels, kdst, sw, sh, dw, dh };
-        smp_parallel_for(0, dh, img_scale_rows, &ctx);
-        memcpy(dst, kdst, outbytes);
-        kfree(kdst);
-    } else {
-        struct img_scale_ctx ctx = { img.pixels, dst, sw, sh, dw, dh };
-        img_scale_rows(0, dh, &ctx);
+    uint32_t *kdst = (uint32_t *)kmalloc(outbytes);
+    if (!kdst) { image_free(&img); return -1; }
+    // Does this source actually carry alpha? A decoder that emits 0x00RRGGBB
+    // leaves every alpha byte zero; a real RGBA image essentially never has a
+    // zero alpha in EVERY pixel. Sample rather than scan the whole image.
+    int has_alpha = 0;
+    {
+        uint32_t total = (uint32_t)sw * (uint32_t)sh;
+        uint32_t step = total / 256u; if (step == 0) step = 1;
+        for (uint32_t i = 0; i < total; i += step) {
+            if (((img.pixels[i] >> 24) & 0xFFu) != 0u) { has_alpha = 1; break; }
+        }
     }
+    struct img_scale_ctx ctx = { img.pixels, kdst, sw, sh, dw, dh, has_alpha };
+    if (smp_get_core_count() > 1) smp_parallel_for(0, dh, img_scale_rows, &ctx);
+    else                          img_scale_rows(0, dh, &ctx);
     image_free(&img);
-    dims[0] = dw; dims[1] = dh;
+    int drc = 0;
+    if (copy_to_user(out, kdst, outbytes) != 0) drc = -14;
+    kfree(kdst);
+    if (drc) return drc;
+    int kdims[2] = { dw, dh };
+    if (copy_to_user(dims, kdims, sizeof(kdims)) != 0) return -14;
     return (int64_t)(dw * dh * 4);
 }
 
@@ -4220,9 +5926,14 @@ int64_t sys_decode_image(const void *data, uint32_t len, uint32_t target,
 // Filesystem syscalls (mkdir, rmdir, unlink, rename, readdir)
 // ============================================================================
 
-int64_t sys_mkdir(const char *path, int mode) {
+int64_t sys_mkdir(const char *upath, int mode) {
     (void)mode;
-    if (!path) return -1;
+    if (!upath) return -1;
+    // #567: bounce the user path fault-safe; every use below reads kpath, and
+    // the subsystem calls (fat/smb) now receive a kernel pointer.
+    char kpath[SC_PATH_MAX];
+    if (strncpy_from_user(kpath, upath, sizeof(kpath)) < 0) return -14;
+    const char *path = kpath;
 
     // #317: SMB network share.
     if (path_is_smb(path)) {
@@ -4234,14 +5945,7 @@ int64_t sys_mkdir(const char *path, int mode) {
     process_t *p = proc_current();
     if (p && p->privilege == PRIV_USER) {
         char parent[256];
-        strncpy(parent, path, sizeof(parent) - 1);
-        parent[255] = '\0';
-        char *last_slash = strrchr(parent, '/');
-        if (last_slash && last_slash != parent) {
-            *last_slash = '\0';
-        } else {
-            parent[0] = '/'; parent[1] = '\0';
-        }
+        sc_parent_of(path, parent, sizeof(parent));   // #676: one shared helper
         if (perms_check(parent, p->euid, p->egid, W_OK) != 0) {
             return -1;  // EACCES
         }
@@ -4254,8 +5958,12 @@ int64_t sys_mkdir(const char *path, int mode) {
     return ret;
 }
 
-int64_t sys_rmdir(const char *path) {
-    if (!path) return -1;
+int64_t sys_rmdir(const char *upath) {
+    if (!upath) return -1;
+    // #567: bounce the user path fault-safe.
+    char kpath[SC_PATH_MAX];
+    if (strncpy_from_user(kpath, upath, sizeof(kpath)) < 0) return -14;
+    const char *path = kpath;
 
     // #317: SMB network share.
     if (path_is_smb(path)) {
@@ -4267,14 +5975,7 @@ int64_t sys_rmdir(const char *path) {
     process_t *p = proc_current();
     if (p && p->privilege == PRIV_USER) {
         char parent[256];
-        strncpy(parent, path, sizeof(parent) - 1);
-        parent[255] = '\0';
-        char *last_slash = strrchr(parent, '/');
-        if (last_slash && last_slash != parent) {
-            *last_slash = '\0';
-        } else {
-            parent[0] = '/'; parent[1] = '\0';
-        }
+        sc_parent_of(path, parent, sizeof(parent));   // #676: one shared helper
         if (perms_check(parent, p->euid, p->egid, W_OK) != 0) {
             return -1;  // EACCES
         }
@@ -4285,8 +5986,12 @@ int64_t sys_rmdir(const char *path) {
     return ret;
 }
 
-int64_t sys_unlink(const char *path) {
-    if (!path) return -1;
+int64_t sys_unlink(const char *upath) {
+    if (!upath) return -1;
+    // #567: bounce the user path fault-safe.
+    char kpath[SC_PATH_MAX];
+    if (strncpy_from_user(kpath, upath, sizeof(kpath)) < 0) return -14;
+    const char *path = kpath;
 
     // #317: SMB network share.
     if (path_is_smb(path)) {
@@ -4294,26 +5999,30 @@ int64_t sys_unlink(const char *path) {
         return smb_delete(path) == 0 ? 0 : -1;
     }
 
-    // ext2 volume (#99): delete on the mounted ext2 filesystem.
-    if (path_is_ext2(path)) {
-        return ext2_unlink(ext2_relpath(path)) == 0 ? 0 : -1;
-    }
-
-    // Permission check: need W_OK on parent directory
+    // Permission check: need W_OK on parent directory.
+    // #676: this USED TO SIT BELOW the "/ext2/..." early return, so an explicit
+    // "/ext2/"-prefixed path reached ext2_unlink() having been checked by
+    // NOTHING. Any Ring-3 process could delete any file on the ext2 root, the
+    // permission database and the shadow file included, purely by spelling the
+    // path with the mount prefix. The check now runs FIRST, for every backend.
     process_t *p = proc_current();
     if (p && p->privilege == PRIV_USER) {
         char parent[256];
-        strncpy(parent, path, sizeof(parent) - 1);
-        parent[255] = '\0';
-        char *last_slash = strrchr(parent, '/');
-        if (last_slash && last_slash != parent) {
-            *last_slash = '\0';
-        } else {
-            parent[0] = '/'; parent[1] = '\0';
-        }
+        sc_parent_of(path, parent, sizeof(parent));   // #676: one shared helper
         if (perms_check(parent, p->euid, p->egid, W_OK) != 0) {
             return -1;  // EACCES
         }
+    }
+
+    // ext2 volume (#99): delete on the mounted ext2 filesystem.
+    if (path_is_ext2(path)) {
+        int r = ext2_unlink(ext2_relpath(path));
+        // #679: drop the policy entry with the file. A stale entry is not
+        // inert: the next file created under that name would silently inherit
+        // the DELETED file's owner and mode instead of its creator's, because
+        // perms_on_create() declines to overwrite an entry that already exists.
+        if (r == 0) perms_remove(path);
+        return r == 0 ? 0 : -1;
     }
 
     int ret = fat_delete(&g_fat_fs, path);
@@ -4321,8 +6030,14 @@ int64_t sys_unlink(const char *path) {
     return ret;
 }
 
-int64_t sys_rename(const char *oldpath, const char *newpath) {
-    if (!oldpath || !newpath) return -1;
+int64_t sys_rename(const char *u_oldpath, const char *u_newpath) {
+    if (!u_oldpath || !u_newpath) return -1;
+    // #567: bounce both user paths fault-safe into kernel buffers.
+    char kold[SC_PATH_MAX], knew[SC_PATH_MAX];
+    if (strncpy_from_user(kold, u_oldpath, sizeof(kold)) < 0) return -14;
+    if (strncpy_from_user(knew, u_newpath, sizeof(knew)) < 0) return -14;
+    const char *oldpath = kold;
+    const char *newpath = knew;
 
     // #317: SMB network share (both paths must be on the same share).
     if (path_is_smb(oldpath) || path_is_smb(newpath)) {
@@ -4362,100 +6077,6 @@ int64_t sys_rename(const char *oldpath, const char *newpath) {
     return ret;
 }
 
-int64_t sys_readdir(int fd, void *entry_buf) {
-    // Read next directory entry from an open directory fd.
-    // entry_buf points to a dirent structure: { char name[256]; uint32_t type; uint32_t size; }
-    if (fd < 0 || fd >= LEGACY_MAX_FDS || !fd_used[fd]) {
-        return -1;
-    }
-
-    if (!entry_buf) return -1;
-
-    typedef struct {
-        char name[256];
-        uint32_t type;    // 0 = file, 1 = directory
-        uint32_t size;
-    } dirent_t;
-    // #503 argtab sizeof-lock: SYS_READDIR arg2 (SZ_DIRENT in rustkern.rs).
-    _Static_assert(sizeof(dirent_t) == 264,
-                   "#503 argtab: SZ_DIRENT in rustkern.rs is stale");
-
-    // #317 pass 4: NFS-backed directory fd. NFSv3 READDIR carries only names
-    // (no type/size), so entries are reported as files with size 0; cat/ls work.
-    if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used && smbfd[fd].is_dir &&
-        smbfd[fd].is_nfs) {
-        smb_fd_t *s = &smbfd[fd];
-        dirent_t *de = (dirent_t *)entry_buf;
-        nfs_entry3_t *e;
-        for (;;) {
-            e = nfs_readdir(s->dirh);
-            if (!e) return -1;   // end-of-dir or error
-            if (e->name[0] == '.' &&
-                (e->name[1] == 0 || (e->name[1] == '.' && e->name[2] == 0)))
-                continue;
-            break;
-        }
-        int i = 0; while (e->name[i] && i < 255) { de->name[i] = e->name[i]; i++; }
-        de->name[i] = '\0';
-        de->type = 0;
-        de->size = 0;
-        return 0;
-    }
-
-    // #317: SMB-backed directory fd.
-    if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used && smbfd[fd].is_dir) {
-        smb_fd_t *s = &smbfd[fd];
-        dirent_t *de = (dirent_t *)entry_buf;
-        smb_dirent_t sde;
-        // Skip the "." and ".." pseudo-entries the server returns; the Files app
-        // synthesizes its own ".." row.
-        for (;;) {
-            int r = smb_readdir(s->dirh, &sde);
-            if (r != 0) return -1;   // 1 = end-of-dir, -1 = error
-            if (sde.name[0] == '.' &&
-                (sde.name[1] == 0 || (sde.name[1] == '.' && sde.name[2] == 0)))
-                continue;
-            break;
-        }
-        int i = 0; while (sde.name[i] && i < 255) { de->name[i] = sde.name[i]; i++; }
-        de->name[i] = '\0';
-        de->type = sde.is_directory ? 1 : 0;
-        de->size = (uint32_t)sde.size;
-        return 0;
-    }
-
-    // ext2-backed directory fd.
-    if (fd >= 3 && e2fd[fd].used && e2fd[fd].is_dir) {
-        ext2_fd_t *e = &e2fd[fd];
-        dirent_t *de = (dirent_t *)entry_buf;
-        char nm[256]; uint32_t cino = 0; uint8_t ft = 0;
-        if (ext2_readdir_ino(e->dir_ino, &e->dir_pos, nm, sizeof(nm), &cino, &ft) != 0) return -1;
-        int i = 0; while (nm[i] && i < 255) { de->name[i] = nm[i]; i++; } de->name[i] = '\0';
-        de->type = (ft == 2) ? 1 : 0;   // EXT2_FT_DIR == 2
-        de->size = 0;
-        if (ft != 2) { ext2_inode_t in; if (ext2_read_inode(cino, &in) == 0) de->size = in.i_size; }
-        return 0;
-    }
-
-    dirent_t *de = (dirent_t *)entry_buf;
-
-    // Use the FAT readdir function which takes a fat_dir_entry_t
-    fat_dir_entry_t raw_entry;
-    char name_buf[256];
-    int ret = fat_readdir(&fd_table[fd], &raw_entry, name_buf);
-    if (ret != 0) return -1;  // No more entries
-
-    // Copy the name
-    int i = 0;
-    while (name_buf[i] && i < 255) { de->name[i] = name_buf[i]; i++; }
-    de->name[i] = '\0';
-
-    // Set type: bit 0x10 in attr means directory
-    de->type = (raw_entry.attr & 0x10) ? 1 : 0;
-    de->size = raw_entry.file_size;
-
-    return 0;  // Success, got an entry
-}
 
 /* #317 pass 4: verify the terminal cat/ls path (sys_open/sys_read/sys_readdir)
    over the persisted network mounts loaded from /CONFIG/NETMOUNTS.CFG. This is
@@ -4473,11 +6094,13 @@ void netfs_fdpath_selftest(void) {
         if (!mp) continue;
         kprintf("[NETFD] --- %s ---\n", mp);
         // ls: open the mount root as a directory, enumerate via sys_readdir.
-        int dfd = (int)sys_open(mp, 0);   // O_RDONLY
+        // #567: kernel-buffer callers use the *_k cores (the user-facing wrappers
+        // now copy_*_user, which would reject these kernel pointers).
+        int dfd = (int)sys_open_k(mp, 0);   // O_RDONLY
         if (dfd < 0) { kprintf("[NETFD]   open dir FAILED\n"); continue; }
         int cnt = 0; dirent_t de;
         char first[256]; first[0] = 0;
-        while (sys_readdir(dfd, &de) == 0 && cnt < 64) {
+        while (sys_readdir_k(dfd, (sc_dirent_t *)&de) == 0 && cnt < 64) {
             if (cnt == 0) { int i=0; while(de.name[i]&&i<255){first[i]=de.name[i];i++;} first[i]=0; }
             kprintf("[NETFD]   %s\n", de.name);
             cnt++;
@@ -4486,7 +6109,7 @@ void netfs_fdpath_selftest(void) {
         kprintf("[NETFD]   ls: %d entries (first=%s)\n", cnt, first);
         // cat: read TEST.TXT from the mount root via the fd path.
         char fp[320]; snprintf(fp, sizeof(fp), "%s/TEST.TXT", mp);
-        int ffd = (int)sys_open(fp, 0);
+        int ffd = (int)sys_open_k(fp, 0);
         if (ffd >= 0) {
             char buf[256]; int64_t r = sys_read(ffd, buf, sizeof(buf) - 1);
             if (r > 0) { buf[r] = 0; kprintf("[NETFD]   cat %s (%d bytes): %s\n", fp, (int)r, buf); }
@@ -4511,7 +6134,7 @@ void ext2_dir_open_selftest(void) {
     typedef struct { char name[256]; uint32_t type; uint32_t size; } dirent_t;
     for (unsigned di = 0; di < sizeof(dirs)/sizeof(dirs[0]); di++) {
         const char *path = dirs[di];
-        int64_t fd = sys_open(path, 0);
+        int64_t fd = sys_open_k(path, 0);   // #567: kernel path -> *_k core
         if (fd < 0) {
             kprintf("[#308] FAIL: sys_open(%s) returned -1 (dir open broken)\n", path);
             continue;
@@ -4519,7 +6142,7 @@ void ext2_dir_open_selftest(void) {
         int count = 0;
         dirent_t de;
         char first[64]; first[0] = 0;
-        while (sys_readdir((int)fd, &de) == 0) {
+        while (sys_readdir_k((int)fd, (sc_dirent_t *)&de) == 0) {
             if (count == 0) { int i=0; while (de.name[i] && i<63){first[i]=de.name[i];i++;} first[i]=0; }
             count++;
             if (count > 5000) break;
@@ -4539,46 +6162,150 @@ void ext2_dir_open_selftest(void) {
 // Working directory syscalls
 // ============================================================================
 
-int64_t sys_getcwd(char *buf, uint64_t size) {
+int64_t sys_getcwd(char *ubuf, uint64_t size) {
     process_t *p = proc_current();
-    if (!p || !buf || size == 0) return -1;
+    if (!p || !ubuf || size == 0) return -1;
     // Return "/" as default if cwd has not been set
     const char *src = (p->cwd[0]) ? p->cwd : "/";
+    // #567: build the (possibly truncated) result in a kernel buffer, then one
+    // fault-safe copy_to_user. p->cwd is bounded to sizeof(kbuf), so capping the
+    // kernel staging buffer at that size never truncates below the old behavior.
+    char kbuf[sizeof(p->cwd)];
+    uint64_t cap = (size < sizeof(kbuf)) ? size : sizeof(kbuf);
     uint64_t i = 0;
-    while (i < size - 1 && src[i]) { buf[i] = src[i]; i++; }
-    buf[i] = '\0';
+    while (i < cap - 1 && src[i]) { kbuf[i] = src[i]; i++; }
+    kbuf[i] = '\0';
+    if (copy_to_user(ubuf, kbuf, i + 1) != 0) return -14;
     return (int64_t)i;
 }
 
-int64_t sys_chdir(const char *path) {
-    process_t *p = proc_current();
-    if (!p || !path) return -1;
+// ===========================================================================
+// #745 Stage 3: sys_chdir. FOUR faults, characterised before any was fixed.
+//
+// FAULT 1, WRONG ACCESS CLASS (the one fs/perms.c predicted). It validated by
+// calling sys_open_k(resolved, 0), i.e. O_RDONLY, which asks perms_check() for
+// R_OK on the target. POSIX chdir requires SEARCH (x) and explicitly NOT read.
+// The two differ exactly on a 0711 directory, which is what #745 Stage 1 moved
+// /CONFIG to, so after that change a non-root process could TRAVERSE /CONFIG
+// but could not cd into it. Recorded there as a pre-existing chdir bug, and it
+// is: it applies to every 0711 directory, not just that one.
+//
+// FAULT 2, NO DIRECTORY CHECK AT ALL. Nothing tested that the target was a
+// directory. chdir("/CONFIG/PASSWD") on a world-readable 0644 FILE returned 0
+// and set cwd to it, after which every relative path in that process resolved
+// under a regular file. That is a plain correctness bug and it is independent
+// of permissions: it reproduces at uid 0.
+//
+// FAULT 3, SILENT TRUNCATION. `resolved` was 256 bytes while the bounced path
+// is SC_PATH_MAX (1024), and both branches truncated with `while (i < 255 ...)`
+// and then proceeded. A path longer than 255 bytes silently became a DIFFERENT
+// path, one that could name a different directory than the caller asked for.
+// Truncating a path and then acting on it is never acceptable; the answer is to
+// refuse.
+//
+// FAULT 4, NO CANONICALIZATION, which is what makes fault 3 reachable rather
+// than theoretical. Nothing collapsed "." or popped "..", so cwd accumulated
+// them: from /HOME/ADMIN, `cd ..` set cwd to the literal string
+// "/HOME/ADMIN/..", and the next `cd ..` to "/HOME/ADMIN/../..". Each one grows
+// the string by three bytes, so a user holding down `cd ..` in the shell walks
+// cwd into the 256-byte truncation of fault 3 in under ninety keystrokes. It
+// also meant getcwd() reported a path no human would recognise.
+//
+// THE FIX uses the primitives that already exist rather than new ones:
+// perms_canon_rs() (rustkern/permpath.rs) is the SAME canonicalizer
+// perms_check() runs before every permission decision, so the string that is
+// authorized here and the string stored in p->cwd are canonical in the same
+// sense; and perms_check(target, X_OK) is the POSIX rule, with the walker
+// already requiring x on every component above it.
+//
+// Justified-C, not Rust: there is no new policy here. The one DECISION, what a
+// path canonicalizes to, is already in Rust and is called; the rest is in-place
+// repair of an existing C handler against existing C primitives (p->cwd,
+// sys_open_k, the FAT/ext2 resolvers), which is the entanglement exemption.
+// ===========================================================================
 
-    // Build absolute resolved path
-    char resolved[256];
-    if (path[0] == '/') {
-        int i = 0;
-        while (i < 255 && path[i]) { resolved[i] = path[i]; i++; }
-        resolved[i] = '\0';
+// Is `kpath` an existing DIRECTORY? 1 yes, 0 no (exists but not a directory, or
+// does not exist). Local filesystems only; the caller handles SMB/NFS.
+//
+// Deliberately NOT a new resolver: it asks the same two backends sys_stat_path
+// asks, in the same order (ext2 root first, then FAT), so chdir and stat cannot
+// disagree about what a directory is.
+static int sc_path_is_dir(const char *kpath) {
+    if (kpath[0] == '/' && kpath[1] == '\0') return 1;   // "/" always
+    {
+        const char *rel = 0;
+        if (path_is_ext2(kpath))        rel = ext2_relpath(kpath);
+        else if (path_root_ext2(kpath)) rel = kpath;
+        if (rel) {
+            uint32_t ino = ext2_resolve_path(rel);
+            if (ino) {
+                ext2_inode_t in;
+                if (ext2_read_inode(ino, &in) == 0)
+                    return ((in.i_mode & 0xF000) == 0x4000) ? 1 : 0;
+            }
+            // Not on ext2: fall through to FAT (may be ESP-only).
+        }
+    }
+    fat_file_t f;
+    if (fat_open(&g_fat_fs, kpath, &f) != 0) return 0;
+    int is_dir = f.is_dir || (f.attr & FAT_ATTR_DIRECTORY);
+    if (f.open) fat_close(&f);
+    return is_dir ? 1 : 0;
+}
+
+int64_t sys_chdir(const char *upath) {
+    process_t *p = proc_current();
+    if (!p || !upath) return -1;
+    char kpath[SC_PATH_MAX];
+    if (strncpy_from_user(kpath, upath, sizeof(kpath)) < 0) return -14;
+
+    // FAULT 3: build the absolute form in a FULL-SIZE buffer and REFUSE on
+    // overflow. Never truncate a path and then act on it.
+    char abs[SC_PATH_MAX];
+    if (kpath[0] == '/') {
+        uint64_t i = 0;
+        while (kpath[i]) { if (i >= sizeof(abs) - 1) return -1; abs[i] = kpath[i]; i++; }
+        abs[i] = '\0';
     } else {
-        // Relative path: prepend current cwd
         const char *base = (p->cwd[0]) ? p->cwd : "/";
-        int ci = 0;
-        while (ci < 254 && base[ci]) { resolved[ci] = base[ci]; ci++; }
-        if (ci > 0 && resolved[ci - 1] != '/') { resolved[ci++] = '/'; }
-        int pi = 0;
-        while (ci < 255 && path[pi]) { resolved[ci++] = path[pi++]; }
-        resolved[ci] = '\0';
+        uint64_t ci = 0;
+        while (base[ci]) { if (ci >= sizeof(abs) - 2) return -1; abs[ci] = base[ci]; ci++; }
+        if (ci > 0 && abs[ci - 1] != '/') abs[ci++] = '/';
+        uint64_t pi = 0;
+        while (kpath[pi]) { if (ci >= sizeof(abs) - 1) return -1; abs[ci++] = kpath[pi++]; }
+        abs[ci] = '\0';
     }
 
-    // Validate: try to open the path to confirm it exists
-    int fd = (int)sys_open(resolved, 0);
-    if (fd < 0) return -1;  // path does not exist
-    sys_close(fd);
+    // FAULT 4: canonicalize with the SAME function perms_check() uses, so the
+    // string checked and the string stored agree with the permission walker.
+    extern int perms_canon_rs(const char *src, char *out, uint32_t cap);
+    char canon[SC_PATH_MAX];
+    if (perms_canon_rs(abs, canon, sizeof(canon)) < 0) return -1;
 
-    // Update process cwd
-    int i = 0;
-    while (i < 255 && resolved[i]) { p->cwd[i] = resolved[i]; i++; }
+    // p->cwd is PROC_CWD_MAX. Refuse rather than store a truncated cwd, which
+    // would make every later relative path in this process resolve elsewhere.
+    uint64_t clen = 0;
+    while (canon[clen]) clen++;
+    if (clen >= PROC_CWD_MAX) return -1;
+
+    // FAULT 2: it must actually BE a directory. SMB/NFS keep the existing
+    // open-based validation; they are remote namespaces with server-side
+    // access control and no perms.c entries.
+    if (path_is_smb(canon) || path_is_nfs(canon)) {
+        int fd = (int)sys_open_k(canon, 0);
+        if (fd < 0) return -1;
+        sys_close(fd);
+    } else {
+        if (!sc_path_is_dir(canon)) return -1;
+        // FAULT 1: POSIX chdir needs SEARCH, not READ. perms_path_check_rs()
+        // requires x on every component above `canon` as part of this call.
+        if (p->privilege == PRIV_USER &&
+            perms_check(canon, p->euid, p->egid, X_OK) != 0)
+            return -13;   // EACCES
+    }
+
+    uint64_t i = 0;
+    while (canon[i]) { p->cwd[i] = canon[i]; i++; }
     p->cwd[i] = '\0';
     return 0;
 }
@@ -4679,13 +6406,21 @@ int64_t sys_setegid(uint32_t egid) {
     return -1;  // EPERM
 }
 
+// #554: chmod/chown must behave correctly on BOTH ext2/POSIX paths (perms.c,
+// unchanged below) and genuine FAT (ESP: /boot, /EFI) paths, which have no
+// uid/gid/mode concept at all. The fs-type routing decision + the FAT-specific
+// handling (map the write bit to the real on-disk FAT_ATTR_READ_ONLY bit;
+// refuse chown outright rather than fake success) is new logic, so it lives in
+// Rust per the 2026-07-16 rule (rustkern/fsperm.rs: rk_chmod_route /
+// rk_chown_route). perms_chmod()/perms_set() themselves are untouched.
 int64_t sys_chmod(const char *path, uint16_t mode) {
     if (!path) return -1;
 
     process_t *p = proc_current();
     if (!p) return -1;
 
-    return perms_chmod(path, p->euid, mode);
+    extern int64_t rk_chmod_route(const char *path, uint16_t mode, uint32_t euid);
+    return rk_chmod_route(path, mode, p->euid);
 }
 
 int64_t sys_chown(const char *path, uint32_t uid, uint32_t gid) {
@@ -4694,66 +6429,250 @@ int64_t sys_chown(const char *path, uint32_t uid, uint32_t gid) {
     process_t *p = proc_current();
     if (!p) return -1;
 
-    // Only root can change ownership
-    if (p->euid != 0) return -1;  // EPERM
-
-    // Get current mode, then update owner
-    uint32_t cur_uid, cur_gid;
-    uint16_t cur_mode;
-    if (perms_get(path, &cur_uid, &cur_gid, &cur_mode) != 0) {
-        cur_mode = 0755;  // Default
-    }
-    perms_set(path, uid, gid, cur_mode);
-    return 0;
+    extern int64_t rk_chown_route(const char *path, uint32_t uid, uint32_t gid, uint32_t euid);
+    return rk_chown_route(path, uid, gid, p->euid);
 }
 
-int64_t sys_passwd_change(const char *username, const char *old_pass, const char *new_pass) {
-    if (!username || !new_pass) return -1;
+// #554: mirrors FsPermInfo in rustkern/fsperm.rs; kept here only for the
+// sizeof lock (Rust owns the actual read/write of this buffer, via
+// rk_fs_perm_info - see sys_fs_perm_info() below).
+typedef struct {
+    uint8_t  fs_type;        // 0 = ext2/POSIX (perms.c), 1 = FAT (ESP), 2 = other (SMB/NFS)
+    uint8_t  is_dir;
+    uint8_t  has_perm_entry; // fs_type==0 only
+    uint8_t  fat_attr;       // fs_type==1 only: raw on-disk FAT_ATTR_* byte
+    uint16_t mode;           // fs_type==0 only: rwxrwxrwx bits
+    uint16_t reserved;
+    uint32_t uid;            // fs_type==0 only
+    uint32_t gid;            // fs_type==0 only
+} k_fsperm_info_t;
+// #554 argtab sizeof-lock: SYS_FS_PERM_INFO arg3 (SZ_FSPERM_INFO in
+// rustkern/argtab.rs).
+_Static_assert(sizeof(k_fsperm_info_t) == 16,
+               "#554 argtab: SZ_FSPERM_INFO in rustkern/argtab.rs is stale");
+
+// Filesystem-aware permission/attribute info: ext2/POSIX paths report the
+// perms.c-backed uid/gid/mode (the SAME values sys_open()'s perms_check()
+// actually enforces); genuine FAT paths report the real on-disk attribute
+// byte and never a fabricated ext2-style mode. Backs the Files Properties
+// permissions tab and the details-view attribute columns/filtering.
+int64_t sys_fs_perm_info(const char *u_path, int reserved_unused, void *ubuf) {
+    (void)reserved_unused;
+    if (!u_path || !ubuf) return -1;
+
+    // #745: bounce ONCE, then the SAME gate sys_stat_path uses. This syscall
+    // reported uid, gid and mode for any path to any caller, which is a
+    // strictly larger disclosure than stat's, and it was the other half of the
+    // limit recorded against /CONFIG 0711 in fs/perms.c.
+    char kpath[SC_PATH_MAX];
+    if (sc_bounce_str(u_path, kpath, sizeof(kpath)) != 0) return -14;
+    if (sc_meta_permit(kpath) != 0) return -13;   // EACCES
+
+    int is_net = (path_is_smb(kpath) || path_is_nfs(kpath)) ? 1 : 0;
+    extern int64_t rk_fs_perm_info(const char *path, int smb_or_nfs, void *out);
+    return rk_fs_perm_info(kpath, is_net, ubuf);
+}
+
+// #565: parse a /THEMES/*.mtheme file and add/update it in the live theme
+// table (see kernel/gui/themes.c theme_load_file_runtime()). Bounded copy of
+// the path, mirroring the existing sys_bootlog_write() idiom for user
+// strings elsewhere in this file.
+int64_t sys_theme_load_file(const char *upath) {
+    if (!upath) return -1;
+    // #567: bounce the user path fault-safe into the kernel buffer.
+    char buf[128];
+    if (sc_bounce_str(upath, buf, sizeof(buf)) != 0) return -1;
+
+    // #700 B7: the caller names ANY path and the kernel opens and parses it in
+    // Ring 0. MEASURED on golden 1025 at uid 1000: theme_load_file_runtime()
+    // was handed the root-owned 0600 /CONFIG/AUTHKEYS and returned a live theme
+    // index, logging "[Themes] Loaded theme 'Untitled' as new index 12 from
+    // /CONFIG/AUTHKEYS". No disclosure channel back to the caller was found
+    // (the parser keeps only the fields it recognises, and a key file sets
+    // none), so the measured impact today is a parser reachable on unreadable
+    // input rather than a read primitive. That is an argument about the CURRENT
+    // parser, not about the boundary, and it stops being true the first time
+    // anyone adds a string field a theme can carry. The check is on the read
+    // itself, which is where it stays correct.
+    {
+        process_t *p = proc_current();
+        if (p && p->privilege == PRIV_USER &&
+            perms_check(buf, p->euid, p->egid, R_OK) != 0)
+            return -1;
+    }
+
+    extern int theme_load_file_runtime(const char *path);
+    return (int64_t)theme_load_file_runtime(buf);
+}
+
+// (themes ticket, 2026-08-07) See SYS_THEME_CONTRAST_CORRECTIONS in syscall.h.
+// No permission check: this only reads a small already-public integer off the
+// live in-memory theme table (the same table SYS_THEME_COLOR already exposes
+// color-by-color to any process), it names no path and touches no file.
+int64_t sys_theme_contrast_corrections(int64_t theme_id) {
+    extern int theme_get_contrast_corrections(int theme_id);
+    return (int64_t)theme_get_contrast_corrections((int)theme_id);
+}
+
+// ===========================================================================
+// #745 Stage 3: THE CREDENTIAL CHOKEPOINT (sys_passwd_change / sys_su).
+//
+// TWO faults lived in these two functions and only one of them was on the
+// ticket.
+//
+// FAULT 1, the one that was reported: neither called users_authenticate().
+// users.h states the rule in as many words, that interactive auth paths MUST
+// call users_authenticate() so failed attempts are counted and lockouts
+// enforced (#566). sys_su() called the raw user_verify_password() instead, so a
+// Ring-3 loop over SYS_SU could try passwords for ANY account, root included,
+// at syscall speed, with no attempt counter, no escalating lockout and no audit
+// record. The lockout that protects the login gate and the lock screen was
+// simply not in this path.
+//
+// Writing the rule in a header did not enforce the rule. It is now enforced by
+// the COMPILER: user_verify_password() is static to proc/users.c and is no
+// longer declared in users.h, so there is no second authenticator left in the
+// kernel for anyone to reach for, and a future caller that tries fails to
+// build. That is the same mechanism-not-memo move that mwt (#707) and buildq
+// (#699) each had to make after a convention failed three times.
+//
+// FAULT 2, found while fixing fault 1, and considerably worse: `username` is a
+// RING-3 POINTER and each function read it MORE THAN ONCE. That is the #509
+// check-and-use hazard applied to identity, and it is a full local privilege
+// escalation rather than a hardening nit:
+//
+//   sys_passwd_change() read it THREE times. user_lookup_name() resolved the
+//   caller's own account, the target->uid == p->euid authorization test passed
+//   on it, and then user_set_password() read the SAME pointer a third time. A
+//   sibling thread that rewrites the buffer to "root" between the check and the
+//   use sets ROOT'S PASSWORD to a string the unprivileged caller chose, knowing
+//   only its own password. su(1) with that password is then uid 0.
+//
+//   sys_su() read it TWICE: verify the caller's own account, then
+//   user_lookup_name() resolves "root", and the caller is handed uid 0 outright.
+//
+// The fix is the one this file already applies everywhere else (#567): bounce
+// EVERY user string into a kernel buffer ONCE, up front, and let every later
+// use read only that copy. The name that was authenticated and the name whose
+// identity is granted are then provably the same BYTES rather than arguably the
+// same string. The passwords are bounced too. They are read only once by
+// today's callees, but "read once" is a property of the current callee, not of
+// the trust boundary, and this whole comment exists because someone relied on
+// exactly that kind of property.
+//
+// AUDIT. Both paths now write an actor-identified record through bootlog_write:
+// an identity change that leaves no trace is not something an operator can ever
+// reconstruct. The record names the acting uid AND the requested account, so a
+// successful escalation and a failed guess are distinguishable after the fact.
+// ===========================================================================
+
+int64_t sys_passwd_change(const char *u_username, const char *u_old, const char *u_new) {
+    if (!u_username || !u_new) return -1;
 
     process_t *p = proc_current();
     if (!p) return -1;
 
-    // Look up the target user
+    // FAULT 2: bounce ONCE. Every use below reads these kernel copies only.
+    char username[USERNAME_MAX];
+    char old_pass[SC_PASSWORD_MAX];
+    char new_pass[SC_PASSWORD_MAX];
+    if (sc_bounce_str(u_username, username, sizeof(username)) != 0) return -14;
+    if (sc_bounce_str(u_new, new_pass, sizeof(new_pass)) != 0) return -14;
+    int have_old = (u_old && sc_bounce_str(u_old, old_pass, sizeof(old_pass)) == 0);
+    if (!have_old) old_pass[0] = 0;
+
     user_entry_t *target = user_lookup_name(username);
     if (!target) return -1;
 
-    // Non-root users can only change their own password and must provide old password
+    // Non-root may change only its OWN password, and must prove the old one.
     if (p->euid != 0) {
-        if (target->uid != p->euid) return -1;  // EPERM
-        if (!old_pass) return -1;
-        if (user_verify_password(username, old_pass) != 0) return -1;
+        if (target->uid != p->euid) {
+            bootlog_write("[AUTH] passwd DENIED: uid=%u tried to change '%s' (#745)",
+                          (unsigned)p->euid, username);
+            return -1;  // EPERM
+        }
+        if (!have_old) return -1;
+        // FAULT 1: rate-limited and counted, exactly like the login gate.
+        int ar = users_authenticate(username, old_pass);
+        if (ar != 0) {
+            bootlog_write("[AUTH] passwd DENIED: uid=%u bad old password for '%s'%s (#745)",
+                          (unsigned)p->euid, username,
+                          (ar == -2) ? " [LOCKED OUT]" : "");
+            return (ar == -2) ? -2 : -1;
+        }
     }
 
-    return user_set_password(username, new_pass);
+    // The strength policy runs inside user_set_password(), which is the one
+    // chokepoint. A policy rejection comes back as PW_RC(code) and is passed
+    // straight out to Ring 3, so `passwd` can print the rule instead of
+    // "password NOT changed".
+    int r = user_set_password(username, new_pass);
+    if (PW_RC_IS_POLICY(r)) {
+        bootlog_write("[AUTH] passwd REFUSED: uid=%u, '%s', %s (policy code %d)",
+                      (unsigned)p->euid, username,
+                      pw_policy_message(PW_RC_CODE(r)), PW_RC_CODE(r));
+        return r;
+    }
+    bootlog_write("[AUTH] passwd %s: uid=%u changed '%s' (#745)",
+                  (r == 0) ? "OK" : "FAILED", (unsigned)p->euid, username);
+    return r;
 }
 
-int64_t sys_su(const char *username, const char *password) {
-    if (!username || !password) return -1;
+// Returns 0 on success, -1 on bad credentials, -2 when the account is locked
+// out right now. -2 is additive: every existing caller tests non-zero.
+int64_t sys_su(const char *u_username, const char *u_password) {
+    if (!u_username || !u_password) return -1;
 
     process_t *p = proc_current();
     if (!p) return -1;
 
-    // Verify credentials
-    if (user_verify_password(username, password) != 0) {
-        return -1;
+    // FAULT 2: bounce ONCE, then never look at Ring-3 memory again. The whole
+    // point of this function is to decide WHICH identity the caller gets, so a
+    // name that can change underneath the decision is the entire vulnerability.
+    char username[USERNAME_MAX];
+    char password[SC_PASSWORD_MAX];
+    if (sc_bounce_str(u_username, username, sizeof(username)) != 0) return -14;
+    if (sc_bounce_str(u_password, password, sizeof(password)) != 0) return -14;
+
+    // #745 followup: non-root may su only to its OWN account. su-to-root by an
+    // unprivileged process is exactly the cross-account authentication we are
+    // removing: it was a slow oracle against root and, via the shared lockout
+    // counter, a way to lock root out of the login gate. Deny BEFORE
+    // users_authenticate() so the target's counter is never touched. Root still
+    // su's to anyone; the in-kernel login gate (gui/login.c) is unaffected.
+    if (!caller_may_authenticate(username)) {
+        bootlog_write("[AUTH] su DENIED (not own account): uid=%u -> '%s' (#745)",
+                      (unsigned)p->euid, username);
+        return -1;   // EPERM; target's lockout state untouched
     }
 
-    // Look up user to get UID/GID
+    // FAULT 1: the rate-limited authenticator, which is now the only one there
+    // is. An account under lockout is refused here before any password compare.
+    int ar = users_authenticate(username, password);
+    if (ar != 0) {
+        bootlog_write("[AUTH] su DENIED: uid=%u -> '%s'%s (#745)",
+                      (unsigned)p->euid, username,
+                      (ar == -2) ? " [LOCKED OUT]" : "");
+        return (ar == -2) ? -2 : -1;
+    }
+
     user_entry_t *target = user_lookup_name(username);
     if (!target) return -1;
 
-    // Switch identity
+    uint32_t from = p->euid;
     p->uid  = target->uid;
     p->gid  = target->gid;
     p->euid = target->uid;
     p->egid = target->gid;
 
+    bootlog_write("[AUTH] su OK: uid=%u -> '%s' uid=%u (#745)",
+                  (unsigned)from, username, (unsigned)target->uid);
     return 0;
 }
 
-int64_t sys_adduser(const char *username, uint32_t uid, uint32_t gid,
-                    const char *home, const char *shell) {
-    if (!username) return -1;
+int64_t sys_adduser(const char *u_username, uint32_t uid, uint32_t gid,
+                    const char *u_home, const char *u_shell) {
+    if (!u_username) return -1;
 
     process_t *p = proc_current();
     if (!p) return -1;
@@ -4761,23 +6680,341 @@ int64_t sys_adduser(const char *username, uint32_t uid, uint32_t gid,
     // Only root can create users
     if (p->euid != 0) return -1;  // EPERM
 
+    // #567: bounce the user strings fault-safe into kernel buffers before any
+    // subsystem (user_create/fat_mkdir/perms_set) reads them.
+    char username[USERNAME_MAX];
+    char home[SC_PATH_MAX];
+    char shell[SC_PATH_MAX];
+    if (sc_bounce_str(u_username, username, sizeof(username)) != 0) return -1;
+    int have_home  = (u_home  && sc_bounce_str(u_home,  home,  sizeof(home))  == 0);
+    int have_shell = (u_shell && sc_bounce_str(u_shell, shell, sizeof(shell)) == 0);
+
     int ret = user_create(username, uid, gid,
-                          home ? home : "/HOME",
-                          shell ? shell : "/APPS/MSH",
+                          have_home  ? home  : "/HOME",
+                          have_shell ? shell : "/APPS/MSH",
                           username);
     if (ret != 0) return -1;
 
+    // #745: this call has no password parameter and never wrote a shadow entry,
+    // so the account it created landed in PASSWD with NOTHING in SHADOW. That
+    // reads as "password not set yet" but is really an undefined state, and it
+    // is how the shipped `ref` account (uid 1002) came to exist. Make the state
+    // EXPLICIT: mark the account no-login ("*"). It still cannot authenticate,
+    // which is correct for an account nobody gave a password to, but it is now a
+    // deliberate no-login account rather than an absent record, so
+    // users_can_authenticate() and the lock policy see the truth.
+    //
+    // Callers that want a usable account must use sys_user_create_pw(), which
+    // sets the password in the same call or creates nothing at all.
+    (void)user_set_nologin(username);
+    bootlog_write("[USERS] adduser '%s' uid=%u: created NO-LOGIN (no password supplied); "
+                  "use SYS_USER_CREATE_PW for a usable account (#745)",
+                  username, (unsigned)uid);
+
     // Create home directory if specified
-    if (home && home[0]) {
+    if (have_home && home[0]) {
         fat_mkdir(&g_fat_fs, home);
         perms_set(home, uid, gid, 0750);
         users_make_home_skeleton(home, uid, gid);
     }
 
     // Persist to disk
-    users_sync();
+    if (users_sync() != 0)
+        kprintf("[USERS] sync failed after user change\n");
 
     return 0;
+}
+
+// #745: create an account and set its password, or create nothing. See the
+// comment on the declaration in syscall.h for why this is one call and not two.
+//
+// Written in C rather than Rust, and the justification is entanglement, not
+// convenience: every line here is a call into existing C subsystems that own
+// mutable global state (user_table/shadow_table in proc/users.c, g_fat_fs,
+// perms.c) and none of it is a decision. The two DECISIONS this path makes,
+// which uid a new account gets and whether a session may lock, are both in
+// rustkern/sessionid.rs with a boot self-test.
+// (#306) Enumerate installable disks for Ring 3. Non-destructive, so any
+// process may call it - the disk picker in /APPS/INSTALL needs it before the
+// user has authenticated as root.
+//
+// usize is the caller's sizeof(inst_target_t). A stale userland binary built
+// against a different layout would otherwise walk the array with the wrong
+// stride and silently show garbage capacities in a DESTRUCTIVE picker.
+int64_t sys_inst_enum(void *ubuf, int max, int usize) {
+    process_t *p = proc_current();
+    if (!p) return -1;
+    if (!ubuf) return -1;
+    if (usize != (int)sizeof(inst_target_t)) {
+        kprintf("[INSTALLER] sys_inst_enum: caller struct is %d bytes, kernel is %d\n",
+                usize, (int)sizeof(inst_target_t));
+        return -22;
+    }
+    if (max <= 0) return -1;
+    if (max > INST_MAX_TARGETS) max = INST_MAX_TARGETS;
+
+    inst_target_t t[INST_MAX_TARGETS];
+    int n = inst_enumerate_targets(t, max);
+    if (n < 0) return -1;
+    if (n > max) n = max;
+    if (n > 0 && copy_to_user(ubuf, t, (size_t)n * sizeof(inst_target_t)) != 0)
+        return -14;
+    return n;
+}
+
+// (#306) Install MayteraOS onto a disk. DESTRUCTIVE and root-only.
+//
+// This takes (kind,index) rather than a descriptor ON PURPOSE. If Ring 3 could
+// hand in a full inst_target_t, it could clear is_boot and aim the installer at
+// the disk we are running from, or inflate sectors past the real capacity and
+// walk the clone off the end. So the kernel re-enumerates and uses ITS OWN
+// descriptor; the caller only gets to say which of the kernel's disks it means.
+int64_t sys_inst_install(int kind, int index) {
+    process_t *p = proc_current();
+    if (!p) return -1;
+    if (p->euid != 0) {
+        kprintf("[INSTALLER] refusing install: uid %u is not root\n", p->euid);
+        return -1;
+    }
+    if (kind < 0 || kind > 255 || index < 0 || index > 255) return -1;
+
+    inst_target_t t[INST_MAX_TARGETS];
+    int n = inst_enumerate_targets(t, INST_MAX_TARGETS);
+    if (n < 0) return -1;
+
+    for (int i = 0; i < n; i++) {
+        if (t[i].kind != (uint8_t)kind || t[i].index != (uint8_t)index)
+            continue;
+        if (t[i].is_boot) {
+            kprintf("[INSTALLER] refusing install onto the boot disk\n");
+            return -3;
+        }
+        kprintf("[INSTALLER] Ring 3 requested install to kind=%d idx=%d\n", kind, index);
+        return installer_do_install_target(&t[i], NULL, NULL);
+    }
+    kprintf("[INSTALLER] no enumerated disk matches kind=%d idx=%d\n", kind, index);
+    return -4;
+}
+
+int64_t sys_user_create_pw(const char *u_username, const char *u_password,
+                           uint32_t uid, uint32_t gid, const char *u_home) {
+    process_t *p = proc_current();
+    if (!p) return -1;
+    if (p->euid != 0) return -1;                  // root only, same as sys_adduser
+
+    char username[USERNAME_MAX];
+    char password[128];
+    char home[SC_PATH_MAX];
+    if (sc_bounce_str(u_username, username, sizeof(username)) != 0) return -1;
+    if (sc_bounce_str(u_password, password, sizeof(password)) != 0) return -1;
+
+    int64_t rc = -1;
+    // Same username rules the first-boot path enforces, applied here too so the
+    // two account-creation paths cannot disagree about what a valid name is.
+    size_t ulen = strlen(username);
+    if (ulen == 0 || ulen >= USERNAME_MAX) goto out;
+    for (size_t i = 0; i < ulen; i++) {
+        unsigned char c = (unsigned char)username[i];
+        if (c <= ' ' || c >= 127 || c == ':') goto out;
+    }
+    if (strcmp(username, "root") == 0) goto out;  // reserved system account
+    if (user_lookup_name(username)) goto out;     // already exists
+
+    // Strength policy, BEFORE the account is created, so a refused password
+    // leaves nothing behind and Ring 3 is told WHICH rule it broke. The old
+    // check here was `password[0] == '\0'`, i.e. an empty password is not a
+    // password, and that was the whole of it: this syscall would happily set
+    // "1" on a new account.
+    {
+        int pc = users_password_check(username, password);
+        if (pc != PW_OK) {
+            bootlog_write("[USERS] create '%s' REFUSED: %s (policy code %d)",
+                          username, pw_policy_message(pc), pc);
+            rc = PW_RC(pc);
+            goto out;
+        }
+    }
+
+    // uid 0 means ALLOCATE. Callers used to compute their own (Settings used
+    // 1000 + user_count, which collides the moment an account is deleted), so
+    // the allocator lives on this side of the boundary where the table is.
+    if (uid == 0) {
+        extern uint32_t next_user_uid_rs(const uint32_t *uids, uint32_t n);
+        int n = 0;
+        user_entry_t *t = users_all(&n);
+        uint32_t inuse[MAX_USERS];
+        uint32_t k = 0;
+        for (int i = 0; i < n && k < (uint32_t)MAX_USERS; i++)
+            if (t[i].active) inuse[k++] = t[i].uid;
+        uid = next_user_uid_rs(inuse, k);
+        if (uid == 0xFFFFFFFFu) goto out;         // uid space exhausted
+    }
+    if (gid == 0) gid = uid;
+    if (user_lookup_uid(uid)) goto out;
+
+    {
+        int have_home = (u_home && sc_bounce_str(u_home, home, sizeof(home)) == 0
+                         && home[0]);
+        if (!have_home) {
+            // /HOME/<NAME8>, uppercased alnum, matching users_create_first_admin.
+            int hp = 0; const char *pfx = "/HOME/";
+            for (int i = 0; pfx[i] && hp < (int)sizeof(home) - 1; i++) home[hp++] = pfx[i];
+            int base = hp;
+            for (size_t i = 0; i < ulen && (int)i < 8 && hp < (int)sizeof(home) - 1; i++) {
+                char c = username[i];
+                if (c >= 'a' && c <= 'z') c -= 32;
+                if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) home[hp++] = c;
+            }
+            home[hp] = '\0';
+            if (hp <= base) goto out;             // no usable characters for a path
+        }
+
+        if (user_create(username, uid, gid, home, "/APPS/MSH", username) != 0) goto out;
+        if (user_set_password(username, password) != 0) {
+            user_delete(uid);                     // roll back; nothing is synced
+            goto out;
+        }
+        // Prove the account we just created can actually authenticate BEFORE
+        // persisting it. This is cheap and it is the assertion whose absence is
+        // the entire bug: the old path "succeeded" while producing an account
+        // that could never log in, and nothing noticed for two releases.
+        if (!users_can_authenticate(username)) {
+            user_delete(uid);
+            bootlog_write("[USERS] create '%s' ROLLED BACK: account would not authenticate (#745)",
+                          username);
+            goto out;
+        }
+
+        if (g_fat_fs.mounted) fat_mkdir(&g_fat_fs, "/HOME");
+        fat_mkdir(&g_fat_fs, home);
+        perms_set(home, uid, gid, 0750);
+        users_make_home_skeleton(home, uid, gid);
+
+        if (users_sync() != 0)
+            kprintf("[USERS] sync failed after user create\n");
+        bootlog_write("[USERS] created '%s' uid=%u gid=%u home='%s' WITH a password (#745)",
+                      username, (unsigned)uid, (unsigned)gid, home);
+        rc = (int64_t)uid;
+    }
+
+out:
+    // Scrub the plaintext. crypto_zero is the compiler-barrier version, so it
+    // is not optimised away the way a plain memset of a dead local can be.
+    { extern void crypto_zero(void *ptr, size_t length);
+      crypto_zero(password, sizeof(password)); }
+    return rc;
+}
+
+// (#745) See syscall.h. A PURE predicate over data the caller already holds:
+// it reveals nothing about any account, only whether a candidate string would
+// be accepted. Deliberately NOT root-gated, because every user needs it to
+// choose their own password. It does let Ring 3 probe the breached-password
+// table one guess at a time; that table is a public 50k word list that ships
+// inside this very image, so there is nothing there to leak.
+int64_t sys_pw_check(const char *u_username, const char *u_password) {
+    char username[USERNAME_MAX];
+    char password[128];
+
+    if (!u_password) return -14;
+    if (sc_bounce_str(u_password, password, sizeof(password)) != 0) return -14;
+    username[0] = '\0';
+    if (u_username && sc_bounce_str(u_username, username, sizeof(username)) != 0) return -14;
+
+    // The SAME call user_set_password() makes, not a re-implementation of it,
+    // so a candidate this accepts cannot then be refused by the set path.
+    int pc = users_password_check(username[0] ? username : NULL, password);
+
+    { extern void crypto_zero(void *ptr, size_t length);
+      crypto_zero(password, sizeof(password)); }
+    return (int64_t)pc;
+}
+
+// (#745) FIRST-BOOT PROVISIONING WITH A SEPARATE ROOT PASSWORD.
+//
+// WHY THIS EXISTS AND SYS_USER_CREATE_PW WAS NOT ENOUGH. The setup wizard runs
+// on an image that ALREADY has a root account, carrying the shipped default
+// credential from the asset base. SYS_USER_CREATE_PW explicitly refuses the
+// name "root" (it is a reserved system account), so the wizard could create the
+// human account and had no way at all to replace root's shipped password. The
+// machine finished setup with a fresh, policy-checked desktop account sitting
+// next to a uid 0 whose password was a published default.
+//
+// The two rules that matter (both passwords pass the FULL policy, and they are
+// not the same string) are enforced HERE, kernel side, before anything is
+// written. They cannot be enforced by two separate syscalls, because a caller
+// could simply not make the second one.
+//
+// The euid==0 gate is the real boundary and it is worth being honest about what
+// it does and does not buy: the caller IS root already, so it can change root's
+// password by other means. This call is not a privilege boundary, it is the
+// only path that changes BOTH accounts atomically under one validation.
+int64_t sys_firstboot_admin(const char *u_username, const char *u_user_pw,
+                            const char *u_root_pw) {
+    process_t *p = proc_current();
+    if (!p) return -1;
+    if (p->euid != 0) return -1;
+
+    char username[USERNAME_MAX];
+    char user_pw[128];
+    char root_pw[128];
+    int64_t rc = -14;
+    if (sc_bounce_str(u_username, username, sizeof(username)) != 0) goto out;
+    if (sc_bounce_str(u_user_pw,  user_pw,  sizeof(user_pw))  != 0) goto out;
+    if (sc_bounce_str(u_root_pw,  root_pw,  sizeof(root_pw))  != 0) goto out;
+
+    // BOTH passwords, BEFORE anything is created or changed. One shared rule
+    // (proc/users.c) with the kernel first-boot screen, so the two paths cannot
+    // disagree about what is acceptable.
+    rc = (int64_t)users_check_first_boot_pair(username, user_pw, root_pw);
+    if (rc != 0) {
+        bootlog_write("[USERS] first-boot provisioning REFUSED for '%s' (code %d)",
+                      username, (int)rc);
+        goto out;
+    }
+
+    if (!user_lookup_uid(0)) {
+        // A genuinely virgin account database: one function owns the whole job,
+        // creating root AND the human account.
+        rc = (int64_t)users_create_first_admin(username, user_pw, root_pw);
+        if (rc == 0) {
+            user_entry_t *u = user_lookup_name(username);
+            rc = u ? (int64_t)u->uid : -1;
+        }
+        goto out;
+    }
+
+    // The shipped-image path. root already exists; take ownership of it, then
+    // create the human account. Ordering matters: sys_user_create_pw() is what
+    // calls users_sync(), so root's new hash and the new account reach the disk
+    // in ONE save. If the account creation fails, root's password is put back
+    // exactly as it was and nothing was synced, so the machine is unchanged and
+    // setup can be retried.
+    if (users_root_pw_begin(root_pw) != 0) { rc = -1; goto out; }
+    rc = sys_user_create_pw(u_username, u_user_pw, 0, 0, NULL);
+    if (rc < 0) {
+        users_root_pw_rollback();
+        bootlog_write("[USERS] first-boot: account creation failed (%d); root password ROLLED BACK (#745)",
+                      (int)rc);
+        goto out;
+    }
+    users_root_pw_commit();
+    // #745: the account the wizard just called an administrator joins the admin
+    // set, so it can actually be offered the elevation prompt. On a SHIPPED
+    // image this is not the same thing as FIRST_ADMIN_UID: measured on a
+    // throwaway VM, the golden already holds `admin` at uid 1000, so the
+    // wizard's account landed at 1001 and a uid-literal admin set would have
+    // refused it while the wizard told the user otherwise.
+    (void)users_grant_admin((uint32_t)rc);
+    IGNORE_RESULT("#745: the account and root's password were already synced by\n                  sys_user_create_pw above; this second save only persists the new\n                  admin GROUP. If it fails the machine still has a working account\n                  and a working root password, and failing setup here would be a\n                  worse outcome than an admin set that reverts to the FIRST_ADMIN_UID\n                  fallback until the next successful save.",
+                  users_sync());
+    bootlog_write("[USERS] first-boot: account '%s' uid=%d created; root given its OWN password (#745)",
+                  username, (int)rc);
+
+out:
+    { extern void crypto_zero(void *ptr, size_t length);
+      crypto_zero(user_pw, sizeof(user_pw));
+      crypto_zero(root_pw, sizeof(root_pw)); }
+    return rc;
 }
 
 int64_t sys_set_theme(int theme_id) {
@@ -4933,7 +7170,8 @@ static void mac_to_str(const uint8_t *mac, char *out) {
 
 int64_t sys_get_net_info(void *buf, uint64_t len) {
     if (!buf || len < sizeof(net_info_t)) return -1;
-    net_info_t *ni = (net_info_t *)buf;
+    net_info_t kni;   // #567: fill kernel-local, then one fault-safe copy_to_user
+    net_info_t *ni = &kni;
     // Report the IP layer's ACTUAL configured address, not the DHCP-offered one.
     // The kernel currently boots with a static IP (ip_set_address), so the DHCP
     // module's offered IP stays 0 and the panel wrongly showed "Disconnected"
@@ -4961,6 +7199,7 @@ int64_t sys_get_net_info(void *buf, uint64_t len) {
     ip_to_str((uint8_t *)&dns, ni->dns);
     mac_to_str(mac, ni->mac);
     ni->connected = (ip != 0) ? 1 : 0;
+    if (copy_to_user(buf, &kni, sizeof(kni)) != 0) return -14;
     return 0;
 }
 
@@ -5005,8 +7244,10 @@ int64_t sys_get_disk_info(int idx, void *buf) {
     extern unsigned long ata_drive_sectors(int);
     extern const char *ata_drive_model(int);
     extern const char *ata_drive_serial(int);
-    sc_disk_info_t *d = (sc_disk_info_t *)buf;
-    for (uint64_t i = 0; i < sizeof(*d); i++) ((uint8_t *)d)[i] = 0;
+    // #567: fill a kernel-local struct, then one fault-safe copy_to_user.
+    sc_disk_info_t kd;
+    sc_disk_info_t *d = &kd;
+    memset(&kd, 0, sizeof(kd));
     if (!ata_drive_present(idx)) return -1;
     d->present = 1;
     d->type    = (uint8_t)ata_drive_type(idx);
@@ -5018,16 +7259,38 @@ int64_t sys_get_disk_info(int idx, void *buf) {
     const char *sr = ata_drive_serial(idx);
     for (k = 0; k < 20 && sr[k]; k++) d->serial[k] = sr[k];
     d->serial[k] = 0;
+    if (copy_to_user(buf, &kd, sizeof(kd)) != 0) return -14;
     return 0;
 }
 
 // Play a sound file (MP3/WAV/...) by path, asynchronously (kernel thread).
+// #745: THE THIRD ONE. #700 found the shape "Ring 3 names any path and the
+// kernel opens and parses it in Ring 0" and fixed it in two places, B3
+// (sys_print_image) and B7 (sys_theme_load_file). This syscall is the same
+// shape and was missed, so it kept the property both of those were fixed for:
+// a uid-1000 caller could hand /CONFIG/SSHHOST.KEY to the audio stack and have
+// Ring 0 read a root-owned 0600 file it may not open.
+//
+// The decoder behind this is the largest single block of vendored C in the
+// kernel (libmad, tremor, faad2, opus), so "the current parser probably does
+// not leak anything back" is not an argument worth making. The check goes on
+// the READ, where it stays correct no matter what the parser later becomes.
+//
+// Same access class as its two siblings: R_OK on the file being read.
 int64_t sys_play_wav(const char *upath) {
     if (!upath) return -1;
+    // #567: bounce the user path fault-safe into the kernel buffer.
     char path[128];
-    int i = 0;
-    for (; i < 127 && upath[i]; i++) path[i] = upath[i];
-    path[i] = '\0';
+    if (sc_bounce_str(upath, path, sizeof(path)) != 0) return -1;
+    {
+        process_t *p = proc_current();
+        if (p && p->privilege == PRIV_USER &&
+            perms_check(path, p->euid, p->egid, R_OK) != 0) {
+            kprintf("[AUDIO] play refused: uid %u may not read %s (#745)\n",
+                    (unsigned)p->euid, path);
+            return -13;   // EACCES
+        }
+    }
     extern int audio_play_file_async(const char *path);
     return audio_play_file_async(path);
 }
@@ -5057,109 +7320,109 @@ int64_t sys_audio_pcm_close(int handle) {
 // NTP sync syscall
 // ============================================================================
 
-static volatile int g_ntp_done = 0;
-static uint32_t     g_ntp_unix_ts = 0;
-
-static void ntp_udp_cb(uint32_t src, uint16_t sp, const void *vdata, uint16_t len) {
-    (void)src; (void)sp;
-    const uint8_t *data = (const uint8_t *)vdata;
-    if (len >= 48) {
-        // Transmit timestamp starts at byte 40 (NTP epoch: Jan 1, 1900)
-        uint32_t ntp_sec = ((uint32_t)data[40] << 24) | ((uint32_t)data[41] << 16)
-                         | ((uint32_t)data[42] <<  8) |  (uint32_t)data[43];
-        g_ntp_unix_ts = ntp_sec - 2208988800UL;
-        g_ntp_done = 1;
-    }
-}
-
-static void unix_days_to_ymd(int days, int *year_out, int *month_out, int *day_out) {
-    int y = 1970;
-    while (1) {
-        int leap = ((y % 4 == 0) && (y % 100 != 0 || y % 400 == 0));
-        int diy = leap ? 366 : 365;
-        if (days < diy) break;
-        days -= diy;
-        y++;
-    }
-    *year_out = y;
-    int leap = ((y % 4 == 0) && (y % 100 != 0 || y % 400 == 0));
-    int dpm[12] = {31, leap?29:28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-    int mo = 0;
-    while (mo < 12 && days >= dpm[mo]) { days -= dpm[mo]; mo++; }
-    *month_out = mo + 1;
-    *day_out   = days + 1;
-}
-
+// #797: THE NTP CLIENT MOVED. What used to sit here - ntp_udp_cb(), a private
+// unix_days_to_ymd(), and a hand-rolled net_poll()+proc_sleep() loop - is now
+// net/sntp.c (transport) plus rustkern/sntp.rs (validation, in Rust per the
+// 2026-07-16 rule). The reasons are recorded at the top of net/sntp.c; the short
+// version is that the code here hardcoded one server, could not be pointed at
+// another, validated NOTHING about the reply before setting the clock, and would
+// have decoded a 2036-or-later timestamp as a date around 1900.
+//
+// syscall 147 keeps its number, its signature and its 0/-1 contract, so the
+// existing Settings date/time caller is unchanged. It is now simply the
+// "use the default server" spelling of syscall 367.
 int64_t sys_ntp_sync(void) {
-    uint8_t pkt[48];
-    for (int i = 0; i < 48; i++) pkt[i] = 0;
-    pkt[0] = 0x1B;  // LI=0, VN=3, Mode=3 (client)
+    return (sntp_sync(NULL, 0, NULL) == SNTP_OK) ? 0 : -1;
+}
 
-    g_ntp_done = 0;
-    g_ntp_unix_ts = 0;
+// #797 SYS_NTP_SYNC_SERVER (367): sync against a CALLER-NAMED server, which is
+// what the first-boot wizard's "NTP server" field needs and what syscall 147
+// could never express.
+//
+// `userver` is a Ring-3 pointer, so it goes through sc_bounce_str() ->
+// strncpy_from_user() -> validate_user_string() before it is read, and syscall
+// 367 also carries a descriptor in rustkern/argtab.rs so the central entry check
+// runs on it too. NULL means "the default server".
+//
+// Unlike 147 this returns the FULL status, not 0/-1: on failure the caller gets
+// the negative SNTP_E_* code, so a wizard can distinguish "that host never
+// answered" from "that host answered with a packet we refused to trust".
+int64_t sys_ntp_sync_server(const char *userver, uint32_t timeout_ms) {
+    char server[128];
+    if (userver) {
+        if (sc_bounce_str(userver, server, sizeof(server)) != 0) return -14;
+    } else {
+        server[0] = '\0';
+    }
+    return (int64_t)sntp_sync(server[0] ? server : NULL, timeout_ms, NULL);
+}
 
-    uint32_t srv = (216u << 24) | (239u << 16) | (35u << 8) | 0u;
-    udp_bind(12300, ntp_udp_cb);
-    if (udp_send(srv, 12300, 123, pkt, 48) < 0) {
-        udp_unbind(12300);
+// #dosverify: trusted-kernel-caller twin of win16_launch() (defined above,
+// near line 316). win16_launch() exists to be reached from a SYSCALL, so it
+// treats `upath` as a userland pointer and bounces it through sc_bounce_str()
+// -> strncpy_from_user() -> validate_user_string(), which (correctly, since
+// #500/MAYTERA-SEC-2026-0016) demands the live U/S page-table bit on every
+// page touched, not just a low address. The WIN16PM.RUN boot autolauncher
+// (win16_autolaunch_thread, exec/win16api.c) is KERNEL code calling
+// win16_launch() with a KERNEL-stack buffer: that buffer is never U/S=user,
+// so validate_user_string() correctly rejects it, sc_bounce_str() returns
+// -14, and win16_launch() returns -1 before ever calling proc_create() --
+// silently, because that call site never checked the return value. Net
+// effect: WIN16PM.RUN has launched nothing since whichever build first
+// carried the #500 hardening (a test VM's own kernel, built one day earlier,
+// still had a working WIN16PM.RUN launch of Word6). That is a real,
+// user-visible regression in an unrelated subsystem, found while verifying
+// the #dosverify DOS-layer change did not itself break Win16 -- it did not,
+// but this pre-existing break meant Word6 could not be run at all to check.
+//
+// The correct fix is not to weaken validate_user_string() (that would reopen
+// the #500/#487 hole for every real syscall caller); it is to give
+// kernel-internal callers a path that never pretends `path` is a user
+// pointer in the first place, exactly like dos_launch() already does not
+// bounce through a user-validated helper. `kpath` must be a NUL-terminated
+// kernel string the caller owns for the duration of this call. g_win16_busy/
+// g_win16_path/win16_proc_entry are the same file-static state win16_launch()
+// above uses; appended here (end of file) rather than beside win16_launch()
+// so every pre-existing smap-uaccess.manifest line number in this file stays
+// byte-for-byte valid (#645 lint is line-pinned; inserting mid-file shifts
+// every entry below it and turns 48 unrelated KNOWN_GAP lines into false
+// "site moved" failures for a change that touches none of them).
+int win16_launch_kernel(const char *kpath) {
+    if (g_win16_busy) return -1;
+    if (!kpath || !kpath[0]) return -1;
+    int i = 0;
+    for (; i < (int)sizeof(g_win16_path) - 1 && kpath[i]; i++) g_win16_path[i] = kpath[i];
+    g_win16_path[i] = '\0';
+    if (!g_win16_path[0]) return -1;
+    // #708: no Ring-3 caller here (this is the /CONFIG/WIN16PM.RUN boot
+    // harness), so the guest runs as the authenticated desktop session. If
+    // nobody has logged in yet the identity is unresolvable and the launch is
+    // REFUSED, rather than silently running the guest as root.
+    if (guestfs_arm_session(GUESTFS_SLOT_WIN16) != 0) {
+        kprintf("[win16] kernel launch of '%s' REFUSED: no usable identity for "
+                "the guest\n", g_win16_path);
         return -1;
     }
-
-    // #512: this loop had three defects, all fixed here.
-    //
-    // (a) UNITS. It was `timer_ticks + 2000`, which READS like 2 seconds and is
-    //     2000 TICKS = 8 seconds at the actual g_timer_hz of 250. Same family as
-    //     #420 (the 18.2Hz-vs-250Hz confusion in wget/https). Now the ms->ticks
-    //     conversion is done by the one sanctioned helper, wq_ms_to_ticks(),
-    //     against the LIVE tick rate, so the number below means what it says.
-    //
-    // (b) IT COULD NOT COMPLETE ON ITS OWN. g_ntp_done is set only by
-    //     ntp_udp_cb(), which runs only from net_poll() -- and the old loop body
-    //     never called net_poll(). The wait therefore depended entirely on some
-    //     OTHER thread happening to pump the stack (the compositor's sys_fb_flip
-    //     calls net_poll()). Where the compositor is not running or not flipping
-    //     (serial/headless boot, compositor blocked), the sync could NEVER
-    //     succeed and always failed after the full 8s. Correctness by
-    //     coincidence. We now pump net_poll() ourselves every pass, exactly as
-    //     net/dns.c's dns_wait() already does for the same UDP request/response
-    //     shape. This is deliberately NOT converted to a blocking wait: per the
-    //     wait-migration plan these net_poll()+sleep loops ARE the TCP/IP
-    //     stack's execution engine (net_worker() only pumps while DHCP is
-    //     unbound), so a bare block here would stop the stack and the wake would
-    //     never come. This site collapses into sock_wait() in Phase 4, once an
-    //     always-armed net service worker exists to drive the stack.
-    //
-    // (c) IT BURNED A FULL CORE. `pause` with no yield, for up to 8 seconds,
-    //     reachable from Ring 3 via the Settings date/time panel. It is
-    //     preemptible (IF=1, and the scheduler drops the BKL across a switch via
-    //     bkl_release_all), so it did not hard-wedge the box, but it stayed
-    //     runnable and competed for CPU the whole time while Settings froze.
-    //     proc_sleep() parks us instead, which also releases the BKL so the
-    //     compositor and the rest of the desktop keep running.
-    //
-    // The timeout STAYS: an NTP server is a remote peer that can go silent with
-    // no detectable signal, and sys_ntp_sync owes its caller an answer. That is
-    // a genuine class-B absent-event timeout, not a papered-over missing wake.
-    #define NTP_TIMEOUT_MS   5000u   // typical NTP client budget; was an 8s accident
-    #define NTP_POLL_MS      2u      // matches dns_wait()'s pump interval
-    uint64_t deadline = wq_deadline_in(wq_ms_to_ticks(NTP_TIMEOUT_MS));
-    while (!g_ntp_done && !wq_deadline_expired(deadline)) {
-        net_poll();                  // (b): pump the stack we are waiting on
-        if (g_ntp_done) break;       // reply landed in this very poll
-        proc_sleep(NTP_POLL_MS);     // (c): yield + release the BKL, never spin
+    g_win16_busy = 1;
+    if (proc_create("win16", win16_proc_entry, NULL, PRIO_NORMAL) < 0) {
+        g_win16_busy = 0;
+        guestfs_disarm_rs(GUESTFS_SLOT_WIN16);
+        return -1;
     }
-
-    udp_unbind(12300);
-    if (!g_ntp_done) return -1;
-
-    uint32_t ts = g_ntp_unix_ts;
-    int sec = (int)(ts % 60); ts /= 60;
-    int min = (int)(ts % 60); ts /= 60;
-    int hr  = (int)(ts % 24); ts /= 24;
-    int y, mo, d;
-    unix_days_to_ymd((int)ts, &y, &mo, &d);
-
-    sys_set_rtc_time(((uint64_t)hr << 16) | ((uint64_t)min << 8) | (uint64_t)sec);
-    sys_set_rtc_date(((uint64_t)y  << 16) | ((uint64_t)mo  << 8) | (uint64_t)d);
     return 0;
 }
+
+
+// #745 login-gate backdrop continuity. `g_wallpaper_idx` above is the LIVE
+// wallpaper ordinal: the compositor's frame loop force-syncs its displayed
+// wallpaper to it every frame (userland/apps/compositor/main.c, the
+// SYS_GET_WALLPAPER poll), so this value IS what is on screen for whatever
+// session is running, and nothing clears it on logout. The kernel login gate
+// reads it when it is re-entered by Switch User / Log Out so the backdrop does
+// not visibly change out from under the user. Read-only on purpose: the write
+// path stays SYS_SET_WALLPAPER and nothing else.
+//
+// Appended at end of file deliberately: kernel/proc/syscall.c is line-anchored
+// by the smap-uaccess manifest, and an insertion anywhere above shifts every
+// anchor after it.
+int syscall_get_wallpaper_idx(void) { return g_wallpaper_idx; }

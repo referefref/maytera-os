@@ -1,0 +1,51 @@
+MayteraOS userland libc - MIT License
+======================================
+
+This directory (userland/libc/) is MayteraOS's freestanding C library for
+Ring 3 user-mode applications. It is deliberately licensed under the
+permissive MIT License below, NOT under the GPLv2-or-later license that
+covers the MayteraOS kernel and OS source (see LICENSE / COPYING at the
+repository root).
+
+Why: every ported or first-party userland application statically links
+userland/libc/libc.a. A copyleft license on libc would impose GPL terms
+on every application linked against it, which would exclude a large
+class of permissively- and Apache-licensed software from ever being
+ported to MayteraOS on a technicality about the library, not about the
+application. A permissive libc is infrastructure, not the product; this
+is the same reasoning behind musl (MIT) and newlib (BSD) in other
+freestanding/embedded C library projects. See
+docs/PORTABILITY_HOMEBREW_SNAPCRAFT_ASSESSMENT.md section 7.2 for the
+full analysis that led to this decision.
+
+Scope: this license covers userland/libc/ only (every .c and .h file
+under this directory carries a short "SPDX-License-Identifier: MIT"
+header pointing back to this file). It does not apply to the kernel, to
+other userland applications, or to vendored third-party components
+elsewhere in the tree; see ATTRIBUTION.md at the repository root for the
+complete per-component license table.
+
+---------------------------------------------------------------------------
+
+MIT License
+
+Copyright (c) 2026 MayteraOS contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be included
+in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.

@@ -5,12 +5,7 @@
 #include "../types.h"
 
 // Keyboard modifier keys
-#define KEY_MOD_SHIFT   0x01
-#define KEY_MOD_CTRL    0x02
-#define KEY_MOD_ALT     0x04
-#define KEY_MOD_CAPS    0x08
-#define KEY_MOD_NUM     0x10
-#define KEY_MOD_SCROLL  0x20
+#include "keymod.h"   // KEY_MOD_*: shared with cpu/isr.c, which cannot include this header
 
 // Special key codes
 #define KEY_ESCAPE      0x01

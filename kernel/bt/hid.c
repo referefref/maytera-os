@@ -11,10 +11,11 @@
 //
 // bt_hid_input_report() is the SINGLE choke point that touches those sinks.
 //
-// NOTE: the usage->set-1 table below mirrors drivers/usb_hid.c. INTEGRATION.md
-// asks for it to be factored into a shared drivers/hid_keymap.h; that refactor
-// touches drivers/ (shared) and must be coordinated with the architect, so for
-// now it is duplicated here with this pointer to the canonical copy.
+// #763: the usage->set-1 table used to be DUPLICATED here from
+// drivers/usb_hid.c, under a note asking for it to be factored out one day.
+// It has been: rustkern/hidmap.rs is the one table and both drivers call it.
+// The duplicate also carried two real bugs (keypad / emitted as a bare 0x35,
+// and no numeric keypad at all), which is what a copy always eventually does.
 #include "hid.h"
 #include "l2cap.h"
 #include "../serial.h"
@@ -27,41 +28,9 @@ extern void mouse_inject_hid(int dx, int dy, uint8_t buttons, int wheel); // dri
 #define HIDP_HDR_SET_PROTOCOL  0x70
 
 // ---------------------------------------------------------------------------
-// HID usage -> PS/2 set-1 scancode (mirror of drivers/usb_hid.c)
+// HID usage -> PS/2 set-1 scancode: the SHARED translator (rustkern/hidmap.rs)
 // ---------------------------------------------------------------------------
-static const uint8_t hid_to_set1[0x74] = {
-    [0x04]=0x1E,[0x05]=0x30,[0x06]=0x2E,[0x07]=0x20,[0x08]=0x12,[0x09]=0x21,
-    [0x0A]=0x22,[0x0B]=0x23,[0x0C]=0x17,[0x0D]=0x24,[0x0E]=0x25,[0x0F]=0x26,
-    [0x10]=0x32,[0x11]=0x31,[0x12]=0x18,[0x13]=0x19,[0x14]=0x10,[0x15]=0x13,
-    [0x16]=0x1F,[0x17]=0x14,[0x18]=0x16,[0x19]=0x2F,[0x1A]=0x11,[0x1B]=0x2D,
-    [0x1C]=0x15,[0x1D]=0x2C,
-    [0x1E]=0x02,[0x1F]=0x03,[0x20]=0x04,[0x21]=0x05,[0x22]=0x06,[0x23]=0x07,
-    [0x24]=0x08,[0x25]=0x09,[0x26]=0x0A,[0x27]=0x0B,
-    [0x28]=0x1C,[0x29]=0x01,[0x2A]=0x0E,[0x2B]=0x0F,[0x2C]=0x39,
-    [0x2D]=0x0C,[0x2E]=0x0D,[0x2F]=0x1A,[0x30]=0x1B,[0x31]=0x2B,
-    [0x33]=0x27,[0x34]=0x28,[0x35]=0x29,[0x36]=0x33,[0x37]=0x34,[0x38]=0x35,
-    [0x39]=0x3A,
-    [0x3A]=0x3B,[0x3B]=0x3C,[0x3C]=0x3D,[0x3D]=0x3E,[0x3E]=0x3F,[0x3F]=0x40,
-    [0x40]=0x41,[0x41]=0x42,[0x42]=0x43,[0x43]=0x44,[0x44]=0x57,[0x45]=0x58,
-    [0x53]=0x45, [0x54]=0x35, [0x55]=0x37, [0x56]=0x4A, [0x57]=0x4E,
-};
-
-static uint8_t hid_ext_set1(uint8_t usage) {
-    switch (usage) {
-        case 0x49: return 0x52; // Insert
-        case 0x4A: return 0x47; // Home
-        case 0x4B: return 0x49; // Page Up
-        case 0x4C: return 0x53; // Delete
-        case 0x4D: return 0x4F; // End
-        case 0x4E: return 0x51; // Page Down
-        case 0x4F: return 0x4D; // Right
-        case 0x50: return 0x4B; // Left
-        case 0x51: return 0x50; // Down
-        case 0x52: return 0x48; // Up
-        case 0x58: return 0x1C; // Keypad Enter
-        default:   return 0x00;
-    }
-}
+extern uint8_t hid_usage_to_set1_rs(uint8_t usage, uint8_t *out_ext);
 
 static void emit_set1(uint8_t code, int extended, int pressed) {
     if (!code) return;
@@ -69,23 +38,12 @@ static void emit_set1(uint8_t code, int extended, int pressed) {
     keyboard_process_scancode(pressed ? code : (uint8_t)(code | 0x80));
 }
 
+// usage 0xE0..0xE7 are the eight modifier bits; everything else is a usage
+// from the report's keycode array. The shared translator handles both.
 static void emit_key(uint8_t usage, int pressed) {
-    if (usage >= 0xE0 && usage <= 0xE7) {
-        switch (usage) {
-            case 0xE0: emit_set1(0x1D, 0, pressed); break; // L Ctrl
-            case 0xE1: emit_set1(0x2A, 0, pressed); break; // L Shift
-            case 0xE2: emit_set1(0x38, 0, pressed); break; // L Alt
-            case 0xE3: emit_set1(0x5B, 1, pressed); break; // L GUI
-            case 0xE4: emit_set1(0x1D, 1, pressed); break; // R Ctrl
-            case 0xE5: emit_set1(0x36, 0, pressed); break; // R Shift
-            case 0xE6: emit_set1(0x38, 1, pressed); break; // R Alt
-            case 0xE7: emit_set1(0x5C, 1, pressed); break; // R GUI
-        }
-        return;
-    }
-    uint8_t ext = hid_ext_set1(usage);
-    if (ext) { emit_set1(ext, 1, pressed); return; }
-    if (usage < sizeof(hid_to_set1)) emit_set1(hid_to_set1[usage], 0, pressed);
+    uint8_t ext = 0;
+    uint8_t code = hid_usage_to_set1_rs(usage, &ext);
+    emit_set1(code, ext, pressed);
 }
 
 // ---------------------------------------------------------------------------

@@ -133,6 +133,17 @@ void decor_fill_circle(int32_t cx, int32_t cy, int32_t radius, uint32_t color);
 void decor_draw_gradient_h(int32_t x, int32_t y, int32_t w, int32_t h,
                            uint32_t color1, uint32_t color2);
 
+// #745 ANTIALIASED variants of the two above. Same signatures, same geometry,
+// but the corner band is coverage-composited against the live framebuffer
+// instead of being a 100%-or-0% integer test. Integer fixed point only (the
+// kernel is soft-float, -mno-sse). Use these wherever a rounded corner sits on
+// a photographic or otherwise non-flat backdrop; the originals remain for every
+// caller that has not migrated.
+void decor_fill_rounded_rect_aa(int32_t x, int32_t y, int32_t w, int32_t h,
+                                int32_t radius, uint32_t color);
+void decor_draw_rounded_rect_aa(int32_t x, int32_t y, int32_t w, int32_t h,
+                                int32_t radius, uint32_t color);
+
 // Draw a vertical gradient
 void decor_draw_gradient_v(int32_t x, int32_t y, int32_t w, int32_t h,
                            uint32_t color1, uint32_t color2);

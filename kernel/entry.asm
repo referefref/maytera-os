@@ -12,6 +12,7 @@ section .text
 ; Export entry point
 global _start
 global kernel_stack_top
+global kernel_stack_bottom
 
 ; Import kernel main
 extern kernel_main

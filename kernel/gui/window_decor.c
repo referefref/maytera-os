@@ -226,6 +226,137 @@ void decor_fill_rounded_rect(int32_t x, int32_t y, int32_t w, int32_t h,
     }
 }
 
+// ============================================================================
+// #745 ANTIALIASED rounded rectangles. INTEGER FIXED POINT ONLY, no float.
+//
+// decor_fill_rounded_rect()/decor_draw_rounded_rect() above are 100%-or-0%
+// integer boundary tests: a corner pixel is either painted in full or not
+// painted at all. That is the stairstep a user reported on the kernel login
+// gate ("the rounded corners of the text input box look pixelated and not
+// antialiased"). These variants sit ALONGSIDE the originals rather than
+// replacing them, so every existing caller keeps its current behaviour and can
+// migrate independently; this is the shared primitive improved in place, not a
+// private copy forked into one subsystem.
+//
+// WHY NO FLOAT: the kernel is built -mno-sse -mno-sse2 (soft float), so a float
+// coverage path would put libgcc soft-float calls in a per-pixel drawing loop.
+// Coverage is computed in 1/16 px fixed point with a Newton's-method integer
+// sqrt and composited through fb_get_pixel + decor_blend_colors, which is
+// exactly how ttf_draw_char() already antialiases text onto this same
+// photographic backdrop a few hundred lines away in this binary.
+// ============================================================================
+
+// Sub-pixel units per pixel. 16 gives the 1px falloff band 16 discrete steps,
+// which is smooth at every radius this tree draws (6 to 21px) with no banding.
+#define DECOR_AA_SUB 16
+
+// Newton's-method integer square root, same shape as the userland compositor's
+// dr_isqrt() but with int64 headroom so the DECOR_AA_SUB scaling cannot
+// overflow for any radius a caller might pass.
+static int32_t decor_isqrt(int64_t n) {
+    if (n <= 0) return 0;
+    int64_t x = n, y = (x + 1) / 2;
+    while (y < x) { x = y; y = (x + n / x) / 2; }
+    return (int32_t)x;
+}
+
+// Coverage 0..255 for one pixel of a corner box. dx,dy are the pixel's offset
+// from the corner CENTRE in whole pixels: the identical inputs the hard-edge
+// test in decor_fill_rounded_rect() uses, so an AA and a non-AA rounded rect of
+// the same radius describe the same circle and agree at the seam. The ramp is
+// 1px wide and centred on the exact arc: fully inside 0.5px in, fully outside
+// 0.5px out.
+static uint8_t decor_corner_coverage(int32_t dx, int32_t dy, int32_t radius) {
+    int64_t sdx = (int64_t)dx * DECOR_AA_SUB;
+    int64_t sdy = (int64_t)dy * DECOR_AA_SUB;
+    int32_t dist = decor_isqrt(sdx * sdx + sdy * sdy);   // distance, 1/16 px
+    int32_t d    = dist - radius * DECOR_AA_SUB;         // signed dist to arc
+    int32_t cov  = (DECOR_AA_SUB / 2) - d;               // clamp(0.5 - d, 0, 1)
+    if (cov <= 0) return 0;
+    if (cov >= DECOR_AA_SUB) return 255;
+    return (uint8_t)(cov * 255 / DECOR_AA_SUB);
+}
+
+// Coverage 0..255 for one pixel of a 1px-wide STROKE whose outer edge sits on
+// the same arc the fill's outer edge does, so a stroked and a filled rounded
+// rect of the same radius line up. Triangular profile of total width 2px and
+// total ink 1px, centred on radius-0.5.
+static uint8_t decor_ring_coverage(int32_t dx, int32_t dy, int32_t radius) {
+    int64_t sdx = (int64_t)dx * DECOR_AA_SUB;
+    int64_t sdy = (int64_t)dy * DECOR_AA_SUB;
+    int32_t dist = decor_isqrt(sdx * sdx + sdy * sdy);
+    int32_t rc   = radius * DECOR_AA_SUB - (DECOR_AA_SUB / 2);
+    int32_t off  = dist - rc;
+    if (off < 0) off = -off;
+    int32_t cov = DECOR_AA_SUB - off;
+    if (cov <= 0) return 0;
+    if (cov >= DECOR_AA_SUB) return 255;
+    return (uint8_t)(cov * 255 / DECOR_AA_SUB);
+}
+
+// Composite `color` at cov/255 over what is already in the framebuffer. The
+// read-blend-write triplet is the whole point: these controls float directly on
+// a wallpaper with no chrome box behind them, so a fractional edge pixel has to
+// be mixed with the photograph, not with a guessed background colour.
+static void decor_blend_pixel(int32_t x, int32_t y, uint32_t color, uint8_t cov) {
+    if (cov == 0 || x < 0 || y < 0) return;
+    if (cov >= 255) { fb_put_pixel((uint32_t)x, (uint32_t)y, color); return; }
+    uint32_t bg = fb_get_pixel((uint32_t)x, (uint32_t)y);
+    fb_put_pixel((uint32_t)x, (uint32_t)y, decor_blend_colors(bg, color, cov));
+}
+
+void decor_fill_rounded_rect_aa(int32_t x, int32_t y, int32_t w, int32_t h,
+                                int32_t radius, uint32_t color) {
+    if (w <= 0 || h <= 0) return;
+    if (radius > w / 2) radius = w / 2;
+    if (radius > h / 2) radius = h / 2;
+    if (radius <= 0) { fb_fill_rect(x, y, w, h, color); return; }
+
+    // Interior and straight edges carry no coverage question: flat fills, the
+    // same three the non-AA version does. Only the four radius x radius corner
+    // boxes route through the per-pixel path.
+    fb_fill_rect(x + radius, y, w - 2 * radius, h, color);
+    fb_fill_rect(x, y + radius, radius, h - 2 * radius, color);
+    fb_fill_rect(x + w - radius, y + radius, radius, h - 2 * radius, color);
+
+    for (int32_t dy = 0; dy < radius; dy++) {
+        for (int32_t dx = 0; dx < radius; dx++) {
+            uint8_t cov = decor_corner_coverage(radius - dx, radius - dy, radius);
+            if (cov == 0) continue;
+            decor_blend_pixel(x + dx,         y + dy,         color, cov);
+            decor_blend_pixel(x + w - 1 - dx, y + dy,         color, cov);
+            decor_blend_pixel(x + dx,         y + h - 1 - dy, color, cov);
+            decor_blend_pixel(x + w - 1 - dx, y + h - 1 - dy, color, cov);
+        }
+    }
+}
+
+void decor_draw_rounded_rect_aa(int32_t x, int32_t y, int32_t w, int32_t h,
+                                int32_t radius, uint32_t color) {
+    if (w <= 0 || h <= 0) return;
+    if (radius > w / 2) radius = w / 2;
+    if (radius > h / 2) radius = h / 2;
+    if (radius <= 0) { fb_draw_rect(x, y, w, h, color); return; }
+
+    // Straight edges stay byte-identical to decor_draw_rounded_rect(): an
+    // axis-aligned 1px line has no antialiasing question.
+    fb_draw_line(x + radius, y, x + w - 1 - radius, y, color);
+    fb_draw_line(x + radius, y + h - 1, x + w - 1 - radius, y + h - 1, color);
+    fb_draw_line(x, y + radius, x, y + h - 1 - radius, color);
+    fb_draw_line(x + w - 1, y + radius, x + w - 1, y + h - 1 - radius, color);
+
+    for (int32_t dy = 0; dy < radius; dy++) {
+        for (int32_t dx = 0; dx < radius; dx++) {
+            uint8_t cov = decor_ring_coverage(radius - dx, radius - dy, radius);
+            if (cov == 0) continue;
+            decor_blend_pixel(x + dx,         y + dy,         color, cov);
+            decor_blend_pixel(x + w - 1 - dx, y + dy,         color, cov);
+            decor_blend_pixel(x + dx,         y + h - 1 - dy, color, cov);
+            decor_blend_pixel(x + w - 1 - dx, y + h - 1 - dy, color, cov);
+        }
+    }
+}
+
 // Draw horizontal gradient
 void decor_draw_gradient_h(int32_t x, int32_t y, int32_t w, int32_t h,
                            uint32_t color1, uint32_t color2) {

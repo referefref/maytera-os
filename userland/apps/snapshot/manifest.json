@@ -1,0 +1,35 @@
+{
+  "app": "snapshot",
+  "version": "1.0.0",
+  "description": "Screen capture with delay timer, annotation tools and BMP export",
+  "icon": "snapshot.bmp",
+  "category": "Graphics",
+  "file_associations": [],
+  "capabilities": [
+    {
+      "action": "capture_screen",
+      "parameters": {"delay_seconds": "int"},
+      "description": "Capture the composited screen via the compositor capture service",
+      "requires_capability": "filesystem.write"
+    },
+    {
+      "action": "annotate",
+      "parameters": {"tool": "string", "color": "string"},
+      "description": "Draw pen, line, box, arrow or marker annotations on the capture",
+      "requires_capability": "app.snapshot.edit"
+    },
+    {
+      "action": "save_capture",
+      "parameters": {},
+      "description": "Save the annotated capture to the next free /SNAPnnn.BMP",
+      "requires_capability": "filesystem.write"
+    }
+  ],
+  "state_queries": [
+    {
+      "query": "get_capture_info",
+      "returns": {"width": "int", "height": "int", "saved_path": "string"},
+      "requires_capability": "app.snapshot.read"
+    }
+  ]
+}

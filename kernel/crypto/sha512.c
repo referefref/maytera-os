@@ -5,6 +5,7 @@
 
 #include "crypto.h"
 #include "../string.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // SHA-512 round constants (first 64 bits of fractional parts of cube roots of
 // the first 80 primes).
@@ -314,7 +315,6 @@ static inline uint64_t sha512_tsc_serialized(void) {
 
 void sha512_rust_selftest(void) {
     extern int kprintf(const char *fmt, ...);
-    extern void bootlog_write(const char *fmt, ...);
 
     uint32_t vectors = 0;
     uint32_t mismatches = 0;

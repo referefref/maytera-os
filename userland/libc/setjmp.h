@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // setjmp.h - Non-local jumps for exception handling
 #ifndef SETJMP_H
 #define SETJMP_H

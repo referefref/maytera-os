@@ -55,6 +55,24 @@ static int g_ahci_slot_port[4] = { -1, -1, -1, -1 };
 static int g_ahci_active = 0;  // 1 once at least one AHCI disk is registered
 
 // True if logical disk slot (channel,drive) is backed by AHCI.
+// #306: does the unified disk layer already own this AHCI port?
+//
+// ata.c maps SATA disks discovered via AHCI into its own 4-slot disk table
+// (g_ahci_slot_port), so ata_read_sectors/ata_write_sectors on that slot go
+// through the AHCI backend. That is the path every normal disk I/O in this
+// kernel takes, and it is the path the verified install used.
+//
+// The installer therefore must NOT also offer the same disk as a raw AHCI
+// target: it would be the same physical drive listed twice, and the raw
+// ahci_write() route is not the one the rest of the system exercises.
+// Returns the disk-layer slot index ((channel<<1)|drive), or -1 if unmapped.
+int inst_ahci_port_mapped(int port) {
+    for (int i = 0; i < 4; i++) {
+        if (g_ahci_slot_port[i] == port) return i;
+    }
+    return -1;
+}
+
 static inline int disk_slot_is_ahci(uint8_t channel, uint8_t drive) {
     if (channel > 1 || drive > 1) return 0;
     int idx = channel * 2 + drive;

@@ -13,6 +13,11 @@ extern isr_handler
 global idt_load
 
 ; Export ISR stubs
+; #645: the live SMAP switch, defined in kernel/security/security.c. Set to 1
+; only after the CR4.SMAP write was read back as taken; 0 means every STAC/CLAC
+; in the kernel is skipped so the image still boots on a CPU without SMAP.
+extern g_smap_active
+
 global isr0, isr1, isr2, isr3, isr4, isr5, isr6, isr7
 global isr8, isr9, isr10, isr11, isr12, isr13, isr14, isr15
 global isr16, isr17, isr18, isr19, isr20, isr21, isr22, isr23
@@ -130,7 +135,41 @@ irq_hda_msi:
     jmp isr_common
 
 ; Common ISR handler
+;
+; #645 ENTRY HARDENING. This is the SINGLE chokepoint every interrupt, trap and
+; exception reaches (every isrN / IRQ / isr128 / irq_smp_wake / irq_hda_msi stub
+; jmps here), which is why both fixes below belong here and nowhere else.
+;
+; 1. CLD. x86-64 does NOT clear RFLAGS.DF on an IDT gate entry. The SysV ABI
+;    requires DF=0 on entry to a C function, and gcc relies on it (it emits
+;    `rep movsb` for memcpy). A Ring-3 process can execute `std` and simply WAIT
+;    for the next timer interrupt, and isr_handler then runs its string
+;    operations BACKWARDS. That is Ring-3-triggerable Ring-0 memory corruption,
+;    it is independent of SMAP, and it was live before this line existed.
+;    One byte, one cycle, unconditional: there is no CPU on which it is wrong.
+;
+; 2. CLAC. The CPU does not clear RFLAGS.AC on an IDT gate entry either, so
+;    without this an interrupt taken while a uaccess copy holds AC=1 would run
+;    the ENTIRE handler with SMAP disabled, and an interrupt taken from a Ring-3
+;    process that set AC itself would do the same. The saved RFLAGS already sits
+;    in the interrupt frame ABOVE us and is NOT touched, so IRETQ still restores
+;    the interrupted context's AC and a copy interrupted mid-flight correctly
+;    resumes with its bracket intact.
+;
+;    Gated on g_smap_active because STAC/CLAC are #UD when CPUID.(EAX=7,ECX=0):
+;    EBX.SMAP is clear, and this stub runs from the very first interrupt, long
+;    before security_init() has decided anything. The flag is 0 until the
+;    CR4.SMAP write has been read back as taken. Cost when SMAP is live: one
+;    byte load and one perfectly-predicted branch per interrupt.
+;
+; Both clobber only RFLAGS, which is dead here: the interrupted RFLAGS was
+; already pushed by the CPU, and no GPR is touched before the pushes below.
 isr_common:
+    cld                     ; #645: SysV ABI requires DF=0; the gate does not clear it
+    cmp byte [rel g_smap_active], 0
+    je .smap_inert
+    clac                    ; #645: no handler may run with SMAP disabled
+.smap_inert:
     ; Save all registers (in reverse order for stack layout)
     push rax
     push rcx

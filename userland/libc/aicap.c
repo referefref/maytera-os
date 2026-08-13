@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // aicap.c - MayteraOS AI capability tokens + consent + audit (#293).
 // See aicap.h for the model. Pure userland; enforced at the aiclient dispatch
 // boundary. #305 will relocate this logic into a protected immutable core.

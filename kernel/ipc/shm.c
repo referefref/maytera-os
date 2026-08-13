@@ -8,6 +8,7 @@
 #include "../mm/heap.h"
 #include "../serial.h"
 #include "../string.h"
+#include "../security/uaccess_smap.h"  // #19/#645: AC brackets for Ring-3 out-params
 
 // Shared memory region table
 static shm_region_t shm_regions[SHM_MAX_REGIONS];
@@ -238,8 +239,11 @@ int64_t sys_shm_map(int id, void **addr) {
     }
 
     // Return virtual address to caller
+    // #19/#645: one store into a Ring-3 out-param.
     if (addr) {
+        uaccess_ac_t __ac = uaccess_begin();
         *addr = (void *)vaddr;
+        uaccess_end(__ac);
     }
 
     kprintf("[SHM] Mapped region %d at vaddr 0x%lx for pid %u (flags=0x%lx)\n",
@@ -369,11 +373,16 @@ int64_t sys_shm_info(int id, size_t *size, uint32_t *ref_count) {
         return -1;
     }
 
-    if (size) {
-        *size = region->size;
-    }
-    if (ref_count) {
-        *ref_count = region->ref_count;
+    // #19/#645: two stores into Ring-3 out-params.
+    {
+        uaccess_ac_t __ac = uaccess_begin();
+        if (size) {
+            *size = region->size;
+        }
+        if (ref_count) {
+            *ref_count = region->ref_count;
+        }
+        uaccess_end(__ac);
     }
 
     return 0;

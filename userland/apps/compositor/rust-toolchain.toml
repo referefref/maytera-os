@@ -1,0 +1,16 @@
+# MayteraOS USERLAND Rust toolchain pin - compositor Start-menu content model
+# (startmenu_model.rs). Same pin as every other userland Rust crate (Arena,
+# RSS parser, Task Manager) and the kernel port: without this, a `rustup
+# update` on the userland build container (the build container) would silently move the
+# floating `stable` channel and change the bytes of the shipped COMPOSIT ELF.
+# The compositor Makefile additionally has a hard version gate that FAILS the
+# build if the active rustc is not this version, so drift can never pass
+# silently.
+#
+# To reproduce on a fresh userland build container:
+#   rustup toolchain install 1.97.0 --profile minimal
+#   rustup target add --toolchain 1.97.0 x86_64-unknown-none
+[toolchain]
+channel = "1.97.0"
+targets = ["x86_64-unknown-none"]
+profile = "minimal"

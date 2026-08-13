@@ -1,3 +1,7 @@
+; SPDX-License-Identifier: MIT
+; Copyright (c) MayteraOS contributors.
+; Full license text: userland/libc/LICENSE (MIT License).
+;
 ; crt0.asm - C runtime startup for MayteraOS user space
 ; This is the entry point for all user-mode programs
 ; Sets up the C environment and calls main()

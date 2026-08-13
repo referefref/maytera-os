@@ -8,7 +8,7 @@
 #define MAYTERA_VERSION_PATCH    0
 
 // Build number (increment for each build)
-#define MAYTERA_BUILD_NUMBER 245
+#define MAYTERA_BUILD_NUMBER 272
 
 // Version string helper macros
 #define STRINGIFY(x) STRINGIFY_HELPER(x)
@@ -17,8 +17,12 @@
 #define MAYTERA_VERSION_STRING "1.25.22"
 
 // Build date (set at compile time)
+#ifndef MAYTERA_BUILD_DATE
 #define MAYTERA_BUILD_DATE       __DATE__
+#endif
+#ifndef MAYTERA_BUILD_TIME
 #define MAYTERA_BUILD_TIME       __TIME__
+#endif
 
 // Full version string
 #define MAYTERA_FULL_VERSION     "MayteraOS v" MAYTERA_VERSION_STRING

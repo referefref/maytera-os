@@ -16,8 +16,20 @@
 #include "../../mm/heap.h"
 #include "../../serial.h"
 #include "../../fs/fat.h"
+// #693: the private `extern` declarations of the VFS file ops that used to
+// sit in this file are GONE. They were not just duplicates: a redeclaration
+// in a TU that never includes fs/vfs.h silently strips the header's
+// MUST_CHECK (warn_unused_result), so a discarded persistence result here
+// compiled clean while the identical mistake elsewhere failed the build. That
+// is a compiler-enforced gate defeated by a forked declaration, which is the
+// same class of bug #695 found when three of them lied about the return TYPE.
+#include "../../fs/vfs.h"
 #include "../../proc/process.h"
+#include "../../proc/users.h"   // #692: resolve the authenticated account
+#include "../../proc/services.h" // #785: register as a built-in service
 #include "../../drivers/tty.h"
+#include "../../cpu/mono.h"   // #499: sched_now_ms() - THE shared real-elapsed-ms clock
+#include "../../security/security.h"   // #697: security_audit() + secure_zero()
 
 extern void net_poll(void);
 extern void tcp_timer(void);
@@ -36,12 +48,11 @@ extern void net_unlock(void);
 
 // pty / proc bridge (same as net/remote_ctrl.c rc_cmd_shell)
 extern struct file *dev_open(const char *name, int flags);
-extern void     file_put(struct file *f);
-extern int64_t  file_read(struct file *f, void *buf, uint64_t count);
-extern int64_t  file_write(struct file *f, const void *buf, uint64_t count);
-extern int      file_ioctl(struct file *f, unsigned cmd, void *arg2);
-extern int      file_poll(struct file *f, int events);
-extern int      proc_create_user_tty(const char *name, void *data, uint64_t sz, int pts_idx);
+// #692: the ssh shell runs as the ACCOUNT that authenticated (g_user),
+// resolved through /CONFIG/PASSWD, not as whatever the sshd worker thread
+// is. The worker is a kernel thread, so the old inherit meant uid 0 for
+// every ssh session regardless of who logged in.
+extern user_entry_t *user_lookup_name(const char *name);
 extern process_t *proc_get(uint32_t pid);
 
 #define MSG_DISCONNECT 1
@@ -82,9 +93,61 @@ static int g_hk_crt = 0;
 static uint8_t *g_ks_blob; static int g_ks_len;   // ssh-rsa public blob
 static int g_hk_ready = 0;
 
-// ---- config (user/pass) ----
-static char g_user[64] = "root";
-static char g_pass[128] = "maytera";
+// ---- config + auth policy (#697) -------------------------------------------
+// THERE IS NO CREDENTIAL IN THIS FILE, AND THERE MUST NEVER BE ONE AGAIN.
+//
+// What was here until #697:
+//     static char g_user[64]  = "root";
+//     static char g_pass[128] = "maytera";
+// compared with strcmp() in the userauth loop. That was a remote root shell on
+// every shipping image: main.c started this listener whenever
+// /CONFIG/SSHHOST.KEY existed, and every image shipped that key. The password
+// was genuinely checked (a wrong one was refused) and /CONFIG/SHADOW was never
+// consulted (a real `admin` account with a real PBKDF2 hash was refused), which
+// is the signature of a second, private authenticator living next to the real
+// one. Changing the VALUE would have fixed nothing: a compiled-in fallback
+// credential IS the defect.
+//
+// Policy now, in the order that kills the class rather than the instance:
+//   1. no credential of any value exists here;
+//   2. the listener does not start unless /CONFIG/SSHD.CFG says enable=1. A
+//      host key is not consent to listen. An image that ships no SSHD.CFG
+//      ships no listener, so a future credential regression has nothing
+//      listening to exploit it;
+//   3. password auth (opt-in, default OFF) goes through users_authenticate(),
+//      the SAME PBKDF2 + rate-limit + lockout path the local login gate uses.
+//      Two authentication implementations is exactly how this happened;
+//   4. no account authenticates by any method unless it is named in
+//      `allowusers=`, so the GLOBAL /CONFIG/AUTHKEYS cannot be replayed to log
+//      in as an arbitrary account.
+// Parsing and the allow decisions live in rustkern/sshdcfg.rs (Rust-first).
+
+#define SSHD_ALLOWUSERS_MAX 256
+typedef struct {
+    uint8_t enable;
+    uint8_t password_auth;
+    uint8_t reject;        // 0 ok, 1 legacy user=/pass= key, 2 malformed value
+    uint8_t _pad0;
+    uint16_t port;
+    uint16_t _pad1;
+    uint8_t allowusers[SSHD_ALLOWUSERS_MAX];
+} sshd_cfg_t;
+_Static_assert(sizeof(sshd_cfg_t) == 264, "sshd_cfg_t must match Rust SshdCfg");
+
+extern int sshd_cfg_parse_rs(const uint8_t *buf, uint32_t len, sshd_cfg_t *out);
+extern int sshd_user_allowed_rs(const sshd_cfg_t *cfg, const uint8_t *user);
+extern int sshd_authkey_match_rs(const uint8_t *buf, uint32_t len,
+                                 const uint8_t *fp, const uint8_t *user);
+extern uint32_t sshd_cfg_selftest_rs(void);
+// #785: render the config back to canonical text so enable/disable can be
+// PERSISTED. The renderer is in Rust next to the parser so there is exactly one
+// understanding of this format; a hand-written C serializer here would be the
+// second implementation, and two implementations of one format is how the
+// compiled-in credential survived review in the first place.
+extern int sshd_cfg_render_rs(const sshd_cfg_t *cfg, uint8_t *out, uint32_t outlen);
+
+static sshd_cfg_t g_cfg;      // zero == disabled, which is the safe state
+static int g_cfg_loaded = 0;
 
 // ---- wire helpers (mirror of ssh2.c) ----
 typedef struct { uint8_t *p; int len, cap; } wb_t;
@@ -134,14 +197,18 @@ typedef struct {
     uint8_t inbuf[SSH2_MAX_PACKET];
     uint32_t peer_chan, our_chan, local_window, remote_window;
     int closed;
+    // #697: the account that ACTUALLY authenticated on this connection. The
+    // shell is spawned as this user. It used to be spawned as the compiled-in
+    // g_user regardless of who logged in.
+    char auth_user[64];
 } srv_t;
 
 static int sock_send_all(int sock, const uint8_t *d, int len) {
-    int sent = 0; uint64_t hz = g_timer_hz?g_timer_hz:250; uint64_t st = timer_ticks;
+    int sent = 0; uint64_t st = sched_now_ms();
     while (sent < len) {
         int r = L_tcp_send(sock, d+sent, (uint16_t)(len-sent>4096?4096:len-sent));
-        if (r > 0) { sent+=r; net_poll(); tcp_timer(); st=timer_ticks; continue; }
-        if (r == TCP_ERR_WOULD_BLOCK) { net_poll(); tcp_timer(); proc_sleep(1); if (timer_ticks-st>hz*10) return -1; continue; }
+        if (r > 0) { sent+=r; net_poll(); tcp_timer(); st=sched_now_ms(); continue; }
+        if (r == TCP_ERR_WOULD_BLOCK) { net_poll(); tcp_timer(); proc_sleep(1); if (sched_now_ms()-st>10000) return -1; continue; }
         return -1;
     }
     return sent;
@@ -207,7 +274,7 @@ static int srv_extract(srv_t *s, int *plen) {
     }
 }
 static int srv_expect(srv_t *s, int want, int *plen) {
-    uint64_t hz = g_timer_hz?g_timer_hz:250; uint64_t st = timer_ticks;
+    uint64_t st = sched_now_ms();
     for (;;) {
         int r = srv_extract(s, plen);
         if (r < 0) return -1;
@@ -222,11 +289,11 @@ static int srv_expect(srv_t *s, int want, int *plen) {
         int ing = srv_ingest(s);
         if (ing < 0) return -1;
         net_poll(); tcp_timer(); proc_sleep(2);
-        if (timer_ticks - st > hz*15) return -1;
+        if (sched_now_ms() - st > 15000) return -1;
     }
 }
 static int srv_read_version(srv_t *s) {
-    uint64_t hz = g_timer_hz?g_timer_hz:250; uint64_t st = timer_ticks;
+    uint64_t st = sched_now_ms();
     for (;;) {
         for (int i = 0; i < s->rlen; i++) {
             if (s->rbuf[i] == '\n') {
@@ -241,7 +308,7 @@ static int srv_read_version(srv_t *s) {
         }
         if (srv_ingest(s) < 0) return -1;
         net_poll(); tcp_timer(); proc_sleep(2);
-        if (timer_ticks - st > hz*10) return -1;
+        if (sched_now_ms() - st > 10000) return -1;
     }
 }
 static void derive(const uint8_t *kmp, int kl, const uint8_t *h, char L, const uint8_t *sid, uint8_t *out, int olen) {
@@ -280,21 +347,54 @@ static int load_host_key(void) {
     g_ks_blob = ksb; g_ks_len = w.len;
     g_hk_ready = 1;
     DBG("[SSHD] host key loaded (n=%d e=%d d=%d crt=%d, K_S=%d)\n", g_hk_nlen, g_hk_elen, g_hk_dlen, g_hk_crt, g_ks_len);
-    // optional /CONFIG/SSHD.CFG user=/pass=
-    uint32_t csz=0; char *cf=(char*)fat_read_file(&g_fat_fs,"/CONFIG/SSHD.CFG",&csz);
-    if (cf && csz) {
-        char line[160]; int li=0;
-        for (uint32_t i=0;i<=csz;i++){ char c=(i<csz)?cf[i]:'\n';
-            if (c=='\n'||li>=(int)sizeof(line)-1){ line[li]=0; li=0;
-                char *eq=0; for(char*p=line;*p;p++) if(*p=='='){eq=p;break;}
-                if(eq){*eq=0; const char*k=line,*v=eq+1; int n2=0; while(v[n2]&&v[n2]!='\r'&&v[n2]!='\n') n2++; char vv[128]; int m=n2<127?n2:127; memcpy(vv,v,m); vv[m]=0;
-                    if(!strcmp(k,"user")) strncpy(g_user,vv,sizeof(g_user)-1);
-                    else if(!strcmp(k,"pass")) strncpy(g_pass,vv,sizeof(g_pass)-1); }
-            } else line[li++]=c;
-        }
-    }
-    if (cf) kfree(cf);
     return 0;
+}
+
+// Load /CONFIG/SSHD.CFG. Returns 1 if the server may listen, 0 otherwise.
+// ABSENT FILE => 0. That is the point: the host key existing is not a decision
+// to expose a network service, and this is the only place that decision is
+// made. Parsing is in Rust (rustkern/sshdcfg.rs); this function only does the
+// file read and the logging.
+static int sshd_load_config(void) {
+    if (g_cfg_loaded) return g_cfg.enable ? 1 : 0;
+    g_cfg_loaded = 1;
+
+    uint32_t bits = sshd_cfg_selftest_rs();
+    if (bits) {
+        // The policy is wrong on THIS build. Refuse to listen rather than
+        // listen with a policy we just proved broken.
+        kprintf("[SSHD] POLICY SELF-TEST FAILED (0x%x) - refusing to start\n", bits);
+        security_audit(AUDIT_PERMISSION_DENIED, 0, "sshd: policy self-test failed, listener refused");
+        g_cfg.enable = 0;
+        return 0;
+    }
+
+    uint32_t csz = 0;
+    uint8_t *cf = (uint8_t *)fat_read_file(&g_fat_fs, "/CONFIG/SSHD.CFG", &csz);
+    int rc = sshd_cfg_parse_rs(cf, cf ? csz : 0, &g_cfg);
+    if (cf) kfree(cf);
+
+    if (rc != 0) {
+        if (g_cfg.reject == 1) {
+            kprintf("[SSHD] /CONFIG/SSHD.CFG carries a legacy user=/pass= credential - REFUSED, not starting\n");
+            security_audit(AUDIT_PERMISSION_DENIED, 0, "sshd: SSHD.CFG contains a credential; config refused");
+        } else {
+            kprintf("[SSHD] /CONFIG/SSHD.CFG is malformed - REFUSED, not starting\n");
+        }
+        g_cfg.enable = 0;
+        return 0;
+    }
+    if (!g_cfg.enable) {
+        kprintf("[SSHD] disabled: /CONFIG/SSHD.CFG %s. No listener.\n",
+                csz ? "does not say enable=1" : "is absent");
+        return 0;
+    }
+    kprintf("[SSHD] enabled by /CONFIG/SSHD.CFG: port %u, password_auth=%s, allowusers='%s'\n",
+            (unsigned)g_cfg.port, g_cfg.password_auth ? "yes" : "NO (pubkey only)",
+            (const char *)g_cfg.allowusers);
+    if (g_cfg.allowusers[0] == 0)
+        kprintf("[SSHD] WARNING: allowusers= is empty, so NO account can authenticate\n");
+    return 1;
 }
 
 // ---- channel <-> pty pump ----
@@ -317,24 +417,65 @@ static void srv_channel_send(srv_t *s, const uint8_t *d, int n) {
     }
 }
 
-// Is this client public-key blob authorized? /CONFIG/AUTHKEYS holds one
-// hex(SHA256(pubkey-blob)) fingerprint per line. Generate with, on Linux:
-//   awk '{print $2}' ~/.ssh/id_rsa.pub | base64 -d | sha256sum
-static int authkey_allowed(const uint8_t *blob, int bl) {
+// Is this client public-key blob authorized FOR THIS USER? /CONFIG/AUTHKEYS
+// holds one entry per line, either
+//     <64-hex-sha256-of-pubkey-blob>              (authorizes any allowed user)
+//     <username> <64-hex-sha256-of-pubkey-blob>   (authorizes ONLY that user)
+// Generate the fingerprint on Linux with:
+//   awk '{print $2}' ~/.ssh/id_ed25519.pub | base64 -d | sha256sum
+// #697: this used to take no user at all; the caller compared the requested
+// user against the compiled-in g_user. With that gone, a global key file could
+// otherwise have been replayed to log in as any account, so matching is now
+// user-aware AND the caller separately requires an allowusers= entry.
+// Line parsing is in rustkern/sshdcfg.rs.
+static int authkey_allowed(const uint8_t *blob, int bl, const char *user) {
     uint8_t fp[32]; sha256(blob, bl, fp);
-    static const char *HX = "0123456789abcdef";
-    char hex[65]; for (int i = 0; i < 32; i++) { hex[i*2]=HX[fp[i]>>4]; hex[i*2+1]=HX[fp[i]&15]; } hex[64]=0;
-    uint32_t sz=0; char *f=(char*)fat_read_file(&g_fat_fs,"/CONFIG/AUTHKEYS",&sz);
+    uint32_t sz=0; uint8_t *f=(uint8_t*)fat_read_file(&g_fat_fs,"/CONFIG/AUTHKEYS",&sz);
     if (!f || !sz) { if (f) kfree(f); return 0; }
-    int found=0; char line[96]; int li=0;
-    for (uint32_t i=0;i<=sz;i++){ char c=(i<sz)?f[i]:'\n';
-        if (c=='\n' || li>=(int)sizeof(line)-1){ line[li]=0; li=0;
-            int n=0; while(line[n]) n++; while(n>0&&(line[n-1]==' '||line[n-1]=='\r'||line[n-1]=='\t')) line[--n]=0;
-            char *p2=line; while(*p2==' '||*p2=='\t') p2++;
-            if ((int)strlen(p2)>=64 && memcmp(p2,hex,64)==0) { found=1; break; }
-        } else line[li++]=c;
-    }
+    int found = sshd_authkey_match_rs(f, sz, fp, (const uint8_t *)user);
     kfree(f); return found;
+}
+
+// May this account authenticate at all? Requires an explicit allowusers= entry
+// AND a real /CONFIG/PASSWD account. Both, deliberately: the config says who is
+// permitted remotely, PASSWD says who exists.
+static int sshd_account_permitted(const char *user) {
+    if (!user || !user[0]) return 0;
+    if (!sshd_user_allowed_rs(&g_cfg, (const uint8_t *)user)) return 0;
+    return user_lookup_name(user) != 0;
+}
+
+// The USERAUTH_FAILURE method-name-list must advertise what is actually
+// offered. It used to say "publickey,password" unconditionally, which now
+// would invite a client to spend its attempts on a method the config disabled.
+static void srv_auth_methods(wb_t *w) {
+    wcstr(w, g_cfg.password_auth ? "publickey,password" : "publickey");
+}
+
+// Audit an sshd auth outcome WITH THE ACTOR NAME. "denied" with no actor cannot
+// answer the only questions an audit trail is for: who tried, and who got in.
+// The username is client-supplied, so it is length-clamped and stripped of
+// anything that is not a printable non-space ASCII character before it reaches
+// the log: an audit record must not be forgeable by choosing a username that
+// injects punctuation into the log line.
+// `ok`: 1 = SUCCEEDED, 0 = DENIED, -1 = a credential OFFER refused before any
+// attempt was made with it (an ssh publickey query with no signature). The last
+// case is logged at INFO rather than WARNING: an ordinary client offers every
+// key it has, so it happens on connections that are not attacks at all.
+static void sshd_audit_auth(int ok, const char *method, const char *user) {
+    char safe[33]; int n = 0;
+    for (const char *q = user; *q && n < (int)sizeof(safe) - 1; q++) {
+        unsigned char c = (unsigned char)*q;
+        safe[n++] = (c > 0x20 && c < 0x7f && c != ':' && c != ',') ? (char)c : '?';
+    }
+    safe[n] = 0;
+    if (n == 0) { safe[0] = '?'; safe[1] = 0; }
+    char detail[96];
+    snprintf(detail, sizeof(detail), "sshd %s auth %s for user '%s'", method,
+             ok > 0 ? "SUCCEEDED" : (ok == 0 ? "DENIED" : "OFFER REFUSED"), safe);
+    security_audit(ok > 0 ? AUDIT_AUTH_SUCCESS
+                          : (ok == 0 ? AUDIT_AUTH_FAIL : AUDIT_AUTH_PROBE),
+                   0, detail);
 }
 
 // Verify a publickey userauth signature. Supports RSA (rsa-sha2-256) and
@@ -520,38 +661,71 @@ static void handle_session(srv_t *s) {
         if (strcmp(meth, "password") == 0 && rem >= 1) {
             p+=1; rem-=1;  // bool FALSE
             uint32_t pl2=ru32(p); p+=4; rem-=4; char pass[128]; int pm=(pl2<127)?(int)pl2:127; if((int)pl2>rem) return; memcpy(pass,p,pm); pass[pm]=0;
-            if (strcmp(user, g_user)==0 && strcmp(pass, g_pass)==0) {
-                uint8_t b=MSG_USERAUTH_SUCCESS; srv_send(s,&b,1); authed=1;
-                DBG("[SSHD] password auth OK for %s\n", user);
+            // #697: THE authenticator, not a second one. users_authenticate()
+            // is the same PBKDF2-against-/CONFIG/SHADOW check the local login
+            // gate and the lock screen use, including its per-account
+            // failed-attempt counter and escalating lockout, so a remote
+            // password-guessing loop is rate limited by the same policy.
+            int ok = 0;
+            if (!g_cfg.password_auth) {
+                DBG("[SSHD] password auth is disabled by config\n");
+            } else if (!sshd_account_permitted(user)) {
+                DBG("[SSHD] password auth refused: '%s' not permitted\n", user);
             } else {
-                uint8_t buf[64]; wb_t w={buf,0,sizeof(buf)}; wu8(&w,MSG_USERAUTH_FAILURE); wcstr(&w,"publickey,password"); wbool(&w,0); srv_send(s,buf,w.len);
-                DBG("[SSHD] password auth FAIL for %s\n", user);
+                ok = (users_authenticate(user, pass) == 0);
+            }
+            // Do not leave the password on this thread's stack after the check.
+            // secure_zero, not memset: memset on a dead local is exactly the
+            // store a compiler is entitled to delete. (It also gives that
+            // primitive its first caller; it had none as of #646.)
+            secure_zero(pass, sizeof(pass));
+            if (ok) {
+                strncpy(s->auth_user, user, sizeof(s->auth_user)-1);
+                s->auth_user[sizeof(s->auth_user)-1] = 0;
+                uint8_t b=MSG_USERAUTH_SUCCESS; srv_send(s,&b,1); authed=1;
+                kprintf("[SSHD] password auth OK for '%s'\n", user);
+                sshd_audit_auth(1, "password", user);
+            } else {
+                uint8_t buf[64]; wb_t w={buf,0,sizeof(buf)}; wu8(&w,MSG_USERAUTH_FAILURE); srv_auth_methods(&w); wbool(&w,0); srv_send(s,buf,w.len);
+                kprintf("[SSHD] password auth DENIED for '%s'\n", user);
+                sshd_audit_auth(0, "password", user);
             }
         } else if (strcmp(meth, "publickey") == 0 && rem >= 1) {
             int has_sig = p[0]; p+=1; rem-=1;
             uint32_t al=ru32(p); p+=4; rem-=4; const uint8_t *algo=p; if((int)al>rem) return; p+=al; rem-=al;
             uint32_t bl=ru32(p); p+=4; rem-=4; const uint8_t *blob=p; if((int)bl>rem) return; p+=bl; rem-=bl;
-            int allowed = (strcmp(user, g_user)==0) && authkey_allowed(blob, (int)bl);
+            // #697: the account must be permitted by config AND the key must be
+            // authorized for THAT account.
+            int allowed = sshd_account_permitted(user) && authkey_allowed(blob, (int)bl, user);
             if (!has_sig) {
                 if (allowed) {  // PK_OK: echo algo + blob, client will re-send signed
                     uint8_t buf[1024]; wb_t w={buf,0,sizeof(buf)}; wu8(&w,MSG_USERAUTH_PK_OK); wstr(&w,algo,(int)al); wstr(&w,blob,(int)bl);
                     if (w.len<=w.cap) srv_send(s,buf,w.len);
                 } else {
-                    uint8_t buf[64]; wb_t w={buf,0,sizeof(buf)}; wu8(&w,MSG_USERAUTH_FAILURE); wcstr(&w,"publickey,password"); wbool(&w,0); srv_send(s,buf,w.len);
+                    uint8_t buf[64]; wb_t w={buf,0,sizeof(buf)}; wu8(&w,MSG_USERAUTH_FAILURE); srv_auth_methods(&w); wbool(&w,0); srv_send(s,buf,w.len);
+                    // A refused key OFFER left NO record at all in the first cut
+                    // of this change: the client never sends the signed request,
+                    // so the audited branch below was never reached and probing
+                    // with unauthorized keys was invisible. Record it, at INFO.
+                    sshd_audit_auth(-1, "pubkey", user);
                 }
             } else {
                 uint32_t sgl=ru32(p); p+=4; rem-=4; const uint8_t *sg=p; if((int)sgl>rem) return;
                 int vok = srv_pubkey_verify(s, user, algo, (int)al, blob, (int)bl, sg, (int)sgl);
                 if (allowed && vok) {
+                    strncpy(s->auth_user, user, sizeof(s->auth_user)-1);
+                    s->auth_user[sizeof(s->auth_user)-1] = 0;
                     uint8_t b=MSG_USERAUTH_SUCCESS; srv_send(s,&b,1); authed=1;
-                    DBG("[SSHD] pubkey auth OK for %s\n", user);
+                    kprintf("[SSHD] pubkey auth OK for '%s'\n", user);
+                    sshd_audit_auth(1, "pubkey", user);
                 } else {
-                    uint8_t buf[64]; wb_t w={buf,0,sizeof(buf)}; wu8(&w,MSG_USERAUTH_FAILURE); wcstr(&w,"publickey,password"); wbool(&w,0); srv_send(s,buf,w.len);
-                    DBG("[SSHD] pubkey auth FAIL for %s\n", user);
+                    uint8_t buf[64]; wb_t w={buf,0,sizeof(buf)}; wu8(&w,MSG_USERAUTH_FAILURE); srv_auth_methods(&w); wbool(&w,0); srv_send(s,buf,w.len);
+                    kprintf("[SSHD] pubkey auth DENIED for '%s'\n", user);
+                    sshd_audit_auth(0, "pubkey", user);
                 }
             }
         } else {
-            uint8_t buf[64]; wb_t w={buf,0,sizeof(buf)}; wu8(&w,MSG_USERAUTH_FAILURE); wcstr(&w,"publickey,password"); wbool(&w,0); srv_send(s,buf,w.len);
+            uint8_t buf[64]; wb_t w={buf,0,sizeof(buf)}; wu8(&w,MSG_USERAUTH_FAILURE); srv_auth_methods(&w); wbool(&w,0); srv_send(s,buf,w.len);
         }
     }
     if (!authed) return;
@@ -569,15 +743,22 @@ static void handle_session(srv_t *s) {
     struct file *master = dev_open("ptmx", 0x0002 | 0x0800);
     if (!master) { DBG("[SSHD] ptmx fail\n"); return; }
     int pts_idx = -1;
-    if (file_ioctl(master, 0x80045430, &pts_idx) != 0 || pts_idx < 0) { file_put(master); return; }
+    if (file_ioctl(master, 0x80045430, &pts_idx) != 0 || pts_idx < 0) {
+            IGNORE_RESULT("pty master teardown; nothing buffered", file_put(master));
+            return;
+        }
     uint32_t msz=0; void *mdata = fat_read_file(&g_fat_fs, "/APPS/MSH", &msz);
-    if (!mdata || !msz) { if(mdata) kfree(mdata); file_put(master); return; }
+    if (!mdata || !msz) {
+            if (mdata) kfree(mdata);
+            IGNORE_RESULT("pty master teardown; nothing buffered", file_put(master));
+            return;
+        }
     int child_started = 0;
 
     // channel-request loop until shell starts, then pump
     process_t *child = 0; int child_pid = -1;
     uint8_t io[512];
-    uint64_t hz = g_timer_hz?g_timer_hz:250; uint64_t idle_start = timer_ticks;
+    uint64_t idle_start = sched_now_ms();
     for (;;) {
         if (s->closed) break;
         tcp_state_t st = L_tcp_state(s->sock);
@@ -632,7 +813,23 @@ static void handle_session(srv_t *s) {
                 int is_exec  = (tl==4 && memcmp(rt,"exec",4)==0);
                 int is_pty   = (tl==7 && memcmp(rt,"pty-req",7)==0);
                 if ((is_shell || is_exec) && !child_started) {
-                    child_pid = proc_create_user_tty("msh", mdata, msz, pts_idx);
+                    // #697: the shell runs as the account that ACTUALLY
+                    // authenticated on this connection, not as a compiled-in
+                    // name. s->auth_user is set only on a successful auth, so
+                    // an empty value here means we reached the channel loop
+                    // without one, which must never spawn anything.
+                    if (!s->auth_user[0]) {
+                        kprintf("[SSHD] refusing shell: no authenticated identity on this session\n");
+                        security_audit(AUDIT_PERMISSION_DENIED, 0, "sshd: shell requested with no authenticated identity");
+                        break;
+                    }
+                    user_entry_t *sue = user_lookup_name(s->auth_user);
+                    if (!sue) {
+                        kprintf("[SSHD] refusing shell: no PASSWD entry for '%s'\n", s->auth_user);
+                        break;
+                    }
+                    child_pid = proc_create_user_tty_as("msh", mdata, msz, pts_idx,
+                                                       proc_as_uid(sue->uid));
                     if (child_pid > 0) {
                         child = proc_get((uint32_t)child_pid); child_started = 1;
                         DBG("[SSHD] shell pid=%d on pts/%d\n", child_pid, pts_idx);
@@ -659,8 +856,10 @@ static void handle_session(srv_t *s) {
                             if (co + 4 <= pl2 - 1) {
                                 uint32_t cl = ru32(p + co); const uint8_t *cmd = p + co + 4;
                                 if (cl > 0 && (int)(co + 4 + cl) <= pl2 - 1) {
-                                    file_write(master, cmd, cl);
-                                    file_write(master, "\nexit\n", 6);  // run it, then close the session
+                                    if (file_write(master, cmd, cl) != (int64_t)cl)
+                                                        kprintf("[SSHD] short write of exec command; it will run TRUNCATED\n");
+                                    if (file_write(master, "\nexit\n", 6) != 6)
+                                                        kprintf("[SSHD] short write of exec epilogue; session may hang\n");
                                 }
                             }
                         }
@@ -669,7 +868,8 @@ static void handle_session(srv_t *s) {
                 if (want_reply) { uint8_t b = (is_shell||is_exec||is_pty)?MSG_CHANNEL_SUCCESS:MSG_CHANNEL_FAILURE; uint8_t buf[8]; wb_t w={buf,0,sizeof(buf)}; wu8(&w,b); wu32(&w,s->peer_chan); srv_send(s,buf,w.len); }
             } else if (t == MSG_CHANNEL_DATA) {
                 uint32_t dl=ru32(p+4); const uint8_t *d=p+8; if ((int)dl > pl2-9) dl = pl2-9>0?pl2-9:0;
-                if (child_started && dl) file_write(master, d, dl);
+                if (child_started && dl && file_write(master, d, dl) != (int64_t)dl)
+                                        kprintf("[SSHD] short write to pty master: client input dropped\n");
                 if (s->local_window >= dl) s->local_window -= dl;
                 if (s->local_window < (1u<<18)) { uint32_t add=(1u<<21)-s->local_window; uint8_t buf[16]; wb_t w={buf,0,sizeof(buf)}; wu8(&w,MSG_CHANNEL_WINDOW_ADJUST); wu32(&w,s->peer_chan); wu32(&w,add); if(srv_send(s,buf,w.len)>=0) s->local_window+=add; }
             } else if (t == MSG_CHANNEL_WINDOW_ADJUST) {
@@ -686,11 +886,12 @@ static void handle_session(srv_t *s) {
         }
         if (!did) { net_poll(); tcp_timer(); proc_sleep(8); }
         else { net_poll(); tcp_timer(); }
-        if (!child_started && timer_ticks - idle_start > hz*60) break;  // no shell within 60s
+        if (!child_started && sched_now_ms() - idle_start > 60000) break;  // no shell within 60s
     }
 
     // teardown
-    file_put(master);
+    IGNORE_RESULT("ssh session teardown: a pty master buffers nothing and the session is gone",
+                  file_put(master));
     if (mdata) kfree(mdata);
     DBG("[SSHD] session closed\n");
 }
@@ -700,7 +901,13 @@ extern int  proc_create_ex(const char *name, void (*entry)(void *), void *arg,
 extern int  proc_reap(uint32_t pid);
 
 static int g_listen = -1;
+// #785: two different facts, kept apart on purpose.
+//   g_running    - the CONTROL flag: should the accept loop keep going.
+//   g_listen_open- whether a socket is actually bound and listening RIGHT NOW.
+// Reporting the control flag as if it were the observable state is how a
+// service claims to be up while nothing is on the port.
 static volatile int g_running = 0;
+static volatile int g_listen_open = 0;
 
 // #435: up to this many SSH sessions run at once, each on its OWN worker
 // thread. The listener thread never blocks inside a session, so a slow or
@@ -731,15 +938,13 @@ static void ssh_session_worker(void *arg) {
 
 static void ssh_server_thread(void *arg) {
     (void)arg;
-    if (load_host_key() != 0) { kprintf("[SSHD] no /CONFIG/SSHHOST.KEY - server not started\n"); return; }
-    g_listen = tcp_socket();
-    if (g_listen < 0) { kprintf("[SSHD] socket fail\n"); return; }
-    if (tcp_bind(g_listen, 22) < 0) { kprintf("[SSHD] bind 22 fail\n"); return; }
-    if (tcp_listen(g_listen, SSH_MAX_SESSIONS) < 0) { kprintf("[SSHD] listen fail\n"); return; }
-    for (int i = 0; i < SSH_MAX_SESSIONS; i++) g_sess_pids[i] = 0;
-    g_running = 1;
-    kprintf("[SSHD] listening on port 22 (max %d concurrent sessions)\n", SSH_MAX_SESSIONS);
-    while (g_running) {
+    // #785: the socket is now created, bound and listening SYNCHRONOUSLY in
+    // ssh_server_start_checked() before this thread is created, so this thread
+    // is purely the accept loop. That is what lets start report whether the
+    // port is actually open: previously every failure mode here (no host key,
+    // bind refused, port in use) happened after the caller had already been
+    // told the server was started, on a thread nobody was watching.
+    while (g_running && g_listen >= 0) {
         // Reap finished workers and count how many are still live.
         int active = 0, freeslot = -1;
         for (int i = 0; i < SSH_MAX_SESSIONS; i++) {
@@ -772,13 +977,173 @@ static void ssh_server_thread(void *arg) {
         // Idle (or all session slots busy): drive the net stack and yield.
         net_poll(); tcp_timer(); proc_sleep(20);
     }
+    // #785: stop path. ssh_server_stop_checked() closes the listening socket
+    // itself (under net_lock, so it serializes with the accept above) and sets
+    // g_listen to -1; this is the belt-and-braces close for any other way the
+    // loop can end, and it must not double close.
+    if (g_listen >= 0) { L_tcp_close(g_listen); g_listen = -1; }
+    g_listen_open = 0;
+    g_running = 0;
+    kprintf("[SSHD] accept loop exited; not listening\n");
 }
 
-void ssh_server_start(void) {
-    if (g_running) { kprintf("[SSHD] already running\n"); return; }
+// #785: the checked entry point. Returns 0 when the port is genuinely open,
+// negative otherwise, so both main.c and the service manager get the truth.
+//
+// `reload` forces the cached config to be re-read. Boot passes 0 (nothing has
+// changed since sshd_load_config() has not run yet); an operator starting the
+// service after editing /CONFIG/SSHD.CFG passes 1, which is what makes
+// enable/disable take effect WITHOUT a rebuild.
+int ssh_server_start_checked(int reload) {
+    if (g_listen_open) { kprintf("[SSHD] already listening\n"); return 0; }
+    if (reload) g_cfg_loaded = 0;
+
+    // THE decision point (#697). No config, no listener, no thread, no socket.
+    // main.c used to call this whenever /CONFIG/SSHHOST.KEY existed, and every
+    // shipping image had that key, so every shipping image listened on 22 and
+    // (with the compiled-in credential that also lived in this file) handed out
+    // a uid 0 shell to anyone on the network. A host key existing is not a
+    // decision to expose a network service. It fails closed.
+    if (!sshd_load_config()) return -1;
+
+    if (load_host_key() != 0) {
+        kprintf("[SSHD] no /CONFIG/SSHHOST.KEY - server not started\n");
+        return -2;
+    }
+    // Bind and listen BEFORE creating the accept thread, so a refused bind is a
+    // return value to the caller rather than a line on a serial console.
+    int ls = tcp_socket();
+    if (ls < 0) { kprintf("[SSHD] socket fail\n"); return -3; }
+    if (tcp_bind(ls, g_cfg.port) < 0) {
+        kprintf("[SSHD] bind %u fail\n", (unsigned)g_cfg.port);
+        L_tcp_close(ls);
+        return -4;
+    }
+    if (tcp_listen(ls, SSH_MAX_SESSIONS) < 0) {
+        kprintf("[SSHD] listen fail\n");
+        L_tcp_close(ls);
+        return -5;
+    }
+    for (int i = 0; i < SSH_MAX_SESSIONS; i++) g_sess_pids[i] = 0;
+    g_listen = ls;
+    g_listen_open = 1;
+    g_running = 1;
+
     // PRIO_NORMAL (not PRIO_LOW): a CPU-busy userland app (e.g. the AI-chat
     // widget) runs at NORMAL and, under the strict-priority scheduler, would
     // starve a PRIO_LOW sshd indefinitely - the box stays alive but SSHD goes
     // silent. NORMAL lets the listener round-robin fairly and keep answering.
-    proc_create("sshd", ssh_server_thread, 0, PRIO_NORMAL);
+    int pid = proc_create("sshd", ssh_server_thread, 0, PRIO_NORMAL);
+    if (pid <= 0) {
+        kprintf("[SSHD] could not create the accept thread\n");
+        g_running = 0; g_listen_open = 0;
+        L_tcp_close(ls); g_listen = -1;
+        return -6;
+    }
+    kprintf("[SSHD] listening on port %u (max %d concurrent sessions)\n",
+            (unsigned)g_cfg.port, SSH_MAX_SESSIONS);
+    security_audit(AUDIT_SERVICE_STATE, 0, "sshd: listener started");
+    return 0;
+}
+
+// Boot entry point, kept void for main.c. The result is logged by the callee.
+void ssh_server_start(void) { (void)ssh_server_start_checked(0); }
+
+// #785: stop. Closes the listening socket HERE rather than asking the accept
+// thread to do it, so that when this returns the port is already closed and a
+// caller can state that as a fact. tcp_close runs under net_lock, which is the
+// same lock the accept loop takes, so the two serialize.
+//
+// Live SESSIONS are deliberately left alone: killing an operator's own remote
+// shell out from under them while they are typing `svc disable sshd` is a
+// hostile surprise, and the security-relevant property (no NEW connections) is
+// already achieved by closing the listener. Existing sessions end when they end.
+int ssh_server_stop_checked(void) {
+    if (!g_listen_open && g_listen < 0) return 0;   // already stopped
+    g_running = 0;                 // tell the accept loop to exit
+    int ls = g_listen;
+    g_listen = -1;
+    g_listen_open = 0;
+    if (ls >= 0) L_tcp_close(ls);
+    kprintf("[SSHD] listener closed by request; port is no longer accepting\n");
+    security_audit(AUDIT_SERVICE_STATE, 0, "sshd: listener stopped by request");
+    return 0;
+}
+
+// ---- background-services (#95) integration (#785) --------------------------
+// sshd is an IN-KERNEL listener, so there is no ELF for the service manager to
+// spawn. Rather than give it a private on/off switch, it registers with the
+// shared registry as a BUILT-IN service and answers the same start/stop/enable
+// verbs every other service does. One subsystem, one set of verbs.
+
+static int sshd_svc_start(void)   { return ssh_server_start_checked(1); }
+static int sshd_svc_stop(void)    { return ssh_server_stop_checked(); }
+static int sshd_svc_running(void) { return g_listen_open ? 1 : 0; }
+
+// Persist enable=0/1 into /CONFIG/SSHD.CFG, which is the ONE source of truth
+// for whether sshd listens. It deliberately does NOT get a second enabled flag
+// in SERVICES.CFG: two files that can disagree about whether a network service
+// is exposed is a worse failure than no persistence at all.
+static int sshd_svc_persist(int enable) {
+    // Start from the config as it is on disk right now, so that persisting the
+    // enable flag cannot silently drop a port= or allowusers= an operator has
+    // edited by hand since boot.
+    sshd_cfg_t cur;
+    memset(&cur, 0, sizeof(cur));
+    uint32_t csz = 0;
+    uint8_t *cf = (uint8_t *)fat_read_file(&g_fat_fs, "/CONFIG/SSHD.CFG", &csz);
+    int rc = sshd_cfg_parse_rs(cf, cf ? csz : 0, &cur);
+    if (cf) kfree(cf);
+    if (rc != 0) {
+        // A malformed or credential-bearing file on disk. Rewriting it would
+        // destroy the evidence and could turn a REFUSED config into an
+        // accepted one. Refuse; the operator must fix the file.
+        kprintf("[SSHD] refusing to persist: /CONFIG/SSHD.CFG does not parse (reject=%u)\n",
+                (unsigned)cur.reject);
+        return -1;
+    }
+    cur.enable = enable ? 1 : 0;
+
+    uint8_t buf[512];
+    int n = sshd_cfg_render_rs(&cur, buf, sizeof(buf));
+    if (n <= 0) { kprintf("[SSHD] refusing to persist: render failed\n"); return -2; }
+
+    if (fat_write_file(&g_fat_fs, "/CONFIG/SSHD.CFG", buf, (uint32_t)n) != 0) {
+        kprintf("[SSHD] refusing to report success: writing /CONFIG/SSHD.CFG FAILED\n");
+        return -3;
+    }
+    // Keep the in-RAM policy consistent with what we just wrote, and force the
+    // next start to re-read from disk rather than trust this copy.
+    g_cfg.enable = cur.enable;
+    g_cfg_loaded = 0;
+    kprintf("[SSHD] /CONFIG/SSHD.CFG persisted: enable=%d\n", enable ? 1 : 0);
+    security_audit(AUDIT_SERVICE_STATE, 0,
+                   enable ? "sshd: ENABLED durably in /CONFIG/SSHD.CFG"
+                          : "sshd: DISABLED durably in /CONFIG/SSHD.CFG");
+    return 0;
+}
+
+// Called from svc_init(). Registers with autostart=0 on purpose: main.c already
+// starts sshd early, before the compositor, which is what makes it usable for
+// debugging a boot that never reaches a desktop. Autostarting it a second time
+// from svc_autostart() would be a no-op at best.
+void sshd_service_register(void) {
+    sshd_cfg_t probe;
+    memset(&probe, 0, sizeof(probe));
+    uint32_t csz = 0;
+    uint8_t *cf = (uint8_t *)fat_read_file(&g_fat_fs, "/CONFIG/SSHD.CFG", &csz);
+    int rc = sshd_cfg_parse_rs(cf, cf ? csz : 0, &probe);
+    if (cf) kfree(cf);
+    // A config we cannot parse counts as DISABLED here, exactly as it does at
+    // the listen decision. Absent file, malformed file and enable=0 all end up
+    // in the same place, which is the point.
+    int enabled = (rc == 0 && probe.enable) ? 1 : 0;
+
+    if (svc_register_builtin("sshd", "svc_sshd", 0, SVC_PERM_NET | SVC_PERM_SPAWN,
+                             0 /* autostart: main.c owns the boot start */,
+                             enabled,
+                             sshd_svc_start, sshd_svc_stop,
+                             sshd_svc_running, sshd_svc_persist) != 0) {
+        kprintf("[SSHD] could not register the 'sshd' service (registry full?)\n");
+    }
 }

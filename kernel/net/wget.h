@@ -230,6 +230,9 @@ int http_resolve_url(const char *base_url, const char *relative, char *result, s
 // Get a connection from the pool (or create new one)
 // Returns socket descriptor or negative error
 int http_get_connection(const char *host, uint16_t port, uint32_t ip);
+// #615: reuse-aware variant + explicit pooled-connection drop (keep-alive retry).
+int http_get_connection_ex(const char *host, uint16_t port, uint32_t ip, int *reused);
+void http_drop_pooled(const char *host, uint16_t port);
 
 // Return a connection to the pool (keep-alive) or close it
 void http_release_connection(int sock, bool keep_alive);

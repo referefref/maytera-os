@@ -1,5 +1,3 @@
-#pragma GCC diagnostic ignored "-Wunused-function"
-#pragma GCC diagnostic ignored "-Wimplicit-function-declaration"
 // netfs.c - Network Filesystem VFS Integration
 // Provides unified interface for local FAT and network NFS file access
 
@@ -116,7 +114,15 @@ static void nfs_attrs_to_vfs_stat(const nfs_fattr3_t *nfs, vfs_stat_t *vfs) {
     vfs->nlink = nfs->nlink;
 }
 
-// Convert FAT attributes to VFS stat
+// Convert FAT attributes to VFS stat.
+// #tls-suppressfix: this function has no callers. That was previously concealed
+// by a FILE-WIDE `#pragma GCC diagnostic ignored "-Wunused-function"`, which is
+// now gone. It is replaced by this NARROW, per-site attribute, so the compiler
+// still reports the NEXT function in this file that falls out of use instead of
+// the whole file opting out of the question. Kept rather than deleted: it is the
+// FAT half of a stat conversion whose NFS and SMB twins are live, so it reads as
+// a gap in this file's coverage rather than as litter.
+static void fat_entry_to_vfs_stat(const fat_dir_entry_t *fat, vfs_stat_t *vfs) __attribute__((unused));
 static void fat_entry_to_vfs_stat(const fat_dir_entry_t *fat, vfs_stat_t *vfs) {
     vfs->is_dir = (fat->attr & FAT_ATTR_DIRECTORY) != 0;
     vfs->is_file = !vfs->is_dir;
@@ -333,15 +339,24 @@ int vfs_close(int fd) {
     if (!vfs_files[fd].active) return -1;
     
     vfs_file_t *file = &vfs_files[fd];
-    
+
+    // #695 Phase 2: THIS IS THE THIRD close() IN THE TREE. sys_close() is the
+    // first, the VFS file_put() -> ops->release() path is the second, and this
+    // one is easy to miss because it already returned int - it simply hardcoded
+    // 0 and threw nfs_close()'s status away. An error-propagation change that
+    // only touches sys_close leaves this one still lying. Named here and in the
+    // CHANGELOG for exactly that reason.
+    int rc = 0;
     if (file->type == FS_TYPE_NFS) {
-        nfs_close(file->handle.nfs_fd);
+        rc = nfs_close(file->handle.nfs_fd);
     } else {
-        fat_close(&file->handle.fat);
+        fat_close(&file->handle.fat);   // void: this family buffers nothing
     }
-    
+
+    // Teardown is unconditional: the slot is freed whether or not the close
+    // reported an error, or one unreachable server leaks a table entry forever.
     file->active = false;
-    return 0;
+    return rc;
 }
 
 ssize_t vfs_read(int fd, void *buffer, size_t count) {

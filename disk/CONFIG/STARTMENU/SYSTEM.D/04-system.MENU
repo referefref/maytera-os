@@ -1,0 +1,19 @@
+# System - all-users Start-menu default fragment. Migrated verbatim from the
+# old hardcoded startmenu_init(). Merges the old "System" + "System Tools".
+category: System
+item: Settings | /APPS/SETTINGS | icon=cog
+item: Font Book | /APPS/FONTBOOK | icon=fontbook
+item: Network | /APPS/network | icon=network
+item: Task Manager | /APPS/taskmgr | icon=task
+item: System Monitor | /APPS/SYSMON | icon=sysmon
+item: Services | /APPS/SVCMGR | icon=services
+item: Device Manager | /APPS/DEVMGR | icon=computer
+# #739: mount/eject CD and floppy IMAGES. icon=computer is reused rather than
+# a new icon added: icon files live outside the repo in the asset base, so a
+# new id would silently fall back to a vector glyph on the real image.
+item: Disk Images | /APPS/DISKIMG | icon=computer
+item: Install MayteraOS to Disk | /APPS/INSTALL | icon=computer
+item: App Store | /APPS/APPSTORE | icon=appstore
+item: System Log | /APPS/SYSLOG | icon=log
+item: 3D Print | /APPS/PRINT3D | icon=print3d
+item: Recycle Bin | @RECYCLE | icon=trash

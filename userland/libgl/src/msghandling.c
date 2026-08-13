@@ -8,9 +8,10 @@
 #define NO_DEBUG_OUTPUT
 #endif
 
-#ifndef NO_DEBUG_OUTPUT
+/* AssaultCube port phase 3: gl_fatal_error() now prints unconditionally
+ * (see that function below), so stdio.h is needed regardless of
+ * NO_DEBUG_OUTPUT. */
 #include <stdio.h>
-#endif
 /* Use this function to output messages when something unexpected
    happens (which might be an indication of an error). *Don't* use it
    when there's GLinternal errors in the code - these should be handled
@@ -50,15 +51,26 @@ void tgl_fixme(const char* format, ...) {
 }
 
 void gl_fatal_error(char* format, ...) {
-#ifndef NO_DEBUG_OUTPUT
+	/* AssaultCube port phase 3 (docs/ASSAULTCUBE_PORT_PLAN.md): this
+	 * function terminates the process either way, so gating its message on
+	 * NO_DEBUG_OUTPUT (a flag meant to silence hot-path per-frame tgl_warning
+	 * /tgl_trace/tgl_fixme spam, see those functions above) bought no
+	 * performance and cost real debuggability: a real, standards-legal
+	 * caller (AssaultCube's own createtexture(), see glopTexImage2D's fix)
+	 * hit this path and the process just vanished with exit(1) and zero
+	 * output, in a build that DOES define NO_DEBUG_OUTPUT (see the Makefile).
+	 * A fatal exit should never be silent regardless of that flag. */
 	va_list ap;
 	va_start(ap, format);
+#ifndef NO_DEBUG_OUTPUT
 	fprintf(stderr, "TinyGL: fatal error: ");
 	vfprintf(stderr, format, ap);
 	fprintf(stderr, "\n");
-	exit(1);
-	va_end(ap);
 #else
-	exit(1);
+	printf("TinyGL: fatal error: ");
+	vprintf(format, ap);
+	printf("\n");
 #endif
+	va_end(ap);
+	exit(1);
 }

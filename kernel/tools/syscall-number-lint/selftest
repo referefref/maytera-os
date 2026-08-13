@@ -1,0 +1,120 @@
+#!/bin/bash
+# Destructive proof for syscall-number-lint: build a deliberately broken tree
+# per rule and require the lint to FAIL each. Then require it to pass the
+# untouched tree. A gate that has only ever been seen green is not evidence of
+# anything.
+#
+# Case 5 is the #745 defect itself: the wizard's own const block kept 373/374
+# after the headers moved to 374/375, which nothing in the build could see.
+# Case 6 covers the OTHER half of that lesson - a rule that cannot run is not a
+# rule. `git archive <commit> kernel` gives the kernel build container no
+# userland/ at all, so rules 3 and 5 quietly skip there; --strict turns that
+# skip into a failure, and this case proves it does.
+set -uo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+SRC=$(cd "$HERE/../../.." && pwd)
+LINT="$HERE/syscall-number-lint"
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
+
+mk() {  # mk <name>  -> copies the two headers + argtab into $T/<name>
+    local n="$1"
+    mkdir -p "$T/$n/kernel/proc" "$T/$n/userland/libc" "$T/$n/kernel/rustkern" \
+             "$T/$n/userland/apps/fixture"
+    cp "$SRC/kernel/proc/syscall.h"      "$T/$n/kernel/proc/"
+    cp "$SRC/userland/libc/syscall.h"    "$T/$n/userland/libc/"
+    cp "$SRC/kernel/rustkern/argtab.rs"  "$T/$n/kernel/rustkern/" 2>/dev/null || true
+}
+
+expect_fail() {
+    local n="$1" why="$2"
+    if bash "$LINT" "$T/$n" >/dev/null 2>&1; then
+        echo "SELFTEST FAIL: lint stayed GREEN on a tree that $why"
+        return 1
+    fi
+    echo "  red as required: $why"
+    return 0
+}
+
+rc=0
+
+# 1. two names on one number - the exact bug that shipped today
+mk dup
+# EXCLUDE SYS_MAX when finding the highest REAL syscall. A first version of this
+# test matched it too, so case 2 "set SYS_MAX to the highest syscall" silently
+# set SYS_MAX to its own existing value, changed nothing, and reported the LINT
+# as broken. The test was wrong, not the lint.
+hi=$(sed -nE 's/^#define[[:space:]]+(SYS_[A-Z0-9_]+)[[:space:]]+([0-9]+).*/\1 \2/p' "$T/dup/kernel/proc/syscall.h" \
+     | awk '$1 != "SYS_MAX" {print $2}' | sort -n | tail -1)
+printf '#define SYS_EVIL_TWIN %s\n' "$((hi - 1))" >> "$T/dup/kernel/proc/syscall.h"
+expect_fail dup "gives two names the same syscall number" || rc=1
+
+# 2. SYS_MAX equal to a real syscall - wrong twice in this tree's history
+mk max
+sed -i -E "s/^#define[[:space:]]+SYS_MAX[[:space:]]+[0-9]+/#define SYS_MAX $hi/" "$T/max/kernel/proc/syscall.h"
+expect_fail max "sets SYS_MAX equal to the highest real syscall" || rc=1
+
+# 3. kernel and libc disagreeing on a shared name
+mk skew
+name=$(sed -nE 's/^#define[[:space:]]+(SYS_[A-Z0-9_]+)[[:space:]]+[0-9]+.*/\1/p' "$T/skew/userland/libc/syscall.h" | grep -v SYS_MAX | head -1)
+sed -i -E "s/^#define[[:space:]]+${name}[[:space:]]+[0-9]+/#define ${name} 4999/" "$T/skew/userland/libc/syscall.h"
+expect_fail skew "makes kernel and libc disagree on $name" || rc=1
+
+# 4. duplicate argtab descriptors, which point pointer validation at the wrong call
+mk atab
+if [ -r "$T/atab/kernel/rustkern/argtab.rs" ]; then
+    first=$(sed -nE 's/.*Desc[[:space:]]*\{[[:space:]]*num:[[:space:]]*([0-9]+).*/\1/p' "$T/atab/kernel/rustkern/argtab.rs" | head -1)
+    printf '    Desc { num: %s, args: [NONE, NONE, NONE, NONE, NONE, NONE] },\n' "$first" >> "$T/atab/kernel/rustkern/argtab.rs"
+    expect_fail atab "duplicates an argtab descriptor for syscall $first" || rc=1
+else
+    echo "  skipped: no argtab.rs"
+fi
+
+# 5. an APP-LOCAL copy of a number that no longer matches the header. This is
+#    #745 exactly: the wizard is a no_std Rust app, cannot include the C header,
+#    and kept 373/374 after the pair was renumbered to 374/375. It compiled, and
+#    the sign-in page reported "could not be saved" on every first boot.
+#    Proven in BOTH spellings, because this tree has both.
+for spell in rust c; do
+    mk app5$spell
+    n5=$(sed -nE 's/^#define[[:space:]]+(SYS_[A-Z0-9_]+)[[:space:]]+([0-9]+).*/\1 \2/p' \
+         "$T/app5$spell/userland/libc/syscall.h" | grep -v '^SYS_MAX ' | head -1)
+    nm5=${n5% *}; nv5=${n5#* }
+    if [ "$spell" = rust ]; then
+        printf 'const %s: i64 = %s;\n' "$nm5" "$((nv5 + 1))" \
+            > "$T/app5$spell/userland/apps/fixture/main.rs"
+    else
+        printf '#define %s %s\n' "$nm5" "$((nv5 + 1))" \
+            > "$T/app5$spell/userland/apps/fixture/main.c"
+    fi
+    expect_fail app5$spell "keeps an app-local $spell copy of $nm5 that drifted from the header" || rc=1
+done
+
+# 6. --strict must REFUSE a tree with no userland/, rather than skipping the two
+#    rules that need it. Without this, the gate is green in the one place it
+#    most needs to run and nobody can tell the difference from the output.
+mk nou
+rm -rf "$T/nou/userland"
+if bash "$LINT" "$T/nou" --strict >/dev/null 2>&1; then
+    echo "SELFTEST FAIL: --strict stayed GREEN on a tree with no userland/ (rules 3+5 silently skipped)"
+    rc=1
+else
+    echo "  red as required: --strict on a tree whose userland/ is absent"
+fi
+#    ...and the same tree must still PASS without --strict, or every kernel-only
+#    build breaks.
+if bash "$LINT" "$T/nou" >/dev/null 2>&1; then
+    echo "  green as required: kernel-only tree without --strict"
+else
+    echo "SELFTEST FAIL: a kernel-only tree failed the non-strict lint"; rc=1
+fi
+
+# 7. and it must still pass the real tree
+if bash "$LINT" "$SRC" --strict >/dev/null 2>&1; then
+    echo "  green as required: the untouched tree, under --strict"
+else
+    echo "SELFTEST FAIL: lint went RED on the untouched tree"; rc=1
+fi
+
+[ "$rc" -eq 0 ] && echo "SELFTEST PASS" || echo "SELFTEST FAILED"
+exit $rc

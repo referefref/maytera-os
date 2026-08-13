@@ -26,6 +26,12 @@
 // C:\WINDOWS + C:\WINDOWS\SYSTEM. Call once at boot after the root FS is mounted.
 void dos_windir_init(void);
 
+// #736: give the guest ONE writable place, /WINDIR/DRIVE_C (what "C:\" means to
+// a guest), by filling its PERMS.DB entry if it is absent. MUST be called AFTER
+// perms_init(), which loads the database and would otherwise discard it. See
+// the long comment at the definition for what was deliberately NOT loosened.
+void dos_scratch_perms(void);
+
 // Translate a DOS/Windows path to a native MayteraOS (uppercase) path.
 //   "C:\\WINDOWS\\WIN.INI" -> "/WINDIR/DRIVE_C/WINDOWS/WIN.INI"
 // Strict superset of the legacy "strip drive letter" behavior:
@@ -38,6 +44,21 @@ void dos_windir_init(void);
 // drive root). out is always NUL-terminated and uppercased.
 void dos_resolve_path(const char *in, const char *reldir, char *out, int outsz);
 
+// #736: the SAME translation, but against EXPLICIT state instead of the
+// process-wide globals. The INT 21h service core (dos/int21svc.c) owns a
+// per-guest current drive and per-drive CWD, and a second guest (or the future
+// DPMI host) owns another; resolving both through one global store is exactly
+// the shared-state fault that consolidation removes. `cwd` may be NULL, which
+// means "every drive is at its root"; it must never return NULL itself.
+// dos_resolve_path() above is now a thin wrapper over this with the globals
+// bound, so there is ONE implementation of the translation, not two.
+typedef const char *(*dos_cwd_lookup_fn)(void *u, char drive);
+void dos_resolve_path_ex(const char *in, const char *reldir, char cur_drive,
+                         dos_cwd_lookup_fn cwd, void *u, char *out, int outsz);
+
+// dos_path_writable() against an explicit current drive (same reason).
+int dos_path_writable_ex(const char *in, char cur_drive);
+
 // Drive metadata. letter is case-insensitive ('a'..'z' / 'A'..'Z').
 int      dos_drive_known(char letter);     // 1 if A/C/E
 int      dos_drive_type(char letter);      // DOS_DRIVE_* (NO_ROOT for unknown)
@@ -47,7 +68,17 @@ int      dos_drive_writable(char letter);  // 1 for A/C, 0 for E (CD) / unknown
 // the normal root FS). Used to reject writes/creates to the read-only CD (E:).
 int      dos_path_writable(const char *in);
 char     dos_current_drive(void);          // current default drive letter
+// The inverse of the "X:" -> /WINDIR/DRIVE_X mapping: 'A'..'Z' if this
+// already-resolved NATIVE path IS a drive root, else 0. See dospath.c for why
+// this is a root test and not the prefix test fs/fat.c uses.
+char     dos_native_root_drive(const char *native);
 void     dos_set_current_drive(char letter);
+
+// Per-drive current directory (native form: uppercase, / separated, no
+// leading or trailing slash; "" = drive root). INT 21h 47h answers from this
+// and dos_resolve_path resolves "X:NAME" against it, so the two agree.
+void        dos_set_drive_cwd(char letter, const char *path);
+const char *dos_get_drive_cwd(char letter);
 int      dos_drive_count(void);            // number of drive letters A..last (=5, A..E)
 
 // Drive-backend hook for the disk-image mount/eject app (#196). For now every

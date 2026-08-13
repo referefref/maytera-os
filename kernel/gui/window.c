@@ -11,6 +11,9 @@
 #include "icons.h"
 #include "ttf.h"
 #include "../fs/fat.h"
+#include "desktop.h"   // (#745) TASKBAR_HEIGHT: the kernel-mode dock's own reserve
+#include "../security/uaccess_smap.h"  // #19/#645: AC brackets for Ring-3 out-params
+#include "../proc/process.h"  // #41: proc_current()/proc_get() for window owner identity
 
 // #165: window transparency/options context menu state + forward decls. The
 // state lives here so wm_handle_mouse_down (above the menu helpers) can see it.
@@ -36,6 +39,12 @@ static struct {
 
     // Drag state
     window_t *dragging_window;
+
+    // (#745) Work-area insets, in px reserved at each screen edge. Published
+    // by the compositor from the ACTIVE dock style (SYS_WM_SET_WORK_AREA);
+    // the defaults below describe the legacy kernel-mode desktop, whose own
+    // dock is a bottom bar of TASKBAR_HEIGHT.
+    int32_t wa_left, wa_top, wa_right, wa_bottom;
 
     // Resize state
     window_t *resizing_window;
@@ -63,7 +72,186 @@ static struct {
     // Title-bar double-click tracking (toggles maximize/restore)
     uint64_t last_tb_click_tick;
     window_t *last_tb_click_win;
+
+    // #711 loop 2 (designer 1): last window whose titlebar buttons had
+    // hover applied, so wm_handle_mouse_move can clear it in O(1) when the
+    // cursor leaves without walking every window every move.
+    window_t *tb_hover_win;
 } wm_state;
+
+// (local 79) The probe below is COMPILED OUT by default. It is an instrument,
+// not a feature: leaving it armed would put a few hundred lines of [FOCDIAG]
+// into every golden's console for a question that is already answered, and
+// deleting it outright would make the next pass rebuild it from scratch (the
+// OpenArena report is NOT fully explained, see the CHANGELOG entry). Re-arm it
+// with `make CFLAGS_EXTRA=-DFOCUSDIAG_ENABLED=1` or by editing the 0 below.
+#ifndef FOCUSDIAG_ENABLED
+#define FOCUSDIAG_ENABLED 0
+#endif
+#if FOCUSDIAG_ENABLED
+
+// ---------------------------------------------------------------------------
+// (local 79) TEMPORARY focus-path diagnostic for the USER-REPORTED OpenArena
+// "window heading flashes green/grey" bug. It exists to DISTINGUISH three
+// candidate causes that all end in the same pixels, and it is expected to be
+// removed once it has answered that question.
+//
+// Why this is plain C and not Rust, per the Rust-first rule: it is a throwaway
+// instrument that has to sit INSIDE window_set_focus()/wm_focus_window() and
+// read wm_state, a file-static this translation unit owns and does not export.
+// An FFI shim plus a repr(C) mirror of window_t, for a probe whose whole point
+// is to be deleted, would be more code, more risk and more to unpick than the
+// thing it measures. Anything that survives this diagnosis gets written in Rust.
+//
+// Three properties a probe must have here, learned the expensive way:
+//   1. BOUNDED. A hard whole-boot line budget; once spent the probe goes
+//      permanently silent, so its perturbation of the timing under test has a
+//      fixed ceiling no matter how long the game runs.
+//   2. DE-DUPLICATED. An identical consecutive transition from an identical
+//      call site collapses into one "repeated N more times" line.
+//   3. NO NEW LOCK AND NO NEW BLOCKING. It calls kprintf(), which formats into
+//      the async console ring under the one bounded irqsave spinlock the
+//      console already owns. The probe adds no lock, touches no filesystem,
+//      and never waits, so it cannot hang inside the failure it is diagnosing.
+//
+// The heartbeat is self-gating BY CONSTRUCTION rather than by a predicate: it
+// is driven by calls into the focus path itself. A fullscreen SDL game pumps
+// wm_focus_window() every frame (openarena sdlshim.cpp re-asserts focus in both
+// SDL_PollEvent and SDL_PumpEvents), so it runs exactly while a game is up and
+// falls silent on its own at an idle desktop. It then dumps the WHOLE window
+// list with no predicate at all, because WHICH of the three candidates is real
+// is precisely what is not yet known, and a predicate written now would encode
+// the guess being tested.
+// ---------------------------------------------------------------------------
+#define FOCUSDIAG_BUDGET   2000u   // whole-boot line budget
+#define FOCUSDIAG_HB_MS    3000u   // heartbeat period while the focus path is hot
+
+static uint32_t  fdg_lines;        // budget spent
+static uint32_t  fdg_pulses;       // total entries to the focus path
+static uint32_t  fdg_pulses_hb;    // ... since the last heartbeat
+static uint32_t  fdg_changes;      // actual focus changes
+static uint32_t  fdg_dup;          // collapsed repeats of the last transition
+static uint64_t  fdg_next_hb;
+static window_t *fdg_last_old;     // COMPARED only, never dereferenced
+static window_t *fdg_last_new;     // COMPARED only, never dereferenced
+static void     *fdg_last_ra;
+static void     *fdg_wfw_ra;       // caller of wm_focus_window, for the CHG line
+
+// Spend one line of budget. Returns 0 once exhausted, and says so exactly once
+// so a truncated log can never be mistaken for a quiet system.
+static int fdg_budget(void) {
+    if (fdg_lines < FOCUSDIAG_BUDGET) { fdg_lines++; return 1; }
+    if (fdg_lines == FOCUSDIAG_BUDGET) {
+        fdg_lines++;
+        kprintf("[FOCDIAG] line budget spent after %u changes; probe now silent\n",
+                fdg_changes);
+    }
+    return 0;
+}
+
+static void fdg_flush_dup(void) {
+    uint32_t n = fdg_dup;
+    if (!n) return;
+    fdg_dup = 0;
+    if (fdg_budget())
+        kprintf("[FOCDIAG]   ^ same transition repeated %u more times\n", n);
+}
+
+// Unconditional state dump: every window, its id/owner/flags, plus which window
+// wm_state THINKS is focused and which one is frontmost. Candidate 1 shows up
+// here as focus=X with fl lacking F=1, or as some other window still carrying
+// F=1; candidate 2 shows up as focus landing on a window that is not the game.
+static void fdg_dump(const char *why) {
+    window_t *f = wm_state.focused_window;
+    window_t *t = wm_state.window_list;
+    if (fdg_budget())
+        kprintf("[FOCDIAG] %s t=%lu pulses=%u(+%u) chg=%u focus=%p '%.32s' fl=%04x "
+                "front=%p '%.32s'\n",
+                why, (unsigned long)timer_ticks, fdg_pulses, fdg_pulses_hb, fdg_changes,
+                (void *)f, f ? f->title : "(none)", (unsigned)(f ? f->flags : 0u),
+                (void *)t, t ? t->title : "(none)");
+    int n = 0;
+    for (window_t *w = wm_state.window_list; w && n < 12; w = w->next, n++) {
+        if (!fdg_budget()) return;
+        kprintf("[FOCDIAG]   w=%p id=%u pid=%u fl=%04x F=%d M=%d V=%d NC=%d z=%u '%.32s'\n",
+                (void *)w, (unsigned)w->id, (unsigned)w->owner_pid, (unsigned)w->flags,
+                (w->flags & WINDOW_FLAG_FOCUSED)   ? 1 : 0,
+                (w->flags & WINDOW_FLAG_MINIMIZED) ? 1 : 0,
+                (w->flags & WINDOW_FLAG_VISIBLE)   ? 1 : 0,
+                (w->flags & WINDOW_FLAG_NOCHROME)  ? 1 : 0,
+                (unsigned)w->z_order, w->title);
+    }
+}
+
+// Every entry to the focus path, BEFORE any early return: a focus call that
+// changes nothing still has to pulse, because "focus never changes and the flag
+// is stale" is itself one of the three answers.
+static void fdg_pulse(void) {
+    fdg_pulses++;
+    fdg_pulses_hb++;
+    if (fdg_lines > FOCUSDIAG_BUDGET) return;
+    uint64_t now = timer_ticks;
+    if (fdg_next_hb == 0) fdg_next_hb = now;   // first pulse dumps immediately
+    if (now < fdg_next_hb) return;
+    uint32_t hz = pit_get_frequency();
+    if (!hz) hz = 1000;
+    // timer_ticks is NOT a wall clock: KVM replays lost ticks in bursts, so the
+    // next deadline is computed from NOW rather than advanced by one period.
+    // Advancing by a period would let one burst queue a run of back-to-back
+    // heartbeats, which is the perturbation this probe is trying not to be.
+    fdg_next_hb = now + (uint64_t)hz * FOCUSDIAG_HB_MS / 1000u;
+    fdg_flush_dup();
+    fdg_dump("hb");
+    fdg_pulses_hb = 0;
+}
+
+// An actual focus change. `ra` is window_set_focus's own caller; fdg_wfw_ra is
+// wm_focus_window's caller when that is how we got here, so the two together
+// name the whole chain for addr2line.
+static void fdg_change(window_t *oldw, window_t *neww, void *ra) {
+    fdg_changes++;
+    if (fdg_lines > FOCUSDIAG_BUDGET) return;
+    if (oldw == fdg_last_old && neww == fdg_last_new && ra == fdg_last_ra) {
+        fdg_dup++;
+        return;
+    }
+    fdg_flush_dup();
+    fdg_last_old = oldw; fdg_last_new = neww; fdg_last_ra = ra;
+    if (fdg_budget())
+        kprintf("[FOCDIAG] CHG #%u t=%lu ra=%p via=%p old=%p '%.32s' fl=%04x -> "
+                "new=%p '%.32s' fl=%04x\n",
+                fdg_changes, (unsigned long)timer_ticks, ra, fdg_wfw_ra,
+                (void *)oldw, oldw ? oldw->title : "(none)",
+                (unsigned)(oldw ? oldw->flags : 0u),
+                (void *)neww, neww ? neww->title : "(none)",
+                (unsigned)(neww ? neww->flags : 0u));
+}
+
+// The window_destroy() re-focus site (candidate 1). Kept as its own function so
+// the call site stays one statement whether the probe is compiled in or out.
+static void fdg_destroy_refocus(window_t *win) {
+    if (!fdg_budget()) return;
+    window_t *nf = wm_state.window_list;
+    kprintf("[FOCDIAG] DESTROY-REFOCUS t=%lu dying=%p '%.32s' fl=%04x -> "
+            "new=%p '%.32s' fl=%04x (flags untouched on both)\n",
+            (unsigned long)timer_ticks,
+            (void *)win, win->title, (unsigned)win->flags,
+            (void *)nf, nf ? nf->title : "(none)",
+            (unsigned)(nf ? nf->flags : 0u));
+}
+
+static void fdg_note_wfw(void *ra) { fdg_wfw_ra = ra; }
+
+#else   /* FOCUSDIAG_ENABLED */
+
+static inline void fdg_pulse(void) { }
+static inline void fdg_note_wfw(void *ra) { (void)ra; }
+static inline void fdg_destroy_refocus(window_t *w) { (void)w; }
+static inline void fdg_change(window_t *o, window_t *n, void *ra) {
+    (void)o; (void)n; (void)ra;
+}
+
+#endif  /* FOCUSDIAG_ENABLED */
 
 // Initialize the window manager
 void wm_init(void) {
@@ -102,6 +290,14 @@ void wm_init(void) {
     }
     wm_state.next_app_id = 0;
 
+    // (#745) Default work area: the legacy kernel-mode desktop reserves its
+    // own bottom dock and nothing else. Under the userland compositor these
+    // are overwritten within a frame of startup by taskbar_publish_work_area().
+    wm_state.wa_left   = 0;
+    wm_state.wa_top    = 0;
+    wm_state.wa_right  = 0;
+    wm_state.wa_bottom = TASKBAR_HEIGHT;
+
     // Initialize dirty region
     wm_state.dirty.count = 0;
     wm_state.dirty.full_redraw = true;  // Initial full redraw
@@ -110,6 +306,135 @@ void wm_init(void) {
     wm_state.running = true;
 
     kprintf("Window manager initialized\n");
+}
+
+// ===========================================================================
+// (#745) Work area. See the block comment in window.h for why the strut is
+// pushed down from the compositor instead of being decided here.
+// ===========================================================================
+
+void wm_get_work_area(rect_t *out) {
+    if (!out) return;
+    int32_t sw = (int32_t)fb_get_width();
+    int32_t sh = (int32_t)fb_get_height();
+    int32_t l = wm_state.wa_left,  t = wm_state.wa_top;
+    int32_t r = wm_state.wa_right, b = wm_state.wa_bottom;
+    if (l < 0) l = 0;
+    if (t < 0) t = 0;
+    if (r < 0) r = 0;
+    if (b < 0) b = 0;
+    // A nonsense inset set must degrade to "no reservation on that axis"
+    // rather than to an empty rect: every placement path below divides the
+    // screen by this, and an empty work area would pin every window to a
+    // point. Fail visible, not stuck.
+    if (l + r >= sw) { l = 0; r = 0; }
+    if (t + b >= sh) { t = 0; b = 0; }
+    out->x      = l;
+    out->y      = t;
+    out->width  = sw - l - r;
+    out->height = sh - t - b;
+}
+
+// Is this window subject to the panel reservation?
+//
+// Two exemptions, both deliberate:
+//  - NOCHROME (#185 borderless panel): no title bar exists to keep reachable,
+//    and the owning app places it deliberately.
+//  - A true fullscreen surface (a game): shrinking it by the panel height
+//    would letterbox it AND break the compositor's fullscreen detection
+//    (fullscreen_in_list() in apps/compositor/main.c requires x,y <= 0 and
+//    full width/height), which is the very thing that hides the chrome for it.
+// Exempt windows are still clamped, just to the physical screen instead of
+// the work area, so no path can lose a window entirely.
+static bool win_respects_work_area(const window_t *win) {
+    if (!win) return false;
+    if (win->flags & WINDOW_FLAG_NOCHROME) return false;
+    if (win->bounds.width  >= (int32_t)fb_get_width() &&
+        win->bounds.height >= (int32_t)fb_get_height()) return false;
+    return true;
+}
+
+// Clamp a proposed top-left so the window's TITLE BAR stays reachable.
+//
+// THE TOP EDGE IS A HARD CLAMP (y >= area.y). Above the work area the header
+// is under a panel and there is no gesture left that can retrieve it, so not
+// one pixel of the window may start there. The other three edges are SOFT:
+// the header is a horizontal strip along the window's top, so it stays
+// grabbable as long as WM_WORK_AREA_MIN_VISIBLE px of the window are inside
+// the work area horizontally and a full title bar's worth is above the
+// bottom edge. That preserves the familiar "shove a window mostly off the
+// side" behaviour while making "lose it completely" unreachable.
+void wm_clamp_to_work_area(const window_t *win, int32_t *x, int32_t *y) {
+    if (!win || !x || !y) return;
+
+    rect_t wa;
+    if (win_respects_work_area(win)) {
+        wm_get_work_area(&wa);
+    } else {
+        wa.x = 0; wa.y = 0;
+        wa.width  = (int32_t)fb_get_width();
+        wa.height = (int32_t)fb_get_height();
+    }
+
+    int32_t w   = win->bounds.width;
+    int32_t tb  = (int32_t)TITLEBAR_HEIGHT;
+    int32_t vis = WM_WORK_AREA_MIN_VISIBLE;
+    if (vis > w) vis = w;
+    if (vis < 1) vis = 1;
+
+    int32_t min_x = wa.x - (w - vis);
+    int32_t max_x = wa.x + wa.width - vis;
+    if (max_x < min_x) max_x = min_x;
+    if (*x < min_x) *x = min_x;
+    if (*x > max_x) *x = max_x;
+
+    int32_t max_y = wa.y + wa.height - tb;
+    if (max_y < wa.y) max_y = wa.y;
+    if (*y > max_y) *y = max_y;
+    if (*y < wa.y)  *y = wa.y;      // hard: never above the work area
+}
+
+void wm_set_work_area(int32_t left, int32_t top, int32_t right, int32_t bottom) {
+    if (left < 0) left = 0;
+    if (top < 0) top = 0;
+    if (right < 0) right = 0;
+    if (bottom < 0) bottom = 0;
+
+    if (left == wm_state.wa_left && top == wm_state.wa_top &&
+        right == wm_state.wa_right && bottom == wm_state.wa_bottom)
+        return;                                   // idempotent: no churn
+
+    wm_state.wa_left   = left;
+    wm_state.wa_top    = top;
+    wm_state.wa_right  = right;
+    wm_state.wa_bottom = bottom;
+
+    rect_t wa;
+    wm_get_work_area(&wa);
+    kprintf("[WM] work area insets l=%d t=%d r=%d b=%d -> rect %d,%d %dx%d\n",
+            (int)left, (int)top, (int)right, (int)bottom,
+            (int)wa.x, (int)wa.y, (int)wa.width, (int)wa.height);
+
+    // Re-apply to every EXISTING window. Without this, switching to a
+    // top-panel dock style while windows are already open leaves exactly the
+    // headers the user complained about stranded under the new panel, and so
+    // does any geometry restored from a profile written before this fix.
+    for (window_t *w = wm_state.window_list; w; w = w->next) {
+        if (w->flags & WINDOW_FLAG_MAXIMIZED) {
+            if (!win_respects_work_area(w)) continue;
+            w->bounds.x      = wa.x;
+            w->bounds.y      = wa.y;
+            w->bounds.width  = wa.width;
+            w->bounds.height = wa.height;
+            user_window_handle_resize(w);
+            continue;
+        }
+        int32_t nx = w->bounds.x, ny = w->bounds.y;
+        wm_clamp_to_work_area(w, &nx, &ny);
+        w->bounds.x = nx;
+        w->bounds.y = ny;
+    }
+    wm_invalidate_all();
 }
 
 // Exclusive mode state: when true, the WM skips normal compositing
@@ -175,6 +500,17 @@ window_t *window_create(const char *title, int32_t x, int32_t y, int32_t width, 
     win->scale_base_w = 0;
     win->scale_base_h = 0;
 
+    // #41: record who created this window, at creation time. For a real
+    // Ring-3 app this runs inside its own SYS_WIN_CREATE syscall (proc.c/
+    // syscall.c already key user_windows[].owner_pid off proc_current() the
+    // same way, at the same call), so proc_current() here IS the app, not
+    // the compositor. A kernel-desktop-fallback window (installer.c,
+    // recyclebin.c, terminal.c, filebrowser.c, settings.c, clock.c,
+    // properties.c) or any other caller with no current process gets 0,
+    // which sys_wm_get_windows() below treats as "no identity" on purpose -
+    // 0 is also idle's pid, and idle is never a real window owner.
+    win->owner_pid = proc_current() ? proc_current()->pid : 0;
+
     // Add to window list (sorted by z-order, highest first)
     if (!wm_state.window_list) {
         wm_state.window_list = win;
@@ -188,7 +524,19 @@ window_t *window_create(const char *title, int32_t x, int32_t y, int32_t width, 
         wm_state.window_list = win;
     }
 
-    kprintf("Created window '%s' at (%d, %d) size %dx%d\n", title, x, y, width, height);
+    // (#745) Initial placement obeys the work area: an app that asks for y=0,
+    // or a cascade that starts there, must not land its title bar under a top
+    // panel. Runs here, after bounds AND flags are set, so the NOCHROME /
+    // fullscreen exemptions in win_respects_work_area() see the real window.
+    {
+        int32_t cx = win->bounds.x, cy = win->bounds.y;
+        wm_clamp_to_work_area(win, &cx, &cy);
+        win->bounds.x = cx;
+        win->bounds.y = cy;
+    }
+
+    kprintf("Created window '%s' at (%d, %d) size %dx%d\n",
+            title, (int)win->bounds.x, (int)win->bounds.y, width, height);
     return win;
 }
 
@@ -211,12 +559,47 @@ void window_destroy(window_t *win) {
 
     // Clear focus if this was the focused window
     if (wm_state.focused_window == win) {
-        wm_state.focused_window = wm_state.window_list;
+        // (local 79) CANDIDATE 1 probe. This reassigns focused_window WITHOUT
+        // clearing WINDOW_FLAG_FOCUSED on the dying window and WITHOUT setting
+        // it on the new one, after which window_set_focus() early-returns
+        // forever and the flag can never be repaired. If that is what the user
+        // is seeing, this line fires and no CHG line follows it.
+        fdg_destroy_refocus(win);
+        // (local 79) FIX, caught firing by the probe above. The old line was a
+        // BARE POINTER ASSIGNMENT: it moved focused_window to the new head
+        // without clearing WINDOW_FLAG_FOCUSED on the dying window and without
+        // setting it on the new one. That leaves the pointer and the flag
+        // disagreeing, and the disagreement is UNREPAIRABLE, because every
+        // later window_set_focus(new_head) sees focused_window == new_head and
+        // early-returns before it can set the flag. The window then draws with
+        // THEME_TITLEBAR_INACTIVE (window_draw reads WINDOW_FLAG_FOCUSED, not
+        // the pointer) while actually holding keyboard focus: a grey heading on
+        // the window you are typing into, until some OTHER window takes focus
+        // and hands it back.
+        //
+        // Routing through window_set_focus() is what keeps the two in step, and
+        // it is the only place that knows how. Clearing the pointer first is
+        // what stops that function's own early-return from swallowing the call.
+        //
+        // DELIBERATELY NOT CHANGED: WHICH window inherits focus. This still
+        // picks the list head exactly as before, even when that head is
+        // minimized or hidden. Choosing a better target is a separate question
+        // with its own answer, and guessing at it here would hide this fix
+        // inside a behaviour change.
+        win->flags &= ~WINDOW_FLAG_FOCUSED;
+        wm_state.focused_window = NULL;
+        window_set_focus(wm_state.window_list);
     }
 
     // Stop dragging if we were dragging this window
     if (wm_state.dragging_window == win) {
         wm_state.dragging_window = NULL;
+    }
+
+    // #711 loop 2: clear titlebar-button hover tracking if this was the
+    // hovered window (same dangling-pointer guard as focused/dragging above).
+    if (wm_state.tb_hover_win == win) {
+        wm_state.tb_hover_win = NULL;
     }
 
     // Stop resizing if we were resizing this window
@@ -269,15 +652,16 @@ void window_maximize(window_t *win) {
     win->stored_bounds.width = win->bounds.width;
     win->stored_bounds.height = win->bounds.height;
 
-    // Get actual screen dimensions from framebuffer
-    uint32_t screen_w = fb_get_width();
-    uint32_t screen_h = fb_get_height();
-
-    // Leave some space for dock at bottom (80 pixels)
-    win->bounds.x = 0;
-    win->bounds.y = 0;
-    win->bounds.width = screen_w;
-    win->bounds.height = screen_h - 80;
+    // (#745) Fill the WORK AREA, not "the screen minus a magic 80". That
+    // constant matched no shipping panel (the taskbar is 36px tall) and
+    // reserved nothing whatsoever at the TOP, so under a top-panel dock style
+    // a maximized window put its title bar straight under the panel.
+    rect_t wa;
+    wm_get_work_area(&wa);
+    win->bounds.x = wa.x;
+    win->bounds.y = wa.y;
+    win->bounds.width = wa.width;
+    win->bounds.height = wa.height;
 
     win->flags |= WINDOW_FLAG_MAXIMIZED;
 
@@ -285,7 +669,12 @@ void window_maximize(window_t *win) {
     // and reflow (e.g. terminal recomputes columns/rows for the new size).
     user_window_handle_resize(win);
 
-    kprintf("Maximized window '%s' to %ux%u\n", win->title, win->bounds.width, win->bounds.height);
+    // (#745) Log the ORIGIN too. "to 1024x724" cannot tell you whether the
+    // window was placed at the top of the screen or at the top of the work
+    // area, which is the entire question this ticket is about.
+    kprintf("Maximized window '%s' to %dx%d at (%d,%d)\n", win->title,
+            (int)win->bounds.width, (int)win->bounds.height,
+            (int)win->bounds.x, (int)win->bounds.y);
 }
 
 // Restore a window from minimized or maximized state
@@ -305,6 +694,14 @@ void window_restore(window_t *win) {
     if (win->flags & WINDOW_FLAG_MINIMIZED) {
         win->flags &= ~WINDOW_FLAG_MINIMIZED;
         win->flags |= WINDOW_FLAG_VISIBLE;
+        // (#745) The dock style (and therefore the reserved edge) can have
+        // changed while this window sat minimized, so re-clamp on the way back.
+        {
+            int32_t rx = win->bounds.x, ry = win->bounds.y;
+            wm_clamp_to_work_area(win, &rx, &ry);
+            win->bounds.x = rx;
+            win->bounds.y = ry;
+        }
         kprintf("Restored minimized window '%s'\n", win->title);
     }
 
@@ -316,6 +713,17 @@ void window_restore(window_t *win) {
         win->bounds.height = win->stored_bounds.height;
 
         win->flags &= ~WINDOW_FLAG_MAXIMIZED;
+
+        // (#745) stored_bounds were captured under whatever work area was in
+        // force at maximize time, which may predate a dock-style switch.
+        // Clamp AFTER clearing MAXIMIZED so the size used by the clamp is the
+        // restored one.
+        {
+            int32_t rx = win->bounds.x, ry = win->bounds.y;
+            wm_clamp_to_work_area(win, &rx, &ry);
+            win->bounds.x = rx;
+            win->bounds.y = ry;
+        }
 
         // Notify the owning user-mode process so it can resize its content
         // buffer and reflow back to the restored dimensions.
@@ -414,12 +822,111 @@ void window_send_to_back(window_t *win) {
     win->z_order = 0;
 }
 
+
+// ============================================================================
+// #27: per-theme window corner shape
+//
+// The corner treatment is a THEME PROPERTY, not a switch on a theme name and
+// not a global toggle: `radius.window` (TM_RADIUS_WINDOW) is the extent, in
+// pixels, of the 45 degree chamfer cut out of each of a window's four outer
+// corners. 0 = square. retro_unix, Classic (Win95) and High Contrast ship 0
+// and keep their hard edges; every other shipped theme ships 4. A theme file
+// that says nothing gets its answer from style= (see theme_fill_v2_defaults),
+// so a new theme can never silently inherit the wrong shape from a hardcoded
+// list of names in here.
+//
+// The cut is a CHAMFER (a flat 45 degree bevel), not a quarter circle. That is
+// what "slightly beveled" means, and it lands exactly on the pixel grid, so
+// there is nothing to smooth. WE DO NOT ANTIALIAS IT: this framebuffer has no
+// per-pixel alpha, and blending the edge against anything other than the real
+// pixel behind the window is what produces a halo.
+//
+// window_point_is_cut() is the ONE definition of the shape. The renderer
+// (window_punch_corners) and the hit test (window_get_at_point) both call it,
+// so drawing and input cannot disagree about where the window is.
+// ============================================================================
+
+#define WIN_BEVEL_MAX   6                                   /* clamp: sanity, and bounds the snapshot */
+#define WIN_BEVEL_PX    (WIN_BEVEL_MAX * (WIN_BEVEL_MAX + 1) / 2)   /* cut pixels per corner */
+#define WIN_EDGE_PX     (WIN_BEVEL_MAX + 1)                 /* border pixels per corner */
+
+int32_t window_corner_bevel(const window_t *win) {
+    if (!win) return 0;
+    /* A borderless panel owns every pixel of its own rectangle; there is no
+     * frame to bevel, and cutting one would punch holes in app content. */
+    if (win->flags & WINDOW_FLAG_NOCHROME) return 0;
+    /* Maximized windows square off, as they do on every desktop that rounds
+     * corners: the cut would otherwise expose wallpaper at the screen edge. */
+    if (win->flags & WINDOW_FLAG_MAXIMIZED) return 0;
+    int32_t b = theme_metric_i(TM_RADIUS_WINDOW);
+    if (b <= 0) return 0;
+    if (b > WIN_BEVEL_MAX) b = WIN_BEVEL_MAX;
+    /* Never chew into a window too small to spare the pixels. */
+    if (win->bounds.width < 4 * b || win->bounds.height < 4 * b) return 0;
+    return b;
+}
+
+// #745: does this window get the compositor-drawn drop shadow? Deliberately
+// next to window_corner_bevel(), because it is the same question ("what outer
+// treatment does this window get?") answered from the same theme property, and
+// splitting the two across the kernel/userland boundary is how they would drift.
+// The COMPOSITOR draws the shadow (only it owns pixels outside a window rect),
+// but the POLICY is decided here once and published through
+// sys_wm_get_windows(), so there is one answer, not two.
+//
+//   1. Opt-in. WINDOW_FLAG_SHADOW only. #189 removed the blanket app-window
+//      drop shadow by explicit user decision; nothing gets one by default.
+//   2. Not maximized. Same reasoning as the corner chamfer directly above: a
+//      maximized window's band is off-screen or a letterbox stripe.
+//   3. The theme gate applies to CHROMED windows only, and this asymmetry is
+//      the whole point. radius.window is the extent of the chamfer the kernel
+//      cuts out of a window's FRAME, so it describes the shape of chrome THIS
+//      FILE draws. A NOCHROME panel has no frame: window_corner_bevel() returns
+//      0 for it not because such a window is square but because "a borderless
+//      panel owns every pixel of its own rectangle" and the kernel has no idea
+//      what shape the app painted in there. Gating a borderless panel's shadow
+//      on radius.window would therefore be judging one window's shape by a
+//      property that says nothing about it, and it MEASURABLY gets the answer
+//      wrong: the shipped default theme is retro_unix (radius.window = 0), the
+//      OOBE wizard is a NOCHROME panel that paints its own 16 px rounded glass
+//      card regardless of theme, and the first version of this gate silently
+//      dropped the shadow on exactly the window it was written for - caught by
+//      diffing a shadow run against a no-shadow run and getting a pixel-
+//      identical image, not by looking at a screenshot.
+//      So: chromed window -> the theme decides (retro_unix, Classic and High
+//      Contrast keep their hard flat edges, as they should). Borderless panel
+//      -> the app decides, because the app is the only thing that knows.
+bool window_wants_shadow(const window_t *win) {
+    if (!win) return false;
+    if (!(win->flags & WINDOW_FLAG_SHADOW)) return false;
+    if (win->flags & WINDOW_FLAG_MAXIMIZED) return false;
+    if (win->flags & WINDOW_FLAG_NOCHROME) return true;
+    return theme_metric_i(TM_RADIUS_WINDOW) > 0;
+}
+
+bool window_point_is_cut(const window_t *win, int32_t x, int32_t y) {
+    int32_t b = window_corner_bevel(win);
+    if (b <= 0) return false;
+    int32_t i = x - win->bounds.x, j = y - win->bounds.y;
+    int32_t w = win->bounds.width, h = win->bounds.height;
+    if (i < 0 || j < 0 || i >= w || j >= h) return false;
+    if (i >= b && i < w - b) return false;      /* not near a left/right edge */
+    if (j >= b && j < h - b) return false;      /* not near a top/bottom edge */
+    int32_t di = (i < b) ? i : (w - 1 - i);
+    int32_t dj = (j < b) ? j : (h - 1 - j);
+    return (di + dj) < b;
+}
+
 // Get window at point (returns topmost window)
 window_t *window_get_at_point(int32_t x, int32_t y) {
     // Iterate from front to back (head of list is front)
     window_t *win = wm_state.window_list;
     while (win) {
-        if ((win->flags & WINDOW_FLAG_VISIBLE) && rect_contains_point(&win->bounds, x, y)) {
+        // #27: a click in a cut-away corner is NOT on this window; it falls
+        // through to whatever is drawn there. Same predicate the renderer uses
+        // to decide not to paint the pixel, so the two can never drift apart.
+        if ((win->flags & WINDOW_FLAG_VISIBLE) && rect_contains_point(&win->bounds, x, y) &&
+            !window_point_is_cut(win, x, y)) {
             return win;
         }
         win = win->next;
@@ -429,7 +936,9 @@ window_t *window_get_at_point(int32_t x, int32_t y) {
 
 // Set focus to window
 void window_set_focus(window_t *win) {
+    fdg_pulse();                                  // (local 79) before the early return
     if (wm_state.focused_window == win) return;
+    fdg_change(wm_state.focused_window, win, __builtin_return_address(0));
 
     // Remove focus from old window
     if (wm_state.focused_window) {
@@ -513,7 +1022,7 @@ static bool is_in_titlebar(window_t *win, int32_t x, int32_t y) {
 // Check if point is on close button
 static bool is_on_close_button(window_t *win, int32_t x, int32_t y) {
     int32_t btn_x = win->bounds.x + win->bounds.width - CLOSE_BUTTON_SIZE - 2;
-    int32_t btn_y = win->bounds.y + 2;
+    int32_t btn_y = win->bounds.y + TITLEBAR_BUTTON_Y_OFFSET;
     return (x >= btn_x && x < btn_x + CLOSE_BUTTON_SIZE &&
             y >= btn_y && y < btn_y + CLOSE_BUTTON_SIZE);
 }
@@ -523,7 +1032,7 @@ uint8_t g_default_window_opacity = 255;
 // Settings cog button: 4th button, left of [minimize][maximize][close].
 static bool is_on_cog_button(window_t *win, int32_t x, int32_t y) {
     int32_t btn_x = win->bounds.x + win->bounds.width - 4 * CLOSE_BUTTON_SIZE - 2 - 3 * TITLEBAR_BUTTON_SPACING;
-    int32_t btn_y = win->bounds.y + 2;
+    int32_t btn_y = win->bounds.y + TITLEBAR_BUTTON_Y_OFFSET;
     return (x >= btn_x && x < btn_x + CLOSE_BUTTON_SIZE &&
             y >= btn_y && y < btn_y + CLOSE_BUTTON_SIZE);
 }
@@ -594,7 +1103,7 @@ static bool is_on_minimize_button(window_t *win, int32_t x, int32_t y) {
     // Maximize is at: width - 2*CLOSE_BUTTON_SIZE - 2 - TITLEBAR_BUTTON_SPACING
     // Minimize is at: width - 3*CLOSE_BUTTON_SIZE - 2 - 2*TITLEBAR_BUTTON_SPACING
     int32_t btn_x = win->bounds.x + win->bounds.width - 3 * CLOSE_BUTTON_SIZE - 2 - 2 * TITLEBAR_BUTTON_SPACING;
-    int32_t btn_y = win->bounds.y + 2;
+    int32_t btn_y = win->bounds.y + TITLEBAR_BUTTON_Y_OFFSET;
     return (x >= btn_x && x < btn_x + CLOSE_BUTTON_SIZE &&
             y >= btn_y && y < btn_y + CLOSE_BUTTON_SIZE);
 }
@@ -603,7 +1112,7 @@ static bool is_on_minimize_button(window_t *win, int32_t x, int32_t y) {
 static bool is_on_maximize_button(window_t *win, int32_t x, int32_t y) {
     // Maximize is at: width - 2*CLOSE_BUTTON_SIZE - 2 - TITLEBAR_BUTTON_SPACING
     int32_t btn_x = win->bounds.x + win->bounds.width - 2 * CLOSE_BUTTON_SIZE - 2 - TITLEBAR_BUTTON_SPACING;
-    int32_t btn_y = win->bounds.y + 2;
+    int32_t btn_y = win->bounds.y + TITLEBAR_BUTTON_Y_OFFSET;
     return (x >= btn_x && x < btn_x + CLOSE_BUTTON_SIZE &&
             y >= btn_y && y < btn_y + CLOSE_BUTTON_SIZE);
 }
@@ -660,6 +1169,19 @@ void wm_handle_mouse_move(int32_t x, int32_t y) {
             new_height = WINDOW_MIN_HEIGHT;
         }
 
+        // (#745) A top-edge resize is a placement path too: dragging the top
+        // border upward must not push the title bar under a top panel. Give
+        // back the over-shoot as height so the BOTTOM edge does not move.
+        if (edge & RESIZE_EDGE_TOP) {
+            rect_t wa;
+            wm_get_work_area(&wa);
+            if (win_respects_work_area(win) && new_y < wa.y) {
+                new_height -= (wa.y - new_y);
+                new_y = wa.y;
+                if (new_height < WINDOW_MIN_HEIGHT) new_height = WINDOW_MIN_HEIGHT;
+            }
+        }
+
         // Invalidate old window area
         wm_invalidate_rect(&win->bounds);
 
@@ -678,7 +1200,14 @@ void wm_handle_mouse_move(int32_t x, int32_t y) {
         // Invalidate old position
         wm_invalidate_rect(&win->bounds);
 
-        window_move(win, x - win->drag_offset_x, y - win->drag_offset_y);
+        // (#745) The drag path uses the SAME clamp as every placement path,
+        // so a window cannot be dragged to where its header is unreachable.
+        {
+            int32_t nx = x - win->drag_offset_x;
+            int32_t ny = y - win->drag_offset_y;
+            wm_clamp_to_work_area(win, &nx, &ny);
+            window_move(win, nx, ny);
+        }
 
         // Invalidate new position
         wm_invalidate_rect(&win->bounds);
@@ -686,6 +1215,34 @@ void wm_handle_mouse_move(int32_t x, int32_t y) {
 
     // Update widget hover states
     window_t *win = window_get_at_point(x, y);
+
+    // #711 loop 2 (designer 1, window decorations): titlebar button hover.
+    // Chromed, visible windows only (NOCHROME windows draw no kernel buttons,
+    // so is_on_*_button would test phantom zones, same guard wm_handle_mouse_down
+    // already uses). Only the titlebar row is invalidated, not the whole
+    // window, matching the per-widget invalidation just below.
+    if (win && (win->flags & WINDOW_FLAG_VISIBLE) && !(win->flags & WINDOW_FLAG_NOCHROME)) {
+        uint8_t new_hover = 0;
+        if (is_on_cog_button(win, x, y)) new_hover = 1;
+        else if (is_on_minimize_button(win, x, y)) new_hover = 2;
+        else if (is_on_maximize_button(win, x, y)) new_hover = 3;
+        else if ((win->flags & WINDOW_FLAG_CLOSABLE) && is_on_close_button(win, x, y)) new_hover = 4;
+        if (win->tb_hover_btn != new_hover) {
+            win->tb_hover_btn = new_hover;
+            rect_t tb_rect = { win->bounds.x, win->bounds.y, win->bounds.width, TITLEBAR_HEIGHT };
+            wm_invalidate_rect(&tb_rect);
+        }
+    }
+    if (wm_state.tb_hover_win && wm_state.tb_hover_win != win) {
+        if (wm_state.tb_hover_win->tb_hover_btn != 0) {
+            wm_state.tb_hover_win->tb_hover_btn = 0;
+            window_t *lw = wm_state.tb_hover_win;
+            rect_t tb_rect = { lw->bounds.x, lw->bounds.y, lw->bounds.width, TITLEBAR_HEIGHT };
+            wm_invalidate_rect(&tb_rect);
+        }
+    }
+    wm_state.tb_hover_win = win;
+
     if (win) {
         rect_t client = window_get_client_rect(win);
         int32_t local_x = x - client.x;
@@ -1056,15 +1613,17 @@ static int win_ci_has(const char *h, const char *n) {
     }
     return 0;
 }
-// Phase 4: the modern window dressing (gradient titlebar) applies to every theme
-// except the Classic (CDE/Motif) family, mirroring the Settings app's
-// classic-vs-modern split so window chrome and app chrome agree.
+// #711: the gradient-vs-flat titlebar decision is now a DATA FIELD
+// (decor.titlebar_gradient in the active .mtheme), not a case-insensitive
+// substring match on the theme's display NAME. The name match was the same
+// anti-pattern gui_theme_is_classic() was written to retire on the userland
+// side: an App Store or hand-written theme called anything outside
+// classic/retro/cde/motif silently got the modern gradient no matter what its
+// author intended, and "High Contrast" got a gradient it should never have had.
+// A theme file with no decor.* line still gets the old answer, because the
+// default is derived from its style= line (see theme_fill_v2_defaults).
 static int win_modern_style(void) {
-    const char *n = theme_get_name(theme_get_current_id());
-    if (!n) return 1;
-    if (win_ci_has(n, "classic") || win_ci_has(n, "retro") ||
-        win_ci_has(n, "cde") || win_ci_has(n, "motif")) return 0;
-    return 1;
+    return theme_get_metric_by_id(-1, TM_DECOR_TITLEBAR_GRADIENT) ? 1 : 0;
 }
 // #136: map a window title to a titlebar icon (windows carry no icon id).
 static icon_id_t window_title_icon(const char *t) {
@@ -1158,41 +1717,34 @@ static int kicon_blit(const char *name, int x, int y, int sz, uint32_t ink, uint
 //   1  Theme:  System | Dark | Light   ( [<] cycle [>] )
 //   2  Scale:  NNN%                     ( [-] [+] )
 //   3  Opacity: NNN%                    ( [-] [+] )
-#define WINMENU_ROWH   26
-#define WINMENU_HDR    22
-#define WINMENU_W      210
+// #711: the decorator popup's geometry is data too (metric.winmenu_*). Row
+// COUNT stays compiled in, because it is the number of controls the popup
+// implements, not a style choice.
+#define WINMENU_ROWH   win_metric_or(TM_WINMENU_ROWH, 26)
+#define WINMENU_HDR    win_metric_or(TM_WINMENU_HDR, 22)
+#define WINMENU_W      win_metric_or(TM_WINMENU_ROWW, 210)
 #define WINMENU_ROWS   4
 
 // Per-window decorator palette (bg / text / dim text / border / accent).
+//
+// #711: this WAS a switch(theme_get_current_id()) over eight hand-copied
+// six-colour palettes, i.e. a second copy of the palette baked into C that
+// editing a .mtheme file could not touch - the survey's obstacle #4, and the
+// clearest example in the tree of "already compiles, already looks plausible,
+// just not the CONFIGURED output". It is now six reads of the active theme's
+// semantic tokens, so this popup follows the theme file like everything else.
+// A theme that sets no color.* keys still lands on sensible values because
+// theme_fill_v2_defaults() derives them from the legacy 51.
 typedef struct { uint32_t bg, text, dim, border, accent, rowhi; } decor_pal_t;
 static decor_pal_t decor_palette(void) {
+    const theme_t *t = theme_get_current();
     decor_pal_t p;
-    switch (theme_get_current_id()) {
-        case THEME_LIGHT: case THEME_MODERN_LIGHT: case THEME_FLUENT_LIGHT:
-            p.bg=0x00F4F6F9; p.text=0x00202428; p.dim=0x00707880;
-            p.border=0x00A8B0BA; p.accent=0x00216FDB; p.rowhi=0x00E1E8F2; break;
-        case THEME_DARK: case THEME_MODERN_DARK: case THEME_FLUENT_DARK:
-            p.bg=0x001E2228; p.text=0x00E8ECF1; p.dim=0x008A929C;
-            p.border=0x003A424C; p.accent=0x004C8DF0; p.rowhi=0x002A3038; break;
-        case THEME_OCEAN:
-            p.bg=0x00102733; p.text=0x00DCEEF5; p.dim=0x007FA6B5;
-            p.border=0x002A4D5E; p.accent=0x0030B0C8; p.rowhi=0x001A3A48; break;
-        case THEME_FOREST:
-            p.bg=0x00152019; p.text=0x00E0EAD8; p.dim=0x008AA088;
-            p.border=0x00324A38; p.accent=0x005CB86A; p.rowhi=0x00203328; break;
-        case THEME_SUNSET:
-            p.bg=0x002A1822; p.text=0x00F4E2DC; p.dim=0x00B58A93;
-            p.border=0x00553040; p.accent=0x00E8794C; p.rowhi=0x003A2230; break;
-        case THEME_HIGH_CONTRAST:
-            p.bg=0x00000000; p.text=0x00FFFFFF; p.dim=0x00C0C0C0;
-            p.border=0x00FFFFFF; p.accent=0x0000FF00; p.rowhi=0x00303030; break;
-        case THEME_CLASSIC:
-            p.bg=0x00C0C0C0; p.text=0x00000000; p.dim=0x00606060;
-            p.border=0x00404040; p.accent=0x00000080; p.rowhi=0x00D8D8D8; break;
-        default: /* THEME_DEFAULT retro UNIX/CDE */
-            p.bg=0x00222A33; p.text=0x00E8EEF4; p.dim=0x0090A0B0;
-            p.border=0x00708090; p.accent=0x0066B2FF; p.rowhi=0x002E3742; break;
-    }
+    p.bg     = t->c_surface_overlay;
+    p.text   = t->c_on_surface;
+    p.dim    = t->c_on_surface_muted;
+    p.border = t->c_border_strong;
+    p.accent = t->c_accent;
+    p.rowhi  = t->s_item_hover_bg;
     return p;
 }
 
@@ -1321,6 +1873,151 @@ static int winmenu_handle_click(int32_t x, int32_t y) {
     return 0;
 }
 
+
+// ============================================================================
+// #27: making the cut corners actually show what is behind the window.
+//
+// This is a software compositor with a single shared surface: the userland
+// compositor paints its whole layer stack (wallpaper, icons, widgets) into the
+// back buffer and THEN calls SYS_COMPOSITOR_RENDER_WINDOWS, which runs
+// wm_draw_all() + wm_draw_apps() into that same buffer. So at the moment the
+// first window is drawn, the pixels under every window's corners already hold
+// exactly what should show through. wm_capture_corners() snapshots them once
+// per composite, before any window is painted; window_punch_corners() writes
+// them back after the window (frame AND app content) has been drawn over them.
+//
+// Overlap is handled by win_covered_above(): a corner pixel that a HIGHER
+// window occupies is left alone rather than restored, so a lower window's
+// corner cannot punch a hole through the window on top of it. That test uses
+// window_point_is_cut() too, so if the higher window's own corner is cut
+// there, the lower window's background is correctly restored.
+//
+// Cost per composite, per window, for a 4px chamfer: 40 pixel reads in the
+// capture pass, then at most 40 pixel writes + 20 border pixels in the punch,
+// each guarded by at most (windows above) integer rect tests. There is NO
+// per-frame mask computation and NO per-pixel work proportional to window
+// area. For a square theme window_corner_bevel() returns 0 and the whole
+// thing collapses to one integer metric read per window per frame.
+// ============================================================================
+
+static struct {
+    window_t *win;
+    int32_t   b;
+    int       n;
+    uint32_t  px[4 * WIN_BEVEL_PX];
+} s_corner_snap[MAX_WINDOWS];
+static int s_corner_snap_n = 0;
+static int s_corner_snap_fresh = 0;
+
+// Enumerate the cut pixels of `win` in a FIXED order. Capture and punch both
+// call this, so entry k of the snapshot always means the same pixel.
+static int win_corner_pixels(const window_t *win, int32_t b,
+                             int32_t *ox, int32_t *oy, int max) {
+    int n = 0;
+    int32_t x = win->bounds.x, y = win->bounds.y;
+    int32_t w = win->bounds.width, h = win->bounds.height;
+    for (int c = 0; c < 4; c++) {
+        int32_t bx = (c & 1) ? x + w - 1 : x;
+        int32_t by = (c & 2) ? y + h - 1 : y;
+        int32_t sx = (c & 1) ? -1 : 1;
+        int32_t sy = (c & 2) ? -1 : 1;
+        for (int32_t dj = 0; dj < b; dj++)
+            for (int32_t di = 0; di + dj < b; di++) {
+                if (n >= max) return n;
+                ox[n] = bx + sx * di;
+                oy[n] = by + sy * dj;
+                n++;
+            }
+    }
+    return n;
+}
+
+// The border pixels that run ALONG the chamfer (di + dj == b), so the frame
+// follows the cut instead of stopping dead at a nibbled corner.
+static int win_corner_edge_pixels(const window_t *win, int32_t b,
+                                  int32_t *ox, int32_t *oy, int max) {
+    int n = 0;
+    int32_t x = win->bounds.x, y = win->bounds.y;
+    int32_t w = win->bounds.width, h = win->bounds.height;
+    for (int c = 0; c < 4; c++) {
+        int32_t bx = (c & 1) ? x + w - 1 : x;
+        int32_t by = (c & 2) ? y + h - 1 : y;
+        int32_t sx = (c & 1) ? -1 : 1;
+        int32_t sy = (c & 2) ? -1 : 1;
+        for (int32_t dj = 0; dj <= b; dj++) {
+            if (n >= max) return n;
+            ox[n] = bx + sx * (b - dj);
+            oy[n] = by + sy * dj;
+            n++;
+        }
+    }
+    return n;
+}
+
+// wm_state.window_list is front-first, so everything before `win` is above it.
+static bool win_covered_above(const window_t *win, int32_t x, int32_t y) {
+    for (window_t *w = wm_state.window_list; w && w != win; w = w->next) {
+        if (!(w->flags & WINDOW_FLAG_VISIBLE)) continue;
+        if (!rect_contains_point(&w->bounds, x, y)) continue;
+        if (window_point_is_cut(w, x, y)) continue;   /* its own corner is cut here too */
+        return true;
+    }
+    return false;
+}
+
+// The frame colour, in ONE place, so the chamfer's border and the rectangular
+// border drawn by window_draw() can never end up different colours.
+static uint32_t win_border_color(const window_t *win) {
+    if (win->theme_override == 1) return 0x00485058;   /* force Dark */
+    if (win->theme_override == 2) return 0x00A8B0BA;   /* force Light */
+    return theme_get_current()->c_border_strong;
+}
+
+void wm_capture_corners(void) {
+    s_corner_snap_n = 0;
+    s_corner_snap_fresh = 1;
+    for (window_t *win = wm_state.window_list;
+         win && s_corner_snap_n < MAX_WINDOWS; win = win->next) {
+        if (!(win->flags & WINDOW_FLAG_VISIBLE)) continue;
+        int32_t b = window_corner_bevel(win);
+        if (b <= 0) continue;
+        int32_t xs[4 * WIN_BEVEL_PX], ys[4 * WIN_BEVEL_PX];
+        int n = win_corner_pixels(win, b, xs, ys, 4 * WIN_BEVEL_PX);
+        int s = s_corner_snap_n++;
+        s_corner_snap[s].win = win;
+        s_corner_snap[s].b   = b;
+        s_corner_snap[s].n   = n;
+        for (int k = 0; k < n; k++)
+            s_corner_snap[s].px[k] = fb_get_pixel((uint32_t)xs[k], (uint32_t)ys[k]);
+    }
+}
+
+void window_punch_corners(window_t *win) {
+    int32_t b = window_corner_bevel(win);
+    if (b <= 0) return;
+    int32_t xs[4 * WIN_BEVEL_PX], ys[4 * WIN_BEVEL_PX];
+
+    // 1. show-through: put back what was behind the window.
+    for (int s = 0; s < s_corner_snap_n; s++) {
+        if (s_corner_snap[s].win != win || s_corner_snap[s].b != b) continue;
+        int n = win_corner_pixels(win, b, xs, ys, 4 * WIN_BEVEL_PX);
+        if (n != s_corner_snap[s].n) break;     /* geometry moved: skip, next composite fixes it */
+        for (int k = 0; k < n; k++) {
+            if (win_covered_above(win, xs[k], ys[k])) continue;
+            fb_put_pixel((uint32_t)xs[k], (uint32_t)ys[k], s_corner_snap[s].px[k]);
+        }
+        break;
+    }
+
+    // 2. run the border down the chamfer.
+    uint32_t col = win_border_color(win);
+    int n = win_corner_edge_pixels(win, b, xs, ys, 4 * WIN_EDGE_PX);
+    for (int k = 0; k < n; k++) {
+        if (win_covered_above(win, xs[k], ys[k])) continue;
+        fb_put_pixel((uint32_t)xs[k], (uint32_t)ys[k], col);
+    }
+}
+
 void window_draw(window_t *win) {
     if (!win || !(win->flags & WINDOW_FLAG_VISIBLE)) return;
     {
@@ -1335,13 +2032,34 @@ void window_draw(window_t *win) {
 
     // Task A: per-window theme override recolours just this window's chrome
     // (titlebar/border/content fill) without changing the global theme.
-    uint32_t ov_titlebar = win->titlebar_color;
-    uint32_t ov_border   = win->border_color;
-    uint32_t ov_bg       = win->bg_color;
+    // #711 loop 2 (designer 1): win->titlebar_color used to be cached at
+    // window_create and refreshed only on FOCUS CHANGE (window_set_focus),
+    // so a window that stayed focused/unfocused across a live theme switch
+    // kept the old theme's flat titlebar colour - invisible for the modern
+    // gradient path below (it already reads the theme fresh), but a real
+    // staleness bug for decor.style=beveled (retro_unix, High Contrast),
+    // whose flat fill uses this value directly. Same WINDOW_FLAG_FOCUSED
+    // check the gradient path already uses as its own source of truth, so
+    // both paths now agree on what "active" means.
+    uint32_t ov_titlebar = (win->flags & WINDOW_FLAG_FOCUSED) ? THEME_TITLEBAR_ACTIVE
+                                                                : THEME_TITLEBAR_INACTIVE;
+    // #711 loop 2 (designer 1): win->border_color used to be cached ONCE at
+    // window_create and never refreshed, so an already-open window's frame
+    // went stale on a live theme switch (no app ever customises border_color
+    // per-window - unlike bg_color, which several apps legitimately set and
+    // which this family does not touch). Reading color.border_strong fresh
+    // every draw call closes that gap; the value is unchanged for every
+    // theme that has not explicitly diverged color.border_strong from the
+    // legacy window_border key it defaults from (theme_fill_v2_defaults).
+    // #27: the two theme_override border literals moved into
+    // win_border_color(), which the chamfer border also reads, so the straight
+    // border and the bevelled border are the same colour by construction.
+    uint32_t ov_border    = win_border_color(win);
+    uint32_t ov_bg        = win->bg_color;
     if (win->theme_override == 1) {          // force Dark
-        ov_titlebar = 0x002A3038; ov_border = 0x00485058; ov_bg = 0x001E2228;
+        ov_titlebar = 0x002A3038; ov_bg = 0x001E2228;
     } else if (win->theme_override == 2) {   // force Light
-        ov_titlebar = 0x00DDE3EA; ov_border = 0x00A8B0BA; ov_bg = 0x00F4F6F9;
+        ov_titlebar = 0x00DDE3EA; ov_bg = 0x00F4F6F9;
     }
 
     // #185: borderless panel. Skip all chrome (border/titlebar/buttons/grips)
@@ -1376,13 +2094,30 @@ void window_draw(window_t *win) {
     int32_t tbx = x + BORDER_WIDTH, tby = y + BORDER_WIDTH;
     int32_t tbw = w - 2 * BORDER_WIDTH;
     if (win_modern_style()) {
-        uint8_t r = (tb_col >> 16) & 0xFF, g = (tb_col >> 8) & 0xFF, b = tb_col & 0xFF;
-        // top shade = tb_col lifted ~22% toward white
-        int tr = r + (255 - r) * 22 / 100;
-        int tg = g + (255 - g) * 22 / 100;
-        int tb2 = b + (255 - b) * 22 / 100;
-        int span = TITLEBAR_HEIGHT > 1 ? TITLEBAR_HEIGHT - 1 : 1;
-        for (int32_t j = 0; j < TITLEBAR_HEIGHT; j++) {
+        // #711: the two gradient stops are DATA (color.titlebar_top /
+        // color.titlebar_bottom), not a hardcoded "lift the fill 22% toward
+        // white". A per-window theme override still wins, because that is a
+        // runtime property of the window, not of the theme; in that case we
+        // fall back to computing the stop from the override colour.
+        const theme_t *th = theme_get_current();
+        int active = (win->flags & WINDOW_FLAG_FOCUSED) != 0;
+        uint32_t g_top = active ? th->c_titlebar_top : th->c_titlebar_inactive_top;
+        uint32_t g_bot = active ? th->c_titlebar_bottom : th->c_titlebar_inactive_bottom;
+        if (win->theme_override != 0 || tb_col != ov_titlebar) { g_top = 0; g_bot = 0; }
+        uint8_t r, g, b, tr8, tg8, tb8;
+        if (g_top != g_bot) {
+            tr8 = (g_top >> 16) & 0xFF; tg8 = (g_top >> 8) & 0xFF; tb8 = g_top & 0xFF;
+            r = (g_bot >> 16) & 0xFF;   g = (g_bot >> 8) & 0xFF;   b = g_bot & 0xFF;
+        } else {
+            r = (tb_col >> 16) & 0xFF; g = (tb_col >> 8) & 0xFF; b = tb_col & 0xFF;
+            tr8 = (uint8_t)(r + (255 - r) * 22 / 100);
+            tg8 = (uint8_t)(g + (255 - g) * 22 / 100);
+            tb8 = (uint8_t)(b + (255 - b) * 22 / 100);
+        }
+        int tr = tr8, tg = tg8, tb2 = tb8;
+        int32_t tbh = TITLEBAR_HEIGHT;
+        int span = tbh > 1 ? tbh - 1 : 1;
+        for (int32_t j = 0; j < tbh; j++) {
             int rr = tr + (r - tr) * j / span;
             int gg = tg + (g - tg) * j / span;
             int bb = tb2 + (b - tb2) * j / span;
@@ -1394,8 +2129,24 @@ void window_draw(window_t *win) {
         fb_fill_rect(tbx, tby, tbw, TITLEBAR_HEIGHT, tb_col);
     }
 
+    // #711 loop 2 (designer 1, window decorations): wire two previously-dead
+    // tokens (color.titlebar_text_inactive, metric.title_inset - both parsed
+    // into theme_t since loop 1 but never read). Gated to decor.style !=
+    // beveled and "no per-window override / no near-white auto-recolour in
+    // effect" (tb_col == ov_titlebar), the same guard the gradient block
+    // above already uses for the same reason: those two cases are a runtime
+    // property of THIS window, not of the active theme, and must keep using
+    // the existing computed-contrast ink. Per the loop-2 director brief
+    // (B8), only the INACTIVE state dims; active keeps its current value.
+    int32_t title_inset = theme_metric_i(TM_TITLE_INSET);
+    if (theme_metric_i(TM_DECOR_STYLE) != TDECOR_BEVELED &&
+        win->theme_override == 0 && tb_col == ov_titlebar &&
+        !(win->flags & WINDOW_FLAG_FOCUSED)) {
+        tb_ink = theme_get_current()->c_titlebar_text_inactive;
+    }
+
     // #136: app icon then title text, both in the readable ink.
-    int32_t title_x = x + BORDER_WIDTH + 4;
+    int32_t title_x = x + BORDER_WIDTH + title_inset;
     int32_t title_y = y + BORDER_WIDTH + (TITLEBAR_HEIGHT - FONT_HEIGHT) / 2;
     {
         int32_t isz = 16;
@@ -1414,13 +2165,20 @@ void window_draw(window_t *win) {
 
     // Draw title bar buttons: [minimize][maximize][close]
     // All buttons are drawn for all windows
-    int32_t btn_y = y + 2;
+    int32_t btn_y = y + TITLEBAR_BUTTON_Y_OFFSET;
+
+    // #711 loop 2: shared hover fill for the filter/minimize/maximize buttons
+    // (color.titlebar_btn_hover, staged data-only since loop 1, now read).
+    // Close keeps its own legacy close_button_hover, already wired below.
+    const theme_t *th_btn = theme_get_current();
+    uint32_t btn_hover_bg = th_btn->c_titlebar_btn_hover;
 
     // #165: transparency button (Zest Filter icon) - far left of the button group.
     {
         int32_t btn_x = x + w - 4 * CLOSE_BUTTON_SIZE - 2 - 3 * TITLEBAR_BUTTON_SPACING;
-        fb_fill_rect(btn_x, btn_y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, tb_col);
-        if (!kicon_blit("FILTER", btn_x + 2, btn_y + 2, 12, tb_ink, tb_col)) {
+        uint32_t fill = (win->tb_hover_btn == 1) ? btn_hover_bg : tb_col;
+        fb_fill_rect(btn_x, btn_y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, fill);
+        if (!kicon_blit("FILTER", btn_x + 2, btn_y + 2, 12, tb_ink, fill)) {
             // fallback: a small funnel/triangle
             int32_t cx = btn_x + CLOSE_BUTTON_SIZE / 2;
             int32_t cy = btn_y + CLOSE_BUTTON_SIZE / 2;
@@ -1433,8 +2191,9 @@ void window_draw(window_t *win) {
     // #165: minimize button (Zest minus icon).
     {
         int32_t btn_x = x + w - 3 * CLOSE_BUTTON_SIZE - 2 - 2 * TITLEBAR_BUTTON_SPACING;
-        fb_fill_rect(btn_x, btn_y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, tb_col);
-        if (!kicon_blit("MINUS", btn_x + 2, btn_y + 2, 12, tb_ink, tb_col)) {
+        uint32_t fill = (win->tb_hover_btn == 2) ? btn_hover_bg : tb_col;
+        fb_fill_rect(btn_x, btn_y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, fill);
+        if (!kicon_blit("MINUS", btn_x + 2, btn_y + 2, 12, tb_ink, fill)) {
             int32_t cx = btn_x + CLOSE_BUTTON_SIZE / 2;
             int32_t cy = btn_y + CLOSE_BUTTON_SIZE / 2;
             for (int i = -4; i <= 4; i++) fb_put_pixel(cx + i, cy, tb_ink);
@@ -1444,7 +2203,8 @@ void window_draw(window_t *win) {
     // Draw maximize button - middle
     {
         int32_t btn_x = x + w - 2 * CLOSE_BUTTON_SIZE - 2 - TITLEBAR_BUTTON_SPACING;
-        fb_fill_rect(btn_x, btn_y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, tb_col);
+        uint32_t fill = (win->tb_hover_btn == 3) ? btn_hover_bg : tb_col;
+        fb_fill_rect(btn_x, btn_y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, fill);
 
         // Draw square outline on maximize button
         int32_t cx = btn_x + CLOSE_BUTTON_SIZE / 2;
@@ -1461,7 +2221,10 @@ void window_draw(window_t *win) {
     // Draw close button - rightmost
     if (win->flags & WINDOW_FLAG_CLOSABLE) {
         int32_t btn_x = x + w - CLOSE_BUTTON_SIZE - 2;
-        uint32_t close_bg = THEME_CLOSE_BUTTON;
+        // #711 loop 2: close_button_hover is a pre-#711 legacy key that
+        // exists in every shipped theme (51-key format) but had never been
+        // read anywhere. This is its first consumer.
+        uint32_t close_bg = (win->tb_hover_btn == 4) ? THEME_CLOSE_BUTTON_HOVER : THEME_CLOSE_BUTTON;
         fb_fill_rect(btn_x, btn_y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, close_bg);
         // #165: Zest X (xmark) icon, tinted white over the red close button.
         if (!kicon_blit("XMARK", btn_x + 2, btn_y + 2, 12, 0x00FFFFFF, close_bg)) {
@@ -1492,7 +2255,11 @@ void window_draw(window_t *win) {
     }
 
     // Draw resize grips (small triangular indicators in all 4 corners)
-    if (win->flags & WINDOW_FLAG_RESIZABLE) {
+    // #711 loop 2 (designer 1): decor.grip was parsed into theme_t since
+    // loop 1 (d_grip / TM_DECOR_GRIP) but had zero consumers; a theme setting
+    // decor.grip=0 had no effect. Default (1) reproduces the prior always-on
+    // behaviour exactly for every theme that does not set the key.
+    if ((win->flags & WINDOW_FLAG_RESIZABLE) && theme_metric_i(TM_DECOR_GRIP)) {
         // Bottom-right corner (3 diagonal lines)
         int32_t grip_x = x + w - RESIZE_GRIP_SIZE;
         int32_t grip_y = y + h - RESIZE_GRIP_SIZE;
@@ -1527,6 +2294,14 @@ void window_draw(window_t *win) {
             fb_put_pixel(x + 2, y + h - 3 - i, 0x00808080);
         }
     }
+
+    // #27: cut the themed corners back out. Everything above filled square
+    // rectangles; this is what makes the shape. Done LAST so it wins over the
+    // border, the titlebar fill and the content fill in one place instead of
+    // each of them having to know the shape. wm_draw_apps() calls it again
+    // after the app blits its content, which is the only other painter inside
+    // this rectangle.
+    window_punch_corners(win);
 }
 
 // Invalidate window (mark for redraw)
@@ -1539,6 +2314,8 @@ void window_invalidate(window_t *win) {
 void wm_draw_all(void) {
     extern int g_win_blit_suppressed;
     if (g_win_blit_suppressed) return;   // screensaver owns the FB; don't draw window frames
+    // #27: snapshot what is behind every cut corner BEFORE any window paints.
+    wm_capture_corners();
     // Find the last window (lowest z-order)
     window_t *win = wm_state.window_list;
     while (win && win->next) {
@@ -1759,6 +2536,8 @@ window_t *wm_get_window_at_index(int index) {
 // Focus a window (brings to front and sets focus)
 void wm_focus_window(window_t *win) {
     if (!win) return;
+    fdg_note_wfw(__builtin_return_address(0));    // (local 79)
+    fdg_pulse();                                  // before the fast-path no-op below
     // Fast-path no-op: if this window is ALREADY focused and ALREADY frontmost,
     // there is nothing to change. A fullscreen app (Arena / Squadron) re-asserts
     // focus every frame so a background window-create can never steal its keyboard
@@ -1813,6 +2592,38 @@ void wm_invalidate_rect(const rect_t *rect) {
 
 void wm_invalidate_all(void) {
     wm_state.dirty.full_redraw = true;
+}
+
+// Mark a window region dirty from a thread that is NOT the desktop/WM thread.
+//
+// Two things make the plain wm_invalidate_rect() above wrong for that caller:
+//
+//  1. It appends with `d->rects[d->count++] = *rect` under no lock. Every
+//     existing caller runs in the desktop/WM context, so they serialise with
+//     each other by construction. A caller on its own proc does not, and two
+//     writers that both pass the bounds check can write ONE ENTRY PAST the
+//     array. Snapshotting the index first makes that impossible: the worst a
+//     race can now do is lose a rect, which is harmless for a caller that
+//     re-marks the same region on its next frame.
+//  2. Its sibling window_invalidate() is NOT a mark, it is a synchronous
+//     window_draw(). Calling that from another proc races the compositor inside
+//     the shared TTF glyph cache; measured as a General Protection Fault in
+//     ttf_get_glyph_f() the first time the DOS layer presented through it.
+//
+// So: this marks, and only marks. The render gate (wm_is_dirty(), read by the
+// kernel desktop loop and by the userland compositor through
+// SYS_WM_APPS_DIRTY) then picks the frame up on its own thread.
+void wm_invalidate_rect_async(const rect_t *rect) {
+    if (!rect) return;
+    dirty_region_t *d = &wm_state.dirty;
+    if (d->full_redraw) return;
+    int i = d->count;                       // snapshot ONCE
+    if (i < 0 || i >= MAX_DIRTY_RECTS) {    // full instead of overflowing
+        d->full_redraw = true;
+        return;
+    }
+    d->rects[i] = *rect;
+    d->count = i + 1;
 }
 
 bool wm_is_dirty(void) {
@@ -1916,6 +2727,11 @@ void wm_draw_apps(void) {
     // Draw all windows back to front, with both decorations and app content
     // per window. This ensures the focused (front) window decorations are
     // never obscured by a background window app content.
+    // #27: normally wm_draw_all() ran first this composite and already took
+    // the corner snapshot; wm_process_frame() calls us on our own, so take it
+    // here in that case. Taking it twice would snapshot window pixels instead
+    // of the background, which is exactly the bug this flag prevents.
+    if (!s_corner_snap_fresh) wm_capture_corners();
     window_t *win = wm_state.window_list;
     while (win && win->next) {
         win = win->next;
@@ -1930,9 +2746,13 @@ void wm_draw_apps(void) {
             if (app && app->on_draw) {
                 app->on_draw(app->app_data);
             }
+            // #27: the content blit is a full rectangle, so it repaints the
+            // two bottom corners window_draw() just cut. Cut them again.
+            window_punch_corners(win);
         }
         win = win->prev;
     }
+    s_corner_snap_fresh = 0;    // #27: next composite must re-snapshot
 }
 
 
@@ -1969,6 +2789,12 @@ int64_t sys_wm_get_windows(wm_window_info_t *buf, int max_count) {
     if (!buf || max_count <= 0) return -1;
     int n = 0;
     window_t *win = wm_state.window_list;
+    // #19/#645: every store in this loop body lands in the caller's Ring-3
+    // array, including the per-byte title copy, so the AC window is the loop
+    // body. Opening it once around the whole loop rather than per row keeps it
+    // to the accesses and adds no unrelated work: the loop body contains
+    // nothing but reads of kernel window state and writes of `buf`.
+    uaccess_ac_t __ac = uaccess_begin();
     while (win && n < max_count) {
         buf[n].id      = (int)win->id;
         buf[n].x       = (int)win->bounds.x;
@@ -1978,12 +2804,46 @@ int64_t sys_wm_get_windows(wm_window_info_t *buf, int max_count) {
         buf[n].visible   = (win->flags & WINDOW_FLAG_VISIBLE)   ? 1 : 0;
         buf[n].minimized = (win->flags & WINDOW_FLAG_MINIMIZED) ? 1 : 0;
         buf[n].focused   = (win->flags & WINDOW_FLAG_FOCUSED)   ? 1 : 0;
+        // #44: same WINDOW_FLAG_MAXIMIZED the kernel already tracks for
+        // layout/paint decisions elsewhere in this file, now also exposed to
+        // userland so the dock right-click menu can label "Maximize" vs
+        // "Restore" correctly instead of guessing.
+        buf[n].maximized = (win->flags & WINDOW_FLAG_MAXIMIZED) ? 1 : 0;
+        // #745: the compositor cannot see kernel window flags any other way,
+        // and it is the only layer that can paint outside a window rect.
+        buf[n].shadow    = window_wants_shadow(win)             ? 1 : 0;
         int ti = 0;
         const char *src = win->title;
         while (ti < 63 && src[ti]) { buf[n].title[ti] = src[ti]; ti++; }
         buf[n].title[ti] = '\0';
+        // #41: resolve the owning process's binary basename as a stable app
+        // identity, distinct from the window's own (app-chosen, arbitrary)
+        // title. owner_pid == 0 is "no Ring-3 owner" by construction
+        // (window_create()'s comment), NOT a real pid - proc_get(0) would
+        // resolve to idle and hand back a bogus "idle" app_id, so it is
+        // special-cased out here rather than trusted to proc_get() to reject.
+        // A dead owner (process exited, window not yet reaped) also falls
+        // through to the empty string, which the compositor's own fallback
+        // path is required to treat as "no identity available".
+        buf[n].app_id[0] = '\0';
+        if (win->owner_pid != 0) {
+            process_t *owner = proc_get(win->owner_pid);
+            if (owner) {
+                int ai = 0;
+                const char *oname = owner->name;
+                while (ai < 31 && oname[ai]) { buf[n].app_id[ai] = oname[ai]; ai++; }
+                buf[n].app_id[ai] = '\0';
+            }
+        }
         n++;
         win = win->next;
     }
+    uaccess_end(__ac);
     return (int64_t)n;
+}
+
+// #564: see the declaration in window.h for the full rationale. Plain peek at
+// the existing global dirty flag - no side effects.
+int64_t sys_wm_apps_dirty(void) {
+    return wm_is_dirty() ? 1 : 0;
 }

@@ -1,174 +1,78 @@
-// stack_guard.h - Stack Canary Protection for MayteraOS
+// stack_guard.h - kernel stack canary protection for MayteraOS.
+//
+// #646 HONESTY PASS (2026-08-05). Measured state, by grepping the whole kernel
+// tree for call sites:
+//
+//   LIVE - the GCC stack protector. The kernel is built with
+//          -fstack-protector-strong -mstack-protector-guard=global (kernel/
+//          Makefile), so every protected function's epilogue compares against
+//          __stack_chk_guard and calls __stack_chk_fail() on a mismatch.
+//   LIVE - stack_guard_init(), called from kernel_main via
+//          security_canary_init() (security.c), installs a per-boot random
+//          guard before almost anything else runs.
+//   LIVE - security_canary_selftest(), armed by `make CANARYTEST=1`, is a real
+//          proof-of-fire: it overflows a 16-byte buffer and the canary must
+//          kpanic. Never armed in a golden.
+//
+// DELETED in this pass, all with ZERO callers, all of them implying protection
+// that did not exist:
+//   stack_guard_t, stack_guard_init_thread(), stack_guard_check(),
+//   stack_guard_generate_canary()  - a whole per-thread canary scheme. Nothing
+//       ever created a stack_guard_t, so stack_guard_check() was never called
+//       and the "Checks performed" statistic was structurally always 0.
+//       stack_guard_generate_canary() was also a SECOND, divergent canary
+//       generator: stack_guard_init() does not use it, it uses
+//       sec_canary_generate_rs() (rustkern/seccore.rs). Two generators means
+//       two behaviours to keep in sync, for a value only one of them produces.
+//   stack_guard_fail(), stack_guard_set_handler(), stack_overflow_handler_t
+//       - a second, WORSE fatal path: a private kprintf-and-spin that neither
+//       kpanic()s nor persists to /PANIC.TXT. It was declared noreturn in this
+//       header, so any future caller would have silently got the bad handler
+//       instead of __stack_chk_fail(). There is now exactly one stack-smash
+//       exit and it is the one GCC calls.
+//   stack_guard_setup_page(), stack_guard_remove_page(),
+//   stack_guard_is_guard_page() - guard pages. Zero callers; remove_page() was
+//       an explicit no-op ("Would need to remap") and is_guard_page() was a
+//       guess ("For now, check if address is unmapped"). No stack in this
+//       kernel has a guard page. SECURITY_FEATURE_GUARD_PAGES is correspondingly
+//       never set.
+//   stack_guard_get_usage(), stack_guard_get_usage_percent(),
+//   stack_guard_near_overflow() - stack usage monitoring over the deleted
+//       stack_guard_t.
+//   stack_guard_get_canary(), stack_guard_set_flags(), stack_guard_get_flags()
+//       and the STACK_GUARD_* / STACK_CANARY_{TERMINATOR,NEWLINE,CR} flags -
+//       configuration for the deleted features.
 #ifndef SECURITY_STACK_GUARD_H
 #define SECURITY_STACK_GUARD_H
 
 #include "../types.h"
 
-// ============================================================================
-// Stack Guard Configuration
-// ============================================================================
-
-// Canary value patterns
-#define STACK_CANARY_MAGIC      0xDEADBEEFCAFEBABEULL   // Fallback magic value
-#define STACK_CANARY_TERMINATOR 0x00                    // Null terminator in LSB
-#define STACK_CANARY_NEWLINE    0x0A                    // Newline character
-#define STACK_CANARY_CR         0x0D                    // Carriage return
-
-// Stack guard features
-#define STACK_GUARD_RANDOM_CANARY   (1 << 0)    // Use random canary per thread
-#define STACK_GUARD_TERMINATOR      (1 << 1)    // Include string terminators
-#define STACK_GUARD_KERNEL          (1 << 2)    // Protect kernel stacks
-#define STACK_GUARD_USER            (1 << 3)    // Protect user stacks
-
-#define STACK_GUARD_DEFAULT (STACK_GUARD_RANDOM_CANARY | STACK_GUARD_TERMINATOR | \
-                             STACK_GUARD_KERNEL | STACK_GUARD_USER)
-
-// ============================================================================
-// Stack Guard State
-// ============================================================================
-
-// Per-thread stack guard info
-typedef struct {
-    uint64_t canary;            // The canary value for this thread
-    uint64_t stack_base;        // Base of the stack (highest address)
-    uint64_t stack_limit;       // Bottom of the stack (lowest address)
-    uint64_t guard_page;        // Guard page address (if using guard pages)
-    bool guard_page_enabled;    // Whether guard page is active
-} stack_guard_t;
-
-// Stack overflow handler callback
-typedef void (*stack_overflow_handler_t)(uint32_t pid, const char *name, uint64_t fault_addr);
-
-// ============================================================================
-// Stack Guard API
-// ============================================================================
-
-/**
- * Initialize the stack guard subsystem
- * Sets up the global canary and enables stack protection
- */
-void stack_guard_init(void);
-
-/**
- * Get the global canary value
- * Used by GCC's -fstack-protector
- * @return global canary value
- */
-uint64_t stack_guard_get_canary(void);
-
-/**
- * Generate a new random canary
- * @return random canary value with protective characters
- */
-uint64_t stack_guard_generate_canary(void);
-
-/**
- * Initialize stack guard for a thread
- * @param guard     pointer to thread's stack guard structure
- * @param stack_base    top of stack (highest address)
- * @param stack_size    size of stack in bytes
- */
-void stack_guard_init_thread(stack_guard_t *guard, uint64_t stack_base, size_t stack_size);
-
-/**
- * Check if the stack canary is intact
- * @param guard     pointer to thread's stack guard
- * @param canary_location   address where canary was placed
- * @return          true if canary is intact
- */
-bool stack_guard_check(const stack_guard_t *guard, const uint64_t *canary_location);
-
-/**
- * Handle stack smashing detection
- * Called when canary corruption is detected
- * This function does not return - terminates the process
- * @param fault_addr    address of corruption
- */
-void stack_guard_fail(uint64_t fault_addr) __attribute__((noreturn));
-
-/**
- * Set custom stack overflow handler
- * @param handler   callback function for stack overflow
- */
-void stack_guard_set_handler(stack_overflow_handler_t handler);
-
-/**
- * Enable/disable stack guard features
- * @param flags     bitmask of STACK_GUARD_* values
- */
-void stack_guard_set_flags(uint32_t flags);
-
-/**
- * Get current stack guard configuration
- * @return current flags
- */
-uint32_t stack_guard_get_flags(void);
-
-// ============================================================================
-// Guard Page Support
-// ============================================================================
-
-/**
- * Set up a guard page at the bottom of a stack
- * @param stack_bottom  lowest stack address
- * @return              0 on success, negative on failure
- */
-int stack_guard_setup_page(uint64_t stack_bottom);
-
-/**
- * Remove a guard page
- * @param stack_bottom  address of guard page
- */
-void stack_guard_remove_page(uint64_t stack_bottom);
-
-/**
- * Check if an address is in a guard page
- * @param addr  address to check
- * @return      true if in guard page
- */
-bool stack_guard_is_guard_page(uint64_t addr);
-
-// ============================================================================
-// Stack Usage Monitoring
-// ============================================================================
-
-/**
- * Get current stack usage for a thread
- * @param guard     thread's stack guard
- * @param current_sp    current stack pointer
- * @return          bytes of stack used
- */
-size_t stack_guard_get_usage(const stack_guard_t *guard, uint64_t current_sp);
-
-/**
- * Get stack usage percentage
- * @param guard     thread's stack guard
- * @param current_sp    current stack pointer
- * @return          percentage of stack used (0-100)
- */
-uint32_t stack_guard_get_usage_percent(const stack_guard_t *guard, uint64_t current_sp);
-
-/**
- * Check if stack is near overflow (> 90% used)
- * @param guard     thread's stack guard
- * @param current_sp    current stack pointer
- * @return          true if stack is nearly full
- */
-bool stack_guard_near_overflow(const stack_guard_t *guard, uint64_t current_sp);
+// Compile-time placeholder. Replaced with a 64-bit random value by
+// stack_guard_init() before any protected frame that outlives the call exists.
+#define STACK_CANARY_MAGIC      0xDEADBEEFCAFEBABEULL
 
 // ============================================================================
 // GCC Stack Protector Support
 // ============================================================================
 
-// This symbol is referenced by GCC's -fstack-protector
-// It must be defined exactly as "__stack_chk_guard"
+// Referenced by GCC's -fstack-protector-strong -mstack-protector-guard=global.
+// The name is fixed by the compiler.
 extern uint64_t __stack_chk_guard;
 
-// This function is called by GCC when stack smashing is detected
+// Called by GCC when a protected function's epilogue sees a canary mismatch.
 extern void __stack_chk_fail(void) __attribute__((noreturn));
 
 /**
- * Print stack guard statistics
+ * Install the real per-boot canary into __stack_chk_guard.
+ *
+ * MUST be called from a chain of no_stack_protector frames only: see the long
+ * comment on the definition in stack_guard.c. Today that chain is
+ * entry.asm -> kernel_main -> security_canary_init -> here.
+ */
+void stack_guard_init(void);
+
+/**
+ * Print the measured stack-protection posture.
  */
 void stack_guard_print_info(void);
 

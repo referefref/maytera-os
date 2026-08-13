@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // errno.h - POSIX errno for MayteraOS userland
 #ifndef LIBC_ERRNO_H
 #define LIBC_ERRNO_H
@@ -61,6 +65,7 @@
 #define ENOTCONN        107
 #define ECONNRESET      104
 #define ECONNREFUSED    111
+#define EAFNOSUPPORT    97   // task #568: real Linux errno value, parse-only
 
 extern int *__errno_location(void);
 #define errno (*__errno_location())

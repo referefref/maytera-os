@@ -10,6 +10,17 @@
 #include "../string.h"
 #include "../mm/heap.h"
 #include "../serial.h"
+#include "../cpu/mono.h"   // #499: sched_now_ms() - THE shared real-elapsed-ms clock
+#include "../cpu/dlprof.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
+#include "http_progress.h"   // #25: real per-fetch progress for the browser chrome
+
+// #615: per-phase fetch profile. Every https_get/https_get_hdr/https_post
+// records where its wall clock went (dns / arp / tcp connect / tls handshake /
+// request / time-to-first-byte / body) and prints ONE serial line. Serial only
+// (#597: file-write tracing corrupts ext2).
+int g_https_prof = 1;
+uint64_t g_pf_dns = 0, g_pf_arp = 0, g_pf_tcp = 0, g_pf_tls = 0;
 
 // External declarations
 extern void net_poll(void);
@@ -26,6 +37,7 @@ struct https_conn {
     tls_context_t *tls;
     char hostname[256];
     uint16_t port;
+    uint16_t pool_flags;   /* #616: bit0 = opened with the ALPN forced to http/1.1 */
     int connected;
 };
 
@@ -60,14 +72,20 @@ static int https_tcp_recv(void *user_data, void *buffer, size_t length) {
     https_conn_t *conn = (https_conn_t *)user_data;
 
     // Poll for data with a real timer-based timeout (~10 seconds)
-    uint64_t start = timer_ticks;
-    uint64_t timeout = (uint64_t)(g_timer_hz ? g_timer_hz : 250) * 5;   // ~5 seconds
+    uint64_t start_ms = sched_now_ms();          // #499: REAL elapsed ms
+    uint64_t timeout_ms = 5000;                  // ~5 seconds
 
-    while (timer_ticks - start < timeout) {
+    while (sched_now_ms() - start_ms < timeout_ms) {
+        g_dp_tls_iter++;
         net_lock();
-        int ret = tcp_recv(conn->tcp_socket, buffer, length);
+        // #608: tcp_recv() takes uint32_t; clamp rather than let a size_t be
+        // narrowed silently (a request that truncates to 0 stalls the loop).
+        size_t _want = length;
+        if (_want > 0xFFFFFFFFu) _want = 0xFFFFFFFFu;
+        int ret = tcp_recv(conn->tcp_socket, buffer, (uint32_t)_want);
         net_unlock();
         if (ret > 0) {
+            g_dp_tls_bytes += (uint64_t)ret;
             return ret;                 // deliver buffered data (incl. in CLOSE_WAIT)
         }
         if (ret == TCP_ERR_CLOSED) {
@@ -79,6 +97,7 @@ static int https_tcp_recv(void *user_data, void *buffer, size_t length) {
 
         net_poll();
         tcp_timer();
+        g_dp_tls_sleep++;
         proc_sleep(2);   // yield so the OS stays responsive during the fetch
 
         // Do NOT bail out on CLOSE_WAIT here. A server honoring "Connection: close"
@@ -125,12 +144,11 @@ static void https_warm_arp(uint32_t host_ip) {
 
     uint8_t mac[6];
     if (arp_resolve(host_ip, mac)) return;            // already cached
-    uint64_t start = timer_ticks;
-    uint64_t hz = g_timer_hz ? g_timer_hz : 250;
+    uint64_t start_ms = sched_now_ms();              // #499: REAL elapsed ms
     while (!arp_resolve(host_ip, mac)) {
         net_poll();
         tcp_timer();
-        if (timer_ticks - start > hz * 4) {           // ~4s ARP window
+        if (sched_now_ms() - start_ms > 4000) {       // ~4s ARP window
             kprintf("[HTTPS] ARP warm-up timed out for on-link host\n");
             return;
         }
@@ -145,8 +163,11 @@ https_conn_t *https_connect(const char *hostname, uint16_t port) {
     // #374: never start a TLS/TCP connect when the network is down; a dead link
     // otherwise burns the full connect-retry timeout and freezes any UI that
     // waits on the fetch. Return immediately so callers get "no network" fast.
-    extern int net_is_up(void);
-    if (!net_is_up()) { kprintf("[HTTPS] network down; skipping connect to %s\n", hostname); return NULL; }
+    // #549: net_wire_usable(), not net_is_up() - the NET_FAULTY policy is
+    // enforced once at the fetch gate, which admits one paced re-probe. Testing
+    // net_is_up() here vetoed that probe.
+    extern int net_wire_usable(void);
+    if (!net_wire_usable()) { kprintf("[HTTPS] no carrier/address; skipping connect to %s\n", hostname); return NULL; }
     https_conn_t *conn = kzalloc(sizeof(https_conn_t));
     if (!conn) return NULL;
 
@@ -156,9 +177,13 @@ https_conn_t *https_connect(const char *hostname, uint16_t port) {
 
     kprintf("[HTTPS] Connecting to %s:%d\n", hostname, port);
 
+    net_progress_phase(HTTP_PHASE_RESOLVING);   // #25
+
     // Resolve hostname
     uint32_t host_ip;
+    uint64_t _t_dns0 = sched_now_ms();
     int ret = dns_resolve(hostname, &host_ip);
+    g_pf_dns = sched_now_ms() - _t_dns0;
     if (ret != 0) {
         kprintf("[HTTPS] DNS resolution failed: %d\n", ret);
         kfree(conn);
@@ -168,7 +193,9 @@ https_conn_t *https_connect(const char *hostname, uint16_t port) {
     // #333: pre-resolve ARP for on-link destinations so the first SYN is not
     // dropped (only the gateway MAC is cached at boot). Fixes same-subnet HTTP/
     // HTTPS fetches to a never-contacted LAN host (e.g. album-art on a LAN box).
-    https_warm_arp(host_ip);
+    { uint64_t _t = sched_now_ms(); https_warm_arp(host_ip); g_pf_arp = sched_now_ms() - _t; }
+
+    net_progress_phase(HTTP_PHASE_CONNECTING);   // #25
 
     kprintf("[HTTPS] Connecting TCP to ");
     ip_print(host_ip);
@@ -177,8 +204,9 @@ https_conn_t *https_connect(const char *hostname, uint16_t port) {
     // #333: retry the connect across the ARP-resolution window. Even with the
     // warm-up above, the first SYN can race ARP on a cold cache; the TCP layer
     // gives up after ~5 retransmits (~1.2s), so try a few times before failing.
-    uint64_t timeout_ticks = (uint64_t)(g_timer_hz ? g_timer_hz : 250) * 3;  // #374 ~3s/attempt (was 5s)
+    uint64_t timeout_ms = 3000;   // #374 ~3s/attempt (was 5s); #499 REAL ms
     int connected = 0;
+    uint64_t _t_tcp0 = sched_now_ms();
     for (int attempt = 0; attempt < 2 && !connected; attempt++) {  // #374 2 attempts (was 3): bound worst-case connect to ~6s
         // Create TCP socket
         conn->tcp_socket = tcp_socket();
@@ -198,14 +226,14 @@ https_conn_t *https_connect(const char *hostname, uint16_t port) {
         }
 
         // Wait for TCP connection
-        uint64_t start_time = timer_ticks;
+        uint64_t start_time_ms = sched_now_ms();
         int dead = 0;
         while (!tcp_is_connected(conn->tcp_socket)) {
             net_poll();
             tcp_timer();
             proc_sleep(2);   // yield during the connect wait
 
-            if (timer_ticks - start_time > timeout_ticks) {
+            if (sched_now_ms() - start_time_ms > timeout_ms) {
                 kprintf("[HTTPS] TCP connection timeout (attempt %d)\n", attempt + 1);
                 dead = 1;
                 break;
@@ -231,7 +259,9 @@ https_conn_t *https_connect(const char *hostname, uint16_t port) {
         return NULL;
     }
 
+    g_pf_tcp = sched_now_ms() - _t_tcp0;
     kprintf("[HTTPS] TCP connected, starting TLS handshake\n");
+    net_progress_phase(HTTP_PHASE_TLS);   // #25
 
     // Create TLS context
     conn->tls = tls_create();
@@ -254,7 +284,9 @@ https_conn_t *https_connect(const char *hostname, uint16_t port) {
     tls_set_verify(conn->tls, 1, 0);
 
     // Perform TLS handshake
+    uint64_t _t_tls0 = sched_now_ms();
     ret = tls_connect(conn->tls);
+    g_pf_tls = sched_now_ms() - _t_tls0;
     if (ret < 0) {
         kprintf("[HTTPS] TLS handshake failed: %s\n", tls_strerror(ret));
         tls_free(conn->tls);
@@ -301,6 +333,210 @@ void https_close(https_conn_t *conn) {
 int https_is_connected(https_conn_t *conn) {
     return conn && conn->connected && tls_is_connected(conn->tls);
 }
+
+/* #616: tiny case-insensitive helpers for the C reuse-policy twin. */
+static int https_lc(int ch) { return (ch >= 'A' && ch <= 'Z') ? ch + 32 : ch; }
+static int https_ci8(const uint8_t *p, const char *lit) {
+    for (int i = 0; i < 8; i++) if (https_lc(p[i]) != https_lc((unsigned char)lit[i])) return 0;
+    return 1;
+}
+static int https_ci_eq(const uint8_t *p, uint32_t n, const char *lit) {
+    uint32_t i = 0;
+    for (; i < n && lit[i]; i++) if (https_lc(p[i]) != https_lc((unsigned char)lit[i])) return 0;
+    return (i == n && !lit[i]);
+}
+static int https_has_token(const uint8_t *v, uint32_t n, const char *tok) {
+    uint32_t i = 0;
+    while (i < n) {
+        while (i < n && (v[i] == ',' || v[i] == ' ' || v[i] == '\t')) i++;
+        uint32_t st = i;
+        while (i < n && v[i] != ',' && v[i] != ' ' && v[i] != '\t') i++;
+        if (i > st && https_ci_eq(v + st, i - st, tok)) return 1;
+    }
+    return 0;
+}
+
+// ===========================================================================
+// #616: TLS CONNECTION REUSE (live-connection pool)
+//
+// MEASURED PROBLEM (#615): every https_get/https_get_hdr opened a fresh TCP
+// connection AND ran a fresh TLS handshake. On the App Store's 103 MB package
+// download (396 Range GETs) the handshake was 414 ms of each 550 ms chunk =
+// 75%, about 2.7 minutes of pure handshake.
+//
+// The state machine (slot table, LRU eviction, idle expiry) and the
+// "may this connection carry another request?" response-header policy live in
+// rustkern/tlspool.rs. See that file for why they are Rust. The TCP/TLS calls
+// stay here in C: they are the existing net stack, not new logic.
+//
+// SECURITY (#232/#510): this is LIVE-CONNECTION reuse only. No session
+// tickets, no session-ID resumption, no abbreviated handshake. A pooled
+// connection is one whose FULL handshake already passed certificate-chain,
+// validity-window and hostname verification in https_connect(); reuse inherits
+// a verified peer identity because it IS the same connection. A hit requires an
+// exact (host, port, alpn-mode) match, so a connection to one host can never
+// serve a request for another. Nothing here weakens or bypasses verification.
+// ===========================================================================
+#define HTTPS_POOL_SLOTS   4
+#define HTTPS_POOL_IDLE_MS 20000
+
+typedef struct {
+    uint64_t conn;            /* opaque https_conn_t*; 0 = free */
+    uint64_t last_used_ms;
+    uint16_t port;
+    uint16_t flags;
+    uint16_t hostlen;
+    uint16_t pad;
+    uint8_t  host[128];
+} https_pool_slot_t;
+_Static_assert(sizeof(https_pool_slot_t) == 152,
+               "https_pool_slot_t must match rustkern/tlspool.rs TlsPoolSlot");
+
+extern int tlspool_acquire_rs(https_pool_slot_t *, uint32_t, const uint8_t *, uint32_t,
+                              uint16_t, uint16_t, uint64_t, uint64_t, uint64_t *);
+extern int tlspool_reap_rs(https_pool_slot_t *, uint32_t, uint64_t, uint64_t, uint64_t *);
+extern int tlspool_store_rs(https_pool_slot_t *, uint32_t, const uint8_t *, uint32_t,
+                            uint16_t, uint16_t, uint64_t, uint64_t, uint64_t *);
+extern int tlspool_drop_rs(https_pool_slot_t *, uint32_t, uint64_t);
+extern int tlspool_count_rs(https_pool_slot_t *, uint32_t);
+extern int http_reuse_ok_rs(const uint8_t *, uint32_t);
+
+static https_pool_slot_t g_https_pool[HTTPS_POOL_SLOTS];
+int g_https_reuse = 1;               /* master switch; set 0 to roll back to per-request handshakes */
+uint32_t g_https_pool_hit = 0, g_https_pool_miss = 0;
+
+static uint32_t https_strlen32(const char *s) { uint32_t n = 0; if (s) while (s[n]) n++; return n; }
+
+/* C reference twin of the Rust response-header reuse policy (strangler
+   pattern: kept as the rollback arm and as the [RUST-DIFF] reference). */
+static int http_reuse_ok_c(const uint8_t *hdr, uint32_t len) {
+    if (!hdr || len == 0 || len > (1u << 20)) return 0;
+    uint32_t eol = 0;
+    while (eol < len && hdr[eol] != '\n') eol++;
+    uint32_t ll = eol;
+    if (ll > 0 && hdr[ll - 1] == '\r') ll--;
+    int http11;
+    if (ll >= 8 && https_ci8(hdr, "HTTP/1.1")) http11 = 1;
+    else if (ll >= 8 && https_ci8(hdr, "HTTP/1.0")) http11 = 0;
+    else return 0;
+    int persistent = http11;
+    uint32_t pos = (eol < len) ? eol + 1 : len;
+    while (pos < len) {
+        uint32_t e = pos;
+        while (e < len && hdr[e] != '\n') e++;
+        uint32_t lend = e;
+        if (lend > pos && hdr[lend - 1] == '\r') lend--;
+        uint32_t next = (e < len) ? e + 1 : len;
+        if (lend == pos) break;                       /* blank line: end of block */
+        uint32_t c = pos;
+        while (c < lend && hdr[c] != ':') c++;
+        if (c >= lend) { pos = next; continue; }
+        uint32_t nlen = c - pos;
+        int is_conn = (https_ci_eq(hdr + pos, nlen, "connection") ||
+                       https_ci_eq(hdr + pos, nlen, "proxy-connection"));
+        if (is_conn) {
+            uint32_t v = c + 1;
+            while (v < lend && (hdr[v] == ' ' || hdr[v] == '\t')) v++;
+            if (https_has_token(hdr + v, lend - v, "close")) persistent = 0;
+            else if (https_has_token(hdr + v, lend - v, "keep-alive")) persistent = 1;
+        }
+        pos = next;
+    }
+    return persistent ? 1 : 0;
+}
+
+static int https_reuse_ok(const uint8_t *hdr, uint32_t len) {
+#ifdef RUST_TLS_POOL
+    return http_reuse_ok_rs(hdr, len);
+#else
+    return http_reuse_ok_c(hdr, len);
+#endif
+}
+
+static void https_pool_reap(void) {
+    uint64_t dead = 0;
+    int guard = HTTPS_POOL_SLOTS + 1;
+    while (guard-- > 0 &&
+           tlspool_reap_rs(g_https_pool, HTTPS_POOL_SLOTS, sched_now_ms(),
+                           HTTPS_POOL_IDLE_MS, &dead) == 1 && dead) {
+        https_close((https_conn_t *)(unsigned long)dead);
+        dead = 0;
+    }
+}
+
+/* Hand back a live pooled connection, or open a fresh one. */
+static https_conn_t *https_conn_acquire(const char *host, uint16_t port,
+                                        int force_h1, int no_pool, int *reused) {
+    uint16_t flags = (uint16_t)(force_h1 ? 1 : 0);
+    if (reused) *reused = 0;
+
+    if (g_https_reuse && !no_pool) {
+        https_pool_reap();
+        uint64_t c = 0;
+        if (tlspool_acquire_rs(g_https_pool, HTTPS_POOL_SLOTS,
+                               (const uint8_t *)host, https_strlen32(host),
+                               port, flags, sched_now_ms(),
+                               HTTPS_POOL_IDLE_MS, &c) == 1 && c) {
+            https_conn_t *conn = (https_conn_t *)(unsigned long)c;
+            /* Do not discover a peer-side FIN by writing a request into it. */
+            if (https_is_connected(conn) &&
+                tcp_get_state(conn->tcp_socket) == TCP_STATE_ESTABLISHED) {
+                g_https_pool_hit++;
+                if (reused) *reused = 1;
+                g_pf_dns = 0; g_pf_arp = 0; g_pf_tcp = 0; g_pf_tls = 0;
+                return conn;
+            }
+            https_close(conn);
+        }
+    }
+
+    g_https_pool_miss++;
+    https_conn_t *conn;
+    if (force_h1) {
+        extern int g_tls_force_h1_alpn;
+        int saved = g_tls_force_h1_alpn;
+        g_tls_force_h1_alpn = 1;
+        conn = https_connect(host, port);
+        g_tls_force_h1_alpn = saved;
+    } else {
+        conn = https_connect(host, port);
+    }
+    if (conn) conn->pool_flags = flags;
+    return conn;
+}
+
+/* Give a connection back to the pool (reusable != 0) or close it. The two
+   outcomes are disjoint on both sides of the FFI, so nothing double-closes. */
+static void https_conn_release(https_conn_t *conn, int reusable) {
+    if (!conn) return;
+    if (!g_https_reuse || !reusable ||
+        !https_is_connected(conn) ||
+        tcp_get_state(conn->tcp_socket) != TCP_STATE_ESTABLISHED) {
+        tlspool_drop_rs(g_https_pool, HTTPS_POOL_SLOTS, (uint64_t)(unsigned long)conn);
+        https_close(conn);
+        return;
+    }
+    uint64_t evicted = 0;
+    int rc = tlspool_store_rs(g_https_pool, HTTPS_POOL_SLOTS,
+                              (const uint8_t *)conn->hostname,
+                              https_strlen32(conn->hostname),
+                              conn->port, conn->pool_flags,
+                              (uint64_t)(unsigned long)conn, sched_now_ms(), &evicted);
+    if (evicted) https_close((https_conn_t *)(unsigned long)evicted);
+    if (rc != 1) https_close(conn);   /* pool refused it: we still own it */
+}
+
+/* Drop every pooled connection (e.g. the link went down). */
+void https_pool_flush(void) {
+    for (int i = 0; i < HTTPS_POOL_SLOTS; i++) {
+        uint64_t c = g_https_pool[i].conn;
+        if (c) {
+            tlspool_drop_rs(g_https_pool, HTTPS_POOL_SLOTS, c);
+            https_close((https_conn_t *)(unsigned long)c);
+        }
+    }
+}
+
 
 // Get error string
 const char *https_strerror(int error) {
@@ -607,7 +843,7 @@ static int https_ip_is_private(uint32_t ip) {
     if (a == 127) return 1;                         // 127.0.0.0/8 (loopback)
     if (a == 169 && b == 254) return 1;              // 169.254.0.0/16 (link-local/metadata)
     if (a == 172 && b >= 16 && b <= 31) return 1;    // 172.16.0.0/12
-    if (a == 192 && b == 168) return 1;              // 192.168.0.0/16
+    if (a == 192 && b == 168) return 1;              // 192.0.2.1/16
     return 0;
 }
 
@@ -674,10 +910,17 @@ static void https_resolve_url(const char *base, const char *loc, char *out, int 
     out[n]=0;
 }
 
-int https_get(const char *url, uint8_t **body_out, uint32_t *body_len_out, int *status_out) {
+// #576: GET-over-TLS core shared by the plain browser GET (https_get) and the
+// header/Range GET (https_get_hdr). extra_headers, when non-NULL/non-empty, is
+// a block of CRLF-terminated request-header lines (e.g. "Range: bytes=0-255\r\n"),
+// same contract as https_post()'s `headers`. It reuses the existing TLS
+// transport + HTTP response parser; it does NOT add a second TLS or HTTP parser.
+static int https_get_ex(const char *url, const char *extra_headers,
+                        uint8_t **body_out, uint32_t *body_len_out, int *status_out) {
     char host[256];
     char path[1024];
     uint16_t port;
+    int have_hdr = (extra_headers && extra_headers[0]);
 
     if (body_out) *body_out = NULL;
     if (body_len_out) *body_len_out = 0;
@@ -686,6 +929,8 @@ int https_get(const char *url, uint8_t **body_out, uint32_t *body_len_out, int *
     char cur_url[1100];
     { int i = 0; for (; url[i] && i < (int)sizeof(cur_url)-1; i++) cur_url[i]=url[i]; cur_url[i]=0; }
     int redir_hops = 0;
+    int force_fresh = 0;    /* #616: bypass the pool on the one retry */
+    int reuse_retry = 0;    /* #616: only ever retry a stale pooled connection once */
 
     // #fix-ssrf-contentlength: capture whether the ORIGINAL request already
     // targets a private/loopback/link-local host (e.g. a LAN device or the
@@ -708,17 +953,29 @@ redo_fetch: ;
         return HTTPS_ERR_CONNECT;
     }
 
-    // Connect
-    https_conn_t *conn = https_connect(host, port);
+    // Connect. #576: a custom-header/Range GET must use HTTP/1.1 (the h2 client
+    // has no Range/custom-header support), so force the ALPN to http/1.1 for it,
+    // the same way https_post() does for POST.
+    uint64_t _t0 = sched_now_ms();
+    uint64_t _t_conn = 0, _t_req = 0, _t_first = 0, _t_last = 0;
+    https_conn_t *conn;
+    int was_reused = 0;
+    /* #616: a pooled, already-verified connection to this exact host:port when
+       one is live, otherwise a fresh TCP + full verified TLS handshake. */
+    conn = https_conn_acquire(host, port, have_hdr, force_fresh, &was_reused);
+    force_fresh = 0;
     if (!conn) {
         return HTTPS_ERR_CONNECT;
     }
+    _t_conn = sched_now_ms();
+    net_progress_phase(HTTP_PHASE_SENDING);   // #25: covers both a fresh connect and a pooled reuse
 
     // HTTP/2 dispatch: if ALPN negotiated "h2", use the HTTP/2 client. Modern
     // sites (Wikipedia, Cloudflare) prefer h2 and stall an HTTP/1.1 request.
-    if (tls_alpn_is_h2(conn->tls)) {
+    if (!have_hdr && tls_alpn_is_h2(conn->tls)) {
         kprintf("[HTTPS] ALPN=h2 -> HTTP/2 path\n");
         char loc[1100]; loc[0]=0; int h2st = 0;
+        net_progress_phase(HTTP_PHASE_RECEIVING);   // #25: h2_get is a black box, no byte-granular progress
         int h2rc = http2_get(conn->tls, host, path, body_out, body_len_out, &h2st, loc, sizeof(loc));
         https_close(conn);
         // #333: a transient net-stack stall (RX contention when many fetches run
@@ -757,28 +1014,39 @@ redo_fetch: ;
         return (h2rc == 0) ? HTTPS_SUCCESS : HTTPS_ERR_TLS;
     }
 
-    // Build request
-    char request[2048];
+    // Build request. #576: inject the caller's extra headers (e.g. a Range:
+    // line) when present, and size the buffer to fit them (a Range line or a
+    // JWT auth header can exceed the old fixed 2048).
+    uint32_t req_cap = 2048 + (have_hdr ? (uint32_t)strlen(extra_headers) : 0);
+    char *request = (char *)kmalloc(req_cap);
+    if (!request) { https_conn_release(conn, 0); return HTTPS_ERR_NO_MEMORY; }
     /* #190: send a modern-Chrome request line + headers. Fingerprinting CDNs
        (Cloudflare WAF, Akamai) score the User-Agent and header set alongside
        the TLS JA3/JA4; a non-browser UA can trigger an immediate post-handshake
        drop or managed challenge even when the TLS fingerprint passes. */
-    int req_len = https_snprintf(request, sizeof(request),
+    int req_len = https_snprintf(request, (int)req_cap,
         "GET %s HTTP/1.1\r\n"
         "Host: %s\r\n"
         "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36\r\n"
         "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8\r\n"
         "Accept-Language: en-US,en;q=0.9\r\n"
         "Accept-Encoding: identity\r\n"
-        "Connection: close\r\n"
+        "%s"
+        "%s"
         "\r\n",
-        path, host);
+        path, host, have_hdr ? extra_headers : "",
+        g_https_reuse ? "Connection: keep-alive\r\n" : "Connection: close\r\n");
 
     // Send request
     int ret = https_send(conn, request, req_len);
+    _t_req = sched_now_ms();
+    kfree(request);
     if (ret < 0) {
         kprintf("[HTTPS] Failed to send request: %d\n", ret);
-        https_close(conn);
+        https_conn_release(conn, 0);
+        /* #616: a pooled connection the peer had already torn down fails HERE.
+           Retry ONCE on a genuinely fresh handshake before reporting failure. */
+        if (was_reused && !reuse_retry) { reuse_retry = 1; force_fresh = 1; goto redo_fetch; }
         return ret;
     }
 
@@ -786,7 +1054,7 @@ redo_fetch: ;
     uint32_t buffer_size = 1048576;   // 1MB: real web pages exceed 64KB (#245)
     uint8_t *buffer = kmalloc(buffer_size);
     if (!buffer) {
-        https_close(conn);
+        https_conn_release(conn, 0);
         return HTTPS_ERR_NO_MEMORY;
     }
 
@@ -796,11 +1064,17 @@ redo_fetch: ;
 
     int would_block_count = 0;
     int is_chunked = 0;
+    int has_cl = 0;                 /* #616: a Content-Length header was present */
+    int no_body = 0;                /* #616: 1xx/204/304 carry no body at all */
     int chunked_done = 0;           /* set once real chunk framing confirms the terminator arrived */
     uint32_t content_length = 0;   /* 0 = unknown */
-    uint64_t recv_deadline = timer_ticks + (uint64_t)(g_timer_hz ? g_timer_hz : 250) * 30;
+    /* #499: 30s of REAL time. timer_ticks is not a wall clock, so under a KVM
+       tick burst this whole-fetch deadline used to expire before the first
+       header byte was even parsed. */
+    uint64_t recv_deadline_ms = sched_now_ms() + 30000;
     while (buffer_len < buffer_size) {
-        if ((int64_t)(timer_ticks - recv_deadline) >= 0) break;  /* overall fetch deadline */
+        g_dp_hb_iter++;
+        if ((int64_t)(sched_now_ms() - recv_deadline_ms) >= 0) break;  /* overall fetch deadline */
         ret = https_recv(conn, buffer + buffer_len, buffer_size - buffer_len);
         if (ret < 0) {
             if (ret == TLS_ERR_CLOSED || ret == HTTPS_ERR_CLOSED) break;
@@ -823,15 +1097,26 @@ redo_fetch: ;
                 // the OS stays responsive instead of spinning during the fetch.
                 net_poll();
                 tcp_timer();
+                g_dp_hb_sleep++;
                 proc_sleep(2);
                 continue;
             }
             kfree(buffer);
-            https_close(conn);
+            https_conn_release(conn, 0);
+            /* #616: same stale-pooled-connection retry as the send path. */
+            if (was_reused && !reuse_retry && buffer_len == 0) {
+                reuse_retry = 1; force_fresh = 1; goto redo_fetch;
+            }
             return ret;
         }
         if (ret == 0) break;
         would_block_count = 0;
+        // #25: gate BOTH actions on one check of the PRE-assignment state -
+        // testing _t_first again after the assignment below is always false
+        // (a live boot-log capture caught this: the RECEIVING transition
+        // never fired because this used to be two separate `if (!_t_first)`
+        // checks, and the first one already makes _t_first non-zero).
+        if (!_t_first) { _t_first = sched_now_ms(); net_progress_phase(HTTP_PHASE_RECEIVING); }
 
         buffer_len += ret;
 
@@ -845,6 +1130,30 @@ redo_fetch: ;
                 is_chunked = https_hdr_has((const char *)buffer,
                                            "transfer-encoding: chunked");
                 content_length = https_content_length((const char *)buffer);
+                net_progress_content_len(content_length);   // #25
+                /* #616: with Connection: keep-alive the peer no longer closes to
+                   signal the end, so a bodyless (1xx/204/304) or Content-Length: 0
+                   response must be recognised explicitly or the loop would sit on
+                   the 30s deadline. */
+                has_cl = https_hdr_has((const char *)buffer, "content-length:");
+                no_body = (status_code == 204 || status_code == 304 ||
+                           (status_code >= 100 && status_code < 200));
+                // #608: same 206 Content-Range gate as the plain-HTTP client
+                // (net/wget.c). Rust, fail-open, rejects only a provable
+                // wrong-start / overshoot mismatch.
+                if (status_code == 206 && have_hdr) {
+                    extern int http_range_check_rs(const uint8_t *, uint32_t,
+                                                   const uint8_t *, uint32_t);
+                    uint32_t _hl = 0; while (extra_headers[_hl]) _hl++;
+                    if (!http_range_check_rs((const uint8_t *)extra_headers, _hl,
+                                             buffer, (uint32_t)headers_end)) {
+                        kprintf("[HTTPS] 206 Content-Range does not satisfy the "
+                                "requested Range; refusing\n");
+                        kfree(buffer);
+                        https_conn_release(conn, 0);
+                        return HTTPS_ERR_TRUNCATED;
+                    }
+                }
             }
         }
 
@@ -854,6 +1163,7 @@ redo_fetch: ;
         // stalled until the per-recv timeout/buffer cap and hung the browser.
         if (headers_end > 0) {
             uint32_t body_len = buffer_len - (uint32_t)headers_end;
+            net_progress_bytes(body_len);   // #25
             if (is_chunked) {
                 // #fix-ssrf-contentlength: real chunk-framing walk instead of
                 // scanning the tail for the raw bytes "0\r\n\r\n" -- that
@@ -869,18 +1179,46 @@ redo_fetch: ;
                 if (cc < 0) {
                     kprintf("[HTTPS] Malformed chunked framing; aborting\n");
                     kfree(buffer);
-                    https_close(conn);
+                    https_conn_release(conn, 0);
                     return HTTPS_ERR_TRUNCATED;
                 }
                 // cc == 0: terminating chunk not seen yet, keep receiving.
-            } else if (content_length > 0 && body_len >= content_length) {
+            } else if (no_body || (has_cl && body_len >= content_length)) {
                 goto recv_done;
             }
         }
     }
 recv_done:
+    _t_last = sched_now_ms();
 
-    https_close(conn);
+    /* #616: a pooled connection that produced NOTHING is a stale socket the
+       peer closed while it sat idle. Retry once on a fresh handshake. */
+    if (was_reused && !reuse_retry && buffer_len == 0) {
+        kfree(buffer);
+        https_conn_release(conn, 0);
+        reuse_retry = 1; force_fresh = 1;
+        goto redo_fetch;
+    }
+    /* Keep the connection ONLY when this response was framed unambiguously
+       (so no unread bytes can bleed into the next request) and the peer did
+       not ask to close. Anything else: close, exactly as before. */
+    {
+        uint32_t _blen = (headers_end > 0) ? (buffer_len - (uint32_t)headers_end) : 0;
+        int _framed = (headers_end > 0) && !is_chunked &&
+                      (no_body ? (_blen == 0) : (has_cl && _blen == content_length));
+        https_conn_release(conn, _framed && https_reuse_ok(buffer, (uint32_t)headers_end) == 1);
+    }
+
+    if (g_https_prof) {
+        kprintf("[HTTPPROF] GET tot=%u conn=%u(dns=%u arp=%u tcp=%u tls=%u) req=%u ttfb=%u body=%u len=%u st=%d reuse=%d pool=%u/%u\n",
+                (uint32_t)(_t_last - _t0), (uint32_t)(_t_conn - _t0),
+                (uint32_t)g_pf_dns, (uint32_t)g_pf_arp, (uint32_t)g_pf_tcp, (uint32_t)g_pf_tls,
+                (uint32_t)(_t_req - _t_conn),
+                (uint32_t)(_t_first ? (_t_first - _t_req) : 0),
+                (uint32_t)(_t_first ? (_t_last - _t_first) : 0),
+                buffer_len, status_code, was_reused,
+                g_https_pool_hit, g_https_pool_miss);
+    }
 
     if (status_out) *status_out = status_code;
 
@@ -944,6 +1282,21 @@ recv_done:
     return HTTPS_SUCCESS;
 }
 
+// #576: public wrappers around the shared GET-over-TLS core.
+int https_get(const char *url, uint8_t **body_out, uint32_t *body_len_out, int *status_out) {
+    return https_get_ex(url, (const char *)0, body_out, body_len_out, status_out);
+}
+
+// #576: GET with caller-supplied extra request headers (e.g. a Range: line for
+// the App Store's chunked partial-content package download) over the SAME TLS
+// transport + HTTP response parser as the plain browser GET. Handles 206
+// Partial Content and a server that ignores Range (200 full body) through the
+// shared recv/parse loop (Content-Length drives completion for both).
+int https_get_hdr(const char *url, const char *extra_headers,
+                  uint8_t **body_out, uint32_t *body_len_out, int *status_out) {
+    return https_get_ex(url, extra_headers, body_out, body_len_out, status_out);
+}
+
 // Case-insensitive substring search for a header presence (header region only).
 static int https_hdr_has(const char *hdr, const char *needle) {
     for (const char *p = hdr; *p; p++) {
@@ -981,10 +1334,13 @@ int https_post(const char *url, const char *headers, const char *body,
     }
 
     extern int g_tls_force_h1_alpn;
+    uint64_t _pt0 = sched_now_ms(), _pt_conn = 0, _pt_req = 0, _pt_first = 0;
+    int saved_h1_alpn = g_tls_force_h1_alpn;
     g_tls_force_h1_alpn = 1;   // #185: POST over HTTP/1.1 (h2 client has no POST yet)
     https_conn_t *conn = https_connect(host, port);
-    g_tls_force_h1_alpn = 0;
-    if (!conn) return HTTPS_ERR_CONNECT;
+    g_tls_force_h1_alpn = saved_h1_alpn;   // #333: restore prior default (now 1 = http/1.1-only), do not force-enable h2
+    if (!conn) { kprintf("[HTTPPROF] POST connect FAILED host=%s\n", host); return HTTPS_ERR_CONNECT; }
+    _pt_conn = sched_now_ms();
 
     uint32_t body_len = body ? (uint32_t)strlen(body) : 0;
 
@@ -1015,8 +1371,9 @@ int https_post(const char *url, const char *headers, const char *body,
     if (g_tls_dbg) kprintf("[POSTDBG] sending request req_len=%d host=%s path=%s\n", req_len, host, path);
     int ret = https_send(conn, request, req_len);
     if (g_tls_dbg) kprintf("[POSTDBG] https_send ret=%d (req_len=%d)\n", ret, req_len);
+    _pt_req = sched_now_ms();
     kfree(request);
-    if (ret < 0) { https_close(conn); return ret; }
+    if (ret < 0) { kprintf("[HTTPPROF] POST send FAILED ret=%d\n", ret); https_close(conn); return ret; }
 
     uint32_t buffer_size = 131072;   // 128KB for chat responses
     uint8_t *buffer = kmalloc(buffer_size);
@@ -1059,6 +1416,7 @@ int https_post(const char *url, const char *headers, const char *body,
             continue;
         }
         would_block_count = 0;
+        if (!_pt_first) _pt_first = sched_now_ms();
         buffer_len += ret;
 
         if (headers_end < 0) {
@@ -1076,6 +1434,13 @@ int https_post(const char *url, const char *headers, const char *body,
     }
 
     https_close(conn);
+    if (g_https_prof) {
+        kprintf("[HTTPPROF] POST tot=%u conn=%u(dns=%u tcp=%u tls=%u) ttfb=%u len=%u st=%d hdrend=%d\n",
+                (uint32_t)(sched_now_ms() - _pt0), (uint32_t)(_pt_conn - _pt0),
+                (uint32_t)g_pf_dns, (uint32_t)g_pf_tcp, (uint32_t)g_pf_tls,
+                (uint32_t)(_pt_first ? (_pt_first - _pt_req) : 0),
+                buffer_len, status_code, headers_end);
+    }
     if (status_out) *status_out = status_code;
 
     // #fix-ssrf-contentlength: a short/truncated body (peer stall, the ~20s
@@ -1197,6 +1562,95 @@ static int nettest_cfg_int(const char *cfg, const char *key, int dflt) {
 
 #define NETTEST_CFG_SETTLE_MS 8000
 
+// #576: cfg-gated Range/partial-content probe for the new https_get_hdr() TLS
+// path. `range=<https-url>` issues two Range GETs over TLS and, for a small
+// resource, verifies the ranged bytes equal the same slice of a full GET. This
+// is the regression proof that the header/Range fetch primitive now speaks TLS
+// (returns 206 Partial Content), not just plaintext http. Never runs in
+// production: gated on /CONFIG/NETTEST.CFG like the rest of the self-test.
+static void nettest_range(const char *url) {
+    extern int https_get_hdr(const char *, const char *, uint8_t **, uint32_t *, int *);
+    kprintf("[NETTEST] --- range: %s (Range over https) ---\n", url);
+    uint8_t *b1 = NULL; uint32_t l1 = 0; int s1 = 0;
+    int r1 = https_get_hdr(url, "Range: bytes=0-63\r\n", &b1, &l1, &s1);
+    kprintf("[NETTEST] range[0-63]:   rc=%d status=%d len=%u first=", r1, s1, l1);
+    for (uint32_t i = 0; i < l1 && i < 32; i++) { char c=(char)b1[i]; kprintf("%c",(c>=32&&c<127)?c:'.'); }
+    kprintf("\n");
+    uint8_t *b2 = NULL; uint32_t l2 = 0; int s2 = 0;
+    int r2 = https_get_hdr(url, "Range: bytes=100-163\r\n", &b2, &l2, &s2);
+    kprintf("[NETTEST] range[100-163]: rc=%d status=%d len=%u\n", r2, s2, l2);
+    uint8_t *bf = NULL; uint32_t lf = 0; int sf = 0;
+    int rf = https_get(url, &bf, &lf, &sf);
+    kprintf("[NETTEST] full GET:       rc=%d status=%d len=%u\n", rf, sf, lf);
+    int pass206 = (r1==0 && s1==206 && l1>0 && r2==0 && s2==206 && l2>0);
+    int match = 0;
+    if (rf==0 && bf && lf >= 164 && b2 && l2 >= 64) {
+        match = 1;
+        for (int i = 0; i < 64; i++) if (bf[100+i] != b2[i]) { match = 0; break; }
+    }
+    kprintf("[NETTEST] range: %s (206=%d bytematch=%d)\n",
+            (pass206 && match) ? "PASS" : "PARTIAL/FAIL", pass206, match);
+    if (b1) kfree(b1);
+    if (b2) kfree(b2);
+    if (bf) kfree(bf);
+}
+
+// #615: throughput bench. `dlbench=<url>` + `dlchunks=<n>` issue N sequential
+// 256KB Range GETs against `url` and report per-chunk and aggregate wall clock,
+// so the per-request overhead is MEASURED, not inferred. Each chunk already
+// prints its own [HTTPPROF] phase line.
+static void nettest_dlbench(const char *url, int nchunks) {
+    extern int https_get_hdr(const char *, const char *, uint8_t **, uint32_t *, int *);
+    extern int wget_fetch_hdr(const char *, const char *, uint8_t **, uint32_t *, int *);
+    int is_https = (url[0]=='h'&&url[1]=='t'&&url[2]=='t'&&url[3]=='p'&&url[4]=='s');
+    kprintf("[NETTEST] --- dlbench: %d x 256KB Range GET %s ---\n", nchunks, url);
+    uint64_t t0 = sched_now_ms();
+    uint64_t total = 0;
+    int okc = 0;
+    for (int i = 0; i < nchunks; i++) {
+        char hdr[64];
+        uint32_t lo = (uint32_t)i * 262144u, hi = lo + 262143u;
+        int n = 0;
+        const char *pre = "Range: bytes=";
+        for (int k = 0; pre[k]; k++) hdr[n++] = pre[k];
+        char tmp[16]; int tn;
+        uint32_t v = lo; tn = 0; if (!v) tmp[tn++]='0'; while (v) { tmp[tn++] = (char)('0'+(v%10)); v/=10; }
+        while (tn) hdr[n++] = tmp[--tn];
+        hdr[n++] = '-';
+        v = hi; tn = 0; if (!v) tmp[tn++]='0'; while (v) { tmp[tn++] = (char)('0'+(v%10)); v/=10; }
+        while (tn) hdr[n++] = tmp[--tn];
+        hdr[n++]='\r'; hdr[n++]='\n'; hdr[n]=0;
+        uint8_t *b = NULL; uint32_t bl = 0; int st = 0;
+        uint64_t c0 = sched_now_ms();
+        int rc = is_https ? https_get_hdr(url, hdr, &b, &bl, &st)
+                          : wget_fetch_hdr(url, hdr, &b, &bl, &st);
+        uint64_t cms = sched_now_ms() - c0;
+        kprintf("[DLBENCH] chunk %d rc=%d st=%d len=%u ms=%u\n", i, rc, st, bl, (uint32_t)cms);
+        if (rc == 0 && bl) { total += bl; okc++; }
+        if (b) kfree(b);
+    }
+    uint64_t tms = sched_now_ms() - t0;
+    kprintf("[DLBENCH] TOTAL chunks=%d/%d bytes=%u ms=%u => %u KB/s (per-chunk %u ms)\n",
+            okc, nchunks, (uint32_t)total, (uint32_t)tms,
+            (uint32_t)(tms ? (total / (tms ? tms : 1)) : 0),
+            (uint32_t)(okc ? (tms / (uint32_t)okc) : 0));
+}
+
+// #615: guest-side https POST probe. `post=<url>` POSTs "{}" with a JSON
+// content-type, exactly like the App Store's bump_download(), and reports
+// rc/status/body so a silent POST failure is visible without a full install.
+static void nettest_post(const char *url) {
+    extern int https_post(const char *, const char *, const char *,
+                          uint8_t **, uint32_t *, int *);
+    kprintf("[NETTEST] --- post: %s ---\n", url);
+    uint8_t *b = NULL; uint32_t bl = 0; int st = 0;
+    int rc = https_post(url, "Content-Type: application/json\r\n", "{}", &b, &bl, &st);
+    kprintf("[NETTEST] post: rc=%d status=%d len=%u body=", rc, st, bl);
+    for (uint32_t i = 0; i < bl && i < 160; i++) { char c=(char)b[i]; kprintf("%c",(c>=32&&c<127)?c:'.'); }
+    kprintf("\n");
+    if (b) kfree(b);
+}
+
 static void nettest_worker(void *arg) {
     (void)arg;
     // Settle before READING the gate file: this worker is started from the tail
@@ -1232,6 +1686,20 @@ static void nettest_worker(void *arg) {
     int only = nettest_cfg_int(cfg, "only", 0);
     int tries = nettest_cfg_int(cfg, "tries", 3);
     if (nettest_cfg_int(cfg, "tlsdbg", 0)) g_tls_dbg = 1;
+    {
+        char rng[512];
+        if (nettest_cfg_get(cfg, "range", rng, sizeof(rng)) && rng[0])
+            nettest_range(rng);   // #576
+    }
+    {   // #615 throughput bench + POST probe
+        char u[512];
+        if (nettest_cfg_get(cfg, "dlbench", u, sizeof(u)) && u[0])
+            nettest_dlbench(u, nettest_cfg_int(cfg, "dlchunks", 6));
+        if (nettest_cfg_get(cfg, "dlbench2", u, sizeof(u)) && u[0])
+            nettest_dlbench(u, nettest_cfg_int(cfg, "dlchunks", 6));
+        if (nettest_cfg_get(cfg, "post", u, sizeof(u)) && u[0])
+            nettest_post(u);
+    }
     if (only) {
         g_http2_dbg = 1;
         static const char *keys[] = { "u1", "u2", "u3", "u4", "u5", "u6" };
@@ -1341,7 +1809,6 @@ static unsigned long pu_ref(const uint8_t *s, unsigned long len) {
 }
 
 void http_parse_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     uint32_t vectors = 0, mism = 0; int first_bad = -1;
 
     // ---- [RUST-DIFF]: well-formed corpus (chunked bodies, CL values, headers) ----
@@ -1471,4 +1938,120 @@ void http_parse_rust_selftest(void) {
                 (unsigned long long)c_cyc,(unsigned long long)r_cyc,
                 (unsigned long long)(ratio100/100),(unsigned long long)(ratio100%100));
     }
+}
+
+
+// ===========================================================================
+// #616 boot self-test for the TLS connection pool (rustkern/tlspool.rs).
+//
+// TWO parts, deliberately different in kind:
+//   [RUST-DIFF] tlspool  - the response-header reuse POLICY has a C reference
+//                          twin (http_reuse_ok_c), so it gets a real
+//                          differential over well-formed AND hostile blocks
+//                          plus in-kernel byte mutations.
+//   [RUST-POOL] tlspool  - the pool state machine is NEW logic with no C twin,
+//                          so a differential would prove nothing (both arms
+//                          would share any design bug). It is checked against
+//                          its INVARIANTS instead: exclusive checkout,
+//                          exact-match lookup, LRU eviction, idle expiry,
+//                          oversize refusal, no-double-store.
+// ===========================================================================
+void tlspool_rust_selftest(void) {
+    static const char *hdrs[] = {
+        "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nconnection: CLOSE\r\n\r\n",
+        "HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\n",
+        "HTTP/1.0 200 OK\r\nConnection: keep-alive\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nConnection: keep-alive, close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nConnection: Keep-Alive\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nProxy-Connection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nX-Closer: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nConnection\r\n\r\n",
+        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-262143/108000000\r\nContent-Length: 262144\r\n\r\n",
+        "HTTP/2 200\r\n\r\n",
+        "HTTP/1.1 200 OK\n\n",
+        "HTTP/1.1\r\n",
+        "garbage with no version at all\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nConnection:\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nConnection: ,,, close ,,,\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nConnection: closer\r\n\r\n",
+        "",
+    };
+    uint32_t vec = 0, mism = 0; int firstbad = -1;
+    uint8_t mb[320];
+    for (unsigned t = 0; t < sizeof(hdrs)/sizeof(hdrs[0]); t++) {
+        uint32_t L = 0; while (hdrs[t][L] && L < sizeof(mb)) { mb[L] = (uint8_t)hdrs[t][L]; L++; }
+        vec++;
+        if (http_reuse_ok_rs(mb, L) != http_reuse_ok_c(mb, L)) { mism++; if (firstbad<0) firstbad=(int)vec-1; }
+        for (uint32_t p = 0; p <= L; p++) {
+            vec++;
+            if (http_reuse_ok_rs(mb, p) != http_reuse_ok_c(mb, p)) { mism++; if (firstbad<0) firstbad=(int)vec-1; }
+        }
+        for (uint32_t k = 0; k < L; k++) {
+            uint8_t save = mb[k];
+            static const uint8_t muts[5] = { 0x00, 0x0d, 0x0a, 0x3a, 0xff };
+            for (int m = 0; m < 5; m++) {
+                mb[k] = muts[m];
+                vec++;
+                if (http_reuse_ok_rs(mb, L) != http_reuse_ok_c(mb, L)) { mism++; if (firstbad<0) firstbad=(int)vec-1; }
+            }
+            mb[k] = save;
+        }
+    }
+    kprintf("[RUST-DIFF] tlspool reuse-policy %u vectors %u mism %s (firstbad=%d)\n",
+            vec, mism, mism ? "FAIL" : "PASS", firstbad);
+
+    https_pool_slot_t sp[3];
+    for (int i = 0; i < 3; i++) {
+        sp[i].conn = 0; sp[i].last_used_ms = 0; sp[i].port = 0;
+        sp[i].flags = 0; sp[i].hostlen = 0; sp[i].pad = 0;
+        for (int j = 0; j < 128; j++) sp[i].host[j] = 0;
+    }
+    int inv = 0, invfail = 0;
+#define POOLCHK(cond) do { inv++; if (!(cond)) { invfail++; \
+    kprintf("[RUST-POOL] INVARIANT FAILED at line %d\n", __LINE__); } } while (0)
+
+    uint64_t ev = 0, got = 0;
+    const char *ha = "a.example.com", *hb = "b.example.com", *hc = "c.example.com";
+    POOLCHK(tlspool_store_rs(sp, 3, (const uint8_t*)ha, 13, 443, 0, 0x1111, 1000, &ev) == 1 && ev == 0);
+    POOLCHK(tlspool_store_rs(sp, 3, (const uint8_t*)hb, 13, 443, 0, 0x2222, 1100, &ev) == 1 && ev == 0);
+    POOLCHK(tlspool_store_rs(sp, 3, (const uint8_t*)hc, 13, 443, 0, 0x3333, 1200, &ev) == 1 && ev == 0);
+    POOLCHK(tlspool_count_rs(sp, 3) == 3);
+    POOLCHK(tlspool_acquire_rs(sp, 3, (const uint8_t*)hb, 13, 443, 0, 1300, 20000, &got) == 1 && got == 0x2222);
+    POOLCHK(tlspool_count_rs(sp, 3) == 2);
+    POOLCHK(tlspool_acquire_rs(sp, 3, (const uint8_t*)hb, 13, 443, 0, 1300, 20000, &got) == 0 && got == 0);
+    POOLCHK(tlspool_store_rs(sp, 3, (const uint8_t*)hb, 13, 443, 0, 0x2222, 1300, &ev) == 1);
+    POOLCHK(tlspool_acquire_rs(sp, 3, (const uint8_t*)hb, 12, 443, 0, 1300, 20000, &got) == 0);
+    POOLCHK(tlspool_acquire_rs(sp, 3, (const uint8_t*)"b.example.comX", 14, 443, 0, 1300, 20000, &got) == 0);
+    POOLCHK(tlspool_acquire_rs(sp, 3, (const uint8_t*)hb, 13, 8443, 0, 1300, 20000, &got) == 0);
+    POOLCHK(tlspool_acquire_rs(sp, 3, (const uint8_t*)hb, 13, 443, 1, 1300, 20000, &got) == 0);
+    POOLCHK(tlspool_count_rs(sp, 3) == 3);
+    ev = 0;
+    POOLCHK(tlspool_store_rs(sp, 3, (const uint8_t*)"d.example.com", 13, 443, 0, 0x4444, 1400, &ev) == 1
+            && ev == 0x1111);
+    POOLCHK(tlspool_count_rs(sp, 3) == 3);
+    { uint8_t big[200]; for (int i = 0; i < 200; i++) big[i] = 'x';
+      ev = 0;
+      POOLCHK(tlspool_store_rs(sp, 3, big, 200, 443, 0, 0x5555, 1500, &ev) == 0 && ev == 0); }
+    POOLCHK(tlspool_store_rs(sp, 3, (const uint8_t*)hc, 13, 443, 0, 0x3333, 1600, &ev) == 1);
+    { int seen = 0; for (int i = 0; i < 3; i++) if (sp[i].conn == 0x3333) seen++;
+      POOLCHK(seen == 1); }
+    POOLCHK(tlspool_acquire_rs(sp, 3, (const uint8_t*)hc, 13, 443, 0, 1600 + 20001, 20000, &got) == 0);
+    { int reaped = 0; uint64_t d = 0;
+      while (tlspool_reap_rs(sp, 3, 1600 + 20001, 20000, &d) == 1 && d) { reaped++; d = 0; }
+      POOLCHK(reaped >= 1);
+      POOLCHK(tlspool_count_rs(sp, 3) == 0); }
+    POOLCHK(tlspool_store_rs(sp, 3, (const uint8_t*)ha, 13, 443, 0, 0x6666, 2000, &ev) == 1);
+    POOLCHK(tlspool_drop_rs(sp, 3, 0x6666) == 1);
+    POOLCHK(tlspool_drop_rs(sp, 3, 0x6666) == 0);
+    POOLCHK(tlspool_count_rs(sp, 3) == 0);
+    POOLCHK(tlspool_acquire_rs((https_pool_slot_t*)0, 3, (const uint8_t*)ha, 13, 443, 0, 1, 1, &got) == 0);
+    POOLCHK(tlspool_store_rs(sp, 0, (const uint8_t*)ha, 13, 443, 0, 0x7777, 1, &ev) == 0);
+    POOLCHK(tlspool_store_rs(sp, 3, (const uint8_t*)ha, 0, 443, 0, 0x7777, 1, &ev) == 0);
+    POOLCHK(tlspool_store_rs(sp, 3, (const uint8_t*)ha, 13, 443, 0, 0, 1, &ev) == 0);
+#undef POOLCHK
+
+    kprintf("[RUST-POOL] tlspool invariants %d checks %d fail %s\n",
+            inv, invfail, invfail ? "FAIL" : "PASS");
 }

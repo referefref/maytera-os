@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // ipc.h - IPC wrappers for MayteraOS user space
 // All IPC functions are defined as static inlines in syscall.h.
 // This file is kept for backward compatibility.

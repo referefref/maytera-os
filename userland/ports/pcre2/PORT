@@ -1,0 +1,104 @@
+# mports recipe: PCRE2. Recipe number two, per docs/MPORTS.md "Doing the next
+# port", and the reason it is second: it retires a live LGPL-3.0 copyleft
+# exposure (GNU regex) rather than only adding a capability.
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA: there is
+# no pcre2-specific script anywhere in the tree, and mports.sh has no idea what
+# PCRE2 is.
+
+name=pcre2
+version=10.45
+class=A
+homepage=https://www.pcre.org/
+
+# The GitHub release asset. The sha256 below is of THIS file and was MEASURED
+# on the build container with sha256sum, not copied from a web page:
+#   wget -O pcre2-10.45.tar.gz https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.45/pcre2-10.45.tar.gz
+#   sha256sum pcre2-10.45.tar.gz
+#   -> 0e138387df7835d7403b8351e2226c1377da804e0737db0e071b48f07c9d12ee  (2,715,958 bytes)
+source_url=https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.45/pcre2-10.45.tar.gz
+tarball=pcre2-10.45.tar.gz
+sha256=0e138387df7835d7403b8351e2226c1377da804e0737db0e071b48f07c9d12ee
+srcdir=pcre2-10.45
+
+# The upstream text's own SPDX line is "BSD-3-Clause WITH PCRE2-exception", so
+# that is what is recorded, hyphenated to match the house style of the other
+# compound ids in components.tsv (Zlib-with-acknowledgment, FTL-or-GPL-2.0).
+# Recording plain BSD-3-Clause would not be WRONG - the exemption only RELAXES
+# the binary-redistribution condition, so BSD-3-Clause is the stricter reading
+# and we discharge it in full in ATTRIBUTION.md - but dropping the exception
+# from the label loses information for no gain. This string must equal the
+# components.tsv row exactly or the attribution gate fails.
+#
+# LICENCE.md is the file upstream ships the text in; COPYING is a one-line
+# pointer to it and is listed too, so a future upstream that inverts the two is
+# caught by mports rather than in review.
+licence=BSD-3-Clause-WITH-PCRE2-exception
+licence_files=LICENCE.md COPYING
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): does this library want to USE a platform
+# layer, or to BE one? CONFIRMED BY MEASUREMENT, not assumed: the only symbols
+# libpcre2-8.a leaves undefined are malloc, free, memcpy, memmove, memset,
+# memcmp, memchr, strchr, strlen, the twelve <ctype.h> predicates, tolower,
+# toupper and the two stack-protector globals. Every one of them is already
+# defined in userland/libc/libc.a, so this port needed ZERO additions to the
+# shared libc (unlike zlib, which needed limits.h). No filesystem, no process
+# model, no event loop, no main(), no threads: PCRE2 matches bytes in a buffer
+# the caller owns, with an allocator the caller can replace via a general
+# context. It USES.
+adoption=USES. Measured: the archive's only external references are libc string/ctype/malloc symbols, all already present in userland/libc. It owns no process, no event loop and no I/O; the caller supplies the subject buffer and may supply the allocator through pcre2_general_context_create().
+
+needs=libc
+
+# Upstream's own non-autotools procedure, verbatim from NON-AUTOTOOLS-BUILD
+# steps (1), (2) and (3). We do NOT run configure: the tarball already ships
+# the generated files under .generic/.dist names for exactly this case. Doing
+# it here as DATA is what keeps the patch series below down to our own delta;
+# freezing a copy of upstream's 483-line config.h or 1,000-line pcre2.h into
+# patches/ would make every version bump unreviewable.
+prepare=src/config.h.generic:src/config.h src/pcre2.h.generic:src/pcre2.h src/pcre2_chartables.c.dist:src/pcre2_chartables.c
+
+# THE ONE REAL PATCH. It appends a single block to the config.h that `prepare`
+# just copied, setting SUPPORT_PCRE2_8 (required: step (1) says at least one
+# code-unit width must be defined) and the four HAVE_* macros our libc
+# satisfies, and it writes down WHY SUPPORT_JIT and SUPPORT_UNICODE stay
+# undefined. It is load-bearing in both directions: the symbols list below
+# requires pcre2_compile_8, which does not exist at all unless SUPPORT_PCRE2_8
+# is defined, so a patch that stopped applying could not pass silently.
+patches=0001-config-h-maytera-settings.patch
+
+build=objects
+
+# EXACTLY the 8-bit source list from NON-AUTOTOOLS-BUILD step (4), in upstream's
+# own order. Not a set assembled by globbing src/pcre2_*.c: that would sweep in
+# pcre2_dftables.c (a standalone table-generator program with its own main()),
+# pcre2_fuzzsupport.c, pcre2_printint.c, pcre2_jit_test.c, pcre2_posix.c and
+# the three pcre2*test.c programs, none of which belong in the library.
+sources=src/pcre2_auto_possess.c src/pcre2_chartables.c src/pcre2_chkdint.c src/pcre2_compile.c src/pcre2_compile_class.c src/pcre2_config.c src/pcre2_context.c src/pcre2_convert.c src/pcre2_dfa_match.c src/pcre2_error.c src/pcre2_extuni.c src/pcre2_find_bracket.c src/pcre2_jit_compile.c src/pcre2_maketables.c src/pcre2_match.c src/pcre2_match_data.c src/pcre2_newline.c src/pcre2_ord2utf.c src/pcre2_pattern_info.c src/pcre2_script_run.c src/pcre2_serialize.c src/pcre2_string_utils.c src/pcre2_study.c src/pcre2_substitute.c src/pcre2_substring.c src/pcre2_tables.c src/pcre2_ucd.c src/pcre2_valid_utf.c src/pcre2_xclass.c
+
+exclude=src/pcre2_dftables.c src/pcre2_fuzzsupport.c src/pcre2_printint.c src/pcre2_jit_test.c src/pcre2_posix.c src/pcre2posix.c src/pcre2test.c src/pcre2grep.c src/pcre2demo.c src/pcre2posix_test.c
+exclude_reason=Not library code. pcre2_dftables.c, pcre2test.c, pcre2grep.c, pcre2demo.c, pcre2_jit_test.c and pcre2posix_test.c are standalone programs with their own main(); pcre2_printint.c and pcre2_fuzzsupport.c are debug/fuzz harness translation units that upstream #includes or links only into those programs. pcre2posix.c is the POSIX regcomp/regexec veneer, which upstream ships as a SEPARATE library (libpcre2-posix) because it redefines the names regcomp/regexec/regfree; adding it to libpcre2-8.a would put those names in every binary that links this port and collide the day userland/libc grows a real POSIX regex. It is excluded by name here, not left to fail at link time in some future consumer. NOTE that src/pcre2_jit_compile.c is NOT excluded: upstream requires it be compiled even without SUPPORT_JIT, because with SUPPORT_JIT undefined it contains no code generator at all, only the stubs that make pcre2_jit_compile() return PCRE2_ERROR_JIT_BADOPTION. The JIT is disabled in config.h (see the patch), not by dropping the file.
+
+# -DPCRE2_CODE_UNIT_WIDTH=8 selects the 8-bit library; -DHAVE_CONFIG_H makes
+# every translation unit include the config.h that `prepare` copied and the
+# patch edited. Both are required by NON-AUTOTOOLS-BUILD step (4). Note
+# userland is REAL SSE2 hardware float, so nothing here fights -mno-sse: that
+# is a KERNEL-only flag and ports.mk never sets it.
+cflags=-DPCRE2_CODE_UNIT_WIDTH=8 -DHAVE_CONFIG_H
+
+headers=src/pcre2.h
+lib=libpcre2-8.a
+
+# THE ANTI-NO-OP CHECK. mports.sh proves with nm that every one of these is a
+# DEFINED symbol in libpcre2-8.a. Each name was read out of the built archive
+# with nm, not from memory: with PCRE2_CODE_UNIT_WIDTH=8 upstream renames every
+# public function through PCRE2_SUFFIX, so the linkable name is pcre2_compile_8
+# and NOT pcre2_compile. Getting that wrong is the guessed-constant shape: an
+# app would compile (pcre2.h #defines pcre2_compile to pcre2_compile_8) while
+# this check silently passed on a name nobody links.
+#
+# pcre2_jit_compile_8 is in this list ON PURPOSE. It is the stub, and requiring
+# it is what proves src/pcre2_jit_compile.c really was compiled rather than
+# quietly dropped along with the JIT.
+symbols=pcre2_compile_8 pcre2_code_free_8 pcre2_match_8 pcre2_dfa_match_8 pcre2_match_data_create_8 pcre2_match_data_create_from_pattern_8 pcre2_match_data_free_8 pcre2_get_ovector_pointer_8 pcre2_get_ovector_count_8 pcre2_substring_get_bynumber_8 pcre2_substring_free_8 pcre2_substring_number_from_name_8 pcre2_substitute_8 pcre2_get_error_message_8 pcre2_pattern_info_8 pcre2_config_8 pcre2_maketables_8 pcre2_jit_compile_8 pcre2_serialize_encode_8

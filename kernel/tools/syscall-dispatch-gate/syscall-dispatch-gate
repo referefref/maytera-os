@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+"""
+syscall-dispatch-gate - FAILS THE BUILD if a syscall that MUST be dispatched
+loses its `case SYS_*:` in kernel/proc/syscall.c while its number is still
+#defined in kernel/proc/syscall.h.
+
+WHY THIS EXISTS
+---------------
+A dropped dispatcher case BUILDS CLEAN. The syscall number stays #defined, the
+kernel implementation function stays compiled and exported, and userland still
+issues the syscall: it just falls through the switch and returns the default
+(-ENOSYS-ish) value, after which the caller silently uses a weaker fallback.
+
+That is exactly how commit 68199dd (#565 theme loader) silently DROPPED
+`case SYS_APP_VERIFY_SIG:`. The number, the header define, and
+kernel_app_verify_sig() all still existed, so nothing failed to build; but the
+#563 app/kernel signing-key split was defeated because the app-key verify path
+never ran and userland fell back to the OTA key. A whole-file overwrite from a
+stale working tree is all it takes, and neither the compiler nor the linker
+sees it.
+
+This gate is the backstop the compiler cannot be: a checked-in manifest of the
+syscalls that MUST have a live dispatcher case, diffed against the source on
+EVERY build. Same philosophy as rust-symbol-gate (#404), which guards the Rust
+FFI export surface for the identical "deletes clean" reason.
+
+THE RULES
+---------
+ * MISSING (a manifest name has no `case SYS_X:` in syscall.c, or no #define in
+   syscall.h)  => the build FAILS. Either you clobbered a case (fix it) or you
+   deliberately retired a syscall (remove it from the manifest in the same
+   change, with justification in the CHANGELOG).
+ * EXTRA (a `case SYS_X:` exists that the manifest does not list) => a non-fatal
+   advisory. Adding a new syscall is not blocked, but run
+   `make syscall-dispatch-update` (or this tool with --update) to record the new
+   case so it too is protected from a future silent drop.
+
+USAGE
+  syscall-dispatch-gate --header <syscall.h> --dispatch <syscall.c> --manifest <file>
+  syscall-dispatch-gate ... --update      # rewrite the manifest from current source
+"""
+import argparse, re, sys, os
+
+CASE_RE   = re.compile(r'\bcase\s+(SYS_[A-Z0-9_]+)\s*:')
+DEFINE_RE = re.compile(r'^\s*#\s*define\s+(SYS_[A-Z0-9_]+)\b')
+
+def read(path):
+    with open(path, 'r') as f:
+        return f.read()
+
+def case_names(dispatch_src):
+    return set(CASE_RE.findall(dispatch_src))
+
+def define_names(header_src):
+    out = set()
+    for line in header_src.splitlines():
+        m = DEFINE_RE.match(line)
+        if m:
+            out.add(m.group(1))
+    return out
+
+def load_manifest(path):
+    names = []
+    if not os.path.exists(path):
+        return names
+    for line in read(path).splitlines():
+        line = line.split('#', 1)[0].strip()
+        if line:
+            names.append(line)
+    return names
+
+def write_manifest(path, names):
+    header = (
+        "# syscall-dispatch.manifest - syscalls that MUST have a live dispatcher\n"
+        "# case in kernel/proc/syscall.c. Enforced by\n"
+        "# tools/syscall-dispatch-gate/syscall-dispatch-gate, wired into the build\n"
+        "# via `make syscall-dispatch-gate` (an order-only prerequisite of\n"
+        "# kernel.elf, so it runs on EVERY build and a dropped case FAILS THE\n"
+        "# BUILD). Seeded from the full set of cases present at restore time; a\n"
+        "# dropped case (see #565/68199dd, which silently killed SYS_APP_VERIFY_SIG\n"
+        "# and the #563 signing-key split) is caught here, not in review.\n"
+        "#\n"
+        "# One SYS_* name per line. Add a name when you add a syscall case; remove\n"
+        "# a name ONLY when you deliberately retire the syscall, in the same change.\n"
+    )
+    with open(path, 'w') as f:
+        f.write(header)
+        for n in sorted(names):
+            f.write(n + "\n")
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--header', required=True)
+    ap.add_argument('--dispatch', required=True)
+    ap.add_argument('--manifest', required=True)
+    ap.add_argument('--update', action='store_true')
+    a = ap.parse_args()
+
+    cases = case_names(read(a.dispatch))
+    defines = define_names(read(a.header))
+
+    if a.update:
+        write_manifest(a.manifest, sorted(cases))
+        print("syscall-dispatch-gate: manifest updated with %d cases -> %s"
+              % (len(cases), a.manifest))
+        return 0
+
+    required = load_manifest(a.manifest)
+    if not required:
+        print("ERROR: manifest %s is empty or missing. A gate that checks nothing"
+              % a.manifest)
+        print("       is worse than no gate. Run with --update to seed it.")
+        return 1
+
+    missing_case = [n for n in required if n not in cases]
+    missing_def  = [n for n in required if n not in defines]
+    extra        = sorted(cases - set(required))
+
+    ok = True
+    if missing_case:
+        ok = False
+        print("SYSCALL DISPATCH GATE: FAIL - %d required syscall(s) have NO"
+              " `case` in %s:" % (len(missing_case), a.dispatch))
+        for n in sorted(missing_case):
+            print("   MISSING CASE: %s  (defined=%s)"
+                  % (n, "yes" if n in defines else "NO"))
+        print("   A number that is still #defined but no longer dispatched is a")
+        print("   silent clobber (see #565). Restore the case, or if you truly")
+        print("   retired the syscall, drop it from %s in the same commit."
+              % a.manifest)
+    if missing_def:
+        ok = False
+        print("SYSCALL DISPATCH GATE: FAIL - %d required syscall(s) have NO"
+              " #define in %s:" % (len(missing_def), a.header))
+        for n in sorted(missing_def):
+            print("   MISSING DEFINE: %s" % n)
+
+    if extra:
+        print("syscall-dispatch-gate: note - %d case(s) not yet in the manifest"
+              " (not fatal): %s" % (len(extra), ", ".join(extra)))
+        print("   run `make syscall-dispatch-update` to protect them too.")
+
+    if ok:
+        print("syscall-dispatch-gate: OK - all %d required dispatcher cases present."
+              % len(required))
+        return 0
+    return 1
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -185,7 +185,7 @@ test_result_t test_memory_alloc(void) {
 qm status 1002
 
 # Start manually
-qm start 1002
+qm start <vmid>
 
 # Check logs
 journalctl -u pveproxy

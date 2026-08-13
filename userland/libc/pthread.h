@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // pthread.h - POSIX Threads API for MayteraOS
 // Part of Task #25 (Threading with clone() syscall)
 //

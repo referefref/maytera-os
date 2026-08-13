@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // stdio.c - Standard I/O implementation
 // Phase 1 libc completion (#422 / CPython #359): full printf family with
 // float (%f/%F/%e/%E/%g/%G), octal (%o), and complete flag/width/precision
@@ -5,18 +9,34 @@
 #include "stdio.h"
 #include "syscall.h"
 #include "string.h"
+#include "unistd.h"
 #include <stdint.h>
 
+// AssaultCube port phase 3: standard remove(), see stdio.h.
+int remove(const char *path) {
+    if (unlink(path) == 0) return 0;
+    return rmdir(path);
+}
+
+// #745 printf-shredding fix: putchar()/puts() used to call
+// syscall1(SYS_PUTCHAR, c) directly, ONE SYSCALL PER CHARACTER, completely
+// bypassing the stdout FILE* stream's buffering (stdio_file.c). Every write()
+// under 256 bytes is mirrored to the syslog ring as one record (see
+// drivers/console.c), so a line built one putchar() at a time landed in the
+// log as one shredded, unreadable record per character. Route through the
+// SAME stdout stream fopen()/fwrite()/fprintf() already use (fputc(), a
+// pre-existing, already-correct shared primitive) instead of adding a
+// second, private buffering scheme. See __stdio_init() in stdio_file.c for
+// why stdout's buffering mode itself is chosen per-process (isatty(1)), which
+// is what keeps this from breaking a real interactive terminal's immediate
+// character echo.
 int putchar(int c) {
-    syscall1(SYS_PUTCHAR, c);
-    return c;
+    return fputc(c, stdout);
 }
 
 int puts(const char *s) {
-    while (*s) {
-        putchar(*s++);
-    }
-    putchar('\n');
+    if (fputs(s, stdout) == EOF) return EOF;
+    if (fputc('\n', stdout) == EOF) return EOF;
     return 0;
 }
 
@@ -32,7 +52,22 @@ int getchar(void) {
 typedef struct { char *p; char *end; int count; } sink_t;
 static void sc(sink_t *s, char c) { if (s->p < s->end) *s->p++ = c; s->count++; }
 static void sn(sink_t *s, const char *b, int n) { for (int i = 0; i < n; i++) sc(s, b[i]); }
-static void spad(sink_t *s, char c, int n) { while (n-- > 0) sc(s, c); }
+// #621 follow-up: this used to call sc() n times unconditionally. sc() stops
+// WRITING once the destination is full but the loop kept running, so a
+// caller-controlled field width (printf("%*f", w, x), or a literal
+// "%2000000000.2f") spun through billions of iterations producing nothing.
+// Measured: a sweep that included a width of 2147483647 wedged for over ten
+// minutes here. The C99 return value is unchanged - every padding byte is
+// still counted - the loop just stops once it can no longer store anything.
+static void spad(sink_t *s, char c, int n) {
+    if (n <= 0) return;
+    while (n > 0 && s->p < s->end) { *s->p++ = c; s->count++; n--; }
+    if (n > 0) {
+        // Saturate instead of overflowing the signed count.
+        if (s->count > 0x7fffffff - n) s->count = 0x7fffffff;
+        else s->count += n;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Integer emit with flags/width/precision.
@@ -88,11 +123,44 @@ static int dbl_signbit(double x) {
     union { double d; uint64_t u; } v; v.d = x; return (int)(v.u >> 63);
 }
 
-// Generate `sig` significant decimal digits of a>0 (finite) into digits[],
-// returning the decimal exponent E where a ~= d0.d1d2... x 10^E.
-static int gen_digits(double a, int sig, char *digits) {
+// ---------------------------------------------------------------------------
+// #621: bounds for the float formatter. Every one of these was previously
+// implicit, and each implicit assumption was false for some ordinary double.
+//
+//   GEN_SIG_MAX   gen_digits() has ALWAYS refused to produce more than this
+//                 many significant digits (the clamp below). That clamp is
+//                 fine in itself, but callers used to compute a digit count
+//                 (nsig = E+1+prec, or prec+1) and then INDEX the buffer with
+//                 it, reading far past the digits that were actually written.
+//                 Callers must now use the generated count and pad with '0'.
+//   FLT_PREC_MAX  hard clamp on a caller-supplied precision. printf("%.100f")
+//                 used to write 100 fraction bytes into an 80-byte buffer.
+//   FLT_BODY_MAX  worst-case formatted body. The widest reachable case is %f
+//                 of a value near DBL_MAX: 309 integer digits + '.' +
+//                 FLT_PREC_MAX fraction digits = 822. %g can reach ~1028 when
+//                 a tiny value pushes the derived precision up. Sized above
+//                 both, and every write into it is bounds-checked anyway, so
+//                 a mistake in this arithmetic truncates instead of smashing.
+// ---------------------------------------------------------------------------
+#define GEN_SIG_MAX   36
+#define FLT_PREC_MAX  512
+#define FLT_BODY_MAX  1152
+
+// Bounded byte sink for the float body builders. Silently drops writes past
+// the end rather than running off the buffer; the builders return the number
+// of bytes actually stored.
+typedef struct { char *p; char *end; } fbuf_t;
+static void fput(fbuf_t *b, char c) { if (b->p < b->end) *b->p++ = c; }
+
+// Generate up to `sig` significant decimal digits of a>0 (finite) into
+// digits[] (capacity `cap`), returning the decimal exponent E where
+// a ~= d0.d1d2... x 10^E. The number ACTUALLY generated is stored through
+// *ngen and is min(sig, GEN_SIG_MAX, cap); callers must not index past it.
+static int gen_digits(double a, int sig, char *digits, int cap, int *ngen) {
     if (sig < 1) sig = 1;
-    if (sig > 36) sig = 36;
+    if (sig > GEN_SIG_MAX) sig = GEN_SIG_MAX;
+    if (cap > 0 && sig > cap) sig = cap;
+    if (ngen) *ngen = sig;
     if (a == 0.0) { for (int i = 0; i < sig; i++) digits[i] = '0'; return 0; }
 
     int E = 0;
@@ -101,7 +169,7 @@ static int gen_digits(double a, int sig, char *digits) {
     while (a < 1.0)   { a *= 10.0; E--; }
     // a now in [1,10)
 
-    char tmp[40];
+    char tmp[GEN_SIG_MAX];
     for (int i = 0; i < sig; i++) {
         int d = (int)a;
         if (d < 0) d = 0;
@@ -130,61 +198,178 @@ static int gen_digits(double a, int sig, char *digits) {
     return E;
 }
 
-// Build the body of an %e conversion (no sign, no field padding) into out.
-static int build_e(char *out, double a, int prec, int upper, int alt) {
-    char digits[40];
-    int E = gen_digits(a, prec + 1, digits);
-    char *o = out;
-    *o++ = digits[0];
+// Build the body of an %e conversion (no sign, no field padding) into out,
+// writing at most `cap` bytes. Returns the number of bytes stored.
+static int build_e(char *out, int cap, double a, int prec, int upper, int alt) {
+    fbuf_t b = { out, out + cap };
+    char digits[GEN_SIG_MAX];
+    int ngen = 0;
+    int E = gen_digits(a, prec + 1, digits, (int)sizeof(digits), &ngen);
+    fput(&b, (ngen > 0) ? digits[0] : '0');
     if (prec > 0 || alt) {
-        *o++ = '.';
-        for (int i = 1; i <= prec; i++) *o++ = digits[i];
+        fput(&b, '.');
+        // Past the digits the generator actually produced, pad with '0'. This
+        // used to index digits[] with i up to prec (unbounded), reading off
+        // the end of a 40-byte stack array for any %.60e or wider.
+        for (int i = 1; i <= prec; i++) fput(&b, (i < ngen) ? digits[i] : '0');
     }
-    *o++ = upper ? 'E' : 'e';
+    fput(&b, upper ? 'E' : 'e');
     int e = E;
-    if (e < 0) { *o++ = '-'; e = -e; } else *o++ = '+';
+    if (e < 0) { fput(&b, '-'); e = -e; } else fput(&b, '+');
     // at least two exponent digits
-    char eb[6]; int en = 0;
+    char eb[8]; int en = 0;
     if (e == 0) eb[en++] = '0';
-    while (e) { eb[en++] = (char)('0' + e % 10); e /= 10; }
-    while (en < 2) eb[en++] = '0';
-    for (int i = en - 1; i >= 0; i--) *o++ = eb[i];
-    return (int)(o - out);
+    while (e && en < (int)sizeof(eb)) { eb[en++] = (char)('0' + e % 10); e /= 10; }
+    while (en < 2 && en < (int)sizeof(eb)) eb[en++] = '0';
+    for (int i = en - 1; i >= 0; i--) fput(&b, eb[i]);
+    return (int)(b.p - out);
 }
 
-// Build the body of an %f conversion (no sign, no field padding) into out.
-static int build_f(char *out, double a, int prec, int alt) {
-    char probe[40];
-    int E = gen_digits(a, 1, probe);        // learn the exponent
+// Build the body of an %f conversion (no sign, no field padding) into out,
+// writing at most `cap` bytes. Returns the number of bytes stored.
+//
+// #621 follow-up (correctness, NOT the stack smash): rounding here was wrong
+// in two independent ways, both PRE-EXISTING. The frozen pre-#621 fixture
+// produces byte-identical wrong output, so neither was introduced by the
+// bounds fix; both were found by diffing 369k conversions against glibc.
+//
+//   A. The "value is below the last printed place" branch emitted a hard zero
+//      with no rounding at all, so printf("%.0f", 0.9) printed "0" and
+//      printf("%.2f", 0.006) printed "0.00". Money and percentages formatted
+//      through this path were silently wrong, not merely imprecise.
+//
+//   B. The significant-digit count was derived from a ONE-DIGIT probe of the
+//      exponent. gen_digits() rounds, and rounding one digit can carry across
+//      a power of ten (9.9 -> 1e1), so the probe's exponent is sometimes one
+//      too high. That made this function ask for one digit too many, which
+//      moved the rounding one place to the right, and the display loop then
+//      truncated the extra digit away: a truncation dressed up as a round.
+//      printf("%.0f", 9.9) printed "9"; printf("%.1f", 97497.18255) printed
+//      "97497.1". Fix: after generating, CONFIRM the exponent the generator
+//      actually produced and regenerate ONCE with the corrected count. Once
+//      is provably enough (the probe can only introduce a single carry), and
+//      it is a straight-line correction rather than a loop, so no adversarial
+//      value can spin here.
+static int build_f(char *out, int cap, double a, int prec, int alt) {
+    fbuf_t b = { out, out + cap };
+    char probe[GEN_SIG_MAX];
+    int pn = 0;
+    int Ep = gen_digits(a, 1, probe, (int)sizeof(probe), &pn);   // rough exponent
 
-    int nsig = E + 1 + prec;                 // sig digits needed through last frac place
+    char digits[GEN_SIG_MAX];
+    int ngen = 0;
+
+    int nsig = Ep + 1 + prec;             // sig digits through the last frac place
     if (nsig < 1) {
-        char *o = out;
-        *o++ = '0';
-        if (prec > 0 || alt) { *o++ = '.'; for (int i = 0; i < prec; i++) *o++ = '0'; }
-        return (int)(o - out);
+        // Defect A. Every significant digit of `a` sits to the right of the
+        // last printed place, so the result is 0 there UNLESS `a` rounds up
+        // into it. That can only happen when nsig == 0, i.e. `a` lies in
+        // [10^-(prec+1), 10^-prec): then it rounds up exactly when
+        // a >= 0.5 * 10^-prec. nsig < 0 puts `a` below a tenth of the last
+        // place, which can never round up.
+        //
+        // gen_digits() only ever rounds AWAY from zero, so the probe exponent
+        // is never too LOW; nsig < 0 therefore cannot be a probe artefact
+        // hiding a value that should have rounded up.
+        int roundup = 0;
+        if (nsig == 0) {
+            // The probe exponent can be one too HIGH (gen_digits() rounds away
+            // from zero, so a leading 9 can carry to 1e+1), which makes nsig
+            // read as 0 for a value that is really below a tenth of the last
+            // printed place - printf("%.0f", 0.095) must be "0", not "1". Do
+            // not trust Ep for this decision: generate the digits and use the
+            // exponent the generator actually produced. Ep >= E2 always, so
+            // nsig == 0 can only mean the true count is 0 or negative.
+            int n2 = 0;
+            int E2 = gen_digits(a, GEN_SIG_MAX, digits, (int)sizeof(digits), &n2);
+            if (E2 + 1 + prec == 0) {
+                if (n2 > 0 && digits[0] > '5') roundup = 1;
+                else if (n2 > 0 && digits[0] == '5') {
+                    for (int i = 1; i < n2; i++) if (digits[i] != '0') { roundup = 1; break; }
+                    // An exact half rounds to even, and the digit it would land
+                    // on is 0, which is already even, so leave roundup at 0.
+                }
+            }
+        }
+        if (!roundup) {
+            fput(&b, '0');
+            if (prec > 0 || alt) {
+                fput(&b, '.');
+                for (int i = 0; i < prec; i++) fput(&b, '0');
+            }
+        } else {
+            // One unit in the last printed place: "1" for %.0f, otherwise
+            // "0." then prec-1 zeros and a final '1'.
+            fput(&b, prec > 0 ? '0' : '1');
+            if (prec > 0 || alt) {
+                fput(&b, '.');
+                for (int i = 0; i < prec; i++) fput(&b, (i == prec - 1) ? '1' : '0');
+            }
+        }
+        return (int)(b.p - out);
     }
 
-    char digits[48];
-    E = gen_digits(a, nsig, digits);         // regenerate with rounding; E may bump
-    char *o = out;
+    int E = gen_digits(a, nsig, digits, (int)sizeof(digits), &ngen);
+    if (E != Ep) {
+        // Defect B: the probe carried, so `nsig` asked for one digit too many
+        // and the value was rounded one place too far right. The fix is NOT to
+        // regenerate with a smaller count: gen_digits() normalises by repeated
+        // multiply/divide by ten, so every extra pass drifts, and re-running it
+        // shallower loses the exact-half information (it made printf("%.0f",
+        // 96.5) print "97" where the true half-to-even answer is "96").
+        // Instead round the digit string ALREADY IN HAND, in decimal. Those
+        // digits came from the deeper, more accurate pass, and a trailing "5"
+        // with nothing after it is an exact half that decimal rounding gets
+        // right by construction.
+        int keep = E + 1 + prec;
+        if (keep < 1) keep = 1;
+        if (keep < ngen) {
+            int up = 0;
+            if (digits[keep] > '5') up = 1;
+            else if (digits[keep] == '5') {
+                for (int i = keep + 1; i < ngen; i++)
+                    if (digits[i] != '0') { up = 1; break; }
+                if (!up) up = (digits[keep - 1] - '0') & 1;   // exact half -> to even
+            }
+            ngen = keep;
+            if (up) {
+                int i = keep - 1;
+                for (; i >= 0; i--) {
+                    if (digits[i] != '9') { digits[i]++; break; }
+                    digits[i] = '0';
+                }
+                if (i < 0) {                    // 99..9 -> 10..0, one place wider
+                    for (int k = keep - 1; k > 0; k--) digits[k] = digits[k - 1];
+                    digits[0] = '1';
+                    E++;
+                }
+            }
+        }
+    }
+
     int di = 0;
     if (E >= 0) {
+        // E is the decimal exponent, so this loop runs E+1 times: 301 times for
+        // 1e300 and 309 for DBL_MAX. It used to write straight into an 80-byte
+        // caller buffer, and it used to index digits[] by `di < nsig` where
+        // nsig could be 307, over-reading a 48-byte array. Both are bounded
+        // now: every store goes through fput(), and past the digits the
+        // generator actually produced (ngen of them) the value is all zeros.
         for (int pos = 0; pos <= E; pos++) {
-            *o++ = (di < nsig) ? digits[di++] : '0';
+            fput(&b, (di < ngen) ? digits[di++] : '0');
         }
     } else {
-        *o++ = '0';
+        fput(&b, '0');
     }
     if (prec > 0 || alt) {
-        *o++ = '.';
+        fput(&b, '.');
         for (int k = 0; k < prec; k++) {
             int idx = (E >= 0) ? (E + 1) + k : k + (E + 1);
-            if (idx < 0) *o++ = '0';
-            else *o++ = (idx < nsig) ? digits[idx] : '0';
+            if (idx < 0 || idx >= ngen) fput(&b, '0');
+            else fput(&b, digits[idx]);
         }
     }
-    return (int)(o - out);
+    return (int)(b.p - out);
 }
 
 static void emit_float(sink_t *s, double val, int prec, char conv,
@@ -207,23 +392,28 @@ static void emit_float(sink_t *s, double val, int prec, char conv,
     }
 
     if (prec < 0) prec = 6;
+    if (prec > FLT_PREC_MAX) prec = FLT_PREC_MAX;   // #621: was unbounded
     double a = dbl_abs(val);
-    char body[80];
+    char body[FLT_BODY_MAX];                        // #621: was char body[80]
     int blen = 0;
     char lc = upper ? (conv + 32) : conv;
 
     if (lc == 'f') {
-        blen = build_f(body, a, prec, alt);
+        blen = build_f(body, (int)sizeof(body), a, prec, alt);
     } else if (lc == 'e') {
-        blen = build_e(body, a, prec, upper, alt);
+        blen = build_e(body, (int)sizeof(body), a, prec, upper, alt);
     } else { // 'g'
         int P = prec ? prec : 1;
-        char probe[40];
-        int X = gen_digits(a, P, probe);       // exponent with P sig digits
+        char probe[GEN_SIG_MAX];
+        int pn = 0;
+        int X = gen_digits(a, P, probe, (int)sizeof(probe), &pn); // exp with P sig digits
         if (X >= -4 && X < P) {
-            blen = build_f(body, a, P - 1 - X, alt);
+            int fp = P - 1 - X;                 // derived precision, can exceed P
+            if (fp < 0) fp = 0;
+            if (fp > FLT_PREC_MAX) fp = FLT_PREC_MAX;
+            blen = build_f(body, (int)sizeof(body), a, fp, alt);
         } else {
-            blen = build_e(body, a, P - 1, upper, alt);
+            blen = build_e(body, (int)sizeof(body), a, P - 1, upper, alt);
         }
         if (!alt) {
             // strip trailing zeros (and a trailing '.') from the mantissa part
@@ -384,13 +574,13 @@ int sprintf(char *str, const char *format, ...) {
     return ret;
 }
 
+// #745 printf-shredding fix: this used to format into a local buffer and
+// then loop putchar() (== one raw SYS_PUTCHAR syscall) per character. printf
+// on every other libc is just vfprintf(stdout, ...); do the same here rather
+// than keeping a second, parallel copy of "format then push through stdout"
+// that only this function used.
 int vprintf(const char *format, va_list ap) {
-    char buf[1024];
-    int len = vsnprintf(buf, sizeof(buf), format, ap);
-    int n = len;
-    if (n >= (int)sizeof(buf)) n = sizeof(buf) - 1;
-    for (int i = 0; i < n; i++) putchar(buf[i]);
-    return len;
+    return vfprintf(stdout, format, ap);
 }
 
 int printf(const char *format, ...) {

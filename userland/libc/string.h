@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // string.h - String functions for MayteraOS userland
 #ifndef LIBC_STRING_H
 #define LIBC_STRING_H

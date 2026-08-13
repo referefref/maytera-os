@@ -458,18 +458,39 @@ int main(void) {
 
     // Main loop
     int running = 1;
+    // #548: update_game()/draw_game()/win_invalidate() used to run
+    // UNCONDITIONALLY every 16ms (60 Hz) forever, even sitting on the static
+    // MENU/PAUSED/GAME_OVER screens where update_game() is already a no-op
+    // (it early-returns unless STATE_PLAYING) and draw_game() paints the
+    // exact same pixels every time - the idle-CPU echo-loop anti-pattern
+    // (same family as the print3d perpetual-orbit fix, #545). Only run the
+    // tight 60Hz loop while a game is actually in motion (STATE_PLAYING);
+    // otherwise block on real events and repaint once when one arrives (a
+    // key/mouse event may transition into STATE_PLAYING, which the next
+    // iteration's state check picks up immediately).
+    draw_game();
+    win_invalidate(win);
     while (running) {
-        // Poll events with a 16 ms timeout (roughly 60 FPS)
+        // Poll events: tight 16ms (60 FPS) only while actually playing (ball
+        // in motion needs a steady tick); otherwise block indefinitely so an
+        // idle Pong window (menu/paused/game-over) costs ~0 CPU.
         gui_event_t ev;
-        int ret = win_get_event(win, &ev, 16);
+        int ret = win_get_event(win, &ev, (state == STATE_PLAYING) ? 16 : -1);
         if (ret > 0) {
             running = handle_event(&ev);
         }
 
-        // Update and draw
-        update_game();
-        draw_game();
-        win_invalidate(win);
+        if (state == STATE_PLAYING) {
+            // Update and draw every tick: the ball/paddles are in motion.
+            update_game();
+            draw_game();
+            win_invalidate(win);
+        } else if (ret > 0) {
+            // A real event may have changed state (unpause, start, restart,
+            // return to menu) or a menu selection; repaint once to reflect it.
+            draw_game();
+            win_invalidate(win);
+        }
     }
 
     win_destroy(win);

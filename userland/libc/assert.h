@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // assert.h - runtime assertions for MayteraOS userland (#422).
 // Previously a no-op ((void)0); now a real assert that reports and aborts.
 #ifndef _MAYTERA_ASSERT_H

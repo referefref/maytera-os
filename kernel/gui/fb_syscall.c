@@ -1,6 +1,6 @@
 // fb_syscall.c - Framebuffer syscall implementation for userland compositor
 #include "fb_syscall.h"
-#include "../syscall.h"
+#include "../proc/syscall.h"
 #include "../video/framebuffer.h"
 #include "../drivers/mouse.h"
 // keyboard types defined in fb_syscall.h
@@ -12,6 +12,10 @@
 #include "../string.h"
 #include "../fs/panic.h"   // #418: STAGE_COMPOSITOR_UP / STAGE_DESKTOP_READY breadcrumbs
 #include "../sync/spinlock.h"   // b740: partial-present damage accumulator
+#include "../cpu/dlprof.h"      // #632: dp_tsc() - the shared rdtsc helper
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
+#include "fbown.h"        // #745 task #59: the framebuffer ownership latch
+#include "../security/uaccess_smap.h"  // #19/#645: AC brackets for Ring-3 out-params
 
 // Framebuffer physical address and size (from boot)
 extern uint64_t g_fb_phys_addr;
@@ -36,9 +40,21 @@ static key_event_t key_queue[KEY_QUEUE_SIZE];
 static volatile int key_queue_head = 0;
 static volatile int key_queue_tail = 0;
 
-// PID of the compositor process (only this can access FB directly)
-// Non-static so sys_compositor_render_windows() in syscall.c can check it
-uint32_t compositor_pid = 0;
+// WHO OWNS THE FRAMEBUFFER lives in rustkern/fbown.rs now, not in a file-scope
+// `uint32_t compositor_pid` here.
+//
+// #745 task #59. That variable latched to the first pid ever to call
+// sys_fb_map() and was cleared in exactly one place, fb_syscall_init(), which
+// runs ONCE at boot. Switch User and Log Out both work by EXITING
+// /APPS/COMPOSIT, so from the first Log Out of a boot the latch held a dead pid
+// and every relaunch was refused here, exit(1)'d, and bounced to the login gate
+// - which, under the shipped autologin=root, re-launched it immediately: an
+// infinite crash-respawn loop pinning a core (measured: 59 respawns, 57 FB-map
+// failures, idle 0%, in ~40 s on golden 1851).
+//
+// The claim is now ARMED by whoever launches the compositor (gui/desktop.c),
+// CLAIMED here, and RELEASED at the proc_exit() chokepoint via
+// fb_owner_proc_exit(). See gui/fbown.h and rustkern/fbown.rs.
 // Set as soon as /APPS/COMPOSIT is launched (before it grabs the FB). The kernel
 // desktop stops drawing once this is set, so the boot splash stays up until the
 // usermode compositor's first frame (seamless handoff, no kernel-desktop flash).
@@ -79,16 +95,81 @@ static spinlock_t g_fb_damage_lock  = SPINLOCK_INIT;
 static bool is_compositor(void) {
     process_t *p = proc_current();
     if (!p) return false;
-    
-    // First caller to map FB becomes the compositor
-    if (compositor_pid == 0) {
-        compositor_pid = p->pid;
+
+    // Fast path: this IS the owner. Every fb_flip/fb_damage/input syscall comes
+    // through here many times a second, so it must be one atomic load.
+    uint32_t owner = fbown_owner_rs();
+    if (owner == p->pid) return true;
+
+    if (owner != 0) {
+        // BACKSTOP, not the mechanism. The release is supposed to happen at
+        // proc_exit() (fb_owner_proc_exit). If a teardown path ever misses that
+        // chokepoint, a dead pid must not be able to hold the screen hostage
+        // until reboot - that is the exact bug this change removes, and a
+        // second copy of it hiding behind a different exit path would look
+        // identical. Clearing the owner does NOT arm the window, so this can
+        // never hand the framebuffer to a process the kernel did not launch.
+        process_t *op = proc_get(owner);
+        if (!op || op->state == PROC_STATE_ZOMBIE ||
+                   op->state == PROC_STATE_UNUSED) {
+            fbown_note_stale_rs();
+            if (fbown_release_rs(owner)) {
+                kprintf("[FB] stale framebuffer owner pid %u was already gone; "
+                        "latch released by the liveness backstop\n", owner);
+            }
+        } else {
+            return false;   // somebody else owns it, and is alive
+        }
+    }
+
+    if (fbown_claim_rs(p->pid) == 1) {
         kprintf("[FB] Process %u registered as compositor\n", p->pid);
         stage_set(STAGE_COMPOSITOR_UP, NULL);  // #418 breadcrumb
         return true;
     }
-    
-    return (p->pid == compositor_pid);
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// The C glue over rustkern/fbown.rs. Declared in gui/fbown.h.
+// ---------------------------------------------------------------------------
+
+void fb_owner_arm(uint32_t pid) {
+    if (fbown_arm_rs(pid)) {
+        kprintf("[FB] framebuffer claim window armed for pid %u\n", pid);
+    }
+}
+
+void fb_owner_disarm(void) {
+    if (fbown_disarm_rs()) {
+        kprintf("[FB] framebuffer claim window closed (no compositor)\n");
+    }
+}
+
+int fb_owner_is(uint32_t pid) { return fbown_is_owner_rs(pid); }
+
+uint32_t fb_owner_pid(void) { return fbown_owner_rs(); }
+
+// PROCESS EXIT HOOK. Called from proc_exit() for every dying process, under
+// cli(), on the dying process's own stack. One atomic compare-exchange for the
+// 99.9% of processes that never owned the framebuffer; no allocation, no lock,
+// no block.
+void fb_owner_proc_exit(uint32_t pid) {
+    if (fbown_release_rs(pid)) {
+        kprintf("[FB] compositor pid %u exited; framebuffer latch released\n",
+                pid);
+    }
+}
+
+// Boot-time proof that the state machine's rules hold, printed so the guard is
+// OBSERVED rather than assumed. Run from main.c before anything can claim.
+void fbown_boot_check(void) {
+    int st = fbown_selftest_rs();
+    if (st != 0) {
+        kprintf("[FB] fbown self-test FAILED case %d\n", st);
+    } else {
+        kprintf("[FB] fbown self-test OK (arm/claim/release/re-arm, 7 cases)\n");
+    }
 }
 
 // ============================================================================
@@ -156,11 +237,15 @@ int64_t sys_fb_info(fb_info_user_t *info) {
     // which is the pattern #503 exists to remove. The NULL guard above stays
     // because NULL is deliberately SKIPPED (not rejected) by the argtab.
     
+    // #19/#645: five stores into a Ring-3 struct; the bracket is the five
+    // stores and nothing else.
+    uaccess_ac_t __ac = uaccess_begin();
     info->width = g_fb_width;
     info->height = g_fb_height;
     info->pitch = g_fb_pitch;
     info->bpp = g_fb_bpp;
     info->phys_addr = g_fb_phys_addr;
+    uaccess_end(__ac);
     
     return 0;
 }
@@ -175,6 +260,116 @@ int64_t sys_fb_info(fb_info_user_t *info) {
 // old growing bootlog write). Declared non-static so main.c can extern it.
 volatile uint64_t g_fb_flip_count = 0;
 
+// ---------------------------------------------------------------------------
+// #632: the network stack's heartbeat was the compositor's frame present, with
+// interrupts off.
+//
+// sys_fb_flip() used to call net_poll() from INSIDE its cli region. net_poll()
+// takes net_lock() and drains up to 64 packets, so every single present held
+// interrupts off across a packet drain whose cost scales with real inbound
+// traffic. On a quiet or DOWN link that is nearly free, which is why the #546
+// and #549 no-carrier fixes never covered it; on a genuinely UP, busy LAN
+// (mDNS/SSDP/ARP/DHCP broadcast chatter) it is paid on EVERY frame, including
+// the cursor-only partial present the compositor uses while the mouse merely
+// moves over a bare desktop.
+//
+// The cli itself must stay: the #307 ROOT CAUSE was that the back->front copy
+// runs on the KERNEL CR3 while the caller is the compositor, and no preemption
+// may observe or clobber that temporary CR3. That requirement covers the CR3
+// switch and the copy, and nothing else. The packet drain was simply sitting
+// inside a window it never needed to be in.
+//
+// FLIP_NET_INSIDE_CLI=1 restores the old placement. It exists ONLY so the #632
+// before/after measurement can be reproduced from this tree with byte-identical
+// instrumentation on both arms; it is not a supported configuration.
+#ifndef FLIP_NET_INSIDE_CLI
+#define FLIP_NET_INSIDE_CLI 0
+#endif
+
+// #745 (task #62): the A/B arm for "can a failing network starve the desktop".
+// FLIP_NET_BLOCKING=1 restores the PRE-FIX mechanism (the present blocks on
+// net_lock via net_poll(), and the dedicated netpump thread is not started)
+// while keeping every counter on the [NETSTARVE] line byte-identical, so the
+// before/after comparison differs only in the mechanism under test. It is a
+// measurement arm, not a supported configuration - the same role
+// FLIP_NET_INSIDE_CLI plays for #632.
+#ifndef FLIP_NET_BLOCKING
+#define FLIP_NET_BLOCKING 0
+#endif
+
+// #632 instrumentation, read by the [FLIPPROF] line in main.c. Cycles, not
+// microseconds: the conversion needs mono_tsc_khz() and is done once per
+// heartbeat rather than on the hot path.
+volatile uint64_t g_flip_cli_tot_cyc  = 0;  // TOTAL cycles with interrupts off
+volatile uint64_t g_flip_net_tot_cyc  = 0;  // TOTAL cycles in the throttled net_poll
+volatile uint64_t g_flip_cpy_tot_cyc  = 0;  // TOTAL cycles in CR3 switch + copy
+volatile uint64_t g_flip_cli_max_cyc  = 0;  // longest whole interrupts-off region
+volatile uint64_t g_flip_net_max_cyc  = 0;  // longest net_poll() within a present
+volatile uint64_t g_flip_cpy_max_cyc  = 0;  // longest CR3-switch + back->front copy
+volatile uint64_t g_flip_cli_over1ms  = 0;  // presents whose cli region exceeded 1ms
+volatile uint64_t g_flip_net_calls    = 0;  // presents that actually ran net_poll
+
+// #745 (task #62) INSTRUMENTATION. Two numbers that turn "it feels laggy" into
+// a measurement, both reported on the [NETSTARVE] serial line:
+//
+//   g_flip_gap_max_cyc - the longest interval between two consecutive presents.
+//     This IS the user's symptom. "The cursor only responds one frame in a few
+//     seconds" is the claim; a gap of 3,000,000us is the evidence. It is
+//     measured in sys_fb_flip itself, so it counts every cause of a stalled
+//     present, not only network ones - which is what makes it useful as the
+//     first question ("did the desktop actually stall?") before the second
+//     ("was it the network?").
+//
+//   g_flip_net_skips - presents that DECLINED to pump the stack because
+//     net_lock was held by another context. Before this change those presents
+//     would have SPUN on that lock with interrupts off. A non-zero, growing
+//     skip count on a laggy machine is the direct fingerprint of network/UI
+//     contention; a zero skip count rules it out.
+//
+// ONE OWNER PER READ-AND-RESET MAXIMUM. There are two independent consumers of
+// the present-gap maximum - the [NETSTARVE] serial line and the enriched
+// /HEARTBEAT.TXT record - and they run in the SAME heartbeat loop iteration.
+// Sharing one variable meant whichever ran first zeroed it and the second read
+// 0 forever (MEASURED: gapmax=0ms in every sample on VM 2462, with the
+// compositor genuinely presenting only 8 frames in 132s, so the true value was
+// tens of seconds). Each consumer now owns its own accumulator, both updated
+// at the single producer site below.
+volatile uint64_t g_flip_gap_max_cyc  = 0;  // longest present gap: [NETSTARVE] owns
+volatile uint64_t g_flip_gap_max_hb   = 0;  // longest present gap: /HEARTBEAT.TXT owns
+volatile uint64_t g_flip_net_skips    = 0;  // pumps declined (net_lock busy)
+
+// The throttled stack pump, factored out so both arms of FLIP_NET_INSIDE_CLI
+// run identical code. Returns the cycles it consumed.
+static inline uint64_t flip_net_pump(void)
+{
+    extern int net_poll_try(int max_pkts);
+    extern volatile uint64_t timer_ticks;
+    extern uint32_t g_timer_hz;
+    static uint64_t s_last_net_tick = 0;
+    uint64_t intv = (g_timer_hz >= 50) ? (g_timer_hz / 50) : 1;
+    if (timer_ticks - s_last_net_tick < intv) return 0;
+    s_last_net_tick = timer_ticks;
+    uint64_t t0 = dp_tsc();
+    // #745 (task #62): NON-BLOCKING. The compositor's present must never wait
+    // on net_lock - net_lock() does `cli` before it spins, so waiting here is
+    // an unpreemptible stall on the one syscall that puts pixels on screen, and
+    // its worst case is the worst case of every network context in the kernel.
+    // If the lock is busy we skip: the dedicated netpump thread is the
+    // always-armed service source, so the cost of skipping is bounded by one
+    // pump interval. The drain bound is 16 rather than net_poll()'s 64 so the
+    // present's own worst case is bounded by construction too.
+#if FLIP_NET_BLOCKING
+    { extern void net_poll(void); net_poll(); }   // PRE-FIX arm: blocks on net_lock
+#else
+    if (!net_poll_try(16)) g_flip_net_skips++;
+#endif
+    uint64_t d = dp_tsc() - t0;
+    g_flip_net_calls++;
+    g_flip_net_tot_cyc += d;
+    if (d > g_flip_net_max_cyc) g_flip_net_max_cyc = d;
+    return d;
+}
+
 int64_t sys_fb_flip(void) {
     // #307: the compositor's per-frame present is the longest single syscall
     // (net_poll + a ~4 MB back->front memcpy). A timer preemption anywhere in
@@ -183,18 +378,38 @@ int64_t sys_fb_flip(void) {
     // process resumes at ..be7 with a wild fault) so the compositor page-faults
     // on its FIRST present and the desktop never comes up. Make the whole
     // present atomic wrt preemption. Interrupts are re-enabled on exit.
-    __asm__ volatile("cli");
+    //
+    // #632 MEASUREMENT: how long is that interrupts-off window really, and how
+    // much of it is the network drain versus the back->front copy? Reported
+    // unconditionally on the [FLIPPROF] line next to [HB] (main.c), because a
+    // counter nobody reads is not a measurement (#621).
+    uint64_t _t_enter = dp_tsc();
+    uint64_t _t_net = 0;
+
+    // #745 (task #62): measure the present-to-present gap. See the comment on
+    // g_flip_gap_max_cyc. First call has no predecessor and is skipped.
     {
-        extern void net_poll(void);
-        extern volatile uint64_t timer_ticks;
-        extern uint32_t g_timer_hz;
-        static uint64_t s_last_net_tick = 0;
-        uint64_t intv = (g_timer_hz >= 50) ? (g_timer_hz / 50) : 1;
-        if (timer_ticks - s_last_net_tick >= intv) {
-            s_last_net_tick = timer_ticks;
-            net_poll();
+        static uint64_t s_prev_enter = 0;
+        if (s_prev_enter) {
+            uint64_t gap = _t_enter - s_prev_enter;
+            if (gap > g_flip_gap_max_cyc) g_flip_gap_max_cyc = gap;
+            if (gap > g_flip_gap_max_hb)  g_flip_gap_max_hb  = gap;
         }
+        s_prev_enter = _t_enter;
     }
+
+    // #632: service the TCP/IP stack BEFORE the interrupts-off region, at the
+    // SAME 20ms cadence as before, so the stack is pumped exactly as often but
+    // no longer with interrupts masked. See the comment above flip_net_pump().
+#if !FLIP_NET_INSIDE_CLI
+    _t_net = flip_net_pump();
+#endif
+
+    __asm__ volatile("cli");
+#if FLIP_NET_INSIDE_CLI
+    _t_net = flip_net_pump();
+#endif
+    uint64_t _t_cpy0 = dp_tsc();
     {
         // #307 ROOT CAUSE FIX: the front buffer is the physical framebuffer at
         // its identity-mapped address (QEMU std-VGA: 0x80000000). In the
@@ -245,7 +460,6 @@ int64_t sys_fb_flip(void) {
     // done - that would reintroduce a growing/expensive write.
     {
         extern volatile uint64_t g_fb_flip_count;
-        extern void bootlog_write(const char *fmt, ...);
         uint64_t c = g_fb_flip_count++;
         if (c == 0) {
             uint32_t sz = g_fb_height * g_fb_pitch;
@@ -260,6 +474,27 @@ int64_t sys_fb_flip(void) {
             // as close to "desktop ready" as the kernel can observe.
             stage_set(STAGE_DESKTOP_READY, NULL);
         }
+    }
+    // #632: close the measurement of the interrupts-off region BEFORE re-enabling
+    // interrupts, so the number is the real masked window and nothing else.
+    {
+        uint64_t now = dp_tsc();
+        uint64_t cli_cyc = now - _t_enter;
+#if !FLIP_NET_INSIDE_CLI
+        // net_poll ran before the cli, so it is not part of the masked window.
+        cli_cyc -= (_t_net < cli_cyc) ? _t_net : 0;
+#else
+        (void)_t_net;   // measured inside the region; already counted
+#endif
+        uint64_t cpy_cyc = now - _t_cpy0;
+        g_flip_cli_tot_cyc += cli_cyc;
+        g_flip_cpy_tot_cyc += cpy_cyc;
+        if (cli_cyc > g_flip_cli_max_cyc) g_flip_cli_max_cyc = cli_cyc;
+        if (cpy_cyc > g_flip_cpy_max_cyc) g_flip_cpy_max_cyc = cpy_cyc;
+        // 1ms threshold, in cycles, from the calibrated TSC rate (khz cycles == 1ms).
+        extern uint64_t mono_tsc_khz_rs(void);
+        uint64_t khz = mono_tsc_khz_rs();
+        if (khz && cli_cyc > khz) g_flip_cli_over1ms++;
     }
     __asm__ volatile("sti");
     return 0;
@@ -315,8 +550,13 @@ static int32_t  g_last_mouse_x = 0;
 static int32_t  g_last_mouse_y = 0;
 static uint32_t g_last_mouse_buttons = 0xFFFFFFFF;  // impossible initial value
 
+// #334: count of compositor SYS_GET_MOUSE polls, so the serial test-input
+// channel can confirm the compositor actually SAMPLED an injected click.
+volatile uint64_t g_mouse_poll_count = 0;
+
 int64_t sys_get_mouse(int32_t *x, int32_t *y, uint32_t *buttons) {
     if (!is_compositor()) return -1;
+    g_mouse_poll_count++;   // #334: compositor sampled the (injected) cursor
 
     int32_t  cx = mouse_x;
     int32_t  cy = mouse_y;
@@ -326,9 +566,13 @@ int64_t sys_get_mouse(int32_t *x, int32_t *y, uint32_t *buttons) {
     g_last_mouse_y       = cy;
     g_last_mouse_buttons = cb;
 
+    // #19/#645: THE hottest user write in the kernel - the compositor polls
+    // this every frame - so the window is three stores, opened once.
+    uaccess_ac_t __ac = uaccess_begin();
     if (x) *x = cx;
     if (y) *y = cy;
     if (buttons) *buttons = cb;
+    uaccess_end(__ac);
 
     return 0;
 }
@@ -336,9 +580,12 @@ int64_t sys_get_mouse(int32_t *x, int32_t *y, uint32_t *buttons) {
 // Read-only global cursor for non-compositor processes (#185). Position only,
 // never -1 throttling: docked panels poll this to track the OS cursor.
 int64_t sys_get_global_mouse(int32_t *x, int32_t *y, uint32_t *buttons) {
+    // #19/#645: three stores into Ring-3 out-params.
+    uaccess_ac_t __ac = uaccess_begin();
     if (x) *x = mouse_x;
     if (y) *y = mouse_y;
     if (buttons) *buttons = mouse_buttons;
+    uaccess_end(__ac);
     return 0;
 }
 
@@ -382,7 +629,10 @@ int64_t sys_get_key(key_event_t *event) {
     }
     
     // Dequeue event
-    *event = key_queue[key_queue_tail];
+    // #19/#645: one struct store into a Ring-3 buffer.
+    {   uaccess_ac_t __ac = uaccess_begin();
+        *event = key_queue[key_queue_tail];
+        uaccess_end(__ac); }
     key_queue_tail = (key_queue_tail + 1) % KEY_QUEUE_SIZE;
     
     return 0;
@@ -447,6 +697,20 @@ int64_t sys_inject_mouse(int32_t x, int32_t y, int32_t type, int32_t button) {
     return hit;
 }
 
+// (#745) Publish the desktop work area (the screen minus whatever the active
+// dock style reserves at each edge). The COMPOSITOR owns the dock style, so it
+// derives the four insets from that style's own edge and thickness and pushes
+// them here; the kernel window manager then uses one definition for initial
+// placement, maximize, restore and the title-bar drag. Compositor-only, gated
+// exactly like sys_inject_mouse: a random Ring-3 app must not be able to
+// reserve the whole screen and strand every window.
+int64_t sys_wm_set_work_area(int32_t left, int32_t top, int32_t right, int32_t bottom) {
+    if (!is_compositor()) return -1;
+    extern void wm_set_work_area(int32_t, int32_t, int32_t, int32_t);
+    wm_set_work_area(left, top, right, bottom);
+    return 0;
+}
+
 // ============================================================================
 // Keyboard Event Queue (called by keyboard driver)
 // ============================================================================
@@ -482,7 +746,7 @@ void fb_syscall_init(void) {
             g_fb_width, g_fb_height, g_fb_bpp, g_fb_pitch);
     
     // Register syscall handlers (done in main syscall dispatcher)
-    compositor_pid = 0;
+    fbown_reset_rs();   // #745 task #59: cold state, nothing armed, no owner
     key_queue_head = 0;
     key_queue_tail = 0;
 }

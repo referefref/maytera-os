@@ -25,9 +25,9 @@
 #include "net/icmp.h"
 #include "net/arp.h"
 #include "net/dhcp.h"
-#include "net/remote_ctrl.h"
 #include "net/https.h"
 #include "fs/fat.h"
+#include "fs/ext2.h"          // #610: on-device fsck + dirty detection
 #include "fs/fat_readahead.h"
 #include "fs/bootlog.h"           // #307 real-hw: persistent /BOOTLOG.TXT
 #include "fs/blockdev.h"          // #307: ATA vs USB MSC root routing
@@ -43,8 +43,11 @@
 #include "proc/syscall.h"
 #include "fs/perms.h"
 #include "proc/users.h"
+#include "proc/pwpolicy.h"
 #include "proc/services.h"
 #include <stdarg.h>
+#include "cpu/dlprof.h"
+#include "fs/userconf.h"   // #683/#684: per-user config paths
 
 // Global FAT filesystem (non-static for access from other modules)
 fat_fs_t g_fat_fs;
@@ -137,6 +140,62 @@ static void hb_top_consumers(char *out, int outsz, uint64_t interval_ticks) {
     prev_n = n;
 }
 
+// #684: copy the /CONFIG/KIMI.KEY deployment seed into the logged-in user's own
+// protected AI settings, once. See the call site for the reasoning.
+static void provision_ai_key(login_result_t *lr) {
+    if (!lr || !g_fat_fs.mounted) return;
+
+    char dest[256];
+    if (userconf_kpath("AISVC.CFG", dest, sizeof(dest)) != 0) return;
+
+    // Already provisioned, or the user has their own settings: never clobber.
+    uint32_t esz = 0;
+    void *existing = fat_read_file(&g_fat_fs, dest, &esz);
+    if (existing) { kfree(existing); return; }
+
+    uint32_t ksz = 0;
+    char *seed = (char *)fat_read_file(&g_fat_fs, "/CONFIG/KIMI.KEY", &ksz);
+    if (!seed) {
+        // The normal deployment case. The user types their key into Settings.
+        return;
+    }
+
+    // Trim to the first line and strip trailing whitespace, matching what the
+    // deleted userland load_key() did, so a hand-edited seed behaves the same.
+    uint32_t n = 0;
+    while (n < ksz && seed[n] != '\n' && seed[n] != '\r') n++;
+    while (n > 0 && (seed[n - 1] == ' ' || seed[n - 1] == '\t')) n--;
+    if (n == 0 || n > 200) { kfree(seed); return; }
+
+    char buf[256];
+    const char *pfx = "api_key=";
+    uint32_t w = 0;
+    while (pfx[w]) { buf[w] = pfx[w]; w++; }
+    for (uint32_t i = 0; i < n; i++) buf[w++] = seed[i];
+    buf[w++] = '\n';
+    kfree(seed);
+
+    // Ensure <home>/CONFIG exists, then write and lock the file down to the
+    // user: 0600, owned by them. perms_set (not perms_on_create) because this
+    // must establish the mode even though Ring 0 just created the path.
+    char dir[256];
+    uint32_t cut = 0;
+    for (uint32_t i = 0; dest[i]; i++) if (dest[i] == '/') cut = i;
+    if (cut > 0) {
+        for (uint32_t i = 0; i < cut; i++) dir[i] = dest[i];
+        dir[cut] = 0;
+        fat_mkdir(&g_fat_fs, dir);
+        perms_on_create(dir, lr->uid, lr->gid, 1);
+    }
+    if (fat_write_file(&g_fat_fs, dest, buf, w) == 0) {
+        perms_set(dest, lr->uid, lr->gid, 0600);
+        if (perms_sync() != 0)
+            kprintf("[PERMS] initial sync failed; permissions are NOT on disk\n");
+        kprintf("[AI] #684: provisioned %s from the /CONFIG/KIMI.KEY seed "
+                "(uid=%u, mode 0600)\n", dest, lr->uid);
+    }
+}
+
 static void heartbeat_worker(void *arg) {
     (void)arg;
     extern volatile uint64_t timer_ticks;      // cpu/isr.c, monotonic PIT tick
@@ -196,11 +255,213 @@ static void heartbeat_worker(void *arg) {
                         tickburst_max_run, tickburst_run_us);
             }
         }
-        kprintf("[HB] tick=%lu uptime=%lus mono=%llums ctxsw=%lu flips=%lu hb=%lu blkc=%lu/%lu %s\n",
+        // #610: wqr = wait-queue un-park rescues. Each one is an instance of
+        // the lost-wakeup race (a wait_event() whose condition came true after
+        // the waiter had already been parked). Before the fix in
+        // sync/waitq.c each of these permanently deleted a thread from the
+        // scheduler; a non-zero count here means the race is live on this
+        // workload and the fix is the only thing preventing the hang.
+        extern volatile uint64_t g_wq_unpark_rescues;
+        // #254/#617: promo = anti-starvation promotions performed, e2w =
+        // contended ext2-lock acquisitions. Both are cumulative. They make the
+        // two fixes auditable from an ordinary boot log instead of needing a
+        // special build: promo climbing means the scheduler had to rescue a
+        // passed-over thread, e2w climbing means the ext2 ticket queue is
+        // actually being used.
+        extern volatile uint64_t g_sched_promotions;
+        extern volatile uint64_t g_ext2_lock_waits;
+        // #621: blkstale = blk_read() demand-cache installs DECLINED because a
+        // write bumped the block-layer write generation while our device read
+        // was in flight (#617). mscnb = iterations ever executed by the USB-MSC
+        // no-block command-lock fallback (#617). Both were added as "measured
+        // rather than asserted" counters and then read by NOBODY: blk_stale_skips()
+        // had ZERO callers in the whole kernel, and g_msc_noblock_spins had only
+        // a one-shot kprintf even though its own comment claimed it was
+        // "readable from the heartbeat". That is this project's recurring
+        // zero-callers trap: the counter exists, so everyone assumes it is being
+        // watched, and nobody is watching.
+        //
+        // They are printed UNCONDITIONALLY, including when zero, on purpose.
+        // "blkstale=0" and a MISSING blkstale field mean completely different
+        // things (measured-and-no-overlap vs this-kernel-never-measured-it),
+        // and collapsing that distinction is exactly what went wrong here. Two
+        // tokens on a line that already carries eight is not spam; the LOUD
+        // reporting is the one-shot [BLKSTALE] line just below.
+        extern uint64_t blk_stale_skips(void);
+        extern volatile uint64_t g_msc_noblock_spins;
+        uint64_t stale_now = blk_stale_skips();
+        // One-shot-per-increase loud line, in the [TICKBURST] shape: a healthy
+        // system stays quiet, and a system where the #617 race is actually live
+        // says so in words rather than leaving a reader to notice a number moved.
+        static uint64_t stale_reported = 0;
+        if (stale_now > stale_reported) {
+            stale_reported = stale_now;
+            kprintf("[BLKSTALE] #617: %llu demand-cache install(s) declined - a "
+                    "write landed on the root device while a read was in flight. "
+                    "The generation guard is doing real work on this workload; "
+                    "without it those sectors would have been cached STALE.\n",
+                    (unsigned long long)stale_now);
+        }
+        // #632: the sys_fb_flip interrupts-off window and the net_poll drain it
+        // used to contain. g_net_poll_* already existed and were already
+        // incremented, but were surfaced only by the gated [DLPROF] line, which
+        // stays silent unless a download is running: instrumented and unread,
+        // the same zero-readers pattern as blk_stale_skips (#621). Printed here
+        // UNCONDITIONALLY, including zero, so an idle desktop states its own
+        // interrupt-off cost instead of leaving it to be assumed.
+        {
+            extern uint64_t g_net_poll_calls, g_net_poll_pkts, g_net_poll_max;
+            extern volatile uint64_t g_flip_cli_max_cyc, g_flip_net_max_cyc;
+            extern volatile uint64_t g_flip_cpy_max_cyc, g_flip_cli_over1ms;
+            extern volatile uint64_t g_flip_net_calls;
+            extern volatile uint64_t g_flip_cli_tot_cyc, g_flip_net_tot_cyc;
+            extern volatile uint64_t g_flip_cpy_tot_cyc;
+            extern volatile uint64_t g_fb_flip_count;
+            uint64_t _khz = mono_tsc_khz(); if (!_khz) _khz = 1;
+            // Per-INTERVAL, not lifetime: a lifetime maximum set once during
+            // boot hides everything that happens afterwards, and a lifetime
+            // total cannot be turned into a percentage of wall clock. The
+            // maxima are read-and-reset so each line describes its own second.
+            static uint64_t _p_ms, _p_flips, _p_cli, _p_net, _p_cpy, _p_pkts, _p_npoll;
+            uint64_t _ms = mono_ms();
+            uint64_t _dms = _ms - _p_ms; _p_ms = _ms;
+            uint64_t _dflips = g_fb_flip_count - _p_flips; _p_flips = g_fb_flip_count;
+            uint64_t _dcli = g_flip_cli_tot_cyc - _p_cli;  _p_cli = g_flip_cli_tot_cyc;
+            uint64_t _dnet = g_flip_net_tot_cyc - _p_net;  _p_net = g_flip_net_tot_cyc;
+            uint64_t _dcpy = g_flip_cpy_tot_cyc - _p_cpy;  _p_cpy = g_flip_cpy_tot_cyc;
+            uint64_t _dpkts = g_net_poll_pkts - _p_pkts;   _p_pkts = g_net_poll_pkts;
+            uint64_t _dnp = g_net_poll_calls - _p_npoll;   _p_npoll = g_net_poll_calls;
+            uint64_t _climax = g_flip_cli_max_cyc; g_flip_cli_max_cyc = 0;
+            uint64_t _netmax = g_flip_net_max_cyc; g_flip_net_max_cyc = 0;
+            uint64_t _cpymax = g_flip_cpy_max_cyc; g_flip_cpy_max_cyc = 0;
+            uint64_t _den = _khz * (_dms ? _dms : 1);   // cycles of one core this interval
+            kprintf("[FLIPPROF] dt=%llums flips=%llu npoll=%llu pkts=%llu drainmax=%llu "
+                    "| CLI-OFF %llu%% avg=%lluus max=%lluus over1ms=%llu "
+                    "| net %llu%% max=%lluus n=%llu | cpy %llu%% max=%lluus\n",
+                    (unsigned long long)_dms,
+                    (unsigned long long)_dflips,
+                    (unsigned long long)_dnp,
+                    (unsigned long long)_dpkts,
+                    (unsigned long long)g_net_poll_max,
+                    (unsigned long long)(_dcli * 100ULL / _den),
+                    (unsigned long long)(_dflips ? (_dcli * 1000ULL / _khz) / _dflips : 0),
+                    (unsigned long long)(_climax * 1000ULL / _khz),
+                    (unsigned long long)g_flip_cli_over1ms,
+                    (unsigned long long)(_dnet * 100ULL / _den),
+                    (unsigned long long)(_netmax * 1000ULL / _khz),
+                    (unsigned long long)g_flip_net_calls,
+                    (unsigned long long)(_dcpy * 100ULL / _den),
+                    (unsigned long long)(_cpymax * 1000ULL / _khz));
+        }
+        // -------------------------------------------------------------------
+        // #745 (task #62): CAN THE NETWORK STARVE THE DESKTOP?  Two lines that
+        // turn "it feels laggy while the network is broken" into numbers you
+        // can read off a serial capture on the real machine.
+        //
+        // [NETSTARVE] answers "did the desktop stall, and was it the network?"
+        //   gapmax   - longest interval between two consecutive frame presents
+        //              THIS interval. This is the user's symptom, in
+        //              milliseconds. A healthy desktop is tens of ms; the
+        //              reported fault is thousands.
+        //   flipskip - presents that declined to pump the stack because
+        //              net_lock was busy. BEFORE this change those presents
+        //              blocked on that lock with interrupts off. Growing
+        //              flipskip on a laggy box = network/UI contention is real;
+        //              flipskip stuck at 0 while gapmax is huge = look
+        //              elsewhere, it is not the network lock.
+        //   lockwait - longest single blocking net_lock acquisition, in us.
+        //              This is what a present USED to be able to pay.
+        //   txmax    - longest single NIC transmit, in us. #549 made USB TX
+        //              fire-and-forget after it had been measured at ~40ms per
+        //              packet on the iMac dongle; this is the standing check
+        //              that it stayed that way on real hardware. Tens of us =
+        //              async as intended. Tens of thousands = a wait is back.
+        //   pump     - pumps done by the dedicated netpump thread, and the
+        //              wakeups it correctly declined as too early (a large
+        //              early count means proc_sleep is collapsing, #577).
+        //
+        // [NETDIAG] answers "why is the network down at all?" - see
+        // net_diag_line() in net/net.c.
+        // -------------------------------------------------------------------
+        {
+            extern volatile uint64_t g_flip_gap_max_cyc, g_flip_net_skips;
+            extern volatile uint64_t g_net_lock_wait_max_cyc, g_net_lock_contended;
+            extern uint64_t g_nic_tx_ok, g_nic_tx_fail, g_nic_tx_max_cyc;
+            extern uint64_t g_net_pump_runs, g_net_pump_early;
+            extern int net_diag_line(char *buf, unsigned long len);
+            uint64_t _khz2 = mono_tsc_khz(); if (!_khz2) _khz2 = 1;
+            uint64_t _gap = g_flip_gap_max_cyc; g_flip_gap_max_cyc = 0;
+            uint64_t _lw  = g_net_lock_wait_max_cyc; g_net_lock_wait_max_cyc = 0;
+            uint64_t _tx  = g_nic_tx_max_cyc; g_nic_tx_max_cyc = 0;
+            // #745 (task #69): holdmax is the FREEZE metric, lockwait is only
+            // the contention metric. net_lock keeps interrupts off for the
+            // whole hold, so on one core a holder is not preemptible and no
+            // second thread can be running to spin: lockwait reads 0 while the
+            // machine is frozen. holdmax cannot. holdra names the caller.
+            extern volatile uint64_t g_net_lock_hold_max_cyc;
+            extern volatile uint64_t g_net_lock_hold_max_ra;
+            extern volatile uint64_t g_net_lock_over_budget, g_net_lock_holds;
+            uint64_t _hm = g_net_lock_hold_max_cyc; g_net_lock_hold_max_cyc = 0;
+            kprintf("[NETSTARVE] gapmax=%luus flipskip=%lu lockwait=%luus "
+                    "holdmax=%luus holdra=%p holdn=%lu overbudget=%lu "
+                    "txmax=%luus tx=%lu/%lu pump=%lu early=%lu contend=%lu\n",
+                    (unsigned long)(_gap * 1000ULL / _khz2),
+                    (unsigned long)g_flip_net_skips,
+                    (unsigned long)(_lw * 1000ULL / _khz2),
+                    (unsigned long)(_hm * 1000ULL / _khz2),
+                    (void *)g_net_lock_hold_max_ra,
+                    (unsigned long)g_net_lock_holds,
+                    (unsigned long)g_net_lock_over_budget,
+                    (unsigned long)(_tx * 1000ULL / _khz2),
+                    (unsigned long)g_nic_tx_ok, (unsigned long)g_nic_tx_fail,
+                    (unsigned long)g_net_pump_runs,
+                    (unsigned long)g_net_pump_early,
+                    (unsigned long)g_net_lock_contended);
+            // #745 (task #69): the console's own cost, on the same line as the
+            // network's, because until now nothing measured it and it is the
+            // larger of the two on real hardware.
+            {
+                extern volatile uint64_t g_serial_tx_drops, g_serial_tx_max_us;
+                extern volatile uint64_t g_serial_tx_suppressed;
+                extern volatile int      g_serial_present;
+                extern volatile uint32_t g_serial_lsr_boot, g_serial_lb_read;
+                extern uint64_t g_tcp_bad_cksum;
+                extern uint64_t g_icmp_rx, g_icmp_rx_reject;
+                kprintf("[CONSOLE] present=%d lsr0=0x%02x lb=0x%02x "
+                        "serdrop=%lu sersupp=%lu serus=%lu "
+                        "| rx icmp=%lu/%lu tcpcksum=%lu\n",
+                        g_serial_present,
+                        (unsigned)(g_serial_lsr_boot & 0xFF),
+                        (unsigned)(g_serial_lb_read & 0xFF),
+                        (unsigned long)g_serial_tx_drops,
+                        (unsigned long)g_serial_tx_suppressed,
+                        (unsigned long)g_serial_tx_max_us,
+                        (unsigned long)g_icmp_rx,
+                        (unsigned long)g_icmp_rx_reject,
+                        (unsigned long)g_tcp_bad_cksum);
+            }
+            static char _ndbuf[256];
+            if (net_diag_line(_ndbuf, sizeof(_ndbuf)) > 0)
+                kprintf("[NETDIAG] %s\n", _ndbuf);
+        }
+        kprintf("[HB] tick=%lu uptime=%lus mono=%llums ctxsw=%lu flips=%lu hb=%lu blkc=%lu/%lu wqr=%lu promo=%lu e2w=%lu blkstale=%lu mscnb=%lu %s\n",
                 (unsigned long)ticks, (unsigned long)(ticks / hz), mono_ms(),
                 (unsigned long)g_ctx_switches,
                 (unsigned long)g_fb_flip_count, (unsigned long)n,
-                (unsigned long)blkc_h, (unsigned long)blkc_m, topbuf);
+                (unsigned long)blkc_h, (unsigned long)blkc_m,
+                (unsigned long)g_wq_unpark_rescues,
+                (unsigned long)g_sched_promotions,
+                (unsigned long)g_ext2_lock_waits,
+                (unsigned long)stale_now,
+                (unsigned long)g_msc_noblock_spins, topbuf);
+        dlprof_report();
+
+        // #679: coalesced write-back of runtime permission changes (ownership
+        // recorded at file-create time). No-ops unless the table is dirty; see
+        // perms_sync_if_dirty() in fs/perms.c for why it lives on this thread.
+        { // #693: the janitor thread is the only recipient; it logs and retries next tick
+          if (perms_sync_if_dirty() != 0)
+              kprintf("[PERMS] deferred sync failed; still dirty, will retry\n"); }
         // Use the LIGHTWEIGHT, constant-cost heartbeat writer (separate
         // /HEARTBEAT.TXT, bounded ring) instead of bootlog_write(). The old
         // bootlog_write() rewrote the whole growing /BOOTLOG.TXT every second,
@@ -208,16 +469,179 @@ static void heartbeat_worker(void *arg) {
         // suspect for wedging the iMac ~62s in (#373). bootlog_heartbeat() can
         // never grow without bound, so it cannot reproduce that starvation.
         if (bootlog_is_armed()) {
-            char hb[224];
+            // ---------------------------------------------------------------
+            // #745 (task #62): THE ENRICHED HEARTBEAT RECORD.
+            //
+            // WHY. On the real iMac there is no serial console, so
+            // /HEARTBEAT.TXT on the stick is the ONLY telemetry. The reported
+            // fault is progressive: responsive at boot, unusable inside a
+            // minute, getting worse throughout. That is an ACCUMULATION
+            // signature - something is growing without bound - and the old
+            // record could not name it. It proved the machine slowed (ctxsw,
+            // flips, and top=) but carried no accumulator, so every candidate
+            // had to be re-argued from source instead of read off the disk.
+            //
+            // Each field below exists to CONFIRM OR ELIMINATE one candidate,
+            // and elimination is worth as much as confirmation here:
+            //
+            //   gap=    REAL milliseconds since the previous beat, from
+            //           mono_ms() and never from timer_ticks (which is not a
+            //           wall clock - KVM replays lost ticks in bursts). The
+            //           nominal beat is 2000. #373's signature was this number
+            //           climbing 4000 -> 27000 and then stopping. This is the
+            //           single most important field: it says WHEN the machine
+            //           started dying, and every other field on the same line
+            //           is then read as "what was true at that moment".
+            //   fgap=   longest gap between two frame PRESENTS in this
+            //           interval. gap= is the kernel's own thread; fgap= is
+            //           the user's actual symptom ("the cursor only responds
+            //           one frame in a few seconds") as a number.
+            //   procs=  live process count. A process leak makes every
+            //           scheduler pass and every snapshot walk longer, which
+            //           degrades progressively and looks exactly like this.
+            //   heapKB= kernel heap in use. The generic leak detector: if this
+            //           climbs monotonically the runaway is an allocation.
+            //   tcp=    active TCP connection-table entries. A failing network
+            //           retries; if failed connects leak entries, tcp_timer()
+            //           (called from every pump loop) walks a growing table.
+            //   blkw=   device WRITE calls, and blks= sectors. #373 was a
+            //           write storm over USB-MSC. Nothing previously counted
+            //           writes at all - blkc=h/m is the READ cache.
+            //   blgKB=  bytes the LOGGING subsystem itself has sent to the
+            //           medium. A diagnostic that cannot exonerate itself is
+            //           not a diagnostic, and #373 was precisely the logger
+            //           starving the machine it was logging.
+            //   nskip=  frame presents that declined to service the network
+            //           because net_lock was busy, and txus= the longest
+            //           single NIC transmit. Together these settle the
+            //           original network hypothesis: both near zero means the
+            //           network did not starve the desktop, whatever else did.
+            //
+            // COST. All of these are already-maintained counters plus two
+            // bounded table walks (proc_count, tcp_diag_snapshot) at 0.5 Hz.
+            // The record is longer, which is why the ring grew to 16 KB.
+            // ---------------------------------------------------------------
+            extern uint32_t proc_count(void);
+            extern size_t   heap_get_used_size(void);
+            extern int      tcp_diag_snapshot(int *out_active, int *c, int nc);
+            extern uint64_t g_blk_write_calls, g_blk_write_sectors;
+            extern uint64_t g_bootlog_bytes_written;
+            // #745 (task #62): mscerr= is the trigger for the deadlock this
+            // change closes, and bldef= is the guard firing. mscerr climbing
+            // while the machine slows is the confirmation; mscerr staying 0
+            // eliminates the whole hypothesis on that boot.
+            extern uint64_t g_msc_xfer_errors, g_bootlog_flushes_deferred;
+            extern volatile uint64_t g_flip_gap_max_hb, g_flip_net_skips;
+            extern uint64_t g_nic_tx_max_hb;
+            // #745 (task #69): the three fields that make a 30-second freeze
+            // NAME ITSELF on a machine with no serial console.
+            //   nhold=  longest net_lock hold this interval, in us. The lock
+            //           keeps IF clear for its whole hold, so this is
+            //           milliseconds of "the scheduler did not run", which is
+            //           exactly why the user's "surely the scheduler fixes
+            //           this" intuition does not apply. Compare it against
+            //           fgap= on the same line: if nhold ~ fgap, the network
+            //           lock IS the freeze; if nhold is small while fgap is
+            //           huge, it is not, and that eliminates a whole family.
+            //   nhra=   the return address that held it for nhold. addr2line
+            //           against this build's kernel.elf.
+            //   blgnb=  bootlog device writes refused because the caller had
+            //           IRQs off. Non-zero means the storage-stack-under-
+            //           net_lock path (the one that could wait unboundedly)
+            //           really is being taken, and the guard is earning its
+            //           keep rather than being dead code.
+            //   serdrop= characters the UART refused to accept inside its
+            //           bounded budget, and serus= the longest single-character
+            //           wait. Before #745 task #69 that wait was capped at
+            //           200,000 port-I/O reads PER CHARACTER, which is not a
+            //           time bound at all: on hardware where TX never drains it
+            //           was worth ~0.2s per character, and kprintf runs inside
+            //           net_lock with interrupts off. A non-zero serdrop on a
+            //           machine that stalls says the freeze was the console,
+            //           not the network.
+            //   ser=P/L/B  P = the loopback presence verdict (1 present, 0
+            //           absent/dead), L = the RAW LSR byte read at serial_init
+            //           BEFORE anything was written, B = the byte the loopback
+            //           test read back where 0xAE was expected. THIS IS THE
+            //           FIELD THAT ANSWERS "is the freeze the console?" on a
+            //           machine with no serial console: 0xFF means the port
+            //           floats (characters were dropped cheaply), 0x00 means it
+            //           decodes but never sets THRE (every character was paying
+            //           the full poll).
+            extern volatile uint64_t g_net_lock_hold_max_hb, g_net_lock_hold_max_ra;
+            extern uint64_t g_bootlog_noblock_defers;
+            extern volatile uint64_t g_serial_tx_drops, g_serial_tx_max_us;
+            extern volatile uint64_t g_serial_tx_suppressed;
+            extern volatile int      g_serial_present;
+            extern volatile uint32_t g_serial_lsr_boot, g_serial_lb_read;
+
+            static uint64_t s_prev_beat_ms = 0;
+            uint64_t _now_ms = mono_ms();
+            uint64_t _gap = s_prev_beat_ms ? (_now_ms - s_prev_beat_ms) : 0;
+            s_prev_beat_ms = _now_ms;
+
+            int _tcpact = 0;
+            (void)tcp_diag_snapshot(&_tcpact, 0, 0);
+            uint64_t _khz3 = mono_tsc_khz(); if (!_khz3) _khz3 = 1;
+            // Read-and-reset, so each record describes ITS OWN interval. A
+            // lifetime maximum set once during boot hides everything after it.
+            uint64_t _fgap = g_flip_gap_max_hb; g_flip_gap_max_hb = 0;
+            uint64_t _txc  = g_nic_tx_max_hb;   g_nic_tx_max_hb  = 0;
+            uint64_t _nhold = g_net_lock_hold_max_hb; g_net_lock_hold_max_hb = 0;
+
+            char hb[512];
             snprintf(hb, sizeof(hb),
-                     "[HB] tick=%lu uptime=%lus ctxsw=%lu flips=%lu hb=%lu blkc=%lu/%lu %s",
+                     "[HB] tick=%lu uptime=%lus gap=%lums ctxsw=%lu flips=%lu "
+                     "fgapus=%lu hb=%lu blkc=%lu/%lu procs=%lu heapKB=%lu "
+                     "tcp=%lu blkw=%lu blks=%lu blgKB=%lu nskip=%lu txus=%lu "
+                     "mscerr=%lu bldef=%lu nhold=%luus nhra=%p blgnb=%lu "
+                     "ser=%d/0x%02x/0x%02x serdrop=%lu sersupp=%lu serus=%lu %s",
                      (unsigned long)ticks,
                      (unsigned long)(ticks / hz),
+                     (unsigned long)_gap,
                      (unsigned long)g_ctx_switches,
                      (unsigned long)g_fb_flip_count,
+                     (unsigned long)(_fgap * 1000ULL / _khz3),
                      (unsigned long)n,
-                     (unsigned long)blkc_h, (unsigned long)blkc_m, topbuf);
+                     (unsigned long)blkc_h, (unsigned long)blkc_m,
+                     (unsigned long)proc_count(),
+                     (unsigned long)(heap_get_used_size() / 1024),
+                     (unsigned long)_tcpact,
+                     (unsigned long)g_blk_write_calls,
+                     (unsigned long)g_blk_write_sectors,
+                     (unsigned long)(g_bootlog_bytes_written / 1024),
+                     (unsigned long)g_flip_net_skips,
+                     (unsigned long)(_txc * 1000ULL / _khz3),
+                     (unsigned long)g_msc_xfer_errors,
+                     (unsigned long)g_bootlog_flushes_deferred,
+                     (unsigned long)(_nhold * 1000ULL / _khz3),
+                     (void *)g_net_lock_hold_max_ra,
+                     (unsigned long)g_bootlog_noblock_defers,
+                     g_serial_present,
+                     (unsigned)(g_serial_lsr_boot & 0xFF),
+                     (unsigned)(g_serial_lb_read & 0xFF),
+                     (unsigned long)g_serial_tx_drops,
+                     (unsigned long)g_serial_tx_suppressed,
+                     (unsigned long)g_serial_tx_max_us,
+                     topbuf);
             bootlog_heartbeat(hb);
+
+            // #745 (task #62): A FIRST USB-MSC TRANSFER ERROR MUST REACH THE
+            // DISK. The ring normally persists on a 30-minute schedule or on
+            // the late-beat anomaly, which is right for a slow decline but can
+            // lose the FIRST error - the trigger for the log-recursion
+            // deadlock this change closes, and the single most valuable record
+            // in the file. Flush the moment the count moves. This runs on the
+            // heartbeat thread, which is never inside the storage stack, so it
+            // cannot re-enter the guard it is reporting on. Rate-limited by
+            // construction: the count moves at most once per beat here.
+            {
+                static uint64_t s_prev_mscerr = 0;
+                if (g_msc_xfer_errors != s_prev_mscerr) {
+                    s_prev_mscerr = g_msc_xfer_errors;
+                    (void)bootlog_heartbeat_flush();
+                }
+            }
         }
         proc_sleep(2000);   // ~2 s between heartbeats (lighter USB-MSC load)
     }
@@ -225,9 +649,44 @@ static void heartbeat_worker(void *arg) {
 
 // Kernel main entry point
 // Called from entry.asm with boot_info pointer in RDI
+// #624 step 2: no_stack_protector is REQUIRED, not cosmetic. kernel_main is
+// still on the stack when security_canary_init() replaces __stack_chk_guard,
+// and GCC's epilogue re-reads the global to compare against the copy its
+// prologue saved. A protected kernel_main would therefore trip a FALSE
+// stack-smash panic the moment it returned. It never returns in practice, but
+// depending on that would be depending on an accident.
+__attribute__((no_stack_protector))
 void kernel_main(boot_info_t *boot_info) {
     // Initialize serial port first for debugging
-    serial_init(COM1, 115200);
+    {
+        // #745 (task #69): CONSUME THE PRESENCE VERDICT. This call has always
+        // returned -1 for an absent or dead UART and the result has always been
+        // discarded; serial.c now latches it, and this says so out loud once.
+        // The kprintf is harmless either way: if there is no UART it goes
+        // nowhere, and the same facts ride every [HB] record as ser=P/L/B.
+        extern volatile uint32_t g_serial_lsr_boot, g_serial_lb_read;
+        int _ser = serial_init(COM1, 115200);
+        kprintf("[SERIAL] probe: rc=%d lsr0=0x%02x loopback_read=0x%02x -> %s\n",
+                _ser, (unsigned)(g_serial_lsr_boot & 0xFF),
+                (unsigned)(g_serial_lb_read & 0xFF),
+                _ser == 0 ? "UART PRESENT" : "NO UART (output latched off)");
+    }
+
+    // #672: FIRST diagnostic of the boot, deliberately. Everything printed
+    // after this line is read as evidence, and until #672 the formatter could
+    // silently shift a line's arguments (printing one field's value under
+    // another field's label, and handing an integer to a %s to dereference).
+    // Proving the formatter before trusting anything it prints is the only
+    // order that makes sense.
+    kformat_selftest();
+
+    // #624 step 2: install the real per-boot stack canary IMMEDIATELY, while
+    // the call stack is only entry.asm -> kernel_main (both unprotected), so no
+    // protected frame is holding the old value. Everything compiled after this
+    // point runs against a random 56-bit canary instead of the compile-time
+    // placeholder. Deliberately before almost all other init: a canary that is
+    // installed late protects nothing that ran early.
+    { extern void security_canary_init(void); security_canary_init(); }
 
     kprintf("\n");
     kprintf("========================================\n");
@@ -356,6 +815,17 @@ void kernel_main(boot_info_t *boot_info) {
     // Runs here (after PCI/ATA, interrupts still off) so control transfers are
     // synchronous and the sine table is built before preemption starts.
     gfx_boot_spinner(spinner_frame++); // USB init
+    // #763: usb_hid_init() had ZERO CALLERS. It was declared in usb_hid.h,
+    // defined in usb_hid.c, and never invoked by anything, which is why its
+    // one-line boot output had never been seen in a log. Nothing had broken
+    // because its two jobs were both covered by accident: the device table is
+    // a file static (already zero) and usb_hid_attach() re-wires the key
+    // callback with the comment "ensure the sink is wired". An init function
+    // that is only correct because nothing needed it is one edit away from
+    // being wrong, so it is called now, and it is called BEFORE usb_init()
+    // enumerates: it clears the device table, so calling it afterwards would
+    // erase the very devices enumeration just found.
+    { extern void usb_hid_init(void); usb_hid_init(); }
     { extern void usb_init(void); usb_init(); }
     syslog_log(LOG_INFO, "USB subsystem initialized");
     // #307 real-hardware bring-up: this can't hit disk yet (no filesystem is
@@ -534,16 +1004,16 @@ void kernel_main(boot_info_t *boot_info) {
         extern int smp_init(void);
         extern int smp_start_aps(void);
         extern void smp_selftest(void);
+        (void)smp_start_aps; (void)smp_selftest;   // used at the #67 site below
         madt_init();   // parse MADT (CPU list) - was never called
-        extern int g_smp_user_sched;
-        if (smp_init() == 0 && g_smp_user_sched) {   // #279: only bring up APs when SMP scheduling is enabled
-            smp_start_aps();
-            // Give the AP a moment to finish lapic/gdt/idt/sse setup and reach
-            // its work loop, then run the parallel self-test (proves the AP
-            // executes real kernel work in parallel with the BSP).
-            for (volatile unsigned long d = 0; d < 200000000UL; d++) { }
-            smp_selftest();
-        }
+        // #67: smp_init() (LAPIC bring-up, needed by #71's HDA MSI) still runs
+        // HERE. The AP START has MOVED to after the FAT root is mounted, so the
+        // /SMPSCHED.TXT escape hatch is readable and one kernel binary can be
+        // tested with AP user scheduling both on and off. This changes nothing
+        // in the shipping build: g_smp_user_sched is 0, so smp_start_aps() was
+        // already unreachable at this point (see cpu/smp.c and the
+        // concurrency-lint allowlist, which both record it).
+        smp_init();
     }
     // #71: HDA's real MSI interrupt (needs the Local APIC, which just came up
     // inside smp_init() above) is now armed from the SAME deferred background
@@ -671,6 +1141,23 @@ void kernel_main(boot_info_t *boot_info) {
         }
     }
 
+    // #610: ON-DEVICE FILESYSTEM CHECK. Runs ONLY when the superblock says the
+    // volume was not cleanly unmounted, has a recorded error, or hit its max
+    // mount count. It is READ-ONLY: it reports and (only when it verified the
+    // whole volume clean) clears the flags it just verified. It cannot make the
+    // machine unbootable; the worst case is a slower boot after an unclean stop.
+    // Escape hatch: an empty /NOFSCK file on the FAT ESP skips it permanently.
+    // This runs HERE, before userland, because that is the only moment nothing
+    // is writing and the answer is therefore authoritative.
+    {
+        ext2_fsck_selftest();
+        int skip  = (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/NOFSCK")) ? 1 : 0;
+        // #610: /FSCKBENCH on the ESP runs the check twice (display on, then
+        // off) to MEASURE what the progress display costs. Off by default.
+        int bench = (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/FSCKBENCH")) ? 1 : 0;
+        ext2_fsck_boot_check(skip, bench);
+    }
+
     // #539: DEFERRED USB TO-RAM trigger. Fixes a shipping perf regression on the
     // two-partition golden (small FAT ESP + big ext2 ROOT). TO-RAM was triggered
     // in the USB-mount block above with a hint sized off the FAT ESP alone
@@ -745,6 +1232,97 @@ void kernel_main(boot_info_t *boot_info) {
     { extern void bootlog_arm(fat_fs_t *fs);
       if (g_fat_fs.mounted) bootlog_arm(&g_fat_fs); }
 
+    // #624: CALL THE SECURITY CORE. kernel/security/security_init() existed
+    // with ZERO CALLERS, so SMEP was never enabled while the code's existence
+    // implied otherwise. THIS IS THE CALL SITE. Placed here deliberately:
+    //   - AFTER panic_log_init()/bootlog_arm(), so that if SMEP does fault a
+    //     latent Ring-0-executes-a-user-page bug, the fault is actually
+    //     recorded to /PANIC.TXT and /BOOTLOG.TXT instead of being lost;
+    //   - AFTER the FAT root is mounted, so the /NOSMEP.TXT no-rebuild escape
+    //     hatch is readable;
+    //   - well BEFORE proc_init() (~line 1495) and any Ring-3 entry, which is
+    //     the only point at which SMEP semantics start to matter.
+    {
+        extern void security_init(void);
+        extern void security_smep_set_requested(bool on);
+        if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/NOSMEP.TXT")) {
+            kprintf("[MAIN] #624: /NOSMEP.TXT present, SMEP disabled by config\n");
+            security_smep_set_requested(false);
+        }
+        /* #645: the SMAP counterpart. This escape hatch matters MORE than the
+         * SMEP one. A missed user-memory access under SMAP is a #PF on a path
+         * the kernel takes in normal operation, so the failure mode is "this
+         * machine no longer boots", and the fix must not require the toolchain
+         * that produced the broken image. Same no-rebuild contract: drop an
+         * empty /NOSMAP.TXT at the root of the FAT ESP. */
+        extern void security_smap_set_requested(bool on);
+        if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/NOSMAP.TXT")) {
+            kprintf("[MAIN] #645: /NOSMAP.TXT present, SMAP disabled by config\n");
+            security_smap_set_requested(false);
+        }
+        security_init();
+
+        /* #67: AP BRING-UP + THE SMP USER-SCHEDULING ESCAPE HATCH.
+         *
+         * g_smp_user_sched gates whether ANY application processor is started
+         * (see cpu/smp.c: the old claim that "APs still run kernel jobs in
+         * parallel" was false, which is why a 2-vCPU VM pins exactly one core).
+         * It defaults to 0 and SHIPS at 0 until the redesigned per-cpu run
+         * queue + safe context-switch handoff has been proven against a real
+         * multi-process load, because the failure it guards is a SILENT wedge.
+         *
+         * Drop an empty /SMPSCHED.TXT at the root of the FAT ESP to enable it
+         * for that boot with no rebuild. Placed here, and not at the original
+         * call site further up, purely so the FAT root is mounted and this file
+         * is readable; smp_init() (which the LAPIC and #71's HDA MSI depend on)
+         * still runs at the original point. */
+        {
+            extern int  g_smp_user_sched;
+            extern void smp_user_sched_enable(int on);
+            extern int  smp_start_aps(void);
+            extern void smp_selftest(void);
+            extern uint32_t smp_get_cpu_count(void);
+            extern uint32_t smp_get_online_count(void);
+            if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/SMPSCHED.TXT")) {
+                kprintf("[MAIN] #67: /SMPSCHED.TXT present, ENABLING AP user "
+                        "scheduling (per-cpu run queues, safe handoff)\n");
+                smp_user_sched_enable(1);
+            }
+            sched_smp_selftest();   // policy self-test, both gate states
+            { extern void schedrace_selftest(void); schedrace_selftest(); }  // #75
+            { extern void bkl_probe_selftest(void); extern int g_smp_bkl_full;
+              if (g_smp_bkl_full) bkl_probe_selftest(); }   // #67 pass 9
+            if (g_smp_user_sched) {
+                smp_start_aps();
+                /* Bounded settle before the parallel self-test. This is a
+                 * pre-scheduler context (proc_init() has not run), so there is
+                 * no thread to sleep and wait_event is unavailable; the loop is
+                 * bounded by BOTH a fixed iteration cap and the condition it
+                 * waits for, and it exits as soon as the APs report online. */
+                for (unsigned long d = 0; d < 40000000UL; d++) {
+                    if (smp_get_online_count() >= smp_get_cpu_count()) break;
+                    __asm__ volatile("pause");
+                }
+                kprintf("[MAIN] #67: %u of %u cores online\n",
+                        smp_get_online_count(), smp_get_cpu_count());
+                smp_selftest();
+            } else {
+                kprintf("[MAIN] #67: AP user scheduling OFF (default); user "
+                        "processes run on the BSP only. Add /SMPSCHED.TXT to "
+                        "the ESP to enable.\n");
+            }
+        }
+
+        /* #653: the security event sink used to be started HERE, and that was
+         * wrong. seclog_init() creates a worker thread, and this block runs
+         * well before proc_init() (see the comment above), so proc_create_ex()
+         * had nothing to create into. The thread never ran a single
+         * instruction and /CONFIG/SECURITY.LOG was never written. The call has
+         * moved to just after proc_init(); events raised before that point sit
+         * in the audit ring and are drained on the worker's first wake, which
+         * is what the ring is for. */
+    }
+
     // #433/#373: opt-in USB HID input diagnostics. If /CONFIG/USBDEBUG.CFG is
     // present on the boot disk, turn on the per-report HID trace + per-transfer
     // xHCI event trace. This makes "does a real keypress produce an interrupt-IN
@@ -795,11 +1373,41 @@ void kernel_main(boot_info_t *boot_info) {
     gfx_boot_log("[BOOT] Filesystems: FAT + ext2 drivers ready");
     gfx_boot_log("[BOOT] DOS / C:\\WINDOWS environment ready");
 
+    // #196 / #404: prove the Rust ISO 9660 parsers (live under -DRUST_ISO9660)
+    // == the C references on THIS build, over malformed vectors and a fuzz
+    // corpus, BEFORE any disc image is mounted. Bounded, runs once, logs one
+    // [RUST-DIFF] iso9660 line to serial + /BOOTLOG.
+    { extern void diskimg_iso_rust_selftest(void); diskimg_iso_rust_selftest(); }
+    // #739: the drive-letter policy's own property test. One line, every
+    // boot, so a rule that stops holding shows up in the boot log rather
+    // than as a drive that quietly went missing.
+    { extern void diskimg_drvmap_selftest(void); diskimg_drvmap_selftest(); }
+
+    // #196 live proof harness. No-op unless /CDTEST.TXT exists on the root FS,
+    // so a normal boot pays one failed file open. When present it mounts each
+    // named image on E:, lists its root, checksums a byte range, then mounts the
+    // NEXT image over the top, which is the live disc-swap path. See
+    // dos/diskimg_test.c.
+    { extern void diskimg_boot_harness(void); diskimg_boot_harness(); }
+
     // #404 / #479 Phase B: prove the Rust ip_checksum == the C ip_checksum on
     // THIS build before the network stack (which now computes/validates IP
     // checksums via ip_checksum_rs under -DRUST_IP_CHECKSUM) is brought up.
     // Bounded, runs once, logs one [RUST-DIFF] line to serial + /BOOTLOG.
     ip_checksum_rust_selftest();
+
+    // #745 (task #36): prove the async HTTP job-slot OWNERSHIP state machine
+    // (rustkern/fetchown.rs) on THIS build, before any app can start a fetch,
+    // and prove the Rust module and proc/syscall.c agree about how many slots
+    // each table has. The two properties it enforces are both NEGATIVE (a
+    // non-owner is refused; a dead owner's slot returns to the pool), and an
+    // unobserved negative property is indistinguishable from an absent one.
+    // Bounded, once, one [RUST-SEC] fetchown line.
+    { extern void fetchown_boot_check(void); fetchown_boot_check(); }
+    // #745 task #59: prove the framebuffer ownership rules before anything can
+    // claim the screen (arm/claim/release/re-arm, and the released-means-
+    // disarmed case that is the whole fix).
+    { extern void fbown_boot_check(void); fbown_boot_check(); }
 
     // #404 / #485 Phase C: prove the Rust ext2 directory-block parser
     // (ext2_dirblock_find_rs, live under -DRUST_EXT2_DIRFIND) == the #476-
@@ -807,6 +1415,21 @@ void kernel_main(boot_info_t *boot_info) {
     // ext2 path lookup runs. Bounded, once, one [RUST-DIFF] ext2_dir line.
     extern void ext2_dir_rust_selftest(void);
     ext2_dir_rust_selftest();
+
+    // #605 (extends the #485 seam): prove the Rust ext2 directory-entry INSERT
+    // (ext2_dirblock_insert_rs, live under -DRUST_EXT2_DIRADD) produces a
+    // BYTE-IDENTICAL resulting block and an identical return code to the C
+    // reference over generated and fuzzed directory blocks, on THIS build,
+    // before anything creates a file. Also replays the #597 hostile block
+    // (a record whose name_len does not fit its own rec_len, which made the
+    // pre-#597 C underflow `rec - used` and memcpy past the block buffer).
+    // Bounded, once, one [RUST-DIFF] + one [RUST-SEC] line each.
+    extern void ext2_dirinsert_rust_selftest(void);
+    ext2_dirinsert_rust_selftest();
+    // #746: the block-level REPOINT that makes rename() atomic over an existing
+    // destination. Same [RUST-DIFF] discipline as the two above.
+    extern void ext2_dirrepoint_rust_selftest(void);
+    ext2_dirrepoint_rust_selftest();
 
     // #404 / #486 Phase D: prove the Rust transport checksums == their C
     // references on THIS build before the network stack uses them. TCP is LIVE
@@ -879,6 +1502,18 @@ void kernel_main(boot_info_t *boot_info) {
     // [RUST-PERF] aes line to serial + /BOOTLOG (#426, no busy-wait).
     extern void aes_rust_selftest(void);
     aes_rust_selftest();
+
+    // #615: prove the Rust 4-bit-table GHASH == the bit-serial C reference on
+    // THIS build BEFORE TLS uses AES-GCM. The bit-serial multiply was measured
+    // at 36-40% of one core for an entire App Store download (build 975
+    // [DLPROF]); the table method is an INDEPENDENT algorithm, so this
+    // differential is a genuine cross-check. 4,177 vectors (random single-block
+    // multiplies + every stream length 0..80, which covers the zero-padded
+    // partial tail) plus the NIST GCM AES-128 Test Case 4 known-answer vector
+    // through the LIVE aes_gcm_* API in both directions, plus an RDTSC
+    // benchmark. Bounded, once, no waiting (#426).
+    extern void ghash_rust_selftest(void);
+    ghash_rust_selftest();
 
     // #404 / #493 Phase K: prove the Rust HMAC construction == the C reference on
     // THIS build BEFORE any consumer (TLS 1.3 Finished key schedule, CSPRNG
@@ -1073,6 +1708,8 @@ void kernel_main(boot_info_t *boot_info) {
     // chunk size. Bounded, once (#426). One [RUST-DIFF]/[RUST-PERF]/[RUST-SEC].
     extern void http_parse_rust_selftest(void);
     http_parse_rust_selftest();
+    extern void tlspool_rust_selftest(void);   /* #616 */
+    tlspool_rust_selftest();
 
     // #404 / #505 Phase Z: prove mp4_parse_rs (LIVE under -DRUST_MP4) ==
     // mp4_parse_c (verbatim reference) on well-formed .m4a atom trees (mixed
@@ -1239,7 +1876,7 @@ void kernel_main(boot_info_t *boot_info) {
         // own carrier-gated DAD-verified .200-.209 static fallback if no lease
         // arrives (~12s). This is the default for test VMs and any image without a
         // static netcfg file; the iMac USB carries /NETCFG.TXT to pin its
-        // ICS-segment static (<ICS_HOST>) instead. Previously this branch
+        // ICS-segment static (192.0.2.1) instead. Previously this branch
         // hard-set a static .200, which suppressed DHCP entirely.
         extern int g_net_static_configured;
         if (!g_net_static_configured) {
@@ -1261,14 +1898,14 @@ void kernel_main(boot_info_t *boot_info) {
             kprintf("[NET] Ping #%d to 192.0.2.1...\n", attempt + 1);
 
             // Try to send (may fail first time due to ARP)
-            int result = icmp_ping(0xC0A80101);
+            int result = icmp_ping(0xC0000201);
             if (result < 0) {
                 kprintf("[NET] Send failed (ARP), waiting...\n");
                 for (int i = 0; i < 50; i++) {
                     net_poll();
                     for (int j = 0; j < 5000; j++) io_wait();
                 }
-                result = icmp_ping(0xC0A80101);
+                result = icmp_ping(0xC0000201);
             }
 
             if (result >= 0) {
@@ -1321,6 +1958,9 @@ void kernel_main(boot_info_t *boot_info) {
 
     // Initialize multi-user subsystems
     perms_init();
+    // #736: the guest scratch location. AFTER perms_init(), because it fills an
+    // absent PERMS.DB entry and the database has just been loaded.
+    { extern void dos_scratch_perms(void); dos_scratch_perms(); }
     gfx_boot_log("[BOOT] Permissions database initialized");
     kprintf("[KERNEL] Permissions database initialized\n");
     users_init();
@@ -1346,6 +1986,20 @@ void kernel_main(boot_info_t *boot_info) {
     // Initialize process management
     gfx_boot_log("[BOOT] Initializing process manager...");
     proc_init();
+
+    /* #653: NOW the security event sink can start - proc_init() is done, so
+     * the worker thread can actually be created. Everything security_audit()
+     * recorded during early boot is still in the ring and gets drained on the
+     * first wake. */
+    // #711: GraphFS journal up BEFORE the audit sink, so the sink's very
+    // first drain already has somewhere tamper-evident to write. Refuses
+    // itself (loudly) unless the root is ext2.
+    { extern void gfs_journal_init(void); gfs_journal_init(); }
+    // #711 slice 2: the graph is a fold of the journal, so it comes up
+    // immediately after the journal and before anything can ask it a question.
+    { extern void gfs_fold_init(void); gfs_fold_init(); }
+    { extern void seclog_init(void); seclog_init(); }
+
     kprintf("[KERNEL] Process subsystem initialized\n");
     // #430 (restored b713): init the futex layer now that the process table
     // exists (enables userland pthread mutex/cond/join). Dropped in the churn.
@@ -1407,17 +2061,90 @@ void kernel_main(boot_info_t *boot_info) {
     kprintf("\n[KERNEL] Enabling interrupts...\n");
     sti();
 
+    // #507 DELAY SELF-CHECK. A delay that lies does not fail loudly: it makes
+    // USB enumeration intermittent (#433/#373/#366), which is how the PIT
+    // mode-3 halving survived so long. So measure the shared busy-delay against
+    // an INDEPENDENT reference and print the result every boot.
+    //
+    // The reference is IRQ0 DELIVERY (timer_ticks), which is the right control
+    // precisely because the mode-3 bug could not affect it: mode 3 divides the
+    // input clock by the full reload value to produce its OUTPUT, so the 250 Hz
+    // interrupt rate was always correct. Only direct reads of the COUNTDOWN
+    // REGISTER were 2x fast, and that is what mono_busy_delay_us() is built on.
+    // Two independent mechanisms agreeing is evidence; the clock agreeing with
+    // itself would not be.
+    //
+    // This is the one place ticks are the RIGHT tool: we are deliberately
+    // measuring tick delivery, not using ticks as a deadline (cpu/mono.h).
+    // Cost is the 200 ms it measures, on a ~40 s boot.
+    {
+        extern volatile uint64_t timer_ticks;
+
+        // SETTLE FIRST, or the reference lies. MEASURED on build 980: running
+        // this measurement immediately after sti() reported 15642 ticks for a
+        // 200 ms delay instead of ~50 - a 313x overcount. That is not a bad
+        // delay, it is KVM handing back every tick the guest missed. The PIT
+        // ran the whole boot with interrupts off, kvm-pit's default
+        // lost_tick_policy="delay" queued every one of those ~10-15k ticks, and
+        // sti() releases the entire backlog at once (it drained at ~78k
+        // ticks/sec). This is the #524/#499 reinjection burst, caught in the
+        // act, and it is exactly why nothing in this kernel may use ticks as a
+        // clock. Here we WANT tick delivery as the reference, so we simply wait
+        // for the backlog to clear before trusting it.
+        //
+        // Bounded (#426): at most ~20 x 100 ms. This is a measurement
+        // precondition, not a device poll - there is nothing to wait ON, and a
+        // machine whose tick rate never settles just proceeds and reports what
+        // it saw rather than hanging.
+        for (int i = 0; i < 20; i++) {
+            uint64_t a = timer_ticks;
+            mono_busy_delay_ms(100);
+            if ((timer_ticks - a) * 10ull < (uint64_t)g_timer_hz * 2ull) break;
+        }
+
+        uint64_t t0 = timer_ticks, m0 = mono_ms();
+        mono_busy_delay_ms(200);
+        uint64_t dt = timer_ticks - t0, dm = mono_ms() - m0;
+        uint64_t expect = (uint64_t)g_timer_hz * 200ull / 1000ull;
+        kprintf("[DELAY] mono_busy_delay_ms(200): %llu ticks (expect ~%llu at %u Hz), %llu ms on mono\n",
+                dt, expect, g_timer_hz, dm);
+        bootlog_write("[DELAY] 200ms -> %llu ticks (expect ~%llu), %llu ms mono", dt, expect, dm);
+        // Half or double the expected tick count means the delay is not the
+        // duration it claims. Say so loudly rather than leaving it to be
+        // rediscovered as flaky USB enumeration months later.
+        if (dt < expect * 3 / 4 || dt > expect * 5 / 4) {
+            kprintf("[DELAY] *** WARNING: busy-delay is NOT wall-clock accurate ***\n");
+            bootlog_write("[DELAY] WARNING busy-delay inaccurate: %llu vs %llu", dt, expect);
+        }
+    }
+
     // Enable preemptive multitasking
     sched_set_preemption(true);
-   // Start TCP remote control service (port 2323)
-    remote_ctrl_init();
+    // #566 decision 2: RC-2323 (hardcoded admin/maytera Ring-0 remote shell +
+    // GUI click-injection) is REMOVED from the build entirely. The SSH server
+    // started below is the sanctioned remote path. No listener on 2323, and no
+    // compile flag that could reintroduce it into a golden.
     { extern void win16_autolaunch_init(void); win16_autolaunch_init(); }
-    gfx_boot_log("[BOOT] Remote control service started on port 2323");
-    // Start the SSH server (port 22) if a host key is present (/CONFIG/SSHHOST.KEY).
+    // #697: Offer to start the SSH server. It starts ONLY if /CONFIG/SSHD.CFG
+    // says enable=1; absent config means no listener, no socket, no thread.
+    //
+    // This call used to be guarded by "is /CONFIG/SSHHOST.KEY present", and it
+    // was, on every shipping image, so every shipping image listened on port 22
+    // and (with the compiled-in credential that also lived in ssh2_server.c)
+    // handed out a uid 0 shell to anyone on the network. A host key existing is
+    // not a decision to expose a network service. The decision now lives in
+    // exactly one place, ssh_server_start(), and it fails closed.
+#ifdef MAYTERA_SSHD
+    // #785: compiled out entirely unless the kernel was built MAYTERA_SSHD=1.
+    // A kernel without it has no server code on the image at all, so there is
+    // nothing for a future config or credential regression to expose.
     { extern void ssh_server_start(void); ssh_server_start(); }
-    gfx_boot_log("[BOOT] SSH server starting on port 22");
+#else
+    kprintf("[SSHD] not built into this kernel (build with MAYTERA_SSHD=1)\n");
+#endif
     gfx_boot_log("[BOOT] Preemptive multitasking enabled");
     kprintf("[KERNEL] Preemptive multitasking enabled\n");
+
 
     // task #317: kick off the SMB network-filesystem self-test in a deferred
     // kernel worker (runs ~12s after boot, when the net stack is fully up).
@@ -1440,6 +2167,17 @@ void kernel_main(boot_info_t *boot_info) {
     {
         extern void nettest_start_deferred_selftest(void);
         nettest_start_deferred_selftest();
+    }
+
+    // #332: JPEG decoder boot self-test (gated on /CONFIG/JPGTEST.CFG). Decodes
+    // an embedded baseline plus two PROGRESSIVE (SOF2) JPEGs through the real
+    // image_load_jpeg path and checks dims + sample pixels vs libjpeg ground
+    // truth. SAME dead-code class as nettest above: jpeg_selftest.c has defined
+    // jpeg_start_deferred_selftest() since #332 but NOTHING ever called it, so
+    // the harness never ran once. Wired here (no-op without the CFG flag).
+    {
+        extern void jpeg_start_deferred_selftest(void);
+        jpeg_start_deferred_selftest();
     }
 
     // #323: USB audio boot self-test. If a USB DAC enumerated, a deferred worker
@@ -1476,6 +2214,63 @@ void kernel_main(boot_info_t *boot_info) {
         int hbpid = proc_create("heartbeat", heartbeat_worker, NULL, PRIO_NORMAL);
         kprintf("[HB] heartbeat thread created, pid=%d\n", hbpid);
     }
+    // #745 (task #70): START THE ASYNCHRONOUS CONSOLE DRAIN.
+    //
+    // Here and not earlier, deliberately. g_console_async is set by the drain
+    // thread ITSELF as its first action, so there is never a window in which
+    // kprintf queues output with no thread to write it - which is the "boot
+    // path before any thread exists" risk, closed by construction rather than
+    // by a comment. Everything printed above this line went out synchronously,
+    // exactly as before.
+    //
+    // /CONSYNC.TXT on the FAT ESP forces the old synchronous console for the
+    // whole boot. That is the CONTROL ARM: it lets the same kernel binary be
+    // measured both ways, the way /SMPSCHED.TXT already gates AP scheduling,
+    // so an A/B comparison cannot be confounded by a rebuild.
+    {
+        extern volatile int g_console_async_wanted;
+        extern void console_drain_worker(void *arg);
+        if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/CONSYNC.TXT")) {
+            g_console_async_wanted = 0;
+            kprintf("[CONSOLE] /CONSYNC.TXT present: SYNCHRONOUS console "
+                    "(control arm for #745 task #70)\n");
+        }
+        int cdpid = proc_create("condrain", console_drain_worker, NULL, PRIO_NORMAL);
+        kprintf("[CONDRAIN] drain thread created, pid=%d\n", cdpid);
+
+        // #745 (task #70) DESTRUCTIVE PROOFS, both off unless their marker file
+        // is on the ESP. /CONPANIC.TXT proves a panic still prints everything
+        // the ring was holding; /CONBURST.TXT proves an overflow announces
+        // itself instead of eating lines quietly. A shipping golden has
+        // neither file and never creates this thread.
+        {
+            extern volatile int g_console_test_panic;
+            extern volatile int g_console_test_burst;
+            extern void console_selftest_worker(void *arg);
+            if (fat_exists(&g_fat_fs, "/CONPANIC.TXT")) g_console_test_panic = 1;
+            if (fat_exists(&g_fat_fs, "/CONBURST.TXT")) g_console_test_burst = 1;
+            if (g_console_test_panic || g_console_test_burst) {
+                int tp = proc_create("contest", console_selftest_worker, NULL,
+                                     PRIO_NORMAL);
+                kprintf("[CONTEST] destructive console proof armed "
+                        "(panic=%d burst=%d), pid=%d\n",
+                        g_console_test_panic, g_console_test_burst, tp);
+            }
+        }
+    }
+
+#ifdef FAT_LOCK_SELFTEST
+    // #746 fatlock: does the converted FAT lock still EXCLUDE? Debug builds
+    // only (`make fatlock-selftest` / `make fatlock-selftest-red`); compiles to
+    // nothing in a shipping kernel. See fs/fat_lock_test.c.
+    { extern void fat_lock_selftest_start(void); fat_lock_selftest_start(); }
+#endif
+
+    // #334: arm the debug-gated serial (COM1) synthetic-input channel. No-op
+    // unless /TESTINPUT.TXT is present on the FAT ESP, so a shipping golden
+    // gains zero surface. Lets host test scripts inject keyboard+mouse events
+    // deterministically, bypassing QEMU's lossy PS/2 model, with a serial ACK.
+    { extern void testinput_init(void); testinput_init(); }
 
     // #372 (restored b713): start the Bluetooth worker thread. Gated behind
     // g_bt_enable (default 0); nothing here touches the radio, so it can never
@@ -1500,6 +2295,89 @@ void kernel_main(boot_info_t *boot_info) {
     {
         extern void dos_start_deferred_launch(void);
         dos_start_deferred_launch();
+    }
+
+    // #692: prove the spawn-identity policy is LIVE on this build before
+    // anything uses it, rather than merely compiled in. One serial line.
+    {
+        extern void spawn_ident_selftest(void);
+        spawn_ident_selftest();
+        // #745: prove the session-lock and account-uid policy on THIS build,
+        // rather than trusting that it was compiled in. Loud on failure.
+        // #745 (local 82): the POSIX process-group/session rules and the
+        // poll(2) event classification. Both are pure Rust policy, and both
+        // are mostly REFUSALS, which is exactly the kind of code that can sit
+        // compiled-in and never once run. Proven on THIS build, loudly.
+        {
+            extern uint32_t pgrp_selftest_rs(void);
+            extern uint32_t pollsys_selftest_rs(void);
+            extern uint32_t poll_bits_check(void);
+            uint32_t pf = pgrp_selftest_rs();
+            uint32_t qf = pollsys_selftest_rs();
+            uint32_t bf = poll_bits_check();
+            kprintf("[PGRP] policy self-test %s mask=0x%x\n", pf ? "FAIL" : "PASS", pf);
+            kprintf("[POLL] classify self-test %s mask=0x%x, vfs bits %s mask=0x%x\n",
+                    qf ? "FAIL" : "PASS", qf, bf ? "MISMATCH" : "match", bf);
+            bootlog_write("[PGRP] self-test %s mask=0x%x; [POLL] self-test %s mask=0x%x bits=0x%x",
+                          pf ? "FAIL" : "PASS", pf, qf ? "FAIL" : "PASS", qf, bf);
+        }
+        {
+            extern uint32_t sessionid_selftest_rs(void);
+            uint32_t sfails = sessionid_selftest_rs();
+            if (sfails == 0) kprintf("[SESSIONID] policy self-test PASS (rust)\n");
+            else             kprintf("[SESSIONID] policy self-test FAIL mask=0x%x\n", sfails);
+            bootlog_write("[SESSIONID] policy self-test %s mask=0x%x",
+                          sfails ? "FAIL" : "PASS", sfails);
+        }
+        // #745: the elevation mechanism. Proves on THIS build that the grant's
+        // path-coverage test refuses "/APPS/../CONFIG/SHADOW", that the
+        // sanitiser strips control bytes and truncates, and that the state
+        // machine really is one-at-a-time / three-attempts / expiry-DENIES.
+        // Every one of those is a refusal, and a refusal that was never
+        // exercised is a claim, not a control.
+        {
+            extern void elevate_selftest(void);
+            elevate_selftest();
+        }
+        // #745: the /CONFIG/LOGIN.CFG contract. Proves on THIS build that the
+        // sign-in mode parses the one way it is allowed to, and - the case that
+        // matters - that composing the file for an autologin change PRESERVES
+        // the login_mode line instead of erasing it. A silent erase there would
+        // look exactly like "the setting did not stick".
+        {
+            extern uint32_t loginmode_selftest_rs(void);
+            uint32_t lfails = loginmode_selftest_rs();
+            if (lfails == 0) kprintf("[LOGINMODE] LOGIN.CFG contract self-test PASS (rust)\n");
+            else             kprintf("[LOGINMODE] LOGIN.CFG contract self-test FAIL mask=0x%x\n", lfails);
+            bootlog_write("[LOGINMODE] LOGIN.CFG contract self-test %s mask=0x%x",
+                          lfails ? "FAIL" : "PASS", lfails);
+        }
+        // Password strength + breached-password policy. Proves on THIS build
+        // that a known-breached password is refused and a strong one is
+        // accepted, and that the 66 KB breach table is actually linked in: a
+        // missing or malformed table would disable the breach check with no
+        // other symptom at all.
+        {
+            uint32_t pfails = pwpolicy_selftest_rs();
+            pw_policy_info_t pi;
+            pw_policy_info_rs(&pi);
+            kprintf("[PWPOLICY] self-test %s mask=0x%x; min=%u max=%u distinct=%u; "
+                    "breach table %u entries (%u bytes, min_len %u)\n",
+                    pfails ? "FAIL" : "PASS", pfails,
+                    pi.min_len, pi.max_len, pi.min_distinct,
+                    pi.table_entries, pi.table_bytes, pi.table_min_len);
+            bootlog_write("[PWPOLICY] self-test %s mask=0x%x; breach table %u entries",
+                          pfails ? "FAIL" : "PASS", pfails, pi.table_entries);
+        }
+    }
+
+    // #708: same reasoning for the DOS/Win16 guest filesystem gate. It asserts
+    // the fail-closed default (an unarmed slot DENIES), that an ordinary uid is
+    // refused /CONFIG/SHADOW, and that root is not, i.e. that the gate really
+    // is calling perms_check() rather than denying everything unconditionally.
+    {
+        extern void guestfs_boot_selftest(void);
+        guestfs_boot_selftest();
     }
 
     // #265 (restored b713): cron-like timer/scheduler. Build the registry
@@ -1577,10 +2455,14 @@ void kernel_main(boot_info_t *boot_info) {
           if (g_fat_fs.mounted) selfupdate_boot_check(&g_fat_fs); }
 #endif
 
+        // #566 LOGIN GATE LOOP. Once any session authenticates this boot, an
+        // exited/dead desktop returns HERE (re-show login), never to the
+        // unauthenticated Ring-0 kernel_shell() below (decision 3, design 3.3a).
+        login_result_t login_result;
+        for (;;) {
         // Run login screen before desktop
         kprintf("[GUI] Starting login screen...\n");
         login_init();
-        login_result_t login_result;
         gfx_boot_log("[BOOT] Starting login screen...");
         login_run(&login_result);
         gfx_boot_log("[BOOT] Login complete, starting desktop...");
@@ -1589,7 +2471,47 @@ void kernel_main(boot_info_t *boot_info) {
         desktop_set_session(login_result.uid, login_result.gid);
         if (login_result.home[0]) {
             fat_mkdir(&g_fat_fs, login_result.home);
+            // #745: mkdir alone left the home ROOT-OWNED, so at uid 0 it worked
+            // by accident and at any other uid the user could not write their
+            // own home. Claim it for the session user, but only when it is not
+            // already theirs: perms_set marks PERMS.DB dirty, and rewriting it
+            // on every single login is a disk write for nothing.
+            //
+            // Deliberately not applied to root's home "/": the filesystem root
+            // is not a home directory and must keep its own 0755 root ownership.
+            if (!(login_result.home[0] == '/' && login_result.home[1] == '\0')) {
+                uint32_t howner = 0, hgroup = 0; uint16_t hmode = 0;
+                int have = perms_get(login_result.home, &howner, &hgroup, &hmode);
+                if (have != 0 || howner != login_result.uid || hgroup != login_result.gid) {
+                    perms_set(login_result.home, login_result.uid, login_result.gid, 0750);
+                    bootlog_write("[SESSION] home '%s' claimed for %u:%u (#745)",
+                                  login_result.home,
+                                  (unsigned)login_result.uid, (unsigned)login_result.gid);
+                }
+                // The skeleton subdirectories are created no-op-if-present and
+                // are stamped with the same ownership, so a home that predates
+                // this change is repaired rather than left half-owned.
+                users_make_home_skeleton(login_result.home,
+                                         login_result.uid, login_result.gid);
+            }
         }
+
+        // #684: PROVISION the AI key from the seed, ONCE, as root.
+        //
+        // The user's decision is that /CONFIG/KIMI.KEY is a deployment SEED,
+        // not something an app reads: "this kimi.key file should only be used
+        // to write that value to settings (in a way that's protected from other
+        // users and apps) not be called directly by the ai chat app". So this,
+        // running in Ring 0 at session start, is the ONLY reader of that file
+        // in the whole system, and it copies the value into the user's own
+        // protected settings.
+        //
+        // Every branch here is a no-op on a normal deployment: the seed is
+        // ABSENT (nothing to do), or the user already has settings (never
+        // overwrite what they typed into Settings). It is deliberately not a
+        // "sync": a user who clears their key must not have it restored on the
+        // next login.
+        provision_ai_key(&login_result);
 
         // #95: build the background services registry now (parses
         // /CONFIG/SERVICES.CFG). Actually starting the services is deferred
@@ -1599,7 +2521,8 @@ void kernel_main(boot_info_t *boot_info) {
         // the kernel identity map, faulting in elf_load_user. Once the
         // compositor is up the allocator is in the same steady state used
         // for every on-demand app launch, so service spawns are safe.
-        svc_init();
+        // Guarded: build the registry once, not on every login-gate iteration.
+        { static int s_svc_inited = 0; if (!s_svc_inited) { svc_init(); s_svc_inited = 1; } }
     gfx_boot_log("[BOOT] Background services registry built");
 
 #ifdef SECTEST_CV_FETCH
@@ -1666,17 +2589,19 @@ void kernel_main(boot_info_t *boot_info) {
         syslog_log(LOG_INFO, "Desktop environment starting");
         desktop_run();
 
-        // If GUI exits, fall back to shell
-        kprintf("[GUI] Desktop exited, falling back to shell\n");
-        console_clear();
-        console_set_colors(FB_CYAN, FB_BLACK);
-        console_puts("========================================\n");
-        console_puts("  MayteraOS 64-bit Kernel v1.0\n");
-        console_puts("========================================\n\n");
-        console_set_colors(FB_WHITE, FB_BLACK);
+        // #566 decision 3: the desktop process exited. DO NOT fall through to an
+        // unauthenticated Ring-0 shell. Loop back to the login gate so the next
+        // thing on screen is authentication, exactly like a fresh boot. On a
+        // framebuffer machine this loop never terminates.
+        kprintf("[GUI] Desktop exited; returning to login gate (no shell fallback)\n");
+        syslog_log(LOG_INFO, "Desktop exited; returning to login gate");
+        gfx_boot_log("[BOOT] Desktop exited; re-showing login gate");
+        } // end #566 login-gate for(;;)
     }
 
-    // Run simple shell (fallback or no framebuffer)
+    // The kernel shell is reachable ONLY when there is no framebuffer at all
+    // (headless/serial bring-up, before any GUI session can exist). After a GUI
+    // session has authenticated it is unreachable (see the login-gate loop).
     kernel_shell();
 
 halt:
@@ -1697,84 +2622,20 @@ static void shell_print(const char *str) {
 }
 
 static void shell_printf(const char *fmt, ...) {
+    // #672: was the weakest of the five parsers, with no flags and no width at
+    // all, so every "%04x" in this kernel printed "04x" and consumed nothing.
+    // Routed through the one shared parser.
     char buf[256];
     va_list args;
     va_start(args, fmt);
-
-    // Simple format
-    char *out = buf;
-    char *end = buf + sizeof(buf) - 1;
-
-    while (*fmt && out < end) {
-        if (*fmt != '%') {
-            *out++ = *fmt++;
-            continue;
-        }
-        fmt++;
-        switch (*fmt) {
-            case 's': {
-                const char *s = va_arg(args, const char *);
-                while (s && *s && out < end) *out++ = *s++;
-                break;
-            }
-            case 'd': {
-                int v = va_arg(args, int);
-                char num[32]; int i = 0;
-                int neg = v < 0;
-                if (neg) v = -v;
-                do { num[i++] = '0' + v % 10; v /= 10; } while (v);
-                if (neg) num[i++] = '-';
-                while (i-- > 0 && out < end) *out++ = num[i];
-                break;
-            }
-            case 'u': {
-                unsigned int v = va_arg(args, unsigned int);
-                char num[32]; int i = 0;
-                do { num[i++] = '0' + v % 10; v /= 10; } while (v);
-                while (i-- > 0 && out < end) *out++ = num[i];
-                break;
-            }
-            case 'l': {
-                fmt++;
-                uint64_t v = va_arg(args, uint64_t);
-                char num[32]; int i = 0;
-                do { num[i++] = '0' + v % 10; v /= 10; } while (v);
-                while (i-- > 0 && out < end) *out++ = num[i];
-                break;
-            }
-            case 'x': {
-                unsigned int v = va_arg(args, unsigned int);
-                char num[32]; int i = 0;
-                do { num[i++] = "0123456789abcdef"[v & 0xf]; v >>= 4; } while (v);
-                while (i-- > 0 && out < end) *out++ = num[i];
-                break;
-            }
-            case 'c': {
-                int c = va_arg(args, int);
-                if (out < end) *out++ = (char)c;
-                break;
-            }
-            case 'p': {
-                uint64_t v = (uint64_t)va_arg(args, void*);
-                *out++ = '0'; *out++ = 'x';
-                char num[32]; int i = 0;
-                do { num[i++] = "0123456789abcdef"[v & 0xf]; v >>= 4; } while (v);
-                while (i-- > 0 && out < end) *out++ = num[i];
-                break;
-            }
-            default:
-                if (out < end) *out++ = *fmt;
-                break;
-        }
-        fmt++;
-    }
-    *out = '\0';
+    vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
 
     kprintf("%s", buf);
     if (g_boot_info && g_boot_info->framebuffer.address) {
         console_puts(buf);
     }
+
 }
 
 static void shell_putc(char c) {
@@ -1837,6 +2698,7 @@ void kernel_shell(void) {
                         shell_print("  help    - Show this help\n");
                         shell_print("  mem     - Show memory info\n");
                         shell_print("  pmm     - Show physical memory stats\n");
+                        shell_print("  security- Show security posture (#646)\n");
                         shell_print("  heap    - Show heap stats\n");
                         shell_print("  fb      - Show framebuffer info\n");
                         shell_print("  ticks   - Show timer ticks\n");
@@ -1860,6 +2722,10 @@ void kernel_shell(void) {
                         shell_print("  pwd     - Print working directory\n");
                         shell_print("  cat     - Show file contents\n");
                         shell_print("  mount   - Mount FAT partition\n");
+                        shell_print("  fsck    - Check the ext2 root (READ-ONLY, no repair)\n");
+                        shell_print("Diagnostics:\n");
+                        shell_print("  hblog   - Show the in-RAM heartbeat ring (no disk write)\n");
+                        shell_print("  logflush - Persist the heartbeat ring to /HEARTBEAT.TXT now\n");
                         shell_print("System:\n");
                         shell_print("  shutdown - Power off system (ACPI)\n");
                         shell_print("  reboot  - Reboot system\n");
@@ -1868,9 +2734,49 @@ void kernel_shell(void) {
                         shell_print("  wget    - Fetch URL (wget <url>)\n");
                         shell_print("  splash  - Show boot splash screen\n");
                         shell_print("\nPress Ctrl+C to cancel running commands\n");
+                    } else if (strcmp(command_buffer, "hblog") == 0) {
+                        // #748: the heartbeat ring is RAM-resident between its
+                        // 30-minute flushes, so give it a reader that does not
+                        // touch the disk at all. Printing it is free; the point
+                        // of the change was to stop WRITING it 1800 times an
+                        // hour, not to stop anyone looking at it.
+                        const char *ring = 0;
+                        uint32_t rl = bootlog_heartbeat_ring(&ring);
+                        uint64_t beats = 0, flushes = 0;
+                        bootlog_heartbeat_stats(&beats, &flushes);
+                        uint32_t i = 0;
+                        while (i < rl) {
+                            char lb[240];
+                            uint32_t j = 0;
+                            while (i < rl && ring[i] != '\n' && j < sizeof(lb) - 2) lb[j++] = ring[i++];
+                            while (i < rl && ring[i] != '\n') i++;   // drop an over-long tail
+                            if (i < rl) i++;                          // consume the newline
+                            lb[j++] = '\n'; lb[j] = 0;
+                            shell_print(lb);
+                        }
+                        shell_printf("[hblog] %lu bytes, %lu beats recorded, "
+                                     "%lu device writes\n",
+                                     (unsigned long)rl, (unsigned long)beats,
+                                     (unsigned long)flushes);
+                    } else if (strcmp(command_buffer, "logflush") == 0) {
+                        int rc = bootlog_heartbeat_flush();
+                        if (rc == 0) shell_print("[logflush] /HEARTBEAT.TXT persisted\n");
+                        else         shell_printf("[logflush] FAILED rc=%d - the ring is "
+                                                  "still only in RAM\n", rc);
                     } else if (strcmp(command_buffer, "mem") == 0) {
                         shell_printf("Total RAM: %lu MB\n", g_boot_info->total_memory / MB);
                         shell_printf("Memory map entries: %u\n", g_boot_info->memory_map_entries);
+                    } else if (strcmp(command_buffer, "security") == 0) {
+                        // #646: security_print_status() gathers the whole
+                        // posture into one report and had ZERO callers, so the
+                        // report was unreachable and its three sub-printers
+                        // with it. Given a call site rather than deleted,
+                        // because after the honesty pass it now states the
+                        // MEASURED posture (what is randomised, what is not,
+                        // SMAP held off, Nova loaded but not enforcing) rather
+                        // than reciting feature names.
+                        extern void security_print_status(void);
+                        security_print_status();
                     } else if (strcmp(command_buffer, "pmm") == 0) {
                         kprintf_set_dual_output(1);
                         pmm_print_stats();
@@ -2277,6 +3183,40 @@ void kernel_shell(void) {
                         }
                     } else if (strcmp(command_buffer, "cd") == 0) {
                         strcpy(g_cwd, "/");
+                    } else if (strcmp(command_buffer, "fsck") == 0) {
+                        // #610: user-runnable, REPORT-ONLY ext2 check. There is
+                        // deliberately no repair mode and no --fix flag: #609 is
+                        // this project's own proof that a repairing fsck can
+                        // destroy the very data it is asked to save.
+                        if (!ext2_is_mounted()) {
+                            shell_print("fsck: no ext2 volume mounted\n");
+                        } else {
+                            uint32_t why = ext2_fsck_needed();
+                            shell_printf("fsck: ext2 root; s_state at mount 0x%x, mount count %u%s\n",
+                                         (unsigned)ext2_state_at_mount(),
+                                         (unsigned)ext2_mnt_count(),
+                                         why ? "  [volume wants checking]" : "  [last unmount was clean]");
+                            shell_print("fsck: READ-ONLY report. Nothing is repaired.\n");
+                            shell_print("fsck: the volume is MOUNTED and live, so a write in flight can\n");
+                            shell_print("      surface as a spurious mismatch; the boot-time check (run\n");
+                            shell_print("      before userland starts) is the authoritative one.\n");
+                            ext2_fsck_report_t *rep =
+                                (ext2_fsck_report_t *)kmalloc(sizeof(ext2_fsck_report_t));
+                            if (!rep) {
+                                shell_print("fsck: out of memory\n");
+                            } else {
+                                int frc = ext2_fsck_run(rep);
+                                if (frc != 0 || !rep->completed) {
+                                    shell_printf("fsck: could NOT run (rc=%d). This is not a clean result.\n", frc);
+                                } else {
+                                    kprintf_set_dual_output(1);
+                                    ext2_fsck_print(rep, 0);
+                                    kprintf_set_dual_output(0);
+                                    shell_printf("fsck: %u problem(s) found\n", (unsigned)rep->total);
+                                }
+                                kfree(rep);
+                            }
+                        }
                     } else if (strcmp(command_buffer, "shutdown") == 0) {
                         shell_print("Shutting down...\n");
                         acpi_shutdown();

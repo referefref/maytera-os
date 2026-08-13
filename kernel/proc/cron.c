@@ -36,6 +36,16 @@ typedef struct {
     uint8_t  persist;        // write to /CONFIG/CRON.CFG
     volatile uint8_t pending;// set by cron_tick (hint), cleared by worker
     uint32_t last_wall_key;  // wall-clock dedup for DAILY/WEEKLY
+    // #692: WHO this job runs as. A cron job is the sharp edge of the
+    // spawn-identity bug: the worker that fires it is a KERNEL THREAD, so
+    // the launched program used to inherit uid 0. Once the desktop session
+    // is not root, that turns a user-created job into a root process, which
+    // is privilege escalation created BY making root mean something.
+    //
+    // The owner is stamped by the KERNEL from the caller of cron_add(); it
+    // is deliberately NOT part of cron_job_t, the userland wire struct, so
+    // Ring 3 cannot ask for a job that runs as somebody else.
+    uint32_t owner_uid;
 } cron_slot_t;
 
 static cron_slot_t g_jobs[CRON_MAX_JOBS];
@@ -73,6 +83,58 @@ static void cron_app_str(char *buf, int *pos, int cap, const char *s) {
 static void cron_app_2d(char *buf, int *pos, int cap, uint32_t v) {
     if (*pos < cap - 1) buf[(*pos)++] = (char)('0' + (v / 10) % 10);
     if (*pos < cap - 1) buf[(*pos)++] = (char)('0' + v % 10);
+}
+
+// ---------------------------------------------------------------------------
+// #698 / #700 B4: CONTROL 2 of 3 - the SERIALIZER cannot emit a separator.
+//
+// Control 1 (validation in cron_add_common) is the one that runs today. This is
+// the one that still holds when control 1 is wrong. Validation is a list of
+// characters somebody remembered to forbid, and the entire history in blame.md
+// is of controls that were accurate when written and quietly stopped covering
+// the cases that mattered. Escaping is not a list: any byte that is not plainly
+// safe becomes "%XX", so a newline, a tab or a space CANNOT reach the file no
+// matter what a future caller, a future field, or a relaxed validator allows.
+// A record separator that the writer is incapable of producing is not a
+// vulnerability that can be reintroduced by editing a different function.
+//
+// Round-trip: '%' itself is escaped, so decoding is exact and unambiguous.
+// Backwards compatible with the existing on-disk file, which contains no '%'.
+static void cron_app_esc(char *buf, int *pos, int cap, const char *s) {
+    static const char HX[] = "0123456789ABCDEF";
+    for (; *s && *pos < cap - 4; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c > 0x20 && c < 0x7F && c != '%') {
+            buf[(*pos)++] = (char)c;
+        } else {
+            buf[(*pos)++] = '%';
+            buf[(*pos)++] = HX[(c >> 4) & 0xF];
+            buf[(*pos)++] = HX[c & 0xF];
+        }
+    }
+}
+
+static int cron_hexval(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return -1;
+}
+
+// Decode in place. A malformed "%" sequence is left literal rather than
+// guessed at, so a hand-edited file degrades to a wrong-looking target (which
+// then fails cron_field_ok) instead of a silently different one.
+static void cron_unescape(char *s) {
+    char *w = s;
+    for (const char *r = s; *r; ) {
+        if (r[0] == '%' && cron_hexval(r[1]) >= 0 && cron_hexval(r[2]) >= 0) {
+            *w++ = (char)((cron_hexval(r[1]) << 4) | cron_hexval(r[2]));
+            r += 3;
+        } else {
+            *w++ = *r++;
+        }
+    }
+    *w = '\0';
 }
 
 static uint64_t cron_ms_to_ticks(uint32_t ms) {
@@ -180,38 +242,116 @@ static void cron_schedule_first(cron_slot_t *s) {
 }
 
 // Core add. If persist!=0 the registry is flushed to disk afterwards.
-static void cron_save(void);
+// #693: 0 only if /CONFIG/CRON.CFG is on the medium.
+static int cron_save(void);
 
-static int cron_add_common(const cron_job_t *job, int persist) {
+// ---------------------------------------------------------------------------
+// #698 / #700 B4: CONTROL 1 of 3 - reject the injection at the door.
+//
+// THE BUG. cron_add_common() validated the type and action enums and nothing
+// else. job.target[64] and job.label[32] arrive from a Ring-3 caller and were
+// copied VERBATIM into the line cron_save() writes. The persisted format is
+// newline-separated records of whitespace-separated fields, so a target
+// containing a newline writes a SECOND RECORD that the caller composes.
+//
+// MEASURED, before this fix, on golden 1025, from uid 1000:
+//   target = "X\nINTERVAL 10 launch /APPS/WHOAMI uid=0"   (39 of 63 bytes)
+// produced in /CONFIG/CRON.CFG:
+//   ONESHOT 3600 launch X
+//   INTERVAL 10 launch /APPS/WHOAMI uid=0 uid=1000 sgp-inject
+// and on the NEXT boot:
+//   [CRON] added job 2 INTERVAL launch '/APPS/WHOAMI' ... owner uid=0
+//   [CRON] launched '/APPS/WHOAMI' pid 26 as uid=0        (repeatedly)
+//
+// WHY #692 DID NOT STOP IT, and why that is the interesting part. #692 removed
+// the caller's ability to CLAIM an identity: the owner is stamped by the kernel
+// from the calling process and is not in the userland wire struct at all. This
+// attack never claims anything. It is stamped honestly as uid=1000, and then
+// writes bytes that a later, entirely legitimate read turns into a root job. An
+// authorization control on the request cannot see it, because the request is
+// authorized. The vulnerable surface is the SERIALIZER.
+//
+// A target is a program path, a callback name or an event name. None of those
+// contain whitespace or control characters, so the safe set is exactly the
+// printable non-space bytes. A label is free text on the tail of the line, so it
+// may hold spaces, but never a control character.
+static int cron_field_ok(const char *s, int max, int allow_space) {
+    int i = 0;
+    for (; i < max && s[i]; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x20 || c == 0x7F) return 0;                 // \n, \r, \t, NUL-adjacent
+        if (c == ' ' && !allow_space) return 0;              // would split a field
+    }
+    return (i < max);      // must have been NUL-terminated inside the array
+}
+
+static int cron_add_common(const cron_job_t *job, int persist, uint32_t owner_uid) {
     if (!g_inited) cron_init();
     if (!job) return -1;
     if (job->type > CRON_TYPE_WEEKLY || job->action > CRON_ACT_EVENT) return -2;
+
+    // #698: a Ring-3 struct is not required to be NUL-terminated. Terminate a
+    // local copy FIRST, or cron_app_str() walks target straight into label.
+    cron_job_t jc = *job;
+    jc.target[CRON_TARGET_MAX - 1] = '\0';
+    jc.label[CRON_LABEL_MAX - 1]   = '\0';
+
+    if (jc.target[0] == '\0') return -5;
+    if (!cron_field_ok(jc.target, CRON_TARGET_MAX, 0) ||
+        !cron_field_ok(jc.label,  CRON_LABEL_MAX,  1)) {
+        kprintf("[CRON] REJECTED add from uid=%u: target/label carries whitespace "
+                "or a control character (record-separator injection, #698)\n",
+                owner_uid);
+        return -6;
+    }
+    // A target that is itself an owner token would be ambiguous with the field
+    // the kernel writes. Cheap to forbid; there is no legitimate such target.
+    if (jc.target[0]=='u' && jc.target[1]=='i' && jc.target[2]=='d' && jc.target[3]=='=')
+        return -6;
+
     cron_slot_t *s = cron_alloc_slot();
     if (!s) return -3;
     memset(s, 0, sizeof(*s));
-    s->j = *job;
+    s->j = jc;
     s->j.id = g_next_id++;
     s->j.run_count = 0;
     s->used = 1;
     s->persist = persist ? 1 : 0;
     s->last_wall_key = 0xFFFFFFFFu;
+    s->owner_uid = owner_uid;
     cron_schedule_first(s);
-    if (persist) cron_save();
-    kprintf("[CRON] added job %u %s %s '%s' (%s)\n",
+    // #693: the job is live in memory but would not survive a reboot.
+    if (persist && cron_save() != 0) return -1;
+    kprintf("[CRON] added job %u %s %s '%s' (%s) owner uid=%u\n",
             s->j.id, cron_type_name(s->j.type), cron_act_name(s->j.action),
-            s->j.target, s->j.label[0] ? s->j.label : "-");
+            s->j.target, s->j.label[0] ? s->j.label : "-", s->owner_uid);
     return (int)s->j.id;
 }
 
-int cron_add(const cron_job_t *job)          { return cron_add_common(job, 1); }
-int cron_add_volatile(const cron_job_t *job) { return cron_add_common(job, 0); }
+// #692: SYS_CRON_ADD lands here. The owner is taken from the CALLING Ring-3
+// process and can never be chosen by the caller. A caller that is not a
+// Ring-3 process (i.e. a kernel thread) is refused rather than defaulted to
+// root, because "the parent happened to be a kernel thread" is exactly how
+// this bug worked.
+int cron_add(const cron_job_t *job) {
+    uint32_t uid = 0, gid = 0;
+    extern int spawnid_caller_ident(uint32_t *uid_out, uint32_t *gid_out);
+    if (spawnid_caller_ident(&uid, &gid) != 0) {
+        kprintf("[CRON] refusing add: no Ring-3 caller to own the job\n");
+        return -4;
+    }
+    return cron_add_common(job, 1, uid);
+}
+
+// Built-in / self-test jobs. Kernel-authored, so root, stated explicitly.
+int cron_add_volatile(const cron_job_t *job) { return cron_add_common(job, 0, 0); }
 
 int cron_remove(uint32_t id) {
     cron_slot_t *s = cron_find_id(id);
     if (!s) return -1;
     int was_persist = s->persist;
     memset(s, 0, sizeof(*s));
-    if (was_persist) cron_save();
+    if (was_persist && cron_save() != 0) return -1;
     kprintf("[CRON] removed job %u\n", id);
     return 0;
 }
@@ -222,7 +362,7 @@ int cron_enable(uint32_t id, int enable) {
     s->j.enabled = enable ? 1 : 0;
     if (enable && (s->j.type == CRON_TYPE_INTERVAL || s->j.type == CRON_TYPE_ONESHOT))
         cron_schedule_first(s);   // re-arm relative to now
-    if (s->persist) cron_save();
+    if (s->persist && cron_save() != 0) return -1;
     return 0;
 }
 
@@ -237,16 +377,36 @@ int cron_list(cron_job_t *out, int max) {
 // ---------------------------------------------------------------------------
 // Persistence: /CONFIG/CRON.CFG
 // ---------------------------------------------------------------------------
-static void cron_save(void) {
-    if (!g_fat_fs.mounted) return;
+static int cron_save(void) {
+    // #693: no filesystem is a real failure to persist, not a silent no-op.
+    if (!g_fat_fs.mounted) return -1;
     static char buf[4096];
     int pos = 0;
+    // #698 / #700 B4: the owner is now the FIRST field, ahead of every byte the
+    // caller chose, and it is mandatory. This follows #692's principle into the
+    // persisted format: the kernel-stamped identity is not something that sits
+    // downstream of user data and can be displaced by it.
+    //
+    // Being precise about what this does and does not buy, because overstating
+    // it is how a control gets trusted for the wrong reason: field order does
+    // NOT prevent injection. An attacker who can write a newline writes a whole
+    // line and can put "uid=0" first just as easily as fifth. What it buys is
+    // that the OLD field order no longer parses at all, so a pre-#698 line (or
+    // one written by an older kernel) fails closed instead of being read with
+    // the owner in the wrong place; and that "no owner" is now unrepresentable
+    // rather than defaulting to root. The anti-injection controls are
+    // cron_field_ok() and cron_app_esc().
     const char *hdr = "# MayteraOS cron jobs (#265). Auto-generated; edit with care.\n"
-                      "# <TYPE> <WHEN> <ACTION> <TARGET> [label]\n";
+                      "# uid=<owner> <TYPE> <WHEN> <ACTION> <TARGET> [label]\n"
+                      "# TARGET and label are %XX-escaped (#698). uid= is mandatory;\n"
+                      "# a line without it is REJECTED, never assumed to be root's.\n";
     cron_app_str(buf, &pos, sizeof(buf), hdr);
     for (int i = 0; i < CRON_MAX_JOBS; i++) {
         cron_slot_t *s = &g_jobs[i];
         if (!s->used || !s->persist) continue;
+        cron_app_str(buf, &pos, sizeof(buf), "uid=");
+        cron_app_u(buf, &pos, sizeof(buf), s->owner_uid);
+        buf[pos < (int)sizeof(buf) - 1 ? pos++ : pos] = ' ';
         cron_app_str(buf, &pos, sizeof(buf), cron_type_name(s->j.type));
         buf[pos < (int)sizeof(buf) - 1 ? pos++ : pos] = ' ';
         switch (s->j.type) {
@@ -270,15 +430,21 @@ static void cron_save(void) {
         buf[pos < (int)sizeof(buf) - 1 ? pos++ : pos] = ' ';
         cron_app_str(buf, &pos, sizeof(buf), cron_act_name(s->j.action));
         buf[pos < (int)sizeof(buf) - 1 ? pos++ : pos] = ' ';
-        cron_app_str(buf, &pos, sizeof(buf), s->j.target);
+        // #698: ESCAPED, not raw. This is the line that wrote the attacker's
+        // newline into the file.
+        cron_app_esc(buf, &pos, sizeof(buf), s->j.target);
         if (s->j.label[0]) {
             buf[pos < (int)sizeof(buf) - 1 ? pos++ : pos] = ' ';
-            cron_app_str(buf, &pos, sizeof(buf), s->j.label);
+            cron_app_esc(buf, &pos, sizeof(buf), s->j.label);
         }
         buf[pos < (int)sizeof(buf) - 1 ? pos++ : pos] = '\n';
     }
     buf[pos < (int)sizeof(buf) ? pos : (int)sizeof(buf) - 1] = '\0';
-    fat_write_file(&g_fat_fs, "/CONFIG/CRON.CFG", buf, (uint32_t)pos);
+    int rc = fat_write_file(&g_fat_fs, "/CONFIG/CRON.CFG", buf, (uint32_t)pos);
+    if (rc != 0)
+        kprintf("[CRON] FAILED to write /CONFIG/CRON.CFG (rc=%d): scheduled jobs "
+                "are NOT on disk and will be lost at reboot\n", rc);
+    return rc;
 }
 
 // Parse one whitespace-delimited field; returns 1 if a field was read.
@@ -311,12 +477,51 @@ static void cron_parse_line(const char *ls, const char *le) {
 
     char typef[16], whenf[24], actf[16], targf[CRON_TARGET_MAX];
     const char *cur = ls;
+
+    // -----------------------------------------------------------------------
+    // #698 / #700 B4: CONTROL 3 of 3 - the reader FAILS CLOSED.
+    //
+    // What was here before: the owner was an OPTIONAL 5th field, found by
+    // scanning for the first token that happened to start with "uid=", and a
+    // line without one DEFAULTED TO ROOT. Two separate ways to become root out
+    // of a malformed line: supply a uid= token anywhere the scan would reach,
+    // or supply none at all. The justification for the default (only root can
+    // write CRON.CFG, so an ownerless line must be root's) was true about the
+    // FILE and false about its CONTENTS, which any uid could dictate through
+    // cron_add(). "Nobody said who owns this, so it must be root" is the exact
+    // shape of assumption #692 was written to delete.
+    //
+    // Now: field 1, positional, mandatory, digits only. Anything else and the
+    // line is DISCARDED. An unparseable schedule entry is a lost job, which is
+    // visible and fixable; an unparseable entry silently promoted to root is
+    // not.
+    // -----------------------------------------------------------------------
+    uint32_t ownerf = 0;
+    {
+        char ownf[24];
+        if (!cron_field(&cur, le, ownf, sizeof(ownf))) return;
+        if (!(ownf[0]=='u' && ownf[1]=='i' && ownf[2]=='d' && ownf[3]=='=') ||
+            ownf[4] == '\0') {
+            kprintf("[CRON] REJECTED line: first field is '%s', expected "
+                    "uid=<n> (#698: an owner is never inferred)\n", ownf);
+            return;
+        }
+        for (int k = 4; ownf[k]; k++) {
+            if (ownf[k] < '0' || ownf[k] > '9') {
+                kprintf("[CRON] REJECTED line: owner field '%s' is not numeric\n", ownf);
+                return;
+            }
+        }
+        ownerf = cron_atou(ownf + 4);
+    }
+
     if (!cron_field(&cur, le, typef, sizeof(typef))) return;
     if (!cron_field(&cur, le, whenf, sizeof(whenf))) return;
     if (!cron_field(&cur, le, actf, sizeof(actf)))   return;
     if (!cron_field(&cur, le, targf, sizeof(targf))) return;
+    cron_unescape(targf);   // #698: %XX -> bytes, exactly inverse to cron_app_esc
 
-    // Remainder of the line (after the four fields) is the label.
+    // Remainder of the line is the label.
     char labelf[CRON_LABEL_MAX];
     int li = 0;
     while (cur < le && (*cur == ' ' || *cur == '\t')) cur++;
@@ -363,10 +568,16 @@ static void cron_parse_line(const char *ls, const char *le) {
     else if (strcmp(actf, "event")    == 0) job.action = CRON_ACT_EVENT;
     else return;
 
+    cron_unescape(labelf);   // #698: the label is escaped on write too
     strncpy(job.target, targf, CRON_TARGET_MAX - 1);
     strncpy(job.label, labelf, CRON_LABEL_MAX - 1);
+    job.target[CRON_TARGET_MAX - 1] = '\0';
+    job.label[CRON_LABEL_MAX - 1] = '\0';
 
-    cron_add_common(&job, 1);  // a config job is persistent
+    // #698: the file is not more trusted than the syscall. cron_add_common()
+    // applies cron_field_ok() to this too, so a hand-edited or downgrade-written
+    // CRON.CFG cannot reintroduce a target the serializer refuses to produce.
+    cron_add_common(&job, 1, ownerf);  // a config job is persistent
 }
 
 static void cron_load(void) {
@@ -410,7 +621,7 @@ void cron_init(void) {
 // ---------------------------------------------------------------------------
 // Firing (worker / process context only)
 // ---------------------------------------------------------------------------
-static void cron_launch_program(const char *path) {
+static void cron_launch_program(const char *path, uint32_t owner_uid) {
     if (!g_fat_fs.mounted) { kprintf("[CRON] launch '%s' failed: no fs\n", path); return; }
     uint32_t sz = 0;
     void *data = fat_read_file(&g_fat_fs, path, &sz);
@@ -418,9 +629,12 @@ static void cron_launch_program(const char *path) {
         kprintf("[CRON] launch '%s' failed: not found\n", path); return; }
     if (elf_validate(data, sz) != 0) { kfree(data);
         kprintf("[CRON] launch '%s' failed: bad ELF\n", path); return; }
-    int pid = proc_create_user(path, data, sz, 0, 0);
+    // #692: THE FIX. This runs on the cron worker, a kernel thread, so the
+    // old inherit gave the job uid 0 no matter who created it. It now runs
+    // as the job's recorded owner, with the gid resolved from that uid.
+    int pid = proc_create_user_as(path, data, sz, 0, 0, proc_as_uid(owner_uid));
     kfree(data);
-    kprintf("[CRON] launched '%s' pid %d\n", path, pid);
+    kprintf("[CRON] launched '%s' pid %d as uid=%u\n", path, pid, owner_uid);
 }
 
 static void cron_fire(cron_slot_t *s) {
@@ -432,7 +646,7 @@ static void cron_fire(cron_slot_t *s) {
             break;
         }
         case CRON_ACT_LAUNCH:
-            cron_launch_program(s->j.target);
+            cron_launch_program(s->j.target, s->owner_uid);
             break;
         case CRON_ACT_EVENT:
             kprintf("[CRON] event '%s' from job %u tick %lu\n",
@@ -487,7 +701,8 @@ static void cron_run_due(void) {
             case CRON_TYPE_ONESHOT:
                 s->j.enabled = 0;
                 s->j.next_fire_tick = 0;
-                if (s->persist) cron_save();   // persist the disabled state
+                if (s->persist && cron_save() != 0)
+                    kprintf("[CRON] disabled state not persisted for job %u\n", s->j.id);
                 break;
             case CRON_TYPE_INTERVAL: {
                 uint64_t step = cron_ms_to_ticks(s->j.interval_ms);

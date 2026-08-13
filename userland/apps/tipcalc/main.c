@@ -17,7 +17,16 @@ int main(int argc, char *argv[]) {
     int tip_btn_y = 220;
     int tip_x[5] = {30, 100, 170, 240, 310};
 
+    // #548: this loop used to redraw the ENTIRE window + win_invalidate()
+    // UNCONDITIONALLY every 500ms tick forever, even fully static (no button
+    // ever pressed) - the idle-CPU echo-loop anti-pattern. Draw only when
+    // needs_draw is set (first paint, a genuine EVENT_REDRAW, or a button
+    // click that may have changed bill/tip state), then block indefinitely
+    // (-1) between events instead of polling every 500ms.
+    int needs_draw = 1;
     for (;;) {
+      if (needs_draw) {
+        needs_draw = 0;
         win_draw_rect(win, 0, 0, W, H, 0x00F5F5F0);
 
         win_draw_text_ttf(win, 30, 20, "Tip Calculator", 28, 0x00202830);
@@ -49,12 +58,15 @@ int main(int argc, char *argv[]) {
         win_draw_text_ttf(win, 30, 350, buf, 28, 0x00308030);
 
         win_invalidate(win);
+      }
 
         gui_event_t ev;
-        int t = win_get_event(win, &ev, 500);
+        int t = win_get_event(win, &ev, -1);
         if (t == 0) continue;
         if (ev.type == EVENT_WINDOW_CLOSE) break;
+        if (ev.type == EVENT_REDRAW) { needs_draw = 1; continue; }
         if (ev.type == EVENT_MOUSE_DOWN) {
+            needs_draw = 1;
             if (gui_point_in_rect(ev.mouse_x, ev.mouse_y, bill_x[0], bill_btn_y, btn_w, btn_h)) {
                 if (bill_cents >= 100) bill_cents -= 100;
             }

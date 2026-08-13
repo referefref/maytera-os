@@ -15,10 +15,23 @@
 #include "../types.h"
 #include "../serial.h"
 #include "../fs/fat.h"
+#include "../fs/perms.h"     // #708: R_OK/W_OK/X_OK
+#include "../fs/guestfs.h"   // #708: the DOS/Win16 guest filesystem gate
 #include "../mm/heap.h"
 #include "x86_16.h"
 #include "win16api.h"
 #include "ne.h"
+#include "../dos/dospath.h"
+#include "../dos/int21svc.h"   // #736: THE one INT 21h service core
+
+// #708: ne.c carries a SECOND, independent INT 21h implementation (win16_int
+// below), separate from the one in dos/dosexec.c. It is reached by any Win16
+// guest, and by a .COM run through win16_run_file. It is gated against the same
+// GUESTFS_SLOT_WIN16 identity as the Win16 API surface in win16api.c.
+static int ne_fs_allow(const char *native_path, int access, const char *what) {
+    return guestfs_allow(GUESTFS_SLOT_WIN16, native_path, access, what);
+}
+
 
 extern fat_fs_t g_fat_fs;
 
@@ -639,6 +652,10 @@ static uint8_t *find_dll_file(const char *modname, uint32_t *out_size) {
         for (int i = 0; up[i]; i++) path[n++] = up[i];
         path[n++] = '.'; path[n++] = 'D'; path[n++] = 'L'; path[n++] = 'L';
         path[n] = '\0';
+        // #708: the DLL BASENAME comes from the guest's own NE import table, so
+        // although the directory list is fixed, which file is opened is
+        // guest-chosen. Gated as an executable read.
+        if (!ne_fs_allow(path, R_OK, "NE dependency load")) continue;
         uint32_t sz = 0;
         void *data = fat_read_file(&g_fat_fs, path, &sz);
         if (data && sz > 0) {
@@ -976,78 +993,71 @@ __attribute__((weak)) void win16_gui_messagebox(const char *title, const char *t
     (void)title; (void)text;
 }
 
-// (#339 Sensei) DOS INT 21h read-only file table (see win16_int AH=3D..44).
-extern void dos_resolve_path(const char *in, const char *reldir, char *out, int outsz);
+// ===========================================================================
+// #736: THIS FILE NO LONGER IMPLEMENTS INT 21h.
+//
+// It used to carry a SECOND implementation (its own g_dosf[16] handle table,
+// its own whole-file-into-RAM open, and an AH=40h that accepted writes and
+// threw them away), reached by EVERY Win16 guest. Measured against the DOS
+// task's implementation it was a strict, worse subset: 13 AH values against
+// 33, no wildcard matching, no DTA, no streaming. So this was not a merge of
+// two comparable implementations, it was ADOPTING THE GOOD ONE AND DELETING
+// THE OTHER, which is why the diff below is almost all deletion.
+//
+// What is left here is the Win16 guest's STATE and its machine bindings. The
+// three that differ from the DOS task are all real, and all state:
+//   psp_seg 0080h   the Win16 layer has always reported this to AH=62h
+//   dos_version     0A03h (DOS 3.10), which is what a Win 3.1 box reports
+//   has_ivt 0       there is no IVT here, so AH=35h answers 0000:0000 and
+//                   AH=25h is accepted and dropped, exactly as before
+// and the CWD binding, which points at the SHARED dospath.c store rather than
+// a private one, because win16api.c has four other call sites that resolve
+// paths through that store and a private copy would put this layer's raw
+// INT 21h path in a different namespace from its own file APIs.
+// ===========================================================================
 extern fat_fs_t g_fat_fs;
-#define DOSF_MAX 16
-typedef struct { int used; uint8_t *data; uint32_t size, pos; } dos_file_t;
-static dos_file_t g_dosf[DOSF_MAX];
+
+static dos_svc_ctx_t g_win16_svc;
+
+static void w16_con_putc(void *u, uint8_t ch) { (void)u; kprintf("%c", (char)ch); }
+// No getkey/peekkey: a Win16 guest has no DOS console keyboard. The service
+// core reads that as "no key waiting", which is what this layer did before by
+// not implementing those calls at all.
+
+static const char *w16_cwd_get(dos_svc_ctx_t *x, char drive) {
+    (void)x; return dos_get_drive_cwd(drive);
+}
+static void w16_cwd_set(dos_svc_ctx_t *x, char drive, const char *p) {
+    (void)x; dos_set_drive_cwd(drive, p);
+}
+
+// #736 Stage 1b: the ONE Win16 guest context. Exported so the KERNEL.102
+// DOS3Call gateway in win16api.c services against the SAME state as the raw
+// INT 21h path, instead of its own DTA and find cursor.
+dos_svc_ctx_t *win16_svc_ctx(void) { return &g_win16_svc; }
+
+static void win16_svc_bind(void) {
+    dos_svc_ctx_init(&g_win16_svc, GUESTFS_SLOT_WIN16, "win16");
+    dos_svc_bind_x86_16(&g_win16_svc, &g_win16_cpu);
+    g_win16_svc.con.putc    = w16_con_putc;
+    g_win16_svc.has_ivt     = 0;
+    g_win16_svc.psp_seg     = 0x0080;
+    g_win16_svc.dos_version = 0x0A03;
+    g_win16_svc.cur_drive   = dos_current_drive();
+    g_win16_svc.cwd_get     = w16_cwd_get;
+    g_win16_svc.cwd_set     = w16_cwd_set;
+    {
+        const char *a = win16_get_appdir();
+        int i = 0;
+        for (; a[i] && i < (int)sizeof(g_win16_svc.appdir) - 1; i++)
+            g_win16_svc.appdir[i] = a[i];
+        g_win16_svc.appdir[i] = '\0';
+    }
+}
 
 static int win16_int(x86_16_cpu_t *c, uint8_t intno) {
-    if (intno == 0x21) {
-        uint8_t ah = (uint8_t)(c->ax >> 8);
-        if (ah == 0x09) { char b[256]; rd_cstr(c, c->ds, c->dx, '$', b, sizeof(b)); kprintf("%s", b); }
-        else if (ah == 0x02) { kprintf("%c", (char)(c->dx & 0xFF)); }
-        else if (ah == 0x4C) { c->exit_code = (int)(c->ax & 0xFF); c->halted = 1; }
-        else if (ah == 0x35) { c->es = 0; c->bx = 0; }   // GetIntVector -> NULL
-        else if (ah == 0x25) { /* SetIntVector: no real IVT, accept silently */ }
-        else if (ah == 0x30) { c->ax = 0x0A03; }         // GetDOSVersion -> 3.10-ish
-        else if (ah == 0x62) { c->bx = 0x0080; }         // GetPSP -> our PSP seg
-        // (#339 Sensei) Minimal read-only DOS file I/O so Win16 2.x apps that
-        // open their data files via raw INT 21h handles (Sensei Calculus reads
-        // CALCVGA.PIC / TOOLRSRC.SRF this way) can load content. Files are read
-        // whole via fat_read_file (FAT + ext2 hook) on open; writes to file
-        // handles are accepted but discarded (content files are read-only). Card
-        // games (FreeCell etc.) never issue these calls, so they stay byte-exact.
-        else if (ah == 0x3D) {   // open existing file, DS:DX=name -> AX=handle
-            char dn[128]; rd_cstr(c, c->ds, c->dx, 0, dn, sizeof(dn));
-            char path[160]; dos_resolve_path(dn, win16_get_appdir(), path, sizeof(path));
-            uint32_t sz = 0; void *d = fat_read_file(&g_fat_fs, path, &sz);
-            if (!d) { c->ax = 0x0002; c->flags |= 1; kprintf("[win16] DOS open '%s' -> not found\n", path); }
-            else { int h = -1; for (int i = 0; i < DOSF_MAX; i++) if (!g_dosf[i].used) { h = i; break; }
-                if (h < 0) { kfree(d); c->ax = 0x0004; c->flags |= 1; }
-                else { g_dosf[h].used = 1; g_dosf[h].data = (uint8_t*)d; g_dosf[h].size = sz; g_dosf[h].pos = 0;
-                    c->ax = (uint16_t)(h + 5); c->flags &= ~1u;
-                    kprintf("[win16] DOS open '%s' -> h%d size %u\n", path, h + 5, sz); } }
-        }
-        else if (ah == 0x3F) {   // read BX=handle CX=count DS:DX=buf -> AX=bytes
-            int h = (int)c->bx - 5;
-            if (h < 0 || h >= DOSF_MAX || !g_dosf[h].used) { c->ax = 0x0006; c->flags |= 1; }
-            else { dos_file_t *f = &g_dosf[h]; uint32_t n = c->cx;
-                if (f->pos > f->size) f->pos = f->size;
-                if (n > f->size - f->pos) n = f->size - f->pos;
-                for (uint32_t i = 0; i < n; i++) x86_16_wr8(c, c->ds, (uint16_t)(c->dx + i), f->data[f->pos + i]);
-                f->pos += n; c->ax = (uint16_t)n; c->flags &= ~1u; }
-        }
-        else if (ah == 0x40) {   // write BX=handle CX=count DS:DX=buf
-            if (c->bx == 1 || c->bx == 2) {   // stdout/stderr -> serial
-                for (uint32_t i = 0; i < c->cx; i++) kprintf("%c", (char)x86_16_rd8(c, c->ds, (uint16_t)(c->dx + i)));
-                c->ax = c->cx; c->flags &= ~1u;
-            } else { int h = (int)c->bx - 5;
-                if (h >= 0 && h < DOSF_MAX && g_dosf[h].used) { c->ax = c->cx; c->flags &= ~1u; }  // discard, report OK
-                else { c->ax = 0x0006; c->flags |= 1; } }
-        }
-        else if (ah == 0x42) {   // lseek AL=mode BX=handle CX:DX=off -> DX:AX=pos
-            int h = (int)c->bx - 5;
-            if (h < 0 || h >= DOSF_MAX || !g_dosf[h].used) { c->ax = 0x0006; c->flags |= 1; }
-            else { dos_file_t *f = &g_dosf[h];
-                int32_t off = (int32_t)(((uint32_t)c->cx << 16) | c->dx);
-                int mode = (int)(c->ax & 0xFF);
-                int64_t base = (mode == 1) ? (int64_t)f->pos : (mode == 2) ? (int64_t)f->size : 0;
-                int64_t np = base + off; if (np < 0) np = 0; if (np > (int64_t)f->size) np = f->size;
-                f->pos = (uint32_t)np; c->ax = (uint16_t)(f->pos & 0xFFFF); c->dx = (uint16_t)(f->pos >> 16); c->flags &= ~1u; }
-        }
-        else if (ah == 0x3E) {   // close BX=handle
-            int h = (int)c->bx - 5;
-            if (h >= 0 && h < DOSF_MAX && g_dosf[h].used) { kfree(g_dosf[h].data); g_dosf[h].used = 0; g_dosf[h].data = 0; }
-            c->ax = 0; c->flags &= ~1u;
-        }
-        else if (ah == 0x44) {   // IOCTL: report file handle (not a char device)
-            c->ax = 0; c->dx = 0; c->flags &= ~1u;
-        }
-        else { kprintf("[win16] INT 21h AH=%02x (ignored)\n", ah); }
-        return 0;
-    }
+    // #736: ONE implementation, reached with THIS guest's context.
+    if (intno == 0x21) { dos_svc_int21(&g_win16_svc, c); return 0; }
     if (intno == 0x80) {
         if (c->ax == 0) { c->halted = 1; return 0; }
         if (c->ax == 1) { char b[256]; rd_cstr(c, c->ds, c->dx, '\0', b, sizeof(b));
@@ -1119,8 +1129,32 @@ static int win16_callfar_should_abort(void) {
     return g_win16_close_requested || g_quit_posted_get();
 }
 
+// #736: commit whatever the guest left open, on EVERY exit path including the
+// early ones, and print the service core's one-line usage/enforcement report.
+// This has to happen BEFORE the caller's guestfs_finish() disarms the identity
+// slot: a write-back is a filesystem access and is gated like any other, so
+// disarming first would silently discard the data the guest thought it saved.
+// It is a wrapper rather than an edit to syscall.c's win16_proc_entry() because
+// that file's line numbers are PINNED by the #645 smap-uaccess manifest, and
+// inserting one line there turns 48 unrelated entries into false failures.
+static int win16_run_file_inner(const char *path);
 int win16_run_file(const char *path) {
+    int rc = win16_run_file_inner(path);
+    dos_svc_ctx_close_all(&g_win16_svc);
+    dos_svc_report(&g_win16_svc);
+    return rc;
+}
+static int win16_run_file_inner(const char *path) {
     g_cdt_init_seg = 0; g_cdt_init_off = 0;   // reset per run (stale-arm guard)
+    // #708: reading the guest's own image is a filesystem access by the
+    // launching user, not a free kernel action. Without this a uid-1000 caller
+    // could pass /CONFIG/SHADOW to SYS_WIN16_RUN and have the kernel slurp a
+    // root-only file into a buffer on its behalf: the NE parse would fail, but
+    // the read would already have happened.
+    if (!ne_fs_allow(path, R_OK | X_OK, "launch: read program image")) {
+        kprintf("[win16] launch of %s DENIED by the guest fs gate\n", path);
+        return -1;
+    }
     uint32_t size = 0;
     void *data = fat_read_file(&g_fat_fs, path, &size);
     if (!data || size == 0) {
@@ -1135,7 +1169,7 @@ int win16_run_file(const char *path) {
     // enable BEFORE x86_16_init / segment load so segbase[] gets selectors and
     // every memory access this run routes through the LDT + arena.
     extern int g_win16_want_pmode;
-    win16_pmode_enable(g_win16_want_pmode ? 1 : 0);   // resets LDT+arena when on
+    win16_pmode_enable(&g_win16_cpu, g_win16_want_pmode ? 1 : 0);   // resets LDT+arena when on
 
     // (#345) Screensaver mode. A "/s" (or "-s") command tail means run the NE as a
     // fullscreen screen saver. SCRNSAVE.LIB WinMain parses the tail: "/s"=run,
@@ -1157,11 +1191,18 @@ int win16_run_file(const char *path) {
 
     for (uint32_t i = 0; i < WIN16_MEM_SIZE; i++) g_win16_mem[i] = 0;
     x86_16_init(&g_win16_cpu, g_win16_mem);
-    x86_16_set_int_handler(win16_int);
-    x86_16_set_farcall_trap(WIN16_THUNK_SEG, win16_api_dispatch);
+    // #736 Stage 1b: x86_16_init() zeroes the struct, including this CPU's
+    // translation mode, so the mode chosen above is re-applied HERE rather
+    // than being silently lost. The reset of the LDT and the arena must still
+    // happen before segment loading, which is why the enable call stays where
+    // it is instead of moving after init.
+    g_win16_cpu.pmode = g_win16_pmode;
+    g_win16_cpu.owner = &g_win16_svc;
+    x86_16_set_int_handler(&g_win16_cpu, win16_int);
+    x86_16_set_farcall_trap(&g_win16_cpu, WIN16_THUNK_SEG, win16_api_dispatch);
     // (#256 VB1) Let a titlebar-X / F4 close break out of a long-running wndproc
     // (the VB runtime runs its message loop INSIDE the window procedure).
-    x86_16_set_callfar_abort(win16_callfar_should_abort);
+    x86_16_set_callfar_abort(&g_win16_cpu, win16_callfar_should_abort);
     g_import_count = 0;
     registry_reset();
 
@@ -1177,6 +1218,11 @@ int win16_run_file(const char *path) {
             g_appdir[n] = '\0';
         }
     }
+    // #736: bind a FRESH INT 21h service context for this run, now that the
+    // app directory (which relative opens resolve against) is known. Fresh
+    // every run, so no handle, CWD or find cursor survives from the last guest.
+    win16_svc_bind();
+
     // (#188 Word6) Publish the DOS-form module path so GetModuleFileName can return
     // it; installers parse it to find their source directory + SETUP.LST/*.INF.
     {

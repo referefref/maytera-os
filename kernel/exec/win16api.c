@@ -17,12 +17,17 @@
 #include "../video/font.h"
 #include "../mm/heap.h"
 #include "../fs/fat.h"
+#include "../fs/perms.h"     // #708: R_OK/W_OK/X_OK
+#include "../fs/guestfs.h"   // #708: the DOS/Win16 guest filesystem gate
 extern uint32_t fb_get_pixel(uint32_t x, uint32_t y);
 extern fat_fs_t g_fat_fs;
 // (#257) shared drive-letter FS layer (dos/dospath.c).
 void dos_resolve_path(const char *in, const char *reldir, char *out, int outsz);
 int  dos_drive_type(char letter);
 int  dos_path_writable(const char *in);
+// #736 Stage 1b: the Win16 guest's INT 21h service context, owned by ne.c.
+#include "../dos/int21svc.h"
+dos_svc_ctx_t *win16_svc_ctx(void);
 
 // ---------------------------------------------------------------------------
 // Win16 debug trace. kprintf is not routed to this VM's serial socket, so the
@@ -38,6 +43,8 @@ static int      g_trace_flushed;       // mid-run flush latch
 static uint8_t  g_import_seen[1024];   // first-occurrence trace dedup (per run)
 int             g_wndproc_trace_n;     // diagnostic: cap wndproc trace lines
 int             g_call_trace_n;        // diagnostic: cap full-call trace lines
+int             g_w6_charwin;          // (#278 DIAG) >0 while inside a WM_CHAR wndproc call to hwnd 004f; win16_api_dispatch traces every API call while armed. Gated behind g_w6life (default 0).
+int             g_w6_postkey_trace;    // (#278 DIAG idle-redraw pass) >0 for N API calls AFTER Word's own PeekMessage(PM_REMOVE) retrieves a WM_KEYDOWN/WM_CHAR/WM_KEYUP for hwnd 004f. Unlike g_w6_charwin (armed only on a wndproc DISPATCH, which this pass found Word's PeekMessage-based loop often skips for keyboard messages, handling them inline instead), this arms at the RETRIEVAL point so a capture shows what Word calls even when it never calls DispatchMessage. Gated behind g_w6life (default 0).
 int             g_win16_app_kind;      // 0=generic, 1=tetris, 2=card game (set by ne.c)
 // (#255 perf C) Set whenever the input pump posts a message (timer/key/mouse) so
 // the idle loop can skip the expensive full repaint (2x canvas memcpy + guest
@@ -90,6 +97,15 @@ void win16_reloc_log(const char *mod, const char *name, unsigned ord,
 #define WM_KEYDOWN      0x0100
 #define WM_KEYUP        0x0101
 #define WM_CHAR         0x0102
+// (Word6 divergence catalog #2, Alt-menu) Standard Win16/Win32 winuser.h
+// values, cross-referenced against this codebase's own pass-62 notes (which
+// independently confirmed WM_CHAR=0x0102 is correct) before use. Real Windows
+// delivers these instead of WM_KEYDOWN/WM_KEYUP/WM_CHAR while Alt is held (or
+// for the Alt keystroke itself); their total previous absence from this file
+// (grepped: zero hits) is why Alt was never tracked as a modifier at all.
+#define WM_SYSKEYDOWN   0x0104
+#define WM_SYSKEYUP     0x0105
+#define WM_SYSCHAR      0x0106
 #define WM_COMMAND      0x0111
 #define WM_TIMER        0x0113
 #define WM_MOUSEMOVE    0x0200
@@ -100,6 +116,34 @@ void win16_reloc_log(const char *mod, const char *name, unsigned ord,
 #define WM_RBUTTONUP    0x0205
 #define MK_LBUTTON      0x0001
 #define MK_RBUTTON      0x0002
+// (#278 Word6 combobox) WM_SETTEXT/WM_GETTEXT are also #define'd further down
+// (identical values) for SendDlgItemMessage; a duplicate #define with the same
+// replacement list is well-defined in C and not a -Werror redefinition warning.
+#define WM_SETTEXT      0x000C
+#define WM_GETTEXT      0x000D
+// CB_* combobox control messages. Standard Win16/Win32 winuser.h values (Win16
+// and Win32 share the same CB_* numbering; USER.EXE never renumbered these),
+// cross-referenced against this file's OWN WM_COMMAND=0x0111/BM_GETCHECK=0xF0
+// (both already the real Windows control-message layout) before wiring - do
+// NOT trust a magic ordinal without checking it against a known-good anchor
+// (Word6 divergence catalog: WM_CHAR=0x0102 was chased for 8 passes before its
+// meaning was confirmed the same way).
+#define CB_ADDSTRING     0x0143
+#define CB_DELETESTRING  0x0144
+#define CB_GETCOUNT      0x0146
+#define CB_GETCURSEL     0x0147
+#define CB_GETLBTEXT     0x0148
+#define CB_GETLBTEXTLEN  0x0149
+#define CB_INSERTSTRING  0x014A
+#define CB_RESETCONTENT  0x014B
+#define CB_SETCURSEL     0x014E
+#define CB_SHOWDROPDOWN  0x014F
+#define CBN_SELCHANGE    1
+// (#278 Word6 combobox) WM_USER-based base. Word's toolbar Style/Font-Name/
+// Font-Size/Zoom% comboboxes are populated via WM_USER+1 and WM_USER+0x15 (see
+// win16_native_combo_proc's banner comment for the MEASURED trace that pinned
+// this) instead of the documented CB_ADDSTRING/CB_SETCURSEL contract.
+#define WM_USER          0x0400
 
 // GetSystemMetrics indices we honour.
 #define SM_CXSCREEN     0
@@ -418,9 +462,73 @@ typedef struct {
 
 static win16_class_t  g_classes[WIN16_MAX_CLASSES];
 static win16_window_t g_windows[WIN16_MAX_WINDOWS];
+// (#278 Word6 combobox) Per-window item-list storage for a predefined
+// COMBOBOX control (ctrl_kind==4 with btn_style's 0x80 marker bit set - see
+// u_createwindow). Indexed by the SAME slot as g_windows (win - g_windows), so
+// no hwnd search is needed and the state lives exactly as long as the window.
+#define W16_COMBO_MAXITEMS 128
+#define W16_COMBO_ITEMLEN  64
+typedef struct {
+    int  used;      // 0 until first touched after (re)create - see combo_state()
+    int  nitems;
+    int  cursel;    // -1 = no selection
+    int  dropped;   // list currently open
+    char items[W16_COMBO_MAXITEMS][W16_COMBO_ITEMLEN];
+} win16_combo_t;
+static win16_combo_t g_combos[WIN16_MAX_WINDOWS];
+// Lazily (re)initialise a combo's state on first touch. u_createwindow forces
+// g_combos[slot].used = 0 whenever a slot is (re)assigned to a COMBOBOX, so a
+// slot recycled from a destroyed window never leaks a stale item list into a
+// new, unrelated control.
+static win16_combo_t *combo_state(win16_window_t *win) {
+    long idx = win - g_windows;
+    if (idx < 0 || idx >= WIN16_MAX_WINDOWS) return 0;
+    win16_combo_t *cb = &g_combos[idx];
+    if (!cb->used) { cb->used = 1; cb->nitems = 0; cb->cursel = -1; cb->dropped = 0; }
+    return cb;
+}
+// (#word6-scroll) Per-window scroll-bar RANGE/POSITION storage, same
+// indexed-by-g_windows-slot pattern as g_combos above. SetScrollRange(USER.64)
+// / SetScrollPos(USER.62) / GetScrollRange(USER.65) / GetScrollPos(USER.63)
+// had NO dedicated handlers at all (pure generic-stub no-ops, `retval=1` and
+// nothing stored -- see g_stub_table), so any app's own "where is the view
+// scrolled to, how far CAN it scroll" bookkeeping built on these four calls
+// was reading back stale/zero data forever, no matter how many times it set a
+// new range/position. Word 6 registers its OWN scrollbar window class
+// (OpusRSB) rather than using the predefined USER SCROLLBAR class, but it
+// still drives it through this exact standard nBar-keyed contract (MEASURED:
+// USER.#64/#62/#65 all fire immediately after the OpusRSB CreateWindow calls,
+// see docs/WORD6_DIVERGENCE_CATALOG.md). Three bars per window (SB_HORZ=0,
+// SB_VERT=1, SB_CTL=2), matching the real Win16 nBar enumeration, so this is a
+// general USER contract fix usable by any scrollbar-driving app, not a Word
+// hack.
+typedef struct { int min, max, pos; } win16_scrollbar_t;
+typedef struct { win16_scrollbar_t bar[3]; } win16_scrollinfo_t;
+static win16_scrollinfo_t g_scrollinfo[WIN16_MAX_WINDOWS];
+static win16_scrollbar_t *scrollbar_state(win16_window_t *win, int nbar) {
+    long idx = win - g_windows;
+    if (idx < 0 || idx >= WIN16_MAX_WINDOWS) return 0;
+    if (nbar < 0 || nbar > 2) nbar = 2;   // clamp any out-of-range nBar to SB_CTL's slot
+    return &g_scrollinfo[idx].bar[nbar];
+}
 static win16_msg_t    g_msgq[WIN16_MSGQ_SIZE];
 static int            g_msgq_head, g_msgq_tail, g_msgq_count;
 static int            g_quit_posted;
+// (Ctrl+Home wedge, Word6 divergence catalog #1) Message-synchronized VK
+// down-state for GetKeyState (USER.106), separate from the real-time
+// g_win16_keydown[] that win16_pump_input's drain loop updates for
+// GetAsyncKeyState/polling games (SkiFree/Golf arrow keys). The drain loop
+// pulls ALL pending raw keys off the kernel keyboard ring in one tight batch,
+// so a fast chord like Ctrl+Home (Ctrl down, Home down, Ctrl up all queued
+// before the app's message loop runs even once) had already flipped
+// g_win16_keydown[VK_CONTROL] back to "up" by the time Word dequeued and
+// handled WM_KEYDOWN(VK_HOME) and called GetKeyState(VK_CONTROL): Word saw
+// Ctrl as released and so a bare Home ran instead of Ctrl+Home. Real Windows
+// defines GetKeyState as the state AS OF THE MESSAGE the app is currently
+// processing, not real-time hardware state (that is GetAsyncKeyState's job);
+// this array is updated in msgq_get() exactly when a WM_KEYDOWN/WM_KEYUP is
+// dequeued, so it stays synchronized to what the app has actually seen.
+static uint8_t         g_win16_keydown_msg[256];
 // (#200 SkiFree) Accessor so the NE run loop (ne.c) can tell whether a WM_QUIT
 // has been latched (ESC / titlebar-X / app PostQuitMessage) and stop resuming.
 int g_quit_posted_get(void) { return g_quit_posted; }
@@ -479,6 +587,13 @@ extern void win16_host_destroy(int slot);
 // On-screen content rect of the host window, for mapping the global cursor into
 // the Win16 canvas (mouse forwarding, #187).
 extern int  win16_host_content_rect(int slot, int *ox, int *oy, int *ow, int *oh);
+// (#win16present) MARKS the host window's screen region dirty; does nothing
+// else. Lives in proc/syscall.c (shared with the DOS layer, a7b5645) and is
+// the off-thread-safe form: wm_invalidate_rect_async() under the hood, NOT
+// window_invalidate() (which is a synchronous window_draw() and races the
+// compositor's TTF glyph cache if called from this proc - see win16api.c's
+// call sites below and the DOS-layer fix this mirrors).
+extern void win16_host_invalidate(int slot);
 // Global kernel cursor + button state (drivers/mouse.c). Screen coords.
 extern int32_t mouse_x;
 extern int32_t mouse_y;
@@ -488,18 +603,72 @@ static uint32_t *g_win16_canvas;    // host window client buffer (NULL until Cre
 static int       g_win16_canvas_w;  // client width  (pixels)
 static int       g_win16_canvas_h;  // client height (pixels)
 static int       g_win16_host_slot = -1;
+
+// (#win16present) The Win16 interpreter paints into g_win16_canvas / the host
+// window's content buffer at MANY call sites (DispatchMessage -> a guest
+// wndproc's own GDI calls, the idle-loop z-repaint, the idle-loop soft
+// repaint, menu popup show/hide) and NONE of them told the compositor the
+// region had changed - the render gate (wm_is_dirty()) is level-triggered, so
+// a freshly-drawn frame only reached the screen when something ELSE (an input
+// event, a taskbar/widget refresh) happened to dirty the screen too. Same bug
+// as the DOS layer (a7b5645), same fix shape: mark, do not draw. Call this
+// after any of those paint points, once the pixels are actually in the
+// buffer. Safe to call from a spot that painted nothing this pass - marking
+// an already-clean window an extra time costs one appended dirty rect.
+static void win16_present_mark(void) {
+    if (g_win16_host_slot >= 0) win16_host_invalidate(g_win16_host_slot);
+}
 // (#345) Win16 .SCR screensaver mode (set in exec/ne.c from a "/s" command tail).
 // When set, the host window is created fullscreen + borderless and any real user
 // input ends the saver. Ordinary apps/games never set it (byte-identical path).
 extern int g_win16_scrsave;
 extern volatile unsigned long long g_win16_scrsave_start;
 static uint16_t  g_win16_main_hwnd = 0;  // hwnd that owns the host canvas (full-screen app window)
+// (Word6 divergence catalog #2, Alt-menu) The g_menus[] slot most recently
+// attached to a top-level chrome window (CreateWindow's class-default-menu
+// auto-load, or an explicit SetMenu). Root-caused via a live [W6WINDUMP]
+// trace: Word calls DestroyWindow on its OWN main frame during a phase-2
+// init-gate failure (the same one pass27's WM_QUIT/WM_CLOSE/WM_DESTROY
+// inhibit was written around), which immediately frees the win16_window_t
+// (win->used=0) even though the interpreter is deliberately keeping the app
+// itself alive; the menu bar stays VISIBLE afterward only because
+// g_win16_canvas retains the last-drawn pixels; nothing repaints it again.
+// So by the time a user can press Alt+<letter> (or click the bar -- this
+// affects win16_pump_mouse's win16_focus_hwnd()-based lookup identically),
+// there is no live top-level window left whose ->hmenu field points at the
+// real menu: win16_focus_hwnd() returns whatever OTHER window is now
+// highest-z (for Word, an unshown "Dde Common" DDE utility window with
+// hmenu==0), and g_win16_main_hwnd itself points at the now-freed slot.
+// The MENU DATA (g_menus[]) is independent of window lifecycle -- entries
+// persist until the next app run resets them -- so caching just the handle
+// value here, at the moment it is legitimately established, sidesteps the
+// whole teardown question entirely without changing DestroyWindow's
+// behaviour (an earlier attempt to inhibit DestroyWindow on the main frame
+// was reverted: Word's OWN subsequent teardown code kept running and used
+// the now-not-actually-destroyed window as a live target, corrupting it --
+// menu bar and toolbar went blank. Caching the handle has no such side
+// effect on any other code path).
+static uint16_t  g_win16_chrome_hmenu = 0;
 int              g_win16_apilog = 0;     // (#188) per-call API dispatch trace (default OFF; floods serial)
-// (#278 word6) Budget-limited paint diagnostic to serial. Set >0 to capture the
-// first N drawing calls from boot (covers Word's startup paint), then goes quiet
-// so it never floods. Default 0 (off).
+// (#278 word6) Budget-limited paint diagnostic. Set >0 to capture the first N
+// TextOut/ExtTextOut/BitBlt/PatBlt calls, then goes quiet so it never floods.
+// Default 0 (off). Routes to the persistent win16_trace buffer (->
+// /WIN16LOG.TXT), not kprintf/serial: serial is silent once the GUI/
+// compositor takes over, and MEASURED this pass, dual-emitting kprintf
+// (~2.6ms/line at 115200 baud) on a few thousand calls cost the interpreter
+// several REAL seconds inside the trace itself, which starved its own
+// input-queue draining and made typing appear to stall - a self-induced
+// Heisenbug from over-instrumentation. win16_trace() alone is a cheap in-RAM
+// vsnprintf.
 int              g_w6log = 0;
-#define W6LOG(...) do { if (g_w6log > 0) { g_w6log--; kprintf(__VA_ARGS__); } } while (0)
+#define W6LOG(...) do { if (g_w6log > 0) { g_w6log--; win16_trace(__VA_ARGS__); } } while (0)
+// (#278 Word6 combobox DIAG, 2026-07-27) Dedicated, isolated trace gate for the
+// toolbar-combobox-text investigation, separate from g_w6log's shared budget so
+// it cannot be starved by unrelated BB/TO/ETO traffic during Word's boot. SHIP
+// OFF (0); flip to 1 only for a diagnostic build, and REVERT before landing any
+// fix (see blame.md / WORD6_DIVERGENCE_CATALOG.md discipline).
+int              g_w6combodiag = 0;
+int              g_w6combo_apiwin = 0;   // (#278 Word6 combobox DIAG) armed API-trace budget
 // (#210) Off-screen scratch buffer for flicker-free full repaints. The compositor
 // samples g_win16_canvas asynchronously; if we bg-fill then redraw the board IN
 // PLACE every frame, the compositor can catch a half-grey intermediate frame
@@ -647,7 +816,7 @@ static void win16_menu_strip_maintain(void) {
         if (!g_menu_snap) return;
     }
     // Discriminate "menu present" from "menu blanked" by counting ink (dark) pixels in
-    // the MENU-TEXT band ONLY. Empirically (per-row dark-pixel dump on VM2160), Word's
+    // the MENU-TEXT band ONLY. Empirically (per-row dark-pixel dump on a test VM), Word's
     // 16px menu strip is: row 2 = a full-width separator line, rows 11-15 = the toolbar's
     // top edge/bevel, and BOTH of those are dark in either state. The menu glyphs of
     // "File Edit View ... Help" live in rows 3-10 (x in [8,470)): ~1000 dark pixels when
@@ -731,6 +900,14 @@ extern int keyboard_get_char(void);
 // Window-frame geometry (kernel-style chrome).
 #define W16_TITLEBAR 20
 #define W16_BORDER   2
+// (#278 Word6 toolbar-layout FIX) Collapsed visible height of a CBS_DROPDOWN /
+// CBS_DROPDOWNLIST combobox: our fixed 8x16 system font's tmHeight (16, see
+// g_gettextmetrics) plus top+bottom border (2*W16_BORDER) plus a couple of
+// pixels of internal padding a real Win16 combobox edit line also reserves.
+// Real USER.EXE ignores the nHeight passed to CreateWindow for these two CBS_
+// types (it is only the reserved MAXIMUM height for the eventual drop-down
+// list) and always renders just this one collapsed line until the list opens.
+#define W16_COMBO_COLLAPSED_H 22
 
 // GDI object table. Handles are small integers; objects are pens/brushes with a
 // COLORREF. Stock objects use fixed handle ids >= 0x100, so app handles from
@@ -741,8 +918,14 @@ extern int keyboard_get_char(void);
 // the toolbar/document blits copied black. Bumped to 256 (handles 1..255, all
 // < 0x100 so still distinct from stock handles).
 #define WIN16_MAX_GDIOBJ 256
-typedef struct { int used; int type; uint32_t color; uint32_t *pix; int w, h, bpp; } win16_gdiobj_t;
-// type: 1 = solid brush, 2 = pen
+// (#278 Word6 pattern-brush pass) pat_mono: for a type==6 PATTERN BRUSH object
+// (CreatePatternBrush/CreateDIBPatternBrush), 1 = the source was a monochrome
+// (1bpp) bitmap, so `pix` holds only pure black/white and consumers must
+// recolour it dynamically via the DC's text/bk colour (the real Win16
+// mono-pattern contract); 0 = a colour (DIB) pattern whose own decoded pixels
+// are used as-is.
+typedef struct { int used; int type; uint32_t color; uint32_t *pix; int w, h, bpp; int pat_mono; } win16_gdiobj_t;
+// type: 1 = solid brush, 2 = pen, 4 = bitmap, 5 = region/font/misc, 6 = pattern brush
 static win16_gdiobj_t g_gdiobj[WIN16_MAX_GDIOBJ];
 
 #define STOCK_WHITE_BRUSH  0x100
@@ -770,6 +953,9 @@ static win16_gdiobj_t g_gdiobj[WIN16_MAX_GDIOBJ];
 #define STOCK_SYSTEM_FIXED_FONT   0x110
 // True for the stock FONT handles above (excludes 0x10f DEFAULT_PALETTE).
 #define IS_STOCK_FONT(h) (((h) >= STOCK_OEM_FIXED_FONT && (h) <= STOCK_SYSTEM_FIXED_FONT) && (h) != STOCK_DEFAULT_PALETTE)
+// (#278 Word6 toolbar-icon-erase pass) max accumulated ExcludeClipRect rects per
+// DC. A 624x23/24px-cell toolbar strip holds ~26 icons; 40 gives headroom.
+#define WIN16_DC_MAX_EXCL 40
 
 // Per-DC state. We model a single device context bound to a window's client area.
 typedef struct {
@@ -793,6 +979,17 @@ typedef struct {
     // compatible bitmap (g_gdiobj), not the DC, so it is not freed on ReleaseDC.
     uint32_t *membuf;        // 0 = not a memory DC
     int      mw, mh;         // memory bitmap dimensions
+    // (Word6 toolbar-icon transparency, follow-on to the CreateDIBitmap
+    // black-square fix) bpp of the bitmap currently bound via SelectObject
+    // (0 = no depth-tracked bitmap selected, e.g. a window/screen DC or a
+    // fresh DC's default sentinel bitmap). BitBlt/StretchBlt need this to
+    // know when the DESTINATION is a genuinely 1bpp (monochrome) bitmap, so a
+    // colour source blitting into it gets quantized to black/white via the
+    // source DC's background colour instead of copied as raw colour (see
+    // blt_quantize_mono). Real GDI bitmaps carry their own bit depth; ours
+    // did not surface it to the DC, so a colour->mono blit silently stayed
+    // colour.
+    int      mbpp;
     // Currently-selected GDI objects, so SelectObject can return the PREVIOUS
     // handle (real Windows contract). Many apps (e.g. CARDS.DLL cdtDrawExt) do
     // `old = SelectObject(dc,obj); if (!old) bail;` and skip drawing if 0 comes
@@ -807,6 +1004,24 @@ typedef struct {
     int      mapmode;              // 1 = MM_TEXT (default)
     int      wox, woy, wex, wey;   // window (logical) origin + extent
     int      vox, voy, vex, vey;   // viewport (device) origin + extent
+    // (#278 Word6 toolbar-icon-erase pass, 2026-07-27f) Clip state. We do not
+    // model general GDI regions; a small accumulated EXCLUDE-rect list plus one
+    // INTERSECT bound is enough for the common "paint each child/icon, then
+    // ExcludeClipRect it, then FillRect the remaining background" idiom real
+    // toolbar/control code uses. Previously ExcludeClipRect/IntersectClipRect
+    // were pure no-op stubs ("we do not model clipping regions"), so a
+    // subsequent FillRect covering the whole band correctly repainted the
+    // background but ALSO blew away the icons that had just been painted and
+    // excluded - decode_dib/CreateDIBitmap were never the bug (re-verified: the
+    // Standard toolbar's 4bpp BITMAPCOREHEADER strip decodes correctly, and the
+    // per-icon SRCAND/SRCPAINT composite writes real pixels; the FillRect right
+    // after is what erases them). clip_incl=0 means unbounded (whole DC), the
+    // real GDI default for a fresh DC.
+    int      clip_n;                       // count of active exclude rects
+    int      clip_l[WIN16_DC_MAX_EXCL], clip_t[WIN16_DC_MAX_EXCL];
+    int      clip_r[WIN16_DC_MAX_EXCL], clip_b[WIN16_DC_MAX_EXCL];
+    int      clip_incl;                    // 1 = an INTERSECT bound is active
+    int      clip_il, clip_it, clip_ir, clip_ib;
 } win16_dc_t;
 // Non-zero sentinels for a freshly created DC's default bitmap/font, kept above
 // the real gdiobj range (1..63) and the stock-object range (0x100..0x108) so a
@@ -837,8 +1052,17 @@ static uint32_t gdiobj_color(uint16_t h, uint32_t deflt) {
         case STOCK_NULL_PEN:     return deflt;
         default: break;
     }
-    if (h < WIN16_MAX_GDIOBJ && g_gdiobj[h].used)
+    if (h < WIN16_MAX_GDIOBJ && g_gdiobj[h].used) {
+        // (#278 Word6 pattern-brush pass) A type==6 pattern brush has no single
+        // COLORREF (see gdiobj_is_pattern / pattern_pixel for the real tiled
+        // fill); pattern-aware consumers check gdiobj_is_pattern() themselves
+        // and never reach here. For any other caller that only wants "a"
+        // colour (e.g. FrameRect's border), use the pattern's own top-left
+        // pixel rather than a hardcoded black, so it is at least representative.
+        if (g_gdiobj[h].type == 6 && g_gdiobj[h].pix)
+            return g_gdiobj[h].pix[0];
         return colorref_to_fb(g_gdiobj[h].color);
+    }
     return deflt;
 }
 
@@ -916,6 +1140,96 @@ static int win16_alloc_gdiobj(int type, uint32_t color) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// (#278 Word6 pattern-brush pass) Real pattern-brush support, shared GDI (not
+// Word-specific): a pattern brush (type==6, see win16_gdiobj_t.pat_mono above)
+// carries the real source bits/dims/bpp instead of a flat colour. These helpers
+// let any consumer (window-background erase, FillRect, PatBlt, ...) tile it.
+// ---------------------------------------------------------------------------
+
+// Is `h` a real pattern-brush gdiobj (CreatePatternBrush/CreateDIBPatternBrush
+// result), as opposed to a solid brush/pen/stock object/region? Only these
+// carry pix+w+h worth tiling.
+static int gdiobj_is_pattern(uint16_t h) {
+    return h && h < WIN16_MAX_GDIOBJ && g_gdiobj[h].used && g_gdiobj[h].type == 6 &&
+           g_gdiobj[h].pix && g_gdiobj[h].w > 0 && g_gdiobj[h].h > 0;
+}
+
+// Tiled pattern-brush colour at absolute canvas/device coords (x,y). Brush
+// origin is always (0,0): SetBrushOrgEx (GDI.148) is a no-op stub and a
+// non-default origin is not something any supported app relies on for a plain
+// background/fill paint. Mono patterns recolour dynamically per real Win16
+// semantics (see the pat_mono comment); colour (DIB) patterns use their own
+// decoded pixels unchanged.
+static uint32_t pattern_pixel(win16_gdiobj_t *b, int x, int y, uint32_t text, uint32_t bk) {
+    int px = x % b->w; if (px < 0) px += b->w;
+    int py = y % b->h; if (py < 0) py += b->h;
+    uint32_t c = b->pix[py * b->w + px];
+    if (b->pat_mono) return (c == FB_COLOR(0, 0, 0)) ? text : bk;
+    return c;
+}
+
+// Fill a canvas rect with a brush: tile it if `hbrush` is a pattern brush,
+// otherwise flat-fill with `fallback` (a solid brush colour, stock object, or
+// resolved syscolor). No DC is in scope here (this is the window-background
+// erase path in win16_draw_frame), so a mono pattern recolours with the Win16
+// default DC attributes, text=black/bk=white.
+static void canvas_fill_brush(int x, int y, int w, int h, uint16_t hbrush, uint32_t fallback) {
+    if (gdiobj_is_pattern(hbrush)) {
+        win16_gdiobj_t *b = &g_gdiobj[hbrush];
+        for (int yy = y; yy < y + h; yy++)
+            for (int xx = x; xx < x + w; xx++)
+                canvas_plot(xx, yy, pattern_pixel(b, xx, yy, FB_COLOR(0, 0, 0), FB_COLOR(255, 255, 255)));
+        return;
+    }
+    canvas_fill(x, y, w, h, fallback);
+}
+
+// As canvas_fill_excl_children_top, but tiles a pattern brush instead of a flat
+// colour when `hbrush` is one (used by the main-frame WS_CLIPCHILDREN erase).
+static void canvas_fill_excl_children_top_brush(int x, int y, int w, int h,
+                                                uint16_t hbrush, uint32_t fallback,
+                                                uint16_t parent_hwnd, int preserve_top) {
+    if (gdiobj_is_pattern(hbrush)) {
+        win16_gdiobj_t *b = &g_gdiobj[hbrush];
+        for (int yy = y; yy < y + h; yy++) {
+            if (yy < preserve_top) continue;
+            for (int xx = x; xx < x + w; xx++)
+                if (!win16_pixel_in_child(parent_hwnd, xx, yy))
+                    canvas_plot(xx, yy, pattern_pixel(b, xx, yy, FB_COLOR(0, 0, 0), FB_COLOR(255, 255, 255)));
+        }
+        return;
+    }
+    canvas_fill_excl_children_top(x, y, w, h, fallback, parent_hwnd, preserve_top);
+}
+
+// Is win's class background a genuine pattern-brush gdiobj, as opposed to the
+// Word syscolor-index encoding [1..21] or the forced-white document pane (see
+// resolve_class_bg, which this mirrors the precedence of)? Returns the handle
+// or 0.
+static uint16_t class_bg_pattern_handle(win16_window_t *win) {
+    if (g_info.segcount >= 100 && win->proc_seg == 0x06f7 && win->proc_off == 0x1f6a) return 0;
+    if (g_info.segcount >= 100 && win->bg_brush >= 1 && win->bg_brush <= 21) return 0;
+    return gdiobj_is_pattern(win->bg_brush) ? win->bg_brush : 0;
+}
+
+// (#278 Word6 pattern-brush pass) Colour to plot at device coords (x,y) for a
+// DC's CURRENTLY SELECTED brush (dc->sel_brush, set by SelectObject): tiles it
+// if the selection is a pattern brush, otherwise the brush's already-resolved
+// flat colour (dc->brush_color). Every "fill/paint with the current brush"
+// call site (Rectangle, RoundRect, Ellipse, PatBlt, DrawFrameControl, ...)
+// should go through this instead of reading dc->brush_color directly, so a
+// pattern brush actually tiles everywhere a solid brush would flat-fill. For
+// every existing solid-brush selection this returns exactly dc->brush_color,
+// so games/apps that only ever use solid brushes are byte-identical.
+static uint32_t dc_brush_pixel(win16_dc_t *dc, int x, int y) {
+    if (gdiobj_is_pattern(dc->sel_brush)) {
+        win16_gdiobj_t *b = &g_gdiobj[dc->sel_brush];
+        return pattern_pixel(b, x, y, dc->text_color, dc->bk_color);
+    }
+    return dc->brush_color;
+}
+
 static win16_window_t *win_from_hwnd(uint16_t hwnd) {
     for (int i = 0; i < WIN16_MAX_WINDOWS; i++)
         if (g_windows[i].used && g_windows[i].hwnd == hwnd) return &g_windows[i];
@@ -936,6 +1250,7 @@ static int dc_alloc(int win) {
             g_dcs[i].bk_mode = 2;                        // OPAQUE (Win16 default)
             g_dcs[i].cur_x = g_dcs[i].cur_y = 0;
             g_dcs[i].membuf = 0; g_dcs[i].mw = g_dcs[i].mh = 0;
+            g_dcs[i].mbpp = 0;   // no depth-tracked bitmap selected yet
             g_dcs[i].sel_pen = STOCK_BLACK_PEN;
             g_dcs[i].sel_brush = STOCK_WHITE_BRUSH;
             g_dcs[i].sel_bitmap = WIN16_DC_DEFBMP;
@@ -945,6 +1260,8 @@ static int dc_alloc(int win) {
             g_dcs[i].vox = g_dcs[i].voy = 0;
             g_dcs[i].wex = g_dcs[i].wey = 1;
             g_dcs[i].vex = g_dcs[i].vey = 1;
+            g_dcs[i].clip_n = 0;          // fresh DC = unclipped (real GDI default)
+            g_dcs[i].clip_incl = 0;
             return i;
         }
     }
@@ -966,7 +1283,43 @@ static void rd_far_cstr(x86_16_cpu_t *c, uint16_t seg, uint16_t off,
 // ---------------------------------------------------------------------------
 // Message queue
 // ---------------------------------------------------------------------------
+// (SkiFree idle-freeze, general fix) Real Windows COALESCES WM_MOUSEMOVE: at
+// most one unretrieved mouse-move sits in an app's queue per window at a time,
+// so a flurry of host motion collapses into a single pending move instead of
+// piling up entries. Our queue used to just append every post unconditionally.
+// win16_pump_mouse() (see its definition) runs on EVERY PeekMessage/GetMessage
+// call and posts a fresh WM_MOUSEMOVE whenever the canvas position differs from
+// the last pump, with no regard for whether a WM_MOUSEMOVE is already sitting
+// unread in the queue. While the host cursor is hovering/jittering over a Win16
+// window, that appended a new entry on every single pump call, so the queue was
+// never observed empty. Any app whose idle/per-frame-advance logic depends on
+// seeing an EMPTY queue (a PeekMessage(PM_NOREMOVE)-driven game loop being the
+// textbook case: SkiFree's slope-advance runs exactly there, #200) starved for
+// as long as the cursor kept moving inside the window: confirmed by injecting a
+// continuous jittering move INSIDE SkiFree's window (freezes solid: two
+// screendumps several seconds apart were byte-identical) versus the exact same
+// injection rate OUTSIDE the window, or a single stationary move (both animate
+// normally). Fix at the single choke point every message post goes through: if
+// an unretrieved WM_MOUSEMOVE for this hwnd is already queued, update it in
+// place (latest position wins, exactly like the real USER message queue)
+// instead of appending a new entry. This never drops a move (the freshest
+// position is always what a consumer would want anyway) and never reorders
+// other message types relative to each other, so click/drag tracking in
+// FreeCell and any other per-move-dependent app is unaffected: only redundant
+// PENDING moves collapse; a move that has already been retrieved (removed) by
+// msgq_get is gone from the queue and cannot be coalesced into.
 static void msgq_post(uint16_t hwnd, uint16_t msg, uint16_t wp, uint32_t lp) {
+    if (msg == WM_MOUSEMOVE) {
+        int idx = g_msgq_head;
+        for (int n = 0; n < g_msgq_count; n++) {
+            if (g_msgq[idx].hwnd == hwnd && g_msgq[idx].message == WM_MOUSEMOVE) {
+                g_msgq[idx].wParam = wp;
+                g_msgq[idx].lParam = lp;
+                return;   // updated the already-pending move in place
+            }
+            idx = (idx + 1) % WIN16_MSGQ_SIZE;
+        }
+    }
     if (g_msgq_count >= WIN16_MSGQ_SIZE) return;
     g_msgq[g_msgq_tail].hwnd = hwnd;
     g_msgq[g_msgq_tail].message = msg;
@@ -980,6 +1333,16 @@ static int msgq_get(win16_msg_t *out) {
     *out = g_msgq[g_msgq_head];
     g_msgq_head = (g_msgq_head + 1) % WIN16_MSGQ_SIZE;
     g_msgq_count--;
+    // Advance the message-synchronized key state exactly when the app takes
+    // this message off the queue (see g_win16_keydown_msg comment above).
+    // (Word6 divergence catalog #2, Alt-menu) WM_SYSKEYDOWN/WM_SYSKEYUP are
+    // the same key-state transition as WM_KEYDOWN/WM_KEYUP, just for a system
+    // key (Alt itself, or any key chorded with Alt); GetKeyState(VK_MENU) and
+    // GetKeyState of a chorded key should reflect them the same way.
+    if (out->message == WM_KEYDOWN || out->message == WM_SYSKEYDOWN)
+        g_win16_keydown_msg[out->wParam & 0xFF] = 1;
+    else if (out->message == WM_KEYUP || out->message == WM_SYSKEYUP)
+        g_win16_keydown_msg[out->wParam & 0xFF] = 0;
     return 1;
 }
 // (#200 SkiFree) Non-removing peek at the head message (for PeekMessage
@@ -1012,6 +1375,55 @@ typedef struct {
     int ntop; int top_idx[WIN16_MAX_TOP]; int top_x[WIN16_MAX_TOP]; int top_w[WIN16_MAX_TOP];
 } win16_menu_t;
 static win16_menu_t g_menus[WIN16_MAX_MENUS];
+// (Word6 divergence catalog #2, Alt-menu) Word's own startup teardown (a
+// phase-2 init-gate failure) calls DestroyMenu on its real top-level menu
+// (u_destroymenu below wipes the g_menus[] slot: used=0/count=0/ntop=0), as
+// part of the same self-teardown sequence separately traced destroying its
+// main frame window (see g_win16_chrome_hmenu's comment). Caching just the
+// HANDLE was not enough once the underlying slot data itself gets wiped, so
+// also keep a deep COPY of the first real (ntop>0) top-level menu ever
+// established for a non-child window. win16_get_chrome_menu() below is the
+// single accessor: prefer the LIVE g_menus[] slot (so edits an app makes
+// after this point -- AppendMenu, CheckMenuItem -- are still reflected) and
+// fall back to the snapshot only once the live slot has been torn down.
+static win16_menu_t g_win16_chrome_menu_snap;
+static int          g_win16_chrome_menu_valid = 0;
+// Find the real chrome menu: the live g_menus[] slot g_win16_chrome_hmenu
+// points at if it is still populated, else the snapshot, else NULL (a game
+// that has not created a menu yet, or has none).
+static win16_menu_t *win16_get_chrome_menu(void) {
+    if (g_win16_chrome_hmenu && g_win16_chrome_hmenu <= WIN16_MAX_MENUS &&
+        g_menus[g_win16_chrome_hmenu - 1].used)
+        return &g_menus[g_win16_chrome_hmenu - 1];
+    if (g_win16_chrome_menu_valid) return &g_win16_chrome_menu_snap;
+    return 0;
+}
+// (#219) open top-level menu index, -1 = none. Moved up here (was declared
+// down near the mouse-driven menu code, win16_pump_mouse) so win16_draw_menubar
+// just below can read it too, to highlight the open/hot title (Word6
+// divergence catalog #2, Alt-menu).
+static int      g_w16_menu_open = -1;
+static int      g_w16_menu_prev = -1;    // (#197) prev menu-open state for close-repaint
+// (Word6 divergence catalog #2, Alt-menu) Bar index highlighted by a bare Alt
+// tap (no popup dropped), -1 = none. Distinct from g_w16_menu_open (which
+// tracks an OPEN POPUP): real Windows lets a bare Alt tap just highlight the
+// first title without dropping its menu; only Down/Enter/another key opens
+// it. Only meaningful (and only drawn) while g_w16_menu_open == -1.
+static int      g_w16_menu_bar_hot = -1;
+// Alt-down tracking for WM_SYSKEYDOWN/WM_SYSKEYUP/WM_SYSCHAR gating (Word6
+// divergence catalog #2, Alt-menu). Updated strictly in cooked-key ARRIVAL
+// order inside win16_pump_input's drain loop, not from the real-time
+// g_win16_keydown array, for the same reason the Ctrl+Home fix (6a848ae)
+// added g_win16_keydown_msg: a fast Alt+letter chord can have Alt-down,
+// letter-down, Alt-up all queued before anything is dispatched, so real-time
+// hardware state may already show Alt released by the time we would
+// otherwise check it.
+static int      g_w16_alt_down = 0;
+// True from the moment Alt goes down until any OTHER key event arrives while
+// it is held; if still true when Alt goes back up, that was a bare Alt tap
+// (real Windows: WM_SYSKEYUP(VK_MENU) with no intervening key enters menu
+// mode), not a chord.
+static int      g_w16_alt_only = 0;
 
 // Parse one menu level (recursive). MF_POPUP=0x10, MF_END=0x80, MF_SEPARATOR=0x800.
 static uint32_t menu_parse_level(win16_menu_t *m, const uint8_t *t, uint32_t len,
@@ -1060,6 +1472,22 @@ static void win16_draw_menubar(win16_window_t *win) {
     if (!g_win16_canvas || !win->hmenu || win->hmenu > WIN16_MAX_MENUS) return;
     win16_menu_t *m = &g_menus[win->hmenu - 1];
     if (!m->used) return;
+    // (Word6 divergence catalog #2, Alt-menu) Refresh the chrome-menu snapshot
+    // on every successful bar draw, not just once at CreateWindow/SetMenu
+    // time. Word builds its menu INCREMENTALLY (CreateMenu, then many
+    // InsertMenu/AppendMenu calls -- see the #278 pass15 comment on
+    // menu_parse_level below), so a one-shot snapshot taken when hMenu is
+    // first attached can freeze an early, still-empty skeleton (top-level
+    // titles present, ntop>0, but zero items under any of them yet); a live
+    // trace via [W6ALTMNEM] draw_popup caught exactly this: n=0 items found
+    // for File's own popup. Re-snapshotting here keeps updating right up
+    // until the window (and with it, DestroyMenu) tears the real slot down,
+    // maximizing the chance the LAST snapshot taken is the fully-populated
+    // menu, not the first skeleton.
+    if (m->ntop > 0 && win->hmenu == g_win16_chrome_hmenu) {
+        g_win16_chrome_menu_snap  = *m;
+        g_win16_chrome_menu_valid = 1;
+    }
     uint32_t bar_bg = FB_COLOR(200,200,200);
     uint32_t ink    = FB_COLOR(20,20,20);
     uint32_t shadow = FB_COLOR(128,128,128);
@@ -1068,6 +1496,17 @@ static void win16_draw_menubar(win16_window_t *win) {
     int x = 8;
     for (int i = 0; i < m->ntop; i++) {
         win16_mitem_t *it = &m->items[m->top_idx[i]];
+        // (Word6 divergence catalog #2, Alt-menu) Pre-measure this title's
+        // '&'-stripped pixel width (mirrors win16_menu_popup_items' own
+        // measurement) so a highlighted title can be filled BEFORE its glyphs
+        // are drawn, matching real Windows' inverted-title look for the
+        // currently open popup or a bare-Alt-tap hot title.
+        int mw = 0;
+        for (const char *sp = it->text; *sp; sp++) if (*sp != '&') mw += FONT_WIDTH;
+        int hi = (i == g_w16_menu_open) || (g_w16_menu_open < 0 && i == g_w16_menu_bar_hot);
+        uint32_t item_bg  = hi ? ink : bar_bg;
+        uint32_t item_ink = hi ? bar_bg : ink;
+        if (hi) canvas_fill(x - 4, 0, mw + 8, WIN16_MENUBAR_H - 1, item_bg);
         int tx = x; int ty = (WIN16_MENUBAR_H - FONT_HEIGHT) / 2; if (ty < 0) ty = 1;
         for (const char *sp = it->text; *sp; sp++) {
             if (*sp == '&') continue;          // strip mnemonic ampersand
@@ -1075,7 +1514,7 @@ static void win16_draw_menubar(win16_window_t *win) {
             if (gph) for (int row = 0; row < FONT_HEIGHT && row < 16; row++) {
                 uint8_t bits = gph[row];
                 for (int col = 0; col < 8; col++)
-                    if (bits & (0x80 >> col)) canvas_plot(tx + col, ty + row, ink);
+                    if (bits & (0x80 >> col)) canvas_plot(tx + col, ty + row, item_ink);
             }
             tx += FONT_WIDTH;
         }
@@ -1100,20 +1539,58 @@ static void win16_draw_frame(win16_window_t *win) {
         win->cy = (par ? par->cy : 0) + win->y;
         win->cw = win->w;
         win->ch = win->h;
+        // (#278 Word6 toolbar-layout FIX, MEASURED via a gated runtime trace then
+        // reverted) A CBS_DROPDOWN/CBS_DROPDOWNLIST combobox's CreateWindow
+        // nHeight is the OS-reserved MAXIMUM height for its eventual drop-down
+        // list (Word's toolbar Style/Font-Name/Font-Size boxes and the Zoom%
+        // box all pass h=181..198), not its collapsed visible height; real
+        // USER.EXE always paints just one collapsed edit line until the list is
+        // actually opened. Painting the full win->h here (as any other flat
+        // child) drew a tall grey block starting in the toolbar row and bleeding
+        // straight through the ruler into the document body -- looking like a
+        // stray misplaced control sitting on top of the document, one more way
+        // the toolbar row looked wrong even after the SWP_SHOWWINDOW fix above
+        // made these controls visible at all. Clamp the CLIENT height only
+        // (win->ch, used for painting); win->h keeps the real value for any
+        // future GetWindowRect / CB_SHOWDROPDOWN support. A real LISTBOX
+        // (btn_style's marker bit clear) is unaffected: its full height is
+        // genuine content, not a reserved drop-down allowance.
+        if (win->ctrl_kind == 4 && (win->btn_style & 0x80) &&
+            (win->btn_style & 0x03) != 0x01 &&   // not CBS_SIMPLE
+            win->ch > W16_COMBO_COLLAPSED_H)
+            win->ch = W16_COMBO_COLLAPSED_H;
         // (#209) On a soft idle repaint, do NOT clear the child client (e.g. the
         // TETRIS playfield) to its bg brush: the compositor may sample the host
         // canvas between this fill and the child's WM_PAINT, showing a grey flash.
         // Let the child's own WM_PAINT overdraw its persistent pixels.
         if (!g_win16_no_bg_fill) {
             uint32_t bg = resolve_class_bg(win);
+            // (#278 Word6 pattern-brush pass) A child window's class background can
+            // be a real pattern brush (Word registers several with a
+            // CreatePatternBrush/CreateDIBPatternBrush result); tile it instead of
+            // the flat fallback colour resolve_class_bg would otherwise report.
+            uint16_t bgh = class_bg_pattern_handle(win);
+            // (#278 Word6 pattern-brush pass, DIAGNOSTIC, one line per hwnd) Confirm
+            // the PRODUCER of any grey child rect: log every child's geometry and
+            // resolved background handle/colour once, so a visible grey rectangle's
+            // (x,y,w,h) can be matched to the window/class/brush that painted it.
+            { static uint16_t traced_hwnd[WIN16_MAX_WINDOWS]; static int traced_n;
+              int already = 0;
+              for (int _i = 0; _i < traced_n; _i++) if (traced_hwnd[_i] == win->hwnd) { already = 1; break; }
+              if (!already && traced_n < WIN16_MAX_WINDOWS) {
+                  traced_hwnd[traced_n++] = win->hwnd;
+                  win16_trace("[bgdiag] child hwnd=%04x @%d,%d %dx%d bg_brush=%d pattern=%d bg=%06x\n",
+                              win->hwnd, win->cx, win->cy, win->cw, win->ch, win->bg_brush, bgh, bg);
+              }
+            }
             // (#219) During an app BeginPaint with a partial invalid region, erase
             // only that region so we never green over content outside it.
             if (g_win16_clip_active) {
                 int fl = win->cx + g_win16_clip_l, ft = win->cy + g_win16_clip_t;
                 int fw = g_win16_clip_r - g_win16_clip_l, fh = g_win16_clip_b - g_win16_clip_t;
-                if (fw > 0 && fh > 0) canvas_fill(fl, ft, fw, fh, bg);
+                if (fw > 0 && fh > 0) canvas_fill_brush(fl, ft, fw, fh, bgh, bg);
             } else {
-                canvas_fill(win->cx, win->cy, win->cw, win->ch, bg);
+                canvas_fill_brush(win->cx, win->cy, win->cw, win->ch, bgh, bg);
             }
         }
         return;
@@ -1147,6 +1624,9 @@ static void win16_draw_frame(win16_window_t *win) {
     }
     if (win->ch < 0) win->ch = 0;
     uint32_t bg = resolve_class_bg(win);
+    // (#278 Word6 pattern-brush pass) as above: tile a real pattern-brush class
+    // background instead of flat-filling resolve_class_bg's fallback colour.
+    uint16_t bgh = class_bg_pattern_handle(win);
     // (#209) On a soft idle repaint we recompute the client rect (above) but do
     // NOT wipe the canvas to the bg brush; the app's WM_PAINT redraws its own
     // pixels over the persistent buffer, so the playfield does not flash. The
@@ -1163,8 +1643,8 @@ static void win16_draw_frame(win16_window_t *win) {
             // (#bugB) keep the chrome children intact even when the app invalidates a
             // region that overlaps them.
             if (fw > 0 && fh > 0) {
-                if (is_main) canvas_fill_excl_children_top(fl, ft, fw, fh, bg, win->hwnd, menu_strip);
-                else canvas_fill(fl, ft, fw, fh, bg);
+                if (is_main) canvas_fill_excl_children_top_brush(fl, ft, fw, fh, bgh, bg, win->hwnd, menu_strip);
+                else canvas_fill_brush(fl, ft, fw, fh, bgh, bg);
             }
         } else if (is_main) {
             // (#bugB) Erase the whole client EXCEPT the chrome child windows
@@ -1172,10 +1652,10 @@ static void win16_draw_frame(win16_window_t *win) {
             // over them (the frame bg brush is white) blanked the whole window on a
             // scroll repaint; excluding the child rectangles fixed the toolbar/ruler/
             // status, and excluding the top menu strip keeps the "File Edit View" row.
-            canvas_fill_excl_children_top(0, 0, g_win16_canvas_w, g_win16_canvas_h, bg, win->hwnd, menu_strip);
+            canvas_fill_excl_children_top_brush(0, 0, g_win16_canvas_w, g_win16_canvas_h, bgh, bg, win->hwnd, menu_strip);
         } else {
             // Only fill this secondary window's own (clamped) rect.
-            canvas_fill(win->cx, win->cy, win->cw, win->ch, bg);
+            canvas_fill_brush(win->cx, win->cy, win->cw, win->ch, bgh, bg);
         }
     }
     if (mbar) win16_draw_menubar(win);
@@ -1195,7 +1675,23 @@ static void dc_lp2dp(win16_dc_t *dc, int *x, int *y) {
     *y = dc->voy + (int)(ly / wey);
 }
 
+// (#278 Word6 toolbar-icon-erase pass) True if (cx,cy) is inside the DC's clip
+// region: within the INTERSECT bound (if one is active) and not inside any
+// EXCLUDEd rect. Coordinates are DC-local (client/memory-bitmap space), same
+// space ExcludeClipRect/IntersectClipRect's rects are given in.
+static int dc_clip_visible(win16_dc_t *dc, int cx, int cy) {
+    if (dc->clip_incl &&
+        (cx < dc->clip_il || cy < dc->clip_it || cx >= dc->clip_ir || cy >= dc->clip_ib))
+        return 0;
+    for (int i = 0; i < dc->clip_n; i++)
+        if (cx >= dc->clip_l[i] && cy >= dc->clip_t[i] &&
+            cx < dc->clip_r[i] && cy < dc->clip_b[i])
+            return 0;
+    return 1;
+}
+
 static void dc_plot(win16_dc_t *dc, int cx, int cy, uint32_t fbcolor) {
+    if ((dc->clip_incl || dc->clip_n) && !dc_clip_visible(dc, cx, cy)) return;
     // Memory DC: plot into its bitmap buffer.
     if (dc->membuf) {
         if (cx < 0 || cy < 0 || cx >= dc->mw || cy >= dc->mh) return;
@@ -1313,6 +1809,59 @@ static void k_localinit(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
 // ===========================================================================
 static char pf_up(char ch) { return (ch >= 'a' && ch <= 'z') ? (char)(ch - 32) : ch; }
 
+// ===========================================================================
+// #708: THE GATE for every guest-reachable filesystem entry point in the Win16
+// layer. The guest's identity was captured at launch (win16_launch /
+// win16_launch_kernel in proc/syscall.c) into GUESTFS_SLOT_WIN16; this asks
+// whether that identity may perform `access` on the RESOLVED NATIVE path.
+// Returns 1 allow, 0 deny. See rustkern/guestfs.rs for the identity model.
+//
+// It always takes the post-dos_resolve_path() name: perms.c and the filesystem
+// both key on native paths, so gating the raw Windows string ("C:\FOO") would
+// be checking a different namespace from the one the access lands in.
+// ===========================================================================
+static int win16_fs_allow(const char *native_path, int access, const char *what) {
+    return guestfs_allow(GUESTFS_SLOT_WIN16, native_path, access, what);
+}
+
+// Parent directory of a native path, for the create case. Creating a file that
+// does not exist is a WRITE TO ITS PARENT, which is how sys_open() already
+// treats it (proc/syscall.c: W_OK|X_OK on the parent when the leaf is absent);
+// checking W_OK on a path with no perms entry would instead hit the root-owned
+// 0755 default and deny every guest create, including a legitimate one into a
+// directory the launching user owns.
+static void win16_parent_path(const char *path, char *out, int outsz) {
+    int last = -1;
+    int i = 0;
+    for (; path[i] && i < outsz - 1; i++) { out[i] = path[i]; if (path[i] == '/') last = i; }
+    out[i] = '\0';
+    if (last <= 0) { out[0] = '/'; out[1] = '\0'; return; }
+    out[last] = '\0';
+}
+
+// May the guest CREATE `path`? If the leaf already exists the guest needs write
+// on the leaf; if it does not, it needs write+search on the parent.
+// /WIN16LOG.TXT is a fixed root-level path, written on a GUEST-PACED schedule
+// from the GetMessage/PeekMessage hot path, and its contents embed
+// guest-supplied strings (WinExec/PlaySound arguments are traced verbatim). So
+// it is a write the guest drives, and it is gated. The decision is cached for
+// the run: a message pump would otherwise call perms_check() thousands of times
+// a second and, once denied, would burn the entire deny-log budget on one
+// repeated line.
+static int g_trace_writable = -1;   // -1 unknown, 0 no, 1 yes
+static int win16_trace_writable(void) {
+    if (g_trace_writable < 0)
+        g_trace_writable = win16_fs_allow("/WIN16LOG.TXT", W_OK, "trace flush") ? 1 : 0;
+    return g_trace_writable;
+}
+
+static int win16_fs_allow_create(const char *path, int leaf_exists, const char *what) {
+    if (leaf_exists) return win16_fs_allow(path, W_OK, what);
+    char parent[160];
+    win16_parent_path(path, parent, sizeof(parent));
+    return win16_fs_allow(parent, W_OK | X_OK, what);
+}
+
 // Resolve an .ini name to a native path. A bare name (no drive/slash) defaults
 // to C:\WINDOWS; anything with a drive or slash resolves as given (#257).
 static void ini_resolve(const char *name, char *out, int outsz) {
@@ -1330,6 +1879,9 @@ static void ini_resolve(const char *name, char *out, int outsz) {
 // Load an .ini into a NUL-terminated host buffer (kmalloc; caller kfree). NULL if absent.
 static char *ini_load(const char *name, uint32_t *out_len) {
     char path[160]; ini_resolve(name, path, sizeof(path));
+    // #708: GetPrivateProfileString takes the filename FROM THE GUEST, so this
+    // reads an arbitrary named file. Gate it like any other guest read.
+    if (!win16_fs_allow(path, R_OK, "Get[Private]Profile* read")) return 0;
     uint32_t sz = 0;
     void *data = fat_read_file(&g_fat_fs, path, &sz);
     char *txt = (char *)kmalloc(sz + 1);
@@ -1440,8 +1992,17 @@ static int pf_atoi(const char *s) {
 static int ini_set_string(const char *file, const char *section, const char *key,
                           const char *value) {
     char path[160]; ini_resolve(file, path, sizeof(path));
+    // #708: WritePrivateProfileString is the BROADEST write primitive in the
+    // whole Win16 interface: the guest names the file and the whole file is
+    // rewritten. It needs read (it does a read-modify) and write.
+    if (!win16_fs_allow(path, R_OK, "Write[Private]Profile* read-modify")) return 0;
     uint32_t sz = 0;
     void *data = fat_read_file(&g_fat_fs, path, &sz);
+    // Creating a brand-new .ini is a write to the parent, not to the leaf.
+    if (!win16_fs_allow_create(path, data != 0, "Write[Private]Profile* write")) {
+        if (data) kfree(data);
+        return 0;
+    }
     char *old = (char *)kmalloc(sz + 1);
     if (!old) { if (data) kfree(data); return 0; }
     if (data) { memcpy(old, data, sz); kfree(data); }
@@ -1715,6 +2276,56 @@ static void k_getfreespace(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
     *argbytes = 2;
 }
 
+// GetFreeSystemResources (USER.284): UINT GetFreeSystemResources(UINT fuSysResource)
+// returns the PERCENTAGE (0-100) of free System/GDI/USER resources. The generic
+// g_stub_table fallback returned 0 = "0% free = totally exhausted", which trips
+// Word 6's low-memory safety checks on essentially every edit ("Word has
+// insufficient memory" / "There are too many edits" / "cannot display the requested
+// font"). Those dialogs make Word ABORT its per-line reformat/layout ("This
+// operation will be incomplete") before it ever measures the run and issues the
+// glyph ExtTextOut, so the typed text never renders (MEASURED, #278 typed-text
+// pass: the reformat pair fires twice per keystroke, all routed through the seg25
+// alert wrapper). This is the SAME "report generous free memory" class already
+// fixed for GlobalCompact/GetFreeSpace/LocalCompact. Real Windows with Word loaded
+// reports a high percentage; report 90% for every resource kind.
+static void u_getfreesystemresources(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
+                                     uint16_t *argbytes) {
+    (void)c;
+    *ax = 90;        // percent free (SYSTEM/GDI/USER all ample)
+    *dx = 0;
+    *argbytes = 2;   // one UINT arg (fuSysResource), Pascal-cleaned
+}
+
+// LocalCompact (KERNEL.13): UINT LocalCompact(UINT wMinFree) = 1 word = 2 bytes.
+// Returns the size, in bytes, of the largest free block in the LOCAL heap after
+// compaction. LocalCompact had NO dedicated handler, so every call fell through
+// to the generic g_stub_table fallback, which returns a fixed AX=1 for every
+// ordinal that lacks one (see find_stub / g_stub_table dispatch). For most
+// boolean-style stubs AX=1 means "success"; for LocalCompact it instead means
+// "the largest contiguous free block in the local heap is 1 byte". MEASURED
+// (win16_trace on a test VM, #278 Word6 continuation pass): every keystroke drove
+// Word's own R_reformat -> PAGINATE-engine path into two MessageBoxes, "Word has
+// insufficient memory. You will not be able to undo this action once it is
+// completed. Do you want to continue?" and "There are too many edits in the
+// document. This operation will be incomplete. Save your work.", BEFORE Word
+// ever reached the ExtTextOut that would draw the new character -- so the
+// document model still advanced (Ln/Col tracked correctly, via a separate small
+// LocalAlloc that a 1-byte "free" answer does not starve) but nothing painted.
+// This is the actual producer the #278 catalog's "invisible typed text" item
+// traces back to, not a DC/viewport transform bug. Fix like the existing
+// GlobalCompact/GetFreeSpace precedent (#188 Word6, #EP3 Fuji Golf): report a
+// generous local-heap free-block size so Word's own low-memory safety check
+// passes the way it would on real Windows with ample free memory. UINT (AX
+// only), so cap at the representable max rather than reusing the 16MB DWORD
+// GlobalCompact reports.
+static void k_localcompact(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
+                           uint16_t *argbytes) {
+    (void)c;
+    *ax = 0xFFFFu;   // largest representable local-heap free block (64KB-1)
+    *dx = 0;
+    *argbytes = 2;
+}
+
 // GetWinFlags (KERNEL.132): DWORD GetWinFlags(void) = no args. Real Windows never
 // returns 0 here; a 0 tells a 1992 app it is in Windows "real mode" with <1MB.
 // Report a protected-mode 386 standard-mode environment with a math coprocessor
@@ -1928,7 +2539,14 @@ static void win16_make_parent_dirs(const char *path) {
         if (path[i] == '/' && n > 0) {
             acc[n] = '\0';
             // Skip the leading mount components that always exist.
-            if (n > 1) fat_mkdir(&g_fat_fs, acc);   // best effort; ignores EEXIST
+            // #708: this is an unbounded guest-driven "mkdir -p" (every '/' in
+            // a guest-supplied path becomes a mkdir), so each component is
+            // gated. Deliberately conservative: a component that does not
+            // exist has no perms entry and so falls to the root-owned 0755
+            // default, which denies a non-root guest. Erring towards refusing
+            // to create is the correct direction for a gate.
+            if (n > 1 && win16_fs_allow(acc, W_OK | X_OK, "create parent dir"))
+                fat_mkdir(&g_fat_fs, acc);   // best effort; ignores EEXIST
         }
         acc[n++] = path[i];
     }
@@ -1945,14 +2563,30 @@ static int win16_file_open(x86_16_cpu_t *c, uint16_t seg, uint16_t off, int crea
         if (!dos_path_writable(dchk)) return HFILE_ERROR;
     }
     win16_resolve_path(c, seg, off, fp->path, sizeof(fp->path));
+    // #708: THE chokepoint. This is the one place a Win16 path becomes a
+    // handle, so gating here covers _lopen, _lcreat, OpenFile and LZOpenFile at
+    // once. The model is read-whole-into-RAM, so an open IS a read.
+    if (!win16_fs_allow(fp->path, R_OK, create ? "_lcreat/OF_CREATE" : "_lopen"))
+        return HFILE_ERROR;
     uint32_t sz = 0;
     void *data = fat_read_file(&g_fat_fs, fp->path, &sz);
+    // A create must also be authorized to WRITE, checked before anything is
+    // materialized on disk. _lclose re-checks at write-back time, because a
+    // handle can outlive a chmod.
+    if (create && !win16_fs_allow_create(fp->path, data != 0, "_lcreat/OF_CREATE write")) {
+        if (data) kfree(data);
+        return HFILE_ERROR;
+    }
     if (!data) {
         if (!create) return HFILE_ERROR;
         // (#188) Materialize parent dirs + an empty on-disk file so subsequent
         // GetFileAttributes / dir-exists probes by the installer succeed.
         win16_make_parent_dirs(fp->path);
-        fat_write_file(&g_fat_fs, fp->path, "", 0);
+        // #693: real _lopen returns HFILE_ERROR when the file cannot be created.
+        if (fat_write_file(&g_fat_fs, fp->path, "", 0) != 0) {
+            kprintf("[WIN16] cannot create %s\n", fp->path);
+            return HFILE_ERROR;
+        }
         sz = 0; fp->cap = 4096; fp->buf = (uint8_t *)kmalloc(fp->cap);
         if (!fp->buf) return HFILE_ERROR;
         fp->size = 0;
@@ -1971,7 +2605,21 @@ static void k_lclose(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
     if (h >= 1 && h < WIN16_MAX_FILES && g_files[h].used) {
         win16_file_t *fp = &g_files[h];
         { extern int g_ole2_k334log; if (g_ole2_k334log) kprintf("[FIO] _lclose h=%d dirty=%d size=%u path=%s b0=%02x%02x%02x%02x\n", h, fp->dirty, fp->size, fp->path, fp->size>0?fp->buf[0]:0, fp->size>1?fp->buf[1]:0, fp->size>2?fp->buf[2]:0, fp->size>3?fp->buf[3]:0); }
-        if (fp->dirty) fat_write_file(&g_fat_fs, fp->path, fp->buf, fp->size);
+        // #693: real _lclose returns HFILE_ERROR on a failed write-back. Returning
+        // 0 here tells a Win16 app its document is saved when it is not.
+        int wrc = 0;
+        // #708: re-check at write-back. The open gate approved this path when
+        // the handle was created; a chmod since then must take effect, and the
+        // whole-file write-back is the moment the data actually lands.
+        if (fp->dirty && !win16_fs_allow(fp->path, W_OK, "_lclose write-back")) wrc = -1;
+        else if (fp->dirty) wrc = fat_write_file(&g_fat_fs, fp->path, fp->buf, fp->size);
+        if (wrc != 0) {
+            kprintf("[WIN16] _lclose: write-back of %s FAILED\n", fp->path);
+            if (fp->buf) kfree(fp->buf);
+            fp->used = 0; fp->buf = 0;
+            *ax = HFILE_ERROR; *dx = 0; *argbytes = 2;
+            return;
+        }
         if (fp->buf) kfree(fp->buf);
         fp->used = 0; fp->buf = 0;
     }
@@ -2016,6 +2664,10 @@ static void k_openfile(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *ar
         x86_16_wr8(c, of_seg, (uint16_t)(of_off+8+i), 0);
     }
     if (wStyle & 0x4000) {                          // OF_EXIST
+        // #708: OF_EXIST is an existence oracle over the whole filesystem, so
+        // it is gated exactly like a read. Without this a guest denied every
+        // open could still map the tree one probe at a time.
+        if (!win16_fs_allow(path, R_OK, "OpenFile/OF_EXIST")) { *ax = HFILE_ERROR; return; }
         uint32_t sz = 0; void *d = fat_read_file(&g_fat_fs, path, &sz);
         if (d) { kfree(d); *ax = 0; } else { *ax = HFILE_ERROR; }
         return;
@@ -2513,8 +3165,26 @@ static int  dlg_ci_eq(const char *a, const char *b);
 static void win16_draw_button(win16_window_t *win);
 static int  win16_native_ctrl_proc(win16_window_t *win, uint16_t msg,
                                     uint16_t wParam, uint32_t lParam, uint32_t *out);
+static void win16_draw_combo(win16_window_t *win);
+static int  win16_native_combo_proc(win16_window_t *win, uint16_t msg,
+                                    uint16_t wParam, uint32_t lParam, uint32_t *out);
 static uint32_t win16_call_wndproc(uint16_t pseg, uint16_t poff, uint16_t hwnd,
                                    uint16_t msg, uint16_t wParam, uint32_t lParam) {
+    // (#278 Word6 combobox DIAG, kept in tree default-off, see
+    // win16_native_combo_proc's banner for the pass this served) This is the
+    // SWALLOW point: a "previous wndproc" of 0:0 (the predefined-control
+    // sentinel - see u_createwindow's ctrl_kind==4 detection and
+    // win16_dispatch_to_window's own comment) silently no-ops here. MEASURED:
+    // Word's toolbar-combo subclass forwards its private WM_USER+1/+0x15
+    // messages here via CallWindowProc, unmodified, with no other processing -
+    // this is exactly where that forward vanishes, one call frame below
+    // win16_native_combo_proc (which lives up in win16_dispatch_to_window and
+    // is never reached via this path).
+    { extern int g_w6combodiag;
+      static int n = 0;
+      if (g_w6combodiag && pseg == 0 && poff == 0 && n < 400) { n++;
+          win16_trace("[W6CWPBAIL] hwnd=%04x msg=%04x wp=%04x lp=%08x (pseg:poff=0:0, swallowed here)\n",
+                      hwnd, msg, wParam, (unsigned)lParam); } }
     if (!g_cpu || (pseg == 0 && poff == 0)) return 0;
     uint16_t args[5];
     args[0] = hwnd;                          // pushed first (leftmost C arg)
@@ -2529,12 +3199,26 @@ static uint32_t win16_call_wndproc(uint16_t pseg, uint16_t poff, uint16_t hwnd,
                 pseg, poff, msg, wParam, (unsigned)lParam);
     // (#278 P41) trace messages delivered to Word's MDI document windows
     // (frame 0040, MDI client 004d, doc child 004e, edit pane 004f, ruler 0050).
+    // (#278 DIAG typed-char-bail pass) kprintf is dropped on a test VM in GUI mode
+    // (serial silent); route via win16_trace -> /WIN16LOG.TXT instead, per the
+    // established rig learning (blame.md). Also: reset the trace ring the first
+    // time ANY WM_CHAR/WM_KEYDOWN reaches ANY window, so the whole 256KB budget
+    // is spent on the interesting post-keystroke window, not consumed by boot
+    // noise before typing starts. Gated behind g_w6life (default 0, SHIP OFF)
+    // like the rest of this file's diagnostic infra - inert unless enabled.
     { extern int g_w6life, g_w6seq;
-      if (g_w6life && g_info.segcount >= 100 &&
-          (hwnd==0x004d||hwnd==0x004e||hwnd==0x004f||hwnd==0x0050||hwnd==0x0040)) {
-        static int nwm=0; if (nwm<160) { nwm++;
-          kprintf("[W6WMSG] SEQ %d: hwnd=%04x msg=%04x wp=%04x lp=%08x proc=%04x:%04x\n",
-                  g_w6seq++, hwnd, msg, wParam, (unsigned)lParam, pseg, poff); } } }
+      if (g_w6life && g_info.segcount >= 100) {
+        if (msg == WM_CHAR || msg == WM_KEYDOWN) {
+          static int reset_done = 0;
+          if (!reset_done) { reset_done = 1; g_trace_len = 0; }
+          static int nk=0; if (nk<4000) { nk++;
+            win16_trace("[W6KEY] SEQ %d: hwnd=%04x msg=%04x wp=%04x lp=%08x proc=%04x:%04x\n",
+                    g_w6seq++, hwnd, msg, wParam, (unsigned)lParam, pseg, poff); }
+        }
+        if (hwnd==0x004d||hwnd==0x004e||hwnd==0x004f||hwnd==0x0050||hwnd==0x0040) {
+          static int nwm=0; if (nwm<4000) { nwm++;
+            win16_trace("[W6WMSG] SEQ %d: hwnd=%04x msg=%04x wp=%04x lp=%08x proc=%04x:%04x\n",
+                    g_w6seq++, hwnd, msg, wParam, (unsigned)lParam, pseg, poff); } } } }
     // WM_CREATE for a data-heavy app (Chips parses its 108 KB CHIPS.DAT here) can
     // legitimately run several million instructions; give the wndproc a generous
     // budget so a genuine init pass is not cut off (rc=1 -> the app sees the
@@ -2549,6 +3233,33 @@ static uint32_t win16_call_wndproc(uint16_t pseg, uint16_t poff, uint16_t hwnd,
     // resolves in DGROUP. Games (<100 segs) are untouched = byte-identical.
     uint16_t w6_save_ds = g_cpu->ds;
     if (g_info.segcount >= 100 && g_info.ds) g_cpu->ds = g_info.ds;
+    // (#278 DIAG idle-redraw pass) arm a per-call API trace window when a
+    // WM_CHAR is delivered to Word's edit pane (0x004f). win16_api_dispatch
+    // (below) decrements+logs every API call made while armed, so a capture
+    // shows the exact API sequence Word's own code makes handling one
+    // keystroke. Widened (2026-07-26) to PERSIST past this single wndproc
+    // call, decaying naturally as win16_api_dispatch decrements it, so the
+    // capture also covers Word's OWN message-loop iterations that follow
+    // (PeekMessage/DispatchMessage/idle branch) instead of being force-reset
+    // to 0 the instant this wndproc call returns. The previous narrow,
+    // immediately-disarmed form was chosen because `qm sendkey` keyboard
+    // delivery was unreliable and a wider window made captures harder to
+    // reproduce; #334's in-kernel testinput channel removes that constraint
+    // (deterministic delivery), so the wider window is now safe to use.
+    // Gated behind g_w6life (default 0, SHIP OFF), inert unless enabled.
+    { extern int g_w6life, g_w6_charwin;
+      if (g_w6life && g_info.segcount >= 100 && hwnd == 0x004f && msg == WM_CHAR)
+        g_w6_charwin = 8000; }
+    // (#278 Word6 combobox DIAG) Arm a per-call API trace for the whole run of
+    // Word's OWN subclass wndproc while it handles msg 0x0401/0x0415 (the
+    // private toolbar-combo protocol), to see EVERY API call it makes (not just
+    // the CallWindowProc forward we already traced) before concluding there is
+    // nothing else there.
+    { extern int g_w6combodiag, g_w6combo_apiwin;
+      if (g_w6combodiag && pseg != 0 && (msg == (uint16_t)(WM_USER + 1) || msg == (uint16_t)(WM_USER + 0x15))) {
+        g_w6combo_apiwin = 20;
+        win16_trace("[W6CBOARM] hwnd=%04x msg=%04x wp=%04x proc=%04x:%04x\n", hwnd, msg, wParam, pseg, poff);
+      } }
     int rc = x86_16_call_far(g_cpu, pseg, poff, args, 5, &rax, &rdx, 16000000UL);
     g_cpu->ds = w6_save_ds;
     if (rc != 0 && g_win16_apilog) kprintf("[win16api]   wndproc call failed rc=%d\n", rc);
@@ -2586,6 +3297,14 @@ static void win16_paint_child_tree(uint16_t parent_hwnd, int depth) {
         // draw its 3D chrome + label here (matching USER's BUTTONWNDPROC WM_PAINT).
         if (ch->ctrl_kind == 1 && ch->proc_seg == 0 && ch->proc_off == 0)
             win16_draw_button(ch);
+        // (#278 Word6 combobox) Likewise for a predefined COMBOBOX (ctrl_kind==4,
+        // btn_style's 0x80 marker bit set - see u_createwindow): draw its collapsed
+        // chrome (+ the open item list, if dropped) here. NOT gated on proc_seg==0:
+        // Word SUBCLASSES these (measured live proc=0077:4e52), so an app wndproc
+        // being present does not mean the control is not still a predefined
+        // COMBOBOX needing its default chrome (see win16_native_combo_proc banner).
+        else if (ch->ctrl_kind == 4 && (ch->btn_style & 0x80))
+            win16_draw_combo(ch);
         win16_paint_child_tree(ch->hwnd, depth + 1);   // (#216) nested descendants
     }
 }
@@ -2604,6 +3323,19 @@ static uint32_t win16_dispatch_to_window(uint16_t hwnd, uint16_t msg,
     if (win->ctrl_kind == 1 && win->proc_seg == 0 && win->proc_off == 0) {
         uint32_t cr = 0;
         if (win16_native_ctrl_proc(win, msg, wParam, lParam, &cr)) return cr;
+    }
+    // (#278 Word6 combobox) A predefined COMBOBOX child owns its own item-list
+    // state + collapsed paint. NOT gated on proc_seg==0 (unlike BUTTON above):
+    // Word SUBCLASSES its toolbar comboboxes (measured live proc=0077:4e52) to
+    // intercept a few messages, then CallWindowProc's anything else through to
+    // the "original" wndproc - which for a predefined control is 0:0 (there is
+    // no real default-combobox code loaded anywhere for that to reach), so
+    // CB_ADDSTRING/CB_SETCURSEL/WM_PAINT were silently swallowed with zero
+    // default behaviour. Handle them here regardless of subclassing; this is
+    // still the general predefined-COMBOBOX case, not Word-specific.
+    if (win->ctrl_kind == 4 && (win->btn_style & 0x80)) {
+        uint32_t cr = 0;
+        if (win16_native_combo_proc(win, msg, wParam, lParam, &cr)) return cr;
     }
     if (msg == WM_PAINT)
         W6LOG("[W6] PAINT hwnd=%04x cx=%d cy=%d cw=%d ch=%d bgbr=%u child=%d soft=%d clip=%d,%d,%d,%d\n",
@@ -2763,7 +3495,19 @@ static void u_createwindow(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
                 case 0x0080: win->ctrl_kind = 1; win->btn_style = (uint8_t)(dwStyle & 0x0F); break;
                 case 0x0081: win->ctrl_kind = 3; break;
                 case 0x0082: win->ctrl_kind = 2; break;
-                case 0x0083: case 0x0085: win->ctrl_kind = 4; break;
+                case 0x0083: win->ctrl_kind = 4; break;   // LISTBOX: full height is real content
+                // (#278 Word6 toolbar-layout FIX) COMBOBOX (atom 0x0085) is a
+                // distinct predefined class from LISTBOX (0x0083); both were
+                // folded into the same ctrl_kind=4 with no way to tell them
+                // apart later. Stash the CBS_TYPE (dwStyle bits 0-1: CBS_SIMPLE=1,
+                // CBS_DROPDOWN=2, CBS_DROPDOWNLIST=3) plus a combobox marker bit
+                // in btn_style (unused by ctrl_kind==4 until now) so the paint
+                // path below can tell a real always-expanded LISTBOX from a
+                // CBS_DROPDOWN/CBS_DROPDOWNLIST combobox, whose window rect's
+                // nHeight is the OS-reserved max height for the eventual
+                // drop-down list, NOT the collapsed visible height (see the
+                // matching comment in win16_draw_frame).
+                case 0x0085: win->ctrl_kind = 4; win->btn_style = (uint8_t)(0x80 | (dwStyle & 0x03)); break;
                 default: break;
             }
         } else {
@@ -2771,9 +3515,21 @@ static void u_createwindow(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
             if      (dlg_ci_eq(cn, "BUTTON")) { win->ctrl_kind = 1; win->btn_style = (uint8_t)(dwStyle & 0x0F); }
             else if (dlg_ci_eq(cn, "STATIC")) { win->ctrl_kind = 2; }
             else if (dlg_ci_eq(cn, "EDIT"))   { win->ctrl_kind = 3; }
-            else if (dlg_ci_eq(cn, "LISTBOX") || dlg_ci_eq(cn, "COMBOBOX")) { win->ctrl_kind = 4; }
+            else if (dlg_ci_eq(cn, "LISTBOX")) { win->ctrl_kind = 4; }
+            else if (dlg_ci_eq(cn, "COMBOBOX")) { win->ctrl_kind = 4; win->btn_style = (uint8_t)(0x80 | (dwStyle & 0x03)); }
         }
     }
+    // (#278 Word6 combobox) Force a fresh item-list on this slot: a slot
+    // recycled from a destroyed window must not leak a stale combo's items
+    // into an unrelated new control.
+    if (win->ctrl_kind == 4 && (win->btn_style & 0x80))
+        g_combos[slot].used = 0;
+    // (#278 Word6 pattern-brush pass, DIAGNOSTIC) Identify which registered CLASS a
+    // grey-background child window belongs to, so a visible grey rectangle can be
+    // traced to a specific window class rather than guessed at.
+    win16_trace("[bgdiag] CreateWindow hwnd=%04x class='%s' child=%d parent=%04x style=%08lx bg_brush=%d ctrl_kind=%d\n",
+                win->hwnd, (ci >= 0) ? g_classes[ci].name : "(builtin)", is_child, win->parent,
+                (unsigned long)dwStyle, win->bg_brush, win->ctrl_kind);
     win->hmenu = is_child ? 0 : hMenu;   // (#152)
     if (!is_child && win->hmenu == 0 && ci >= 0 && g_classes[ci].has_menu) {
         // (#152) load the class default menu (WNDCLASS.lpszMenuName) when the app
@@ -2787,9 +3543,43 @@ static void u_createwindow(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
         if (!mt) mt = win16_get_resource_first(hinst, 4, &mlen);
         if (mt && mlen >= 4) win->hmenu = win16_parse_menu(mt, mlen);
     }
+    // (Word6 divergence catalog #2, Alt-menu) Cache the handle AND a deep
+    // copy of the menu data, both independent of this window's own
+    // lifecycle; see g_win16_chrome_hmenu's and g_win16_chrome_menu_snap's
+    // declarations for why both are needed.
+    if (!is_child && win->hmenu) {
+        g_win16_chrome_hmenu = win->hmenu;
+        if (win->hmenu <= WIN16_MAX_MENUS && g_menus[win->hmenu - 1].ntop > 0) {
+            g_win16_chrome_menu_snap  = g_menus[win->hmenu - 1];
+            g_win16_chrome_menu_valid = 1;
+        }
+    }
     win->shown = is_child ? 1 : 0;   // children are visible with their parent
     if (!is_child && g_info.segcount >= 100 && (dwStyle & 0x10000000UL))
         win->shown = 1;   // (#278 pass31) WS_VISIBLE top-level is shown (SDM dialogs)
+    // (#278 Word6 pattern-brush-pass FOLLOW-ON, MEASURED root cause of the four
+    // flat-grey rectangles in the blank document body) Word's Formatting-toolbar
+    // Style/Font-Name/Font-Size comboboxes and the Standard toolbar's Zoom%
+    // combobox are real standard-control LISTBOX/COMBOBOX children (ctrl_kind==4)
+    // whose DROPDOWN LIST PORTION Word creates WITHOUT WS_VISIBLE (measured via a
+    // gated CreateWindow trace: dwStyle 0x44a00042/0x44a00352, WS_VISIBLE bit
+    // clear) precisely so it stays collapsed until the user opens the dropdown;
+    // real USER.CreateWindow never auto-shows a window lacking WS_VISIBLE -- an
+    // explicit ShowWindow(SW_SHOW)/CB_SHOWDROPDOWN is required, and Word issues
+    // none of those for an idle blank document. The unconditional `is_child?1:0`
+    // default above ignores that, so these four STOCK_LTGRAY_BRUSH-background
+    // list children render permanently, overlapping the document body right below
+    // the toolbars -- NOT a pattern-brush bug (CreatePatternBrush/
+    // CreateDIBPatternBrush above are unrelated and correct on their own merits,
+    // but Word never even routes these controls' backgrounds through them).
+    // Match real Windows semantics for Word only (segcount>=100), the same
+    // precedent as the top-level WS_VISIBLE gating just above and the
+    // WM_SHOWWINDOW delivery below: a child's initial shown state follows its
+    // create-time WS_VISIBLE bit. Gated so games (whose child-control creation
+    // patterns are unverified against this stricter, more faithful rule) keep
+    // byte-identical behaviour.
+    if (is_child && g_info.segcount >= 100 && !(dwStyle & 0x10000000UL))
+        win->shown = 0;
     // (#278 P46) Track the REAL WS_VISIBLE bit from the create style, independent of
     // the render `shown` flag. Word's edit pane is created without WS_VISIBLE.
     win->dwstyle    = dwStyle;
@@ -3009,7 +3799,8 @@ static void u_movewindow(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
 
 // SetWindowPos (USER.232): SetWindowPos(hwnd, hwndInsertAfter, x, y, cx, cy, wFlags)
 //   = 7w = 14 bytes. Stack top->bottom: wFlags, cy, cx, y, x, hwndInsertAfter, hwnd.
-//   SWP_NOSIZE=0x0001, SWP_NOMOVE=0x0002.
+//   SWP_NOSIZE=0x0001, SWP_NOMOVE=0x0002, SWP_NOZORDER=0x0004, SWP_NOREDRAW=0x0008,
+//   SWP_NOACTIVATE=0x0010, SWP_SHOWWINDOW=0x0040, SWP_HIDEWINDOW=0x0080.
 static void u_setwindowpos(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
                            uint16_t *argbytes) {
     uint16_t flags = arg16(c, 0);
@@ -3021,8 +3812,68 @@ static void u_setwindowpos(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
     uint16_t hwnd = arg16(c, 6);
     win16_window_t *win = win_from_hwnd(hwnd);
     if (win) {
+        int old_w = win->w, old_h = win->h;
         if (!(flags & 0x0002)) { win->x = x; win->y = y; }   // not SWP_NOMOVE
         if (!(flags & 0x0001)) { win->w = cx; win->h = cy; } // not SWP_NOSIZE
+        // (#word6-scroll FIX) SetWindowPos silently dropped WM_SIZE on a real
+        // size change -- the EXACT same gap u_movewindow (above) was already
+        // fixed for, with its own comment explaining why (Tetris's GameGrid
+        // derives its per-cell pixel size from WM_SIZE's lParam; without a
+        // fresh WM_SIZE after a resize it keeps a stale 1x1 cell size). This
+        // handler never got the matching fix. MEASURED (a test VM, #word6-scroll
+        // pass): Word 6's document body (OpusWwd, hwnd 004f) is laid out via
+        // SetWindowPos, not MoveWindow, as part of finalizing the MDI child's
+        // geometry once the toolbar dock/ruler/status bar all have their final
+        // positions. Without WM_SIZE here, Word's document view keeps whatever
+        // client height it cached from an EARLIER (pre-final-layout) size and
+        // never learns the real one -- its own "does the next line still fit,
+        // or do I need to scroll the view" arithmetic is working from a wrong
+        // number, so it can silently stop drawing new lines once it (wrongly)
+        // believes the client is full, without ever reaching whatever routine
+        // would actually shift the view. This is a general USER.232 contract
+        // fix (same justification as u_movewindow's), not Word-specific: any
+        // app resizing a window via SetWindowPos (many prefer it over
+        // MoveWindow since it can combine position+size+zorder+visibility in
+        // one call) was equally never told its new size.
+        if (!(flags & 0x0001) && (cx != old_w || cy != old_h)) {
+            win16_draw_frame(win);   // recompute cw/ch (client size) for the new rect first
+            uint32_t lp = ((uint32_t)(uint16_t)win->ch << 16) | (uint16_t)win->cw;
+            msgq_post(hwnd, WM_SIZE, 0, lp);
+        }
+        // (#278 Word6 toolbar-layout FIX, MEASURED via a gated runtime trace then
+        // reverted) real SetWindowPos can show/hide a window in the SAME call via
+        // SWP_SHOWWINDOW(0x0040)/SWP_HIDEWINDOW(0x0080); this implementation only
+        // ever touched position/size and silently dropped those two bits, leaving
+        // win->shown whatever it was at CreateWindow time. Word's Formatting
+        // toolbar's Style/Font-Name/Font-Size comboboxes and the Standard
+        // toolbar's Zoom% combobox are created WITHOUT WS_VISIBLE (correct: a
+        // control is not yet laid out) and are then positioned AND shown via
+        // exactly this call (measured flags=0x0054 = SWP_SHOWWINDOW|
+        // SWP_NOACTIVATE|SWP_NOZORDER), never a separate ShowWindow. Dropping the
+        // show bit left all four permanently invisible, leaving a blank gap at
+        // the START of each toolbar row exactly where Word's own (correctly
+        // positioned) button-strip paint code assumes they already are -- this
+        // is why the Bold/Italic/Underline/etc. buttons LOOKED shifted right /
+        // not left-aligned: the buttons were never wrong, the sibling combo
+        // controls immediately to their left were just never realized. Mirror
+        // ShowWindow's own WM_SHOWWINDOW delivery + activation semantics (#278
+        // P46, u_showwindow above) so a real visibility transition here is
+        // faithful, not a bare flag flip; this is a general USER.232 contract
+        // fix (not Word-specific), since any app can legitimately combine
+        // position+show in one call.
+        if (flags & (0x0040 | 0x0080)) {   // SWP_SHOWWINDOW | SWP_HIDEWINDOW
+            int show = (flags & 0x0040) ? 1 : 0;
+            if (show != win->ws_visible) {
+                win->ws_visible = show;
+                if (show) win->dwstyle |=  0x10000000UL;
+                else      win->dwstyle &= ~0x10000000UL;
+                win16_call_wndproc(win->proc_seg, win->proc_off, hwnd,
+                                   0x0018 /*WM_SHOWWINDOW*/, (uint16_t)show, 0);
+            }
+            if (show && !win->is_child) win->z = ++g_win16_z_counter;
+            win->shown = show;
+            g_win16_z_dirty = 1;   // (#209) visibility changed -> full repaint next idle
+        }
         win16_draw_frame(win);
         msgq_post(hwnd, WM_PAINT, 0, 0);
     }
@@ -3456,6 +4307,39 @@ static uint16_t win16_focus_hwnd(void) {
     return 0;
 }
 
+// (Word6 divergence catalog #2, Alt-menu) Find the shown top-level window
+// that actually carries a menu (win->hmenu pointing at a used g_menus slot).
+// A live [W6ALTMNEM] trace showed neither win16_focus_hwnd() (highest-z
+// shown top-level: for Word this can be an off-screen utility/DDE window
+// with hmenu==0, see the #219 win16_draw_frame comment) NOR g_win16_main_hwnd
+// (latched once, on the FIRST top-level CreateWindow -- Word's startup
+// dialog-dismiss dance recreates/reparents windows, per the extensive
+// win16_pump_input "W6TIP"/"W6RDY" comments, so the first-ever hwnd is not
+// reliably the one SetMenu (USER.158) was later called on) reliably points
+// at the real menu-bearing frame: both showed hmenu==0 in the trace even
+// though the menu bar visibly renders (drawn via u_setmenu's direct
+// win16_draw_frame(win) call on whatever hwnd the app actually passed).
+// Searching for hmenu directly sidesteps needing to know which cached hwnd
+// variable is current. Ties broken by highest z, mirroring win16_focus_hwnd.
+static win16_window_t *win16_find_menu_window(void) {
+    win16_window_t *best = 0; uint32_t best_z = 0;
+    { extern int g_w6life; if (g_w6life) {
+        for (int i = 0; i < WIN16_MAX_WINDOWS; i++) {
+            win16_window_t *w = &g_windows[i];
+            if (!w->used) continue;
+            kprintf("[W6WINDUMP] i=%d hwnd=%04x used=%d child=%d shown=%d hmenu=%04x z=%u title='%s'\n",
+                    i, w->hwnd, w->used, w->is_child, w->shown, w->hmenu, w->z, w->title);
+        }
+    } }
+    for (int i = 0; i < WIN16_MAX_WINDOWS; i++) {
+        win16_window_t *w = &g_windows[i];
+        if (!w->used || w->is_child || !w->shown || !w->hmenu) continue;
+        if (w->hmenu > WIN16_MAX_MENUS || !g_menus[w->hmenu - 1].used) continue;
+        if (!best || w->z >= best_z) { best = w; best_z = w->z; }
+    }
+    return best;
+}
+
 // (#278 pass31) Find a shown top-level window whose title contains a substring
 // (case-insensitive). Used to locate Word's startup "Tip of the Day" SDM dialog
 // so it can be auto-dismissed (it is shown unconditionally and blocks typing).
@@ -3533,14 +4417,63 @@ static uint16_t win16_focus_hwnd(void);  // fwd (defined below)
 // it reallocates the host window content buffer. Re-point the Win16 canvas at the
 // new buffer + size and invalidate the scratch so no drawing ever touches the old
 // freed buffer. Same (kernel/WM) context as drawing, so no extra locking needed.
+//
+// (#word6-maximize) This is the ONLY path a host-level resize (the compositor's
+// title-bar Maximize/Restore button, or F11) reaches the Win16 interpreter --
+// user_window_handle_resize() (proc/syscall.c) reallocates the content buffer and
+// calls straight in here, with NO WM_SIZE ever posted to the guest. Before this
+// fix the main window's cx/cy/cw/ch DID silently track the new canvas (is_main
+// forces them to the full canvas on every win16_draw_frame(), so the document
+// area itself always grew/shrank correctly), but the app was never TOLD its
+// frame changed size, so it never re-ran its own dock-bar layout. MEASURED (VM
+// 2160, screendump before/after clicking the compositor Maximize button, build
+// 903 baseline): the toolbars/ruler stayed correct only because they are
+// anchored near the TOP, but Word's status bar -- docked at the OLD (taller)
+// bottom Y -- ended up entirely off the new (shorter) canvas and vanished from
+// the screen. Same root cause the MoveWindow (#204) and SetWindowPos
+// (#word6-scroll) API paths were already fixed for: any resize that skips
+// WM_SIZE leaves an app's own absolute-positioned dock children stale. Mirror
+// that fix here for the ONE remaining resize source, the host/compositor level.
 void win16_host_rebind_canvas(int slot, uint32_t *new_buf, int new_w, int new_h) {
     if (slot < 0 || slot != g_win16_host_slot) return;
     if (!new_buf || new_w <= 0 || new_h <= 0) return;
+    int old_w = g_win16_canvas_w, old_h = g_win16_canvas_h;
     g_win16_canvas   = new_buf;
     g_win16_canvas_w = new_w;
     g_win16_canvas_h = new_h;
     g_win16_scratch_w = 0;   // force scratch realloc at new geometry next repaint
     g_win16_scratch_h = 0;
+
+    // Tell the main (canvas-owning) window about its new outer size and SEND a
+    // faithful WM_SIZE so the app's own frame layout (dock toolbars/ruler/status
+    // bar, MDI client resize) re-runs, exactly like a real maximize/restore/
+    // resize on Windows 3.1. Gated on an actual size change so a rebind with
+    // identical dimensions (e.g. a spurious call) is a no-op, matching
+    // u_movewindow/u_setwindowpos's own old_w/old_h != new gating.
+    if ((new_w != old_w || new_h != old_h) && g_win16_main_hwnd) {
+        win16_window_t *mw = win_from_hwnd(g_win16_main_hwnd);
+        if (mw) {
+            mw->w = new_w;
+            mw->h = new_h;
+            win16_draw_frame(mw);   // recompute cx/cy/cw/ch for the new canvas
+            uint32_t lp = ((uint32_t)(uint16_t)mw->ch << 16) | (uint16_t)mw->cw;
+            msgq_post(mw->hwnd, WM_SIZE, 0, lp);
+            // (#word6-maximize) MEASURED (a test VM, FreeCell maximize): WM_SIZE
+            // alone reflows anchored chrome (menu bar, a right-anchored "Cards
+            // Left" label) but is NOT sufficient to bring back the play-field
+            // content -- real Win16 apps that redraw only in WM_PAINT (rather
+            // than eagerly inside their WM_SIZE handler, which Word happens to
+            // do) rely on the OS generating a WM_PAINT for the newly-exposed
+            // area after a resize. win16_draw_frame() above already re-fills
+            // the client to the bg brush at the new size (wiping any stale
+            // content), so without a follow-up WM_PAINT that fill is never
+            // painted over and the window is stuck blank. Mirror
+            // u_movewindow's own repaint-after-resize (`if (repaint)
+            // msgq_post(hwnd, WM_PAINT, 0, 0)`); a host-level resize is always
+            // a visible geometry change, so it is unconditional here.
+            msgq_post(mw->hwnd, WM_PAINT, 0, 0);
+        }
+    }
 }
 
 static void win16_soft_repaint_focus(void) {
@@ -3652,6 +4585,15 @@ static uint16_t kernel_key_to_vk(int code, int *is_release, char *ch) {
         // Function keys (kernel cooked codes from cpu/isr.c) -> Win16 VK_F1..F12.
         // TETRIS uses F3 (VK_F3=0x72) as its New Game key. F4/F11/F12 are claimed
         // by the kernel desktop (close/DOOM) so they never reach us; that is fine.
+        // (Word6 divergence catalog #2, Alt-menu) case 0x88 (F1) and case 0x87
+        // (F10) used to ALSO be hit by a bare Right-Shift / Left-Shift press
+        // respectively (isr.h's old KEY_RSHIFT=0x88/KEY_LSHIFT=0x87 collided
+        // with isr.c's local KEY_F1/KEY_F10 at the same bytes): every Shift
+        // press was silently delivered here as WM_KEYDOWN(VK_F1) or
+        // WM_KEYDOWN(VK_F10) too. isr.h's KEY_LSHIFT/KEY_RSHIFT/KEY_ALT moved
+        // to 0x95/0x96/0x9A (see isr.h); these two case labels are unchanged
+        // (0x87/0x88 are isr.c's own KEY_F10/KEY_F1, now unambiguous) and F1/
+        // F10 now correctly reach VK_F1/VK_F10 only from an actual F-key press.
         case 0x88: return 0x70;  // KEY_F1  -> VK_F1
         case 0x89: return 0x71;  // KEY_F2  -> VK_F2
         case 0x8B: return 0x72;  // KEY_F3  -> VK_F3 (New Game)
@@ -3664,6 +4606,79 @@ static uint16_t kernel_key_to_vk(int code, int *is_release, char *ch) {
         case 0x8A: return 0x75;  // KEY_F6  -> VK_F6
         case 0x85: return 0x7A;  // KEY_F11 -> VK_F11
         case 0x86: return 0x7B;  // KEY_F12 -> VK_F12
+        // (Ctrl+Home wedge, Word6 divergence catalog #1, ROOT CAUSE) KEY_LCTRL
+        // used to be 0x84 in cpu/isr.h, IDENTICAL to isr.c's own local KEY_F5
+        // (0x84, scancode 0x3F). A bare Ctrl press was therefore delivered here
+        // as code=0x84 and this switch (correctly, for real F5) mapped it to
+        // VK_F5, so holding Ctrl alone made Word 6 receive WM_KEYDOWN(VK_F5)
+        // and open its real "Go To" dialog (RegisterClass/CreateWindow 'Go To'
+        // confirmed via a gated g_w6life trace on a test VM), which our interpreter
+        // creates but never shows (shown=0) and which then loops creating child
+        // controls forever: the wedge. isr.h now emits 0x99 for Ctrl press
+        // (0x84 is unambiguously F5 again); map it here to the real VK_CONTROL
+        // so GetKeyState(VK_CONTROL) (USER.106) correctly reports Ctrl down and
+        // Word's OWN VK_HOME handler (below) can tell Home from Ctrl+Home itself.
+        // No state is forced; only the modifier is now delivered truthfully.
+        case 0x99: return 0x11;                  // KEY_LCTRL (fixed) -> VK_CONTROL
+        case 0x94: *is_release = 1; return 0x11; // KEY_LCTRL_UP -> VK_CONTROL release
+        // Home (cooked code 0x47, cpu/isr.c's raw PS/2 extended make code) had
+        // no case here at all, so it fell through to the generic "printable
+        // ASCII press" branch below (0x47 == ASCII 'G'): pressing Home was
+        // silently typed as the letter G instead of moving the caret, which is
+        // why Ctrl+Home never moved Ln/Col even before the F5 misfire (Word6
+        // divergence catalog item 6). Map it to real VK_HOME so Word's own
+        // inline WM_KEYDOWN(VK_HOME) handler runs and decides "start of line"
+        // vs "start of document" itself via GetKeyState(VK_CONTROL) above,
+        // faithful to real Win16, not a forced caret jump.
+        // NOTE (known, NOT fixed here): 0x47 is genuinely ambiguous at the
+        // keyboard_get_char() layer: cpu/isr.c also pushes the SAME byte for
+        // Shift+G (scancode_to_ascii_shift['g']=='G'==0x47), and this exact
+        // ambiguity already exists system-wide (see proc/syscall.c
+        // SYS_INJECT_KEY and userland/libc/textfield.h, which also key off
+        // 0x47 for Home unconditionally). This fix matches that existing
+        // convention rather than inventing a new one; a real fix needs a
+        // richer per-event structure (scancode + extended flag) threaded
+        // through instead of one overloaded byte. Out of scope for this
+        // task (see blame.md).
+        case 0x47: return 0x24;  // KEY_HOME -> VK_HOME
+        // (#word6-scroll) PageUp/PageDown/End had the EXACT same gap as Home
+        // above, just never fixed: cpu/isr.c forwards these extended keys as
+        // their raw PS/2 make-code byte (Home=0x47, End=0x4F, PgUp=0x49,
+        // PgDn=0x51, Delete=0x53 -- see isr.c's own comment), and with no case
+        // here they fell through to the "printable ASCII press" branch below.
+        // 0x49 and 0x51 are ALSO the ASCII codes for the letters 'I' and 'Q',
+        // so pressing PageDown was silently typed into the document as the
+        // letter 'Q' (PageUp as 'I'), and Word's own WM_KEYDOWN(VK_NEXT) /
+        // WM_KEYDOWN(VK_PRIOR) scroll-page handler was never reached at all --
+        // this is the root cause of "PgDn/PgUp do not scroll the document"
+        // (MEASURED via a live testinput repro + reference Bochs diff, see
+        // docs/WORD6_DIVERGENCE_CATALOG.md). Cross-checked against the VK_*
+        // values already proven correct in this switch: real Windows numbers
+        // VK_PRIOR..VK_DOWN as one contiguous block (0x21 PRIOR, 0x22 NEXT,
+        // 0x23 END, 0x24 HOME, 0x25 LEFT, 0x26 UP, 0x27 RIGHT, 0x28 DOWN) --
+        // HOME/LEFT/UP/RIGHT/DOWN above are already 0x24/0x25/0x26/0x27/0x28,
+        // so PRIOR=0x21/NEXT=0x22/END=0x23 slot into the same known-correct
+        // range, not a guess. Delete (0x53 -> VK_DELETE=0x2E) is the same
+        // class of gap; fixed alongside since it is a one-line, well-defined
+        // mapping and shares the identical bug shape. Same ambiguity caveat
+        // as Home above (0x49/'I', 0x51/'Q', 0x4F/'O', 0x53/'S' collide with
+        // real letters at this cooked-code layer); out of scope to fix the
+        // deeper ambiguity here, same as Home.
+        case 0x49: return 0x21;  // KEY_PAGEUP   -> VK_PRIOR
+        case 0x51: return 0x22;  // KEY_PAGEDOWN -> VK_NEXT
+        case 0x4F: return 0x23;  // KEY_END      -> VK_END
+        case 0x53: return 0x2E;  // KEY_DELETE   -> VK_DELETE
+        // (Word6 divergence catalog #2, Alt-menu) KEY_ALT/KEY_ALT_UP are new
+        // cooked codes (cpu/isr.c previously never produced any for the real
+        // Alt key at all, see isr.c/isr.h); map to real VK_MENU (0x12) so
+        // GetKeyState(VK_MENU) works and win16_pump_input's SYS-key gating
+        // (below) can post WM_SYSKEYDOWN/WM_SYSKEYUP(VK_MENU) faithfully.
+        // 0x9A/0x9C were also chosen to de-collide KEY_LSHIFT/KEY_RSHIFT/
+        // KEY_ALT from isr.c's local KEY_F10/KEY_F1/KEY_F2 (all previously
+        // 0x87/0x88/0x89); the F1/F2/F10 cases above are unchanged and are
+        // now unambiguous since isr.h's modifier codes moved off those bytes.
+        case 0x9A: return 0x12;                  // KEY_ALT (fixed) -> VK_MENU
+        case 0x9C: *is_release = 1; return 0x12; // KEY_ALT_UP -> VK_MENU release
         default: break;
     }
     // Printable-ASCII release: base | 0x80 (only emitted for 0x20-0x7E).
@@ -3711,13 +4726,36 @@ static int      g_w16_pcvx = -100000;    // previous canvas x (move throttle)
 static int      g_w16_pcvy = -100000;
 static uint64_t g_w16_lclick_t = 0;      // last left-down tick (double-click)
 static int      g_w16_lclick_x = 0, g_w16_lclick_y = 0;
-static int      g_w16_menu_open = -1;    // open top-level menu index, -1 = none
-static int      g_w16_menu_prev = -1;    // (#197) prev menu-open state for close-repaint
+// g_w16_menu_open / g_w16_menu_prev / g_w16_menu_bar_hot moved up to just
+// after g_menus[] (Word6 divergence catalog #2) so win16_draw_menubar can
+// read them too.
 // (#219) Bits saved from the canvas under the open popup, restored on close so the
 // app content beneath (cards, board, sprites) returns WITHOUT a full-client erase.
 static uint32_t *g_w16_menu_save = 0;
 static int       g_w16_menu_save_x, g_w16_menu_save_y, g_w16_menu_save_w, g_w16_menu_save_h;
 static int       g_w16_menu_save_t = -1;  // top-level title the current save belongs to
+
+// (Word6 divergence catalog #2, Alt-menu) Find the top-level title whose
+// '&'-prefixed mnemonic letter matches ch (case-insensitive). Returns the top
+// index or -1. Shared by the keyboard Alt+letter path in win16_pump_input so
+// it opens the SAME popup a mouse click on that title already would --
+// reuses win16_menu_bar_hit/win16_menu_popup_items/win16_draw_menu_popup
+// below rather than forking a second menu-tracking implementation.
+static int win16_menu_mnemonic_hit(win16_menu_t *m, char ch) {
+    if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 'a' + 'A');
+    for (int i = 0; i < m->ntop; i++) {
+        win16_mitem_t *it = &m->items[m->top_idx[i]];
+        for (const char *sp = it->text; *sp; sp++) {
+            if (*sp == '&' && sp[1]) {
+                char mnem = sp[1];
+                if (mnem >= 'a' && mnem <= 'z') mnem = (char)(mnem - 'a' + 'A');
+                if (mnem == ch) return i;
+                break;   // only the first '&' in a title text is the mnemonic
+            }
+        }
+    }
+    return -1;
+}
 
 // Top-level menu-bar hit-test (canvas coords). Returns the top index or -1.
 static int win16_menu_bar_hit(win16_menu_t *m, int cvx, int cvy) {
@@ -3801,6 +4839,9 @@ static void win16_menu_save_under(int px, int py, int pw, int ph, int t) {
 static void win16_draw_menu_popup(win16_menu_t *m, int t) {
     int idx[40], px, py, pw, ph;
     int n = win16_menu_popup_items(m, t, idx, 40, &px, &py, &pw, &ph);
+    { extern int g_w6life; if (g_w6life)
+        kprintf("[W6ALTMNEM] draw_popup t=%d n=%d px=%d py=%d pw=%d ph=%d ntop=%d top_x[t]=%d\n",
+                t, n, px, py, pw, ph, m->ntop, (t>=0 && t<m->ntop) ? m->top_x[t] : -1); }
     if (n <= 0) return;
     win16_menu_save_under(px, py, pw, ph, t);   // (#219) snapshot before overpainting
     uint32_t bg = FB_COLOR(238,238,238), ink = FB_COLOR(20,20,20), bd = FB_COLOR(90,90,90);
@@ -4097,6 +5138,21 @@ static int win16_pump_input(void) {
     while (key_target && keyboard_has_char() && drained < 16) {
         int code = keyboard_get_char();
         drained++;
+        // (Word6 divergence catalog #2, Alt-menu) Esc first exits menu-select
+        // mode (an open popup or a bare-Alt-tap highlight), exactly like real
+        // Windows: DefWindowProc's menu-tracking loop eats an Esc that only
+        // closes tracking, it does not ALSO reach the app as a document Esc
+        // in the same keystroke. Just clear the state here; the existing
+        // idle-frame diff (g_w16_menu_prev vs g_w16_menu_open, below in the
+        // paint path) does the actual canvas restore + bar redraw, exactly
+        // as it already does for a mouse-click-outside-popup close.
+        if (code == 0x1B && (g_w16_menu_open >= 0 || g_w16_menu_bar_hot >= 0)) {
+            g_w16_menu_open = -1;
+            g_w16_menu_bar_hot = -1;
+            g_win16_z_dirty = 1;
+            posted++;
+            continue;
+        }
         // ESC, or F4 (kernel desktop close convention), closes the Win16 app.
         // (#278 pass30) For Word (segcount>=100) ESC is a normal editing key
         // (cancel/dismiss a modal dialog, deselect), NOT an app-close, so the
@@ -4113,19 +5169,120 @@ static int win16_pump_input(void) {
         int is_release; char ch;
         uint16_t vk = kernel_key_to_vk(code, &is_release, &ch);
         if (vk == 0) continue;
+
+        // (Word6 divergence catalog #2, Alt-menu) Alt state tracking, updated
+        // in strict cooked-code ARRIVAL order (see g_w16_alt_down's
+        // declaration comment for why real-time state is the wrong thing to
+        // read here). kernel_key_to_vk maps BOTH KEY_ALT and KEY_ALT_UP to
+        // VK_MENU (0x12); is_release tells the two apart.
+        if (vk == 0x12) {
+            if (!is_release) {
+                g_w16_alt_down = 1;
+                g_w16_alt_only = 1;
+            } else {
+                g_w16_alt_down = 0;
+                if (g_w16_alt_only && g_w16_menu_open < 0) {
+                    // Bare Alt tap (no other key while held): toggle the
+                    // menu-bar highlight, like real Windows entering/leaving
+                    // menu-select mode on a lone Alt press/release. Alt+letter
+                    // (below, via WM_SYSCHAR) opens a popup directly instead
+                    // of going through this toggle.
+                    // (Word6 divergence catalog #2) win16_get_chrome_menu is
+                    // cached independent of window lifecycle; see its
+                    // declaration for why win16_focus_hwnd()/g_win16_main_hwnd
+                    // are NOT reliable here (both traced to hmenu==0 via
+                    // [W6ALTMNEM]), and why a plain handle is not enough
+                    // (Word's own DestroyMenu wipes the g_menus[] slot too).
+                    // Fall back to a live-window search if nothing was ever
+                    // cached (e.g. games, which never tear their frame down
+                    // the way Word's init-gate failure does).
+                    win16_menu_t *cm = win16_get_chrome_menu();
+                    if (!cm) { win16_window_t *fw = win16_find_menu_window();
+                        if (fw && fw->hmenu && fw->hmenu <= WIN16_MAX_MENUS) cm = &g_menus[fw->hmenu - 1]; }
+                    if (cm) {
+                        g_w16_menu_bar_hot = (g_w16_menu_bar_hot < 0) ? 0 : -1;
+                        g_win16_z_dirty = 1;
+                    }
+                }
+                g_w16_alt_only = 0;
+            }
+        } else if (g_w16_alt_down) {
+            g_w16_alt_only = 0;   // a chord: some other key arrived while Alt was held
+        }
+        // A system key (Alt itself, or any key while Alt is held) generates
+        // WM_SYSKEYDOWN/WM_SYSKEYUP/WM_SYSCHAR instead of WM_KEYDOWN/WM_KEYUP/
+        // WM_CHAR (Word6 divergence catalog #2, ROOT CAUSE: this codebase
+        // never made this distinction, so Alt+letter degraded to a plain
+        // WM_CHAR and the mnemonic letter was typed into the document).
+        int is_sys = (vk == 0x12) || g_w16_alt_down;
+
+        // (Word6 divergence catalog #2, Alt-menu) A bare-Alt-tap highlight
+        // (g_w16_menu_bar_hot) with no popup open is not a modal capture (see
+        // the mnemonic-matching comment below for the deeper menu-select-mode
+        // routing this interpreter does not implement); the simple thing that
+        // must not happen is the title staying highlighted after the user
+        // just goes back to typing without Alt. Clear it on any ordinary key.
+        if (!is_sys && g_w16_menu_bar_hot >= 0) { g_w16_menu_bar_hot = -1; g_win16_z_dirty = 1; }
+
+        // (Word6 divergence catalog #2) Menu tracking captures the input loop
+        // while a popup is open (real Windows: TrackPopupMenu's modal loop),
+        // so ordinary key PRESSES must not leak into the document underneath.
+        // Esc already closed the popup above before reaching here; VK_MENU
+        // still flows through so a further Alt+letter can switch to a
+        // different top-level title while one is open. Releases are still
+        // delivered (harmless, and keeps g_win16_keydown/GetKeyState from
+        // getting a key stuck "down" if its release lands while the popup
+        // happens to be open).
+        if (g_w16_menu_open >= 0 && vk != 0x12 && !is_release) continue;
+
         g_win16_keydown[vk & 0xFF] = is_release ? 0 : 1;   // for GetKeyState/GetAsyncKeyState
         { extern int g_w6life; if (g_w6life && g_info.segcount>=100)
-            kprintf("[W6KDRAIN] code=%02x vk=%02x ch=%02x rel=%d -> post to %04x\n",
-                    code, vk, (unsigned char)ch, is_release, key_target); }
+            kprintf("[W6KDRAIN] code=%02x vk=%02x ch=%02x rel=%d sys=%d -> post to %04x\n",
+                    code, vk, (unsigned char)ch, is_release, is_sys, key_target); }
         if (is_release) {
-            msgq_post(key_target, WM_KEYUP, vk, 0);
+            msgq_post(key_target, is_sys ? WM_SYSKEYUP : WM_KEYUP, vk, 0);
             posted++;
         } else {
-            msgq_post(key_target, WM_KEYDOWN, vk, 0);
+            msgq_post(key_target, is_sys ? WM_SYSKEYDOWN : WM_KEYDOWN, vk, 0);
             posted++;
-            // TranslateMessage would synthesise WM_CHAR for character keys; post
-            // it directly so apps that read WM_CHAR also work.
-            if (ch) { msgq_post(key_target, WM_CHAR, (uint16_t)(uint8_t)ch, 0); posted++; }
+            // TranslateMessage would synthesise WM_CHAR/WM_SYSCHAR for
+            // character keys; post it directly so apps that read it work.
+            if (ch) {
+                msgq_post(key_target, is_sys ? WM_SYSCHAR : WM_CHAR, (uint16_t)(uint8_t)ch, 0);
+                posted++;
+                // (Word6 divergence catalog #2, Alt-menu) Alt+letter: match
+                // the char against the focused top-level window's menu
+                // mnemonics and open that popup, reusing the SAME
+                // g_w16_menu_open/win16_draw_menu_popup/win16_menu_popup_hit
+                // mechanism a mouse click on the title already drives (see
+                // win16_pump_mouse above) rather than forking a second menu
+                // implementation. vk!=0x12 excludes the Alt keystroke itself
+                // (which has no ch and would not reach here anyway).
+                if (is_sys && vk != 0x12) {
+                    // (Word6 divergence catalog #2) See win16_get_chrome_menu's
+                    // declaration for why this is not looked up via a live
+                    // window object (win16_focus_hwnd()/g_win16_main_hwnd) or
+                    // even a live-but-possibly-wiped g_menus[] slot alone.
+                    win16_menu_t *cm = win16_get_chrome_menu();
+                    if (!cm) { win16_window_t *fw = win16_find_menu_window();
+                        if (fw && fw->hmenu && fw->hmenu <= WIN16_MAX_MENUS) cm = &g_menus[fw->hmenu - 1]; }
+                    { extern int g_w6life; if (g_w6life)
+                        kprintf("[W6ALTMNEM] ch=%c focus=%04x mainhwnd=%04x chrome=%04x cm=%p ntop=%d\n",
+                                ch, focus, g_win16_main_hwnd, g_win16_chrome_hmenu, (void*)cm,
+                                cm ? cm->ntop : -1); }
+                    if (cm) {
+                        int t = win16_menu_mnemonic_hit(cm, ch);
+                        { extern int g_w6life; if (g_w6life)
+                            kprintf("[W6ALTMNEM] mnemonic_hit -> t=%d\n", t); }
+                        if (t >= 0) {
+                            g_w16_menu_open = t;
+                            g_w16_menu_bar_hot = -1;
+                            g_w16_alt_only = 0;
+                            g_win16_z_dirty = 1;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -4217,101 +5374,18 @@ static int win16_pump_input(void) {
             }
         }
     }
-    // (#278 Word6 pass37) DOC-READY injection. Word finishes activating the initial
-    // document for editing by SENDING its frame an internal message 0x10 whose wParam
-    // is the newly built view object; the frame wndproc (seg222:0x0860) routes msg
-    // 0x10 through its jump table -> seg222:0x09c8 -> seg85:0x3566 (the extended
-    // handler), whose msg-0x10 case (seg85:0x37a0) validates the view (lcall
-    // seg182:0), ORs the "document ready" flag [DGROUP:0x344] bit3, and builds the
-    // page/view layout + status. In our host that internal SendMessage is never
-    // emitted (the doc-creation command chain that would post it does not complete),
-    // so the edit page never paints and typing is impossible. Everything the handler
-    // needs is now present: the active-view global [DGROUP:0x1d18] is populated (the
-    // WM_CREATE doc-view build ran, pass35), and the frame/edit windows exist. Once
-    // the Tip is gone and the view is non-null, synthesize that one message with the
-    // real view as wParam, exactly as Word would. Word-gated (segcount>=100), one
-    // shot; a no-op for games (they never populate [0x1d18] and are <100 segs).
-    {
-        // (#278 pass49) DOC-READY injection, TIMING-CORRECTED. Static RE (this pass)
-        // of the msg-0x10 handler seg85:0x37a0 shows it is Word's OWN initial-render
-        // command: gate1 (seg85:0x3faa, arg=1) -> if 0, the handler does
-        //   OR [0x344],8   (set paint bit3)
-        //   then the page builders 0x3846:0x3e / 0x3855:0x19da / 0x3831:0x25c,
-        // laying out + painting the document IN Word's natural wndproc context.
-        // gate1 returns 0 iff [0x4d0]==0, [0x337]&0x20==0, [0x33f]&4==0, [0x4c8]<3,
-        // [0x4ce]==0, AND ([0x15fe]==0 OR SDM.90([0x15fe])==0). At runtime all five
-        // early flags are 0 (pass); the ONLY blocker was [0x15fe] (an SDM.DLL
-        // re-entrancy scratch, non-zero only transiently) being non-zero at the one
-        // moment pass 37 fired -> SDM.90 -> gate bailed. Fire ONLY while [0x15fe]==0
-        // (SDM at rest), retrying across pump iterations, so the gate passes and
-        // Word renders itself. Word-gated (segcount>=100); a no-op for games.
-        static int s_w6_docready = 0;
-        if (!s_w6_docready && g_info.segcount >= 100 && g_cpu && g_info.ds
-            && !win16_find_toplevel_by_title("Tip of the Day") && g_win16_focus) {
-            uint16_t view  = x86_16_rd16(g_cpu, g_info.ds, 0x1d18);
-            uint16_t sdm   = x86_16_rd16(g_cpu, g_info.ds, 0x15fe);
-            uint16_t f4d0  = x86_16_rd16(g_cpu, g_info.ds, 0x04d0);
-            uint16_t f4c8  = x86_16_rd16(g_cpu, g_info.ds, 0x04c8);
-            uint16_t f4ce  = x86_16_rd16(g_cpu, g_info.ds, 0x04ce);
-            uint16_t g344b = x86_16_rd16(g_cpu, g_info.ds, 0x0344);
-            // Only fire when the SDM scratch is at rest so gate1 does not bail on
-            // SDM.90, AND when the other five gate flags are already in the pass
-            // state (they are, at rest). This retries every pump pass until the
-            // conditions line up rather than burning the one shot on a bad moment.
-            int gate_ok = (sdm == 0) && (f4d0 == 0) && (f4ce == 0) && (f4c8 < 3);
-            if (view && gate_ok) {
-                uint16_t frame = g_win16_focus;
-                for (int g = 0; g < 8; g++) {
-                    win16_window_t *fw = win_from_hwnd(frame);
-                    if (!fw || fw->parent == 0) break;
-                    frame = fw->parent;
-                }
-                win16_window_t *fwp = win_from_hwnd(frame);
-                if (fwp) {
-                    s_w6_docready = 1;
-                    kprintf("[W6RDY49] fire msg0x10 view=%04x frame=%04x [15fe]=%04x "
-                            "[4d0]=%04x [4c8]=%04x [4ce]=%04x [344]before=%04x\n",
-                            view, frame, sdm, f4d0, f4c8, f4ce, g344b);
-                    win16_call_wndproc(fwp->proc_seg, fwp->proc_off, frame,
-                                       0x0010 /*Word internal doc-ready*/, view, 0);
-                    uint16_t g344a = x86_16_rd16(g_cpu, g_info.ds, 0x0344);
-                    kprintf("[W6RDY49] after msg0x10 [344]after=%04x (bit3=%d)\n",
-                            g344a, (g344a & 0x08) ? 1 : 0);
-                    // Repaint so the freshly laid-out page shows immediately.
-                    win16_paint_all_z();
-                    g_win16_z_dirty = 0;
-                    // (#278 pass61) The initial-render (msg-0x10) set paint-ready
-                    // bit3 in [0x344] ONLY NOW, AFTER the document view window's
-                    // early WM_PAINTs already ran with bit3 clear (the nodraw /
-                    // request-repaint path) and left the page gray. Real Word
-                    // repaints the view once the doc is ready; our frame cascade in
-                    // win16_paint_all_z does not re-enter the deeply nested MDI edit
-                    // pane, so deliver that WM_PAINT explicitly to the doc view
-                    // window(s) now that bit3 is set. Word-gated + one-shot (guarded
-                    // by s_w6_docready), so games are unaffected.
-                    // (#278 p61) clear paint-ready bit3 so the edit pane takes the
-                    // FULL-paint dispatcher (seg222:0x2048) that iterates the now-built
-                    // display list, not the fast cached-blit (bit3-set) path; and run
-                    // it under soft-repaint so BeginPaint uses the FULL client clip (a
-                    // partial clip only paints part of the page width).
-                    { uint16_t v=x86_16_rd16(g_cpu,g_info.ds,0x0344);
-                      x86_16_wr16(g_cpu,g_info.ds,0x0344,(uint16_t)(v & ~0x08)); }
-                    { int prevsr = g_win16_in_soft_repaint;
-                      g_win16_in_soft_repaint = 1;
-                      for (int wi = 0; wi < WIN16_MAX_WINDOWS; wi++) {
-                          win16_window_t *ew = &g_windows[wi];
-                          if (ew->used && ew->shown && ew->is_child
-                              && ew->proc_seg == 0x06f7 && ew->proc_off == 0x1f6a) {
-                              ew->inval_valid = 0;
-                              win16_dispatch_to_window(ew->hwnd, WM_PAINT, 0, 0);
-                          }
-                      }
-                      g_win16_in_soft_repaint = prevsr;
-                    }
-                }
-            }
-        }
-    }
+    // (#278 CHROME-TEARDOWN FIX, 2026-07-25) The Word6 DOC-READY injection that
+    // used to live here has been REMOVED. It synthesized message 0x10 to Word's
+    // frame wndproc; 0x10 == WM_CLOSE (see #define WM_CLOSE 0x0010 above), so Word's
+    // own frame wndproc handled it as an application close and tore down the chrome
+    // (DestroyWindow via seg182:0x25c + DestroyMenu via seg31:0x25d2). That teardown
+    // was the real root of the missing-toolbar and empty-menu-popup divergences.
+    // Real Word never sends its own frame WM_CLOSE during File>New; the empty initial
+    // document is just a window-background white page, and Word builds/paints its own
+    // toolbars and menus naturally. The earlier reading of 0x10 as a Word-internal
+    // "doc-ready initial-render" message (pass37/pass49) is disproven: at runtime,
+    // injecting 0x10 fires a DestroyWindow teardown, not a render. Removing the
+    // injection lets Word's natural chrome + paint complete, matching the reference.
     // Mouse: sample the cursor + buttons and post client/menu messages.
     win16_pump_mouse();
 
@@ -4364,6 +5438,35 @@ static void u_peekmessage(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
     // Pump real input (keyboard/mouse/timers) into the queue, then peek.
     win16_pump_input();
 
+    // (Word6 divergence catalog #2, Alt-menu) Keep an open menu popup painted
+    // on top, same as GetMessage's idle-wait loop does below -- PeekMessage
+    // has NO equivalent of its own, so any app whose message loop is built
+    // around PeekMessage (rather than blocking GetMessage) never repainted
+    // an Alt+mnemonic-opened popup at all. See u_getmessage's matching block
+    // (and win16_get_chrome_menu's declaration) for why the fallback to
+    // win16_get_chrome_menu() is needed instead of a live window's ->hmenu.
+    if (g_w16_menu_open >= 0) {
+        win16_window_t *mfw = win_from_hwnd(win16_focus_hwnd());
+        win16_menu_t *mpm = 0;
+        if (mfw && mfw->hmenu && mfw->hmenu <= WIN16_MAX_MENUS && g_menus[mfw->hmenu - 1].used)
+            mpm = &g_menus[mfw->hmenu - 1];
+        else
+            mpm = win16_get_chrome_menu();
+        if (mpm) win16_draw_menu_popup(mpm, g_w16_menu_open);
+        else     g_w16_menu_open = -1;
+    }
+    if (g_w16_menu_prev >= 0 && g_w16_menu_open < 0) {
+        win16_menu_restore_under();
+        win16_window_t *mfw = win_from_hwnd(win16_focus_hwnd());
+        if (mfw && mfw->hwnd == g_win16_main_hwnd && mfw->hmenu) win16_draw_menubar(mfw);
+        g_win16_z_dirty = 0;
+    }
+    g_w16_menu_prev = g_w16_menu_open;
+    // (#win16present) Mirror u_getmessage's mark: the menu popup show/restore
+    // above (PeekMessage's own equivalent, since PeekMessage has no idle wait
+    // to hang a periodic mark off) may have painted.
+    win16_present_mark();
+
     // (#200 ski-flicker) SkiFree (app_kind 3) draws its sprites every frame with
     // NO background erase (GetDC + opaque SRCCOPY) and relies on the OS to clear
     // the slope. Run the flicker-free full repaint (erase + full redraw into the
@@ -4381,7 +5484,28 @@ static void u_peekmessage(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
         if (timer_ticks - s_ski_pk_paint >= sintv) {
             s_ski_pk_paint = timer_ticks;
             win16_soft_repaint_focus();
+            win16_present_mark();   // (#win16present)
         }
+    }
+
+    // (#toolbar-icon diag) Word 6's WinMain message loop is built on
+    // PeekMessage, not GetMessage (confirmed by the pre-existing [W6PMSG]
+    // gated trace above, which only ever fires here). u_getmessage has flushed
+    // the in-memory win16_trace buffer to /WIN16LOG.TXT on every idle poll
+    // since (#205); PeekMessage never had the equivalent, so any app whose
+    // loop is PeekMessage-based (Word 6) left the ENTIRE run's trace
+    // (LoadBitmap/BitBlt/etc. for the toolbar bitmaps included) stuck in
+    // memory and never written to disk, no matter how long it stayed open.
+    // Mirror the same growth-gated flush here so the file sink actually
+    // reflects a PeekMessage app's run (general fix, not Word-specific).
+    if (g_trace_len > 0 && g_trace_len != g_trace_last_flush_len) {
+        g_trace_flushed = 1;
+        g_trace_last_flush_len = g_trace_len;
+        // #693: a diagnostic trace. Nothing can act on the failure, but a
+        // silently-absent trace file has cost real debugging time before.
+        if (win16_trace_writable() &&
+            fat_write_file(&g_fat_fs, "/WIN16LOG.TXT", g_trace, g_trace_len) != 0)
+            kprintf("[WIN16] trace flush to /WIN16LOG.TXT FAILED\n");
     }
 
     win16_msg_t m;
@@ -4396,6 +5520,29 @@ static void u_peekmessage(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
     if (have) { msg_write(c, msg_seg, msg_off, &m); *ax = 1; }
     else      { *ax = 0; }
     *dx = 0;
+
+    // (#278 DIAG idle-redraw pass) Arm the post-key API trace when Word ACTUALLY
+    // RETRIEVES (PM_REMOVE, not just peeks) a keyboard message for its edit pane.
+    // This pass found Word's PeekMessage loop never calls DispatchMessage for
+    // WM_KEYDOWN/WM_CHAR (handles them inline instead), so g_w6_charwin (armed
+    // only inside a wndproc dispatch) never arms for those; arm here instead so
+    // we see what Word calls right after pulling the message off its queue.
+    { extern int g_w6life, g_w6_postkey_trace;
+      if (g_w6life && g_info.segcount >= 100 && have && (remove & 0x0001) &&
+          m.hwnd == 0x004f &&
+          (m.message == WM_KEYDOWN || m.message == WM_CHAR || m.message == WM_KEYUP))
+        g_w6_postkey_trace = 4000; }
+
+    // (#278 DIAG idle-redraw pass) Trace every PeekMessage return (empty or not)
+    // while g_w6life is armed, so a capture shows whether Word's PeekMessage
+    // loop ever actually sees an EMPTY queue (have=0) between keystrokes, which
+    // is the precondition for its idle/deferred-redraw branch to run at all.
+    { extern int g_w6life;
+      if (g_w6life && g_info.segcount >= 100) {
+        static uint32_t npm=0; if (npm<20000) { npm++;
+          win16_trace("[W6PMRET] n=%u have=%d msg=%04x hwnd=%04x remove=%04x qcount=%d caller=%04x:%04x\n",
+              (unsigned)npm, have, have?m.message:0, have?m.hwnd:0, remove, g_msgq_count,
+              x86_16_rd16(c,c->ss,(uint16_t)(c->sp+2)), x86_16_rd16(c,c->ss,c->sp)); } } }
 
     // (#200/#205) SkiFree's PeekMessage(PM_NOREMOVE) game loop spins flat-out
     // when the queue is empty (it calls its per-frame slope-advance, which is
@@ -4642,7 +5789,11 @@ static void u_getmessage(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
     if (g_trace_len > 0 && g_trace_len != g_trace_last_flush_len) {
         g_trace_flushed = 1;
         g_trace_last_flush_len = g_trace_len;
-        fat_write_file(&g_fat_fs, "/WIN16LOG.TXT", g_trace, g_trace_len);
+        // #693: a diagnostic trace. Nothing can act on the failure, but a
+        // silently-absent trace file has cost real debugging time before.
+        if (win16_trace_writable() &&
+            fat_write_file(&g_fat_fs, "/WIN16LOG.TXT", g_trace, g_trace_len) != 0)
+            kprintf("[WIN16] trace flush to /WIN16LOG.TXT FAILED\n");
     }
 
     win16_msg_t m;
@@ -4710,10 +5861,23 @@ static void u_getmessage(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
             // Keep an open menu popup painted on top of whatever the app drew
             // (runs even for card games whose periodic repaint is suppressed).
             if (g_w16_menu_open >= 0) {
+                // (Word6 divergence catalog #2) Prefer the live window's own
+                // hmenu (so in-place edits like CheckMenuItem show up), but
+                // fall back to win16_get_chrome_menu() -- without this, a
+                // menu opened via Alt+mnemonic while Word's own frame window
+                // is torn down (see g_win16_chrome_hmenu's comment) would be
+                // closed again on the VERY NEXT idle pass, before ever being
+                // drawn: win16_focus_hwnd() returns a DIFFERENT, hmenu-less
+                // window at that point, which this check used to treat as
+                // "menu gone" and immediately reset g_w16_menu_open to -1.
                 win16_window_t *fw = win_from_hwnd(win16_focus_hwnd());
-                if (fw && fw->hmenu && fw->hmenu <= WIN16_MAX_MENUS &&
-                    g_menus[fw->hmenu - 1].used)
-                    win16_draw_menu_popup(&g_menus[fw->hmenu - 1], g_w16_menu_open);
+                win16_menu_t *pm = 0;
+                if (fw && fw->hmenu && fw->hmenu <= WIN16_MAX_MENUS && g_menus[fw->hmenu - 1].used)
+                    pm = &g_menus[fw->hmenu - 1];
+                else
+                    pm = win16_get_chrome_menu();
+                if (pm)
+                    win16_draw_menu_popup(pm, g_w16_menu_open);
                 else
                     g_w16_menu_open = -1;
             }
@@ -4729,6 +5893,12 @@ static void u_getmessage(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
                 g_win16_z_dirty = 0;      // (#209) just settled it
             }
             g_w16_menu_prev = g_w16_menu_open;
+            // (#win16present) Any of the paint calls above (z-repaint, soft
+            // repaint, menu popup show, menu-close restore) may have written
+            // fresh pixels into the host window's content buffer with no other
+            // choke point downstream. Mark unconditionally: an extra mark on a
+            // pass that painted nothing costs one appended dirty rect.
+            win16_present_mark();
             if (timer_ticks - idle_start >= idle_cap) {
                 kprintf("[win16api] GetMessage idle cap reached -> quitting\n");
                 g_quit_posted = 1;
@@ -4810,6 +5980,13 @@ static void u_dispatchmessage(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
         kprintf("[W6DISP] DispatchMessage msg=%04x hwnd=%04x wp=%04x proc=%04x:%04x\n",
                 message, hwnd, wParam, dw?dw->proc_seg:0, dw?dw->proc_off:0); } }
     uint32_t r = win16_dispatch_to_window(hwnd, message, wParam, lParam);
+    // (#win16present) The wndproc just called (a game's WM_TIMER frame-advance,
+    // a WM_PAINT, a WM_COMMAND that redrew something) may have written fresh
+    // pixels into the host window's content buffer. Mark it: see
+    // win16_present_mark()'s comment. This is the primary fix - it is the one
+    // choke point every message-driven guest draw passes through, mirroring
+    // dos_present()'s single call site.
+    win16_present_mark();
     *ax = (uint16_t)(r & 0xFFFF); *dx = (uint16_t)(r >> 16); *argbytes = 4;
 }
 
@@ -5000,6 +6177,9 @@ static int mm_play_named(const char *dospath) {
     // Read the WAV file and submit its PCM directly via audio_play_buffer, which
     // bypasses the kernel AudioDecode layer (that lacks a WAV decoder). This is
     // the path that actually produces output on the HDA/AC97 driver.
+    // #708: sndPlaySound/PlaySound take a guest-supplied filename and read it,
+    // so they are an arbitrary-file read primitive dressed as audio.
+    if (!win16_fs_allow(path, R_OK, "sndPlaySound/PlaySound")) return 0;
     uint32_t sz = 0;
     void *d = fat_read_file(&g_fat_fs, path, &sz);
     int ok = 0;
@@ -5570,7 +6750,19 @@ static void u_adjustwindowrectex(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, ui
 static void u_setmenu(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *argbytes) {
     uint16_t hmenu = arg16(c, 0);
     win16_window_t *win = win_from_hwnd(arg16(c, 1));
-    if (win) { win->hmenu = hmenu; win16_draw_frame(win); }
+    if (win) {
+        win->hmenu = hmenu;
+        // (Word6 divergence catalog #2, Alt-menu) See g_win16_chrome_hmenu /
+        // g_win16_chrome_menu_snap.
+        if (!win->is_child && hmenu) {
+            g_win16_chrome_hmenu = hmenu;
+            if (hmenu <= WIN16_MAX_MENUS && g_menus[hmenu - 1].ntop > 0) {
+                g_win16_chrome_menu_snap  = g_menus[hmenu - 1];
+                g_win16_chrome_menu_valid = 1;
+            }
+        }
+        win16_draw_frame(win);
+    }
     *ax = 1; *dx = 0; *argbytes = 4;
 }
 static void u_drawmenubar(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *argbytes) {
@@ -5828,6 +7020,64 @@ static void u_invalidaterect(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
 // (ordinal-table-only, silent no-op), so the exposed rows were never invalidated and
 // rendered as stale black boxes / a scroll blanked the chrome. Games never call
 // ScrollWindow*, so this path is editor-only and cannot regress them.
+// (#278 Word6 continuation) Shift the PIXELS of a window's client sub-rect by
+// (dx,dy) within the shared host canvas. Real USER.ScrollWindow/ScrollWindowEx
+// blit-shift the covered content and invalidate only the newly-exposed strip;
+// our prior implementation invalidated a rect and reposted WM_PAINT but NEVER
+// moved a single pixel (win16_scroll_invalidate below does not touch canvas
+// memory, and XAmount/YAmount were parsed into local variables that no caller
+// ever read -- see the u_scrollwindow/u_scrollwindowex callers below before this
+// fix). A well-behaved app's WM_PAINT (Word 6 included) only repaints the
+// INVALIDATED region on the assumption the rest of the client was already moved
+// into place by ScrollWindow itself; skipping the pixel move meant the bulk of
+// the client (everything outside whatever narrow strip got invalidated) never
+// visually scrolled, while the document model/pagination happily advanced --
+// exactly the "PgDn flips the page counter but the view never moves" divergence
+// catalogued against the Bochs reference. This performs the actual shift so the
+// canvas matches what real Windows would have blitted, before the existing
+// invalidate/WM_PAINT path (unchanged below) asks the app to redraw the exposed
+// edge. Row-major shift with an overlap-safe copy direction (like memmove);
+// horizontal shift is rare for Word's vertical line/page scrolling but handled
+// for completeness. dx/dy are directly the ScrollWindow(nXAmount,nYAmount)
+// semantics: new content at (x,y) = old content at (x-dx,y-dy).
+static void win16_scroll_shift(win16_window_t *w, int l, int t, int rr, int b,
+                               int dx, int dy) {
+    if (!g_win16_canvas || (!dx && !dy)) return;
+    int cl = w->cx + l, ct = w->cy + t, cr = w->cx + rr, cb = w->cy + b;
+    if (cl < 0) cl = 0;
+    if (ct < 0) ct = 0;
+    if (cr > g_win16_canvas_w) cr = g_win16_canvas_w;
+    if (cb > g_win16_canvas_h) cb = g_win16_canvas_h;
+    if (cr <= cl || cb <= ct) return;
+    int width = cr - cl;
+    // Clamp the shift so the copy stays within the rect (a shift >= the rect's
+    // own extent just means "everything is uncovered"; nothing to move).
+    if (dy >= cb - ct || dy <= -(cb - ct)) dy = 0;
+    if (dx >= cr - cl || dx <= -(cr - cl)) dx = 0;
+    if (dy > 0) {
+        for (int y = cb - 1; y >= ct + dy; y--)
+            memmove(g_win16_canvas + (size_t)y * g_win16_canvas_w + cl,
+                    g_win16_canvas + (size_t)(y - dy) * g_win16_canvas_w + cl,
+                    (size_t)width * sizeof(uint32_t));
+    } else if (dy < 0) {
+        for (int y = ct; y < cb + dy; y++)
+            memmove(g_win16_canvas + (size_t)y * g_win16_canvas_w + cl,
+                    g_win16_canvas + (size_t)(y - dy) * g_win16_canvas_w + cl,
+                    (size_t)width * sizeof(uint32_t));
+    }
+    if (dx > 0) {
+        for (int y = ct; y < cb; y++) {
+            uint32_t *row = g_win16_canvas + (size_t)y * g_win16_canvas_w + cl;
+            memmove(row + dx, row, (size_t)(width - dx) * sizeof(uint32_t));
+        }
+    } else if (dx < 0) {
+        for (int y = ct; y < cb; y++) {
+            uint32_t *row = g_win16_canvas + (size_t)y * g_win16_canvas_w + cl;
+            memmove(row, row - dx, (size_t)(width + dx) * sizeof(uint32_t));
+        }
+    }
+}
+
 static void win16_scroll_invalidate(x86_16_cpu_t *c, uint16_t hwnd,
                                     uint16_t rseg, uint16_t roff,
                                     uint16_t cseg, uint16_t coff) {
@@ -5854,6 +7104,87 @@ static void win16_scroll_invalidate(x86_16_cpu_t *c, uint16_t hwnd,
     g_win16_frame_dirty = 1;
 }
 
+// (#word6-scroll) SetScrollRange/SetScrollPos/GetScrollRange/GetScrollPos
+// (USER.64/62/65/63): real per-(hwnd,nBar) storage via scrollbar_state()
+// above, replacing the generic no-op stub (see that struct's declaration
+// comment for why the stub was a real bug, not a harmless default). Argument
+// layouts and byte counts are UNCHANGED from the existing g_stub_table
+// entries this replaces (cross-checked before wiring, per the skill's "verify
+// every magic constant" rule): SetScrollPos=8b, GetScrollPos=4b,
+// SetScrollRange=10b, GetScrollRange=12b.
+
+// SetScrollRange (USER.64): SetScrollRange(hwnd, nBar, nMin, nMax, bRedraw)
+// = 1+1+1+1+1 = 5w = 10 bytes. Stack top-down: bRedraw, nMax, nMin, nBar, hwnd.
+static void u_setscrollrange(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
+                             uint16_t *argbytes) {
+    int bredraw   = (int16_t)arg16(c, 0); (void)bredraw;
+    int nmax      = (int16_t)arg16(c, 1);
+    int nmin      = (int16_t)arg16(c, 2);
+    int nbar      = (int16_t)arg16(c, 3);
+    uint16_t hwnd = arg16(c, 4);
+    win16_window_t *w = win_from_hwnd(hwnd);
+    win16_scrollbar_t *sb = w ? scrollbar_state(w, nbar) : 0;
+    if (sb) {
+        sb->min = nmin; sb->max = nmax;
+        if (sb->pos < nmin) sb->pos = nmin;
+        if (sb->pos > nmax) sb->pos = nmax;
+    }
+    *ax = 1; *dx = 0; *argbytes = 10;
+}
+
+// GetScrollRange (USER.65): GetScrollRange(hwnd, nBar, lpMin far, lpMax far)
+// = 1+1+2+2 = 6w = 12 bytes. Stack top-down: lpMax.off, lpMax.seg, lpMin.off,
+// lpMin.seg, nBar, hwnd. Writes the CURRENT range to the two far int* out
+// params (the real Win16 contract; unlike SetScrollRange/SetScrollPos this
+// one has no useful AX/DX return value).
+static void u_getscrollrange(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
+                             uint16_t *argbytes) {
+    uint16_t maxoff = arg16(c, 0), maxseg = arg16(c, 1);
+    uint16_t minoff = arg16(c, 2), minseg = arg16(c, 3);
+    int nbar      = (int16_t)arg16(c, 4);
+    uint16_t hwnd = arg16(c, 5);
+    win16_window_t *w = win_from_hwnd(hwnd);
+    win16_scrollbar_t *sb = w ? scrollbar_state(w, nbar) : 0;
+    int mn = sb ? sb->min : 0, mx = sb ? sb->max : 0;
+    if (!(minseg == 0 && minoff == 0)) x86_16_wr16(c, minseg, minoff, (uint16_t)mn);
+    if (!(maxseg == 0 && maxoff == 0)) x86_16_wr16(c, maxseg, maxoff, (uint16_t)mx);
+    *ax = 1; *dx = 0; *argbytes = 12;
+}
+
+// SetScrollPos (USER.62): SetScrollPos(hwnd, nBar, nPos, bRedraw) = 1+1+1+1 =
+// 4w = 8 bytes. Stack top-down: bRedraw, nPos, nBar, hwnd. Returns the OLD
+// (pre-call) position in AX, matching the real contract (callers commonly
+// ignore it, but a faithful value costs nothing here).
+static void u_setscrollpos(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
+                           uint16_t *argbytes) {
+    int bredraw   = (int16_t)arg16(c, 0); (void)bredraw;
+    int npos      = (int16_t)arg16(c, 1);
+    int nbar      = (int16_t)arg16(c, 2);
+    uint16_t hwnd = arg16(c, 3);
+    win16_window_t *w = win_from_hwnd(hwnd);
+    win16_scrollbar_t *sb = w ? scrollbar_state(w, nbar) : 0;
+    int old = 0;
+    if (sb) {
+        old = sb->pos;
+        int p = npos;
+        if (p < sb->min) p = sb->min;
+        if (p > sb->max) p = sb->max;
+        sb->pos = p;
+    }
+    *ax = (uint16_t)old; *dx = 0; *argbytes = 8;
+}
+
+// GetScrollPos (USER.63): GetScrollPos(hwnd, nBar) = 1+1 = 2w = 4 bytes.
+// Returns the current position in AX.
+static void u_getscrollpos(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
+                           uint16_t *argbytes) {
+    int nbar      = (int16_t)arg16(c, 0);
+    uint16_t hwnd = arg16(c, 1);
+    win16_window_t *w = win_from_hwnd(hwnd);
+    win16_scrollbar_t *sb = w ? scrollbar_state(w, nbar) : 0;
+    *ax = (uint16_t)(sb ? sb->pos : 0); *dx = 0; *argbytes = 4;
+}
+
 // ScrollWindow (USER.61): ScrollWindow(hwnd, XAmount, YAmount, lpRect FAR*, lpClipRect
 // FAR*) = 1+1+1+2+2 = 7 words = 14 bytes. Stack top-down: clip.off, clip.seg,
 // rect.off, rect.seg, YAmount, XAmount, hwnd.
@@ -5861,8 +7192,24 @@ static void u_scrollwindow(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
                            uint16_t *argbytes) {
     uint16_t clip_off = arg16(c, 0), clip_seg = arg16(c, 1);
     uint16_t rect_off = arg16(c, 2), rect_seg = arg16(c, 3);
-    /* YAmount=arg16(c,4), XAmount=arg16(c,5) (deltas; see helper note) */
+    int yamount = (int16_t)arg16(c, 4), xamount = (int16_t)arg16(c, 5);
     uint16_t hwnd     = arg16(c, 6);
+    // (#278 Word6 continuation) Actually shift the client pixels before
+    // invalidating, so the majority of the client that ScrollWindow's caller
+    // expects to already be in place (and therefore never repaints) is visually
+    // correct. See win16_scroll_shift for why this was previously a no-op.
+    win16_window_t *w = win_from_hwnd(hwnd);
+    if (w) {
+        int l, t, rr, b;
+        if (rect_seg == 0 && rect_off == 0) { l = 0; t = 0; rr = w->cw; b = w->ch; }
+        else {
+            l  = (int16_t)x86_16_rd16(c, rect_seg, rect_off);
+            t  = (int16_t)x86_16_rd16(c, rect_seg, (uint16_t)(rect_off + 2));
+            rr = (int16_t)x86_16_rd16(c, rect_seg, (uint16_t)(rect_off + 4));
+            b  = (int16_t)x86_16_rd16(c, rect_seg, (uint16_t)(rect_off + 6));
+        }
+        win16_scroll_shift(w, l, t, rr, b, xamount, yamount);
+    }
     win16_scroll_invalidate(c, hwnd, rect_seg, rect_off, clip_seg, clip_off);
     *ax = 1; *dx = 0; *argbytes = 14;
 }
@@ -5873,11 +7220,137 @@ static void u_scrollwindow(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
 // lprcClip.seg, lprcScroll.off, lprcScroll.seg, dy, dx, hwnd.
 static void u_scrollwindowex(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
                              uint16_t *argbytes) {
+    int dy = (int16_t)arg16(c, 8), dxa = (int16_t)arg16(c, 9);
     uint16_t clip_off = arg16(c, 4), clip_seg = arg16(c, 5);
     uint16_t rect_off = arg16(c, 6), rect_seg = arg16(c, 7);
     uint16_t hwnd     = arg16(c, 10);
+    // (#278 Word6 continuation) as u_scrollwindow above: actually move the pixels.
+    win16_window_t *w = win_from_hwnd(hwnd);
+    if (w) {
+        int l, t, rr, b;
+        if (rect_seg == 0 && rect_off == 0) { l = 0; t = 0; rr = w->cw; b = w->ch; }
+        else {
+            l  = (int16_t)x86_16_rd16(c, rect_seg, rect_off);
+            t  = (int16_t)x86_16_rd16(c, rect_seg, (uint16_t)(rect_off + 2));
+            rr = (int16_t)x86_16_rd16(c, rect_seg, (uint16_t)(rect_off + 4));
+            b  = (int16_t)x86_16_rd16(c, rect_seg, (uint16_t)(rect_off + 6));
+        }
+        win16_scroll_shift(w, l, t, rr, b, dxa, dy);
+    }
     win16_scroll_invalidate(c, hwnd, rect_seg, rect_off, clip_seg, clip_off);
     *ax = 1; *dx = 0; *argbytes = 22;   // return SIMPLEREGION(1)
+}
+
+
+// (#word6-scroll) ScrollDC (USER.221): ScrollDC(hdc, dx, dy, lprcScroll FAR*,
+// lprcClip FAR*, hrgnUpdate, lprcUpdate FAR*) = 1+1+1+2+2+1+2 = 10w = 20 bytes.
+// PREVIOUSLY a pure no-op stub ({ "USER", 221, 20, 1 } in g_stub_table): it popped
+// the 20 arg bytes and returned 1 (success) but MOVED NO PIXELS. Word 6 scrolls its
+// document view with ScrollDC on the doc-window DC -- NOT ScrollWindow/ScrollWindowEx,
+// which prior passes correctly found Word never calls for this path -- once the caret
+// advances past the last visible row: Word ScrollDC's the existing client bits up by
+// one line height, then repaints ONLY the newly-exposed bottom strip (the caret line)
+// into the vacated row. So a no-op ScrollDC produced exactly the catalogued symptom
+// (per-line blit Y clamped at the bottom ~580px; earlier lines never shift: stale top
+// + one fresh bottom strip). This performs the real pixel shift via the SAME
+// overlap-safe win16_scroll_shift primitive ScrollWindow already uses, then reports
+// the exposed strip in lprcUpdate so Word's own paint of the vacated edge is correct.
+// dx/dy and the rects are DC-logical (mapped through the DC transform like BitBlt;
+// identity for Word's MM_TEXT doc DC). General USER fix: any Win16 app scrolling a
+// view via ScrollDC benefits identically.
+static void u_scrolldc(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx_out,
+                       uint16_t *argbytes) {
+    uint16_t upd_off  = arg16(c, 0), upd_seg  = arg16(c, 1);
+    uint16_t hrgn     = arg16(c, 2);
+    uint16_t clip_off = arg16(c, 3), clip_seg = arg16(c, 4);
+    uint16_t scr_off  = arg16(c, 5), scr_seg  = arg16(c, 6);
+    int dy  = (int16_t)arg16(c, 7);
+    int dxa = (int16_t)arg16(c, 8);
+    uint16_t hdc = arg16(c, 9);
+    *argbytes = 20; *ax = 1; *dx_out = 0;
+    if (!hdc || hdc >= WIN16_MAX_DC || !g_dcs[hdc].used) return;
+    win16_dc_t *dc = &g_dcs[hdc];
+    // Scroll rect (DC-logical); default = the whole DC surface.
+    int l, t, rr, b;
+    if (scr_seg == 0 && scr_off == 0) {
+        if (dc->membuf) { l = 0; t = 0; rr = dc->mw; b = dc->mh; }
+        else if (dc->win >= 0) { l = 0; t = 0; rr = g_windows[dc->win].cw; b = g_windows[dc->win].ch; }
+        else return;
+    } else {
+        l  = (int16_t)x86_16_rd16(c, scr_seg, scr_off);
+        t  = (int16_t)x86_16_rd16(c, scr_seg, (uint16_t)(scr_off + 2));
+        rr = (int16_t)x86_16_rd16(c, scr_seg, (uint16_t)(scr_off + 4));
+        b  = (int16_t)x86_16_rd16(c, scr_seg, (uint16_t)(scr_off + 6));
+        // Map the logical rect corners through the DC transform, exactly as BitBlt
+        // does (identity for MM_TEXT; a viewport origin would shift it).
+        dc_lp2dp(dc, &l, &t);
+        dc_lp2dp(dc, &rr, &b);
+    }
+    // Intersect with the clip rect if supplied (also DC-logical -> device).
+    if (!(clip_seg == 0 && clip_off == 0)) {
+        int cl = (int16_t)x86_16_rd16(c, clip_seg, clip_off);
+        int ct = (int16_t)x86_16_rd16(c, clip_seg, (uint16_t)(clip_off + 2));
+        int cr = (int16_t)x86_16_rd16(c, clip_seg, (uint16_t)(clip_off + 4));
+        int cb = (int16_t)x86_16_rd16(c, clip_seg, (uint16_t)(clip_off + 6));
+        dc_lp2dp(dc, &cl, &ct);
+        dc_lp2dp(dc, &cr, &cb);
+        if (cl > l) l = cl;
+        if (ct > t) t = ct;
+        if (cr < rr) rr = cr;
+        if (cb < b) b = cb;
+    }
+    if (rr > l && b > t) {
+        if (dc->membuf && dc->mw > 0 && dc->mh > 0) {
+            // Memory-DC scroll: shift the bitmap buffer in place (overlap-safe,
+            // memmove-ordered), same semantics as win16_scroll_shift on the canvas.
+            if (l < 0) l = 0;
+            if (t < 0) t = 0;
+            if (rr > dc->mw) rr = dc->mw;
+            if (b > dc->mh) b = dc->mh;
+            int width = rr - l;
+            int vdy = dy, vdx = dxa;
+            if (vdy >= b - t || vdy <= -(b - t)) vdy = 0;
+            if (vdx >= rr - l || vdx <= -(rr - l)) vdx = 0;
+            if (vdy > 0)
+                for (int y = b - 1; y >= t + vdy; y--)
+                    memmove(dc->membuf + (size_t)y * dc->mw + l,
+                            dc->membuf + (size_t)(y - vdy) * dc->mw + l,
+                            (size_t)width * sizeof(uint32_t));
+            else if (vdy < 0)
+                for (int y = t; y < b + vdy; y++)
+                    memmove(dc->membuf + (size_t)y * dc->mw + l,
+                            dc->membuf + (size_t)(y - vdy) * dc->mw + l,
+                            (size_t)width * sizeof(uint32_t));
+            if (vdx > 0)
+                for (int y = t; y < b; y++) {
+                    uint32_t *row = dc->membuf + (size_t)y * dc->mw + l;
+                    memmove(row + vdx, row, (size_t)(width - vdx) * sizeof(uint32_t));
+                }
+            else if (vdx < 0)
+                for (int y = t; y < b; y++) {
+                    uint32_t *row = dc->membuf + (size_t)y * dc->mw + l;
+                    memmove(row, row - vdx, (size_t)(width + vdx) * sizeof(uint32_t));
+                }
+        } else if (dc->win >= 0) {
+            win16_scroll_shift(&g_windows[dc->win], l, t, rr, b, dxa, dy);
+            g_win16_frame_dirty = 1;
+        }
+    }
+    // Report the newly-exposed strip in lprcUpdate (device/client coords). Word
+    // paints only this region after the shift. For a content-up scroll (dy<0) the
+    // exposed strip is the bottom |dy| rows.
+    int ul = l, ut = t, ur = rr, ub = b;
+    if (dy < 0) ut = b + dy;
+    else if (dy > 0) ub = t + dy;
+    if (dxa < 0) ul = rr + dxa;
+    else if (dxa > 0) ur = l + dxa;
+    if (!(upd_seg == 0 && upd_off == 0)) {
+        x86_16_wr16(c, upd_seg, upd_off,                 (uint16_t)ul);
+        x86_16_wr16(c, upd_seg, (uint16_t)(upd_off + 2), (uint16_t)ut);
+        x86_16_wr16(c, upd_seg, (uint16_t)(upd_off + 4), (uint16_t)ur);
+        x86_16_wr16(c, upd_seg, (uint16_t)(upd_off + 6), (uint16_t)ub);
+    }
+    (void)hrgn;  // hrgnUpdate: repaint is driven by the app's own paint of lprcUpdate
 }
 
 // FillRect (USER.81): FillRect(hdc, lpRect far, hBrush) = 1+2+1 = 4w = 8 bytes.
@@ -5893,10 +7366,20 @@ static void u_fillrect(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
         int t = (int16_t)x86_16_rd16(c, r_seg, (uint16_t)(r_off + 2));
         int rr = (int16_t)x86_16_rd16(c, r_seg, (uint16_t)(r_off + 4));
         int b = (int16_t)x86_16_rd16(c, r_seg, (uint16_t)(r_off + 6));
-        uint32_t col = gdiobj_color(hbr, FB_COLOR(255,255,255));
-        for (int yy = t; yy < b; yy++)
-            for (int xx = l; xx < rr; xx++)
-                dc_plot(dc, xx, yy, col);
+        // (#278 Word6 pattern-brush pass) FillRect's hBrush is an EXPLICIT
+        // argument (not necessarily the DC's currently-selected brush), so
+        // check it directly rather than going through dc_brush_pixel.
+        if (gdiobj_is_pattern(hbr)) {
+            win16_gdiobj_t *pb = &g_gdiobj[hbr];
+            for (int yy = t; yy < b; yy++)
+                for (int xx = l; xx < rr; xx++)
+                    dc_plot(dc, xx, yy, pattern_pixel(pb, xx, yy, dc->text_color, dc->bk_color));
+        } else {
+            uint32_t col = gdiobj_color(hbr, FB_COLOR(255,255,255));
+            for (int yy = t; yy < b; yy++)
+                for (int xx = l; xx < rr; xx++)
+                    dc_plot(dc, xx, yy, col);
+        }
     }
     *ax = 1; *dx = 0; *argbytes = 8;
 }
@@ -6173,6 +7656,17 @@ static void g_selectobject(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
             dc->membuf = g_gdiobj[hobj].pix;
             dc->mw = g_gdiobj[hobj].w;
             dc->mh = g_gdiobj[hobj].h;
+            // (Word6 toolbar-icon transparency) Surface the bitmap's real bit
+            // depth onto the DC so BitBlt/StretchBlt can tell a genuinely 1bpp
+            // (monochrome) destination from a colour one.
+            dc->mbpp = g_gdiobj[hobj].bpp;
+            // (#toolbar-icon diag) Correlate the DC handle a later BitBlt trace
+            // names (hdc) with the bitmap OBJECT handle CreateBitmap's own
+            // trace named (obj=NN), plus a pixel sample, so a BitBlt's source
+            // DC number can be matched back to which CreateBitmap call built it.
+            win16_trace("SelectObject dc=%d <- bmp obj=%d %dx%d px0=%06x\n",
+                        hdc, hobj, dc->mw, dc->mh,
+                        (unsigned)(dc->membuf ? dc->membuf[0] : 0xDEADDEADu));
         } else if (is_font) {
             prev = dc->sel_font; dc->sel_font = hobj;
         } else {
@@ -6189,7 +7683,11 @@ static void g_deleteobject(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
                            uint16_t *argbytes) {
     uint16_t h = arg16(c, 0);
     if (h && h < WIN16_MAX_GDIOBJ && g_gdiobj[h].used) {
-        if (g_gdiobj[h].type == 4 && g_gdiobj[h].pix) {
+        // type==4 (bitmap) and type==6 (pattern brush, #278 Word6 pattern-brush
+        // pass) both own a kmalloc'd pixel buffer; free it here. Deleting the
+        // SOURCE bitmap a pattern brush was created from is safe: CreatePatternBrush
+        // copies the bits into its own buffer rather than aliasing the source's.
+        if ((g_gdiobj[h].type == 4 || g_gdiobj[h].type == 6) && g_gdiobj[h].pix) {
             kfree(g_gdiobj[h].pix); g_gdiobj[h].pix = 0;
         }
         g_gdiobj[h].used = 0;
@@ -6285,7 +7783,7 @@ static void g_rectangle(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
         if (!dc->brush_null)
             for (int yy = t; yy < b; yy++)
                 for (int xx = l; xx < r; xx++)
-                    dc_plot(dc, xx, yy, dc->brush_color);
+                    dc_plot(dc, xx, yy, dc_brush_pixel(dc, xx, yy));
         for (int xx = l; xx < r; xx++) { dc_plot(dc, xx, t, dc->pen_color);
                                          dc_plot(dc, xx, b-1, dc->pen_color); }
         for (int yy = t; yy < b; yy++) { dc_plot(dc, l, yy, dc->pen_color);
@@ -6308,11 +7806,41 @@ static void g_patblt(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
     int y = (int16_t)arg16(c, 4);
     int x = (int16_t)arg16(c, 5);
     uint16_t hdc = arg16(c, 6);
+    if (g_w6log > 0 && hdc && hdc < WIN16_MAX_DC && g_dcs[hdc].used) {
+        win16_dc_t *dcx = &g_dcs[hdc];
+        win16_trace("[W6] PATBLT win=%d mem=%d hdc=%d x=%d y=%d w=%d h=%d rop=%06x brush=%d brushcol=%06x null=%d\n",
+                dcx->win, dcx->membuf?1:0, hdc, x, y, w, h, rop, dcx->sel_brush, dcx->brush_color, dcx->brush_null);
+    }
     if (hdc && hdc < WIN16_MAX_DC && g_dcs[hdc].used) {
         win16_dc_t *dc = &g_dcs[hdc];
-        for (int yy = y; yy < y + h; yy++)
-            for (int xx = x; xx < x + w; xx++)
-                dc_plot(dc, xx, yy, dc->brush_color);
+        // (#278 Word6 pass) FIX: honour the DC's window/viewport mapping for
+        // the fill rect, exactly as ExtTextOut/LineTo/Rectangle/Polygon/Ellipse
+        // already do (see dc_lp2dp's call sites and the #word6 FIX comment at
+        // g_exttextout). PatBlt was the one primitive still missing this
+        // transform. MEASURED (#278 Word6 black-bar pass): Word 6 whitens its
+        // reused 1-line document strip buffer via
+        // PatBlt(hdc, 0, lineTop, width, lineHeight, WHITENESS) against a DC
+        // whose viewport origin was set (SetViewportOrgEx, GDI.480) to
+        // -lineTop so LOGICAL y=lineTop lands at DEVICE y=0 in the small
+        // reused bitmap - the identical technique already documented for
+        // ExtTextOut. Without the mapping here, the fill landed at
+        // unmapped device row `lineTop` instead of row 0, leaving the top of
+        // the freshly-allocated (zeroed = black) bitmap unpainted; that
+        // untouched black region is what got BitBlt'd to the screen as the
+        // solid black bar per blank paragraph. dc_lp2dp is the identity for
+        // MM_TEXT DCs (every other app + the window DCs), so this is a no-op
+        // for them - confirmed no other traced app (FreeCell, Tetris/#219)
+        // sets a non-default viewport, so PATCOPY/PATINVERT callers elsewhere
+        // are unaffected.
+        int l = x, t = y, r = x + w, b = y + h;
+        dc_lp2dp(dc, &l, &t); dc_lp2dp(dc, &r, &b);
+        if (r < l) { int tmp = l; l = r; r = tmp; }
+        if (b < t) { int tmp = t; t = b; b = tmp; }
+        // (#278 Word6 pattern-brush pass) tile the selected brush if it is a
+        // pattern brush, instead of always flat-filling dc->brush_color.
+        for (int yy = t; yy < b; yy++)
+            for (int xx = l; xx < r; xx++)
+                dc_plot(dc, xx, yy, dc_brush_pixel(dc, xx, yy));
     }
     *ax = 1; *dx = 0; *argbytes = 14;  // (#278 pass30) PatBlt = hdc+x+y+w+h(5w)+dwRop(2w)=14 bytes; was 12 -> 2-byte Pascal-stack desync -> caller lret popped garbage cs:ip (cs=17e2 wild jump)
 }
@@ -6639,7 +8167,7 @@ static void g_poly(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *argbyt
                     if (xs[b] < xs[a]) { int t = xs[a]; xs[a] = xs[b]; xs[b] = t; }
             for (int a = 0; a + 1 < xc; a += 2)
                 for (int xx = xs[a]; xx <= xs[a+1]; xx++)
-                    dc_plot(dc, xx, yy, dc->brush_color);
+                    dc_plot(dc, xx, yy, dc_brush_pixel(dc, xx, yy));
         }
     }
     // Outline (pen): consecutive segments; Polygon closes the figure, Polyline does not.
@@ -6685,33 +8213,128 @@ static void g_gettextface(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t 
     *ax = (uint16_t)i; *dx = 0; *argbytes = 8;
 }
 // SetPixel (GDI.31, not imported) -- skip. GetTextMetrics (GDI.93):
-//   (hdc, lpMetrics far) = 1+2 = 3w = 6 bytes. Fill a plausible TEXTMETRIC.
+//   (hdc, lpMetrics far) = 1+2 = 3w = 6 bytes.
+// (#278 Word6 font-measurement audit) Was filling only the first 7 fields
+// (tmHeight..tmMaxCharWidth, 14 of 31 bytes) and leaving tmWeight, tmItalic,
+// tmUnderlined, tmStruckOut, tmFirstChar/tmLastChar/tmDefaultChar/tmBreakChar,
+// tmPitchAndFamily, tmCharSet, tmOverhang, tmDigitizedAspectX/Y as WHATEVER
+// GARBAGE was already in the guest buffer. tmPitchAndFamily in particular is
+// a font-capability bitmask Word's font code reads to decide whether the
+// selected font is TrueType/scalable (TMPF_TRUETYPE=0x04) vs a fixed-pitch
+// raster font (TMPF_FIXED_PITCH=0x01 means "NOT fixed pitch", historically
+// inverted) - an uninitialized byte here can make Word branch into the
+// TrueType-only metrics path (GetOutlineTextMetrics/GetCharABCWidths) on some
+// boots and not others, nondeterministically. Fill the COMPLETE 31-byte
+// Win16 TEXTMETRIC (byte-packed, no alignment padding) so every field is a
+// faithful, deterministic description of our fixed 8x16 bitmap system font:
+// not italic/underlined/struck-out, fixed pitch, FF_MODERN family, ANSI
+// charset, no TrueType/vector/device bits set.
 static void g_gettextmetrics(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
                              uint16_t *argbytes) {
     uint16_t m_off = arg16(c, 0);
     uint16_t m_seg = arg16(c, 1);
-    // TEXTMETRIC (Win16) starts with tmHeight, tmAscent, tmDescent ... (s_word).
-    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 0), FONT_HEIGHT);   // tmHeight
-    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 2), FONT_HEIGHT-3); // tmAscent
-    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 4), 3);             // tmDescent
-    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 6), 0);             // tmInternalLeading
-    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 8), 0);             // tmExternalLeading
-    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 10), FONT_WIDTH);   // tmAveCharWidth
-    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 12), FONT_WIDTH);   // tmMaxCharWidth
+    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 0),  FONT_HEIGHT);    // tmHeight
+    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 2),  FONT_HEIGHT-3);  // tmAscent
+    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 4),  3);              // tmDescent
+    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 6),  0);              // tmInternalLeading
+    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 8),  0);              // tmExternalLeading
+    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 10), FONT_WIDTH);     // tmAveCharWidth
+    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 12), FONT_WIDTH);     // tmMaxCharWidth
+    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 14), 400);            // tmWeight (FW_NORMAL)
+    x86_16_wr8 (c, m_seg, (uint16_t)(m_off + 16), 0);              // tmItalic
+    x86_16_wr8 (c, m_seg, (uint16_t)(m_off + 17), 0);              // tmUnderlined
+    x86_16_wr8 (c, m_seg, (uint16_t)(m_off + 18), 0);              // tmStruckOut
+    x86_16_wr8 (c, m_seg, (uint16_t)(m_off + 19), 0x20);           // tmFirstChar
+    x86_16_wr8 (c, m_seg, (uint16_t)(m_off + 20), 0xFF);           // tmLastChar
+    x86_16_wr8 (c, m_seg, (uint16_t)(m_off + 21), '?');            // tmDefaultChar
+    x86_16_wr8 (c, m_seg, (uint16_t)(m_off + 22), ' ');            // tmBreakChar
+    // tmPitchAndFamily: low nibble = pitch/tech bits (0 = fixed pitch, no
+    // vector, no truetype, no device), high nibble = FF_MODERN (high nibble 0x3) so a
+    // font-substitution gate that inspects the family sees a plausible,
+    // faithful monospace system font rather than 0/garbage.
+    x86_16_wr8 (c, m_seg, (uint16_t)(m_off + 23), 0x30);           // tmPitchAndFamily
+    x86_16_wr8 (c, m_seg, (uint16_t)(m_off + 24), 0);              // tmCharSet (ANSI_CHARSET)
+    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 25), 0);              // tmOverhang
+    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 27), 96);             // tmDigitizedAspectX (96dpi, matches GetDeviceCaps LOGPIXELS)
+    x86_16_wr16(c, m_seg, (uint16_t)(m_off + 29), 96);             // tmDigitizedAspectY
     *ax = 1; *dx = 0; *argbytes = 6;
 }
 
 // ExcludeClipRect (GDI.21): ExcludeClipRect(hdc, x1,y1,x2,y2 s_word x4) = 5w = 10 bytes.
-// We do not model clipping regions; accept and balance the stack. Return COMPLEXREGION(3).
+// (#278 Word6 toolbar-icon-erase pass, 2026-07-27f, ROOT CAUSE FIX) Previously a
+// pure no-op ("we do not model clipping regions"). Real toolbar/control paint
+// code composites each icon/child into a shared off-screen DC, calls
+// ExcludeClipRect around it to protect it, THEN FillRect's the whole band to
+// paint the background gaps. With this a no-op, that FillRect painted straight
+// over the just-drawn icons (measured: Standard toolbar's 4bpp icon strip
+// decodes fine and the per-icon SRCAND/SRCPAINT composite writes real pixels;
+// the very next FillRect erased 100% of them). Now actually accumulates the
+// rect so dc_plot (see dc_clip_visible) skips it. General GDI-correctness fix,
+// not Word-specific: any Win16 app relying on ExcludeClipRect benefits.
 static void g_excludecliprect(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
                               uint16_t *argbytes) {
-    (void)c; *ax = 3; *dx = 0; *argbytes = 10;
+    int x1 = (int16_t)arg16(c, 0), y1 = (int16_t)arg16(c, 1);
+    int x2 = (int16_t)arg16(c, 2), y2 = (int16_t)arg16(c, 3);
+    uint16_t hdc = arg16(c, 4);
+    *argbytes = 10; *dx = 0; *ax = 3;   // COMPLEXREGION, as before
+    if (hdc && hdc < WIN16_MAX_DC && g_dcs[hdc].used) {
+        win16_dc_t *dc = &g_dcs[hdc];
+        int l = x1 < x2 ? x1 : x2, r = x1 < x2 ? x2 : x1;
+        int t = y1 < y2 ? y1 : y2, b = y1 < y2 ? y2 : y1;
+        if (dc->clip_n < WIN16_DC_MAX_EXCL) {
+            dc->clip_l[dc->clip_n] = l; dc->clip_t[dc->clip_n] = t;
+            dc->clip_r[dc->clip_n] = r; dc->clip_b[dc->clip_n] = b;
+            dc->clip_n++;
+        }
+        // else: silently drop (COMPLEXREGION already returned); a DC that
+        // needs more than WIN16_DC_MAX_EXCL exclusions falls back to the old
+        // no-clip behaviour for the overflow rects rather than crashing.
+    }
 }
 
-// IntersectClipRect (GDI.22): same signature/cleanup as ExcludeClipRect.
+// IntersectClipRect (GDI.22): same signature as ExcludeClipRect. Narrows the
+// DC's single INTERSECT bound (real GDI intersects the whole clip region; we
+// only track one rect, sufficient for the "clip drawing to this sub-area"
+// idiom, not general multi-rect intersection).
 static void g_intersectcliprect(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
                                 uint16_t *argbytes) {
-    (void)c; *ax = 3; *dx = 0; *argbytes = 10;
+    int x1 = (int16_t)arg16(c, 0), y1 = (int16_t)arg16(c, 1);
+    int x2 = (int16_t)arg16(c, 2), y2 = (int16_t)arg16(c, 3);
+    uint16_t hdc = arg16(c, 4);
+    *argbytes = 10; *dx = 0; *ax = 3;   // COMPLEXREGION, as before
+    if (hdc && hdc < WIN16_MAX_DC && g_dcs[hdc].used) {
+        win16_dc_t *dc = &g_dcs[hdc];
+        int l = x1 < x2 ? x1 : x2, r = x1 < x2 ? x2 : x1;
+        int t = y1 < y2 ? y1 : y2, b = y1 < y2 ? y2 : y1;
+        if (dc->clip_incl) {
+            if (l > dc->clip_il) dc->clip_il = l;
+            if (t > dc->clip_it) dc->clip_it = t;
+            if (r < dc->clip_ir) dc->clip_ir = r;
+            if (b < dc->clip_ib) dc->clip_ib = b;
+        } else {
+            dc->clip_incl = 1;
+            dc->clip_il = l; dc->clip_it = t; dc->clip_ir = r; dc->clip_ib = b;
+        }
+    }
+}
+
+// SelectClipRgn (GDI.44): SelectClipRgn(hdc, hrgn) = 2w = 4 bytes. Was a pure
+// argbyte-correct MISS stub (g_stub_table, retval=0). hrgn==0 ("no clip
+// region") is the common real-app idiom to RESET a DC's clip after a scoped
+// exclude/intersect sequence (real GDI: NULL selects "the whole DC is
+// visible"); implement that case for real. hrgn!=0 would need a tracked
+// region object (CreateRectRgn etc, not modeled) - left as a logged no-op
+// rather than guessed at, matching the "never force" rule.
+static void g_selectcliprgn(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
+                            uint16_t *argbytes) {
+    uint16_t hrgn = arg16(c, 0);
+    uint16_t hdc  = arg16(c, 1);
+    *argbytes = 4; *dx = 0; *ax = 2;   // SIMPLEREGION
+    if (hdc && hdc < WIN16_MAX_DC && g_dcs[hdc].used) {
+        win16_dc_t *dc = &g_dcs[hdc];
+        if (hrgn == 0) { dc->clip_n = 0; dc->clip_incl = 0; }
+        else win16_trace("SelectClipRgn hdc=%d hrgn=%d (non-NULL region, not modeled)\n", hdc, hrgn);
+    }
 }
 
 // SetBkMode (GDI.2): SetBkMode(hdc, nBkMode s_word) = 2w = 4 bytes. Return prev (OPAQUE=2).
@@ -7093,186 +8716,32 @@ static void k_getprocaddress(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16
 // the live CPU registers (NOT Pascal stack args), so argbytes = 0. Word's SETUP uses
 // it for AH=0x36 GetDiskFreeSpace (the temp-dir space check) and a few file/dir ops.
 // We report a generous, fixed free space so installers proceed. (#188 Word6)
-// (#188) Resolve a DOS path that sits at guest DS:DX into a native MayteraOS path.
-static void dos3_resolve_dsdx(x86_16_cpu_t *c, char *out, int outsz) {
-    char dos[160]; rd_far_cstr(c, c->ds, c->dx, dos, sizeof(dos));
-    dos_resolve_path(dos, win16_get_appdir(), out, outsz);
-}
-static void dos3_set_cf(x86_16_cpu_t *c, int set) {
-    if (set) c->flags |= WIN16_F_CF; else c->flags &= (uint16_t)~WIN16_F_CF;
-}
-// (#278 pass16) Last DOS error (INT 21 extended error). Word 6 MS-C runtime,
-// after a failed DOS3Call, issues AH=59h (Get Extended Error) to retrieve the
-// precise code; its GetTempFileName loop maps the result via a classifier that
-// needs the real ENOENT (2) to recognize a free temp name. We were returning 0
-// for AH=59h, so the error code was lost (0x8000 instead of 0x8002).
-// (#278 pass16) FindFirst/FindNext (AH=4e/4f) + Set DTA (AH=1a) for the win16
-// DOS3Call gateway. The MS-C runtime path classifier (used by GetTempFileName)
-// calls FindFirst after a failed GetFileAttributes to confirm a candidate name
-// is free; our old default returned FindFirst as success, so no temp name was
-// ever considered free. Implement against the FAT so a non-existent pattern
-// correctly fails (CF=1) and a real file fills the DTA.
-static uint16_t g_dta_seg = 0, g_dta_off = 0x0080;
-static char     g_find_dir[160];
-static char     g_find_pat[16];
-static uint32_t g_find_pos;
-
-static int dos_wild_match(const char *pat, const char *name) {
-    if (*pat == '\0') return *name == '\0';
-    if (*pat == '*') {
-        if (pat[1] == '\0') return 1;
-        for (const char *n = name; ; n++) {
-            if (dos_wild_match(pat + 1, n)) return 1;
-            if (*n == '\0') return 0;
-        }
-    }
-    if (*name == '\0') return 0;
-    if (*pat != '?') {
-        char a = *pat, b = *name;
-        if (a >= 'a' && a <= 'z') a -= 32;
-        if (b >= 'a' && b <= 'z') b -= 32;
-        if (a != b) return 0;
-    }
-    return dos_wild_match(pat + 1, name + 1);
-}
-
-static void dos_dta_write(x86_16_cpu_t *c, const char *name83, uint32_t fsize, uint8_t attr) {
-    uint16_t sg = g_dta_seg ? g_dta_seg : c->ds, o = g_dta_off;
-    for (int i = 0; i < 0x15; i++) x86_16_wr8(c, sg, (uint16_t)(o + i), 0);
-    x86_16_wr8(c, sg, (uint16_t)(o + 0x15), attr);
-    x86_16_wr8(c, sg, (uint16_t)(o + 0x16), 0);
-    x86_16_wr8(c, sg, (uint16_t)(o + 0x17), 0);
-    x86_16_wr8(c, sg, (uint16_t)(o + 0x18), 0x21);  // date = 1980-01-01
-    x86_16_wr8(c, sg, (uint16_t)(o + 0x19), 0x00);
-    x86_16_wr8(c, sg, (uint16_t)(o + 0x1a), (uint8_t)(fsize & 0xff));
-    x86_16_wr8(c, sg, (uint16_t)(o + 0x1b), (uint8_t)((fsize >> 8) & 0xff));
-    x86_16_wr8(c, sg, (uint16_t)(o + 0x1c), (uint8_t)((fsize >> 16) & 0xff));
-    x86_16_wr8(c, sg, (uint16_t)(o + 0x1d), (uint8_t)((fsize >> 24) & 0xff));
-    int i = 0; for (; name83[i] && i < 12; i++) x86_16_wr8(c, sg, (uint16_t)(o + 0x1e + i), (uint8_t)name83[i]);
-    x86_16_wr8(c, sg, (uint16_t)(o + 0x1e + i), 0);
-}
-
-// Scan g_find_dir for the next entry matching g_find_pat at/after g_find_pos.
-// Returns 0 + fills the DTA on a hit, -1 on no match.
-static int dos_find_next(x86_16_cpu_t *c) {
-    fat_file_t dir;
-    const char *dp = g_find_dir[0] ? g_find_dir : "/";
-    if (fat_open(&g_fat_fs, dp, &dir) != 0) return -1;
-    if (!fat_is_dir(&dir)) { fat_close(&dir); return -1; }
-    fat_dir_entry_t e; char nm[256]; uint32_t idx = 0; int hit = -1;
-    while (fat_readdir(&dir, &e, nm) == 0) {
-        if (idx++ < g_find_pos) continue;
-        char up[16]; int k = 0;
-        for (; nm[k] && k < 12; k++) { char ch = nm[k]; if (ch >= 'a' && ch <= 'z') ch -= 32; up[k] = ch; }
-        up[k] = 0;
-        if (dos_wild_match(g_find_pat, up)) {
-            g_find_pos = idx;
-            dos_dta_write(c, up, e.file_size, e.attr);
-            hit = 0; break;
-        }
-    }
-    fat_close(&dir);
-    return hit;
-}
-static uint16_t g_dos3_last_err = 0;
+// ===========================================================================
+// #736 Stage 1b: DOS3Call (KERNEL.102) IS NO LONGER AN INT 21h IMPLEMENTATION.
+//
+// It was the THIRD one: 17 AH values with its OWN DTA, its OWN find cursor and
+// its OWN copy of dos_wild_match(). Worse than mere duplication, it was
+// reachable by the SAME Win16 guest as the raw INT 21h path in ne.c, through a
+// DIFFERENT DTA: a 4Eh findfirst issued one way followed by a 4Fh findnext
+// issued the other read a find record the first call never wrote. (Whether any
+// shipped title actually mixes them was NOT measured; the divergence is
+// structural, so it is closed rather than surveyed.)
+//
+// What is left is what the name says it is: a register-frame gateway. It has no
+// case labels for DOS functions, which is what makes "there is one INT 21h"
+// structural rather than a matter of anybody's discipline. This is the exact
+// shape docs/DOS4GW_DESIGN.md section 6 specifies for the DPMI bridge, now with
+// a worked example in the tree.
+//
+// The guest's state is g_win16_svc, the SAME context the raw INT 21h path uses,
+// so the two can no longer disagree about the DTA, the find cursor, the handle
+// table, the current directory or the last error.
+// ===========================================================================
 static void k_dos3call(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *argbytes) {
-    *argbytes = 0;
-    uint8_t ah = (uint8_t)(c->ax >> 8);
-    dos3_set_cf(c, 0);   // default: success (CF=0)
-    switch (ah) {
-        case 0x36: {   // Get Disk Free Space (DL=drive). Report ~256 MB free.
-            c->ax = 8; c->cx = 512; c->bx = 0xFFFF; c->dx = 0xFFFF;
-            *ax = c->ax; *dx = c->dx; return;
-        }
-        case 0x19:            // Get current default drive -> C: (2)
-            c->ax = (uint16_t)((c->ax & 0xFF00) | 0x02); *ax = c->ax; *dx = 0; return;
-        case 0x0E:            // Select disk (DL=drive). Return # of drives in AL.
-            c->ax = (uint16_t)((c->ax & 0xFF00) | 0x1A); *ax = c->ax; return;
-        case 0x30:            // Get DOS version -> 3.10
-            c->ax = 0x0A03; *ax = c->ax; *dx = 0; return;
-        case 0x25:            // Set interrupt vector: accept silently
-        case 0x35:            // Get interrupt vector: return NULL (ES:BX = 0)
-            c->es = 0; c->bx = 0; *ax = 0; *dx = 0; return;
-        case 0x43: {          // Get/Set file attributes (DS:DX path). AL=0 get,1 set.
-            uint8_t al = (uint8_t)(c->ax & 0xFF);
-            char path[160]; dos3_resolve_dsdx(c, path, sizeof(path));
-            if (al == 0) {    // GET: CF=0 + CX=attrs if exists, else CF=1 + AX=2.
-                uint32_t sz = 0; void *d = fat_read_file(&g_fat_fs, path, &sz);
-                if (d) { kfree(d); c->cx = 0x20; dos3_set_cf(c, 0); *ax = 0; g_dos3_last_err = 0; }
-                else { c->ax = 0x02; dos3_set_cf(c, 1); *ax = 0x02; g_dos3_last_err = 2; }  // ENOENT
-                *dx = c->dx; return;
-            }
-            *ax = 0; dos3_set_cf(c, 0); return;   // SET: accept
-        }
-        case 0x59: {          // Get Extended Error (BX=version). Return the last DOS
-            // error so the MS-C runtime can classify it (e.g. ENOENT=2). AX=ext err,
-            // BH=class, BL=action, CH=locus. CF cleared.
-            c->ax = g_dos3_last_err;
-            if (g_dos3_last_err == 2) { c->bx = 0x0801; c->cx = (uint16_t)((c->cx & 0x00FF) | 0x0200); }
-            else { c->bx = 0; }
-            dos3_set_cf(c, 0);
-            *ax = c->ax; *dx = c->dx; return;
-        }
-        case 0x2A: {          // Get Date: CX=year, DH=month, DL=day, AL=weekday.
-            int day = 1, month = 1, year = 2026, wday = 0;
-            extern void rtc_read_date(int *, int *, int *, int *);
-            rtc_read_date(&day, &month, &year, &wday);
-            c->cx = (uint16_t)year;
-            c->dx = (uint16_t)(((month & 0xFF) << 8) | (day & 0xFF));
-            c->ax = (uint16_t)(wday & 0xFF);
-            dos3_set_cf(c, 0); *ax = c->ax; *dx = c->dx; return;
-        }
-        case 0x2C: {          // Get Time: CH=hour, CL=min, DH=sec, DL=centisec.
-            int hh = 0, mm = 0, ss = 0;
-            extern void rtc_read_time(int *, int *, int *);
-            rtc_read_time(&hh, &mm, &ss);
-            c->cx = (uint16_t)(((hh & 0xFF) << 8) | (mm & 0xFF));
-            c->dx = (uint16_t)(((ss & 0xFF) << 8) | 0);
-            c->ax = 0; dos3_set_cf(c, 0); *ax = 0; *dx = c->dx; return;
-        }
-        case 0x1A:            // Set Disk Transfer Area (DS:DX)
-            g_dta_seg = c->ds; g_dta_off = c->dx;
-            *ax = 0; dos3_set_cf(c, 0); return;
-        case 0x4E: {          // Find First File (DS:DX pattern, CX=attr mask)
-            char path[176]; dos3_resolve_dsdx(c, path, sizeof(path));
-            int sl = -1; for (int i = 0; path[i]; i++) if (path[i] == '/') sl = i;
-            if (sl < 0) {
-                g_find_dir[0] = 0;
-                int j = 0; for (; path[j] && j < (int)sizeof(g_find_pat) - 1; j++) g_find_pat[j] = path[j];
-                g_find_pat[j] = 0;
-            } else {
-                int dl = sl ? sl : 1; if (dl > (int)sizeof(g_find_dir) - 1) dl = (int)sizeof(g_find_dir) - 1;
-                for (int i = 0; i < dl; i++) { g_find_dir[i] = path[i]; }
-                g_find_dir[dl] = 0;
-                int j = 0; for (; path[sl + 1 + j] && j < (int)sizeof(g_find_pat) - 1; j++) g_find_pat[j] = path[sl + 1 + j];
-                g_find_pat[j] = 0;
-            }
-            int has_wild = 0; for (int i = 0; g_find_pat[i]; i++) if (g_find_pat[i] == '*' || g_find_pat[i] == '?') has_wild = 1;
-            g_find_pos = 0;
-            if (dos_find_next(c) == 0) { dos3_set_cf(c, 0); c->ax = 0; *ax = 0; g_dos3_last_err = 0; }
-            else { uint16_t err = has_wild ? 0x12 : 0x02;   // 0x12 no-more-files, 0x02 file-not-found
-                   dos3_set_cf(c, 1); c->ax = err; *ax = err; g_dos3_last_err = err; }
-            *dx = c->dx; return;
-        }
-        case 0x4F: {          // Find Next File (continues g_find_pos search)
-            if (dos_find_next(c) == 0) { dos3_set_cf(c, 0); c->ax = 0; *ax = 0; g_dos3_last_err = 0; }
-            else { dos3_set_cf(c, 1); c->ax = 0x12; *ax = 0x12; g_dos3_last_err = 0x12; }
-            *dx = c->dx; return;
-        }
-        case 0x39: {          // MkDir (DS:DX). Actually create the directory.
-            char path[160]; dos3_resolve_dsdx(c, path, sizeof(path));
-            int rc = fat_mkdir(&g_fat_fs, path);
-            dos3_set_cf(c, rc < 0 ? 0 : 0);   // report success regardless (best effort)
-            *ax = 0; return;
-        }
-        case 0x3A:            // RmDir: accept
-        case 0x3B:            // ChDir: accept (single working dir model)
-        case 0x47:            // Get current directory: write "" into DS:SI
-            if (ah == 0x47) x86_16_wr8(c, c->ds, c->si, 0);
-            *ax = 0; dos3_set_cf(c, 0); return;
-        default:
-            c->ax = 0; *ax = 0; *dx = 0; return;
-    }
+    *argbytes = 0;                       // registers in, registers out
+    dos_svc_int21(win16_svc_ctx(), c);
+    *ax = c->ax;
+    *dx = c->dx;
 }
 // WritePrivateProfileString (KERNEL.129): (lpSection,lpKey,lpString,lpFile) =
 //   4 far ptrs = 8w = 16b. (#133) Writes the named .ini via the routed FS.
@@ -7571,6 +9040,19 @@ static void u_loadstring(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *
         x86_16_wr8(c, buf_seg, (uint16_t)(buf_off + n), blk[p++]);
     x86_16_wr8(c, buf_seg, (uint16_t)(buf_off + n), 0);
     *ax = n;
+    // (#278 Word6 combobox DIAG, kept in tree default-off) General LoadString
+    // trace, added to check whether Word's toolbar-combo subclass ever calls
+    // LoadString to resolve its private WM_USER+1/+0x15 wParams. MEASURED: it
+    // never does (its only calls handling that message are GetParent then
+    // CallWindowProc - see win16_native_combo_proc's banner) - kept as a
+    // general-purpose probe for a future pass, not specific to that finding.
+    { extern int g_w6combodiag;
+      static int nlog = 0;
+      if (g_w6combodiag && nlog < 200) { nlog++;
+          char got[32]; uint16_t k = 0;
+          for (; k < n && k < sizeof(got)-1; k++) got[k] = (char)x86_16_rd8(c, buf_seg, (uint16_t)(buf_off+k));
+          got[k] = 0;
+          win16_trace("[W6LOADSTR] hinst=%04x uid=%u -> n=%u s='%s'\n", hinst, uid, n, got); } }
 }
 // ---------------------------------------------------------------------------
 // Shared printf core for wsprintf (USER.420, C-stack varargs) and wvsprintf
@@ -7735,11 +9217,25 @@ static int win16_vk_down(uint16_t vk) {
     if (vk == 0x04) return (mouse_buttons & 4) ? 1 : 0;   // VK_MBUTTON
     return g_win16_keydown[vk & 0xFF] ? 1 : 0;
 }
+// (Ctrl+Home wedge, Word6 divergence catalog #1) Message-synchronized variant
+// for GetKeyState: reads g_win16_keydown_msg (updated in msgq_get() as each
+// WM_KEYDOWN/WM_KEYUP is actually dequeued) instead of the real-time
+// g_win16_keydown that win16_pump_input's raw-input drain updates ahead of
+// the app's own message loop. See the g_win16_keydown_msg comment for why
+// the real-time array raced a fast Ctrl+Home chord.
+static int win16_vk_down_msg(uint16_t vk) {
+    if (vk == 0x01) return (mouse_buttons & 1) ? 1 : 0;   // VK_LBUTTON
+    if (vk == 0x02) return (mouse_buttons & 2) ? 1 : 0;   // VK_RBUTTON
+    if (vk == 0x04) return (mouse_buttons & 4) ? 1 : 0;   // VK_MBUTTON
+    return g_win16_keydown_msg[vk & 0xFF] ? 1 : 0;
+}
 // GetKeyState (USER.106): GetKeyState(nVirtKey) = 1w = 2b. Returns 0xFF80 (high
 // bit set = down) for a pressed key/button, else 0. Apps test the sign bit.
+// Uses the message-synchronized state (real GetKeyState semantics: state as of
+// the message currently being processed, not live hardware state).
 static void u_getkeystate(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *argbytes) {
     uint16_t vk = arg16(c, 0);
-    *ax = win16_vk_down(vk) ? 0xFF80 : 0;
+    *ax = win16_vk_down_msg(vk) ? 0xFF80 : 0;
     *dx = 0; *argbytes = 2;
 }
 // GetAsyncKeyState (USER.249): like GetKeyState but reads the instantaneous
@@ -7890,6 +9386,18 @@ static void u_setwindowlong(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_
     if (!w) return;
     if (nidx == -4) {                          // GWL_WNDPROC: subclass
         *ax = w->proc_off; *dx = w->proc_seg;
+        // (#278 DIAG typed-char-bail pass) unconditionally log every GWL_WNDPROC
+        // subclass, unlike the generic first-seen dedup, so we can see WHICH
+        // hwnd gets subclassed and to what proc, and WHEN relative to typing.
+        // Ruled out one theory this pass: Word's edit pane (0x004f, class
+        // "OpusWwd") is NEVER subclassed (only 0044/0048/004a/004b/004c are),
+        // so its original wndproc genuinely is the one WM_CHAR reaches - the
+        // DefWindowProc-only behavior is not a missed-subclass bug. Gated
+        // behind g_w6life (default 0, SHIP OFF), inert unless enabled.
+        { extern int g_w6life;
+          if (g_w6life)
+            win16_trace("[W6SWL] SetWindowLong hwnd=%04x GWL_WNDPROC old=%04x:%04x new=%04x:%04x\n",
+                        hwnd, w->proc_seg, w->proc_off, hi, lo); }
         w->proc_off = lo; w->proc_seg = hi;
         return;
     }
@@ -7970,6 +9478,13 @@ static void u_callwindowproc(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16
     *argbytes = 14;
     uint32_t lParam = ((uint32_t)lp_hi << 16) | lp_lo;
     uint32_t r;
+    // (#278 Word6 combobox DIAG) Every guest CallWindowProc, to see what "previous
+    // proc" Word's toolbar-combo subclass actually chains to and with which message.
+    { extern int g_w6combodiag;
+      static int n = 0;
+      if (g_w6combodiag && n < 400) { n++;
+          win16_trace("[W6CWP] hwnd=%04x msg=%04x wp=%04x lp=%08x prev=%04x:%04x\n",
+                      hwnd, msg, wParam, (unsigned)lParam, p_seg, p_off); } }
     if (p_seg == WIN16_API_THUNK_SEG) {
         // (#369) Previous proc is a built-in API thunk; dispatch it properly
         // instead of running the F000 guard region as code.
@@ -8047,6 +9562,18 @@ static uint32_t rop_combine(uint32_t rop, uint32_t s, uint32_t d) {
         case 0x00BB0226UL: return ~s | d;        // MERGEPAINT
         case 0x00000042UL: return 0;             // BLACKNESS
         case 0x00FF0062UL: return 0x00FFFFFFUL;  // WHITENESS
+        // (Word6 toolbar-icon black-square bug, follow-on) DSna = D & ~S.
+        // Word 6 computes its toolbar button AND-mask ON THE FLY from the
+        // single colour-image strip with this ROP (measured: "rop=220326" is
+        // the only ROP value seen besides the three already handled above),
+        // instead of shipping a separate pre-built mask resource. Falling
+        // through to the "treat unknown as SRCCOPY" default overwrote the
+        // mask strip with a raw copy of the colour image rather than the
+        // correct AND-punched mask, which is why real icon colour data (now
+        // that GDI.442 CreateDIBitmap actually decodes it, see above) was
+        // still bleeding through as flat magenta instead of a properly
+        // masked, transparent-background icon.
+        case 0x00220326UL: return d & ~s;        // DSna
         default:           return s;             // treat unknown as SRCCOPY
     }
 }
@@ -8074,16 +9601,43 @@ static int dc_surface(win16_dc_t *dc, uint32_t **base, int *stride,
     return (cw > 0 && ch > 0);
 }
 
+// (Word6 toolbar-icon transparency, follow-on to the CreateDIBitmap
+// black-square fix, a9e8f2b/build 863) Real Win16 GDI quantizes a COLOUR
+// source pixel to a MONOCHROME (1bpp) destination bitmap using the SOURCE
+// DC's current background colour (SetBkColor), per the documented BitBlt
+// colour->mono contract: source pixel == src bk_color -> bit 1 (white),
+// else -> bit 0 (black). This is exactly the standard "derive an AND-mask
+// from a colour image at runtime" idiom (SetBkColor(hdcColour, colourKeyRGB);
+// BitBlt(hdcMono, ..., hdcColour, ..., SRCCOPY)) instead of shipping a
+// separate mask resource -- measured as what Word 6's toolbar paint does
+// (the DSna `D & ~S` compose step downstream only makes sense against a
+// real black/white mask). Quantizing to the same two literal 32-bit values
+// (0x000000/0xFFFFFF) our mono bitmaps already use (CreateBitmap/
+// SetBitmapBits's bpp==1 decode) keeps the invariant that a genuinely-1bpp
+// destination only ever holds those two values, so every later ROP combine
+// (AND/OR/XOR/DSna) against it stays a pure two-value boolean op with no
+// other change needed anywhere else in the pipeline.
+static uint32_t blt_quantize_mono(win16_dc_t *src, uint32_t s) {
+    uint32_t bk = src ? src->bk_color : FB_COLOR(255, 255, 255);
+    return (s == bk) ? 0x00FFFFFFu : 0x00000000u;
+}
+
 // Copy a w x h block from src(sx,sy) to dst(dx,dy), honouring memory vs window
 // and the raster op (so card masks AND/OR correctly).
 static void blt_copy_rop(win16_dc_t *dst, int dx, int dy, int w, int h,
                          win16_dc_t *src, int sx, int sy, uint32_t rop) {
     if (!dst || !src || w <= 0 || h <= 0) return;
+    // (Word6 toolbar-icon transparency) A genuinely 1bpp destination must be
+    // colour-quantized per pixel (see blt_quantize_mono), never fast-pathed as
+    // a raw byte copy; games/apps whose destination is not 1bpp (the
+    // overwhelming majority - dst->mbpp is 0 unless SelectObject just bound a
+    // real 1bpp bitmap object) are completely unaffected.
+    int dst_mono = (dst->mbpp == 1);
     // (#255 perf B) Fast path for SRCCOPY: clip the rectangle once, then copy
     // whole rows with memmove (overlap-safe for screen self-blit scrolls). This
     // replaces ~w*h per-pixel function calls + bounds checks with one memmove per
     // row and is identical in output for the common in-bounds sprite blit.
-    if (rop == 0x00CC0020UL) {
+    if (rop == 0x00CC0020UL && !dst_mono) {
         uint32_t *sb, *db; int ss, ds, sox, soy, smw, smh, dox, doy, dmw, dmh;
         if (dc_surface(src, &sb, &ss, &sox, &soy, &smw, &smh) &&
             dc_surface(dst, &db, &ds, &dox, &doy, &dmw, &dmh)) {
@@ -8100,6 +9654,26 @@ static void blt_copy_rop(win16_dc_t *dst, int dx, int dy, int w, int h,
             if (cw <= 0 || ch <= 0) return;
             int dy0 = doy + dy, sy0 = soy + sy;
             int dx0 = dox + dx, sx0 = sox + sx;
+            // (Word6 Standard toolbar blank-band fix) The clip above only bounds
+            // dx/dy/sx/sy against each DC's own CLIENT rect (0..dmw/dmh, 0..smw/smh).
+            // It does NOT know a DC's absolute canvas origin (dox/doy/sox/soy) can
+            // itself be negative - e.g. Word's toolbar band windows are placed at
+            // win->cx == -3 by design (T3Tb relative x), so a perfectly in-bounds
+            // client-relative dx==0 still lands at absolute dx0==-3. Left unclamped,
+            // that negative offset was fed straight into memmove()'s pointer
+            // arithmetic: db + row*ds + dx0 walks BACKWARD past the start of the
+            // row into the tail of the row above, corrupting/mis-placing the whole
+            // strip flush instead of just cropping its off-canvas edge (exactly what
+            // a real BitBlt does for a negative destination/source origin). Clip the
+            // ABSOLUTE coordinates too, advancing the paired source/dest offset and
+            // shrinking the copy extent by the same clipped amount so the remaining
+            // pixels still land in the right place - never just clamp dx0/dy0/sx0/sy0
+            // to 0 on their own, that would shift the image instead of cropping it.
+            if (dx0 < 0) { sx0 -= dx0; cw += dx0; dx0 = 0; }
+            if (dy0 < 0) { sy0 -= dy0; ch += dy0; dy0 = 0; }
+            if (sx0 < 0) { dx0 -= sx0; cw += sx0; sx0 = 0; }
+            if (sy0 < 0) { dy0 -= sy0; ch += sy0; sy0 = 0; }
+            if (cw <= 0 || ch <= 0) return;
             // Self-blit overlap: if copying down within the same buffer, go
             // bottom-up so we never overwrite a source row before reading it.
             if (sb == db && dy0 > sy0) {
@@ -8121,6 +9695,10 @@ static void blt_copy_rop(win16_dc_t *dst, int dx, int dy, int w, int h,
     for (int yy = 0; yy < h; yy++)
         for (int xx = 0; xx < w; xx++) {
             uint32_t s = blt_get_pixel(src, sx + xx, sy + yy);
+            // (Word6 toolbar-icon transparency) Quantize to black/white via the
+            // SOURCE DC's bk_color before combining, so a 1bpp destination only
+            // ever receives a real mono value (see blt_quantize_mono above).
+            if (dst_mono) s = blt_quantize_mono(src, s);
             uint32_t v = simple ? s
                        : rop_combine(rop, s, blt_get_pixel(dst, dx + xx, dy + yy));
             dc_plot(dst, dx + xx, dy + yy, v);
@@ -8395,6 +9973,80 @@ static void g_createbitmap(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t
     win16_trace("CreateBitmap %dx%d bpp=%d bits=%s -> obj=%d\n", w, h, bpp, (b_seg||b_off)?"yes":"null", obj);
     *ax = (uint16_t)obj;
 }
+// SetBitmapBits (GDI.106): SetBitmapBits(HBITMAP hbmp, DWORD cBytes,
+// LPVOID lpBits far) = word + dword + far ptr = 1+2+2 = 5w = 10 bytes.
+//
+// (Word6 toolbar-icon black-square bug) Word 6 builds its toolbar's AND-mask
+// and colour-image bitmap strips with the standard two-step Windows idiom:
+// CreateBitmap(w,h,1,1,NULL) to allocate a blank placeholder (verified by
+// win16_trace: "CreateBitmap 624x23 bpp=1 bits=null -> obj=NN" fires for
+// exactly these strips), then SetBitmapBits() to fill in the real pixel data.
+// CreateBitmap fills a NULL-lpBits bitmap with solid BLACK (FB_COLOR(0,0,0))
+// as its placeholder colour (see g_createbitmap above). This handler was a
+// dead stub (g_stub_table, argbytes=10, no-op: it cleaned the Pascal stack
+// and returned but never touched the bitmap's pixel buffer), so the strips
+// stayed permanently solid black. Word's own toolbar paint then does the
+// correct classic two-pass transparent-bitmap blit (BitBlt SRCAND with the
+// mask, then BitBlt SRCPAINT with the colour image -- both ROPs are already
+// handled correctly by rop_combine()), but ANDing and PAINTing with an
+// all-black source can only ever produce black: SRCAND (s&d) with s=0 zeroes
+// the destination, and the following SRCPAINT (s|d) with s=0 changes nothing.
+// So every toolbar button rendered as a solid black square regardless of the
+// blit/ROP logic being correct - the divergence was upstream, in the missing
+// producer of the bitmap's actual pixel data. Decode the caller's packed DDB
+// bits (word-aligned scanlines, top-down, by bpp) exactly like CreateBitmap's
+// own lpBits path above, and write them into the SAME bitmap object's pixel
+// buffer that BitBlt/StretchBlt later read from. General GDI fix (not
+// Word-specific): any Win16 app using CreateBitmap(NULL)+SetBitmapBits() to
+// build a bitmap was equally broken.
+static void g_setbitmapbits(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
+                            uint16_t *argbytes) {
+    uint16_t b_off = arg16(c, 0);
+    uint16_t b_seg = arg16(c, 1);
+    uint32_t cbytes = arg32(c, 2);
+    uint16_t hbmp = arg16(c, 4);
+    *argbytes = 10; *ax = 0; *dx = 0;
+    if (!hbmp || hbmp >= WIN16_MAX_GDIOBJ || !g_gdiobj[hbmp].used ||
+        g_gdiobj[hbmp].type != 4 || !g_gdiobj[hbmp].pix)
+        return;
+    win16_gdiobj_t *bm = &g_gdiobj[hbmp];
+    int w = bm->w, h = bm->h;
+    int bpp = bm->bpp ? bm->bpp : 1;
+    if (w <= 0 || h <= 0) return;
+    int rowbytes = ((w * bpp + 15) / 16) * 2;
+    uint32_t avail = (uint32_t)rowbytes * (uint32_t)h;
+    uint32_t need = (cbytes && cbytes < avail) ? cbytes : avail;
+    for (int y = 0; y < h; y++) {
+        uint32_t rowoff = (uint32_t)y * rowbytes;
+        if (rowoff >= need) break;
+        uint16_t roff = (uint16_t)(b_off + rowoff);
+        for (int x = 0; x < w; x++) {
+            uint8_t r = 0, g = 0, bl = 0;
+            if (bpp == 1) {
+                uint8_t byte = x86_16_rd8(c, b_seg, (uint16_t)(roff + (x >> 3)));
+                int bit = (byte >> (7 - (x & 7))) & 1;
+                r = g = bl = bit ? 255 : 0;
+            } else if (bpp == 4) {
+                uint8_t byte = x86_16_rd8(c, b_seg, (uint16_t)(roff + (x >> 1)));
+                int v = (x & 1) ? (byte & 0x0F) : (byte >> 4);
+                r = g = bl = (uint8_t)(v * 17);
+            } else if (bpp == 8) {
+                uint8_t v = x86_16_rd8(c, b_seg, (uint16_t)(roff + x));
+                r = g = bl = v;
+            } else if (bpp == 24) {
+                bl = x86_16_rd8(c, b_seg, (uint16_t)(roff + x * 3 + 0));
+                g  = x86_16_rd8(c, b_seg, (uint16_t)(roff + x * 3 + 1));
+                r  = x86_16_rd8(c, b_seg, (uint16_t)(roff + x * 3 + 2));
+            } else {
+                continue;
+            }
+            bm->pix[(uint32_t)y * w + x] = FB_COLOR(r, g, bl);
+        }
+    }
+    win16_trace("SetBitmapBits hbmp=%d %dx%d bpp=%d cbytes=%u\n",
+                hbmp, w, h, bpp, (unsigned)cbytes);
+    *ax = (uint16_t)need;   // real Windows returns the number of bytes used
+}
 // GetObject (GDI.82): GetObject(hObject, cbBuffer, lpvObject far) = 4w = 8b.
 // Card games call this on a loaded card HBITMAP to read bmWidth/bmHeight before
 // BitBlt'ing it; without it the BITMAP struct stays garbage and the blit is
@@ -8499,9 +10151,23 @@ static void g_bitblt(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *argb
     // are 1:1 for these transforms, so w/h are unchanged (use StretchBlt for scaling).
     if (dst) dc_lp2dp(dst, &xd, &yd);
     if (src) dc_lp2dp(src, &xs, &ys);
-    win16_trace("BB d%d<-s%d @%d,%d %dx%d src%d,%d rop=%x dmem=%d smem=%d\n",
+    // (#toolbar-icon diag) Sample the actual source/dest pixel AT the blit
+    // origin (not just index 0) so a file-based trace (win16_trace, unlike
+    // the g_w6log/kprintf path below which is silent once the GUI takes
+    // over the real serial port) can show whether the SOURCE bits are
+    // already black going in (a producer bug upstream of this blit) versus
+    // arriving with real colour and being clobbered here (a blit/ROP bug).
+    uint32_t diag_s = (src) ? blt_get_pixel(src, xs, ys) : 0xDEADDEADu;
+    uint32_t diag_d0 = (dst) ? blt_get_pixel(dst, xd, yd) : 0xDEADDEADu;
+    // (Word6 toolbar-icon transparency) dbpp/sbk let a trace confirm the exact
+    // MEASURED bpp of the blit's destination bitmap and the source DC's
+    // background colour (the colour-key) at the moment of the blit, without
+    // needing a separate probe.
+    win16_trace("BB d%d<-s%d @%d,%d %dx%d src%d,%d rop=%x dmem=%d smem=%d spx=%06x dpx0=%06x dbpp=%d sbk=%06x\n",
                 hdst, hsrc, xd, yd, w, h, xs, ys, (unsigned)rop,
-                dst ? (dst->membuf ? 1 : 0) : -1, src ? (src->membuf ? 1 : 0) : -1);
+                dst ? (dst->membuf ? 1 : 0) : -1, src ? (src->membuf ? 1 : 0) : -1,
+                (unsigned)diag_s, (unsigned)diag_d0,
+                dst ? dst->mbpp : -1, (unsigned)(src ? src->bk_color : 0));
     if (g_w6log > 0) {
         uint32_t sp0 = (src && src->membuf && src->mw > 0) ? src->membuf[0] : 0xDEAD;
         W6LOG("[W6] BB dwin=%d d@%d,%d %dx%d <- s%d(mem=%d %dx%d) s@%d,%d rop=%06x srcpx0=%06x\n",
@@ -8509,6 +10175,10 @@ static void g_bitblt(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *argb
               src ? src->mw : 0, src ? src->mh : 0, xs, ys, (unsigned)rop, sp0);
     }
     if (dst && src) blt_copy_rop(dst, xd, yd, w, h, src, xs, ys, rop);
+    if (dst) {
+        uint32_t diag_d1 = blt_get_pixel(dst, xd, yd);
+        win16_trace("BB   -> dpx1=%06x\n", (unsigned)diag_d1);
+    }
     *ax = 1; *dx = 0; *argbytes = 20;
 }
 // StretchBlt (GDI.35): adds nSrcW,nSrcH (2 more words) = 12w = 24b.
@@ -8530,12 +10200,18 @@ static void g_stretchblt(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *
                 hdst, hsrc, xd, yd, dw, dh, xs, ys, sw, sh,
                 dst ? (dst->membuf ? 1 : 0) : -1, src ? (src->membuf ? 1 : 0) : -1);
     if (dst && src && dw > 0 && dh > 0 && sw > 0 && sh > 0) {
+        // (Word6 toolbar-icon transparency) Same mono-destination quantization
+        // rule as BitBlt (see blt_quantize_mono): a shared GDI contract, not a
+        // BitBlt-only special case, so StretchBlt into a genuinely 1bpp
+        // destination is equally correct.
+        int dst_mono = (dst->mbpp == 1);
         int simple = (rop == 0x00CC0020UL);
         for (int yy = 0; yy < dh; yy++)
             for (int xx = 0; xx < dw; xx++) {
                 int sxp = xs + (xx * sw) / dw;
                 int syp = ys + (yy * sh) / dh;
                 uint32_t s = blt_get_pixel(src, sxp, syp);
+                if (dst_mono) s = blt_quantize_mono(src, s);
                 uint32_t v = simple ? s
                            : rop_combine(rop, s, blt_get_pixel(dst, xd + xx, yd + yy));
                 dc_plot(dst, xd + xx, yd + yy, v);
@@ -8581,7 +10257,7 @@ static void g_ellipse(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *arg
         for (int yy=t; yy<b; yy++) for (int xx=l; xx<r; xx++) {
             int ddx=xx-cx, ddy=yy-cy;
             if ((long)ddx*ddx*ry*ry + (long)ddy*ddy*rx*rx <= (long)rx*rx*ry*ry) {
-                if (!dc->brush_null) dc_plot(dc, xx, yy, dc->brush_color);
+                if (!dc->brush_null) dc_plot(dc, xx, yy, dc_brush_pixel(dc, xx, yy));
             }
         }
     }
@@ -8595,7 +10271,7 @@ static void g_roundrect(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *a
     if (hdc && hdc < WIN16_MAX_DC && g_dcs[hdc].used) {
         win16_dc_t *dc=&g_dcs[hdc];
         if (!dc->brush_null)
-            for (int yy=t; yy<b; yy++) for (int xx=l; xx<r; xx++) dc_plot(dc, xx, yy, dc->brush_color);
+            for (int yy=t; yy<b; yy++) for (int xx=l; xx<r; xx++) dc_plot(dc, xx, yy, dc_brush_pixel(dc, xx, yy));
         for (int xx=l; xx<r; xx++){dc_plot(dc,xx,t,dc->pen_color);dc_plot(dc,xx,b-1,dc->pen_color);}
         for (int yy=t; yy<b; yy++){dc_plot(dc,l,yy,dc->pen_color);dc_plot(dc,r-1,yy,dc->pen_color);}
     }
@@ -8612,8 +10288,51 @@ static void g_createbrushindirect(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, u
 // (#278 Word6) GDI object creators Word needs during window paint. They return
 // valid GDI object handles (region=type 5) so SelectObject/DeleteObject accept
 // them; precise geometry is not required to reach the message loop / first paint.
+//
+// CreatePatternBrush (GDI.60): CreatePatternBrush(HBITMAP hbmp) = 1w = 2b. Real
+// GDI copies the bitmap's bits into the new brush (the source HBITMAP can be
+// (and typically immediately is) DeleteObject'd right after -- the brush does
+// NOT keep a live reference to it), so this was a stub returning a flat
+// 0xC0C0C0 grey solid brush regardless of the source bitmap's real pattern.
+// Word 6 calls this 4x per run with real 8x8 monochrome bitmaps for its window
+// class backgrounds; the flat-grey stub is exactly why those windows painted
+// solid grey rectangles instead of their real (often plain white/transparent)
+// pattern. `hbmp` is a normal type==4 bitmap gdiobj (built via
+// CreateBitmap+SetBitmapBits, see those handlers) whose `pix` is already a
+// decoded WxH FB_COLOR array; copy it (not alias it -- the source bitmap can
+// be deleted independently) into a new type==6 PATTERN BRUSH object. Bitmaps
+// created 1bpp (bpp==1) are flagged pat_mono so tiling consumers recolour them
+// from the DC's live text/bk colour instead of the two literal colours the
+// bitmap happened to decode to (the real Win16 mono-pattern contract).
 static void g_createpatternbrush(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *argbytes) {
-    (void)c; *ax = (uint16_t)win16_alloc_gdiobj(1, 0xC0C0C0); *dx = 0; *argbytes = 2;  // GDI.60 CreatePatternBrush(HBITMAP)
+    uint16_t hbmp_arg = arg16(c, 0);   // GDI.60 CreatePatternBrush(HBITMAP) = 1w = 2b
+    *dx = 0; *argbytes = 2;
+    if (hbmp_arg && hbmp_arg < WIN16_MAX_GDIOBJ && g_gdiobj[hbmp_arg].used &&
+        g_gdiobj[hbmp_arg].type == 4 && g_gdiobj[hbmp_arg].pix &&
+        g_gdiobj[hbmp_arg].w > 0 && g_gdiobj[hbmp_arg].h > 0) {
+        win16_gdiobj_t *src = &g_gdiobj[hbmp_arg];
+        uint32_t n = (uint32_t)src->w * (uint32_t)src->h;
+        uint32_t *pix = (uint32_t *)kmalloc(n * 4);
+        if (pix) {
+            memcpy(pix, src->pix, n * 4);
+            int obj = win16_alloc_gdiobj(6, 0);
+            if (obj) {
+                g_gdiobj[obj].pix = pix;
+                g_gdiobj[obj].w = src->w; g_gdiobj[obj].h = src->h; g_gdiobj[obj].bpp = src->bpp;
+                g_gdiobj[obj].pat_mono = (src->bpp <= 1);
+                win16_trace("CreatePatternBrush hbmp=%d -> obj=%d %dx%d mono=%d\n",
+                            hbmp_arg, obj, src->w, src->h, g_gdiobj[obj].pat_mono);
+                *ax = (uint16_t)obj;
+                return;
+            }
+            kfree(pix);
+        }
+    }
+    // Source bitmap not a real decoded bitmap object (never captured, or the
+    // handle is stale/invalid): fall back to the old flat grey so callers still
+    // get a valid, usable brush handle.
+    win16_trace("CreatePatternBrush hbmp=%d has no captured bits, grey fallback\n", hbmp_arg);
+    *ax = (uint16_t)win16_alloc_gdiobj(1, 0xC0C0C0);
 }
 static void g_createpenindirect(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *argbytes) {
     uint16_t off=arg16(c,0), seg=arg16(c,1);                                          // GDI.62 CreatePenIndirect(LPLOGPEN)
@@ -8648,15 +10367,106 @@ static void g_getnearestcolor(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint1
 // CreateDIBitmap (GDI.442): CreateDIBitmap(hdc, lpInfoHeader far, dwUsage long,
 //   lpInit far, lpInitInfo far, wUsage) = 1+2+2+2+2+1 = 10 words = 20 bytes
 //   (wine gdi.exe16.spec: pascal CreateDIBitmap(word ptr long ptr ptr word)).
-//   Word's font/UI init calls this; UNIMPL popped argbytes=0 = a 20-byte Pascal
-//   stack DESYNC that corrupted the following font-table calls. Return a GDI bitmap
-//   handle (we do not actually decode the DIB; the metrics path only needs a valid
-//   non-null handle + a balanced stack). argbytes MUST be 20.
+//
+// (Word6 toolbar-icon black-square bug, ROOT CAUSE) This was a stub that threw
+// away lpInit/lpInitInfo entirely and returned a bitmap object hardcoded to
+// 1x1 with NO pixel buffer allocated at all (measured via a gated diagnostic
+// trace: "SelectObject dc=3 <- bmp obj=54 1x1 px0=deaddead", our NULL-pix
+// sentinel). Word 6 calls CreateDIBitmap with CBM_INIT to build its toolbar's
+// AND-mask/colour-image strips directly from its resource-decoded DIB bytes;
+// getting back a fake 1x1/no-buffer handle meant the very next call, a
+// StretchBlt stretching that "bitmap" up to the real 624x23 strip size,
+// stretched a single missing (-> black, since blt_get_pixel on a NULL membuf
+// returns 0) source pixel across the whole button-icon strip (measured:
+// "SB d2<-s3 @0,0 624x23 src0,0 1x1 dmem=1 smem=0"). Every subsequent
+// per-button SRCAND/SRCPAINT transparent-bitmap blit pair then combined an
+// all-black mask with an all-black colour image, which can only ever produce
+// black (see blt_copy_rop/rop_combine, both already correct) - so the
+// toolbar rendered solid black squares even though the blit/ROP logic
+// downstream was fine the whole time. This was the actual missing PRODUCER
+// (GDI.106 SetBitmapBits and GDI.440 SetDIBits, also fixed/checked this pass,
+// turned out NOT to be what Word calls here).
+//
+// Fix: when CBM_INIT (dwInit & 0x4) is set and real DIB header + bits are
+// supplied, decode them with the SAME marshal-then-decode_dib() approach
+// SetDIBitsToDevice already uses for a header+bits pair living in separate
+// guest far pointers (lpInitInfo describes the actual pixel format being
+// supplied, exactly like real GDI uses it), and allocate a properly sized,
+// fully populated bitmap object. Fall back to the old dummy 1x1 handle only
+// when Word passes no init data (a plain size/format query with dwInit=0).
 static void g_createdibitmap(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *argbytes) {
-    uint16_t h = win16_alloc_gdiobj(4, 0);   // type 4 = bitmap
-    if (h && h < WIN16_MAX_GDIOBJ) { g_gdiobj[h].w = 1; g_gdiobj[h].h = 1; g_gdiobj[h].bpp = 8; }
-    *ax = h ? h : 0x420; *dx = 0; *argbytes = 20;
-    (void)c;
+    uint16_t bmi_off  = arg16(c, 1), bmi_seg = arg16(c, 2);
+    uint16_t bits_off = arg16(c, 3), bits_seg = arg16(c, 4);
+    uint32_t dwinit   = arg32(c, 5);
+    *argbytes = 20; *dx = 0; *ax = 0;
+    int done = 0;
+    if ((dwinit & 0x4u) && bmi_seg && bits_seg) {   // CBM_INIT with real data
+        uint8_t hdr[64];
+        for (int i = 0; i < 64; i++) hdr[i] = x86_16_rd8(c, bmi_seg, (uint16_t)(bmi_off + i));
+        uint32_t hdrsize = dib_rd32(hdr);
+        int W = 0, H = 0, bpp = 0, ncolors = 0, pal_entry = 0, hdr_ok = 1;
+        if (hdrsize == 12) {
+            W = (int)dib_rd16(hdr + 4); H = (int)dib_rd16(hdr + 6);
+            bpp = (int)dib_rd16(hdr + 10); pal_entry = 3;
+        } else if (hdrsize >= 40 && hdrsize < 512) {
+            W = (int)dib_rd32(hdr + 4); H = (int)dib_rd32(hdr + 8);
+            bpp = (int)dib_rd16(hdr + 14); ncolors = (int)dib_rd32(hdr + 32); pal_entry = 4;
+        } else {
+            hdr_ok = 0;
+        }
+        if (hdr_ok) {
+            if (H < 0) H = -H;
+            if (W > 0 && H > 0 && W <= 4096 && H <= 4096) {
+                if (bpp <= 8) { int defc = 1 << bpp; if (ncolors <= 0 || ncolors > defc) ncolors = defc; }
+                else ncolors = 0;
+                int rowbytes = ((W * bpp + 31) / 32) * 4;
+                int pal_bytes = ncolors * pal_entry;
+                uint32_t total = hdrsize + (uint32_t)pal_bytes + (uint32_t)rowbytes * H;
+                uint8_t *buf = (uint8_t *)kmalloc(total);
+                if (buf) {
+                    for (uint32_t i = 0; i < total; i++) buf[i] = 0;
+                    for (uint32_t i = 0; i < hdrsize; i++)
+                        buf[i] = (i < 64) ? hdr[i] : x86_16_rd8(c, bmi_seg, (uint16_t)(bmi_off + i));
+                    for (int i = 0; i < pal_bytes; i++)
+                        buf[hdrsize + i] = x86_16_rd8(c, bmi_seg, (uint16_t)(bmi_off + hdrsize + i));
+                    uint8_t *bitbase = buf + hdrsize + pal_bytes;
+                    for (int r = 0; r < H; r++) {
+                        uint32_t dstrow = (uint32_t)r * rowbytes;
+                        uint16_t srcrow = (uint16_t)(bits_off + (uint32_t)r * rowbytes);
+                        for (int i = 0; i < rowbytes; i++)
+                            bitbase[dstrow + i] = x86_16_rd8(c, bits_seg, (uint16_t)(srcrow + i));
+                    }
+                    int dw = 0, dh = 0;
+                    uint32_t *pix = decode_dib(buf, total, &dw, &dh);
+                    kfree(buf);
+                    if (pix) {
+                        int obj = win16_alloc_gdiobj(4, 0);
+                        if (obj) {
+                            g_gdiobj[obj].pix = pix; g_gdiobj[obj].w = dw;
+                            g_gdiobj[obj].h = dh; g_gdiobj[obj].bpp = 8;
+                            win16_trace("CreateDIBitmap CBM_INIT -> obj=%d %dx%d\n", obj, dw, dh);
+                            *ax = (uint16_t)obj; done = 1;
+                        } else {
+                            kfree(pix);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if (!done) {
+        // No CBM_INIT data (a size/format query) or decode failed: return a
+        // harmless real 1x1 bitmap (actually allocated, not just a bogus
+        // handle with a dangling pixel buffer) so SelectObject/GetObject/
+        // DeleteObject on it stay well-behaved.
+        uint16_t h = (uint16_t)win16_alloc_gdiobj(4, 0);
+        if (h) {
+            uint32_t *b1 = (uint32_t *)kmalloc(4);
+            if (b1) b1[0] = FB_COLOR(0, 0, 0);
+            g_gdiobj[h].pix = b1; g_gdiobj[h].w = 1; g_gdiobj[h].h = 1; g_gdiobj[h].bpp = 8;
+        }
+        *ax = h ? h : 0x420;
+    }
 }
 
 // GetCharWidth (GDI.350): GetCharWidth(hdc, wFirstChar, wLastChar, lpBuffer far)
@@ -8899,6 +10709,361 @@ static int win16_native_ctrl_proc(win16_window_t *win, uint16_t msg,
                     msgq_post(parent, WM_COMMAND, win->ctrl_id, clp);
             } else if (g_w16_mousepath) {
                 kprintf("[BTN] hwnd=%04x id=%u UP inside=%d (no click)\n", win->hwnd, win->ctrl_id, inside);
+            }
+            return 1;
+        }
+        default:
+            return 0;   // let the generic path handle other messages
+    }
+}
+
+// ===========================================================================
+// (#278 Word6) Default USER predefined COMBOBOX (atom 0x0085 / class name
+// "COMBOBOX") behaviour. USER.344 (COMBOBOXCTLWNDPROC) was a pure stub, so a
+// real CBS_DROPDOWN/CBS_DROPDOWNLIST combobox (Word's Style / Font-Name /
+// Font-Size toolbar boxes and the Zoom% box - ctrl_kind==4 with btn_style's
+// 0x80 marker bit set, see u_createwindow) rendered as a flat grey rect: no
+// border, no current-selection text, no dropdown arrow, and CB_ADDSTRING /
+// CB_SETCURSEL silently no-op'd (win16_call_wndproc bails immediately when
+// proc_seg==proc_off==0, which is exactly the predefined-control case).
+//
+// This section gives it real per-window item-list storage (g_combos[], see
+// its declaration near g_windows[]) plus the standard collapsed paint. The
+// collapsed chrome was matched in STRUCTURE (not a hand-guessed modern style)
+// against a real Win 3.1 render: the build host:/root/w6ref/bochs/render-final.png,
+// probed pixel-by-pixel with Python/PIL. MEASURED there: the text field is a
+// 1px sunken frame (top+left black, bottom+right white - the white matches
+// the field's own fill, so the far edge is genuinely invisible, exactly as in
+// the reference); the dropdown button is a full black-outlined RAISED square
+// flush to the control's right edge (1px white top/left bevel, 1px shadow
+// bottom/right bevel just inside the outline). Word's own toolbar bitmap for
+// the arrow glyph has extra app-specific decoration (a stem above the
+// triangle); this is a SHARED USER control, not a Word-specific one, so it
+// draws the generic filled downward triangle instead of reverse-engineering
+// Word's private bitmap resource.
+//
+// Basic click-driven open/select is also wired (see win16_native_combo_proc):
+// a click on the collapsed control opens the list via SetCapture (the same
+// technique u_setcapture already documents for scrollbar/slider drags), so
+// the list's item rows - necessarily outside the control's own clamped
+// win->ch rect - still route their clicks here; a second click hit-tests the
+// rows, updates CB_GETCURSEL + the displayed text, closes the list, and SENDs
+// CBN_SELCHANGE via WM_COMMAND to the parent (matching real USER).
+// ===========================================================================
+
+// Copy an item string into the control's displayed text (win->title, the
+// same field BUTTON already reuses for its own label).
+static void win16_combo_set_title(win16_window_t *win, const char *s) {
+    int n = 0;
+    for (; s[n] && n < (int)sizeof(win->title) - 1; n++) win->title[n] = s[n];
+    win->title[n] = 0;
+}
+
+// Draw the open item list below the collapsed control (lx,ly = the control's
+// bottom-left corner in canvas coords, lw = control width). Reuses the popup
+// menu's save/restore-under buffer (win16_menu_save_under/restore_under, see
+// their #219 declarations) so the document/ruler pixels the list covers over
+// come back correctly on close; a combo list and a menu popup are never open
+// at once in practice, so sharing that one global save slot (keyed off a
+// sentinel outside the real popup-index range) is safe.
+#define W16_COMBO_SAVE_T(hwnd) (-1000 - (int)(hwnd))
+static void win16_draw_combo_list(win16_window_t *win, win16_combo_t *cb,
+                                  int lx, int ly, int lw) {
+    if (!g_win16_canvas || lw <= 0) return;
+    int rowh = FONT_HEIGHT + 4;
+    int avail = (win->h > win->ch) ? (win->h - win->ch) : rowh * 8;
+    int maxrows = avail / rowh; if (maxrows < 1) maxrows = 1;
+    int n = cb->nitems; if (n > maxrows) n = maxrows;
+    if (n < 1) n = 1;   // always show at least an empty frame while open
+    int lh = n * rowh + 2;
+    uint32_t face  = FB_COLOR(192,192,192), ink   = FB_COLOR(0,0,0);
+    uint32_t bd    = FB_COLOR(90,90,90),    white = FB_COLOR(255,255,255);
+    uint32_t selbg = FB_COLOR(0,0,128),     selink = FB_COLOR(255,255,255);
+    win16_menu_save_under(lx, ly, lw, lh, W16_COMBO_SAVE_T(win->hwnd));
+    canvas_fill(lx, ly, lw, lh, face);
+    for (int x = 0; x < lw; x++) { canvas_plot(lx+x, ly, bd); canvas_plot(lx+x, ly+lh-1, bd); }
+    for (int y = 0; y < lh; y++) { canvas_plot(lx, ly+y, bd); canvas_plot(lx+lw-1, ly+y, bd); }
+    int yy = ly + 1;
+    for (int i = 0; i < n && i < cb->nitems; i++) {
+        int sel = (i == cb->cursel);
+        canvas_fill(lx+1, yy, lw-2, rowh, sel ? selbg : white);
+        dlg_text(lx+4, yy+2, cb->items[i], sel ? selink : ink);
+        yy += rowh;
+    }
+}
+
+// Draw the COLLAPSED combobox: sunken text field + current-selection text +
+// raised dropdown-arrow button; if open, also draws the item list beneath it.
+static void win16_draw_combo(win16_window_t *win) {
+    if (!g_win16_canvas || win->cw <= 0 || win->ch <= 0) return;
+    win16_combo_t *cb = combo_state(win);
+    if (!cb) return;
+    int bx = win->cx, by = win->cy, bw = win->cw, bh = win->ch;
+    uint32_t face = FB_COLOR(192,192,192);
+    uint32_t hi   = FB_COLOR(255,255,255);
+    uint32_t sh   = FB_COLOR(110,110,110);
+    uint32_t ink  = FB_COLOR(0,0,0);
+    int cbs_type   = win->btn_style & 0x03;   // CBS_SIMPLE=1, DROPDOWN=2, DROPDOWNLIST=3
+    int has_button = (cbs_type != 0x01);      // CBS_SIMPLE has no button, list always shown
+    int arrow_w = bh; if (arrow_w > 24) arrow_w = 24; if (arrow_w < 14) arrow_w = 14;
+    int edit_w = has_button ? (bw - arrow_w) : bw;
+    if (edit_w < 1) edit_w = 1;
+
+    // Sunken edit/display field (top+left black, bottom+right white - the
+    // white bottom/right is the same colour as the fill, matching the
+    // reference: the far edge is genuinely invisible against the white field).
+    canvas_fill(bx, by, edit_w, bh, hi);
+    for (int x = 0; x < edit_w; x++) { canvas_plot(bx+x, by, ink); canvas_plot(bx+x, by+bh-1, hi); }
+    for (int y = 0; y < bh; y++) { canvas_plot(bx, by+y, ink); canvas_plot(bx+edit_w-1, by+y, hi); }
+    if (win->title[0]) {
+        int maxw = edit_w - 6;
+        char clipped[64]; int ci = 0, w = 0;
+        for (const char *p = win->title; *p && ci < (int)sizeof(clipped) - 1; p++) {
+            if (w + FONT_WIDTH > maxw) break;
+            clipped[ci++] = *p; w += FONT_WIDTH;
+        }
+        clipped[ci] = 0;
+        dlg_text(bx + 4, by + (bh - FONT_HEIGHT) / 2, clipped, ink);
+    }
+
+    if (has_button) {
+        // Raised dropdown-arrow button flush to the right edge: a full black
+        // outline (matches the reference's solid perimeter) plus a 1px hi/sh
+        // bevel just inside it for the raised look, and a plain filled
+        // downward triangle (the generic USER glyph - see the section banner
+        // above for why Word's own decorated bitmap is out of scope here).
+        int ax0 = bx + edit_w, aw = bw - edit_w;
+        canvas_fill(ax0, by, aw, bh, face);
+        for (int x = 0; x < aw; x++) { canvas_plot(ax0+x, by, ink); canvas_plot(ax0+x, by+bh-1, ink); }
+        for (int y = 0; y < bh; y++) { canvas_plot(ax0, by+y, ink); canvas_plot(ax0+aw-1, by+y, ink); }
+        for (int x = 1; x < aw-1; x++) canvas_plot(ax0+x, by+1, hi);
+        for (int y = 1; y < bh-1; y++) canvas_plot(ax0+1, by+y, hi);
+        for (int x = 1; x < aw-1; x++) canvas_plot(ax0+x, by+bh-2, sh);
+        for (int y = 1; y < bh-1; y++) canvas_plot(ax0+aw-2, by+y, sh);
+        int mx = ax0 + aw/2, my = by + bh/2 - 1;
+        for (int half = 3, row = 0; half >= 0; half--, row++)
+            for (int x = -half; x <= half; x++) canvas_plot(mx+x, my+row, ink);
+    }
+
+    if (cb->dropped && has_button)
+        win16_draw_combo_list(win, cb, bx, by + bh, bw);
+}
+
+// Native predefined-COMBOBOX class proc (USER.344, COMBOBOXCTLWNDPROC), for a
+// child of atom/class 0x0085 / "COMBOBOX" created with no wndproc of its own
+// (see u_createwindow's ctrl_kind==4 detection). Owns the item-list storage +
+// current selection and drives collapsed paint, basic click-to-open/select,
+// and the CB_*/WM_SETTEXT/WM_GETTEXT messages an app uses to populate/read it.
+//
+// (MEASURED, gated win16_trace capture, 2026-07-27 - see WORD6_DIVERGENCE_CATALOG.md
+// for the full pass writeup; this is a PIN, the text still does not display)
+// Word 6 does NOT drive its toolbar Style/Font-Name/Font-Size/Zoom% controls
+// through the standard CB_ADDSTRING/CB_SETCURSEL/WM_SETTEXT contract: it
+// SUBCLASSES them (win->proc_seg:proc_off is Word's own code, measured live at
+// 0077:4e52 for all four) and, for these four controls specifically, the
+// traced sequence is CREATE -> WM_SETFONT -> WM_SHOWWINDOW -> msg=0x0401
+// (WM_USER+1, wParam=0x07/0x1f/0xfd for the three Style/Font-Name/Font-Size
+// boxes) or msg=0x0415 (WM_USER+0x15, wParam=0x07, the Zoom% box) -> WM_GETTEXT.
+//
+// Chasing the PRODUCER (not the WM_GETTEXT consumer, which already worked and
+// correctly returns whatever win->title holds): a gated per-call API trace of
+// Word's subclass proc while it handles msg 0x0401/0x0415 shows it calls
+// EXACTLY TWO APIs - USER.46 GetParent(), then USER.122 CallWindowProc(),
+// forwarding the identical hwnd/msg/wParam/lParam unchanged - and NOTHING
+// else (no LoadString, no wsprintf, no direct memory read). Word's own code
+// has ZERO special knowledge of this message; it unconditionally defers to
+// "the previous wndproc" it saved at subclass time, which for a predefined
+// COMBOBOX is our 0:0 sentinel (no real NE code backs a predefined control -
+// see u_createwindow's ctrl_kind==4) - so the message is silently swallowed
+// one call frame below this function (win16_call_wndproc's pseg==0&&poff==0
+// bail) and never produces text, no matter how many times it is forwarded.
+//
+// A first theory this pass held (wParam is a STRINGTABLE resource id,
+// block=(id>>4)+1/index=id&15 exactly like LoadString/USER.176 decodes,
+// resolved via win16_get_resource()'s existing every-loaded-module fallback -
+// the same mechanism that already makes CARDS.DLL's strings/bitmaps work) is
+// MEASURED-REFUTED: a standalone NE resource-table dump of both WINWORD.EXE
+// and its companion WORDRES.DLL (present on the C: drive, auto-loaded via
+// load_dependencies) shows ZERO RT_STRING (type 6) resources in EITHER file.
+// There is no string table for wParam to index into.
+//
+// Conclusion (PIN, not fixed): since Word's own subclass provably does
+// nothing but forward, the algorithm that turns wParam into "Normal"/"Times
+// New Roman"/"10"/"100%" must live inside real Windows 3.1 USER.EXE's own
+// (undocumented - this is not a public CB_* message) COMBOBOXCTLWNDPROC
+// extension, which our interpreter does not load or emulate as guest code.
+// Implementing it faithfully would mean disassembling that real binary (via
+// the Bochs reference rig, the build host:/root/w6ref or tools/word6/bochs) to learn
+// the real algorithm - genuinely deep, out of this pass's scope. Do NOT
+// hardcode the observed strings (not faithful emulation) and do NOT
+// resurrect the STRINGTABLE theory without new evidence; the gated
+// diagnostics that produced this pin (g_w6combodiag, win16_call_wndproc's
+// swallow trace, the armed per-call API trace) are left in tree, default off,
+// as a starting point for whoever picks this up next.
+static int win16_native_combo_proc(win16_window_t *win, uint16_t msg,
+                                   uint16_t wParam, uint32_t lParam, uint32_t *out) {
+    *out = 0;
+    win16_combo_t *cb = combo_state(win);
+    if (!cb) return 0;
+    switch (msg) {
+        case WM_PAINT:
+            win16_draw_combo(win);
+            return 1;
+        // NOTE: msg WM_USER+1 / WM_USER+0x15 (the private toolbar-combo protocol
+        // this proc's banner comment documents) are DELIBERATELY not handled here.
+        // MEASURED (this pass) and REFUTED the previous "STRINGTABLE resource id"
+        // theory: neither WINWORD.EXE nor WORDRES.DLL contains ANY RT_STRING
+        // (type 6) resource (verified with a standalone NE resource-table parser
+        // against both files), and a gated live API trace of Word's OWN subclass
+        // proc (0077:4e52) handling this exact message shows it calls exactly
+        // GetParent() then CallWindowProc(savedOldProc, hwnd, SAME msg, SAME
+        // wParam, 0) and NOTHING else - no LoadString, no wsprintf, no direct
+        // memory read of any style/font/size table. Word's own code has ZERO
+        // special knowledge of this message; it unconditionally defers to
+        // whatever the REAL (pre-subclass) window proc would do with it. Since
+        // that pre-subclass proc is real Windows 3.1 USER.EXE's own
+        // COMBOBOXCTLWNDPROC (not anything Word ships), the algorithm that
+        // turns wParam into "Normal"/"Times New Roman"/"10"/"100%" lives inside
+        // undocumented real-USER.EXE code we do not have loaded or emulated as
+        // guest instructions - implementing it correctly would mean disassembling
+        // that real binary, which is out of scope for this pass (see
+        // WORD6_DIVERGENCE_CATALOG.md). PIN, not fixed: do not resurrect the
+        // STRINGTABLE theory without new evidence, and do not hardcode the
+        // observed strings - that would not be faithful emulation.
+        case WM_SETTEXT:
+            if (g_cpu) rd_far_cstr(g_cpu, (uint16_t)(lParam >> 16), (uint16_t)lParam,
+                                   win->title, sizeof(win->title));
+            win16_draw_combo(win);
+            return 1;
+        case WM_GETTEXT: {
+            uint16_t s_seg = (uint16_t)(lParam >> 16), s_off = (uint16_t)lParam;
+            uint16_t n = 0;
+            if (g_cpu && wParam > 0) {
+                for (; n < (uint16_t)(wParam - 1) && win->title[n]; n++)
+                    x86_16_wr8(g_cpu, s_seg, (uint16_t)(s_off + n), (uint8_t)win->title[n]);
+                x86_16_wr8(g_cpu, s_seg, (uint16_t)(s_off + n), 0);
+            }
+            *out = n;
+            return 1;
+        }
+        case CB_ADDSTRING:
+        case CB_INSERTSTRING: {
+            char buf[W16_COMBO_ITEMLEN];
+            if (g_cpu) rd_far_cstr(g_cpu, (uint16_t)(lParam >> 16), (uint16_t)lParam, buf, sizeof(buf));
+            else buf[0] = 0;
+            if (cb->nitems >= W16_COMBO_MAXITEMS) { *out = (uint32_t)0xFFFFFFFF; return 1; }
+            int idx = cb->nitems;
+            if (msg == CB_INSERTSTRING) {
+                int16_t req = (int16_t)wParam;
+                if (req >= 0 && req < cb->nitems) idx = req;
+            }
+            for (int k = cb->nitems; k > idx; k--)
+                for (int b = 0; b < W16_COMBO_ITEMLEN; b++) cb->items[k][b] = cb->items[k-1][b];
+            { int n = 0; for (; buf[n] && n < W16_COMBO_ITEMLEN - 1; n++) cb->items[idx][n] = buf[n];
+              cb->items[idx][n] = 0; }
+            cb->nitems++;
+            if (cb->cursel >= idx) cb->cursel++;
+            *out = (uint32_t)idx;
+            return 1;
+        }
+        case CB_DELETESTRING: {
+            int idx = (int16_t)wParam;
+            if (idx >= 0 && idx < cb->nitems) {
+                for (int k = idx; k < cb->nitems - 1; k++)
+                    for (int b = 0; b < W16_COMBO_ITEMLEN; b++) cb->items[k][b] = cb->items[k+1][b];
+                cb->nitems--;
+                if (cb->cursel == idx) cb->cursel = -1;
+                else if (cb->cursel > idx) cb->cursel--;
+            }
+            *out = (uint32_t)cb->nitems;
+            return 1;
+        }
+        case CB_RESETCONTENT:
+            cb->nitems = 0; cb->cursel = -1; cb->dropped = 0;
+            win->title[0] = 0;
+            win16_draw_combo(win);
+            return 1;
+        case CB_GETCOUNT:
+            *out = (uint32_t)cb->nitems;
+            return 1;
+        case CB_GETCURSEL:
+            *out = (cb->cursel >= 0) ? (uint32_t)cb->cursel : (uint32_t)0xFFFFFFFF;
+            return 1;
+        case CB_SETCURSEL: {
+            int idx = (int16_t)wParam;
+            if (idx >= 0 && idx < cb->nitems) {
+                cb->cursel = idx;
+                win16_combo_set_title(win, cb->items[idx]);
+                *out = (uint32_t)idx;
+            } else {
+                cb->cursel = -1;
+                win->title[0] = 0;
+                *out = (uint32_t)0xFFFFFFFF;
+            }
+            win16_draw_combo(win);
+            return 1;
+        }
+        case CB_GETLBTEXTLEN: {
+            int idx = (int16_t)wParam;
+            if (idx >= 0 && idx < cb->nitems) {
+                int n = 0; while (cb->items[idx][n]) n++;
+                *out = (uint32_t)n;
+            } else *out = (uint32_t)0xFFFFFFFF;
+            return 1;
+        }
+        case CB_GETLBTEXT: {
+            int idx = (int16_t)wParam;
+            uint16_t s_seg = (uint16_t)(lParam >> 16), s_off = (uint16_t)lParam;
+            if (idx >= 0 && idx < cb->nitems && g_cpu) {
+                const char *s = cb->items[idx];
+                uint16_t k = 0; for (; s[k]; k++) x86_16_wr8(g_cpu, s_seg, (uint16_t)(s_off+k), (uint8_t)s[k]);
+                x86_16_wr8(g_cpu, s_seg, (uint16_t)(s_off+k), 0);
+                *out = k;
+            } else *out = (uint32_t)0xFFFFFFFF;
+            return 1;
+        }
+        case CB_SHOWDROPDOWN:
+            cb->dropped = wParam ? 1 : 0;
+            if (!cb->dropped) win16_menu_restore_under();
+            win16_draw_combo(win);
+            return 1;
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONDBLCLK: {
+            int cbs_type = win->btn_style & 0x03;
+            if (cbs_type == 0x01) return 0;   // CBS_SIMPLE: no button, nothing to toggle
+            int clx = (int16_t)(lParam & 0xFFFF), cly = (int16_t)(lParam >> 16);
+            if (!cb->dropped) {
+                if (clx >= 0 && clx < win->cw && cly >= 0 && cly < win->ch) {
+                    cb->dropped = 1;
+                    g_win16_capture_hwnd = win->hwnd;   // (#393) SetCapture, so the
+                                                         // off-rect list clicks below
+                                                         // still route to this hwnd
+                    win16_draw_combo(win);
+                }
+            } else {
+                int rowh = FONT_HEIGHT + 4;
+                int rel = cly - win->ch - 1;
+                int row = (rel >= 0) ? rel / rowh : -1;
+                int changed = 0;
+                if (row >= 0 && row < cb->nitems && row != cb->cursel) {
+                    cb->cursel = row;
+                    win16_combo_set_title(win, cb->items[row]);
+                    changed = 1;
+                }
+                cb->dropped = 0;
+                if (g_win16_capture_hwnd == win->hwnd) g_win16_capture_hwnd = 0;   // ReleaseCapture
+                win16_menu_restore_under();
+                win16_draw_combo(win);
+                if (changed) {
+                    // WM_COMMAND to the PARENT: wParam=id, lParam=MAKELONG(hwndCtl, CBN_SELCHANGE)
+                    uint16_t parent = win->parent;
+                    uint32_t clp = ((uint32_t)CBN_SELCHANGE << 16) | win->hwnd;
+                    win16_window_t *pw = win_from_hwnd(parent);
+                    if (pw && (pw->proc_seg || pw->proc_off))
+                        win16_call_wndproc(pw->proc_seg, pw->proc_off, parent, WM_COMMAND, win->ctrl_id, clp);
+                    else
+                        msgq_post(parent, WM_COMMAND, win->ctrl_id, clp);
+                }
             }
             return 1;
         }
@@ -9471,8 +11636,8 @@ static void g_fastwindowframe(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint1
         int b = (int16_t)x86_16_rd16(c, r_seg, (uint16_t)(r_off+6));
         if (fw < 1) fw = 1;
         if (fh < 1) fh = 1;
-        for (int yy = t; yy < b; yy++) for (int k = 0; k < fw; k++) { dc_plot(dc, l+k, yy, dc->brush_color); dc_plot(dc, rr-1-k, yy, dc->brush_color); }
-        for (int xx = l; xx < rr; xx++) for (int k = 0; k < fh; k++) { dc_plot(dc, xx, t+k, dc->brush_color); dc_plot(dc, xx, b-1-k, dc->brush_color); }
+        for (int yy = t; yy < b; yy++) for (int k = 0; k < fw; k++) { dc_plot(dc, l+k, yy, dc_brush_pixel(dc, l+k, yy)); dc_plot(dc, rr-1-k, yy, dc_brush_pixel(dc, rr-1-k, yy)); }
+        for (int xx = l; xx < rr; xx++) for (int k = 0; k < fh; k++) { dc_plot(dc, xx, t+k, dc_brush_pixel(dc, xx, t+k)); dc_plot(dc, xx, b-1-k, dc_brush_pixel(dc, xx, b-1-k)); }
     }
     *ax = 1; *dx = 0; *argbytes = 14;
 }
@@ -10241,8 +12406,73 @@ static void g_createhatchbrush(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint
     uint32_t cr = arg32(c, 0);   /* nStyle = arg16(2) ignored (rendered solid) */
     *ax = (uint16_t)win16_alloc_gdiobj(1, cr); *dx = 0; *argbytes = 6;
 }
+// CreateDIBPatternBrush (GDI.445): CreateDIBPatternBrush(HGLOBAL hGlobal,
+//   wUsage) = 2w = 4b. hGlobal names a PACKED DIB (BITMAPINFOHEADER/CORE +
+// colour table + bits, all contiguous in one block) -- unlike CreateDIBitmap's
+// separate header/bits far pointers. Our GlobalAlloc handles are the segment
+// paragraph itself (see k_globallock's comment), so the whole packed DIB lives
+// at hGlobal:0000 and can be marshalled + decode_dib'd directly. This was a
+// stub returning a flat 0xC0C0C0 grey solid brush, discarding Word's real
+// pattern; decode the header (same size computation g_createdibitmap uses) and
+// store the DIB's own decoded colours as a type==6 pattern brush. pat_mono=0:
+// a colour DIB pattern is never recoloured by the DC's text/bk colour (that
+// only applies to a monochrome CreatePatternBrush source, see g_createpatternbrush).
 static void g_createdibpatternbrush(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *argbytes) {
-    (void)c; *ax = (uint16_t)win16_alloc_gdiobj(1, 0xC0C0C0); *dx = 0; *argbytes = 4;
+    uint16_t hglobal_arg = arg16(c, 0);
+    *dx = 0; *argbytes = 4;
+    if (hglobal_arg) {
+        uint16_t bmi_seg = hglobal_arg, bmi_off = 0;
+        uint8_t hdr[64];
+        for (int i = 0; i < 64; i++) hdr[i] = x86_16_rd8(c, bmi_seg, (uint16_t)(bmi_off + i));
+        uint32_t hdrsize = dib_rd32(hdr);
+        int W = 0, H = 0, bpp = 0, ncolors = 0, pal_entry = 0, hdr_ok = 1;
+        if (hdrsize == 12) {
+            W = (int)dib_rd16(hdr + 4); H = (int)dib_rd16(hdr + 6);
+            bpp = (int)dib_rd16(hdr + 10); pal_entry = 3;
+        } else if (hdrsize >= 40 && hdrsize < 512) {
+            W = (int)dib_rd32(hdr + 4); H = (int)dib_rd32(hdr + 8);
+            bpp = (int)dib_rd16(hdr + 14); ncolors = (int)dib_rd32(hdr + 32); pal_entry = 4;
+        } else {
+            hdr_ok = 0;
+        }
+        if (hdr_ok && H < 0) H = -H;
+        if (hdr_ok && W > 0 && H > 0 && W <= 4096 && H <= 4096) {
+            if (bpp <= 8) { int defc = 1 << bpp; if (ncolors <= 0 || ncolors > defc) ncolors = defc; }
+            else ncolors = 0;
+            int rowbytes = ((W * bpp + 31) / 32) * 4;
+            int pal_bytes = ncolors * pal_entry;
+            uint32_t total = hdrsize + (uint32_t)pal_bytes + (uint32_t)rowbytes * H;
+            // A packed DIB addressed as a single real-mode segment:offset cannot
+            // exceed 64K; anything larger is not something this 16-bit API can
+            // have actually handed us, so bail to the fallback rather than
+            // truncate a read silently.
+            if (total > 0 && total <= 0xFFFF) {
+                uint8_t *buf = (uint8_t *)kmalloc(total);
+                if (buf) {
+                    for (uint32_t i = 0; i < total; i++)
+                        buf[i] = x86_16_rd8(c, bmi_seg, (uint16_t)(bmi_off + i));
+                    int dw = 0, dh = 0;
+                    uint32_t *pix = decode_dib(buf, total, &dw, &dh);
+                    kfree(buf);
+                    if (pix) {
+                        int obj = win16_alloc_gdiobj(6, 0);
+                        if (obj) {
+                            g_gdiobj[obj].pix = pix; g_gdiobj[obj].w = dw;
+                            g_gdiobj[obj].h = dh; g_gdiobj[obj].bpp = (bpp > 0) ? bpp : 24;
+                            g_gdiobj[obj].pat_mono = 0;
+                            win16_trace("CreateDIBPatternBrush hGlobal=%04x -> obj=%d %dx%d\n",
+                                        hglobal_arg, obj, dw, dh);
+                            *ax = (uint16_t)obj;
+                            return;
+                        }
+                        kfree(pix);
+                    }
+                }
+            }
+        }
+    }
+    win16_trace("CreateDIBPatternBrush hGlobal=%04x decode failed, grey fallback\n", hglobal_arg);
+    *ax = (uint16_t)win16_alloc_gdiobj(1, 0xC0C0C0);
 }
 static void g_createbitmapindirect(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx, uint16_t *argbytes) {
     uint16_t off=arg16(c,0),seg=arg16(c,1);
@@ -10281,7 +12511,7 @@ static void g_ellipse_outline(win16_dc_t *dc, int l, int t, int r, int b, int fi
     int cx=(l+r)/2, cy=(t+b)/2, rx=(r-l)/2, ry=(b-t)/2; if(rx<1)rx=1; if(ry<1)ry=1;
     for(int yy=t; yy<=b; yy++) for(int xx=l; xx<=r; xx++){
         if(!ellipse_in(xx,yy,cx,cy,rx,ry)) continue;
-        if(fill && !dc->brush_null) dc_plot(dc,xx,yy,dc->brush_color);
+        if(fill && !dc->brush_null) dc_plot(dc,xx,yy,dc_brush_pixel(dc,xx,yy));
         // boundary pixel: inside but a 4-neighbour is outside -> pen outline
         if(!ellipse_in(xx-1,yy,cx,cy,rx,ry)||!ellipse_in(xx+1,yy,cx,cy,rx,ry)||
            !ellipse_in(xx,yy-1,cx,cy,rx,ry)||!ellipse_in(xx,yy+1,cx,cy,rx,ry))
@@ -10694,6 +12924,8 @@ static const win16_api_entry_t g_api_table[] = {
     { "KERNEL", 17, "GLOBALFREE",        k_globalfree },
     { "KERNEL", 25, "GLOBALCOMPACT",     k_globalcompact },
     { "KERNEL", 169, "GETFREESPACE",     k_getfreespace },      // (#EP3 Fuji Golf)
+    { "USER", 284, "GETFREESYSTEMRESOURCES", u_getfreesystemresources }, // (#278 Word6 typed-text: stub 0% tripped low-memory bail)
+    { "KERNEL", 13, "LOCALCOMPACT",      k_localcompact },      // (#278 Word6 continuation)
     { "KERNEL", 132, "GETWINFLAGS",      k_getwinflags },      // (#Excel4)
     { "KERNEL", 20, "GLOBALSIZE",        k_globalsize },        // (#188 Word6)
     { "KERNEL", 166, "WINEXEC",          k_winexec },           // (#188 Word6)
@@ -10813,6 +13045,11 @@ static const win16_api_entry_t g_api_table[] = {
     { "USER",   81, "FILLRECT",          u_fillrect },
     { "USER",   61, "SCROLLWINDOW",      u_scrollwindow },
     { "USER",  319, "SCROLLWINDOWEX",    u_scrollwindowex },
+    { "USER",  221, "SCROLLDC",         u_scrolldc },
+    { "USER",   62, "SETSCROLLPOS",      u_setscrollpos },
+    { "USER",   63, "GETSCROLLPOS",      u_getscrollpos },
+    { "USER",   64, "SETSCROLLRANGE",    u_setscrollrange },
+    { "USER",   65, "GETSCROLLRANGE",    u_getscrollrange },
     { "USER",  107, "DEFWINDOWPROC",     u_defwindowproc },
     { "USER",  108, "GETMESSAGE",        u_getmessage },
     { "USER",  109, "PEEKMESSAGE",       u_peekmessage },
@@ -10928,6 +13165,7 @@ static const win16_api_entry_t g_api_table[] = {
     { "GDI",    37, "POLYLINE",          g_polyline },       // (#EP3 Fuji Golf)
     { "GDI",    21, "EXCLUDECLIPRECT",   g_excludecliprect },
     { "GDI",    22, "INTERSECTCLIPRECT", g_intersectcliprect },
+    { "GDI",    44, "SELECTCLIPRGN",     g_selectcliprgn },
     { "GDI",    27, "RECTANGLE",         g_rectangle },
     { "GDI",    31, "SETPIXEL",          g_setpixel },
     { "GDI",    29, "PATBLT",            g_patblt },
@@ -10967,6 +13205,7 @@ static const win16_api_entry_t g_api_table[] = {
     { "GDI",    64, "CREATERECTRGN",      g_createrectrgn },
     { "GDI",    65, "CREATERECTRGNINDIRECT", g_createrectrgnindirect },
     { "GDI",    48, "CREATEBITMAP",       g_createbitmap },
+    { "GDI",   106, "SETBITMAPBITS",      g_setbitmapbits },
     { "GDI",    51, "CREATECOMPATIBLEBITMAP", g_createcompatiblebitmap },
     { "GDI",    56, "CREATEFONT",        g_createfont },
     { "GDI",    57, "CREATEFONTINDIRECT", g_createfontindirect },
@@ -11142,7 +13381,7 @@ static const win16_stub_entry_t g_stub_table[] = {
     { "GDI", 41, 10, 1 },  // FrameRgn
     { "GDI", 42, 4, 1 },  // InvertRgn
     { "GDI", 43, 4, 1 },  // PaintRgn
-    { "GDI", 44, 4, 0 },  // SelectClipRgn
+    // GDI ordinal 44 (SelectClipRgn) moved to a real handler (g_api_table) above.
     { "GDI", 46, 0, 1 },  // BITMAPBITS
     { "GDI", 47, 8, 1 },  // CombineRgn
     { "GDI", 71, 12, 0 },  // EnumObjects
@@ -11157,7 +13396,11 @@ static const win16_stub_entry_t g_stub_table[] = {
     { "GDI", 102, 6, 1 },  // OffsetVisRgn
     { "GDI", 103, 6, 1 },  // PtVisible
     { "GDI", 105, 4, 0 },  // SelectVisRgn
-    { "GDI", 106, 10, 0 },  // SetBitmapBits
+    // GDI.106 SetBitmapBits moved to g_api_table (g_setbitmapbits): a real
+    // handler is needed (see the definition above g_getobject) because Word 6's
+    // toolbar builds its AND-mask/colour bitmap strips via CreateBitmap(NULL)
+    // then SetBitmapBits(); a no-op stub left every such bitmap solid black
+    // (the toolbar-icon black-square bug).
     { "GDI", 117, 6, 0 },  // SetDCOrg
     { "GDI", 118, 0, 1 },  // InternalCreateDC
     { "GDI", 119, 4, 1 },  // AddFontResource
@@ -11455,10 +13698,6 @@ static const win16_stub_entry_t g_stub_table[] = {
     { "USER", 55, 10, 0 },  // EnumChildWindows
     { "USER", 59, 2, 1 },  // SetActiveWindow
     { "USER", 61, 14, 1 },  // ScrollWindow
-    { "USER", 62, 8, 1 },  // SetScrollPos
-    { "USER", 63, 4, 0 },  // GetScrollPos
-    { "USER", 64, 10, 1 },  // SetScrollRange
-    { "USER", 65, 12, 0 },  // GetScrollRange
     { "USER", 80, 12, 1 },  // UnionRect
     { "USER", 86, 0, 0 },  // IconSize
     { "USER", 99, 8, 1 },  // DlgDirSelect
@@ -11521,7 +13760,6 @@ static const win16_stub_entry_t g_stub_table[] = {
     { "USER", 216, 8, 0 },  // UserSeeUserDo
     { "USER", 217, 4, 1 },  // LookupMenuHandle
     { "USER", 220, 4, 0 },  // LoadMenuIndirect
-    { "USER", 221, 20, 1 },  // ScrollDC
     { "USER", 222, 4, 0 },  // GetKeyboardState
     { "USER", 223, 4, 1 },  // SetKeyboardState
     { "USER", 224, 2, 0 },  // GetWindowTask
@@ -11566,7 +13804,6 @@ static const win16_stub_entry_t g_stub_table[] = {
     { "USER", 279, 0, 1 },  // OldSetDeskPattern
     { "USER", 280, 4, 1 },  // SetSystemMenu
     { "USER", 281, 2, 0 },  // GetSysColorBrush
-    { "USER", 284, 2, 0 },  // GetFreeSystemResources
     { "USER", 285, 4, 1 },  // SetDeskWallpaper
     { "USER", 287, 2, 0 },  // GetLastActivePopup
     { "USER", 289, 0, 0 },  // keybd_event
@@ -11799,7 +14036,6 @@ static const win16_stub_entry_t g_stub_table[] = {
     { "KERNEL", 2, 0, 1 },  // ExitKernel
     { "KERNEL", 11, 2, 1 },  // LocalHandle
     { "KERNEL", 12, 2, 1 },  // LocalFlags
-    { "KERNEL", 13, 2, 1 },  // LocalCompact
     { "KERNEL", 14, 4, 0 },  // LocalNotify
     { "KERNEL", 22, 2, 1 },  // GlobalFlags
     { "KERNEL", 26, 2, 1 },  // GlobalFreeAll
@@ -12285,6 +14521,11 @@ void win16_api_begin(const win16_loader_info_t *info,
     g_w16_pbtn = 0; g_w16_pcvx = -100000; g_w16_pcvy = -100000;
     g_w16_lclick_t = 0; g_w16_menu_open = -1;
     g_w16_menu_prev = -1; g_dlg_active = 0; g_dlg_end = 0; g_dlg_nitems = 0;
+    // (Word6 divergence catalog #2, Alt-menu) Reset Alt-tracking state too, so
+    // a held Alt key from a prior run (or the desktop) cannot leak into the
+    // freshly launched app as an already-down modifier.
+    g_w16_menu_bar_hot = -1; g_w16_alt_down = 0; g_w16_alt_only = 0;
+    g_win16_chrome_hmenu = 0;   // (Word6 divergence catalog #2) no stale handle across runs
 
     // No host window / canvas yet; CreateWindow allocates it.
     g_win16_host_slot = -1;
@@ -12313,7 +14554,16 @@ void win16_api_end(void) {
     for (int i = 0; i < WIN16_MAX_FILES; i++) {
         if (!g_files[i].used) continue;
         if (g_files[i].dirty)
-            fat_write_file(&g_fat_fs, g_files[i].path, g_files[i].buf, g_files[i].size);
+            // #693: last-chance write-back at teardown. Nothing can act (the app is
+            // already gone) but the user must be told the document did not make it.
+            // #708: gated. This loop writes to GUEST-CONTROLLED paths with no
+            // other check, so it is a write primitive in its own right, not
+            // merely a flush of something already authorized.
+            if (!win16_fs_allow(g_files[i].path, W_OK, "teardown write-back") ||
+                fat_write_file(&g_fat_fs, g_files[i].path, g_files[i].buf,
+                               g_files[i].size) != 0)
+                kprintf("[WIN16] teardown write-back of %s FAILED: unsaved app data "
+                        "LOST\n", g_files[i].path);
         if (g_files[i].buf) kfree(g_files[i].buf);
         g_files[i].used = 0; g_files[i].buf = 0;
     }
@@ -12359,8 +14609,15 @@ void win16_api_end(void) {
 
     // Persist the API/loader trace so it can be inspected from the RC console
     // (kprintf is not routed to this VM's serial socket).
-    if (g_trace_len > 0)
-        fat_write_file(&g_fat_fs, "/WIN16LOG.TXT", g_trace, g_trace_len);
+    if (g_trace_len > 0 && win16_trace_writable())
+        { if (fat_write_file(&g_fat_fs, "/WIN16LOG.TXT", g_trace, g_trace_len) != 0)
+                kprintf("[WIN16] final trace flush FAILED\n"); }   // #693
+
+    // #708: re-decide the trace-write permission for the next guest. The SLOT
+    // itself is disarmed in win16_proc_entry() (proc/syscall.c), NOT here:
+    // ne.c calls this function only "if (is_ne)", so a .COM run through the
+    // Win16 layer would never reach it and would leave the slot armed.
+    g_trace_writable = -1;
 }
 
 // Trace sink for the NE loader (ne.c) to record module/DLL/resource events.
@@ -12384,6 +14641,60 @@ int win16_api_dispatch(x86_16_cpu_t *c, uint16_t off) {
 
     const win16_import_t *im = 0;
     if (off < (uint16_t)g_import_count) im = &g_imports[off];
+
+    // (#278 DIAG typed-char-bail pass) while g_w6_charwin is armed (set by
+    // win16_call_wndproc around a WM_CHAR delivery to Word's edit pane), log
+    // EVERY API call (not just first-seen) so we see the exact sequence Word's
+    // own code makes while handling one keystroke, including calls the
+    // first-seen dedup below would otherwise swallow as repeats. MEASURED
+    // result this pass: for the first character typed into an empty line,
+    // Word's OpusWwd wndproc calls exactly ONE API - USER.107 DefWindowProc -
+    // and nothing else (no GetDC, no InvalidateRect, no GDI draw). Gated
+    // behind g_w6_charwin, which is itself gated behind g_w6life (default 0,
+    // SHIP OFF); both inert unless enabled.
+    if (g_w6_charwin > 0) {
+        g_w6_charwin--;
+        if (im) {
+            if (im->by_ordinal)
+                win16_trace("[W6CHW] %s.#%u ret=%04x:%04x\n", im->module, im->ordinal, ret_cs, ret_ip);
+            else
+                win16_trace("[W6CHW] %s.%s ret=%04x:%04x\n", im->module, im->name, ret_cs, ret_ip);
+        } else {
+            win16_trace("[W6CHW] <unknown import id %u> ret=%04x:%04x\n", off, ret_cs, ret_ip);
+        }
+    }
+
+    // (#278 Word6 combobox DIAG) armed by win16_call_wndproc right before it
+    // invokes Word's OWN subclass code for msg 0x0401/0x0415, to see every API
+    // call that subclass makes while handling the private toolbar-combo
+    // protocol (not just the CallWindowProc forward already traced).
+    { extern int g_w6combodiag, g_w6combo_apiwin;
+      if (g_w6combodiag && g_w6combo_apiwin > 0) {
+        g_w6combo_apiwin--;
+        if (im) {
+            if (im->by_ordinal)
+                win16_trace("[W6CBOAPI] %s.#%u ret=%04x:%04x\n", im->module, im->ordinal, ret_cs, ret_ip);
+            else
+                win16_trace("[W6CBOAPI] %s.%s ret=%04x:%04x\n", im->module, im->name, ret_cs, ret_ip);
+        } else {
+            win16_trace("[W6CBOAPI] <unknown import id %u> ret=%04x:%04x\n", off, ret_cs, ret_ip);
+        }
+      } }
+
+    // (#278 DIAG idle-redraw pass) armed by u_peekmessage right after Word
+    // RETRIEVES a keyboard message for hwnd 004f (see there for why this is a
+    // separate hook from g_w6_charwin).
+    if (g_w6_postkey_trace > 0) {
+        g_w6_postkey_trace--;
+        if (im) {
+            if (im->by_ordinal)
+                win16_trace("[W6PK] %s.#%u ret=%04x:%04x\n", im->module, im->ordinal, ret_cs, ret_ip);
+            else
+                win16_trace("[W6PK] %s.%s ret=%04x:%04x\n", im->module, im->name, ret_cs, ret_ip);
+        } else {
+            win16_trace("[W6PK] <unknown import id %u> ret=%04x:%04x\n", off, ret_cs, ret_ip);
+        }
+    }
 
     // (#278 P52 runtime-callf-trace follow-up 4) name EVERY win16 API call whose
     // call site is in seg155's doc-create window [0x9be,0xb89] (sel 0x04df). The
@@ -12515,7 +14826,16 @@ int win16_api_dispatch(x86_16_cpu_t *c, uint16_t off) {
 extern void *proc_create(const char *name, void (*fn)(void *), void *arg, int prio);
 extern void  proc_sleep(unsigned ms);
 extern int   g_win16_want_pmode;
- extern int win16_launch(const char *path);
+// #dosverify: was win16_launch() (the syscall-facing wrapper, proc/syscall.c),
+// which bounces `path` through strncpy_from_user() on the assumption it is a
+// USER pointer. This thread is kernel code passing its own kernel-stack
+// buffer, which strncpy_from_user()'s live U/S page-table walk correctly
+// rejects (see win16_launch_kernel()'s comment in syscall.c) -- so every
+// WIN16PM.RUN launch was silently failing before proc_create() ever ran,
+// found while verifying #dosverify did not regress Word6/Win16 games.
+// win16_launch_kernel() is the same launch, for a caller that already owns a
+// kernel string.
+extern int win16_launch_kernel(const char *path);
 extern char  g_win16_cmdtail[128];
 static void win16_autolaunch_thread(void *arg) {
     (void)arg;
@@ -12539,6 +14859,6 @@ static void win16_autolaunch_thread(void *arg) {
     kprintf("[WIN16AUTO] launching %s (%s)\n", path, want_pm?"pmode":"realmode");
     g_win16_cmdtail[0] = 0;
     g_win16_want_pmode = want_pm;
-    win16_launch(path);
+    win16_launch_kernel(path);
 }
 void win16_autolaunch_init(void) { proc_create("win16auto", win16_autolaunch_thread, 0, 2); }

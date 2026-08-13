@@ -38,7 +38,7 @@
 // precisely the pattern that let the tick-deadline bug family spread. Anything
 // that needs REAL elapsed time must call mono_*() rather than grow another
 // private clock. Still carrying tick deadlines and able to adopt this directly:
-// net/tls, sync/futex, ipc/msg, net/smb, net/ftp, proc/cron.
+// net/tls, sync/futex, ipc/msg, net/smb, proc/cron. (net/ftp adopted it in #499/#604.)
 //
 // CALIBRATION REFERENCE. Calibration counts PIT channel 0's countdown register,
 // read via the latch command, and times it with the TSC. That reference is a
@@ -72,6 +72,13 @@ const MONO_PIT_INPUT_HZ: u64 = 1_193_182;
 // [MONO] boot line, which must land near the CPU's nominal TSC rate. Verified
 // against a known host, not asserted from a datasheet.
 const MONO_PIT_DEC_PER_CLOCK: u64 = 2;
+
+// Channel 0 reload assumed by the PRE-CALIBRATION fallback delay below, used
+// only to detect counter wraparound. cpu/pic.c main() programs 250 Hz, and
+// pit_set_frequency() can raise it for games; a stale value here would at worst
+// mis-attribute a wrap in the fallback path, which the TSC path (in use by the
+// time anything can change the frequency) does not depend on at all.
+const MONO_PIT_FALLBACK_HZ: u64 = 250;
 
 static MONO_TSC_KHZ: AtomicU64 = AtomicU64::new(0);
 static MONO_TSC_BASE: AtomicU64 = AtomicU64::new(0);
@@ -242,4 +249,103 @@ pub extern "C" fn mono_us_rs() -> u64 {
 #[no_mangle]
 pub extern "C" fn mono_tsc_khz_rs() -> u64 {
     MONO_TSC_KHZ.load(Ordering::Relaxed)
+}
+
+// =============================================================================
+// #507: THE shared short busy-delay. Real microseconds, interrupts in any
+// state, no scheduler required.
+// =============================================================================
+//
+// WHY THIS EXISTS. drivers/xhci.c carried a PRIVATE copy of the PIT-latch loop
+// below, and that copy was missing the MODE 3 factor of two: it treated one
+// observed counter unit as one PIT input clock, so every xhci_delay(ms) slept
+// for ms/2 of real time. USB enumeration is built out of spec-mandated MINIMUM
+// waits (TDRSTR port-reset recovery, the 2ms Set-Address recovery of USB 2.0
+// 9.2.6.3, hub power-good), and silently halving all of them is precisely the
+// shape of the intermittent real-iMac enumeration failures (#433/#373/#366).
+//
+// The factor of two was never the real defect though: the DUPLICATION was. The
+// constant that was wrong here (MONO_PIT_DEC_PER_CLOCK) was already RIGHT forty
+// lines up, in this file, because mono_init_rs() needs it too. So this is not a
+// "patch a 2 into the call site" fix. The private clock is deleted and both
+// users now derive their timing from the one place that owns the PIT: this
+// module. Get the constant wrong in future and BOTH the monotonic clock and
+// every device delay move together, which the boot [MONO] kHz line catches.
+//
+// PRECEDENCE. Once the TSC is calibrated (which happens at main.c immediately
+// after pit_init(), long before usb_init()) this spins on the TSC: no port I/O
+// per iteration, so it is far cheaper than latching the PIT thousands of times.
+// The PIT path remains only as the pre-calibration / calibration-failed
+// fallback, and it is now correct rather than 2x fast.
+//
+// BOUNDED (#426). Both paths carry an iteration cap. A delay is not a device
+// poll, so it terminates by construction, but a wedged TSC or an absent PIT
+// must degrade to "returns early" and never to an unbounded hang.
+#[no_mangle]
+pub extern "C" fn mono_busy_delay_us_rs(us: u64) {
+    if us == 0 {
+        return;
+    }
+
+    let khz = MONO_TSC_KHZ.load(Ordering::Relaxed);
+    if khz != 0 {
+        // cycles = us * khz / 1000. saturating_mul keeps an absurd caller
+        // argument from wrapping the target to a tiny value (which would turn
+        // a long delay into no delay at all: the very bug class above).
+        let target = us.saturating_mul(khz) / 1000;
+        let t0 = mono_rdtsc();
+        let mut safety: u64 = 1_000_000_000;
+        while safety > 0 {
+            safety -= 1;
+            // SAFETY: PAUSE has no operands and no memory effects.
+            unsafe {
+                core::arch::asm!("pause", options(nomem, nostack, preserves_flags));
+            }
+            if mono_rdtsc().wrapping_sub(t0) >= target {
+                return;
+            }
+        }
+        return;
+    }
+
+    // ---- Fallback: measure PIT channel 0's countdown directly. -------------
+    // Used only before mono_init_rs() has run (or if it failed). Channel 0
+    // keeps counting in hardware whether or not interrupts are enabled, so this
+    // works arbitrarily early.
+    let hz = MONO_PIT_FALLBACK_HZ;
+    let mut reload = MONO_PIT_INPUT_HZ / hz;
+    if reload == 0 || reload > 65535 {
+        reload = 65535;
+    }
+
+    // MODE 3: the counter is decremented by MONO_PIT_DEC_PER_CLOCK per input
+    // clock, so a microsecond is that many more counter units than a naive
+    // reading of the datasheet's input frequency suggests. This is the exact
+    // factor drivers/xhci.c used to omit.
+    let target_counts = us
+        .saturating_mul(MONO_PIT_INPUT_HZ)
+        .saturating_mul(MONO_PIT_DEC_PER_CLOCK)
+        / 1_000_000;
+    if target_counts == 0 {
+        return;
+    }
+
+    let mut counted: u64 = 0;
+    let mut safety: u64 = 200_000_000;
+    // SAFETY: Ring 0 port I/O against the PIT, programmed by pit_init().
+    unsafe {
+        let mut prev = mono_pit_latch();
+        while counted < target_counts && safety > 0 {
+            safety -= 1;
+            core::arch::asm!("pause", options(nomem, nostack, preserves_flags));
+            let cur = mono_pit_latch();
+            let delta = if cur <= prev {
+                (prev - cur) as u64
+            } else {
+                (prev as u64) + reload.saturating_sub(cur as u64)
+            };
+            counted += delta;
+            prev = cur;
+        }
+    }
 }

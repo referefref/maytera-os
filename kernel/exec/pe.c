@@ -4,6 +4,7 @@
 #include "../serial.h"
 #include "../mm/heap.h"
 #include "../string.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // ============================================================================
 // Error Messages
@@ -518,7 +519,6 @@ static uint32_t pe_build_wellformed(uint8_t *buf, uint32_t cap, uint32_t *seed) 
 }
 
 void pe_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     static uint8_t buf[4096];
     uint32_t seed = 0x504504e0u;
     uint32_t vectors = 0, mismatches = 0;

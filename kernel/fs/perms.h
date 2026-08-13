@@ -31,9 +31,23 @@ typedef struct perm_entry {
 // Initialize permissions subsystem, load from /CONFIG/PERMS.DB
 void perms_init(void);
 
-// Check if a user has access to a file
-// Returns 0 on success, -1 (EACCES) on denied
+// Check if a user has access to a file, with POSIX path resolution (#674):
+// the path is canonicalized (made absolute, "." dropped, ".." popped, "//"
+// collapsed) exactly the way the filesystem resolves it, and SEARCH (x) is
+// required on every directory component before `access` is applied to the
+// object itself. Root (uid 0) and pre-perms_init callers bypass, unchanged.
+// Returns 0 on success, -1 (EACCES) on denied.
 int perms_check(const char *path, uint32_t uid, uint32_t gid, int access);
+
+// #674: the single-object decision, for ONE already-canonical path. No
+// traversal, and no uid-0 / !perms_initialized bypass (perms_check owns those).
+// Exposed for the Rust path walker in rustkern/permpath.rs; not a general API.
+int perms_check_leaf(const char *path, uint32_t uid, uint32_t gid, int access);
+
+// #674: boot self-test. Proves canonicalization and directory traversal against
+// the LIVE database, in both directions (denied stays denied, allowed stays
+// allowed). Called from perms_init(); logs [PERMS-SELFTEST].
+void perms_selftest(void);
 
 // Set permissions for a file
 void perms_set(const char *path, uint32_t uid, uint32_t gid, uint16_t mode);
@@ -42,7 +56,12 @@ void perms_set(const char *path, uint32_t uid, uint32_t gid, uint16_t mode);
 void perms_remove(const char *path);
 
 // Flush permissions database to disk
-void perms_sync(void);
+MUST_CHECK int perms_sync(void);   // #693: 0 only if PERMS.DB is on the medium
+
+// #679: coalesced write-back, called from the heartbeat worker. Without it,
+// ownership recorded at create time never reaches /CONFIG/PERMS.DB and is lost
+// at reboot, so a user could write a file they created only until they rebooted.
+MUST_CHECK int perms_sync_if_dirty(void);   // #693
 
 // Get permissions for a file
 // Returns 0 on success, -1 if no entry exists
@@ -54,5 +73,13 @@ int perms_chmod(const char *path, uint32_t caller_uid, uint16_t mode);
 
 // Set default permissions for a newly created file
 void perms_set_default(const char *path, uint32_t uid, uint32_t gid, int is_dir);
+
+// #679 prereq: record create-time ownership, the way Linux gives a new inode
+// its creator's uid/gid. Call at EVERY create point with the creating process's
+// euid/egid. Does NOT overwrite an existing entry, so a seeded 0600 or an
+// operator chmod survives a delete-and-rewrite by its Ring-0 owner.
+// Without this, perms_check()'s root-owned no-entry default denies W_OK to
+// every non-root process for every path it creates, including in its own home.
+void perms_on_create(const char *path, uint32_t uid, uint32_t gid, int is_dir);
 
 #endif // PERMS_H

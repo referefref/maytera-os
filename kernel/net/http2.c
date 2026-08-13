@@ -14,6 +14,8 @@
 #include "../string.h"
 #include "../mm/heap.h"
 #include "../serial.h"
+#include "../cpu/mono.h"   // #499: sched_now_ms() - THE shared real-elapsed-ms clock
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 extern void net_poll(void);
 extern void proc_sleep(uint32_t ms);
@@ -457,22 +459,22 @@ static int hpack_decode_block(dyn_table_t *t, const uint8_t *block,
 // ---------------------------------------------------------------------------
 static int h2_read_full(tls_context_t *tls, uint8_t *buf, uint32_t len) {
     uint32_t got = 0;
-    uint64_t hz = g_timer_hz ? g_timer_hz : 250;
     // Wall-clock deadline so a stalled peer can never wedge the fetch worker
     // (the old spin counter could reset on any trickle and hang for minutes).
-    uint64_t deadline = timer_ticks + hz * 20;      // ~20s of no progress
+    // #499: it must be a REAL wall clock to say that. timer_ticks is not one.
+    uint64_t deadline_ms = sched_now_ms() + 20000;  // ~20s of no progress
     int dbg_polls = 0;
     while (got < len) {
         int r = tls_recv(tls, buf + got, len - got);
         if (r > 0) {
             got += (uint32_t)r;
-            deadline = timer_ticks + hz * 20;        // extend on real progress
+            deadline_ms = sched_now_ms() + 20000;    // extend on real progress
             continue;
         }
         if (r == TLS_ERR_WOULD_BLOCK) {
             net_poll();
             proc_sleep(2);
-            if ((int64_t)(timer_ticks - deadline) >= 0) {
+            if ((int64_t)(sched_now_ms() - deadline_ms) >= 0) {
                 if (g_http2_dbg) kprintf("[H2DBG] h2_read_full TIMEOUT got=%u/%u\n", got, len);
                 return -1;
             }
@@ -911,7 +913,6 @@ void http2_frame_selftest(void) {
     const char *verdict = (mism==0 && rr_evil==-1) ? "PASS" : "FAIL";
     kprintf("[RUST-DIFF] http2_frame: %d frames, mism=%d, evil C-ref rc=%d (buggy: unchecked OOB read) Rust rr=%d (want -1 = confined) -> %s\n",
             frames, mism, rc_evil, rr_evil, verdict);
-    extern void bootlog_write(const char *fmt, ...);
     bootlog_write("[RUST-DIFF] http2_frame: %d frames mism=%d evil C-ref rc=%d Rust rr=%d(confined) -> %s",
             frames, mism, rc_evil, rr_evil, verdict);
     kprintf("[RUST-SEC] http2_frame: MAYTERA-SEC-2026-0010 (CWE-476/125, REMOTE pre-auth): "

@@ -7,9 +7,11 @@
 #include "../../libc/maytera.h"
 #include "../../libc/gui.h"
 #include "../../libc/gui_font.h"
+#include "../../libc/gui_scroll.h"   // shared scrollbar contrast rule (#745 item 77)
 #include "../../libc/notify.h"
 #include "../../libc/syscall.h"
 #include "../../libc/theme.h"
+#include "../../libc/gui_theme.h"
 #include "../../libc/pwd.h"
 #include "../../libc/unistd.h"
 #include "../../libc/assoc.h"
@@ -102,10 +104,21 @@ static inline unsigned int files_dim(unsigned int bg) {
 #define BORDER_COLOR  fp_border()
 
 // ---- model ----------------------------------------------------------------
+// #554: per-entry filesystem-aware permission/attribute info, fetched via
+// SYS_FS_PERM_INFO alongside the existing readdir data. fs_type tells the
+// UI (details column, Properties tab) which of mode/uid/gid vs fat_attr is
+// meaningful - never both, and never a fabricated value for the one that
+// doesn't apply on this filesystem (see docs/UI_STYLE_GUIDE.md #554).
 typedef struct {
     char name[MAX_NAME_LEN];
     bool is_directory;
     uint32_t size;
+    uint8_t  fs_type;        // FSPERM_TYPE_POSIX / _FAT / _OTHER
+    uint8_t  has_perm_entry; // fs_type==POSIX only
+    uint8_t  fat_attr;       // fs_type==FAT only
+    uint16_t mode;           // fs_type==POSIX only
+    uint32_t uid;            // fs_type==POSIX only
+    uint32_t gid;            // fs_type==POSIX only
 } file_entry_t;
 
 // A browser tab: its own location + navigation history + view state.
@@ -128,10 +141,15 @@ static int hover_item = -1;
 
 // view + sort + filter
 enum { VIEW_LIST, VIEW_DETAILS, VIEW_ICONS };
-enum { SORT_NAME, SORT_SIZE, SORT_TYPE };
+enum { SORT_NAME, SORT_SIZE, SORT_TYPE, SORT_ATTR };  // #554: SORT_ATTR
 static int  g_view = VIEW_DETAILS;
 static int  g_sort = SORT_NAME;
 static char g_filter[48] = "";
+// #554: filter out FAT hidden-attribute files and UNIX-convention dotfiles.
+// Off by default so existing behavior (everything shown) is unchanged; the
+// View menu toggles it. This is the "filtering ... on attribute columns" half
+// of task #554 - the other half is the sortable Attr column below.
+static bool g_show_hidden = false;
 
 // dropdown menu state
 enum { MENU_NONE, MENU_NEW, MENU_VIEW, MENU_CTX };
@@ -170,6 +188,30 @@ static void load_directory(const char *path);
 static void navigate_to(const char *path);                 // defined below (navigation)
 static int  copy_file(const char *src, const char *dst);   // defined below (clipboard)
 static void open_add_network(void);                        // #317 Network "Add" dialog
+static void files_error(const char *what, const char *detail);   // #742
+static void files_err_clear(void);                               // #742
+
+// ---- #742 failure reporting ------------------------------------------------
+// The thing that failed is the DISK, so the report must not need the disk.
+// g_err lives in RAM and is drawn in the status bar until the next action;
+// notify_post() (which writes /CONFIG/NOTIFY.TXT) and printf() are best-effort
+// extras on top, never the only channel. That ordering is the point: an error
+// path whose only output is another write to the failing medium is not a report.
+static char g_err[192];
+
+static void files_err_clear(void) { g_err[0] = 0; }
+
+static void files_error(const char *what, const char *detail) {
+    int o = 0;
+    for (int i = 0; what && what[i] && o < (int)sizeof(g_err) - 2; i++) g_err[o++] = what[i];
+    if (detail && detail[0]) {
+        if (o < (int)sizeof(g_err) - 3) { g_err[o++] = ':'; g_err[o++] = ' '; }
+        for (int i = 0; detail[i] && o < (int)sizeof(g_err) - 1; i++) g_err[o++] = detail[i];
+    }
+    g_err[o] = 0;
+    printf("[files] %s\n", g_err);
+    notify_post("Files", g_err, NOTIFY_ERROR);   // best effort; may itself fail
+}
 
 // ---- tiny string helpers --------------------------------------------------
 static int str_len(const char *s) { int n = 0; while (s[n]) n++; return n; }
@@ -356,6 +398,16 @@ static const char *icon_for_entry(const char *name, int is_dir, int selected) {
 }
 
 // ---- icons ----------------------------------------------------------------
+// (#704) The literal colors from here down through draw_file_icon() are
+// INTENTIONALLY NOT themed: they are file-type / icon-glyph identity colors
+// (folder gold, image green, code blue, media purple, archive orange, the
+// generic-file grey), the same category as a syntax highlighter's palette
+// or a chart series. A folder icon needs to keep reading as "gold folder"
+// regardless of the active theme, the same way it does in every other
+// desktop OS; recoloring it per-theme would make file types LESS
+// identifiable, not more consistent. These are also mostly fallback glyphs
+// (draw_mico() failed to find the real icon-font asset), used rarely on a
+// system with a complete icon set.
 static void draw_folder_icon(int x, int y) {
     win_draw_rect(window_handle, x, y + 2, 6, 4, ICON_FOLDER);
     win_draw_rect(window_handle, x, y + 4, ICON_SIZE, ICON_SIZE - 4, ICON_FOLDER);
@@ -386,6 +438,32 @@ static void draw_arrow(int x, int y, int dir, uint32_t c) {  // 0=left 1=right 2
     else for (int i = 0; i < 5; i++) win_draw_rect(window_handle, x + 4 - i, y + i, 2 + i * 2, 2, c);
 }
 
+// #554: format the Attr details-view column + the Properties permissions
+// text. ext2 gets a real symbolic rwxrwxrwx mode string (perms.c-backed);
+// FAT gets the real on-disk attribute flags in the SAME letter order the
+// kernel itself already uses for its own diagnostic listing (fs/fat.c
+// fat_list_dir_inner: D,R,H,S,A) so the two never drift apart; SMB/NFS (no
+// local permission model) show a plain dash rather than a guess.
+static void fmt_attr(const file_entry_t *it, char *out) {
+    if (it->fs_type == FSPERM_TYPE_POSIX) {
+        static const char rwx[3] = {'r', 'w', 'x'};
+        for (int grp = 0; grp < 3; grp++) {
+            uint16_t bits = (it->mode >> ((2 - grp) * 3)) & 7;
+            for (int b = 0; b < 3; b++) out[grp * 3 + b] = (bits & (4 >> b)) ? rwx[b] : '-';
+        }
+        out[9] = '\0';
+    } else if (it->fs_type == FSPERM_TYPE_FAT) {
+        out[0] = (it->fat_attr & FSPERM_FAT_DIRECTORY) ? 'D' : '-';
+        out[1] = (it->fat_attr & FSPERM_FAT_READONLY)  ? 'R' : '-';
+        out[2] = (it->fat_attr & FSPERM_FAT_HIDDEN)    ? 'H' : '-';
+        out[3] = (it->fat_attr & FSPERM_FAT_SYSTEM)    ? 'S' : '-';
+        out[4] = (it->fat_attr & FSPERM_FAT_ARCHIVE)   ? 'A' : '-';
+        out[5] = '\0';
+    } else {
+        out[0] = '-'; out[1] = '\0';
+    }
+}
+
 // ---- size formatting ------------------------------------------------------
 static void fmt_size(uint32_t sz, char *out) {
     char num[24];
@@ -412,6 +490,15 @@ static void sort_items(void) {
                 if (g_sort == SORT_SIZE) swap = (a->size > key.size);
                 else if (g_sort == SORT_TYPE) { char ea[8], ek[8]; ext_of(a->name, ea); ext_of(key.name, ek);
                     int c = 0; while (ea[c] && ea[c] == ek[c]) c++; swap = ((unsigned char)ea[c] > (unsigned char)ek[c]); }
+                else if (g_sort == SORT_ATTR) {
+                    // #554: compare within the same fs_type first (ext2 mode
+                    // bits and FAT attribute bits are not the same scale), so
+                    // a mixed listing degrades to fs_type order rather than an
+                    // apples-to-oranges numeric compare.
+                    if (a->fs_type != key.fs_type) swap = (a->fs_type > key.fs_type);
+                    else if (a->fs_type == FSPERM_TYPE_FAT) swap = (a->fat_attr > key.fat_attr);
+                    else swap = (a->mode > key.mode);
+                }
                 else { int c = 0; char ca, cb;
                     do { ca = a->name[c]; cb = key.name[c]; if (ca>='A'&&ca<='Z')ca+=32; if (cb>='A'&&cb<='Z')cb+=32; c++; }
                     while (ca && ca == cb); swap = ((unsigned char)ca > (unsigned char)cb); }
@@ -545,6 +632,43 @@ void open_add_network(void) {
     fb_redraw();
 }
 
+// #554: zero the permission/attribute fields for a freshly-pushed items[i] -
+// items[] is a static array reused across directory loads, so a slot not
+// explicitly re-stamped here would show whatever fs_type/mode/fat_attr a
+// PREVIOUS, unrelated directory's entry left behind at that index.
+static void item_clear_perm(int i) {
+    items[i].fs_type = FSPERM_TYPE_OTHER;
+    items[i].has_perm_entry = 0;
+    items[i].fat_attr = 0;
+    items[i].mode = 0;
+    items[i].uid = 0;
+    items[i].gid = 0;
+}
+// Fetch the real filesystem-aware permission/attribute info for items[i],
+// which must already have its name set; dirpath is the containing directory
+// (CUR.path at load time - a local path, never SMB, so this is skipped for
+// the SMB readdir loop, which has no local permission model anyway).
+static void item_fetch_perm(int i, const char *dirpath) {
+    char full[MAX_PATH_LEN];
+    path_join(full, dirpath, items[i].name);
+    fsperm_info_t fi;
+    if (sys_fs_perm_info(full, &fi) == 0) {
+        items[i].fs_type        = fi.fs_type;
+        items[i].has_perm_entry = fi.has_perm_entry;
+        items[i].fat_attr       = fi.fat_attr;
+        items[i].mode           = fi.mode;
+        items[i].uid            = fi.uid;
+        items[i].gid            = fi.gid;
+    }
+}
+// #554 hidden-file filter: a FAT ATTR_HIDDEN entry, or a UNIX-convention
+// dotfile (name starts with '.', excluding the synthesized ".." row).
+static bool item_is_hidden(int i) {
+    if (items[i].fs_type == FSPERM_TYPE_FAT && (items[i].fat_attr & FSPERM_FAT_HIDDEN)) return true;
+    if (items[i].name[0] == '.' && !str_eq(items[i].name, "..")) return true;
+    return false;
+}
+
 static void load_directory(const char *path) {
     str_copy(CUR.path, path, MAX_PATH_LEN);
     current_path = CUR.path;
@@ -556,17 +680,17 @@ static void load_directory(const char *path) {
     if (str_eq(path, "/NET")) {
         load_netmounts();
         str_copy(items[item_count].name, "[+ Add Network Location]", MAX_NAME_LEN);
-        items[item_count].is_directory = false; items[item_count].size = 0; item_count++;
+        items[item_count].is_directory = false; items[item_count].size = 0; item_clear_perm(item_count); item_count++;
         for (int k = 0; k < g_netmount_count && item_count < MAX_ITEMS; k++) {
             str_copy(items[item_count].name, g_netmounts[k].label, MAX_NAME_LEN);
-            items[item_count].is_directory = true; items[item_count].size = 0; item_count++;
+            items[item_count].is_directory = true; items[item_count].size = 0; item_clear_perm(item_count); item_count++;
         }
         return;
     }
 
     if (path[0] == '/' && path[1] != '\0') {
         str_copy(items[item_count].name, "..", MAX_NAME_LEN);
-        items[item_count].is_directory = true; items[item_count].size = 0; item_count++;
+        items[item_count].is_directory = true; items[item_count].size = 0; item_clear_perm(item_count); item_count++;
     }
     // #317: for network (/SMB) paths, enumerate with a SINGLE open + sequential
     // fd-based readdir. The path-based sys_readdir() wrapper re-opens the dir for
@@ -582,6 +706,9 @@ static void load_directory(const char *path) {
                 str_copy(items[item_count].name, entry.name, MAX_NAME_LEN);
                 items[item_count].is_directory = (entry.type == 1);
                 items[item_count].size = entry.size;
+                // #554: SMB has no local permission model (enforced server-side);
+                // fs_type stays FSPERM_TYPE_OTHER, no extra round trip per file.
+                item_clear_perm(item_count);
                 item_count++;
             }
             close(fd);
@@ -589,7 +716,7 @@ static void load_directory(const char *path) {
         sort_items();
         if (item_count == 0) {
             str_copy(items[0].name, "(empty)", MAX_NAME_LEN);
-            items[0].is_directory = false; items[0].size = 0; item_count = 1;
+            items[0].is_directory = false; items[0].size = 0; item_clear_perm(0); item_count = 1;
         }
         return;
     }
@@ -603,12 +730,17 @@ static void load_directory(const char *path) {
         str_copy(items[item_count].name, entry.name, MAX_NAME_LEN);
         items[item_count].is_directory = (entry.type == 1);
         items[item_count].size = entry.size;
+        // #554: real, filesystem-aware permission/attribute info (ext2 mode
+        // via perms.c, or the native FAT attribute byte - never both, never
+        // fabricated; see item_fetch_perm's doc comment).
+        item_fetch_perm(item_count, path);
+        if (!g_show_hidden && item_is_hidden(item_count)) continue;
         item_count++;
     }
     sort_items();
     if (item_count == 0) {
         str_copy(items[0].name, "(empty)", MAX_NAME_LEN);
-        items[0].is_directory = false; items[0].size = 0; item_count = 1;
+        items[0].is_directory = false; items[0].size = 0; item_clear_perm(0); item_count = 1;
     }
 }
 
@@ -708,8 +840,14 @@ static int rb_idx_lookup(const char *name, char *out, int outsz) {
     return 0;
 }
 
-// Remove the index line for "name" and rewrite TRASH_INDEX.
-static void rb_idx_remove(const char *name) {
+// Remove the index line for "name" and rewrite TRASH_INDEX. Returns 0 only if
+// the rewritten index reached the medium.
+//
+// #742: this used to unlink(TRASH_INDEX) FIRST and then hope the create
+// succeeded. If it did not, the restore information for EVERY item in the bin
+// was gone, not just this one, and nothing said so. O_TRUNC does the same job
+// in one operation with no window in which the index does not exist.
+static int rb_idx_remove(const char *name) {
     char nb[8192]; int nl = 0; int i = 0;
     while (i < rb_idx_len) {
         int ls = i; while (i < rb_idx_len && rb_idx_buf[i] != '\n') i++;
@@ -719,11 +857,16 @@ static void rb_idx_remove(const char *name) {
         if (bar < le) { int k = ls, t = 0, m = 1; while (k < bar) { if (rb_idx_buf[k] != name[t]) { m = 0; break; } k++; t++; } if (m && name[t] == 0) match = 1; }
         if (!match) { for (int j = ls; j < le && nl < (int)sizeof(nb) - 1; j++) nb[nl++] = rb_idx_buf[j]; if (nl < (int)sizeof(nb) - 1) nb[nl++] = '\n'; }
     }
-    unlink(TRASH_INDEX);
-    int fd = open(TRASH_INDEX, 0x41);
-    if (fd >= 0) { if (nl) write(fd, nb, nl); close(fd); }
+    int fd = open(TRASH_INDEX, 0x241);   // O_WRONLY|O_CREAT|O_TRUNC
+    if (fd < 0) return -1;
+    int rc = 0;
+    if (nl && write(fd, nb, nl) != nl) rc = -1;
+    if (rc == 0 && fsync(fd) != 0) rc = -1;
+    if (close(fd) != 0) rc = -1;
+    if (rc != 0) return rc;              // keep the in-RAM copy consistent with disk
     for (int j = 0; j < nl; j++) rb_idx_buf[j] = nb[j];
     rb_idx_len = nl; rb_idx_buf[nl] = 0;
+    return 0;
 }
 
 static void rb_load(void) {
@@ -754,37 +897,73 @@ static int rb_count_selected(void) {
 }
 
 // Move every selected trashed file back to its recorded original location.
+// #742: every step is checked. An item whose restore FAILED keeps its index
+// entry and therefore stays in the bin and stays visible, which is the whole
+// point of a bin: the previous code dropped the index entry unconditionally, so
+// a failed restore made the file vanish from the UI while still sitting in
+// /CONFIG/RECYCLE with no record of where it belonged.
 static void rb_restore_selected(void) {
+    int failed = 0, done = 0;
+    files_err_clear();
     for (int i = rb_count - 1; i >= 0; i--) {
         if (!rb_items[i].selected) continue;
         char src[200]; rb_join(src, sizeof(src), TRASH_DIR, rb_items[i].name);
+        int ok = 0;
         if (rb_items[i].original_path[0] && !str_eq(rb_items[i].original_path, "(unknown)")) {
-            if (rename(src, rb_items[i].original_path) != 0) {        // (#239) ext2 rename fallback
-                if (copy_file(src, rb_items[i].original_path) == 0) unlink(src);
+            if (rename(src, rb_items[i].original_path) == 0) ok = 1;
+            else if (copy_file(src, rb_items[i].original_path) == 0) {
+                // copy_file() fsync'd, so the restored copy is real before the
+                // bin copy goes.
+                ok = (unlink(src) == 0);
             }
         }
-        rb_idx_remove(rb_items[i].name);
+        if (!ok) { failed++; continue; }          // leave it in the bin, visible
+        if (rb_idx_remove(rb_items[i].name) != 0) failed++;
+        else done++;
+    }
+    if (failed) {
+        files_error(done ? "Some items could not be restored and are still in the Recycle Bin"
+                         : "Could not restore; the item is still in the Recycle Bin", 0);
     }
     rb_load();
 }
 
-// Permanently unlink every selected trashed file.
+// Permanently unlink every selected trashed file. #742: a failed unlink used to
+// still drop the index entry, so the file stayed on disk forever, invisible and
+// unrestorable, and the user was shown a successful delete.
 static void rb_delete_selected(void) {
+    int failed = 0;
+    files_err_clear();
     for (int i = rb_count - 1; i >= 0; i--) {
         if (!rb_items[i].selected) continue;
         char p[200]; rb_join(p, sizeof(p), TRASH_DIR, rb_items[i].name);
-        unlink(p);
-        rb_idx_remove(rb_items[i].name);
+        if (unlink(p) != 0) { failed++; continue; }   // keep the index entry
+        if (rb_idx_remove(rb_items[i].name) != 0) failed++;
     }
+    if (failed) files_error("Some items could not be deleted and are still in the Recycle Bin", 0);
     rb_load();
 }
 
 static void rb_empty(void) {
+    int failed = 0;
+    files_err_clear();
     for (int i = 0; i < rb_count; i++) {
         char p[200]; rb_join(p, sizeof(p), TRASH_DIR, rb_items[i].name);
-        unlink(p);
+        if (unlink(p) != 0) failed++;
     }
-    unlink(TRASH_INDEX);
+    if (failed) {
+        // #742: do NOT wipe the index while files remain. Their entries are the
+        // only record of where they came from; dropping the index turns a
+        // recoverable failure into a permanent one.
+        files_error("Could not empty the Recycle Bin; some items remain", 0);
+    } else {
+        int fd = open(TRASH_INDEX, 0x241);   // O_WRONLY|O_CREAT|O_TRUNC
+        int rc = (fd < 0) ? -1 : 0;
+        if (rc == 0 && fsync(fd) != 0) rc = -1;
+        if (fd >= 0 && close(fd) != 0) rc = -1;
+        if (rc != 0) files_error("Recycle Bin emptied, but the index could not be cleared", TRASH_INDEX);
+        else { rb_idx_len = 0; rb_idx_buf[0] = 0; }
+    }
     rb_load();
 }
 
@@ -961,7 +1140,7 @@ static void draw_preview(void) {
 static void draw_tabbar(void) {
     win_draw_rect(window_handle, 0, 0, WIN_W, TABBAR_H, SIDEBAR_BG);
     win_draw_rect(window_handle, 0, TABBAR_H - 1, WIN_W, 1, BORDER_COLOR);
-    int rad = (theme_get_active() == 4) ? 0 : 6;
+    int rad = gui_theme_is_classic() ? 0 : 6;
     for (int i = 0; i < tab_count; i++) {
         int tx = 4 + i * (TAB_W + 2);
         bool act = (i == active_tab);
@@ -969,7 +1148,9 @@ static void draw_tabbar(void) {
         gui_fill_rounded_aa(window_handle, tx, 3, TAB_W, TABBAR_H - 3, rad, tb, SIDEBAR_BG);
         char title[18]; str_copy(title, basename_of(tabs[i].path), 18);
         win_draw_text(window_handle, tx + 10, 6, title, act ? TEXT_COLOR : SIDE_TEXT);
-        win_draw_text(window_handle, tx + TAB_W - 16, 6, "x", 0x00C05050);
+        // (#704) tab close affordance: was a hardcoded muted red, now the
+        // theme's error/danger token.
+        win_draw_text(window_handle, tx + TAB_W - 16, 6, "x", theme_color(THEME_COLOR_ERROR));
     }
     if (tab_count < MAX_TABS) {
         int ax = 4 + tab_count * (TAB_W + 2);
@@ -1042,6 +1223,10 @@ static void draw_sidebar(void) {
     }
     y += 6;
     win_draw_text(window_handle, 8, y, "This PC", SIDE_TEXT); y += 20;
+    // (#704) Sidebar device/network/trash icon literals below are fallback
+    // glyphs (draw_mico() found no icon-font asset), same "icon identity
+    // color, not chrome" classification as the file-type colors above -
+    // intentionally not themed.
     for (int i = 0; i < g_disk_count; i++) {
         win_draw_rect(window_handle, 12, y + 2, ICON_SIZE, ICON_SIZE - 2, 0x00808890);
         gui_draw_rect_outline(window_handle, 12, y + 2, ICON_SIZE, ICON_SIZE - 2, 0x00505860);
@@ -1147,7 +1332,8 @@ static void draw_file_list(void) {
         }
         // TTF is variable-width: measure the name and trim with an ellipsis to
         // fit the name column (fixes the bitmap-width assumption that clipped text).
-        int namecol = (g_view == VIEW_DETAILS) ? (lw - 150) : (lw - 80);
+        // #554: DETAILS reserves an extra ~80px on the right for the Attr column.
+        int namecol = (g_view == VIEW_DETAILS) ? (lw - 230) : (lw - 80);
         char nm[64]; int j = 0;
         while (it->name[j] && j < 60) { nm[j] = it->name[j]; j++; }
         nm[j] = 0;
@@ -1160,6 +1346,9 @@ static void draw_file_list(void) {
         uint32_t dimc = (i == CUR.sel) ? files_dim(ITEM_SELECTED) : DIM_TEXT;
         win_draw_text(window_handle, lx + 32, y + 5, nm, tint);
         if (g_view == VIEW_DETAILS) {
+            // #554: Attr column (real per-filesystem attributes; see fmt_attr).
+            { char as[10]; fmt_attr(it, as);
+                win_draw_text_small(window_handle, lx + lw - 210, y + 7, as, dimc); }
             if (!it->is_directory) { char ss[24]; fmt_size(it->size, ss);
                 win_draw_text_small(window_handle, lx + lw - 130, y + 7, ss, dimc); }
             char e[8]; ext_of(it->name, e);
@@ -1174,8 +1363,16 @@ static void draw_file_list(void) {
         int sbx = lx + lw, sh = CONTENT_H;
         int th = (visible * sh) / item_count; if (th < 20) th = 20;
         int ty = max_scroll ? (CUR.scroll * (sh - th)) / max_scroll : 0;
-        win_draw_rect(window_handle, sbx, CONTENT_Y, 14, sh, THEME_SCROLLBAR_BG);
-        win_draw_rect(window_handle, sbx + 2, CONTENT_Y + ty, 10, th, THEME_SCROLLBAR_THUMB);
+        // Geometry is this app's; the COLOURS come from the shared rule, or
+        // the thumb is 1.23:1 on the default theme (#745 item 77). The surface
+        // is BG_COLOR, this app's OWN content fill (fp_content()), NOT the
+        // theme's window_bg: measured on a booted VM they are 0xEBEEF0 and
+        // 0xB4B4B4, and the repair has to be told the colour actually behind
+        // the gutter or it is contrast against a pixel nobody drew.
+        uint32_t sb_track, sb_thumb;
+        gui_scroll_colors(0, BG_COLOR, &sb_track, &sb_thumb);
+        win_draw_rect(window_handle, sbx, CONTENT_Y, 14, sh, sb_track);
+        win_draw_rect(window_handle, sbx + 2, CONTENT_Y + ty, 10, th, sb_thumb);
     }
 }
 
@@ -1278,14 +1475,19 @@ static void draw_recycle_view(void) {
         int th = (visible * sh) / rb_count; if (th < 20) th = 20;
         int maxs = rb_count - visible;
         int ty = maxs ? (rb_scroll * (sh - th)) / maxs : 0;
-        win_draw_rect(window_handle, sbx, ly, 14, sh, THEME_SCROLLBAR_BG);
-        win_draw_rect(window_handle, sbx + 2, ly + ty, 10, th, THEME_SCROLLBAR_THUMB);
+        uint32_t sb_track, sb_thumb;   // surface = BG_COLOR, see the list view
+        gui_scroll_colors(0, BG_COLOR, &sb_track, &sb_thumb);
+        win_draw_rect(window_handle, sbx, ly, 14, sh, sb_track);
+        win_draw_rect(window_handle, sbx + 2, ly + ty, 10, th, sb_thumb);
     }
 }
 
 // ---- dropdown menus -------------------------------------------------------
 static const char *menu_new_items[]  = { "New Folder", "New Text File", NULL };
-static const char *menu_view_items[] = { "Icons", "List", "Details", "--", "Sort: Name", "Sort: Size", "Sort: Type", "--", "Preview Pane", NULL };
+// #554: added "Sort: Attr" (ext2 mode / FAT attributes) and "Show Hidden
+// Files" (FAT ATTR_HIDDEN + UNIX dotfiles). menu_select's indices below must
+// stay in sync with this order.
+static const char *menu_view_items[] = { "Icons", "List", "Details", "--", "Sort: Name", "Sort: Size", "Sort: Type", "Sort: Attr", "--", "Preview Pane", "Show Hidden Files", NULL };
 static const char *menu_ctx_items[]  = { "Open", "Open with...", "--", "Install Font", "--", "Copy", "Cut", "Paste", "--", "Compress to .zip", "Compress to .tar.gz", "Extract here", "--", "Rename", "Delete", "--", "Properties", NULL };
 
 static const char **active_menu_items(void) {
@@ -1316,6 +1518,13 @@ static void draw_status(void) {
     int y = WIN_H - STATUS_H;
     win_draw_rect(window_handle, 0, y, WIN_W, STATUS_H, STATUS_BG);
     win_draw_rect(window_handle, 0, y, WIN_W, 1, BORDER_COLOR);
+    if (g_err[0]) {
+        // Deliberately takes over the whole status bar and stays until the next
+        // action. A failed delete that scrolls away has not been reported.
+        win_draw_rect(window_handle, 0, y + 1, WIN_W, STATUS_H - 1, 0x00A02020);
+        win_draw_text(window_handle, 8, y + 4, g_err, 0x00FFFFFF);
+        return;
+    }
     if (g_in_recycle) {
         char s[64]; gui_itoa(rb_count, s, 16); int l = str_len(s);
         const char *it = " items in Recycle Bin"; while (*it) s[l++] = *it++; s[l] = 0;
@@ -1333,7 +1542,7 @@ static void draw_status(void) {
 // gui_* primitives (buttons, fields, tabs) match the active theme + render
 // modern (rounded/AA) or classic (beveled) like the Settings app.
 static void files_apply_style(void) {
-    gui_set_style(theme_get_active() == 4 ? GUI_STYLE_CLASSIC : GUI_STYLE_MODERN);
+    gui_set_style(gui_theme_is_classic() ? GUI_STYLE_CLASSIC : GUI_STYLE_MODERN);
     gui_palette_t p;
     p.surface        = fp_content();
     p.surface_raised = fp_toolbar();
@@ -1381,6 +1590,26 @@ static void do_new_file(void) {
         int fd = open(p, 0x41); if (fd >= 0) { close(fd); break; } }
     load_directory(CUR.path); fb_redraw();
 }
+// Append one "<name>|<original path>" record to the trash index, durably.
+// Returns 0 only if the record is on the medium. Without the index a trashed
+// file shows as "(unknown)" and can never be restored, so a silent failure here
+// is a quieter version of the same data loss.
+static int trash_index_add(const char *name, const char *src) {
+    int fd = open(TRASH_INDEX, 0x41);
+    if (fd < 0) return -1;
+    char line[MAX_PATH_LEN * 2]; int l = 0;
+    for (int i = 0; name[i] && l < 120; i++) line[l++] = name[i];
+    line[l++] = '|';
+    for (int i = 0; src[i] && l < (int)sizeof(line) - 2; i++) line[l++] = src[i];
+    line[l++] = '\n';
+    int rc = 0;
+    if (sys_seek(fd, 0, 2) < 0) rc = -1;
+    if (rc == 0 && write(fd, line, l) != l) rc = -1;
+    if (rc == 0 && fsync(fd) != 0) rc = -1;
+    if (close(fd) != 0) rc = -1;
+    return rc;
+}
+
 static void do_delete(void) {
     if (CUR.sel < 0 || CUR.sel >= item_count) return;
     file_entry_t *it = &items[CUR.sel];
@@ -1390,20 +1619,40 @@ static void do_delete(void) {
     mkdir("/CONFIG", 0755);
     mkdir(TRASH_DIR, 0755);
     path_join(dst, TRASH_DIR, it->name);
+    files_err_clear();
     // (#239) ext2 rename() is unreliable, so fall back to copy_file()+unlink for
     // files. Only when the file truly reaches the bin do we record the index.
     int moved = 0;
     if (rename(src, dst) == 0) moved = 1;
-    else if (!it->is_directory && copy_file(src, dst) == 0) { unlink(src); moved = 1; }
-    if (moved) {
-        int fd = open(TRASH_INDEX, 0x41);
-        if (fd >= 0) { sys_seek(fd, 0, 2);
-            char line[MAX_PATH_LEN * 2]; int l = 0;
-            for (int i = 0; it->name[i] && l < 120; i++) line[l++] = it->name[i];
-            line[l++] = '|';
-            for (int i = 0; src[i] && l < (int)sizeof(line) - 2; i++) line[l++] = src[i];
-            line[l++] = '\n'; write(fd, line, l); close(fd); }
-    } else { if (it->is_directory) rmdir(src); else unlink(src); }
+    else if (!it->is_directory && copy_file(src, dst) == 0) {
+        // copy_file() has fsync'd, so the bin copy is real. ONLY NOW may the
+        // source go, and only if the unlink itself succeeds.
+        if (unlink(src) == 0) moved = 1;
+        else {
+            files_error("Copied to Recycle Bin but could not remove the original", src);
+            load_directory(CUR.path); fb_redraw();
+            return;
+        }
+    }
+    if (!moved) {
+        // #742 THE BUG. This branch used to read:
+        //     else { if (it->is_directory) rmdir(src); else unlink(src); }
+        // A failed move to the Recycle Bin was "handled" by PERMANENTLY DELETING
+        // the file: the one thing the Recycle Bin exists to prevent, done as the
+        // fallback for the operation that was supposed to prevent it. The return
+        // was discarded too, so the reload simply showed the item gone and the
+        // user was told it had worked. An undoable delete is not a fallback for
+        // an undoable delete. Report it and change nothing.
+        files_error("Could not move to Recycle Bin; the file was NOT deleted", src);
+        fb_redraw();
+        return;
+    }
+    if (trash_index_add(it->name, src) != 0) {
+        // The file IS in the bin, so this is not a loss, but Restore will not
+        // know where it came from. Say so rather than discover it later.
+        files_error("Moved to Recycle Bin, but the index write failed; "
+                    "Restore will not know the original location", it->name);
+    }
     load_directory(CUR.path); fb_redraw();
 }
 static void open_selected(void) {
@@ -1455,6 +1704,100 @@ static void rename_commit(const char *newname) {
     load_directory(CUR.path);
     fb_redraw();
 }
+// #554: after load_directory() (which always resets CUR.sel to -1), re-find
+// an item by name so a permissions edit can keep the Properties dialog open
+// and showing the NEW value - required to actually demonstrate an edit
+// persisted, rather than just that the dialog silently closed.
+static void reselect_by_name(const char *name) {
+    for (int k = 0; k < item_count; k++) {
+        if (str_eq(items[k].name, name)) { CUR.sel = k; return; }
+    }
+}
+
+// #554: Properties permissions edit, ext2/POSIX paths only (FAT is toggled
+// directly by clicking the read-only hotspot - see props_ro_toggle() - since
+// a FAT path has nothing else to edit). buf is "MODE" or "MODE:UID:GID",
+// MODE always octal (e.g. "644"); UID/GID are decimal and optional. Applies
+// chmod always, chown only when both UID and GID were given (chown requires
+// root; a non-root caller just sees chown's normal EPERM, silently no-op'd
+// here exactly like every other Files op that can fail against permissions).
+static void perms_edit_commit(const char *buf) {
+    if (CUR.sel < 0 || CUR.sel >= item_count) return;
+    file_entry_t *it = &items[CUR.sel];
+    if (it->fs_type != FSPERM_TYPE_POSIX) return;
+    if (!buf || !buf[0]) return;
+
+    unsigned mode = 0; int i = 0;
+    while (buf[i] >= '0' && buf[i] <= '7') { mode = (mode << 3) | (unsigned)(buf[i] - '0'); i++; }
+    if (i == 0) return;  // not a valid octal mode; refuse rather than guess
+
+    char full[MAX_PATH_LEN];
+    path_join(full, CUR.path, it->name);
+    char savedname[MAX_NAME_LEN]; str_copy(savedname, it->name, MAX_NAME_LEN);
+    chmod(full, (mode_t)mode);
+
+    if (buf[i] == ':') {
+        i++;
+        unsigned uid = 0; int j = i;
+        while (buf[j] >= '0' && buf[j] <= '9') { uid = uid * 10 + (unsigned)(buf[j] - '0'); j++; }
+        if (j > i && buf[j] == ':') {
+            int k = j + 1; unsigned gid = 0; int gs = k;
+            while (buf[k] >= '0' && buf[k] <= '9') { gid = gid * 10 + (unsigned)(buf[k] - '0'); k++; }
+            if (k > gs) chown(full, (uid_t)uid, (gid_t)gid);
+        }
+    }
+    load_directory(CUR.path);
+    reselect_by_name(savedname);
+    g_props_open = 1;
+    fb_redraw();
+}
+// Opens the generic text-entry overlay pre-filled "mode:uid:gid" for the
+// currently-selected ext2/POSIX item.
+static void open_perms_edit(void) {
+    if (CUR.sel < 0 || CUR.sel >= item_count) return;
+    file_entry_t *it = &items[CUR.sel];
+    if (it->fs_type != FSPERM_TYPE_POSIX) return;
+    char buf[40]; int n = 0;
+    unsigned mode = it->mode & 0777;
+    char oct[8]; int oi = 0;
+    if (mode == 0) oct[oi++] = '0';
+    else { char tmp[8]; int t = 0; unsigned v = mode;
+        while (v) { tmp[t++] = (char)('0' + (v % 8)); v /= 8; }
+        while (t > 0) oct[oi++] = tmp[--t]; }
+    oct[oi] = 0;
+    for (int k = 0; oct[k]; k++) buf[n++] = oct[k];
+    buf[n++] = ':';
+    { char tmp[16]; int t = 0; unsigned v = it->uid; if (v == 0) tmp[t++] = '0';
+      while (v) { tmp[t++] = (char)('0' + (v % 10)); v /= 10; }
+      while (t > 0) buf[n++] = tmp[--t]; }
+    buf[n++] = ':';
+    { char tmp[16]; int t = 0; unsigned v = it->gid; if (v == 0) tmp[t++] = '0';
+      while (v) { tmp[t++] = (char)('0' + (v % 10)); v /= 10; }
+      while (t > 0) buf[n++] = tmp[--t]; }
+    buf[n] = 0;
+    str_copy(g_te_title, "Mode[:uid:gid]", sizeof(g_te_title));
+    str_copy(g_te_buf, buf, MAX_NAME_LEN);
+    g_te_len = str_len(g_te_buf);
+    g_te_purpose = 3;       // #554: permissions edit
+    g_te_open = 1;
+}
+// #554: FAT paths have no mode to edit, only ONE genuine toggle - the
+// on-disk read-only attribute (chmod's owner-write bit, per fs/fat.c
+// fat_set_readonly()). Applied directly on click; no text entry needed.
+static void props_ro_toggle(void) {
+    if (CUR.sel < 0 || CUR.sel >= item_count) return;
+    file_entry_t *it = &items[CUR.sel];
+    if (it->fs_type != FSPERM_TYPE_FAT) return;
+    char full[MAX_PATH_LEN];
+    path_join(full, CUR.path, it->name);
+    char savedname[MAX_NAME_LEN]; str_copy(savedname, it->name, MAX_NAME_LEN);
+    int was_ro = (it->fat_attr & FSPERM_FAT_READONLY) ? 1 : 0;
+    chmod(full, was_ro ? 0644 : 0444);
+    load_directory(CUR.path);
+    reselect_by_name(savedname);
+    g_props_open = 1;
+    fb_redraw();
+}
 // Open the generic text-entry overlay seeded with the selected file's name.
 static void open_rename(void) {
     if (CUR.sel < 0 || CUR.sel >= item_count) return;
@@ -1474,6 +1817,7 @@ static int te_key(char c, uint32_t kc) {
         g_te_open = 0;
         if (g_te_purpose == 1) rename_commit(g_te_buf);
         else if (g_te_purpose == 2) { parse_add_input(g_te_buf); navigate_to("/NET"); }  // #317
+        else if (g_te_purpose == 3) perms_edit_commit(g_te_buf);  // #554
     } else if (c == '\b' || kc == 0x0E) {
         if (g_te_len > 0) g_te_buf[--g_te_len] = 0;
     } else if (c >= 32 && c < 127 && g_te_len < MAX_NAME_LEN - 1) {
@@ -1485,14 +1829,14 @@ static int te_key(char c, uint32_t kc) {
 // ---- Task C: "Open with" app picker ---------------------------------------
 typedef struct { const char *label; const char *path; } ow_app_t;
 static const ow_app_t OW_APPS[] = {
-    { "Text Editor",  "/APPS/editor"   },
-    { "Image Viewer", "/APPS/imgview"  },
-    { "Maytera Studio", "/APPS/paint"  },
-    { "Web Browser",  "/APPS/browser"  },
-    { "Music Player", "/APPS/musicplr" },
-    { "Media Player", "/APPS/mplayer"  },
-    { "Terminal",     "/APPS/terminal" },
-    { "Python",       "/APPS/python"   },
+    { "Text Editor",  "/APPS/EDITOR"   },
+    { "Image Viewer", "/APPS/IMAGEVIEWER"  },
+    { "Maytera Studio", "/APPS/PAINT"  },
+    { "Web Browser",  "/APPS/BROWSER"  },
+    { "Music Player", "/APPS/MUSICPLR" },
+    { "Media Player", "/APPS/MEDIAPLAYER"  },
+    { "Terminal",     "/APPS/TERMINAL" },
+    { "Python",       "/APPS/PYTHON.ELF" },
 };
 #define OW_N ((int)(sizeof(OW_APPS)/sizeof(OW_APPS[0])))
 static void open_openwith(void) {
@@ -1527,7 +1871,19 @@ static void name_with_suffix(char *out, const char *base) {
     out[o] = 0;
 }
 
-// Stream-copy a regular file src -> dst. Returns 0 on success.
+// Stream-copy a regular file src -> dst. Returns 0 ONLY if every byte is on the
+// medium.
+//
+// #742: this used to return 0 after an unchecked close(), and THREE callers go
+// on to unlink() the SOURCE on that 0. That is the data-loss mechanism, and it
+// does not need a broken disk: sys_fsync()'s own contract says that on a
+// non-zero return "the file may be EMPTY OR ABSENT, and is NEVER the previous
+// contents", because ext2_write_file truncates the destination before it
+// discovers there is no room and the rollback leaves a valid ZERO-BYTE file. So
+// a full volume could produce a successful-looking copy of nothing, followed by
+// the deletion of the only real copy. fsync() is the call that makes the answer
+// mean something, and it must be checked BEFORE close(), because close()
+// consumes the fd whether or not it reports an error.
 static int copy_file(const char *src, const char *dst) {
     int in = open(src, 0);              // O_RDONLY
     if (in < 0) return -1;
@@ -1541,7 +1897,9 @@ static int copy_file(const char *src, const char *dst) {
         if (rc) break;
     }
     if (n < 0) rc = -1;
-    close(in); close(out);
+    if (rc == 0 && fsync(out) != 0) rc = -1;   // durable, or it did not happen
+    if (close(out) != 0) rc = -1;              // the final flush can still fail
+    close(in);
     return rc;
 }
 
@@ -1584,13 +1942,28 @@ static void do_paste(void) {
     fb_redraw();
 }
 
-// ---- Properties dialog (#251) ---------------------------------------------
+// ---- Properties dialog (#251, #554 permissions section) -------------------
+// #554: the permissions section is filesystem-aware, per the docs/UI_STYLE_
+// GUIDE.md design decision - ext2/POSIX shows real owner/group/mode with an
+// edit hotspot; genuine FAT (ESP: /boot, /EFI) shows the real on-disk
+// attribute flags with ONLY a read-only toggle (the one genuine equivalent
+// that exists); neither ever shows a fabricated value for the model that
+// does not apply to that path.
+#define PROPS_BW 340
+#define PROPS_BH 300
+static inline int props_bx(void) { return (WIN_W - PROPS_BW) / 2; }
+static inline int props_by(void) { return (WIN_H - PROPS_BH) / 2; }
+// Y of the permissions-edit / read-only-toggle hotspot line, shared by
+// draw_props() and props_hit() so they can never disagree.
+static int g_props_hotspot_y = 0;
+static int g_props_hotspot_kind = 0;  // 0 = none this frame, 1 = edit perms, 2 = toggle RO
+
 static void draw_props(void) {
     if (!g_props_open) return;
     if (CUR.sel < 0 || CUR.sel >= item_count) { g_props_open = 0; return; }
     file_entry_t *it = &items[CUR.sel];
-    int bw = 340, bh = 168;
-    int bx = (WIN_W - bw) / 2, by = (WIN_H - bh) / 2;
+    int bw = PROPS_BW, bh = PROPS_BH;
+    int bx = props_bx(), by = props_by();
     win_draw_rect(window_handle, bx, by, bw, bh, theme_color(THEME_COLOR_MENU_BG));
     gui_draw_rect_outline(window_handle, bx, by, bw, bh, BORDER_COLOR);
     win_draw_rect(window_handle, bx, by, bw, 22, fp_acc());
@@ -1604,7 +1977,72 @@ static void draw_props(void) {
     { char sz[24]; fmt_size((uint32_t)it->size, sz); win_draw_text(window_handle, tx + 90, ty, sz, TEXT_COLOR); } ty += 24;
     win_draw_text(window_handle, tx, ty, "Location:", TEXT_COLOR);
     win_draw_text(window_handle, tx + 90, ty, CUR.path, TEXT_COLOR); ty += 30;
+
+    win_draw_rect(window_handle, bx + 8, ty, bw - 16, 1, BORDER_COLOR); ty += 12;
+    g_props_hotspot_kind = 0;
+    g_props_hotspot_y = 0;
+
+    if (it->fs_type == FSPERM_TYPE_POSIX) {
+        win_draw_text(window_handle, tx, ty, "Filesystem:", TEXT_COLOR);
+        win_draw_text(window_handle, tx + 90, ty, "ext2 (POSIX permissions)", TEXT_COLOR); ty += 24;
+        win_draw_text(window_handle, tx, ty, "Owner:", TEXT_COLOR);
+        { char s[16]; gui_itoa((int)it->uid, s, 16); struct passwd *pw = getpwuid(it->uid);
+          char line[48]; int n = 0; const char *p = s; while (*p) line[n++] = *p++;
+          if (pw && pw->pw_name[0]) { line[n++] = ' '; line[n++] = '('; const char *q = pw->pw_name;
+              while (*q && n < 44) { line[n++] = *q++; }
+              line[n++] = ')'; }
+          line[n] = 0; win_draw_text(window_handle, tx + 90, ty, line, TEXT_COLOR); } ty += 24;
+        win_draw_text(window_handle, tx, ty, "Group:", TEXT_COLOR);
+        { char s[16]; gui_itoa((int)it->gid, s, 16); win_draw_text(window_handle, tx + 90, ty, s, TEXT_COLOR); } ty += 24;
+        win_draw_text(window_handle, tx, ty, "Mode:", TEXT_COLOR);
+        { char rwx[10]; fmt_attr(it, rwx);
+          char oct[8]; int oi = 0; unsigned v = it->mode & 0777;
+          if (v == 0) oct[oi++] = '0'; else { char tmp[8]; int t = 0;
+              while (v) { tmp[t++] = (char)('0' + (v % 8)); v /= 8; } while (t > 0) oct[oi++] = tmp[--t]; }
+          oct[oi] = 0;
+          char line[24]; int n = 0; for (int k = 0; rwx[k]; k++) line[n++] = rwx[k];
+          line[n++] = ' '; line[n++] = '('; for (int k = 0; oct[k]; k++) line[n++] = oct[k]; line[n++] = ')'; line[n] = 0;
+          win_draw_text(window_handle, tx + 90, ty, line, TEXT_COLOR); }
+        ty += 26;
+        g_props_hotspot_y = ty; g_props_hotspot_kind = 1;
+        win_draw_text(window_handle, tx, ty, "[ Edit Permissions... ]", fp_acc());
+        ty += 24;
+        if (!it->has_perm_entry) win_draw_text_small(window_handle, tx, ty, "(default: no explicit entry yet)", DIM_TEXT);
+    } else if (it->fs_type == FSPERM_TYPE_FAT) {
+        win_draw_text(window_handle, tx, ty, "Filesystem:", TEXT_COLOR);
+        win_draw_text(window_handle, tx + 90, ty, "FAT (ESP - no owner/mode)", TEXT_COLOR); ty += 24;
+        win_draw_text(window_handle, tx, ty, "Attributes:", TEXT_COLOR);
+        { char a[10]; fmt_attr(it, a);
+          char line[40]; int n = 0; for (int k = 0; a[k]; k++) line[n++] = a[k];
+          const char *legend = "  (D=Dir R=RO H=Hid S=Sys A=Arc)";
+          for (int k = 0; legend[k] && n < 38; k++) line[n++] = legend[k];
+          line[n] = 0; win_draw_text_small(window_handle, tx + 90, ty + 2, line, TEXT_COLOR); }
+        ty += 30;
+        g_props_hotspot_y = ty; g_props_hotspot_kind = 2;
+        win_draw_text(window_handle, tx, ty,
+                      (it->fat_attr & FSPERM_FAT_READONLY) ? "[ Clear Read-Only ]" : "[ Set Read-Only ]",
+                      fp_acc());
+        ty += 24;
+        win_draw_text_small(window_handle, tx, ty, "(FAT has no owner/exec bit; this is the only", DIM_TEXT); ty += 14;
+        win_draw_text_small(window_handle, tx, ty, "real permission FAT supports)", DIM_TEXT);
+    } else {
+        win_draw_text(window_handle, tx, ty, "Filesystem:", TEXT_COLOR);
+        win_draw_text(window_handle, tx + 90, ty, "Network share", TEXT_COLOR); ty += 24;
+        win_draw_text_small(window_handle, tx, ty, "Permissions are enforced by the server; no local model.", DIM_TEXT);
+    }
     win_draw_text(window_handle, bx + bw - 130, by + bh - 26, "[ click to close ]", DIM_TEXT);
+}
+// Returns: 1 = the perms-edit hotspot was hit, 2 = the RO-toggle hotspot was
+// hit, 0 = click landed elsewhere (caller should close the dialog). Must be
+// called only while g_props_open, right after a draw_props() so
+// g_props_hotspot_y/_kind reflect the CURRENT selection.
+static int props_hit(int lx, int ly) {
+    if (g_props_hotspot_kind == 0) return 0;
+    int bx = props_bx(), tx = bx + 16;
+    int hw = 220;  // generous click width for either label
+    if (lx >= tx && lx < tx + hw && ly >= g_props_hotspot_y - 14 && ly < g_props_hotspot_y + 8)
+        return g_props_hotspot_kind;
+    return 0;
 }
 
 // ---- Task C overlays: geometry, draw, hit-test ----------------------------
@@ -1786,7 +2224,9 @@ static void menu_select(int idx) {
             case 4: g_sort = SORT_NAME; sort_items(); break;
             case 5: g_sort = SORT_SIZE; sort_items(); break;
             case 6: g_sort = SORT_TYPE; sort_items(); break;
-            case 8: g_preview_on = !g_preview_on; break;
+            case 7: g_sort = SORT_ATTR; sort_items(); break;
+            case 9: g_preview_on = !g_preview_on; break;
+            case 10: g_show_hidden = !g_show_hidden; load_directory(CUR.path); break;
         }
     } else if (g_menu == MENU_CTX) {
         // Match by label so the action stays correct as items are added/removed.
@@ -1821,7 +2261,6 @@ static int menu_hit(int lx, int ly) {  // returns item index or -1
 }
 
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
 
     // Resolve the current user's home directory for Quick access. Desktop apps
     // run as root (home "/"), so fall back to the admin home where the standard
@@ -1861,6 +2300,16 @@ int main(int argc, char **argv) {
             }
         }
     }
+    // (#745) argv[1] as a start path, so a desktop folder icon can open Files
+    // AT that folder. Applied AFTER the /CONFIG/FILESPATH.CFG one-shot above so
+    // the existing AUTORUN override still wins, and only for an absolute path.
+    // The desktop needs this because it cannot rely on writing /CONFIG: a
+    // non-root session has no authority there (#683), so a sentinel file would
+    // work for the root autologin and silently fail for everyone else.
+    if (argc >= 2 && argv[1] && argv[1][0] == '/') {
+        str_copy(tabs[0].path, argv[1], MAX_PATH_LEN);
+        startpath = tabs[0].path;
+    }
     load_directory(startpath);
     // #239: the desktop / start-menu Recycle Bin launches drop a one-shot
     // sentinel so Files opens straight into the integrated Recycle Bin view.
@@ -1883,13 +2332,29 @@ int main(int argc, char **argv) {
             // Task C: modal overlays capture keys first.
             if (g_te_open) { te_key(c, kc); fb_redraw(); break; }
             if (g_openwith_open) { if (c == 27) { g_openwith_open = 0; fb_redraw(); } break; }
-            if (g_props_open && c == 27) { g_props_open = 0; fb_redraw(); break; }
+            if (g_props_open) {
+                if (c == 27) { g_props_open = 0; fb_redraw(); break; }
+                // #554: 'e' triggers the SAME action the permissions hotspot's
+                // mouse click does (edit mode/owner/group on ext2, toggle
+                // read-only on FAT) - keyboard-only path, verified this way.
+                if ((c == 'e' || c == 'E') && g_props_hotspot_kind != 0) {
+                    if (g_props_hotspot_kind == 1) open_perms_edit();
+                    else props_ro_toggle();
+                    fb_redraw(); break;
+                }
+            }
             if (g_menu != MENU_NONE && c == 27) { g_menu = MENU_NONE; fb_redraw(); break; }
             // (#251) clipboard keyboard shortcuts (Ctrl+C/X/V arrive as control chars)
             if (!g_in_recycle) {
                 if (c == 0x03) { do_copy();  break; }   // Ctrl+C
                 if (c == 0x18) { do_cut();   break; }   // Ctrl+X
                 if (c == 0x16) { do_paste(); break; }   // Ctrl+V (do_paste redraws)
+                // #554: Ctrl+P opens Properties on the selected item, mouse-free
+                // (the context menu's "Properties" item was previously the only
+                // way in; keyboard-only per the same reasoning as the other
+                // Ctrl shortcuts here, and it is what let this dialog's
+                // permissions section be verified without mouse injection).
+                if (c == 0x10 && CUR.sel >= 0 && CUR.sel < item_count) { g_props_open = 1; fb_redraw(); break; }
             }
             if (g_in_recycle) {
                 // ESC leaves the recycle view back to the current folder; a/d
@@ -1920,7 +2385,11 @@ int main(int argc, char **argv) {
             // Task C: modal overlays consume clicks first.
             if (g_te_open) {
                 int h = te_hit(lx, ly);
-                if (h == 0) { g_te_open = 0; if (g_te_purpose == 1) rename_commit(g_te_buf); }
+                if (h == 0) {
+                    g_te_open = 0;
+                    if (g_te_purpose == 1) rename_commit(g_te_buf);
+                    else if (g_te_purpose == 3) perms_edit_commit(g_te_buf);  // #554
+                }
                 else if (h == 1 || h == -2) { g_te_open = 0; }
                 fb_redraw(); break;
             }
@@ -1930,8 +2399,15 @@ int main(int argc, char **argv) {
                 else if (h == -2) g_openwith_open = 0;
                 fb_redraw(); break;
             }
-            // (#251) Properties dialog is modal: any click dismisses it.
-            if (g_props_open) { g_props_open = 0; fb_redraw(); break; }
+            // (#251, #554) Properties dialog is modal. A click on the
+            // permissions hotspot acts instead of dismissing; any other click
+            // (inside or outside the dialog) still dismisses it, unchanged.
+            if (g_props_open) {
+                int h = props_hit(lx, ly);
+                if (h == 1) { open_perms_edit(); fb_redraw(); break; }         // ext2: edit mode/owner/group
+                if (h == 2) { props_ro_toggle(); break; }                      // FAT: toggle read-only
+                g_props_open = 0; fb_redraw(); break;
+            }
             // menu first
             if (g_menu != MENU_NONE) {
                 int h = menu_hit(lx, ly);

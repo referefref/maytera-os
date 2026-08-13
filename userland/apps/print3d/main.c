@@ -712,7 +712,11 @@ static void draw_all(void) {
 // cleanly on both the FAT ESP and the ext2 root.
 #define SLICE_OUT "/SLICED.GCO"
 
-// Slice the selected STL model to g-code with the CuraEngine port (/APPS/CURASLIC),
+// Slice the selected STL model to g-code with the CuraEngine port (/APPS/curaslice).
+// #660: this used to spawn /APPS/CURASLIC, the 2026-07-12 asset-base binary. The
+// slicer is built from userland/apps/curaslice and installs as /APPS/curaslice, so
+// every slice until now ran the STALE copy, not the one this repo builds. Same
+// old-name-shadows-new-name trap as COMPOSIT vs compositor.
 // then load the result so it can be printed. CuraEngine has a compiled-in default
 // profile (0.2 mm layers, 2 walls, 20% infill); we pass only the output path and
 // the model. The wait uses the kernel child-exit wait-queue (proc_wait): the
@@ -758,8 +762,8 @@ static void do_slice(void) {
     av[n++] = (char *)"-o"; av[n++] = (char *)SLICE_OUT;
     av[n++] = g_files[g_sel].path;
     av[n] = 0;
-    int pid = sys_spawn_args("/APPS/CURASLIC", av, n);
-    if (pid < 0) { set_status("Slice failed: could not start CuraEngine (/APPS/CURASLIC)."); return; }
+    int pid = sys_spawn_args("/APPS/curaslice", av, n);
+    if (pid < 0) { set_status("Slice failed: could not start CuraEngine (/APPS/curaslice)."); return; }
     int st = 0;
     sys_waitpid(pid, &st, 0);   // blocks on the child-exit wait-queue
 

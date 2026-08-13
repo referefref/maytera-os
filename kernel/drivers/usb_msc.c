@@ -5,6 +5,8 @@
 #include "../mm/heap.h"
 #include "../mm/pmm.h"
 #include "../fs/bootlog.h"
+#include "../sync/waitq.h"     // #617: the canonical block-until-condition primitive
+#include "../sync/noblock.h"   // #617: wq_may_block() - may THIS context park?
 
 // =============================================================================
 // Global State
@@ -165,34 +167,148 @@ int usb_msc_bulk_reset_recovery(usb_msc_device_t *dev) {
 // a yielding lock so a waiter gives the CPU to the in-flight command's thread
 // (busy-spinning here would starve the holder under the cooperative parts of
 // the scheduler). Uncontended during early single-threaded boot.
+//
+// #617: this WAS a hand-rolled sleeping mutex - `while (test_and_set) { if
+// (preemption) proc_sleep(1); else proc_yield(); }` - i.e. exactly the #426
+// banned pattern, unbounded, on the hottest I/O path in the product (the golden
+// USB-boots, so EVERY block read passes through here). It was ranked #1 in the
+// concurrency-lint DEBT ledger. It is now routed through the canonical
+// wait-queue primitive.
+//
+// WHY THE WAKE CANNOT BE LOST, which is the only thing that matters when you
+// replace a poll with a park:
+//
+//  1. STRUCTURAL. The release path sets g_msc_cmd_busy = 0 and THEN calls
+//     wake_up_all(). A waiter runs __wait_prepare() (which links it onto the
+//     queue) and only THEN re-tests the lock. So a release landing between a
+//     waiter's test and its sleep still finds the waiter linked and wakes it.
+//     This is the same prepare-then-RE-CHECK ordering xhci_block_for_cc()
+//     relies on (#614), and it is why no timeout is needed for correctness.
+//
+//  2. REDUNDANT, per CLAUDE.md's preferred shape (an always-armed second wake
+//     source, e.g. hda_space_wq woken by both the BCIS ISR and the 10 ms poll
+//     worker). Here the belt-and-braces is a bounded SLEEP QUANTUM rather than
+//     a second waker: each park is capped at MSC_CMD_BLOCK_MS, after which we
+//     simply re-test the lock and park again. Note what this is NOT: it is not
+//     wait_event_timeout() and it never gives up. The overall wait is still
+//     unbounded, exactly as the old poll was, so liveness is unchanged and this
+//     cannot turn a working boot into a failing one; the cap only guarantees
+//     that even a wake lost to some unforeseen path degrades to a 10 ms
+//     zero-CPU re-poll instead of stranding the storage stack forever. That is
+//     the deliberate difference from the banned pattern, which burned a core
+//     per waiter at 1 ms; here a waiter is off the run queue the whole time and
+//     the core can idle-HLT.
+//
+// THE NO-BLOCK BRANCH is retained and unchanged in behavior. wq_may_block()
+// (sync/noblock.h) is the canonical statement of the three conditions under
+// which parking is legal: scheduler live, we are a process, IRQs on. During USB
+// enumeration none of that holds - and there, by construction, the lock is
+// UNCONTENDED (the USB stack is single-threaded before the scheduler exists),
+// so the fallback loop is unreachable in practice rather than merely rare. It
+// stays because removing it would change a boot-critical path on an argument
+// about reachability, and this conversion is meant to be provably no worse.
+#define MSC_CMD_BLOCK_MS 10
+static wait_queue_head_t g_msc_cmd_wq = { .head = NULL, .lock = SPINLOCK_INIT };
 static volatile int g_msc_cmd_busy = 0;
-static void msc_cmd_lock(void) {
+
+// Fallback for a context that must not park (pre-scheduler / no proc / IF=0).
+// See above: unreachable by construction once the scheduler is live, because
+// every runtime caller reaches msc_cmd_lock() with interrupts on.
+// Iterations ever executed by the no-block fallback below. The claim "this is
+// unreachable by construction" is exactly the kind of claim that rots, so it is
+// COUNTED rather than asserted: a non-zero value here means a no-block context
+// really did hit contention on the MSC command lock and the fallback is not
+// dead after all, which would make it a genuine #426 site again. Reported once
+// on serial the first time it fires, and, since #621, ALSO carried on every
+// [HB] heartbeat line as "mscnb=" so a reader can tell "measured, zero"
+// from "this kernel never measured it". Until #621 the "readable from the
+// heartbeat" half of this sentence was simply false: nothing read it.
+volatile uint64_t g_msc_noblock_spins = 0;
+
+static void msc_cmd_lock_noblock(void) {
     extern void proc_yield(void);
     extern void proc_sleep(uint32_t ms);
     extern _Bool sched_preemption_enabled(void);
     while (__sync_lock_test_and_set(&g_msc_cmd_busy, 1)) {
-        // #375: at runtime the lock holder SLEEPS during its (slow-USB) transfer
-        // wait, so a waiter that merely proc_yield()s here would re-queue itself
-        // READY and busy-spin through the scheduler, pegging a core. Sleep
-        // instead so the core can idle-HLT while the in-flight command runs.
-        // Early boot (no preemption) keeps the cooperative yield.
+        if (g_msc_noblock_spins++ == 0)
+            kprintf("[USB-MSC] #617: no-block contention on the command lock; "
+                    "the fallback poll is NOT dead code after all\n");
         if (sched_preemption_enabled()) proc_sleep(1);
         else proc_yield();
     }
 }
+
+static void msc_cmd_lock(void) {
+    // Uncontended acquire: the overwhelmingly common case (and the ONLY case
+    // during early boot). No queue, no lock, one atomic.
+    if (__sync_lock_test_and_set(&g_msc_cmd_busy, 1) == 0) return;
+
+    for (;;) {
+        if (!wq_may_block()) { msc_cmd_lock_noblock(); return; }
+        wait_queue_entry_t wqe;
+        __wait_prepare(&g_msc_cmd_wq, &wqe, 0);
+        // Re-check AFTER queueing: this is the lost-wake close.
+        if (g_msc_cmd_busy)
+            (void)__wait_event_wait_deadline(&wqe, sched_now_ms() + MSC_CMD_BLOCK_MS);
+        __wait_finish(&g_msc_cmd_wq, &wqe);
+        if (__sync_lock_test_and_set(&g_msc_cmd_busy, 1) == 0) return;
+    }
+}
+
 static void msc_cmd_unlock(void) {
     __sync_lock_release(&g_msc_cmd_busy);
+    // Unconditional, like xhci's drain wake: wake_up_all() is documented safe
+    // from IRQ context and is a no-op on an empty queue, so it costs a lock and
+    // a NULL check when nobody is waiting (the common case) and is safe on the
+    // early-boot path where no process exists yet.
+    wake_up_all(&g_msc_cmd_wq);
 }
 
 static int usb_msc_transport_inner(usb_msc_device_t *dev, usb_msc_cbw_t *cbw,
                                    void *data, usb_msc_csw_t *csw);
 
+// #745 (task #62): THE LOG FILE LIVES ON THIS DEVICE.
+//
+// Every error path in usb_msc_transport_inner() below calls bootlog_write(),
+// and on a USB-booted machine bootlog_write() flushes /BOOTLOG.TXT through
+// blk_write() -> usb_msc_write() -> usb_msc_transport() -> msc_cmd_lock().
+// That lock is a plain test-and-set with no owner tracking, so the thread ends
+// up waiting for a lock it is already holding, in a `for (;;)` that reparks
+// every MSC_CMD_BLOCK_MS (10 ms) and never returns. One transfer error
+// therefore burns one thread forever, and since errors get more frequent under
+// load the machine degrades progressively rather than failing at once.
+//
+// The window below makes the logger RAM-and-serial-only for the duration of a
+// whole SCSI command, so the recursion cannot begin. It brackets the LOCK as
+// well as the command, because the deadlock is against the lock, not the
+// command. Nothing is lost: the buffered lines reach the disk on the next
+// bootlog_write() issued from a context that is not inside the storage stack.
 int usb_msc_transport(usb_msc_device_t *dev, usb_msc_cbw_t *cbw,
                       void *data, usb_msc_csw_t *csw) {
+    bootlog_defer_begin();
     msc_cmd_lock();
     int r = usb_msc_transport_inner(dev, cbw, data, csw);
     msc_cmd_unlock();
+    bootlog_defer_end();
     return r;
+}
+
+// #745 (task #62): BOUND THE ERROR LOGGING. The defer window above stops the
+// deadlock; it does not stop a transfer-error storm from filling the 96 KB
+// bootlog RAM buffer in seconds and evicting every line of boot evidence
+// recorded before it. The first MSC_ERRLOG_MAX errors carry all the diagnostic
+// value; after that the COUNT is the information, and it is reported on the
+// heartbeat line as mscerr= so "measured, zero" is distinguishable from "never
+// measured". Same counter-gated idiom as g_tx_diag in drivers/usb_ecm.c.
+#define MSC_ERRLOG_MAX 12
+static uint32_t g_msc_errlog = 0;
+uint64_t g_msc_xfer_errors = 0;      // every transport error, logged or not
+
+static int msc_errlog_take(void) {
+    g_msc_xfer_errors++;
+    if (g_msc_errlog >= MSC_ERRLOG_MAX) return 0;
+    g_msc_errlog++;
+    return 1;
 }
 
 static int usb_msc_transport_inner(usb_msc_device_t *dev, usb_msc_cbw_t *cbw,
@@ -208,13 +324,15 @@ retry:
                                     dev->bulk_out_ep, cbw, USB_MSC_CBW_SIZE, 0);
     if (result < 0) {
         kprintf("[USB-MSC] Failed to send CBW (result=%d)\n", result);
-        bootlog_write("[USB-MSC] slot %d: send CBW FAILED (result=%d) attempt %d/%d",
-                      dev->slot_id, result, retry_count + 1, max_retries);
+        if (msc_errlog_take())
+            bootlog_write("[USB-MSC] slot %d: send CBW FAILED (result=%d) attempt %d/%d",
+                          dev->slot_id, result, retry_count + 1, max_retries);
         if (retry_count++ < max_retries) {
             usb_msc_bulk_reset_recovery(dev);
             goto retry;
         }
-        bootlog_write("[USB-MSC] slot %d: giving up after %d CBW retries", dev->slot_id, max_retries);
+        if (msc_errlog_take())
+            bootlog_write("[USB-MSC] slot %d: giving up after %d CBW retries", dev->slot_id, max_retries);
         return -1;
     }
 
@@ -228,8 +346,9 @@ retry:
         if (result < 0) {
             kprintf("[USB-MSC] Data transfer failed (ep=%d, dir=%d, len=%d)\n",
                     ep, direction, cbw->data_transfer_len);
-            bootlog_write("[USB-MSC] slot %d: data transfer FAILED ep=%d dir=%d len=%d",
-                          dev->slot_id, ep, direction, cbw->data_transfer_len);
+            if (msc_errlog_take())
+                bootlog_write("[USB-MSC] slot %d: data transfer FAILED ep=%d dir=%d len=%d",
+                              dev->slot_id, ep, direction, cbw->data_transfer_len);
             // Try to get CSW anyway
         }
     }
@@ -240,19 +359,22 @@ retry:
                                 dev->bulk_in_ep, csw, USB_MSC_CSW_SIZE, 1);
     if (result < 0) {
         kprintf("[USB-MSC] Failed to receive CSW\n");
-        bootlog_write("[USB-MSC] slot %d: receive CSW FAILED, clearing stall and retrying once", dev->slot_id);
+        if (msc_errlog_take())
+            bootlog_write("[USB-MSC] slot %d: receive CSW FAILED, clearing stall and retrying once", dev->slot_id);
         // Try clear stall and get CSW again
         usb_msc_clear_stall(dev, dev->bulk_in_ep);
         result = xhci_bulk_transfer(dev->controller, dev->slot_id,
                                     dev->bulk_in_ep, csw, USB_MSC_CSW_SIZE, 1);
         if (result < 0) {
-            bootlog_write("[USB-MSC] slot %d: receive CSW FAILED again, attempt %d/%d",
-                          dev->slot_id, retry_count + 1, max_retries);
+            if (msc_errlog_take())
+                bootlog_write("[USB-MSC] slot %d: receive CSW FAILED again, attempt %d/%d",
+                              dev->slot_id, retry_count + 1, max_retries);
             if (retry_count++ < max_retries) {
                 usb_msc_bulk_reset_recovery(dev);
                 goto retry;
             }
-            bootlog_write("[USB-MSC] slot %d: giving up after %d CSW retries", dev->slot_id, max_retries);
+            if (msc_errlog_take())
+                bootlog_write("[USB-MSC] slot %d: giving up after %d CSW retries", dev->slot_id, max_retries);
             return -1;
         }
     }
@@ -260,8 +382,9 @@ retry:
     // Validate CSW
     if (csw->signature != USB_MSC_CSW_SIGNATURE) {
         kprintf("[USB-MSC] Invalid CSW signature: 0x%08x\n", csw->signature);
-        bootlog_write("[USB-MSC] slot %d: invalid CSW signature 0x%08x, attempt %d/%d",
-                      dev->slot_id, csw->signature, retry_count + 1, max_retries);
+        if (msc_errlog_take())
+            bootlog_write("[USB-MSC] slot %d: invalid CSW signature 0x%08x, attempt %d/%d",
+                          dev->slot_id, csw->signature, retry_count + 1, max_retries);
         if (retry_count++ < max_retries) {
             usb_msc_bulk_reset_recovery(dev);
             goto retry;

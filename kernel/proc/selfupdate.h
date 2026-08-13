@@ -61,6 +61,15 @@ int kernel_selfupdate_apply(const void *new_kernel, uint32_t len,
 int kernel_ota_verify_sig(const uint8_t digest[32],
                           const uint8_t *sig, uint32_t sig_len);
 
+// Verify a detached RSA signature over a 32-byte digest against the baked-in
+// APP-REPOSITORY public key (proc/app_pubkey.h), domain-separated from the OTA
+// key (#563). Used by SYS_APP_VERIFY_SIG so the App Store client authenticates a
+// signed catalog manifest with a key that CANNOT sign a kernel. During the
+// migration window it also accepts the legacy OTA key. Returns 0 if valid, -1
+// otherwise.
+int kernel_app_verify_sig(const uint8_t digest[32],
+                          const uint8_t *sig, uint32_t sig_len);
+
 // Flush pending disk state, then ACPI-reboot to boot the freshly written
 // kernel. Does not return on success. Call ONLY after a SELFUPD_OK apply.
 void kernel_selfupdate_reboot(void);

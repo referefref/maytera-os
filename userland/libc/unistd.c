@@ -1,7 +1,12 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // unistd.c - POSIX unistd wrappers
 #include "unistd.h"
 #include "syscall.h"
 #include "errno.h"
+#include "stdarg.h"
 
 pid_t getpid(void)  { return (pid_t)syscall0(SYS_GETPID); }
 pid_t getppid(void) { return (pid_t)syscall0(SYS_GETPPID); }
@@ -103,6 +108,18 @@ int pipe(int fds[2]) {
     return 0;
 }
 
+// #586: device control. Was declared in <sys/ioctl.h> but never implemented;
+// interactive TTY/PTY use (TIOCGPTN, TIOCSWINSZ, TCGETS/TCSETS) needs it.
+int ioctl(int fd, unsigned long request, ...) {
+    va_list ap;
+    va_start(ap, request);
+    void *arg = va_arg(ap, void *);
+    va_end(ap);
+    long r = syscall3(SYS_IOCTL, fd, (long)request, (long)arg);
+    if (r < 0) { errno = (int)(-r); return -1; }
+    return (int)r;
+}
+
 int chdir(const char *path) {
     long r = syscall1(SYS_CHDIR, (long)path);
     if (r < 0) { errno = (int)(-r); return -1; }
@@ -168,11 +185,25 @@ int usleep(unsigned long us) {
 }
 
 int mkdir(const char *path, int mode) {
-    return (int)syscall2(SYS_MKDIR, (long)path, mode);
+    // task #578: this wrapper used to return the raw syscall value with NO
+    // errno translation at all, unlike every sibling wrapper in this same
+    // file (open/close/unlink/... all do "if (r<0) errno=(int)(-r)").
+    // Callers that check errno==EEXIST after a failed mkdir() (upstream
+    // ioquake3's Sys_Mkdir, ported verbatim into
+    // userland/apps/openarena/sys_maytera.c, is exactly this pattern) were
+    // reading STALE errno left over from some earlier, unrelated libc call
+    // instead of anything mkdir() itself set - paired with the kernel-side
+    // fat_mkdir() fix (kernel/fs/fat.c) that now actually returns -17 for
+    // "already exists" instead of a generic -1.
+    long r = syscall2(SYS_MKDIR, (long)path, mode);
+    if (r < 0) { errno = (int)(-r); return -1; }
+    return 0;
 }
 
 int rmdir(const char *path) {
-    return (int)syscall1(SYS_RMDIR, (long)path);
+    long r = syscall1(SYS_RMDIR, (long)path);
+    if (r < 0) { errno = (int)(-r); return -1; }
+    return 0;
 }
 
 int rename(const char *oldpath, const char *newpath) {

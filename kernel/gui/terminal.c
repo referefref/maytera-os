@@ -12,6 +12,14 @@
 #include "../cpu/idt.h"
 #include "../drivers/mouse.h"
 #include "../fs/fat.h"
+// #693: the private `extern` declarations of the VFS file ops that used to
+// sit in this file are GONE. They were not just duplicates: a redeclaration
+// in a TU that never includes fs/vfs.h silently strips the header's
+// MUST_CHECK (warn_unused_result), so a discarded persistence result here
+// compiled clean while the identical mistake elsewhere failed the build. That
+// is a compiler-enforced gate defeated by a forked declaration, which is the
+// same class of bug #695 found when three of them lied about the return TYPE.
+#include "../fs/vfs.h"
 #include "../boot_info.h"
 #include "../exec/pe.h"
 #include "../exec/elf.h"
@@ -542,8 +550,8 @@ void terminal_destroy(terminal_t *term) {
     term->running = false;
     term->pump_running = 0;
     if (term->ptmx) {
-        extern void file_put(struct file *f);
-        file_put(term->ptmx);
+        IGNORE_RESULT("terminal close: the pty master buffers nothing, and the window is going away, so there is no recipient for an error",
+                      file_put(term->ptmx));
         term->ptmx = NULL;
     }
 
@@ -656,7 +664,6 @@ void terminal_on_destroy(void *app_data) {
 // CSI sequences (msh/mvi read these directly).
 static void term_key_to_master(terminal_t *term, int c) {
     if (!term || !term->ptmx) return;
-    extern int64_t file_write(struct file *f, const void *buf, uint64_t count);
 
     // Printable ASCII and common control bytes go through unchanged. The
     // ldisc (in cooked mode) handles erase/kill; in raw mode msh/mvi get the
@@ -665,7 +672,8 @@ static void term_key_to_master(terminal_t *term, int c) {
         uint8_t b = (uint8_t)c;
         // Window manager passes Enter as '\n'; most shells want '\r' on TTY.
         if (b == '\n') b = '\r';
-        file_write(term->ptmx, &b, 1);
+        if (file_write(term->ptmx, &b, 1) != 1)
+                    kprintf("[TERM] pty master short write: keystroke dropped\n");
         return;
     }
 
@@ -680,7 +688,8 @@ static void term_key_to_master(terminal_t *term, int c) {
     }
     uint64_t n = 0;
     while (seq[n]) n++;
-    file_write(term->ptmx, seq, n);
+    if (file_write(term->ptmx, seq, n) != (int64_t)n)
+            kprintf("[TERM] pty master short write: arrow key dropped\n");
 }
 
 // Pump kernel thread: drain pty master output -> cell grid, detect child exit.
@@ -736,7 +745,6 @@ static void terminal_pump_thread(void *arg) {
 static int terminal_spawn_shell(terminal_t *term) {
     extern fat_fs_t g_fat_fs;
     extern struct file *dev_open(const char *name, int flags);
-    extern void file_put(struct file *f);
     extern int  file_ioctl(struct file *f, unsigned cmd, void *arg2);
 
     if (!g_fat_fs.mounted) {
@@ -764,32 +772,23 @@ static int terminal_spawn_shell(terminal_t *term) {
     // TIOCGPTN = 0x80045430
     if (file_ioctl(master, 0x80045430, &pts_idx) != 0 || pts_idx < 0) {
         terminal_print(term, "shell: TIOCGPTN failed\n");
-        file_put(master);
+        IGNORE_RESULT("pty teardown after TIOCGPTN failed: nothing is buffered on a pty master",
+                      file_put(master));
         kfree(data);
         return -1;
     }
 
-    int pid = proc_create_user_tty("msh", data, sz, pts_idx);
+    int pid = proc_create_user_tty_as("msh", data, sz, pts_idx, proc_as_session());
     kfree(data);
     if (pid < 0) {
         terminal_print(term, "shell: spawn failed\n");
-        file_put(master);
+        IGNORE_RESULT("pty teardown on a failed spawn: nothing is buffered on a pty master",
+                      file_put(master));
         return -1;
     }
 
-    // Apply session UID/GID to spawned shell
-    {
-        extern uint32_t desktop_get_session_uid(void);
-        extern uint32_t desktop_get_session_gid(void);
-        extern process_t *proc_get(uint32_t pid);
-        process_t *child = proc_get((uint32_t)pid);
-        if (child) {
-            child->uid  = desktop_get_session_uid();
-            child->gid  = desktop_get_session_gid();
-            child->euid = desktop_get_session_uid();
-            child->egid = desktop_get_session_gid();
-        }
-    }
+    // #692: the session uid/gid stamp that used to sit here is gone; the
+    // shell's identity is named at the spawn above.
 
     term->ptmx      = master;
     term->child_pid = pid;
@@ -803,7 +802,8 @@ static int terminal_spawn_shell(terminal_t *term) {
                            PRIO_NORMAL);
     if (pump < 0) {
         terminal_print(term, "shell: pump thread failed\n");
-        file_put(master);
+        IGNORE_RESULT("pty teardown on a failed spawn: the master has nothing buffered, and this path is already returning -1 to the caller",
+                      file_put(master));
         term->ptmx = NULL;
         return -1;
     }

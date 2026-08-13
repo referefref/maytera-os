@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // ctype.c - character classification (C locale) for MayteraOS userland (#422).
 #include "ctype.h"
 

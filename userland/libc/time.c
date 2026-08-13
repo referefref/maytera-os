@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // time.c - calendar time for MayteraOS userland (#422 / CPython #359).
 // Pure epoch<->civil conversion (Howard Hinnant's algorithm). No timezone
 // database: localtime == gmtime (UTC). time() returns whatever the kernel

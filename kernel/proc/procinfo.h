@@ -11,15 +11,22 @@
 //   SYS_PROC_LIST 238, SYS_KILL 80, SYS_SETPRIORITY 244, SYS_GET_CPU_USAGE 193,
 //   SYS_GET_MEM_INFO 194, SYS_GET_CPU_PER_CORE 259, SYS_CRON_* 276-279.
 //
-// SECURITY NOTE (deliberate, and a departure from this file's neighbours):
-// every syscall backed by this header VALIDATES its user pointer via
-// validate_user_ptr() before writing a single byte. The rest of the syscall
-// surface does NOT: validate_user_ptr() is defined in security/validate.c and
-// has ZERO other callers in the tree, so e.g. SYS_PROC_LIST hands arg1 straight
-// to proc_snapshot(), which happily writes process records into any kernel
-// address a Ring-3 caller names. That is a pre-existing systemic hole affecting
-// ~300 syscalls and is far outside #487's scope to fix, but new syscalls will
-// not add to it. Reported for the security owner.
+// SECURITY NOTE, CORRECTED 2026-08-05 (#646). The text that stood here said
+// validate_user_ptr() "has ZERO other callers in the tree" and that
+// SYS_PROC_LIST "hands arg1 straight to proc_snapshot()". Both were true when
+// #487 was written and are FALSE now, so they are replaced rather than left to
+// mislead the next reader into re-fixing something already fixed. What is true
+// today:
+//   - validate_user_ptr() (security/validate.c) has many callers: proc/syscall.c,
+//     this file's syscalls, and rustkern/argtab.rs.
+//   - proc/syscall.c runs syscall_validate_args() as a CHOKEPOINT before the
+//     dispatch switch, driven by the descriptor table in rustkern/argtab.rs.
+//     SYS_PROC_LIST (238) is declared there, so its user pointer IS validated
+//     before proc_snapshot() sees it.
+//   - The residual gap is narrower and different: a syscall with NO descriptor
+//     is not validated and the gate returns 0. tools/syscall-ptr-lint holds the
+//     ledger of undeclared syscalls and fails the build if that set grows.
+//     Judge coverage by that ledger, not by this comment.
 #ifndef PROCINFO_H
 #define PROCINFO_H
 
@@ -134,6 +141,12 @@ int64_t sys_proc_detail(uint32_t pid, void *uout);
 
 #define PI_SVC_STOP   0
 #define PI_SVC_START  1
+// (#785) Enable/disable, which unlike start/stop is DURABLE: it rewrites the
+// service's own config file so the state survives a reboot. svc_enable()
+// returns non-zero when it could not make the change durable, and this verb
+// passes that straight through rather than flattening it to success.
+#define PI_SVC_DISABLE 2
+#define PI_SVC_ENABLE  3
 
 // Sentinel for sys_net_conns: every connection regardless of owner. Cannot be a
 // real pid (0 is a legitimate query meaning "kernel-internal / unowned").

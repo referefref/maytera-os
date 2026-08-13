@@ -49,6 +49,61 @@ static void ahci_delay(uint32_t ms) {
     }
 }
 
+// #287/#426: RDTSC helper, hoisted here so the ERROR-RECOVERY waits below can
+// use it. The full rationale for a cycle budget over a loop counter is in the
+// AHCI_CMD_TIMEOUT_CYCLES comment further down; this is the same clock.
+static inline uint64_t ahci_rdtsc_(void) {
+    uint32_t lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((uint64_t)hi << 32) | lo;
+}
+
+// Deliberately generous ceiling (8 GHz; real x86-64 CPUs are always slower)
+// used to convert a millisecond budget into cycles without a calibrated TSC
+// frequency. Over-estimating the clock means a deadline always takes AT LEAST
+// the nominal time, never less - we must never give up on a working port early.
+#define AHCI_TSC_CYCLES_PER_MS_MAX 8000000ULL
+
+// #287/#426 BOUNDED REGISTER WAIT FOR THE ERROR-RECOVERY PATH.
+//
+// port_stop_cmd(), port_start_cmd() and the PxCMD.CLO wait in
+// ahci_port_recover() each polled 500 times with an ahci_delay(1) between
+// tries. ahci_delay(1) is 20,000 `outb 0x80` I/O-port round trips, so those
+// three loops together cost up to 30,000,000 port writes, every one of them a
+// VM exit under virtualization.
+//
+// That is the SAME trap already documented below for wait_cmd_complete(),
+// which was converted to an RDTSC budget precisely because calling
+// ahci_delay() on every poll inflated microsecond waits into multi-second
+// ones. The recovery path was missed at the time.
+//
+// It matters MORE here than anywhere else in this file, because recovery runs
+// with INTERRUPTS OFF. Every caller reaches ahci_read()/ahci_write() through
+// drivers/ata.c's public wrappers, which hold g_ata_io_lock via
+// spinlock_acquire_irqsave(), and that lock is held across the whole transfer
+// including wait_cmd_complete() and therefore ahci_port_recover(). So ONE
+// wedged or failing command could stop the timer tick, keyboard/mouse input
+// and the compositor for the entire spin: measured as up to ~30 s of dead
+// machine on a single disk error. That interrupts-masked hold is #287.
+//
+// Polling the MMIO register against a real-time budget keeps the same nominal
+// bound with a couple of register reads per iteration instead of tens of
+// thousands of port writes.
+//
+// Waits until (*reg & mask) == want_zero ? 0 : mask. Returns 1 if the
+// condition was met inside the budget, 0 on timeout.
+#define AHCI_RECOVER_TIMEOUT_MS 500
+static int ahci_wait_reg(volatile uint32_t *reg, uint32_t mask, int want_zero,
+                         uint32_t budget_ms) {
+    uint64_t budget = (uint64_t)budget_ms * AHCI_TSC_CYCLES_PER_MS_MAX;
+    uint64_t t0 = ahci_rdtsc_();
+    for (;;) {
+        uint32_t v = *reg & mask;
+        if (want_zero ? (v == 0) : (v == mask)) return 1;
+        if ((ahci_rdtsc_() - t0) >= budget) return 0;
+    }
+}
+
 // Classify the signature's low 16 bits into a device type. The high 16 bits
 // are device-specific (e.g. ATAPI's 0xEB14, PM's 0x9669); QEMU sometimes
 // leaves them as 0xFFFF, so we match on the low half which is identical for the
@@ -94,28 +149,22 @@ static void port_stop_cmd(volatile uint32_t *port_regs) {
     // Clear FRE (FIS Receive Enable)
     port_regs[PORT_CMD / 4] &= ~PORT_CMD_FRE;
     
-    // Wait until FR (FIS Receive Running) and CR (Command Running) are cleared
-    int timeout = 500;
-    while (timeout > 0) {
-        uint32_t cmd = port_regs[PORT_CMD / 4];
-        if (!(cmd & PORT_CMD_FR) && !(cmd & PORT_CMD_CR)) {
-            return;
-        }
-        ahci_delay(1);
-        timeout--;
-    }
-    
+    // Wait until FR (FIS Receive Running) and CR (Command Running) are cleared.
+    // #287/#426: real-time budget, not 500 x ahci_delay(1) (= 10,000,000 port
+    // writes with interrupts off). See ahci_wait_reg() above.
+    if (ahci_wait_reg(&port_regs[PORT_CMD / 4], PORT_CMD_FR | PORT_CMD_CR, 1,
+                      AHCI_RECOVER_TIMEOUT_MS))
+        return;
+
     kprintf("[AHCI] Warning: Port stop command timeout\n");
 }
 
 // Start command engine
 static void port_start_cmd(volatile uint32_t *port_regs) {
-    // Wait until CR is cleared
-    int timeout = 500;
-    while ((port_regs[PORT_CMD / 4] & PORT_CMD_CR) && timeout > 0) {
-        ahci_delay(1);
-        timeout--;
-    }
+    // Wait until CR is cleared. #287/#426: real-time budget, not
+    // 500 x ahci_delay(1) with interrupts off. See ahci_wait_reg() above.
+    (void)ahci_wait_reg(&port_regs[PORT_CMD / 4], PORT_CMD_CR, 1,
+                        AHCI_RECOVER_TIMEOUT_MS);
     
     // Set FRE and ST
     port_regs[PORT_CMD / 4] |= PORT_CMD_FRE;
@@ -219,11 +268,7 @@ static int find_cmd_slot(ahci_port_t *port) {
 // it works as a wall-clock source even during ahci_init() (called from
 // ata_init() before sti() enables interrupts in main.c) when timer_ticks is
 // still frozen. Same primitive drivers/ata.c's read_tsc() uses for timing.
-static inline uint64_t ahci_rdtsc(void) {
-    uint32_t lo, hi;
-    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
-    return ((uint64_t)hi << 32) | lo;
-}
+#define ahci_rdtsc ahci_rdtsc_
 
 // Command timeout for wait_cmd_complete() below, expressed as a TSC cycle
 // budget rather than a raw loop-iteration count. AHCI_CMD_TIMEOUT_MS (5s)
@@ -247,7 +292,7 @@ static inline uint64_t ahci_rdtsc(void) {
 // in a normal boot, turned into a multi-minute stall. Polling RDTSC plus a
 // couple of MMIO register reads is cheap and needs no artificial delay.
 #define AHCI_CMD_TIMEOUT_MS 5000
-#define AHCI_TSC_CYCLES_PER_MS_MAX 8000000ULL
+/* AHCI_TSC_CYCLES_PER_MS_MAX is defined above, next to ahci_wait_reg(). */
 #define AHCI_CMD_TIMEOUT_CYCLES \
     ((uint64_t)AHCI_CMD_TIMEOUT_MS * AHCI_TSC_CYCLES_PER_MS_MAX)
 
@@ -301,11 +346,10 @@ static void ahci_port_recover(ahci_port_t *port, int slot) {
     if ((tfd & (PORT_TFD_STS_BSY | PORT_TFD_STS_DRQ)) &&
         (ahci_hba.cap & HBA_CAP_SCLO)) {
         port_regs[PORT_CMD / 4] |= PORT_CMD_CLO;
-        int clo_timeout = 500;
-        while ((port_regs[PORT_CMD / 4] & PORT_CMD_CLO) && clo_timeout > 0) {
-            ahci_delay(1);
-            clo_timeout--;
-        }
+        // #287/#426: real-time budget, not 500 x ahci_delay(1) with
+        // interrupts off. See ahci_wait_reg() above.
+        (void)ahci_wait_reg(&port_regs[PORT_CMD / 4], PORT_CMD_CLO, 1,
+                            AHCI_RECOVER_TIMEOUT_MS);
     }
 
     // Restart the command engine (sets FRE+ST) so the port is usable again.

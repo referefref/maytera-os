@@ -60,13 +60,20 @@ int main(int argc, char **argv) {
             return 1;
         }
     } else {
-        // Root can su without password, just setuid
-        if (setuid(pw->pw_uid) != 0) {
-            printf("su: setuid failed\n");
-            return 1;
-        }
+        // Root can su without password, just setuid/setgid. #554 fix: setgid
+        // MUST run BEFORE setuid. sys_setgid()'s "root can set any gid" check
+        // tests the CALLER's CURRENT euid (kernel proc/syscall.c sys_setgid),
+        // and setuid() just changed this process's own euid away from 0 - so
+        // the old order (setuid then setgid) always failed setgid with EPERM
+        // for any su target other than root itself, discovered while
+        // verifying task #554's chmod/chown enforcement (this bug blocked
+        // testing as a non-root user at all). Group first, while still root.
         if (setgid(pw->pw_gid) != 0) {
             printf("su: setgid failed\n");
+            return 1;
+        }
+        if (setuid(pw->pw_uid) != 0) {
+            printf("su: setuid failed\n");
             return 1;
         }
     }

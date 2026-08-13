@@ -12,6 +12,7 @@
 #include "../mm/vmm.h"
 #include "../sync/waitq.h"
 #include "../proc/process.h"
+#include "../security/uaccess_smap.h"  // #19/#645: AC bracket on the caller-buffer copy
 
 // ============================================================================
 // Tunables
@@ -413,14 +414,22 @@ int64_t audio_pcm_write(int handle, const void *ubuf, uint32_t frames) {
         uint32_t run = s->cap_frames - idx;
         if (run > n) run = n;
 
-        memcpy(s->ring + (size_t)idx * s->ch,
-               src + (size_t)done * s->ch,
-               (size_t)run * s->ch * sizeof(int16_t));
-        if (run < n) {
-            memcpy(s->ring,
-                   src + (size_t)(done + run) * s->ch,
-                   (size_t)(n - run) * s->ch * sizeof(int16_t));
-        }
+        // #19/#645: `src` is the Ring-3 PCM buffer (this function's only
+        // caller is sys_audio_pcm_write) and pcm_user_range_ok() above proved
+        // it ACCESS_READ_USER, i.e. U/S=1, i.e. a certain #PF without AC. The
+        // bracket is inside the loop and around the two copies ONLY: the
+        // wait_event_interruptible() earlier in this loop must never run with
+        // AC set.
+        {   uaccess_ac_t __ac = uaccess_begin();
+            memcpy(s->ring + (size_t)idx * s->ch,
+                   src + (size_t)done * s->ch,
+                   (size_t)run * s->ch * sizeof(int16_t));
+            if (run < n) {
+                memcpy(s->ring,
+                       src + (size_t)(done + run) * s->ch,
+                       (size_t)(n - run) * s->ch * sizeof(int16_t));
+            }
+            uaccess_end(__ac); }
 
         s->w += n;
         done += n;

@@ -1,0 +1,20 @@
+{
+  "name": "Install to Disk",
+  "version": "1.0.0",
+  "binary": "INSTALL",
+  "icon": "install.bmp",
+  "category": "System",
+  "description": "Install MayteraOS onto an internal disk so this computer can start on its own, without the USB stick.",
+  "capabilities": {
+    "actions": [],
+    "queries": []
+  },
+  "window": {
+    "default_width": 640,
+    "default_height": 480,
+    "resizable": false,
+    "min_width": 640,
+    "min_height": 480
+  },
+  "ipc_channels": []
+}

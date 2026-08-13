@@ -4,6 +4,12 @@
 #include "../../libc/gui.h"
 #include "../../libc/theme.h"
 #include "../../libc/aiclient.h"
+#include "../../libc/fcntl.h"     // #586: O_RDWR / O_NONBLOCK for /dev/ptmx
+#include "../../libc/termios.h"   // #586: TIOCGPTN / TIOCSWINSZ / struct winsize
+#include "../../libc/sys/ioctl.h" // #586: ioctl()
+#include "../../libc/unistd.h"    // #745: getuid() (was an implicit declaration)
+#include "../../libc/pwd.h"       // #745: the session user's real name and home
+#include "../../libc/userconf.h"  // #745: <home>/APPS on PATH, and a real HOME/USER
 
 // Terminal dimensions
 #define TERM_CHAR_W     8
@@ -92,6 +98,8 @@ static char cwd[256] = "/";
 static int escape_state = STATE_NORMAL;
 static int escape_params[16];
 static int escape_param_count = 0;
+static int csi_private = 0;       // #586: ESC[? ... private-mode sequences
+static int current_reverse = 0;   // #586: SGR 7 reverse video (status lines)
 
 // Window position for coordinate conversion
 static int win_x = 100;
@@ -279,14 +287,22 @@ static void handle_escape_char(char c) {
     if (escape_state == STATE_ESCAPE) {
         if (c == '[') {
             escape_state = STATE_CSI;
+            csi_private = 0;
             parse_csi_params();
         } else {
+            // ESC 7/8, ESC (B, etc.: single/short sequences we do not model.
             escape_state = STATE_NORMAL;
         }
         return;
     }
 
     if (escape_state == STATE_CSI) {
+        // #586: private-mode introducer, e.g. ESC[?25l (cursor), ESC[?1049h
+        // (alt screen). Without consuming '?', the numeric tail leaked as text.
+        if (c == '?') {
+            csi_private = 1;
+            return;
+        }
         if (c >= '0' && c <= '9') {
             escape_params[escape_param_count] = escape_params[escape_param_count] * 10 + (c - '0');
             return;
@@ -302,6 +318,26 @@ static void handle_escape_char(char c) {
         // End of sequence - process command
         escape_param_count++;  // Count includes last param
 
+        // #586: private-mode set/reset (ESC[?<n>h / ESC[?<n>l). Consume it so
+        // the tail never leaks as text; act on the modes we can render.
+        if (csi_private) {
+            if (c == 'h' || c == 'l') {
+                int on = (c == 'h');
+                for (int i = 0; i < escape_param_count; i++) {
+                    if (escape_params[i] == 25) {
+                        cursor_visible = on;              // DECTCEM
+                    } else if (escape_params[i] == 1049 ||
+                               escape_params[i] == 47 ||
+                               escape_params[i] == 1047) {
+                        term_clear();                      // enter/leave alt screen
+                    }
+                }
+            }
+            csi_private = 0;
+            escape_state = STATE_NORMAL;
+            return;
+        }
+
         switch (c) {
             case 'm':  // SGR - Set Graphics Rendition
                 for (int i = 0; i < escape_param_count; i++) {
@@ -310,6 +346,18 @@ static void handle_escape_char(char c) {
                         // Reset
                         current_fg = 7;
                         current_bg = 0;
+                        current_reverse = 0;
+                    } else if (p == 7) {
+                        // Reverse video: swap fg/bg so status lines invert.
+                        if (!current_reverse) {
+                            int t = current_fg; current_fg = current_bg; current_bg = t;
+                            current_reverse = 1;
+                        }
+                    } else if (p == 27) {
+                        if (current_reverse) {
+                            int t = current_fg; current_fg = current_bg; current_bg = t;
+                            current_reverse = 0;
+                        }
                     } else if (p >= 30 && p <= 37) {
                         // Foreground color
                         current_fg = p - 30;
@@ -340,8 +388,22 @@ static void handle_escape_char(char c) {
                 break;
 
             case 'J':  // Erase display
-                if (escape_params[0] == 2) {
+                if (escape_params[0] == 2 || escape_params[0] == 3) {
                     term_clear();
+                } else {
+                    // #586: default (0) = erase from cursor to end of screen.
+                    // vi clears the tail of its window this way.
+                    for (int col = cursor_x; col < term_cols; col++) {
+                        cells[cursor_y][col].ch = ' ';
+                        cells[cursor_y][col].fg = current_fg;
+                        cells[cursor_y][col].bg = current_bg;
+                    }
+                    for (int row = cursor_y + 1; row < term_rows; row++)
+                        for (int col = 0; col < term_cols; col++) {
+                            cells[row][col].ch = ' ';
+                            cells[row][col].fg = current_fg;
+                            cells[row][col].bg = current_bg;
+                        }
                 }
                 break;
 
@@ -599,29 +661,15 @@ static int pipe_resolve(char *line, char **argv, int *argcp, char *pathout) {
     if (argc == 0) return 0;
     *argcp = argc;
     char *prog = argv[0];
-    if (prog[0] == '/') {
-        int fd = open(prog, 0);
-        if (fd >= 0) { close(fd); str_copy(pathout, prog, 256); return 1; }
-        return 0;
-    }
-    char path[256];
-    str_copy(path, "/APPS/", 256);
-    int pl = 6, k = 0;
-    while (prog[k] && pl < 255) {
-        char c = prog[k++];
-        if (c >= 'a' && c <= 'z') c -= 32;
-        path[pl++] = c;
-    }
-    path[pl] = '\0';
-    int fd = open(path, 0);
-    if (fd >= 0) { close(fd); str_copy(pathout, path, 256); return 1; }
-    str_copy(path, "/APPS/", 256);
-    pl = 6; k = 0;
-    while (prog[k] && pl < 255) path[pl++] = prog[k++];
-    path[pl] = '\0';
-    fd = open(path, 0);
-    if (fd >= 0) { close(fd); str_copy(pathout, path, 256); return 1; }
-    return 0;
+    // #745: this hand-rolled resolver had "/APPS/" written into it TWICE and
+    // consulted $PATH nowhere, so a command that ran fine on its own became
+    // "Command not found in pipe" the moment it appeared in a pipeline. That
+    // was already wrong for anything outside /APPS; with a per-user
+    // application directory it would have been wrong for every app a user
+    // installed for themselves. resolve_program() is the shared resolver that
+    // already knows about $PATH, the ".ELF" suffix and the nested /GAMES
+    // convention, so use it instead of maintaining a second, weaker copy.
+    return resolve_program(prog, pathout);
 }
 
 // run_pipe: execute "c1 | c2" with c1's stdout feeding c2's stdin and c2's
@@ -696,7 +744,7 @@ static void term_ai_handle(const char *rest) {
         if (g_ai_ready == 1) aiclient_reset();   // seed system prompt once per session
     }
     if (g_ai_ready != 1) {
-        term_puts("AI unavailable: no API key at /CONFIG/KIMI.KEY\n");
+        term_puts("Set your API key in Settings > AI.\n");
         return;
     }
     aiclient_add(0, rest);
@@ -706,6 +754,214 @@ static void term_ai_handle(const char *rest) {
     int rc = aiclient_run_turn(answer, sizeof(answer), 0);
     if (rc != 0) { term_puts("\033[31mAI error:\033[0m "); term_puts(answer); term_puts("\n"); }
     else         { term_puts("\033[36mAI:\033[0m ");       term_puts(answer); term_puts("\n"); }
+}
+
+// ---- #586: interactive foreground execution on a real pty ------------------
+// Translate a window key event into the byte(s) a tty program expects on stdin.
+// Returns the count written into out[] (0 = drop this key). Printable and
+// control chars (ESC=0x1b, Tab, Ctrl-*) arrive as key_char; arrows/Enter/Backspace
+// may arrive as a special keycode with key_char==0.
+static int key_event_to_bytes(const gui_event_t *ev, char *out) {
+    char c = ev->key_char;
+    uint32_t kc = ev->keycode;
+    if (c != 0) {
+        if (c == '\n') c = '\r';   // Enter -> CR
+        out[0] = c;
+        return 1;
+    }
+    switch (kc) {
+        case 0x80: out[0] = 0x1b; out[1] = '['; out[2] = 'A'; return 3; // Up
+        case 0x81: out[0] = 0x1b; out[1] = '['; out[2] = 'B'; return 3; // Down
+        case 0x82: out[0] = 0x1b; out[1] = '['; out[2] = 'D'; return 3; // Left
+        case 0x83: out[0] = 0x1b; out[1] = '['; out[2] = 'C'; return 3; // Right
+        case 0x1C: out[0] = '\r'; return 1;    // Enter
+        case 0x0E: out[0] = 0x7f; return 1;    // Backspace
+        default:   return 0;
+    }
+}
+
+// Run a simple foreground command on a pseudo-terminal so interactive TUIs
+// (vi, and any program that reads stdin) receive keystrokes and render their
+// full-screen output. Reuses the kernel PTY (ptmx/pts) subsystem: keystrokes
+// the terminal window receives are written to the master (kernel feeds them
+// into the slave's line discipline = child stdin); the child's output is read
+// from the master and rendered through the terminal's ANSI engine. Returns
+// when the child exits (master EOF).
+static void run_foreground_pty(const char *path, char **argv, int argc) {
+    int master = open("/dev/ptmx", O_RDWR | O_NONBLOCK);
+    if (master < 0) {
+        term_puts("\033[31mpty: /dev/ptmx unavailable\033[0m\n");
+        return;
+    }
+    int pts_idx = -1;
+    if (ioctl(master, TIOCGPTN, &pts_idx) != 0 || pts_idx < 0) {
+        term_puts("\033[31mpty: TIOCGPTN failed\033[0m\n");
+        close(master);
+        return;
+    }
+    // Tell the tty its window size so the child (vi) sizes its screen correctly.
+    {
+        struct winsize ws;
+        ws.ws_row = (unsigned short)term_rows;
+        ws.ws_col = (unsigned short)term_cols;
+        ws.ws_xpixel = 0;
+        ws.ws_ypixel = 0;
+        ioctl(master, TIOCSWINSZ, &ws);
+    }
+    char slavepath[24];
+    { const char *pre = "/dev/pts/"; int i = 0;
+      while (pre[i]) { slavepath[i] = pre[i]; i++; }
+      if (pts_idx >= 10) slavepath[i++] = (char)('0' + pts_idx / 10);
+      slavepath[i++] = (char)('0' + pts_idx % 10);
+      slavepath[i] = '\0'; }
+    int slave = open(slavepath, O_RDWR);
+    if (slave < 0) {
+        term_puts("\033[31mpty: slave open failed\033[0m\n");
+        close(master);
+        return;
+    }
+    // Point the child's stdio at the slave: save ours, dup2 slave, spawn (the
+    // spawn inherits fds 0/1/2), then restore ours and drop the slave so only
+    // the child holds it (its close on exit gives the master EOF).
+    int s0 = dup(0), s1 = dup(1), s2 = dup(2);
+    dup2(slave, 0); dup2(slave, 1); dup2(slave, 2);
+    int pid = sys_spawn_args(path, argv, argc);
+    dup2(s0, 0); dup2(s1, 1); dup2(s2, 2);
+    close(s0); close(s1); close(s2);
+    close(slave);
+    if (pid <= 0) {
+        term_puts("\033[31mFailed to run: ");
+        term_puts(path);
+        term_puts("\033[0m\n");
+        close(master);
+        return;
+    }
+    // Pump: forward keystrokes to the master, render child output from it.
+    gui_event_t ev;
+    char kb[8];
+    char rbuf[1024];
+    int alive = 1;
+    while (alive) {
+        int et = win_get_event(window_handle, &ev, 10);
+        if (et != 0) {
+            switch (ev.type) {
+                case EVENT_KEY_DOWN: {
+                    int n = key_event_to_bytes(&ev, kb);
+                    if (n > 0) write(master, kb, n);
+                    break;
+                }
+                case EVENT_REDRAW:
+                    term_redraw();
+                    break;
+                case EVENT_RESIZE: {
+                    term_handle_resize(ev.mouse_x, ev.mouse_y);
+                    struct winsize ws;
+                    ws.ws_row = (unsigned short)term_rows;
+                    ws.ws_col = (unsigned short)term_cols;
+                    ws.ws_xpixel = 0; ws.ws_ypixel = 0;
+                    ioctl(master, TIOCSWINSZ, &ws);
+                    break;
+                }
+                case EVENT_WINDOW_CLOSE:
+                    alive = 0;   // closing the master hangs the child up
+                    break;
+                default: break;
+            }
+        }
+        int drew = 0;
+        for (;;) {
+            int n = read(master, rbuf, sizeof(rbuf));
+            if (n > 0) {
+                for (int i = 0; i < n; i++) term_putc(rbuf[i]);
+                drew = 1;
+                if (n < (int)sizeof(rbuf)) break;   // likely drained
+                continue;
+            }
+            if (n == 0) { alive = 0; break; }   // EOF: child exited
+            break;                               // EAGAIN / no data
+        }
+        if (drew) term_redraw();
+    }
+    int st = 0;
+    sys_waitpid(pid, &st, 0);
+    close(master);
+    // Reset rendition and leave the cursor visible for the shell prompt.
+    current_fg = 7; current_bg = 0; current_reverse = 0; cursor_visible = true;
+    term_redraw();
+}
+
+// #610 on-device filesystem checker. Mirrors ext2_fsck_report_t in
+// kernel/fs/ext2.h; the kernel refuses the call unless the buffer is >= 200
+// bytes, and the layout is locked there by _Static_assert.
+#define SYS_FSCK 356
+typedef struct {
+    unsigned int completed, inodes_used, blocks_used, dirs_used;
+    unsigned int e_bad_block_ptr, e_dup_block, e_phantom_inode, e_leaked_inode;
+    unsigned int e_block_used_bitmap_free, e_block_free_bitmap_used;
+    unsigned int e_bad_dirent, e_orphan_inode, e_link_mismatch;
+    unsigned int e_group_free_bad, e_sb_free_bad, e_bad_inode, e_io, total;
+    unsigned char first_msg[128];
+} term_fsck_report_t;
+
+static void term_fsck_line(const char *label, unsigned int n) {
+    if (!n) return;
+    term_puts("  \033[31m");
+    term_puts(label);
+    term_puts("\033[0m ");
+    term_put_int((int)n);
+    term_puts("\n");
+}
+
+static void term_do_fsck(void) {
+    term_fsck_report_t r;
+    long st = syscall3(SYS_FSCK, (long)&r, (long)sizeof(r), 1);
+    if (st == -19) { term_puts("\033[31mfsck: no ext2 volume mounted\033[0m\n"); return; }
+    if (st >= 0) {
+        term_puts("\033[1;33mfsck\033[0m  ext2 root, s_state at mount 0x");
+        term_put_int((int)(st & 0xFF));
+        term_puts(", mount count ");
+        term_put_int((int)((st >> 8) & 0xFFFF));
+        term_puts((st >> 24) ? "  \033[31m[volume wants checking]\033[0m\n"
+                             : "  \033[32m[last unmount was clean]\033[0m\n");
+    }
+    term_puts("\033[2mREAD-ONLY report. Nothing is repaired, and there is no repair\n"
+              "mode: a repairing fsck can destroy the data it is asked to save.\n"
+              "The volume is mounted and live, so a write in flight can surface as\n"
+              "a spurious mismatch; the boot-time check is the authoritative one.\033[0m\n");
+    term_puts("Scanning...\n");
+    long rc = syscall3(SYS_FSCK, (long)&r, (long)sizeof(r), 0);
+    if (rc != 0 || !r.completed) {
+        term_puts("\033[31mfsck: could NOT run (rc=");
+        term_put_int((int)rc);
+        term_puts("). That is not a clean result.\033[0m\n");
+        return;
+    }
+    term_puts("inodes in use: ");   term_put_int((int)r.inodes_used);
+    term_puts("   directories: "); term_put_int((int)r.dirs_used);
+    term_puts("   blocks in use: "); term_put_int((int)r.blocks_used);
+    term_puts("\n");
+    if (!r.total) { term_puts("\033[32mCLEAN: no problems found.\033[0m\n"); return; }
+    term_puts("\033[1;31m");
+    term_put_int((int)r.total);
+    term_puts(" problem(s) found:\033[0m\n");
+    term_fsck_line("out-of-range block pointers ......", r.e_bad_block_ptr);
+    term_fsck_line("multiply-claimed blocks .........", r.e_dup_block);
+    term_fsck_line("phantom inodes (used, bmap free) .", r.e_phantom_inode);
+    term_fsck_line("leaked inodes ...................", r.e_leaked_inode);
+    term_fsck_line("blocks in use but free in bitmap .", r.e_block_used_bitmap_free);
+    term_fsck_line("blocks marked used, unreferenced .", r.e_block_free_bitmap_used);
+    term_fsck_line("corrupt directory entries .......", r.e_bad_dirent);
+    term_fsck_line("orphan inodes (lost+found) ......", r.e_orphan_inode);
+    term_fsck_line("wrong link counts ...............", r.e_link_mismatch);
+    term_fsck_line("wrong group summary counts ......", r.e_group_free_bad);
+    term_fsck_line("wrong superblock free counts ....", r.e_sb_free_bad);
+    term_fsck_line("implausible inodes ..............", r.e_bad_inode);
+    term_fsck_line("block read failures .............", r.e_io);
+    if (r.first_msg[0]) {
+        term_puts("  first: ");
+        term_puts((const char *)r.first_msg);
+        term_puts("\n");
+    }
 }
 
 static void execute_command(const char *cmd) {
@@ -721,10 +977,18 @@ static void execute_command(const char *cmd) {
     // Built-in commands (only ones that MUST be builtins)
     if (str_eq(cmd, "help")) {
         term_puts("\033[1;33mMayteraOS Terminal - Commands:\033[0m\n");
-        term_puts("\nBuilt-in: cd, pwd, clear, history, exit, export, help\n");
+        term_puts("\nBuilt-in: cd, pwd, clear, history, exit, export, help, fsck\n");
+        term_puts("\033[2m  fsck  check the ext2 root filesystem (READ-ONLY, never repairs)\033[0m\n");
         term_puts("External: ls, cat, head, tail, grep, echo, touch, date,\n");
         term_puts("  uptime, whoami, env, cp, mv, rm, mkdir, rmdir, sort,\n");
-        term_puts("  wc, tac, less, test, tee, tr, cut, uniq, stat\n");
+        term_puts("  wc, tac, less, test, tee, tr, cut, uniq, stat,\n");
+        term_puts("  chmod, chown\n");
+        term_puts("\033[2m  chmod <mode> <file>       octal mode, e.g. chmod 644 foo.txt\n");
+        term_puts("  chown <user[:group]> <file>  numeric uid[:gid] or name[:group],\n");
+        term_puts("                             root only\n");
+        term_puts("  On a FAT path (/boot, /EFI): chmod only toggles the real\n");
+        term_puts("  read-only attribute (write bit set/clear); chown is refused,\n");
+        term_puts("  FAT has no owner. \033[0m\n");
         term_puts("\nAll commands in /APPS/ are available.\n");
         term_puts("Use UP/DOWN arrows for command history.\n");
         return;
@@ -732,6 +996,12 @@ static void execute_command(const char *cmd) {
 
     if (str_eq(cmd, "clear")) {
         term_clear();
+        return;
+    }
+
+    // #610: on-device filesystem check. Report-only, by design.
+    if (str_eq(cmd, "fsck")) {
+        term_do_fsck();
         return;
     }
 
@@ -948,6 +1218,15 @@ static void execute_command(const char *cmd) {
             return;
         }
 
+        // #586: a simple foreground command (no file redirection) runs on a
+        // real pty so it can read the keyboard on stdin - this is what makes
+        // interactive TUIs like vi work. Redirections ("> file", "< file")
+        // still use the capture path below.
+        if (!redir_out && !redir_in && !redir_err) {
+            run_foreground_pty(path, argv_ptrs, argc);
+            return;
+        }
+
         // Capture the child's stdout through a pipe (pipes, dup2 and spawn fd
         // inheritance all share the VFS per-process fd table). For "> file"
         // we buffer the captured output, then CLOSE the pipe (freeing its VFS
@@ -1036,11 +1315,35 @@ int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
 
-    // Initialize default environment variables
-    setenv_local("PATH", "/APPS");
-    setenv_local("HOME", "/");
+    // Initialize default environment variables.
+    //
+    // #745: PATH now leads with the session user's own application directory,
+    // so an app they installed for themselves runs by name. HOME and USER were
+    // hardcoded to "/" and the literal string "user" - not defaults, just
+    // wrong - which meant "cd ~" and "echo $HOME" in the terminal disagreed
+    // with msh, with the Files app, and with the kernel's own idea of the
+    // session. All three now come from the passwd table through the one shared
+    // home join. Root's home is "/", so a root session gets exactly the values
+    // it had before, with PATH deduped to the single "/APPS".
+    {
+        char hp[192], home[192], pathv[400];
+        if (userhome_path(0, "APPS", hp, sizeof(hp)) == 0 && !str_eq(hp, "/APPS")) {
+            int o = 0;
+            for (int i = 0; hp[i] && o < (int)sizeof(pathv) - 8; i++) pathv[o++] = hp[i];
+            pathv[o++] = ':';
+            const char *sysdir = "/APPS";
+            for (int i = 0; sysdir[i] && o < (int)sizeof(pathv) - 1; i++) pathv[o++] = sysdir[i];
+            pathv[o] = '\0';
+            setenv_local("PATH", pathv);
+        } else {
+            setenv_local("PATH", "/APPS");
+        }
+        if (userhome_root(home, sizeof(home)) == 0) setenv_local("HOME", home);
+        else setenv_local("HOME", "/");
+        struct passwd *pw = getpwuid(getuid());
+        setenv_local("USER", (pw && pw->pw_name[0]) ? pw->pw_name : "user");
+    }
     setenv_local("SHELL", "/bin/terminal");
-    setenv_local("USER", "user");
     setenv_local("TERM", "maytera-256color");
 
     // Sync the kernel per-process working directory with our tracked cwd ("/")

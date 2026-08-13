@@ -728,6 +728,22 @@ static const uint8_t font8x8[95][8] = {
 // mask, layer opacity and lock-alpha all still apply. Falls back to the
 // compact 8x8 bitmap font only if the TTF registry is unavailable.
 static unsigned char g_text_gbmp[192 * 192];
+// #530 per-layer font memory: whatever the Text tool is set to at the moment
+// a stamp actually lands is what this layer will remember. ui.c picks this
+// back up next time this layer becomes active with the Text tool selected,
+// so re-editing text on a layer continues in the SAME font without the user
+// re-opening the Choose Font dialog every time.
+static void text_save_layer_font(layer_t *L) {
+    L->has_text_font = 1;
+    strncpy(L->text_family, g_tool.text_family, sizeof(L->text_family) - 1);
+    L->text_family[sizeof(L->text_family) - 1] = 0;
+    strncpy(L->text_style, g_tool.text_style, sizeof(L->text_style) - 1);
+    L->text_style[sizeof(L->text_style) - 1] = 0;
+    L->text_face   = g_tool.text_font;
+    L->text_bold   = g_tool.text_bold;
+    L->text_italic = g_tool.text_italic;
+    L->text_size   = g_tool.size;
+}
 static void text_commit(int x, int y) {
     layer_t *L = al();
     if (!L || !L->px || !g_tool.text[0]) return;
@@ -764,6 +780,7 @@ static void text_commit(int x, int y) {
                                        g_tool.fg, g_tool.opacity);
             cx += 8 * scale;
         }
+        text_save_layer_font(L);
         g_doc.comp_dirty = 1; g_doc.modified = 1;
         return;
     }
@@ -801,6 +818,7 @@ static void text_commit(int x, int y) {
                 put_px(L->px, ux, uy + t, g_tool.fg, g_tool.opacity);
     }
 
+    text_save_layer_font(L);
     g_doc.comp_dirty = 1; g_doc.modified = 1;
 }
 

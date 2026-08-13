@@ -1,3 +1,7 @@
+; SPDX-License-Identifier: MIT
+; Copyright (c) MayteraOS contributors.
+; Full license text: userland/libc/LICENSE (MIT License).
+;
 ; syscall.asm - System call stubs for MayteraOS user space
 ; x86-64 syscall calling convention:
 ;   Syscall number in RAX
@@ -76,3 +80,8 @@ syscall6:
     mov     r9, [rsp+8]     ; arg6 (on stack)
     syscall
     ret
+
+; #640 leg 4: mark the stack NON-EXECUTABLE. ld marks PT_GNU_STACK RWE for
+; the WHOLE link if ANY input object lacks this note, so every hand-written
+; NASM object needs it, not just crt0. gcc emits it automatically for C.
+section .note.GNU-stack noalloc noexec nowrite progbits

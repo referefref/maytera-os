@@ -19,13 +19,28 @@ static char nv_lower(char c) {
     return (c >= 'A' && c <= 'Z') ? (char)(c - 'A' + 'a') : c;
 }
 
-// Case-insensitive substring search. Returns 1 if `needle` occurs in `hay`.
-static int ci_contains(const char *hay, const char *needle) {
-    if (!needle || !*needle) return 0;
-    for (const char *h = hay; *h; h++) {
-        const char *a = h, *b = needle;
-        while (*a && *b && nv_lower(*a) == nv_lower(*b)) { a++; b++; }
-        if (!*b) return 1;
+// Case-insensitive substring search over a BOUNDED, possibly non-NUL-terminated
+// buffer. Returns 1 if `needle` occurs in hay[0..haylen).
+//
+// #745: this took a NUL-terminated string, and nova_scan() bounded it by copying
+// the caller's text into a 16KB FILE-STATIC scratch buffer. That was safe only
+// while nova_scan() had ZERO CALLERS. The moment a syscall reaches it, two
+// concurrent scans interleave their copies and each can end up scanning the
+// other's text, which is a real bypass: thread B's benign prompt overwrites
+// thread A's hostile one mid-scan and the hostile one is passed clean. The
+// previous NOT-WIRED banner in nova.h flagged this and told whoever wired it up
+// to either take a mutex or pass a scratch buffer. Taking a LENGTH is better
+// than both: the scratch buffer is deleted outright, so the matcher is
+// reentrant by construction rather than by a lock somebody has to remember.
+static int ci_contains_n(const char *hay, int haylen, const char *needle) {
+    if (!needle || !*needle || haylen <= 0) return 0;
+    int nl = 0;
+    while (needle[nl]) nl++;
+    if (nl > haylen) return 0;
+    for (int i = 0; i + nl <= haylen; i++) {
+        int j = 0;
+        while (j < nl && nv_lower(hay[i + j]) == nv_lower(needle[j])) j++;
+        if (j == nl) return 1;
     }
     return 0;
 }
@@ -33,10 +48,10 @@ static int ci_contains(const char *hay, const char *needle) {
 // Detects a long run of base64-alphabet chars (a common obfuscation carrier).
 // Requires >= 32 contiguous [A-Za-z0-9+/=] chars including at least one digit
 // or +/= symbol, which normal prose almost never produces.
-static int has_long_b64_run(const char *text) {
+static int has_long_b64_run_n(const char *text, int len) {
     int run = 0, had_sym = 0;
-    for (const char *p = text; *p; p++) {
-        char c = *p;
+    for (int i = 0; i < len; i++) {
+        char c = text[i];
         int is64 = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
                    (c >= '0' && c <= '9') || c == '+' || c == '/' || c == '=';
         if (is64) {
@@ -177,7 +192,7 @@ static const nova_rule_t g_rules[] = {
 
 // Evaluate one rule against text. Returns 1 if fired, and sets *matched_out to
 // a literal that matched (or "base64-blob" for the obfuscation heuristic).
-static int nova_eval_rule(const nova_rule_t *r, const char *text,
+static int nova_eval_rule(const nova_rule_t *r, const char *text, int len,
                           const char **matched_out) {
     int matched_groups = 0;
     const char *first_match = 0;
@@ -185,7 +200,7 @@ static int nova_eval_rule(const nova_rule_t *r, const char *text,
         if (!r->groups[g].lits[0]) break;      // terminator group
         int hit = 0;
         for (int l = 0; l < NOVA_MAX_LITS && r->groups[g].lits[l]; l++) {
-            if (ci_contains(text, r->groups[g].lits[l])) {
+            if (ci_contains_n(text, len, r->groups[g].lits[l])) {
                 hit = 1;
                 if (!first_match) first_match = r->groups[g].lits[l];
                 break;
@@ -197,27 +212,24 @@ static int nova_eval_rule(const nova_rule_t *r, const char *text,
         if (matched_out) *matched_out = first_match ? first_match : "(keyword)";
         return 1;
     }
-    if ((r->flags & NOVA_RF_B64) && has_long_b64_run(text)) {
+    if ((r->flags & NOVA_RF_B64) && has_long_b64_run_n(text, len)) {
         if (matched_out) *matched_out = "base64-blob";
         return 1;
     }
     return 0;
 }
 
-int nova_scan(const char *text, nova_hit_t *hits, int max_hits) {
-    if (!text) return 0;
-
-    // Work on a bounded, NUL-terminated copy so a huge/oddly-terminated prompt
-    // cannot run the matcher unbounded.
-    static char buf[NOVA_SCAN_CAP + 1];
-    int n = 0;
-    while (text[n] && n < NOVA_SCAN_CAP) { buf[n] = text[n]; n++; }
-    buf[n] = 0;
+// #745: THE reentrant entry point. No copy, no static scratch, no lock needed.
+// The CALLER owns the bound, because the caller is the one that knows how much
+// of its buffer is real; rustkern/aiguard.rs caps at AIGUARD_SCAN_CAP and
+// reports `truncated` so nothing has to guess whether a scan was complete.
+int nova_scan_n(const char *text, int len, nova_hit_t *hits, int max_hits) {
+    if (!text || len <= 0) return 0;
 
     int fired = 0;
     for (int i = 0; i < NOVA_NRULES; i++) {
         const char *m = 0;
-        if (nova_eval_rule(&g_rules[i], buf, &m)) {
+        if (nova_eval_rule(&g_rules[i], text, len, &m)) {
             if (hits && fired < max_hits) {
                 hits[fired].rule     = g_rules[i].name;
                 hits[fired].category = g_rules[i].category;
@@ -228,6 +240,15 @@ int nova_scan(const char *text, nova_hit_t *hits, int max_hits) {
         }
     }
     return fired;
+}
+
+// NUL-terminated convenience wrapper, kept for nova_selftest() and the GUI.
+// NOVA_SCAN_CAP bounds the strlen walk only; it is NOT the guard's scan cap.
+int nova_scan(const char *text, nova_hit_t *hits, int max_hits) {
+    if (!text) return 0;
+    int n = 0;
+    while (text[n] && n < NOVA_SCAN_CAP) n++;
+    return nova_scan_n(text, n, hits, max_hits);
 }
 
 int nova_worst_severity(const char *text) {

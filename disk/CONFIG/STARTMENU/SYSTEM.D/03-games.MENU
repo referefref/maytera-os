@@ -1,0 +1,42 @@
+# Games - all-users Start-menu default fragment. Migrated verbatim from the
+# old hardcoded startmenu_init(), PLUS the two entries that used to live in
+# /GAMES.CFG (Commander Keen 4/6) - that file existed only on the golden
+# image, dated 4 July, and was never in git; this is that content, now
+# reproducible by a build. One unified submenu: native games (sys_spawn), the
+# Win16 Entertainment Pack titles + SkiFree (win16_run, type=win16), and the
+# DOS games (dos_run, type=dos). See #208.
+category: Games
+item: Maytera Arena | /APPS/ARENA | icon=game_arena
+item: Maytera Chess | /APPS/CHESS | icon=game_chess
+item: Maytera Squadron | /APPS/SQUADRON | icon=game_squadron
+item: AssaultCube | /APPS/ASSAULTCUBE | icon=game
+item: ClassiCube | /APPS/CLASSICUBE | icon=game
+# #537: DOOM lives at /GAMES/DOOM/DOOM.ELF (alongside its DOOM1.WAD); the old
+# /APPS/DOOM.ELF path did not exist, so that hardcoded entry launched nothing
+# for an unknown length of time. The existence check in
+# startmenu_model.rs::sm_model_finish() means a mistake like that now just
+# fails to render the item, instead of rendering an item that launches
+# nothing.
+item: DOOM | /GAMES/DOOM/DOOM.ELF | icon=game_doom
+item: Lemmings | /APPS/lemmings | icon=game_lemmings
+item: Solitaire | /APPS/SOLITAIRE | icon=game_solitaire
+item: Pong | /APPS/pong | icon=game_pong
+item: GL Cube | /APPS/GLCUBE | icon=game_glcube
+item: GL Matrix | /APPS/GLMATRIX | icon=game_glmatrix
+item: Tetris | /WIN16/MSEP/TETRIS.EXE | icon=win3x | type=win16
+item: Chips Challenge | /WIN16/MSEP/CHIPS.EXE | icon=win3x | type=win16
+item: FreeCell | /WIN16/MSEP/FREECELL.EXE | icon=win3x | type=win16
+item: Golf | /WIN16/MSEP/GOLF.EXE | icon=win3x | type=win16
+item: JezzBall | /WIN16/MSEP/JEZZBALL.EXE | icon=win3x | type=win16
+item: TetraVex | /WIN16/MSEP/TETRAVEX.EXE | icon=win3x | type=win16
+item: Rodent's Revenge | /WIN16/MSEP/RODENT.EXE | icon=win3x | type=win16
+item: Tut's Tomb | /WIN16/MSEP/TUTSTOMB.EXE | icon=win3x | type=win16
+item: SkiFree | /WIN16/EP3/SKI.EXE | icon=win3x | type=win16
+item: The Incredible Machine | /DOS/TIM/TIM.EXE | icon=dosapp | type=dos
+item: Commander Keen 5 | /DOS/KEEN5/KEEN5E.EXE | icon=dosapp | type=dos
+item: Commander Keen 4 | /GAMES/KEEN4/KEEN4E.EXE | icon=dosapp | type=dos
+item: Commander Keen 6 | /GAMES/KEEN6/K6DEMO.EXE | icon=dosapp | type=dos
+# Added to /GAMES.CFG by another agent after this ticket was written (found by
+# re-checking the live golden, build 1743, rather than trusting the ticket's
+# older snapshot of that file).
+item: Mutant Space Bats of Doom | /GAMES/BATS/BATS.EXE | icon=dosapp | type=dos

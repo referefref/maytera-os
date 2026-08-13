@@ -12,6 +12,7 @@
 #include "ed25519.h"
 #include "../string.h"
 #include "../mm/heap.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 typedef uint8_t  u8;
 typedef uint64_t u64;
@@ -424,7 +425,6 @@ static inline u64 ed25519_rdtsc(void) {
 
 void ed25519_decode_selftest(void) {
     extern int kprintf(const char *fmt, ...);
-    extern void bootlog_write(const char *fmt, ...);
     extern void unpack25519_rs(i64 *o, const u8 *n);
     gf a, b; int mism = 0; uint32_t st = 0x2545F491;
     static const u8 edges[4][32] = {

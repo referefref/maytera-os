@@ -205,6 +205,8 @@ typedef struct {
     int volume;       /* 0..10 (0 = mute)                                      */
     int bots;         /* default bot count for a new match, 1..15               */
     int minimap;      /* 1 = show the radar minimap overlay (toggle with M)     */
+    int render_scale; /* T0(a) #578: 1 = full res, 2 = half (~1/4 fillrate),
+                       * 3 = third, 4 = quarter. 1 keeps the exact 1:1 present. */
 } ArenaCfg;
 extern ArenaCfg g_arena_cfg;
 
@@ -234,6 +236,7 @@ void r_frame(World *world, uint32_t *blit, int stride);   /* draw full 3D scene 
 void r_shutdown(void);
 void r_add_tracer(vec3 a, vec3 b, uint32_t rgb);          /* beam/rail effect  */
 void r_set_fov(int fov_deg);                              /* horizontal FOV     */
+void r_set_render_scale(int den);   /* T0(a) #578: 1=full,2=half,3=third,4=qtr */
 void r_spawn_particles(vec3 pos, uint32_t rgb, int count, float speed);
 void r_explosion(vec3 pos, float radius);
 

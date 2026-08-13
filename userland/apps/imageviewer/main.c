@@ -7,6 +7,7 @@
 #include "../../libc/maytera.h"
 #include "../../libc/gui.h"
 #include "../../libc/theme.h"
+#include "../../libc/gui_theme.h"
 #include "../../libc/gui_style.h"
 
 #define WIN_W 640
@@ -145,8 +146,7 @@ static void apply_theme(void) {
 
     // Classic (Win95) theme keeps the beveled renderer; everything else uses
     // the modern rounded / soft-shadow renderer.
-    int active = get_theme();
-    int classic = (active == 4);  // kernel theme id 4 = Classic
+    int classic = gui_theme_is_classic();
     gui_set_style(classic ? GUI_STYLE_CLASSIC : GUI_STYLE_MODERN);
 
     gui_palette_t pal;

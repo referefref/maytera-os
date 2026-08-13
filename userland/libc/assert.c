@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // assert.c - assertion failure handler for MayteraOS userland (#422).
 #include "assert.h"
 #include "stdio.h"

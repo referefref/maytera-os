@@ -18,6 +18,15 @@ void ZB_plot(ZBuffer* zb, ZBufferPoint* p) {
 	if (zbps == 1) {
 		GLushort* pz;
 		PIXEL* pp;
+		// #560-followup: a point whose projected (x,y) lands outside the
+		// buffer (near-clip W close to zero, or a rounding edge case at the
+		// viewport boundary) used to be written with NO bounds check at all,
+		// corrupting whatever heap/bss memory follows zb->zbuf/zb->pbuf -
+		// the same missing-bounds-check class as the ZB_copyBuffer bug fixed
+		// earlier (#560 audit). Reject it here instead of walking off the
+		// end of the buffer.
+		if (p->x < 0 || p->x >= zb->xsize || p->y < 0 || p->y >= zb->ysize)
+			return;
 		pz = zb->zbuf + (p->y * zb->xsize + p->x);
 		pp = (PIXEL*)((GLbyte*)zb->pbuf + zb->linesize * p->y + p->x * PSZB);
 

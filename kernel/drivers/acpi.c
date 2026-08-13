@@ -371,6 +371,15 @@ int acpi_init(void) {
 void acpi_shutdown_flush(void) {
     fat_cache_flush(0);   // flush any dirty FAT readahead blocks
     ata_flush_all();      // tell each ATA drive to commit its write cache
+    // #610: mark the ext2 volume CLEAN. This is the whole point of the dirty
+    // flag: without a write here, a graceful "qm shutdown" and a yanked USB
+    // stick are indistinguishable on the next boot, and they must not be.
+    // Idempotent, and it runs on BOTH shutdown paths (the SCI power-button
+    // handler and acpi_shutdown() itself both call this).
+    {
+        extern void ext2_mark_clean(void);
+        ext2_mark_clean();
+    }
 }
 
 // #298: SCI interrupt handler. QEMU/Proxmox "qm shutdown" presses the virtual

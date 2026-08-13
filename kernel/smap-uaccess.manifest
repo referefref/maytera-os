@@ -1,0 +1,222 @@
+# smap-uaccess.manifest - #645 ledger of Ring-0 accesses to USER memory that do
+# NOT go through the copy_*_user primitives.
+#
+# FORMAT   <file>:<line>: <substring that must still be present near that line>
+# SECTIONS EXEMPT    provably safe for a stated reason; not a fault under SMAP.
+#          KNOWN_GAP a REAL unwrapped user access. Under SMAP this is a #PF on
+#                    a path the kernel takes in normal operation. Listed so the
+#                    gate can go green on "nothing NEW landed" while never
+#                    implying the tree is clean.
+#
+# THE LEDGER IS CHECKED, NOT TRUSTED. smap-uaccess-lint rule B1 re-reads every
+# entry and FAILS if the substring is no longer near that line: a site that was
+# fixed MUST be delisted, and a site that moved MUST have its line corrected.
+# This is the #514 lesson applied to a ledger: a list of things that used to be
+# true is worse than no list, because it reads as coverage.
+#
+# THE INTERLOCK. While this file has ANY gap entry, the lint FAILS a build whose
+# SMAP compile-time default is ON (i.e. one built without -DCONFIG_NO_SMAP).
+# Enabling SMAP with sites unconverted does not produce a hardened kernel, it
+# produces one that #PFs during process launch. Drain the ledger first; the
+# interlock is what stops that from being a judgement call.
+#
+# ===========================================================================
+# #19 (2026-08-11): THE LEDGER WAS DRAINED TO ONE ENTRY, AND CR4.SMAP IS STILL
+# OFF BECAUSE OF THAT ONE ENTRY. Read the gap section before touching the flag.
+# ===========================================================================
+# What the old ledger said, and what was actually true when it was re-measured
+# against the tree at f5652a4:
+#
+#   * It carried 125 gap entries and kernel/Makefile summarised them as "126
+#     measured Ring-0 accesses to user memory". That number was WRONG IN BOTH
+#     DIRECTIONS.
+#     - About 35 entries had ALREADY BEEN FIXED, by #566/#567/#700, and nobody
+#       delisted them. They anchor on the DECLARATION line of a user pointer
+#       (`char *ub = (char *)arg1;`), which rule B3 flags, while the write two
+#       lines below had become a copy_to_user(). Rule B1 only checks that the
+#       anchor TEXT is still present, and a declaration does not move when the
+#       body under it is fixed, so a fixed site reads exactly like a live one.
+#     - About 25 entries were never user accesses at all. `process_t *p =
+#       proc_current();` and `p->brk = new_brk;` are kernel-struct accesses that
+#       B3 attributes to a user pointer because they share a function with one.
+#       Those are below, in the exempt section, with the reason stated.
+#     - And it MISSED real sites: drivers/tty.c's tty_output_drain(),
+#       drivers/usb_cdc_acm.c's write-direction twin, and the whole IPC name
+#       service (ipc/msg.c sys_ipc_register_name/sys_ipc_lookup_name, added
+#       after the audit). Its prose UNDETECTABLE section had also gone stale on
+#       line numbers: fs/fat.c 1312/2337 -> 1841/3026, drivers/dev.c 98/143/151
+#       -> 99/145/153.
+#   * The genuinely unwrapped sites it DID name are converted: either to a
+#     copy_*_user() / strncpy_from_user() call, or to a uaccess_begin()/
+#     uaccess_end() bracket placed around the ACCESS (a copy loop, a batch of
+#     stores, a copy engine), never around a whole function.
+#   * And arming CR4.SMAP exposed a class NEITHER the ledger nor the lint could
+#     see, which is the single remaining blocker. See the gap section below.
+#
+# The conversions were verified by BOOTING an armed kernel, not by reading this
+# lint's output. The first armed boot died at RIP=0x5d3056 (memcpy_fast)
+# CR2=0x80000000 err=0x3, which is exec/elf.c's PT_LOAD copy: the ledger's own
+# headline claim, confirmed on a machine.
+#
+# HONEST LIMIT, unchanged: this lint cannot prove the ABSENCE of an unwrapped
+# access. An empty gap section means no site of the recognised shapes is left,
+# not that the tree is provably clean. The boot is the other half of the proof.
+
+[EXEMPT]
+
+# --- proc/procinfo.c : c_cstr_into() is the tail of the ROW BUILDERS, and the
+# AC window for those is opened by the CALLER, around the whole builder call
+# (sys_proc_handles / sys_svc_list). The builder IS this path's copy engine (see
+# the file header: "every byte copied into the caller's buffer is copied by the
+# Rust builders through exactly-sized slices"), so bracketing the engine is the
+# same discipline mm/uaccess.asm applies to its own copy loop. c_cstr_into's
+# OTHER caller, sys_svc_control(), passes a kernel buffer.
+proc/procinfo.c:23: for (uint32_t i = 0; i < cap; i++) dst[i] = 0;
+proc/procinfo.c:27: while (i < room && src[i]) { dst[i] = src[i]; i++; }
+proc/procinfo.c:28: dst[i] = 0;
+
+# --- proc/process.c : a DECLARATION, not a dereference. Rule B3's pointer
+# pattern matches the declaration itself. The store two lines below is a
+# copy_to_user() now, matching thread.c's already-converted twin.
+proc/process.c:2373: uint32_t *ctid = current_proc->clear_child_tid;
+
+# --- proc/signal.c : a DECLARATION, not a dereference. Every field store that
+# used to go through `frame` is built in a kernel-local sigframe_t and handed
+# over with ONE copy_to_user().
+proc/signal.c:139: sigframe_t *frame = (sigframe_t *)user_rsp;
+
+# --- proc/syscall.c sys_list_users : `t` is the KERNEL user table returned by
+# users_all(). B3 attributes it to the user side because the same function calls
+# copy_to_user() on its (genuinely user) output buffer. Reading a kernel table
+# is not a user access, and the one user write here is already a copy_to_user().
+proc/syscall.c:363: user_entry_t *t = users_all(&n);
+proc/syscall.c:366: if (!t[i].active) continue;
+proc/syscall.c:372: for (k = 0; k < 63 && t[i].username[k]; k++) ke.username[k] = t[i].use
+proc/syscall.c:374: for (k = 0; k < 63 && t[i].display_name[k]; k++) ke.display_name[k] =
+proc/syscall.c:376: ke.uid = t[i].uid;
+proc/syscall.c:377: ke.gid = t[i].gid;
+
+# --- proc/syscall.c spawn_impl : `kargp` is the KERNEL array that
+# copy_from_user() just filled FROM argv. B3 marks a copy_from_user DESTINATION
+# as a user pointer as well as its source, so the kernel-array reads below it
+# are flagged. The two genuine Ring-3 reads in this function (the argv pointer
+# array, and each argument string) are a copy_from_user() and a
+# strncpy_from_user() respectively.
+proc/syscall.c:3024: char *kargp[64];
+proc/syscall.c:3029: if (!kargp[i]) break;
+
+# --- proc/syscall.c sys_brk / sys_mmap / sys_munmap : `p` is proc_current(),
+# a KERNEL process_t. Same B3 attribution artefact: these take a user ADDRESS as
+# a scalar and never dereference it, they only hand it to the VMM. Nothing here
+# reads or writes user memory.
+proc/syscall.c:4496: process_t *p = proc_current();
+proc/syscall.c:4497: if (!p || p->privilege != PRIV_USER) {
+proc/syscall.c:4501: if (p->brk == 0) {
+proc/syscall.c:4502: p->brk = DEFAULT_BRK_START;
+proc/syscall.c:4506: return (int64_t)p->brk;
+proc/syscall.c:4510: uint64_t old_brk = p->brk;
+proc/syscall.c:4516: if (vmm_alloc_user_pages(p->cr3, old_brk, pages, VMM_USER_RW) != 0) {
+proc/syscall.c:4522: vmm_free_user_pages(p->cr3, new_brk, pages);
+proc/syscall.c:4525: p->brk = new_brk;
+proc/syscall.c:4548: process_t *p = proc_current();
+proc/syscall.c:4549: if (!p || p->privilege != PRIV_USER) return -1;
+proc/syscall.c:4552: if (!p->mm) p->mm = mm_create();
+proc/syscall.c:4553: if (!p->mm) return -1;
+proc/syscall.c:4579: uint64_t r = do_mmap((mm_struct_t *)p->mm, addr, len,
+proc/syscall.c:4585: process_t *p = proc_current();
+proc/syscall.c:4586: if (!p || p->privilege != PRIV_USER) {
+proc/syscall.c:4611: if (p->mm) return do_munmap((mm_struct_t *)p->mm, addr, len);
+proc/syscall.c:4614: vmm_free_user_pages(p->cr3, addr, pages);
+
+[KNOWN_GAP]
+# ONE entry, and it is a CLASS, not a site. Do not add anything else here to
+# make a build pass: an entry here disarms CR4.SMAP for the WHOLE kernel (the
+# Makefile interlock), which is a far larger regression than whatever site you
+# were trying to land. Convert the site.
+#
+# THE BLOCKER: A RING-3 PATH STRING IS HANDED TO THE FILESYSTEM RAW.
+# The syscall surface VALIDATES a path string (rustkern/argtab.rs declares it
+# Kind::Str, security/validate.c walks it) and then passes the CALLER'S OWN
+# Ring-3 pointer to the filesystem, which walks it again with plain Ring-0
+# loads: fat_read_file's /SMB and /NFS prefix tests, the /ext2 and root-routing
+# predicates in proc/syscall_path.h, ext2, fs/perms.c. Every one of those loads
+# is a #PF once CR4.SMAP is set. MEASURED on an armed boot: RIP inside
+# fat_read_file (fs/fat.c), CR2 in the user window, err=0x1 (present, read,
+# supervisor), with RSI holding the Ring-3 path and RDI the kernel fat_fs_t.
+#
+# It is a class of HUNDREDS of loads across a dozen files, so bracketing them
+# one at a time is not a fix, it is a list that goes stale. The fix is the
+# shape: bounce each declared string into kernel memory ONCE, at the dispatcher,
+# and rewrite the argument, so nothing downstream ever holds a Ring-3 string.
+# That also closes the check-and-use race argtab.rs's own header asks for, and
+# costs almost nothing, because validate_user_string() already walks every byte.
+#
+# THAT BOUNCE WAS BUILT, AND IT IS NOT IN THE TREE, BECAUSE IT REGRESSED THE
+# DESKTOP AND THE CAUSE WAS NOT FOUND. With it in, the compositor started,
+# mapped its framebuffer, read /CONFIG/LOGIN.CFG and then went idle at 0% CPU
+# without drawing; the control (same commit, bounce removed) drew the full
+# desktop. Two real bugs in it were found and fixed and did NOT explain the
+# rest: strnlen_user() returns the length EXCLUDING the NUL (so a capacity of
+# `need` silently truncated every path by one character), and the argtab
+# validation must run BEFORE the bounce, not after (validating the kernel copy
+# rejects it with -EFAULT). The leading unproven suspect for the residual is a
+# descriptor that declares an OUT parameter as Kind::Str: bouncing one of those
+# hands the handler a kernel buffer to fill and the caller never sees the
+# result, silently. Whoever picks this up should start by auditing every s()
+# entry in rustkern/argtab.rs for write-direction use, and should keep the
+# `make SMAPTEST=1` negative control armed while doing it.
+proc/syscall_path.h:46: return p && p[0]=='/' && p[1]=='e' && p[2]=='x' && p[3]=='t'
+fs/fat.c:2224: if (path && (path[0]=='/') &&
+
+# ---------------------------------------------------------------------------
+# CONVERTED, and still UNDETECTABLE BY THIS LINT - hand-maintained
+# ---------------------------------------------------------------------------
+# These were real unwrapped user accesses that no textual rule here can reach,
+# because the user pointer arrives as a plain `void *buf` through a VFS
+# function-pointer table (f->ops->read/write) or a driver op, with nothing in
+# the callee naming it as user memory. They are all converted now. They stay
+# listed, as prose, because the lint still cannot see them: if one of these
+# brackets is deleted, NOTHING in the build will notice, and this list is the
+# only pointer to where to look.
+#
+#   fs/fat.c fat_read_inner()/fat_write_inner()   - the two cluster memcpys
+#   fs/fat_vfs.c fat_file_write()                 - the g_wbuf fill loop
+#   fs/ext2_vfs.c e2v_read()/e2v_write()          - the two buffer memcpys
+#   fs/pipe.c pipe_read_fn()/pipe_write_fn()      - the two byte loops
+#   proc/fdlayer.c sys_read()                     - the SMB, ext2-rw and
+#                                                   ext2-window memcpys
+#   drivers/tty.c tty_read()/tty_write()/tty_output_drain()
+#   drivers/dev.c devzero_read()/devurandom_read()/devurandom_write()
+#   drivers/console.c console_write()             - the kputc loop and the
+#                                                   syslog mirror memcpy
+#   drivers/usb_cdc_acm.c usb_cdc_acm_write()/usb_cdc_acm_read()
+#   drivers/audio_pcm.c audio_pcm_write()         - the two ring memcpys ONLY,
+#                                                   never the wait_event around
+#                                                   them
+#   gui/fb_syscall.c sys_fb_info/sys_get_mouse/sys_get_global_mouse/sys_get_key
+#   gui/window.c sys_wm_get_windows()             - the whole row loop body
+#   gui/theme.c sys_theme_get_name()              - copy_to_user (no dispatcher
+#                                                   case exists for it today)
+#   ipc/shm.c sys_shm_map()/sys_shm_info()        - the out-param stores
+#   ipc/msg.c msg_queue_message()/msg_dequeue_message() - the payload memcpys;
+#             sys_ipc_register_name()/sys_ipc_lookup_name() now bounce the
+#             Ring-3 name once with strncpy_from_user
+#   sync/futex.c futex_wait()/futex_cmp_requeue() - the `*addr` load ONLY; the
+#             futex_wait bracket must stay inside the bucket lock and must not
+#             span the wait
+#   proc/syscall.c SYS_FONT_NAME / SYS_FONT_STYLE / SYS_FONT_FIND /
+#             SYS_CLIP_SET / SYS_CLIP_GET / SYS_SSH_CLIENT / SYS_NET_INFO /
+#             SYS_PROC_LIST / SYS_KERNEL_UPDATE and sc_copy_str_user()
+#
+# NOT a fault site, checked and cleared: net/socket.c (every user buffer already
+# goes through copy_*_user), the net_cr3_* helpers (they switch TO the kernel
+# CR3 and bounce payloads either side), exec/pe.c and the Win16 layer (kernel
+# heap only), drivers/tty.c's tty_ioctl() handlers (proc/syscall.c bounces the
+# ioctl arg through a kernel buffer at the SYS_IOCTL boundary; that clearance
+# lasts only as long as tty_ioctl_user_desc() lists every cmd whose handler
+# dereferences `arg`), fs/pipe.c pipe_create()'s pipefd[] (bounced at
+# SYS_PIPE), fs/fat.c's readdir family (bounced at SYS_READDIR), ipc/shm.c's
+# memset of the kernel direct-map alias in shm_create, gui/fb_syscall.c's
+# sys_fb_flip (it copies under the kernel CR3, whose identity map is U/S=0, as
+# the boot pre-flight probe measures), and all DMA (device DMA does not honour
+# SMAP, and no driver hands a user VA to a TRB/PRD).

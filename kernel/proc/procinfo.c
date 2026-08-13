@@ -12,6 +12,7 @@
 #include "../fs/vfs.h"
 #include "../net/tcp.h"
 #include "../security/validate.h"
+#include "../security/uaccess_smap.h"  // #19/#645: AC bracket around the row builders
 
 // ---------------------------------------------------------------------------
 // C reference twins. Kept VERBATIM alongside the Rust for the boot differential
@@ -108,7 +109,16 @@ int64_t sys_proc_handles(uint32_t pid, void *ubuf, int max) {
         src[n].path = f->path;
         n++;
     }
-    return handles_build(src, n, (handle_info_t *)ubuf, (uint32_t)max);
+    // #19/#645: the BUILDER is this path's copy engine (see the file header:
+    // every byte reaching the caller's buffer is written by it through
+    // exactly-sized slices), so the AC window is around the copy engine, which
+    // is exactly where mm/uaccess.asm puts its own. validate_user_ptr() above
+    // already proved the destination is ACCESS_RW_USER, i.e. U/S=1, i.e. a
+    // guaranteed #PF here without AC.
+    uaccess_ac_t __ac = uaccess_begin();
+    int64_t __r = handles_build(src, n, (handle_info_t *)ubuf, (uint32_t)max);
+    uaccess_end(__ac);
+    return __r;
 }
 
 int64_t sys_net_conns(uint32_t pid, void *ubuf, int max) {
@@ -123,13 +133,21 @@ int64_t sys_net_conns(uint32_t pid, void *ubuf, int max) {
     if (n <= 0) return 0;
     if (pid == PI_PID_ALL) {
         // Whole table: copy up to max rows straight through.
+        // #19/#645: one bulk copy through the canonical primitive instead of a
+        // per-row raw store into user memory.
         int w = (n < max) ? n : max;
-        for (int i = 0; i < w; i++) ((tcp_conn_info_t *)ubuf)[i] = all[i];
+        if (w > 0 && copy_to_user(ubuf, all, (size_t)w * sizeof(all[0])) != 0) {
+            return -1;
+        }
         return w;
     }
     // One process: the Rust filter bounds the destination by construction.
-    return conn_filter_by_pid(all, (uint32_t)n, pid,
-                              (tcp_conn_info_t *)ubuf, (uint32_t)max);
+    // #19/#645: bracket the builder (this path's copy engine), as above.
+    uaccess_ac_t __ac = uaccess_begin();
+    int64_t __r = conn_filter_by_pid(all, (uint32_t)n, pid,
+                                     (tcp_conn_info_t *)ubuf, (uint32_t)max);
+    uaccess_end(__ac);
+    return __r;
 }
 
 #define PI_MAX_SVCS 32
@@ -157,11 +175,32 @@ int64_t sys_svc_list(void *ubuf, int max) {
         src[n].account = s->account;
         n++;
     }
-    return svc_build(src, n, (svc_info_t *)ubuf, (uint32_t)max);
+    // #19/#645: bracket the builder (this path's copy engine), as above.
+    uaccess_ac_t __ac = uaccess_begin();
+    int64_t __r = svc_build(src, n, (svc_info_t *)ubuf, (uint32_t)max);
+    uaccess_end(__ac);
+    return __r;
 }
 
 int64_t sys_svc_control(const char *uname, int action) {
     if (!uname) return -1;
+    // #692: starting a service creates a Ring-3 process running as that
+    // service's account, and every service the golden ships is uid 0. With
+    // no check here, any unprivileged process could mint a root process on
+    // demand. Found by a sweep AFTER the three known launcher sites were
+    // fixed, which is the whole reason the sweep was run.
+    //
+    // (#785) This root gate is no longer inert: the Task Manager's Start/Stop
+    // buttons and the svcmgr enable/disable path both reach this syscall, so a
+    // non-root desktop session is now genuinely refused here rather than merely
+    // hypothetically.
+    {
+        process_t *cur = proc_current();
+        if (cur && cur->privilege == PRIV_USER && cur->euid != 0) {
+            kprintf("[SVC] DENIED svc_control by uid=%u (root only)\n", cur->euid);
+            return -1;
+        }
+    }
     if (validate_user_string(uname, PI_NAME_MAX) != VALIDATE_OK) return -1;
     // Copy the name into kernel space before using it: the caller could
     // otherwise race the string's contents between validation and use.
@@ -169,6 +208,11 @@ int64_t sys_svc_control(const char *uname, int action) {
     c_cstr_into(name, PI_NAME_MAX, uname);
     if (action == PI_SVC_START) return svc_start(name);
     if (action == PI_SVC_STOP)  return svc_stop(name);
+    // (#785) Durable enable/disable. svc_enable() persists first and returns
+    // negative if it could not, so the caller is never told a change is
+    // permanent when it is only in RAM.
+    if (action == PI_SVC_ENABLE)  return svc_enable(name, 1);
+    if (action == PI_SVC_DISABLE) return svc_enable(name, 0);
     return -1;
 }
 
@@ -214,10 +258,26 @@ int64_t sys_proc_detail(uint32_t pid, void *uout) {
     for (int fd = 0; fd < MAX_FDS; fd++) if (p->fds[fd]) nh++;
     d.handles = nh;
 
+    // #421 phase 5: this is a THIRD caller of proc_mem_fill_in()+
+    // proc_mem_account() (process.c's proc_snapshot() and procmem.c's
+    // proc_mem_info() are the other two), reachable directly from userland
+    // via SYS_PROC_DETAIL (sys_proc_detail, syscall.c). It was missed on the
+    // first pass of the g_proc_mm_lock fix (see process.h for the full race
+    // writeup) because it lives in a separate file from procmem.c/process.c;
+    // grep for every proc_mem_fill_in/proc_mem_account call site before
+    // trusting this lock is complete again if a fourth ever appears. Found
+    // by reproducing the real crash: with only the first two call sites
+    // locked, AssaultCube's phase-4/5 crash-recovery scenario still
+    // panicked the kernel at the exact same proc_mem_account_rs address,
+    // because sys_proc_detail (polled by Task Manager / procinfo consumers)
+    // walked the same being-freed vma_list through this unlocked path.
     proc_mem_in_t mi;
     proc_mem_out_t mo;
+    proc_mm_lock();
     proc_mem_fill_in(p, &mi);
-    if (proc_mem_account(&mi, &mo) == 1) {
+    int mem_ok = (proc_mem_account(&mi, &mo) == 1);
+    proc_mm_unlock();
+    if (mem_ok) {
         d.working_set_kb = mo.working_set_kb;
         d.private_kb = mo.private_kb;
         d.virt_kb = mo.virt_kb;
@@ -225,7 +285,8 @@ int64_t sys_proc_detail(uint32_t pid, void *uout) {
         d.vma_count = mo.vma_walked;
         d.mem_flags = mo.flags;
     }
-    *(proc_detail_t *)uout = d;
+    // #19/#645: one fixed-size struct to user memory, through the primitive.
+    if (copy_to_user(uout, &d, sizeof(d)) != 0) return -1;
     return 1;
 }
 

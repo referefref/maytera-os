@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // math.c - minimal freestanding libm for MayteraOS userland.
 // Added for the TinyGL port (task #319). Accuracy targets graphics use, not
 // full IEEE conformance. Uses SSE2 (the userland is built with -msse2).
@@ -130,6 +134,10 @@ double pow(double x, double y) {
 float powf(float x, float y) { return (float)pow((double)x, (double)y); }
 float sinf(float x) { return (float)sin((double)x); }
 float cosf(float x) { return (float)cos((double)x); }
+// AssaultCube port phase 3 (docs/ASSAULTCUBE_PORT_PLAN.md): the same
+// double-to-float wrapper pattern as sinf/cosf/powf above, just the four
+// functions that happened not to be needed by anything before this port.
+float tanf(float x) { return (float)tan((double)x); }
 
 // ---- atan/atan2/asin/acos ----
 double atan(double x) {
@@ -160,6 +168,10 @@ double asin(double x) {
     return atan(x / sqrt(1.0 - x*x));
 }
 double acos(double x) { return M_PI_2 - asin(x); }
+// AssaultCube port phase 3: float wrappers, same pattern as sinf/cosf/tanf.
+float atan2f(float y, float x) { return (float)atan2((double)y, (double)x); }
+float asinf(float x) { return (float)asin((double)x); }
+float acosf(float x) { return (float)acos((double)x); }
 
 // ===========================================================================
 // Phase 1 (#422 / CPython #359) additions: the libm essentials CPython's math
@@ -273,6 +285,14 @@ double modf(double x, double *iptr) {
     if (x != x) return x;
     if (x + x == x && x != 0.0) return copysign(0.0, x);  // +/-inf -> +/-0
     return x - i;
+}
+// AssaultCube port phase 3: float overload (real, not a stub: converts
+// through the double implementation above rather than reimplementing).
+float modff(float x, float *iptr) {
+    double di;
+    float r = (float)modf((double)x, &di);
+    *iptr = (float)di;
+    return r;
 }
 
 double remainder(double x, double y) {

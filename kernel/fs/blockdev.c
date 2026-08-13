@@ -28,6 +28,7 @@
 #include "../drivers/usb_msc.h"
 #include "../mm/pmm.h"
 #include "../string.h"
+#include "../sync/spinlock.h"   // #421: canonical irqsave lock (see blk_lk below)
 
 extern int kprintf(const char *fmt, ...);
 extern void proc_yield(void);
@@ -122,14 +123,92 @@ static uint64_t *g_tag = 0;
 static uint32_t  g_slots = 0;
 static uint32_t  g_mask = 0;
 
-// Simple yielding lock (tiny holds; matches msc_cmd_lock pattern in the tree).
-static volatile int g_blk_busy = 0;
-static void blk_lk(void)   { while (__sync_lock_test_and_set(&g_blk_busy, 1)) proc_yield(); }
-static void blk_ul(void)   { __sync_lock_release(&g_blk_busy); }
+// #421 (AssaultCube shadow-cache freeze): this WAS a hand-rolled yielding lock,
+//   static volatile int g_blk_busy;
+//   blk_lk() { while (test_and_set(&g_blk_busy,1)) proc_yield(); }
+// which is a #426 violation and it FROZE the whole kernel under AssaultCube's
+// startup shadow-cache write storm (hundreds of tiny ext2 writes). Root cause,
+// measured on build 916 by pausing the vCPU at the freeze and walking the proc
+// table: the critical sections here are a single memcpy (a few instructions
+// between the acquire xchg and the release mov). If the timer preempts a holder
+// inside that window, the holder is left READY while still holding g_blk_busy,
+// and because add_to_ready_queue() is PRIORITY-ordered a lower-priority holder
+// can then be starved indefinitely by the higher-priority procs that are now
+// spinning here. Every block-I/O proc piles into proc_yield()->sched_schedule(),
+// producing a context-switch STORM on the BSP (CPU#0 pinned ~90%, IF=0 so the
+// timer barely ticks, kernel heartbeat dead, NO panic). It never recovers.
+// Fix: use the canonical irqsave spinlock, exactly like g_e2c_lock (fs/ext2.c)
+// and g_ata_io_lock (drivers/ata.c). IRQs are masked across the tiny memcpy, so
+// the holder can NEVER be preempted mid-hold: it always reaches the release, the
+// lock can never be left stuck, and the yield-storm is structurally impossible.
+// Every section below is a bounded memcpy + tag write with NO sleep/nested lock,
+// so holding IRQs off across it is correct and short (bounded like ata_dma_wait).
+static spinlock_t g_blk_lock = SPINLOCK_INIT;
+static uint64_t blk_lk(void)        { return spinlock_acquire_irqsave(&g_blk_lock); }
+static void     blk_ul(uint64_t fl) { spinlock_release_irqrestore(&g_blk_lock, fl); }
 
 // Stats: RAM-served sectors vs USB-served sectors (verification).
 static uint64_t g_ram_hits = 0;
 static uint64_t g_usb_reads = 0;
+
+// #617 WRITE GENERATION - the demand cache's lost-update guard.
+//
+// THE BUG (reproduced deterministically by tools/blkdev-harness, 200/200 trials
+// before this change, 0/200 after). blk_read()'s BLK_MODE_CACHE miss path drops
+// g_blk_lock across the BLOCKING usb_msc_read() - it must, that is a slow USB
+// round trip and holding an irqsave spinlock across it is the #618 freeze - and
+// then installs the bytes it got back into the cache UNCONDITIONALLY. So:
+//
+//   reader:  ... miss on LBA X ... [lock dropped] ... device READ(X) -> "old"
+//                                                    <-- PREEMPTED HERE
+//   writer:                        WRITE(X,"new") to the medium, then takes
+//                                  g_blk_lock and installs "new" in the cache
+//   reader:  resumes, takes g_blk_lock, installs "old" over it, tags it VALID
+//
+// The medium now holds "new" and the cache serves "old", permanently, to every
+// later reader. usb_msc_transport() serializing whole SCSI commands does NOT
+// help: the losing window is between usb_msc_read() RETURNING and blk_lk(),
+// which is a handful of instructions and one timer tick wide.
+//
+// THE FIX, and why it is this one. g_wgen is bumped (under g_blk_lock) by every
+// write that touches the cache. A reader snapshots it before issuing its device
+// read and, at install time, installs ONLY if it is unchanged. If some write
+// landed while we were away we cannot tell whether it was OUR sector (an
+// aliasing write to a different LBA can have overwritten the tag that would
+// otherwise have told us), so we decline to install and leave whatever the
+// writer put there - which is by construction at least as fresh as ours. The
+// caller still gets the bytes the device returned; an overlapping read is
+// entitled to either image, but the CACHE must never keep the stale one.
+//
+// This is deliberately the SAME shape as fs/ext2.c's g_e2c_wgen (#597), which
+// fixed exactly this class one layer up. blockdev had no equivalent, and ext2
+// readers never take ext2_lock, so the block layer could reintroduce staleness
+// underneath a correctly-behaving ext2 cache.
+//
+// WHY IT CANNOT DEADLOCK OR COST ANYTHING: no new lock, no new lock ORDER, and
+// nothing blocking added inside a critical section. The snapshot and the
+// compare both happen inside g_blk_lock sections that already existed; the net
+// addition to the hot path is one 64-bit load and one 64-bit compare per
+// coalesced run. Critically it does NOT widen the lock across the I/O, which is
+// what made #618 a 45-second install freeze.
+//
+// WHY NOT RE-READ INSTEAD OF DECLINING: a retry can lose the same race again,
+// so it needs its own bound, and it spends an extra USB command to repair a
+// cache entry the next miss would fetch anyway. Declining is unbounded-free.
+//
+// The skip count is exported (blk_stale_skips) rather than left invisible: if
+// this ever fires often, that is a MEASUREMENT that read/write overlap is
+// common on the root device, not a guess.
+//
+// #621: exporting it was NOT enough. blk_stale_skips() shipped in #617 with
+// ZERO CALLERS anywhere in the kernel, which is the same trap this project
+// keeps falling into (validate_user_ptr, sse_save, #433): the accessor exists,
+// so everyone assumes somebody is watching it, and nobody is. It is now read
+// once per heartbeat by the [HB] worker in main.c and printed as "blkstale=",
+// unconditionally including when zero, plus a one-shot loud [BLKSTALE] line
+// the first time it moves. Do not remove that reader without adding another.
+static volatile uint64_t g_wgen = 0;
+static uint64_t g_stale_skips = 0;
 
 static inline uint8_t *chunk_sector(uint64_t sec) {
     return g_chunk[sec / BLK_CHUNK_SECS] + (sec % BLK_CHUNK_SECS) * BLK_SECTOR;
@@ -373,6 +452,9 @@ void blk_clear_root_usb(void) {
 }
 
 int blk_root_is_usb(void) { return g_root_usb; }
+// #306: which USB device is the root? The installer needs it to refuse the
+// disk it booted from - cloning a disk onto itself corrupts the source.
+int blk_root_usb_index(void) { return g_root_usb_index; }
 
 void blk_cache_stats(uint64_t *hits, uint64_t *misses, int *enabled) {
     if (hits) *hits = g_ram_hits;
@@ -380,16 +462,22 @@ void blk_cache_stats(uint64_t *hits, uint64_t *misses, int *enabled) {
     if (enabled) *enabled = g_mode;   // 0 off, 1 toram, 2 cache
 }
 
+// #617: how many demand-cache installs were declined because a write landed
+// during the read. Zero on a read-only workload (boot, fsck, app launch) by
+// construction, so a non-zero value is a real measurement of read/write overlap
+// on the root device, not noise.
+uint64_t blk_stale_skips(void) { return g_stale_skips; }
+
 int blk_read(uint8_t channel, uint8_t drive, uint64_t lba, uint32_t count, void *buf) {
     if (g_root_usb) {
         // TO-RAM: serve entirely from RAM (the win). Stick untouched.
         if (g_mode == BLK_MODE_TORAM && lba + count <= g_ram_sectors) {
             uint8_t *p = (uint8_t *)buf;
-            blk_lk();
+            uint64_t __bf = blk_lk();
             for (uint32_t i = 0; i < count; i++)
                 memcpy(p + (uint64_t)i * BLK_SECTOR, chunk_sector(lba + i), BLK_SECTOR);
             g_ram_hits += count;
-            blk_ul();
+            blk_ul(__bf);
             return (int)count;
         }
         usb_msc_device_t *dev = usb_msc_get_device(g_root_usb_index);
@@ -401,15 +489,15 @@ int blk_read(uint8_t channel, uint8_t drive, uint64_t lba, uint32_t count, void 
             // Demand cache hit? Serve this one sector from RAM and move on.
             if (g_mode == BLK_MODE_CACHE) {
                 uint32_t idx = (uint32_t)lba_i & g_mask;
-                blk_lk();
+                uint64_t __bf = blk_lk();
                 if (g_tag[idx] == lba_i) {
                     memcpy(dst, chunk_sector(idx), BLK_SECTOR);
                     g_ram_hits++;
-                    blk_ul();
+                    blk_ul(__bf);
                     i++;
                     continue;
                 }
-                blk_ul();
+                blk_ul(__bf);
             }
             // #550 MISS: coalesce the run of consecutive sectors that ALSO miss
             // and fetch the whole run in ONE SCSI READ(10), straight into the
@@ -422,7 +510,7 @@ int blk_read(uint8_t channel, uint8_t drive, uint64_t lba, uint32_t count, void 
                     uint64_t l2 = lba + i + run;
                     uint32_t idx2 = (uint32_t)l2 & g_mask;
                     int hit;
-                    blk_lk(); hit = (g_tag[idx2] == l2); blk_ul();
+                    uint64_t __bf = blk_lk(); hit = (g_tag[idx2] == l2); blk_ul(__bf);
                     if (hit) break;
                 }
                 run++;
@@ -436,17 +524,41 @@ int blk_read(uint8_t channel, uint8_t drive, uint64_t lba, uint32_t count, void 
             if (room == 0) room = 1;
             if (run > room) run = room;
 
+            // #617: snapshot the write generation BEFORE the blocking device
+            // read, so any write that completes while the lock is dropped is
+            // visible to us when we come back to install.
+            //
+            // Deliberately NOT under g_blk_lock, unlike the install check. An
+            // aligned 64-bit load is atomic on x86-64 and g_wgen is volatile
+            // and monotonically increasing, so the only thing the snapshot has
+            // to guarantee is gen0 <= the generation the medium was in when our
+            // read observed it - and reading it immediately before issuing the
+            // read gives exactly that. Every ordering that could go "wrong"
+            // goes wrong SAFELY: seeing a stale (lower) gen0 can only make the
+            // install check fail and skip, never install stale bytes. Taking
+            // the lock here would add a cli/sti round trip to every coalesced
+            // miss run on the hottest read path in the product for no
+            // correctness gain (#619 throughput).
+            uint64_t gen0 = g_wgen;
             if (usb_msc_read(dev, 0, lba_i, dst, run) != 0) return -1;
             g_usb_reads += run;
             if (g_mode == BLK_MODE_CACHE) {
-                blk_lk();
-                for (uint32_t k = 0; k < run; k++) {
-                    uint32_t idx = (uint32_t)(lba_i + k) & g_mask;
-                    memcpy(chunk_sector(idx), dst + (uint64_t)k * BLK_SECTOR,
-                           BLK_SECTOR);
-                    g_tag[idx] = lba_i + k;
+                uint64_t __bf = blk_lk();
+                if (g_wgen == gen0) {
+                    for (uint32_t k = 0; k < run; k++) {
+                        uint32_t idx = (uint32_t)(lba_i + k) & g_mask;
+                        memcpy(chunk_sector(idx), dst + (uint64_t)k * BLK_SECTOR,
+                               BLK_SECTOR);
+                        g_tag[idx] = lba_i + k;
+                    }
+                } else {
+                    // #617: a write landed while our I/O was in flight. Our
+                    // image may already be stale and we cannot prove otherwise,
+                    // so do not publish it as valid. The cache keeps the
+                    // writer's copy, which is at least as fresh.
+                    g_stale_skips++;
                 }
-                blk_ul();
+                blk_ul(__bf);
             }
             i += run;
         }
@@ -455,36 +567,124 @@ int blk_read(uint8_t channel, uint8_t drive, uint64_t lba, uint32_t count, void 
     return ata_read_sectors_dma(channel, drive, (uint32_t)lba, (uint8_t)count, buf);
 }
 
+// #614: WRITE-side run coalescing - the App Store "20 minute freeze".
+//
+// blk_write issued ONE SCSI WRITE(10) per 512-byte sector, ALWAYS. A 103 MB
+// package download (/STOREDL.TMP) plus its 104 MB unpack is ~207 MB = ~414,000
+// Bulk-Only Transport commands, each costing THREE xHCI waits (CBW + data +
+// CSW) all serialized on the single g_msc_cmd_busy command lock. The READ path
+// was given run coalescing by #550; the write path never was, and that
+// asymmetry is where essentially the whole install wall clock went.
+//
+// It could not just copy blk_read's shape, for a reason worth stating: the old
+// loop advanced `src` by exactly one sector per iteration (its own comment said
+// so), and, more fundamentally, xhci_bulk_transfer() puts the CALLER's pointer
+// straight into a TRB as a PHYSICAL address while the kernel heap at
+// 0x10000000 is vmm-remapped page by page to ARBITRARY physical pages
+// (mm/heap.c) - so a >4 KB transfer directly out of a kmalloc'd buffer is not
+// guaranteed physically contiguous. Writes therefore stage through a dedicated
+// 64 KB-aligned, physically CONTIGUOUS bounce buffer: one memcpy per run (a few
+// microseconds) buys a 64x reduction in USB commands and makes no contiguity
+// assumption about the caller's buffer at all. If the bounce buffer cannot be
+// allocated we fall back to the exact previous one-sector-per-command loop, so
+// this can never turn a working write into a failing one.
+#define BLK_WBOUNCE_SECS   BLK_USB_CHUNK                                  /* 64 sectors = 32 KB */
+#define BLK_WBOUNCE_PAGES  ((BLK_WBOUNCE_SECS * BLK_SECTOR) / PMM_PAGE_SIZE)
+static uint8_t *g_wbounce = 0;
+static int      g_wbounce_tried = 0;
+
+static uint8_t *blk_wbounce(void) {
+    if (g_wbounce || g_wbounce_tried) return g_wbounce;
+    g_wbounce_tried = 1;
+    // Over-allocate by 64 KB so the usable base can be aligned UP to a 64 KB
+    // boundary: an xHCI Transfer TRB must not cross 64 KB, and a 32 KB transfer
+    // that starts on a 64 KB boundary never can.
+    for (int attempt = 0; attempt < 8; attempt++) {
+        uint64_t raw = pmm_alloc_pages(BLK_WBOUNCE_PAGES + 16u);
+        if (!raw) break;
+        uint64_t aligned = (raw + BLK_ALIGN64K - 1) & ~(BLK_ALIGN64K - 1);
+        uint64_t hi = aligned + (uint64_t)BLK_WBOUNCE_PAGES * PMM_PAGE_SIZE;
+        // Same heap-window hazard blk_alloc_chunks documents: a PHYSICAL page in
+        // [0x10000000,0x20000000) is aliased by the heap's virtual remap, so its
+        // identity pointer must never be used. Park it and retry.
+        if (aligned < BLK_HEAP_WIN_HI && hi > BLK_HEAP_WIN_LO) {
+            if (g_nparked < BLK_MAX_PARKED) { g_parked[g_nparked++] = raw; continue; }
+            pmm_free_pages(raw, BLK_WBOUNCE_PAGES + 16u);
+            break;
+        }
+        g_wbounce = (uint8_t *)aligned;
+        break;
+    }
+    return g_wbounce;
+}
+
+// #745 (task #62): DEVICE WRITE ACCOUNTING. The progressive-degradation report
+// on the real iMac (responsive at boot, unusable inside a minute) is the #373
+// shape, and #373 was a WRITE STORM over the slow USB-MSC stack. Nothing in the
+// heartbeat record could see it: blkc=h/m counts block-cache READ hits/misses,
+// and there was no write counter at all. These two are reported per-heartbeat
+// so a stick brought back off the machine shows write traffic climbing (or
+// flat, which rules the whole class out) alongside the widening beat gaps.
+uint64_t g_blk_write_calls   = 0;
+uint64_t g_blk_write_sectors = 0;
+
 int blk_write(uint8_t channel, uint8_t drive, uint64_t lba, uint32_t count, const void *buf) {
+    g_blk_write_calls++;
+    g_blk_write_sectors += count;
     if (g_root_usb) {
         usb_msc_device_t *dev = usb_msc_get_device(g_root_usb_index);
         if (!dev || !dev->ready) return -1;
         const uint8_t *p = (const uint8_t *)buf;
-        for (uint32_t i = 0; i < count; i++) {
+        uint8_t *bnc = blk_wbounce();
+        for (uint32_t i = 0; i < count; ) {
             uint64_t lba_i = lba + i;
             const uint8_t *src = p + (uint64_t)i * BLK_SECTOR;
-            // WRITE-THROUGH: persist to the physical stick (settings, notes, and
+            uint32_t run = 1;
+            if (bnc) {
+                run = count - i;
+                if (run > BLK_WBOUNCE_SECS) run = BLK_WBOUNCE_SECS;
+                memcpy(bnc, src, (uint64_t)run * BLK_SECTOR);
+            }
+            // WRITE-THROUGH: persist to the physical medium (settings, notes, and
             // the /HEARTBEAT.TXT + /BOOTLOG.TXT diagnostics must survive power-off),
             // then keep the RAM copy coherent so reads stay instant.
-            // #550: single sector, ALWAYS. Do NOT substitute BLK_USB_CHUNK here:
-            // src advances by exactly one sector per iteration, so any count > 1
-            // would read past the caller's buffer and write garbage to the stick.
-            if (usb_msc_write(dev, 0, lba_i, src, 1) != 0) {
+            if (usb_msc_write(dev, 0, lba_i, bnc ? (const void *)bnc : (const void *)src,
+                              run) != 0) {
                 // Failed: RAM still holds the pre-write (on-disk) data, which is
                 // correct, so leave TO-RAM untouched. For the demand cache, drop
-                // any stale copy of this LBA so we don't serve unwritten data.
+                // any stale copy of the whole run so we don't serve unwritten data.
                 if (g_mode == BLK_MODE_CACHE) {
-                    uint32_t idx = (uint32_t)lba_i & g_mask;
-                    blk_lk(); if (g_tag[idx] == lba_i) g_tag[idx] = BLK_TAG_INVALID; blk_ul();
+                    uint64_t __bf = blk_lk();
+                    g_wgen++;   // #617: an invalidate is a cache-visible change too
+                    for (uint32_t k = 0; k < run; k++) {
+                        uint32_t idx = (uint32_t)(lba_i + k) & g_mask;
+                        if (g_tag[idx] == lba_i + k) g_tag[idx] = BLK_TAG_INVALID;
+                    }
+                    blk_ul(__bf);
                 }
                 return -1;
             }
-            if (g_mode == BLK_MODE_TORAM && lba_i < g_ram_sectors) {
-                blk_lk(); memcpy(chunk_sector(lba_i), src, BLK_SECTOR); blk_ul();
+            if (g_mode == BLK_MODE_TORAM) {
+                uint64_t __bf = blk_lk();
+                for (uint32_t k = 0; k < run; k++) {
+                    if (lba_i + k >= g_ram_sectors) break;
+                    memcpy(chunk_sector(lba_i + k), src + (uint64_t)k * BLK_SECTOR,
+                           BLK_SECTOR);
+                }
+                blk_ul(__bf);
             } else if (g_mode == BLK_MODE_CACHE) {
-                uint32_t idx = (uint32_t)lba_i & g_mask;
-                blk_lk(); memcpy(chunk_sector(idx), src, BLK_SECTOR); g_tag[idx] = lba_i; blk_ul();
+                uint64_t __bf = blk_lk();
+                g_wgen++;   // #617: see the g_wgen comment. Must be inside the
+                            // SAME critical section as the install, so a reader
+                            // can never observe the new bytes with the old gen.
+                for (uint32_t k = 0; k < run; k++) {
+                    uint32_t idx = (uint32_t)(lba_i + k) & g_mask;
+                    memcpy(chunk_sector(idx), src + (uint64_t)k * BLK_SECTOR, BLK_SECTOR);
+                    g_tag[idx] = lba_i + k;
+                }
+                blk_ul(__bf);
             }
+            i += run;
         }
         return (int)count;
     }

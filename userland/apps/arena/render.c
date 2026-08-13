@@ -58,6 +58,11 @@ typedef struct { vec3 pos; float radius; int t, dur; int active; } RExpl;
 /* ------------------------------------------------------------------ state */
 static ZBuffer *g_zb = 0;
 static int g_rw = 0, g_h = 0, g_reqw = 0;   /* g_rw = width rounded down to x4 */
+/* T0(a) #578: g_h is the DISPLAY height (present target); g_renderh is the
+ * ZBuffer/render height. With render scale OFF they are equal (byte-identical
+ * present); with half-res active g_renderh is the smaller scaled height and
+ * present() upscales g_rw x g_renderh back to the full display. */
+static int g_renderh = 0;
 
 static RTracer g_tracers[R_MAX_TRACERS];
 static RExpl   g_expl[R_MAX_EXPL];
@@ -132,12 +137,15 @@ void r_set_fov(int fov_deg) {
 
 /* ------------------------------------------------------------- GL bring-up */
 static void proj_setup(void) {
-    float aspect = (g_h > 0) ? (float)g_rw / (float)g_h : 1.0f;
+    /* aspect + viewport use the RENDER dims (g_rw x g_renderh), not the
+     * display dims, so the projection stays correct at half-res (both axes
+     * scaled by the same factor modulo the x4 width rounding). */
+    float aspect = (g_renderh > 0) ? (float)g_rw / (float)g_renderh : 1.0f;
     /* half-width at the near plane = R_NEAR * tan(fov/2). 90deg -> tan45 = 1. */
     double hw = (double)R_NEAR * (double)mx_tanf((float)g_fov_deg * 0.5f
                                                  * 3.14159265f / 180.0f);
     double hh = hw / (double)aspect;
-    glViewport(0, 0, g_rw, g_h);
+    glViewport(0, 0, g_rw, g_renderh);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
     glFrustum(-hw, hw, -hh, hh, (double)R_NEAR, (double)R_FAR);
@@ -162,11 +170,21 @@ void r_init(int w, int h) {
     if (w < 16) w = 16;
     if (h < 16) h = 16;
     g_reqw = w;
-    g_rw   = w & ~3;          /* ZB_open floors xsize to a multiple of 4      */
-    if (g_rw < 16) g_rw = 16;
-    g_h    = h;
+    g_h    = h;              /* full display height (present target)           */
+    /* Render dims: with scale OFF these equal the old values (g_rw = w&~3,
+     * g_renderh = h) so present() stays byte-identical; with half-res active
+     * they are the scaled-down dims (~1/4 the pixels). */
+    if (ZB_renderScaleActive()) {
+        g_rw      = ZB_scaleDim(w);       /* floored to x4 inside ZB_scaleDim  */
+        g_renderh = ZB_scaleDim(h);
+    } else {
+        g_rw      = w & ~3;               /* ZB_open floors xsize to a mult of 4 */
+        g_renderh = h;
+    }
+    if (g_rw < 16)      g_rw = 16;
+    if (g_renderh < 16) g_renderh = 16;
 
-    g_zb = ZB_open(g_rw, g_h, ZB_MODE_RGBA, 0);
+    g_zb = ZB_open(g_rw, g_renderh, ZB_MODE_RGBA, 0);
     if (!g_zb) return;
     glInit(g_zb);
     glShadeModel(GL_SMOOTH);
@@ -188,8 +206,30 @@ void r_camera_basis(vec3 *eye, vec3 *right, vec3 *up, vec3 *fwd) {
     if (fwd)   *fwd   = g_fwd;
 }
 
+/* T0(a) #578: set the render scale (den = 1 full, 2 half, 3 third, 4 quarter)
+ * and, if the renderer is already up, reopen the ZBuffer at the new render
+ * size so a Settings change applies live without a restart. Called from
+ * main.c's cfg apply so main.c does not need to include zbuffer.h. */
+static int g_render_den = 1;   /* current scale denominator (1 = full res)     */
+void r_set_render_scale(int den) {
+    if (den < 1) den = 1;
+    if (den > 4) den = 4;
+    if (den == g_render_den && g_zb) return;   /* unchanged: no needless reopen */
+    g_render_den = den;
+    ZB_setRenderScale(1, den);
+    if (g_zb) {                     /* live reopen at the new render size      */
+        int w = g_reqw, h = g_h;
+        glClose();
+        ZB_close(g_zb);
+        g_zb = 0;
+        r_init(w, h);
+    }
+}
+
 void r_resize(int w, int h) {
-    if (g_zb && (w & ~3) == g_rw && h == g_h) { g_reqw = w; return; }
+    /* Compare against the DISPLAY dims (g_reqw x g_h), not the render dims,
+     * so half-res (g_rw != w&~3) does not force a needless reopen. */
+    if (g_zb && (w & ~3) == (g_reqw & ~3) && h == g_h) { g_reqw = w; return; }
     if (g_zb) { glClose(); ZB_close(g_zb); g_zb = 0; }
     r_init(w, h);
 }
@@ -1317,6 +1357,17 @@ static void draw_viewmodel_sprite(World *w, uint32_t *blit, int stride) {
 static void present(uint32_t *blit, int stride) {
     if (!g_zb || !blit || stride <= 0) return;
     const uint32_t *src = (const uint32_t *)g_zb->pbuf;
+    if (g_renderh != g_h || g_rw != (g_reqw & ~3)) {
+        /* T0(a) #578 half-res: nearest-neighbor upscale the small render
+         * buffer (g_rw x g_renderh) to the full display (g_reqw x g_h),
+         * clamped to the blit stride. HUD/menus are drawn into `blit` at
+         * FULL res AFTER present (main.c), so they stay crisp. */
+        int dw = (g_reqw < stride) ? g_reqw : stride;
+        ZB_upscaleNearest((const PIXEL *)src, g_rw, g_renderh,
+                          (PIXEL *)blit, dw, g_h, stride);
+        return;
+    }
+    /* 1:1 fast path (scale OFF): unchanged from before this change. */
     int copyw = (g_rw < stride) ? g_rw : stride;
     int padw  = (g_reqw < stride) ? g_reqw : stride;
     for (int y = 0; y < g_h; y++) {

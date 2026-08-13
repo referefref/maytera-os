@@ -66,9 +66,17 @@ typedef struct {
 // 65536 covers the largest window this stack can ever advertise/see.
 #define TCP_SEND_BUFFER_SIZE    65536
 
-// TCP timeouts (in timer ticks, ~18.2 ticks/sec on x86)
-#define TCP_RETRANSMIT_TIMEOUT  500     // 2s at 250Hz PIT (was 36 = 0.14s, stale 18.2Hz value; too short -> RST mid-transfer on slow SMB/USB-RAID reads)
-#define TCP_TIME_WAIT_TIMEOUT   546     // ~30 seconds (2*MSL)
+// TCP timeouts (#499: REAL milliseconds on the shared monotonic clock)
+// #499: REAL milliseconds, not ticks. These were tick counts compared against
+// timer_ticks, which counts ticks DELIVERED, not time ELAPSED: a KVM tick-replay
+// burst made the RTO fire early and produced a spurious retransmit storm. The
+// values below preserve the previous EFFECTIVE durations at the 250Hz PIT
+// (500 ticks = 2000ms, 546 ticks = 2184ms) so this is a clock change only, not
+// a behaviour change. NOTE: the old "~30 seconds (2*MSL)" comment on
+// TCP_TIME_WAIT_TIMEOUT has been wrong since the PIT moved to 250Hz; the real
+// TIME_WAIT has been ~2.2s for a long time and stays ~2.2s here.
+#define TCP_RETRANSMIT_TIMEOUT_MS  2000  // 2s (was 500 ticks @250Hz)
+#define TCP_TIME_WAIT_TIMEOUT_MS   2184  // ~2.2s (was 546 ticks @250Hz)
 #define TCP_CONNECT_TIMEOUT     180     // ~10 seconds
 #define TCP_MAX_RETRIES         5
 
@@ -113,7 +121,7 @@ typedef struct {
     uint32_t send_offset;               // Offset of first unsent byte
 
     // Retransmission control
-    uint64_t last_send_time;            // Time of last send (for RTO)
+    uint64_t last_send_time_ms;         // #499: sched_now_ms() at last send (for RTO)
     uint16_t retries;                   // Number of retransmission attempts
 
     // Listening socket (for accept)
@@ -174,13 +182,26 @@ int tcp_send(int sock, const void *data, uint16_t length);
 
 // Receive data (returns bytes received or negative error)
 // Non-blocking: returns 0 if no data available
-int tcp_recv(int sock, void *buffer, uint16_t length);
+// #608: `length` is uint32_t, NOT uint16_t. It used to be uint16_t, and every
+// caller that streams a large body holds its remaining space in a size_t. The
+// implicit narrowing at the call site turned a remaining space that is an
+// exact multiple of 65536 into a request for ZERO bytes, which this function
+// answers with 0 ("no data yet") forever: the App Store's 256KB Range chunk
+// stalled at exactly 65535 bytes received and died on the idle timeout.
+// A single recv still returns at most TCP_RECV_BUFFER_SIZE bytes.
+int tcp_recv(int sock, void *buffer, uint32_t length);
 
 // Close a connection
 int tcp_close(int sock);
 
 // Get connection state
 tcp_state_t tcp_get_state(int sock);
+// #524: bytes queued for recv (>0), 0 if none yet, -1 terminal/invalid. Used by
+// the BSD socket layer as a blocking-recv readiness condition. Reads only BSS.
+int tcp_rx_pending(int sock);
+// #524: connected peer endpoint (HOST byte order) for accept(). Pure BSS read.
+// Returns 0 on success, -1 for an invalid/unconnected socket.
+int tcp_get_peer(int sock, uint32_t *ip_host, uint16_t *port_host);
 
 // Get last error for a socket
 int tcp_get_error(int sock);

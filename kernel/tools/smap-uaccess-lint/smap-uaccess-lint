@@ -1,0 +1,803 @@
+#!/usr/bin/env python3
+"""
+smap-uaccess-lint - FAILS THE BUILD if (A) the SMAP mechanism itself has
+regressed, or (B) a NEW Ring-0 access to user memory has appeared that is
+neither routed through the copy_*_user primitives, nor bracketed by
+uaccess_begin()/uaccess_end(), nor recorded on kernel/smap-uaccess.manifest.
+
+WHY THIS EXISTS (#645)
+======================
+With CR4.SMAP set, ANY Ring-0 read or write to a user-accessible page (U/S=1)
+raises #PF unless RFLAGS.AC is set. So an unwrapped user access is no longer a
+subtle TOCTOU risk that builds clean and mostly works: it is a HARD FAULT on
+whatever path takes it. The failure mode is "this machine does not boot", and
+the compiler cannot see it coming.
+
+THE TWO GAPS THIS CLOSES
+------------------------
+#566's copy-user-lint is a good gate with two documented limits, and BOTH of
+them are load-bearing under SMAP. They were measured, not assumed:
+
+  GAP 1 - FILE SCOPE. copy-user-lint's own header says it "reasons about
+  proc/syscall.c ONLY". Measured against the tree, 43 of the 122 live
+  copy_*_user call sites are in OTHER files (net/socket.c, mm/fault.c,
+  proc/signal.c, proc/thread.c, proc/process.c), and the heaviest unwrapped
+  user accesses in the kernel are outside syscall.c entirely: the ELF loader
+  writing PT_LOAD segments and relocations into the child address space, the
+  initial-argv builder writing the user stack, and the whole signal-frame
+  build/restore path. None of that was linted by anything. A new raw user deref
+  in any of those files compiled clean.
+
+  GAP 2 - TRACING DEPTH. copy-user-lint traces ONE level (dispatcher case ->
+  handler defined in syscall.c). A user pointer handed to a SECOND-level helper
+  is invisible to it. That is not hypothetical: sc_copy_str() in proc/syscall.c
+  reads a user string byte-by-byte with NO validation at all, and is reached as
+  case -> sys_session_unlock()/sys_auth_lockout()/sys_set_autologin() ->
+  sc_copy_str(), i.e. exactly two levels, so the gate never saw it.
+
+This lint widens BOTH: the file set is derived (not hand-listed), and the call
+tracing is depth-limited but greater than one.
+
+RULE A - MECHANISM INTEGRITY (precise, textual, zero false positives)
+--------------------------------------------------------------------
+The SMAP bracket is only as good as four specific pieces of code. Each one, if
+quietly deleted, leaves a kernel that still BOOTS and still SAYS "SMAP: ENABLED"
+while the protection is partly or wholly gone. That is the worst possible
+outcome, so each is asserted here:
+
+  A1 mm/uaccess.asm      Every one of the 4 primitives must SET AC before its
+                         faultable region and CLEAR AC on EVERY return path -
+                         including the *_ex_fixup path, which mm/fault.c reaches
+                         by rewriting RIP and which therefore SKIPS the normal
+                         post-region CLAC. Miss that one and every -EFAULT
+                         leaves the rest of the syscall running with SMAP off.
+  A2 cpu/idt.asm         isr_common must CLAC (no handler may run with SMAP
+                         disabled) and CLD (the SysV ABI requires DF=0 and an
+                         IDT gate does not clear it).
+  A3 proc/syscall.c      IA32_FMASK must clear AC and DF on SYSCALL entry. AC is
+                         writable from CPL 3, so without the AC bit a Ring-3
+                         process runs the ENTIRE syscall with SMAP disabled just
+                         by setting it before the instruction.
+  A4 security/security.c g_smap_active must be armed from the FEATURE BIT (which
+                         required a CR4 readback), never from the mere request
+                         flag. Arming it from the request would execute STAC on
+                         a machine whose CR4 write was silently dropped.
+
+RULE B - NO NEW UNWRAPPED USER ACCESS
+-------------------------------------
+B1 LEDGER FRESHNESS. Every manifest entry names a file, a line and a substring.
+   If the substring is no longer on that line, the entry is STALE and the lint
+   FAILS. A fixed site MUST be delisted. This is what stops the ledger rotting
+   into a list of things that used to be true (the #514 defect class).
+
+B2 CR3-WINDOW SCAN. A kernel routine that switches CR3 to another process's
+   address space and then dereferences memory is, by construction, touching a
+   foreign user mapping. These windows are textually unmistakable, so any
+   memory access inside one must be AC-bracketed or manifested.
+
+B3 VALIDATED-THEN-DEREFFED SCAN, widened. The same rule copy-user-lint applies
+   inside syscall.c, applied across the DERIVED watch set: any file that calls
+   validate_user_ptr / validate_user_string / mm_prefault_range / a copy_*_user
+   wrapper is watched automatically, so a new file joins the moment it starts
+   handling user pointers. Nothing to hand-maintain, nothing to forget.
+
+HONEST LIMITS - READ THESE BEFORE TRUSTING A GREEN RUN
+------------------------------------------------------
+* This is pattern analysis over C text, NOT whole-program dataflow. It finds the
+  structural markers that the sites measured in this tree actually exhibit. A
+  user pointer laundered through a struct field, a global, or a function pointer
+  will not be traced.
+* It cannot prove the ABSENCE of an unwrapped access. It can only prove that no
+  NEW one matching its detectors has appeared since the ledger was written.
+* GREEN here does NOT mean SMAP is safe to enable. It means no new site of the
+  recognised shapes has landed. The ledger's KNOWN_GAP entries are still live
+  faults waiting to happen; they are listed precisely so nobody mistakes a green
+  build for a clean one.
+"""
+
+import argparse, os, re, sys, tempfile
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def read(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as fh:
+        return fh.read()
+
+def strip_comments(text, keep_strings=False):
+    """Remove /*...*/ and //... so a rule cannot be satisfied BY A COMMENT.
+    Newlines are preserved so line numbers stay exact.
+
+    String literals are blanked too by default, so that a rule cannot be
+    satisfied by a mention inside a message either. keep_strings=True is for
+    RULE B2 ONLY, which must see inline-asm bodies: the CR3 write it hunts for
+    lives INSIDE a string literal (`__asm__("mov %0, %%cr3" ...)`), so blanking
+    strings made every foreign-CR3 window invisible and B2 silently matched
+    nothing. That bug was caught by the self-test, which is the entire reason
+    the self-test exists."""
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        if text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            out.append("".join(c if c == "\n" else " " for c in text[i:j]))
+            i = j
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" " * (j - i))
+            i = j
+        elif text[i] in "\"'":
+            q = text[i]; j = i + 1
+            while j < n and text[j] != q:
+                j += 2 if text[j] == "\\" else 1
+            j = min(j + 1, n)
+            out.append(text[i:j] if keep_strings
+                       else "".join(c if c == "\n" else " " for c in text[i:j]))
+            i = j
+        else:
+            out.append(text[i]); i += 1
+    return "".join(out)
+
+def asm_strip(text):
+    """NASM comments start with ';'. Blank them, keep line count."""
+    return "\n".join(ln.split(";", 1)[0] for ln in text.split("\n"))
+
+
+class Report:
+    def __init__(self):
+        self.fail = []
+        self.notes = []
+    def bad(self, rule, msg):
+        self.fail.append((rule, msg))
+    def note(self, msg):
+        self.notes.append(msg)
+
+
+# ---------------------------------------------------------------------------
+# RULE A - mechanism integrity
+# ---------------------------------------------------------------------------
+
+PRIMITIVES = ["copy", "set", "strncpy", "strnlen"]
+
+def rule_a1(root, rep):
+    path = os.path.join(root, "mm", "uaccess.asm")
+    if not os.path.isfile(path):
+        rep.bad("A1", "mm/uaccess.asm not found; the 4 user-copy primitives are "
+                      "the ONLY place the kernel touches user memory, so its "
+                      "absence means this lint is checking nothing.")
+        return
+    lines = asm_strip(read(path)).split("\n")
+
+    entry = {}
+    for i, ln in enumerate(lines):
+        m = re.match(r"^\s*(__uaccess_\w+):", ln)
+        if m:
+            entry.setdefault(m.group(1), i)
+
+    for p in PRIMITIVES:
+        name, start_lbl = "__uaccess_" + p, "__uaccess_%s_ex_start" % p
+        if name not in entry:
+            rep.bad("A1", "mm/uaccess.asm: primitive %s is missing entirely." % name)
+            continue
+        beg = entry[name]
+        # routine ends where the NEXT primitive's entry label begins
+        ends = [entry["__uaccess_" + q] for q in PRIMITIVES
+                if "__uaccess_" + q in entry and entry["__uaccess_" + q] > beg]
+        end = min(ends) if ends else len(lines)
+        body = lines[beg:end]
+
+        if start_lbl not in entry:
+            rep.bad("A1", "mm/uaccess.asm: %s has no %s label; the fault-fixup "
+                          "exception table in mm/fault.c is built from these "
+                          "symbols." % (name, start_lbl))
+            continue
+
+        # AC must be SET before the faultable region begins.
+        stac_rel = [k for k, ln in enumerate(body) if re.search(r"\bSMAP_STAC\b", ln)]
+        start_rel = entry[start_lbl] - beg
+        if not stac_rel or min(stac_rel) >= start_rel:
+            rep.bad("A1", "mm/uaccess.asm: %s does not SMAP_STAC before %s. Under "
+                          "SMAP its user access faults on the first byte."
+                          % (name, start_lbl))
+
+        # AC must be CLEARED on EVERY return path, fixup included.
+        last_label = None
+        for k, ln in enumerate(body):
+            if re.match(r"^\s*[\w.]+:", ln):
+                last_label = k
+            if re.match(r"^\s*ret\b", ln):
+                lo = last_label if last_label is not None else 0
+                if not any(re.search(r"\bSMAP_CLAC\b", body[j]) for j in range(lo, k)):
+                    rep.bad("A1", "mm/uaccess.asm:%d: `ret` in %s is reachable "
+                                  "without SMAP_CLAC. AC would stay SET after "
+                                  "return, disabling SMAP for the rest of the "
+                                  "syscall." % (beg + k + 1, name))
+        fx = "__uaccess_%s_ex_fixup" % p
+        if fx in entry:
+            f_rel = entry[fx] - beg
+            tail = body[f_rel:]
+            cut = next((k for k, ln in enumerate(tail[1:], 1)
+                        if re.match(r"^\s*[\w.]+:", ln)), len(tail))
+            if not any(re.search(r"\bSMAP_CLAC\b", ln) for ln in tail[:cut]):
+                rep.bad("A1", "mm/uaccess.asm: %s does not SMAP_CLAC. mm/fault.c "
+                              "reaches this label by REWRITING RIP, which skips "
+                              "the CLAC after the region, so every -EFAULT would "
+                              "return with SMAP disabled." % fx)
+
+
+def rule_a2(root, rep):
+    path = os.path.join(root, "cpu", "idt.asm")
+    if not os.path.isfile(path):
+        rep.bad("A2", "cpu/idt.asm not found."); return
+    txt = asm_strip(read(path))
+    m = re.search(r"^isr_common:(.*?)call\s+isr_handler", txt, re.S | re.M)
+    if not m:
+        rep.bad("A2", "cpu/idt.asm: could not find isr_common ... call isr_handler. "
+                      "That is the single entry chokepoint for every interrupt, "
+                      "trap and exception; if it moved, this rule must move too.")
+        return
+    head = m.group(1)
+    if not re.search(r"^\s*clac\b", head, re.M):
+        rep.bad("A2", "cpu/idt.asm: isr_common does not CLAC before calling the C "
+                      "handler. An interrupt taken during a user copy (AC=1), or "
+                      "from a Ring-3 process that set AC itself, would run the "
+                      "whole handler with SMAP disabled.")
+    if not re.search(r"^\s*cld\b", head, re.M):
+        rep.bad("A2", "cpu/idt.asm: isr_common does not CLD. x86-64 does not clear "
+                      "DF on an IDT gate, the SysV ABI requires DF=0, and gcc "
+                      "emits `rep movsb`. Ring 3 can `std` and wait for a timer "
+                      "interrupt to run kernel string ops backwards.")
+
+
+def rule_a3(root, rep):
+    path = os.path.join(root, "proc", "syscall.c")
+    if not os.path.isfile(path):
+        rep.bad("A3", "proc/syscall.c not found."); return
+    txt = strip_comments(read(path))
+    m = re.search(r"wrmsr\s*\(\s*MSR_SFMASK\s*,([^;]*)\)", txt)
+    if not m:
+        rep.bad("A3", "proc/syscall.c: no wrmsr(MSR_SFMASK, ...) found. Without it "
+                      "nothing clears AC or DF on SYSCALL entry.")
+        return
+    mask = m.group(1)
+    for bit, macro, why in (
+        ("AC", "SFMASK_AC", "AC is writable from CPL 3, so a Ring-3 process can set "
+                            "it and run the ENTIRE syscall with SMAP disabled."),
+        ("DF", "SFMASK_DF", "DF is not cleared by SYSCALL; gcc's `rep movsb` then "
+                            "runs backwards inside the kernel."),
+    ):
+        if macro not in mask:
+            rep.bad("A3", "proc/syscall.c: IA32_FMASK does not include %s. %s"
+                          % (macro, why))
+    for macro, val in (("SFMASK_AC", 0x40000), ("SFMASK_DF", 0x400)):
+        d = re.search(r"#define\s+%s\s+(0x[0-9A-Fa-f]+|\d+)" % macro, txt)
+        if d and int(d.group(1), 0) != val:
+            rep.bad("A3", "proc/syscall.c: %s is defined as %s, expected 0x%x."
+                          % (macro, d.group(1), val))
+
+
+def rule_a4(root, rep):
+    path = os.path.join(root, "security", "security.c")
+    if not os.path.isfile(path):
+        rep.bad("A4", "security/security.c not found."); return
+    txt = strip_comments(read(path))
+    asg = re.findall(r"g_smap_active\s*=\s*([^;]+);", txt)
+    if not asg:
+        rep.bad("A4", "security/security.c: g_smap_active is never assigned, so "
+                      "every STAC/CLAC in the kernel is permanently inert while "
+                      "the boot log may still claim SMAP is on.")
+        return
+    armed = [a for a in asg if a.strip() not in ("0", "0u")]
+    if not armed:
+        rep.bad("A4", "security/security.c: g_smap_active is only ever set to 0.")
+        return
+    for a in armed:
+        if "SECURITY_FEATURE_SMAP" not in a:
+            rep.bad("A4", "security/security.c: g_smap_active armed from `%s`, not "
+                          "from the SECURITY_FEATURE_SMAP bit. That bit is the only "
+                          "value gated on a CR4 READBACK; arming from the request "
+                          "flag would execute STAC on a hypervisor that silently "
+                          "dropped the CR4 write." % a.strip())
+
+
+# ---------------------------------------------------------------------------
+# RULE B - no new unwrapped user access
+# ---------------------------------------------------------------------------
+
+COPY_WRAPPERS = ("copy_from_user", "copy_to_user", "strncpy_from_user",
+                 "strnlen_user", "clear_user")
+VALIDATORS = ("validate_user_ptr", "validate_user_string", "mm_prefault_range")
+
+def derive_watch_set(root):
+    """Any .c file that validates or copies a user pointer is watched. Derived,
+    never hand-listed, so a new file joins the moment it handles user memory."""
+    watch = []
+    needles = COPY_WRAPPERS + VALIDATORS
+    for dirpath, _dirs, files in os.walk(root):
+        for f in sorted(files):
+            if not f.endswith(".c"):
+                continue
+            p = os.path.join(dirpath, f)
+            rel = os.path.relpath(p, root)
+            if rel.startswith("security/validate") or rel.startswith("tools"):
+                continue
+            body = read(p)
+            if any(nd in body for nd in needles):
+                watch.append(rel)
+    return watch
+
+
+CR3_WRITE = re.compile(r'(?:mov|movq)\s+%0\s*,\s*%%cr3|%%cr3["\s]*:\s*:\s*"r"')
+CR3_ANY   = re.compile(r'%%cr3')
+# B2's deref set deliberately EXCLUDES plain `p->field`. Inside a foreign-CR3
+# window the KERNEL half of the address space is still mapped (that is what makes
+# the window usable at all), so `prev->cr3` and friends are ordinary kernel
+# struct accesses and flagging them is pure noise. What is actually dangerous
+# there is an explicit cast to a foreign address, or a bulk copy: those are the
+# shapes every measured site in this tree takes.
+DEREF = re.compile(r'\*\s*\(\s*volatile'
+                   r'|\*\s*\(\s*\w+[\w\s*]*\*\s*\)'
+                   r'|\b(?:memcpy|memmove|memset|strcpy|strncpy)\s*\(')
+BRACKET = re.compile(r'\buaccess_begin\s*\(|\buaccess_end\s*\(')
+
+def rule_b2(root, watch, manifest, rep):
+    """CR3-window scan: a routine that loads another address space's CR3 and then
+    dereferences memory is touching a foreign user mapping by construction."""
+    for rel in watch + ["exec/elf.c", "proc/process.c"]:
+        path = os.path.join(root, rel)
+        if not os.path.isfile(path):
+            continue
+        # keep_strings: the CR3 write lives inside an inline-asm STRING literal.
+        lines = strip_comments(read(path), keep_strings=True).split("\n")
+        if not any(CR3_ANY.search(ln) for ln in lines):
+            continue
+        # A window opens at a CR3 write and closes at the next CR3 write
+        # (the restore). Scan the span between them.
+        open_at = None
+        for i, ln in enumerate(lines):
+            if CR3_ANY.search(ln) and re.search(r'"r"\s*\(', ln):
+                if open_at is None:
+                    open_at = i
+                    continue
+                span = lines[open_at + 1:i]
+                bracketed = any(BRACKET.search(s) for s in span)
+                for k, s in enumerate(span):
+                    if not DEREF.search(s):
+                        continue
+                    lineno = open_at + 2 + k
+                    if bracketed or manifest.covers(rel, lineno, s):
+                        continue
+                    rep.bad("B2", "%s:%d: memory access inside a foreign-CR3 window "
+                                  "is a Ring-0 touch of another process's USER "
+                                  "mapping, and is neither uaccess_begin()/"
+                                  "uaccess_end() bracketed nor on the manifest:\n"
+                                  "        %s" % (rel, lineno, s.strip()[:110]))
+                open_at = None
+
+
+FUNC_RE = re.compile(r'^[A-Za-z_][\w \t*]*\b(\w+)\s*\(([^;{)]*)\)\s*\{', re.M)
+
+def split_functions(text):
+    """Crude but adequate brace matcher: returns [(name, params, start_line, body)]."""
+    out = []
+    for m in FUNC_RE.finditer(text):
+        name, params = m.group(1), m.group(2)
+        i = text.index("{", m.start()); depth, j = 0, i
+        while j < len(text):
+            if text[j] == "{": depth += 1
+            elif text[j] == "}":
+                depth -= 1
+                if depth == 0: break
+            j += 1
+        out.append((name, params, text[:i].count("\n") + 1, text[i:j + 1]))
+    return out
+
+
+def rule_b3(root, watch, manifest, rep):
+    """Validated-then-dereffed, across the whole derived watch set (GAP 1), and
+    following calls into same-file helpers (GAP 2)."""
+    for rel in watch:
+        path = os.path.join(root, rel)
+        text = strip_comments(read(path))
+        funcs = split_functions(text)
+        by_name = {f[0]: f for f in funcs}
+
+        for name, params, startline, body in funcs:
+            # user pointers = identifiers handed to a validator or to the USER
+            # side of a copy wrapper, within this function.
+            users = set()
+            # PROVENANCE BY SOURCE, not just by validation. The signal path never
+            # validates: proc/signal.c builds the sigframe by casting the Ring-3
+            # stack pointer (`sigframe_t *frame = (sigframe_t *)user_rsp;`) and
+            # writing ~40 fields through it, and sys_rt_sigreturn reads them back
+            # the same way. Those are Ring-0 accesses to a user page on EVERY
+            # signal delivery, and a validation-only rule cannot see them.
+            # Likewise clear_child_tid, which is an address Ring 3 chose.
+            for m in re.finditer(r"\b([A-Za-z_]\w*)\s*=\s*[^;]*\b"
+                                 r"(?:user_rsp|clear_child_tid)\b", body):
+                users.add(m.group(1))
+            for v in VALIDATORS:
+                for m in re.finditer(r"\b%s\s*\(\s*\(?[^,()]*?\)?\s*([A-Za-z_]\w*)" % v, body):
+                    users.add(m.group(1))
+            for m in re.finditer(r"\bcopy_from_user\s*\([^,]+,\s*\(?[^,()]*\)?\s*([A-Za-z_]\w*)", body):
+                users.add(m.group(1))
+            for m in re.finditer(r"\b(?:copy_to_user|clear_user)\s*\(\s*\(?[^,()]*\)?\s*([A-Za-z_]\w*)", body):
+                users.add(m.group(1))
+            for m in re.finditer(r"\b(?:strncpy_from_user)\s*\([^,]+,\s*\(?[^,()]*\)?\s*([A-Za-z_]\w*)", body):
+                users.add(m.group(1))
+            if not users:
+                continue
+            # simple aliases: T *v = (T*)u;
+            for m in re.finditer(r"\b([A-Za-z_]\w*)\s*=\s*\(?[^;=]*?\)?\s*([A-Za-z_]\w*)\s*;", body):
+                if m.group(2) in users:
+                    users.add(m.group(1))
+
+            # GAP 2: follow same-file helpers called with a user pointer, so a
+            # deref two (or three) levels down is still attributed here.
+            analysis = [(rel, startline, body)]
+            seen, frontier, depth = {name}, [(name, body)], 0
+            while frontier and depth < 3:
+                nxt = []
+                for _fn, fb in frontier:
+                    for cm in re.finditer(r"\b([A-Za-z_]\w*)\s*\(([^;)]*)\)", fb):
+                        callee, args = cm.group(1), cm.group(2)
+                        if callee in seen or callee not in by_name:
+                            continue
+                        if not any(re.search(r"\b%s\b" % re.escape(u), args) for u in users):
+                            continue
+                        seen.add(callee)
+                        cn, cp, cl, cb = by_name[callee]
+                        for pm in re.finditer(r"([A-Za-z_]\w*)\s*(?:\[\s*\])?\s*(?:,|$)", cp):
+                            users.add(pm.group(1))
+                        analysis.append((rel, cl, cb))
+                        nxt.append((cn, cb))
+                frontier = nxt; depth += 1
+
+            for arel, abase, abody in analysis:
+                if BRACKET.search(abody):
+                    continue
+                for off, ln in enumerate(abody.split("\n")):
+                    hit = None
+                    for u in users:
+                        u_re = re.escape(u)
+                        if re.search(r"\*\s*%s\b" % u_re, ln) or \
+                           re.search(r"\b%s\s*->" % u_re, ln) or \
+                           re.search(r"\b%s\s*\[" % u_re, ln) or \
+                           re.search(r"\b(?:memcpy|memmove|memset|strcpy|strncpy|sprintf|snprintf)\s*\([^;]*\b%s\b" % u_re, ln):
+                            hit = u; break
+                    if not hit:
+                        continue
+                    if re.search(r"\b(?:%s)\s*\(" % "|".join(COPY_WRAPPERS + VALIDATORS), ln):
+                        continue
+                    lineno = abase + off
+                    if manifest.covers(arel, lineno, ln):
+                        continue
+                    rep.bad("B3", "%s:%d: Ring-0 deref of user pointer `%s` outside "
+                                  "copy_*_user and outside an AC bracket:\n        %s"
+                                  % (arel, lineno, hit, ln.strip()[:110]))
+
+
+# ---------------------------------------------------------------------------
+# manifest
+# ---------------------------------------------------------------------------
+
+class Manifest:
+    """Lines are:  <file>:<line>: <substring that must still be present>
+    Sections [EXEMPT] (safe for a stated reason) and [KNOWN_GAP] (a real
+    unwrapped access, still a live fault under SMAP, deliberately ledgered)."""
+    def __init__(self, path=None):
+        self.entries, self.gaps, self.path = [], [], path
+        if not path or not os.path.isfile(path):
+            return
+        section = None
+        for raw in read(path).split("\n"):
+            ln = raw.strip()
+            if not ln or ln.startswith("#"):
+                continue
+            if ln.startswith("[") and ln.endswith("]"):
+                section = ln.strip("[]"); continue
+            m = re.match(r"^([\w./\-]+):(\d+):\s*(.+)$", ln)
+            if not m:
+                continue
+            e = (m.group(1), int(m.group(2)), m.group(3).strip(), section)
+            self.entries.append(e)
+            if section == "KNOWN_GAP":
+                self.gaps.append(e)
+
+    def covers(self, rel, lineno, text):
+        for f, n, sub, _s in self.entries:
+            if f == rel and abs(n - lineno) <= 2 and sub[:24] in text:
+                return True
+            if f == rel and sub[:24] in text:
+                return True
+        return False
+
+    def check_fresh(self, root, rep):
+        """B1: a manifest entry whose code no longer matches is STALE and fails."""
+        for f, n, sub, _s in self.entries:
+            p = os.path.join(root, f)
+            if not os.path.isfile(p):
+                rep.bad("B1", "manifest: %s:%d refers to a file that no longer "
+                              "exists. Delete the entry." % (f, n))
+                continue
+            lines = read(p).split("\n")
+            window = lines[max(0, n - 4): n + 3]
+            if not any(sub[:24] in w for w in window):
+                rep.bad("B1", "manifest: %s:%d no longer contains %r. Either the "
+                              "site moved (fix the line number) or it was FIXED "
+                              "(delete the entry). A ledger of things that used to "
+                              "be true is how #514 happened." % (f, n, sub[:40]))
+
+
+# ---------------------------------------------------------------------------
+# self-test
+# ---------------------------------------------------------------------------
+
+GOOD_UACCESS = """
+section .text
+%macro SMAP_STAC 0
+    cmp byte [rel g_smap_active], 0
+    je %%s
+    stac
+%%s:
+%endmacro
+%macro SMAP_CLAC 0
+    cmp byte [rel g_smap_active], 0
+    je %%c
+    clac
+%%c:
+%endmacro
+__uaccess_copy:
+    mov rcx, rdx
+    SMAP_STAC
+__uaccess_copy_ex_start:
+    rep movsb
+__uaccess_copy_ex_end:
+    SMAP_CLAC
+    xor rax, rax
+    ret
+__uaccess_copy_ex_fixup:
+    mov rax, rcx
+    SMAP_CLAC
+    ret
+__uaccess_set:
+    mov rcx, rdx
+    SMAP_STAC
+__uaccess_set_ex_start:
+    rep stosb
+__uaccess_set_ex_end:
+    SMAP_CLAC
+    xor rax, rax
+    ret
+__uaccess_set_ex_fixup:
+    mov rax, rcx
+    SMAP_CLAC
+    ret
+__uaccess_strncpy:
+    SMAP_STAC
+__uaccess_strncpy_ex_start:
+    mov al, [rsi]
+__uaccess_strncpy_ex_end:
+    SMAP_CLAC
+    ret
+__uaccess_strncpy_ex_fixup:
+    SMAP_CLAC
+    ret
+__uaccess_strnlen:
+    SMAP_STAC
+__uaccess_strnlen_ex_start:
+    mov al, [rdi]
+__uaccess_strnlen_ex_end:
+    SMAP_CLAC
+    ret
+__uaccess_strnlen_ex_fixup:
+    SMAP_CLAC
+    ret
+"""
+
+GOOD_IDT = """
+isr_common:
+    cld
+    cmp byte [rel g_smap_active], 0
+    je .si
+    clac
+.si:
+    push rax
+    mov rdi, rsp
+    call isr_handler
+    iretq
+"""
+
+GOOD_SYSCALL = """
+#define MSR_SFMASK 0xC0000084
+#define SFMASK_IF 0x200
+#define SFMASK_TF 0x100
+#define SFMASK_DF 0x400
+#define SFMASK_AC 0x40000
+void syscall_init(void) {
+    wrmsr(MSR_SFMASK, SFMASK_IF | SFMASK_TF | SFMASK_DF | SFMASK_AC);
+}
+"""
+
+GOOD_SECURITY = """
+volatile uint8_t g_smap_active = 0;
+void security_init(void) {
+    g_smap_active = (rep.features & SECURITY_FEATURE_SMAP) ? 1u : 0u;
+}
+"""
+
+GOOD_WATCHED = """
+int handler(void *ubuf, unsigned n) {
+    char k[64];
+    if (validate_user_ptr(ubuf, n, ACCESS_READ) != VALIDATE_OK) return -1;
+    if (copy_from_user(k, ubuf, n) != 0) return -1;
+    return k[0];
+}
+"""
+
+def build_tree(base, uaccess, idt, syscall, security, watched):
+    for sub in ("mm", "cpu", "proc", "security", "net"):
+        os.makedirs(os.path.join(base, sub), exist_ok=True)
+    open(os.path.join(base, "mm", "uaccess.asm"), "w").write(uaccess)
+    open(os.path.join(base, "cpu", "idt.asm"), "w").write(idt)
+    open(os.path.join(base, "proc", "syscall.c"), "w").write(syscall)
+    open(os.path.join(base, "security", "security.c"), "w").write(security)
+    open(os.path.join(base, "net", "socket.c"), "w").write(watched)
+
+def run_all(root, manifest):
+    rep = Report()
+    rule_a1(root, rep); rule_a2(root, rep); rule_a3(root, rep); rule_a4(root, rep)
+    manifest.check_fresh(root, rep)
+    watch = derive_watch_set(root)
+    rule_b2(root, watch, manifest, rep)
+    rule_b3(root, watch, manifest, rep)
+    return rep, watch
+
+def self_test():
+    cases = []
+    def case(desc, rule, **kw):
+        cases.append((desc, rule, kw))
+
+    case("baseline: correct tree", None)
+    case("A1 STAC removed from __uaccess_copy", "A1",
+         uaccess=GOOD_UACCESS.replace("    mov rcx, rdx\n    SMAP_STAC\n",
+                                      "    mov rcx, rdx\n", 1))
+    case("A1 fixup CLAC removed (the -EFAULT leak)", "A1",
+         uaccess=GOOD_UACCESS.replace("__uaccess_copy_ex_fixup:\n    mov rax, rcx\n    SMAP_CLAC\n",
+                                      "__uaccess_copy_ex_fixup:\n    mov rax, rcx\n", 1))
+    case("A2 isr_common CLAC removed", "A2", idt=GOOD_IDT.replace("    clac\n", ""))
+    case("A2 isr_common CLD removed", "A2", idt=GOOD_IDT.replace("    cld\n", ""))
+    case("A3 IA32_FMASK loses the AC bit", "A3",
+         syscall=GOOD_SYSCALL.replace(" | SFMASK_AC", ""))
+    case("A3 SFMASK_AC defined to the wrong bit", "A3",
+         syscall=GOOD_SYSCALL.replace("#define SFMASK_AC 0x40000",
+                                      "#define SFMASK_AC 0x4000"))
+    case("A4 g_smap_active armed from the request flag", "A4",
+         security=GOOD_SECURITY.replace("(rep.features & SECURITY_FEATURE_SMAP) ? 1u : 0u",
+                                        "g_smap_requested ? 1u : 0u"))
+    case("B3 new raw user deref in a watched file (GAP 1)", "B3",
+         watched=GOOD_WATCHED.replace("if (copy_from_user(k, ubuf, n) != 0) return -1;",
+                                      "memcpy(k, ubuf, n);"))
+    case("B3 raw deref two levels down a helper (GAP 2)", "B3",
+         watched="""
+static void helper(const char *s, char *d) { d[0] = s[0]; }
+int handler(void *ubuf, unsigned n) {
+    char k[64];
+    if (validate_user_ptr(ubuf, n, ACCESS_READ) != VALIDATE_OK) return -1;
+    helper(ubuf, k);
+    return k[0];
+}
+""")
+    # NOTE the fixture deliberately validates a DIFFERENT pointer than the one it
+    # derefs, so B3 cannot fire and only B2 can catch it. That isolation is the
+    # point: it proves the CR3-window rule works on its own, rather than being
+    # masked by the validated-then-dereffed rule that happens to cover the same
+    # line in the real tree.
+    case("B2 unbracketed access inside a foreign-CR3 window", "B2",
+         watched="""
+int loader(unsigned long pml4, char *dst, const char *src, unsigned n, void *other) {
+    if (validate_user_ptr(other, 4, ACCESS_READ) != VALIDATE_OK) return -1;
+    __asm__ volatile("mov %0, %%cr3" : : "r"(pml4) : "memory");
+    memcpy((void *)dst, src, n);
+    __asm__ volatile("mov %0, %%cr3" : : "r"(pml4) : "memory");
+    return 0;
+}
+""")
+
+    passed = 0
+    print("smap-uaccess-lint self-test")
+    print("=" * 72)
+    for desc, want, kw in cases:
+        with tempfile.TemporaryDirectory() as td:
+            build_tree(td,
+                       kw.get("uaccess", GOOD_UACCESS),
+                       kw.get("idt", GOOD_IDT),
+                       kw.get("syscall", GOOD_SYSCALL),
+                       kw.get("security", GOOD_SECURITY),
+                       kw.get("watched", GOOD_WATCHED))
+            rep, _ = run_all(td, Manifest())
+            rules = {r for r, _m in rep.fail}
+            if want is None:
+                ok = not rep.fail
+                got = "GREEN" if ok else "RED(%s)" % ",".join(sorted(rules))
+                want_s = "GREEN"
+            else:
+                ok = want in rules
+                got = "RED(%s)" % ",".join(sorted(rules)) if rep.fail else "GREEN"
+                want_s = "RED(%s)" % want
+            passed += ok
+            print("  [%s] %-52s want %-12s got %s"
+                  % ("PASS" if ok else "FAIL", desc, want_s, got))
+    print("=" * 72)
+    print("%d/%d self-test cases passed" % (passed, len(cases)))
+    if passed != len(cases):
+        print("\nTHE GATE IS BROKEN. A lint that cannot be shown to go RED on a\n"
+              "synthetic violation is not a gate. Fix it before trusting a build.")
+        return 1
+    print("Proven: RED on each synthetic violation, GREEN on correct code.")
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(description="#645 SMAP user-access lint")
+    ap.add_argument("--root", default=".", help="kernel/ directory")
+    ap.add_argument("--manifest", default=None)
+    ap.add_argument("--self-test", action="store_true")
+    ap.add_argument("--smap-default", choices=("on", "off"), default=None,
+                    help="the kernel's COMPILE-TIME SMAP default for this build "
+                         "(off == built with -DCONFIG_NO_SMAP). With any "
+                         "KNOWN_GAP entry on the ledger, `on` FAILS the build.")
+    ap.add_argument("--list-watch", action="store_true")
+    a = ap.parse_args()
+
+    if a.self_test:
+        return self_test()
+
+    root = os.path.abspath(a.root)
+    man = Manifest(a.manifest)
+    rep, watch = run_all(root, man)
+
+    if a.list_watch:
+        print("derived watch set (%d files):" % len(watch))
+        for w in watch:
+            print("   ", w)
+        return 0
+
+    if man.gaps:
+        print("[smap-uaccess-lint] KNOWN_GAP ledger: %d unwrapped user access(es) "
+              "still live." % len(man.gaps))
+        for f, n, sub, _s in man.gaps:
+            print("    %s:%d  %s" % (f, n, sub[:88]))
+        print("    These are REAL faults under SMAP, not theoretical. They are "
+              "listed so a green build is never mistaken for a clean one.")
+
+    # THE INTERLOCK. Shipping a kernel whose SMAP default is ON while unwrapped
+    # user accesses remain does not harden anything: it #PFs on the first
+    # process launch. This makes "do not turn it on yet" a build failure rather
+    # than a note in a document that the next person will not read.
+    if a.smap_default == "on" and man.gaps:
+        rep.bad("INTERLOCK",
+                "SMAP compile-time default is ON, but %d KNOWN_GAP unwrapped "
+                "user access(es) remain on the ledger. Every one of them is a "
+                "#PF the moment CR4.SMAP is set, on paths the kernel takes "
+                "during normal operation (process launch, signal delivery, "
+                "read()). Either drain the ledger or build with -DCONFIG_NO_SMAP."
+                % len(man.gaps))
+
+    if rep.fail:
+        print("\n[smap-uaccess-lint] FAILED: %d violation(s)\n" % len(rep.fail))
+        for rule, msg in rep.fail:
+            print("  (%s) %s\n" % (rule, msg))
+        print("A new unwrapped Ring-0 access to user memory FAULTS under SMAP.")
+        return 1
+
+    print("[smap-uaccess-lint] OK: SMAP mechanism intact (A1-A4); no new "
+          "unwrapped user access in %d watched file(s)." % len(watch))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

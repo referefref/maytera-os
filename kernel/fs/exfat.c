@@ -1,6 +1,20 @@
+// #tls-suppressfix: -Wimplicit-function-declaration is GONE from this list.
+// It was hiding exactly one thing, a call to strcasecmp(), which is defined in
+// string.c and was declared in no header; string.h now declares it. That is the
+// dangerous member of the set: it is the warning that catches calling a function
+// the compiler has to guess the signature of, in a filesystem parser.
+//
+// The four below REMAIN, deliberately and with a measured justification rather
+// than as inherited noise. Removing them reveals 17 warnings, none of which is a
+// wrong-behaviour bug: 15 x -Wunused-parameter (uniform VFS-shaped op signatures
+// where this driver ignores an argument), 1 x -Wsign-compare and
+// 1 x -Waddress-of-packed-member (on-disk exFAT structures are packed, and
+// taking the address of a packed field is inherent to parsing them). They are
+// left as a file-scope pragma only because they are file-wide in cause; they are
+// NOT a licence to stop reading new warnings, and this file is now in
+// tools/warning-suppression-audit so the count is checked rather than trusted.
 #pragma GCC diagnostic ignored "-Waddress-of-packed-member"
 #pragma GCC diagnostic ignored "-Wunused-parameter"
-#pragma GCC diagnostic ignored "-Wimplicit-function-declaration"
 #pragma GCC diagnostic ignored "-Wsign-compare"
 #pragma GCC diagnostic ignored "-Wunused-function"
 // exfat.c - exFAT Filesystem Driver for MayteraOS
@@ -8,6 +22,7 @@
 #include "../serial.h"
 #include "../string.h"
 #include "../mm/heap.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // =============================================================================
 // Internal Helpers
@@ -326,7 +341,10 @@ int exfat_mount(exfat_fs_t *fs, void *device_ctx,
 
 void exfat_unmount(exfat_fs_t *fs) {
     if (!fs) return;
-    exfat_sync(fs);
+    // #693: unmount teardown has no caller that can act; log and continue so
+    // the mount is still torn down (a failed sync must not leak the mount).
+    if (exfat_sync(fs) != 0)
+        kprintf("[exFAT] final sync FAILED on unmount: dirty metadata LOST\n");
     fs->mounted = 0;
     kprintf("[exFAT] Unmounted filesystem\n");
 }
@@ -1051,7 +1069,6 @@ static void exfat_dirty_stack(void) {
 }
 
 void exfat_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     extern int exfat_dir_step_c(const uint8_t *, uint32_t, uint32_t, exfat_dir_info_t *);
     extern int exfat_dir_step_rs(const uint8_t *, uint32_t, uint32_t, exfat_dir_info_t *);
     static uint8_t buf[4096];

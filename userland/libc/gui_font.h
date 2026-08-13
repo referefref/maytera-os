@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // gui_font.h - MayteraOS shared font picker (the ChooseFont common dialog)
 //
 // WHY THIS EXISTS (#351):

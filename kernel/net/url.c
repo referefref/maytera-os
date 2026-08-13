@@ -3,6 +3,7 @@
 #include "url.h"
 #include "../string.h"
 #include "../serial.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // Character classification helpers
 static inline bool is_alpha(char c) {
@@ -860,7 +861,6 @@ static int url_build_vector(uint32_t idx, uint32_t *seed, char *buf, int cap) {
 }
 
 void url_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     static char buf[4096];
     uint32_t seed = 0x9e3779b1;
     uint32_t vectors = 0, mismatches = 0;

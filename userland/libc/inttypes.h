@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // inttypes.h - PRI*/SCN* format macros for MayteraOS libc (#359 Phase 2).
 #ifndef LIBC_INTTYPES_H
 #define LIBC_INTTYPES_H

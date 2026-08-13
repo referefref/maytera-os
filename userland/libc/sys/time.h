@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // sys/time.h - timeval + gettimeofday for MayteraOS libc (#359 Phase 2).
 #ifndef LIBC_SYS_TIME_H
 #define LIBC_SYS_TIME_H

@@ -4,6 +4,7 @@
 #include "../serial.h"
 #include "../string.h"
 #include "../cpu/isr.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // Ping state
 static uint16_t ping_id = 0x1234;
@@ -146,31 +147,47 @@ int icmp_parse(const uint8_t *buf, uint32_t len, icmp_parsed_t *out) {
 // Handle incoming ICMP packet. The untrusted PARSE/validate is now icmp_parse()
 // (Rust under -DRUST_ICMP); only the reply-send / echo-reply bookkeeping stays
 // here in C.
+// #745 (task #69): DEFAULT OFF, same precedent as g_tcp_dbg (#225) and the
+// #520 DHCP tracing flag. icmp_handle() runs inside net_poll()'s 64-packet
+// drain with net_lock held and interrupts OFF, and it used to emit between one
+// and four serial lines PER RECEIVED PACKET, unconditionally, the first of them
+// before any validation at all. kprintf writes one byte at a time and each byte
+// is a bounded UART wait, so a remote host pinging this machine got to choose
+// how long it spent unable to run the scheduler. That is a remote liveness
+// defect, not a logging preference. The counters below carry the information.
+int g_icmp_dbg = 0;
+uint64_t g_icmp_rx = 0, g_icmp_rx_reject = 0;
+
 void icmp_handle(uint32_t src_ip, const void *data, uint16_t length) {
     extern void serial_puts(uint16_t port, const char *str);
-    serial_puts(0x3F8, "[ICMP] icmp_handle called!\r\n");
+    g_icmp_rx++;
+    if (g_icmp_dbg) serial_puts(0x3F8, "[ICMP] icmp_handle called!\r\n");
 
     icmp_parsed_t p;
     int rc = icmp_parse((const uint8_t *)data, length, &p);
     if (rc != ICMP_PARSE_OK) {
-        if (rc == ICMP_PARSE_ETOOSHORT) {
-            serial_puts(0x3F8, "[ICMP] REJECT: too short\r\n");
-        } else {
-            serial_puts(0x3F8, "[ICMP] REJECT: oversize\r\n");
+        g_icmp_rx_reject++;
+        if (g_icmp_dbg) {
+            if (rc == ICMP_PARSE_ETOOSHORT) {
+                serial_puts(0x3F8, "[ICMP] REJECT: too short\r\n");
+            } else {
+                serial_puts(0x3F8, "[ICMP] REJECT: oversize\r\n");
+            }
         }
         return;
     }
 
-    kprintf("[ICMP] type=%d code=%d len=%d\n", p.type, p.code, length);
+    if (g_icmp_dbg) kprintf("[ICMP] type=%d code=%d len=%d\n", p.type, p.code, length);
 
     if (!p.checksum_ok) {
-        kprintf("[ICMP] REJECT: bad checksum (recv 0x%04x)\n", p.checksum);
+        g_icmp_rx_reject++;
+        if (g_icmp_dbg) kprintf("[ICMP] REJECT: bad checksum (recv 0x%04x)\n", p.checksum);
         return;
     }
 
     switch (p.type) {
         case ICMP_ECHO_REQUEST: {
-            serial_puts(0x3F8, "[ICMP] Got ECHO REQUEST - sending reply!\r\n");
+            if (g_icmp_dbg) serial_puts(0x3F8, "[ICMP] Got ECHO REQUEST - sending reply!\r\n");
             // Send echo reply. `length` is MTU-bounded by ip.c (see ICMP_MAX_LEN);
             // the parse already rejected anything over the bound before we get here.
             uint8_t reply[length];
@@ -184,12 +201,13 @@ void icmp_handle(uint32_t src_ip, const void *data, uint16_t length) {
             uint32_t dest_host = ((src_ip & 0xFF) << 24) | ((src_ip & 0xFF00) << 8) |
                                  ((src_ip >> 8) & 0xFF00) | ((src_ip >> 24) & 0xFF);
             int result = ip_send(dest_host, IP_PROTO_ICMP, reply, length);
-            kprintf("[ICMP] ip_send returned %d\n", result);
+            if (g_icmp_dbg) kprintf("[ICMP] ip_send returned %d\n", result);
+            (void)result;
             break;
         }
 
         case ICMP_ECHO_REPLY: {
-            serial_puts(0x3F8, "[ICMP] Got ECHO REPLY\r\n");
+            if (g_icmp_dbg) serial_puts(0x3F8, "[ICMP] Got ECHO REPLY\r\n");
             // Check if this is reply to our ping
             if (ntohs(p.id) == ping_id && ping_pending) {
                 // Convert src_ip from network byte order to host byte order
@@ -301,7 +319,6 @@ static int icmp_parsed_eq(int rc_a, const icmp_parsed_t *a, int rc_b, const icmp
 }
 
 void icmp_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     // 8 KiB scratch arena: big enough that the oversize SEC probe's (deliberately
     // over-claimed) length stays inside OUR allocation, so demonstrating the C's
     // unbounded read can never fault the boot. The real packet is much smaller.

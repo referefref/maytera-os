@@ -25,13 +25,14 @@ void blk_clear_root_usb(void);
 
 // Non-zero if the root block device is currently a USB MSC disk.
 int blk_root_is_usb(void);
+int blk_root_usb_index(void);
 
 // Sector I/O in 512-byte units. channel/drive give the ATA identity used on the
 // ATA path; they are ignored on the USB path. Returns the number of sectors
 // transferred (> 0) on success, <= 0 on error, matching the ata_*_dma calling
 // convention the FS layer already checks against.
 int blk_read(uint8_t channel, uint8_t drive, uint64_t lba, uint32_t count, void *buf);
-int blk_write(uint8_t channel, uint8_t drive, uint64_t lba, uint32_t count, const void *buf);
+MUST_CHECK int blk_write(uint8_t channel, uint8_t drive, uint64_t lba, uint32_t count, const void *buf);
 
 // #375/#417: after the USB root is verified, copy the root device into RAM
 // (TO-RAM) so all later reads are RAM-speed and the slow stick is never
@@ -57,5 +58,11 @@ void blk_toram_set_disabled(int disabled);
 // #375: RAM stats for verification/diagnostics. hits = sectors served from RAM,
 // misses = sectors read from USB. *enabled: 0 off, 1 TO-RAM, 2 demand cache.
 void blk_cache_stats(uint64_t *hits, uint64_t *misses, int *enabled);
+
+// #617: demand-cache installs DECLINED because a write completed while the
+// read's device I/O was in flight (the lost-read-modify-write guard). See the
+// g_wgen comment in blockdev.c. Non-zero means real read/write overlap on the
+// root device; it is a measurement, not an error.
+uint64_t blk_stale_skips(void);
 
 #endif // BLOCKDEV_H

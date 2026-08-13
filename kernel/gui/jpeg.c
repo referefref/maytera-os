@@ -5,6 +5,7 @@
 #include "../mm/heap.h"
 #include "../string.h"
 #include "../serial.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // #404 Phase W: the Rust port of the pure JPEG header-parse seam (rustkern.rs).
 // Signature-locked here; a mismatch fails the C compile (the FFI "lock"). Live
@@ -25,14 +26,18 @@ typedef struct {
     uint8_t quant[4][64];           // Quantization tables (up to 4)
     int quant_valid[4];
 
-    // Huffman tables: [0]=DC, [1]=AC, each has [0]=luminance, [1]=chrominance
-    uint8_t huff_bits[2][2][16];    // Number of codes of each length
-    uint8_t huff_vals[2][2][256];   // Symbol values
-    int huff_valid[2][2];
+    // Huffman tables: [0]=DC, [1]=AC. Second index is the table slot: baseline
+    // uses 0..1 (luma/chroma), but PROGRESSIVE (SOF2) may define up to 4 DC and
+    // 4 AC tables (T.81 Th=0..3), so the slot dimension is 4. This is the
+    // PRIVATE decoder struct; jpeg_hdr_t (FFI-locked to rustkern.rs) is NOT
+    // changed and still carries only the baseline [2][2] tables.
+    uint8_t huff_bits[2][4][16];    // Number of codes of each length
+    uint8_t huff_vals[2][4][256];   // Symbol values
+    int huff_valid[2][4];
 
     // Fast Huffman lookup
-    int16_t huff_fast[2][2][1 << 10];
-    int huff_fast_bits[2][2];
+    int16_t huff_fast[2][4][1 << 10];
+    int huff_fast_bits[2][4];
 
     // Image info
     uint32_t width, height;
@@ -60,7 +65,33 @@ typedef struct {
 
     // DC prediction
     int dc_pred[JPEG_MAX_COMPONENTS];
+
+    // Progressive JPEG (SOF2) state. #332 root-cause fix: baseline decodes and
+    // IDCTs block-by-block in one pass; progressive accumulates dequantized DCT
+    // coefficients for ALL blocks across ALL scans into full-image per-component
+    // buffers (ZIGZAG order), then runs IDCT+upsample+color-convert ONCE at the
+    // end. These fields are on the PRIVATE decoder struct (NOT jpeg_hdr_t, which
+    // is FFI-locked to rustkern.rs at sizeof 1512), so extending them is safe.
+    int      prog;                          // 1 if progressive (SOF2)
+    int      max_h, max_v;                  // max sampling factors over comps
+    int      comp_bx[JPEG_MAX_COMPONENTS];  // non-interleaved real blocks wide
+    int      comp_by[JPEG_MAX_COMPONENTS];  // non-interleaved real block rows
+    int      coeff_w[JPEG_MAX_COMPONENTS];  // coeff stride in blocks (MCU-padded)
+    int      coeff_h[JPEG_MAX_COMPONENTS];  // coeff block rows (MCU-padded)
+    int16_t *coeff[JPEG_MAX_COMPONENTS];    // full-image DCT coeffs, zigzag order
+    int      eob_run;                       // progressive AC end-of-band run
+    int      scan_ncomp;                    // components in the current scan
+    int      scan_comp[JPEG_MAX_COMPONENTS];// their component indices
+    int      scan_ss, scan_se;              // spectral selection start/end
+    int      scan_ah, scan_al;              // successive approximation hi/lo
 } jpeg_decoder_t;
+
+// Progressive full-image coefficient memory budget. A crafted 4096x4096 4:4:4
+// image would demand ~100MB of int16 coefficients; the kernel heap tops out at
+// 256MB and is shared. Clamp so an attacker-controlled dimension cannot force an
+// unbounded allocation: reject (JPEG_ERR_UNSUPPORTED) anything larger. 64MB
+// comfortably covers real content (AssaultCube textures, web/album art).
+#define JPEG_PROG_MAX_COEFF_BYTES  (64ULL * 1024 * 1024)
 
 // Zigzag order for DCT coefficients
 static const uint8_t zigzag[64] = {
@@ -114,8 +145,13 @@ static void jpeg_fill_bits(jpeg_decoder_t *d) {
 }
 
 // Get n raw bits (MSB-first), 0..16. Returns the unsigned value.
+// Robustness: n comes from a Huffman-decoded magnitude/run size. A valid stream
+// never needs more than 16 bits at once, but a CORRUPT table can decode a symbol
+// byte up to 255, which would drive the shift below (32 - n) negative (UB, and a
+// wrong value on x86 where the count is masked). Bound n at the shared read site
+// so no caller (baseline decode_block included) can trip it.
 static int get_bits(jpeg_decoder_t *d, int n) {
-    if (n == 0) return 0;
+    if (n <= 0 || n > 16) return 0;
     if (d->code_bits < n) jpeg_fill_bits(d);
     unsigned int k = d->code_buffer >> (32 - n);
     d->code_buffer <<= n;
@@ -226,9 +262,10 @@ static int decode_huff(jpeg_decoder_t *d, int dc, int idx) {
     return -1;
 }
 
-// Extend sign for DC/AC values
+// Extend sign for DC/AC values. Same robustness bound as get_bits: a corrupt
+// table can yield bits > 16, which would make (bits - 1) drive a huge shift.
 static int extend(int val, int bits) {
-    if (bits == 0) return 0;
+    if (bits <= 0 || bits > 16) return 0;
     int vt = 1 << (bits - 1);
     if (val < vt) {
         // Equivalent to: val + (-1 << bits) + 1, avoiding negative shift
@@ -624,6 +661,63 @@ int jpeg_parse_headers(const uint8_t *data, uint32_t len, jpeg_hdr_t *out) {
 #endif
 }
 
+// ===========================================================================
+// Shared output primitives (used by BOTH the baseline and the progressive
+// paths, so the upsample + YCbCr->RGB math lives in ONE place, not forked).
+// jpeg_upsample_block scatters an 8x8 spatial block into the per-component MCU
+// buffer with nearest-neighbour (box) chroma upsampling; jpeg_mcu_to_rgb color-
+// converts one finished MCU into the BGRA output. Both are byte-for-byte the
+// verbatim baseline math, just factored out.
+// ===========================================================================
+static void jpeg_upsample_block(jpeg_decoder_t *d, int *target, const int *block,
+                                int bx, int by, int h, int v) {
+    int scale_x = d->mcu_width / (h * 8);
+    int scale_y = d->mcu_height / (v * 8);
+    for (int y = 0; y < 8; y++) {
+        for (int x = 0; x < 8; x++) {
+            int val = block[y * 8 + x] + 128;
+            int px = bx * 8 + x;
+            int py = by * 8 + y;
+            for (int sy = 0; sy < scale_y; sy++) {
+                for (int sx = 0; sx < scale_x; sx++) {
+                    int tx = px * scale_x + sx;
+                    int ty = py * scale_y + sy;
+                    if (tx < d->mcu_width && ty < d->mcu_height) {
+                        target[ty * d->mcu_width + tx] = val;
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void jpeg_mcu_to_rgb(jpeg_decoder_t *d, const int *mcu_y, const int *mcu_cb,
+                            const int *mcu_cr, int mcu_x_idx, int mcu_y_idx,
+                            uint32_t *pixels) {
+    int base_x = mcu_x_idx * d->mcu_width;
+    int base_y = mcu_y_idx * d->mcu_height;
+    for (int y = 0; y < d->mcu_height && base_y + y < (int)d->height; y++) {
+        for (int x = 0; x < d->mcu_width && base_x + x < (int)d->width; x++) {
+            int idx = y * d->mcu_width + x;
+            int r, g, b;
+            if (d->components == 1) {
+                r = g = b = clamp(mcu_y[idx]);
+            } else {
+                // YCbCr to RGB conversion
+                int yy = mcu_y[idx];
+                int cb = mcu_cb[idx] - 128;
+                int cr = mcu_cr[idx] - 128;
+                r = clamp(yy + ((cr * 359) >> 8));
+                g = clamp(yy - ((cb * 88 + cr * 183) >> 8));
+                b = clamp(yy + ((cb * 454) >> 8));
+            }
+            int px = base_x + x;
+            int py = base_y + y;
+            pixels[py * d->width + px] = 0xFF000000 | (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
 // Decode the entropy-coded scan into RGB pixels. #404 Phase W: the SOS scan
 // header (component table selectors + Ss/Se/Ah/Al) is now parsed by the pure
 // header seam (jpeg_parse_headers), which sets d->comp_dc/comp_ac and leaves
@@ -696,59 +790,14 @@ static int jpeg_decode_scan(jpeg_decoder_t *d, uint32_t *pixels) {
                             return ret;
                         }
 
-                        // Copy block to MCU buffer with upsampling
-                        int scale_x = d->mcu_width / (h * 8);
-                        int scale_y = d->mcu_height / (v * 8);
-
-                        for (int y = 0; y < 8; y++) {
-                            for (int x = 0; x < 8; x++) {
-                                int val = block[y * 8 + x] + 128;
-                                int px = bx * 8 + x;
-                                int py = by * 8 + y;
-
-                                // Upsample
-                                for (int sy = 0; sy < scale_y; sy++) {
-                                    for (int sx = 0; sx < scale_x; sx++) {
-                                        int tx = px * scale_x + sx;
-                                        int ty = py * scale_y + sy;
-                                        if (tx < d->mcu_width && ty < d->mcu_height) {
-                                            target[ty * d->mcu_width + tx] = val;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        // Copy block to MCU buffer with upsampling (shared).
+                        jpeg_upsample_block(d, target, block, bx, by, h, v);
                     }
                 }
             }
 
-            // Convert MCU to RGB and write to output
-            int base_x = mcu_x_idx * d->mcu_width;
-            int base_y = mcu_y_idx * d->mcu_height;
-
-            for (int y = 0; y < d->mcu_height && base_y + y < (int)d->height; y++) {
-                for (int x = 0; x < d->mcu_width && base_x + x < (int)d->width; x++) {
-                    int idx = y * d->mcu_width + x;
-                    int r, g, b;
-
-                    if (d->components == 1) {
-                        r = g = b = clamp(mcu_y[idx]);
-                    } else {
-                        // YCbCr to RGB conversion
-                        int yy = mcu_y[idx];
-                        int cb = mcu_cb[idx] - 128;
-                        int cr = mcu_cr[idx] - 128;
-
-                        r = clamp(yy + ((cr * 359) >> 8));
-                        g = clamp(yy - ((cb * 88 + cr * 183) >> 8));
-                        b = clamp(yy + ((cb * 454) >> 8));
-                    }
-
-                    int px = base_x + x;
-                    int py = base_y + y;
-                    pixels[py * d->width + px] = 0xFF000000 | (r << 16) | (g << 8) | b;
-                }
-            }
+            // Convert MCU to RGB and write to output (shared).
+            jpeg_mcu_to_rgb(d, mcu_y, mcu_cb, mcu_cr, mcu_x_idx, mcu_y_idx, pixels);
 
             restart_count++;
         }
@@ -759,6 +808,570 @@ static int jpeg_decode_scan(jpeg_decoder_t *d, uint32_t *pixels) {
     kfree(mcu_cr);
 
     return JPEG_SUCCESS;
+}
+
+// ===========================================================================
+// #332 ROOT-CAUSE FIX: PROGRESSIVE JPEG (SOF2) decoding.
+//
+// Baseline (SOF0) has ONE scan and decodes+IDCTs each block in a single pass.
+// Progressive (SOF2) splits the image across MANY scans: each scan carries a
+// spectral band (Ss..Se) of either DC or AC coefficients at one successive-
+// approximation bit position (Ah/Al). Coefficients must be ACCUMULATED for all
+// blocks across all scans into a full-image per-component buffer (kept in
+// ZIGZAG order so block[k] indexes directly by the Ss..Se band AND feeds the
+// existing zigzag-input jpeg_dequant_idct), then IDCT+upsample+color-convert is
+// run ONCE at the end. Algorithm per ITU-T T.81 Annex G (matches libjpeg).
+//
+// This path is SELF-CONTAINED (its own marker walk + multi-scan loop) and does
+// NOT touch jpeg_hdr_t or the baseline jpeg_parse_headers seam (both FFI-locked
+// to rustkern.rs). It REUSES the shared primitives: jpeg_fill_bits, get_bits,
+// build_huffman, decode_huff, extend, idct_block/jpeg_dequant_idct, zigzag,
+// clamp, and the jpeg_upsample_block / jpeg_mcu_to_rgb output writers.
+//
+// LANGUAGE: implemented in C in-place. Justification (per the Rust-first rule):
+// ENTANGLEMENT. It shares the baseline decoder's Huffman tables, bit reader,
+// dequant+fixed-point-IDCT seam, and output writers verbatim; a Rust reimpl
+// would either fork that machinery (banned) or need an FFI shim around every
+// one of those internal statics. No float anywhere (soft-float / no-SSE): all
+// math is the same fixed-point integer path as baseline.
+//
+// ROBUSTNESS: decodes UNTRUSTED files. Every table index, coefficient position
+// (Ss/Se in 0..63, k<=Se before each write), component count, sampling factor,
+// and the full-image allocation size are bounds-checked; malformed input
+// returns a negative error, never OOB or panic. The coefficient allocation is
+// capped (JPEG_PROG_MAX_COEFF_BYTES) so attacker-controlled dimensions cannot
+// exhaust the heap.
+// ===========================================================================
+
+// Pre-scan (honouring 2-byte segment lengths) for the first Start-Of-Frame
+// marker and return its low byte (0xC0=baseline, 0xC2=progressive, ...), or -1
+// if none is found. SOFn = 0xC0..0xCF EXCLUDING DHT(0xC4), JPG(0xC8), DAC(0xCC).
+static int jpeg_scan_sof(const uint8_t *data, uint32_t len) {
+    uint32_t pos = 2;  // after SOI
+    while (pos + 2 <= len) {
+        if (data[pos] != 0xFF) { pos++; continue; }
+        uint32_t p = pos + 1;
+        while (p < len && data[p] == 0xFF) p++;   // skip fill bytes
+        if (p >= len) break;
+        int m = data[p];
+        pos = p + 1;
+        if (m == 0xD8 || m == 0x01 || (m >= 0xD0 && m <= 0xD7)) continue; // no payload
+        if (m == 0xD9 || m == 0xDA) break;   // EOI or SOS (no SOF seen)
+        if (m >= 0xC0 && m <= 0xCF && m != 0xC4 && m != 0xC8 && m != 0xCC)
+            return m;   // a real frame header
+        if (pos + 2 > len) break;
+        int l = (data[pos] << 8) | data[pos + 1];
+        if (l < 2) break;
+        pos += (uint32_t)l;   // skip this segment by its length
+    }
+    return -1;
+}
+
+// Advance to and consume the next marker in the stream. If a marker was already
+// latched by jpeg_fill_bits during entropy decode, d->pos already points just
+// past it, so hand it back. Otherwise scan forward for 0xFF followed by a
+// non-0x00/non-0xFF byte. Returns the marker low byte, or -1 at end of data.
+static int jpeg_prog_next_marker(jpeg_decoder_t *d) {
+    if (d->marker != 0) {
+        int m = d->marker;
+        d->marker = 0;
+        return m;
+    }
+    while (d->pos < d->data_len) {
+        int b = d->data[d->pos++];
+        if (b != 0xFF) continue;
+        while (d->pos < d->data_len && d->data[d->pos] == 0xFF) d->pos++;
+        if (d->pos >= d->data_len) return -1;
+        int m = d->data[d->pos++];
+        if (m == 0x00) continue;   // stuffed 0xFF00, keep scanning
+        return m;
+    }
+    return -1;
+}
+
+// --- Progressive segment parsers (write directly into the decoder). ---------
+
+static int prog_parse_dqt(jpeg_decoder_t *d) {
+    int l = hdr_read_u16(d->data, d->data_len, &d->pos);
+    if (l < 0) return JPEG_ERR_CORRUPT;
+    l -= 2;
+    while (l > 0) {
+        int info = hdr_read_byte(d->data, d->data_len, &d->pos);
+        if (info < 0) return JPEG_ERR_CORRUPT;
+        l--;
+        int prec = info >> 4;
+        int idx = info & 0x0F;
+        if (idx >= 4) return JPEG_ERR_CORRUPT;
+        if (prec != 0) return JPEG_ERR_UNSUPPORTED;   // 16-bit quant not supported
+        for (int i = 0; i < 64; i++) {
+            int v = hdr_read_byte(d->data, d->data_len, &d->pos);
+            if (v < 0) return JPEG_ERR_CORRUPT;
+            d->quant[idx][i] = (uint8_t)v;
+        }
+        d->quant_valid[idx] = 1;
+        l -= 64;
+    }
+    return JPEG_SUCCESS;
+}
+
+static int prog_parse_dht(jpeg_decoder_t *d) {
+    int l = hdr_read_u16(d->data, d->data_len, &d->pos);
+    if (l < 0) return JPEG_ERR_CORRUPT;
+    l -= 2;
+    while (l > 0) {
+        int info = hdr_read_byte(d->data, d->data_len, &d->pos);
+        if (info < 0) return JPEG_ERR_CORRUPT;
+        l--;
+        int dc = (info >> 4) & 1;   // 0=DC, 1=AC
+        int idx = info & 0x0F;
+        if (idx >= 4) return JPEG_ERR_CORRUPT;   // progressive allows Th 0..3
+        int total = 0;
+        for (int i = 0; i < 16; i++) {
+            int c = hdr_read_byte(d->data, d->data_len, &d->pos);
+            if (c < 0) return JPEG_ERR_CORRUPT;
+            d->huff_bits[dc][idx][i] = (uint8_t)c;
+            total += c;
+        }
+        l -= 16;
+        if (total > 256) return JPEG_ERR_CORRUPT;   // huff_vals[.][.] is [256]
+        for (int i = 0; i < total; i++) {
+            int v = hdr_read_byte(d->data, d->data_len, &d->pos);
+            if (v < 0) return JPEG_ERR_CORRUPT;
+            d->huff_vals[dc][idx][i] = (uint8_t)v;
+        }
+        l -= total;
+        // Rebuild the fast/slow decode table now; reject non-canonical tables
+        // (build_huffman==0) rather than decode with a partial one. DHT may be
+        // (re)defined between scans in progressive, so this runs per DHT.
+        if (!build_huffman(d, dc, idx)) return JPEG_ERR_CORRUPT;
+        d->huff_valid[dc][idx] = 1;
+    }
+    return JPEG_SUCCESS;
+}
+
+static int prog_parse_dri(jpeg_decoder_t *d) {
+    int l = hdr_read_u16(d->data, d->data_len, &d->pos);
+    if (l < 0) return JPEG_ERR_CORRUPT;
+    (void)l;
+    int ri = hdr_read_u16(d->data, d->data_len, &d->pos);
+    if (ri < 0) return JPEG_ERR_CORRUPT;
+    d->restart_interval = ri;
+    return JPEG_SUCCESS;
+}
+
+static int prog_parse_sof2(jpeg_decoder_t *d) {
+    int l = hdr_read_u16(d->data, d->data_len, &d->pos);
+    if (l < 0) return JPEG_ERR_CORRUPT;
+    int prec = hdr_read_byte(d->data, d->data_len, &d->pos);
+    if (prec != 8) return JPEG_ERR_UNSUPPORTED;   // 8-bit only
+    int height = hdr_read_u16(d->data, d->data_len, &d->pos);
+    int width = hdr_read_u16(d->data, d->data_len, &d->pos);
+    int comps = hdr_read_byte(d->data, d->data_len, &d->pos);
+    if (width <= 0 || height <= 0) return JPEG_ERR_CORRUPT;
+    if (width > JPEG_MAX_WIDTH || height > JPEG_MAX_HEIGHT) return JPEG_ERR_UNSUPPORTED;
+    if (comps != 1 && comps != 3) return JPEG_ERR_UNSUPPORTED;
+    d->width = width;
+    d->height = height;
+    d->components = comps;
+    int max_h = 1, max_v = 1;
+    for (int i = 0; i < comps; i++) {
+        d->comp_id[i] = hdr_read_byte(d->data, d->data_len, &d->pos);
+        int s = hdr_read_byte(d->data, d->data_len, &d->pos);
+        if (d->comp_id[i] < 0 || s < 0) return JPEG_ERR_CORRUPT;
+        d->comp_h[i] = s >> 4;
+        d->comp_v[i] = s & 0x0F;
+        d->comp_qt[i] = hdr_read_byte(d->data, d->data_len, &d->pos);
+        if (d->comp_h[i] < 1 || d->comp_h[i] > 4 ||
+            d->comp_v[i] < 1 || d->comp_v[i] > 4) return JPEG_ERR_UNSUPPORTED;
+        if (d->comp_qt[i] < 0 || d->comp_qt[i] >= 4) return JPEG_ERR_CORRUPT;
+        if (d->comp_h[i] > max_h) max_h = d->comp_h[i];
+        if (d->comp_v[i] > max_v) max_v = d->comp_v[i];
+    }
+    d->max_h = max_h;
+    d->max_v = max_v;
+    d->mcu_width = max_h * 8;
+    d->mcu_height = max_v * 8;
+    d->mcu_count_x = (width + d->mcu_width - 1) / d->mcu_width;
+    d->mcu_count_y = (height + d->mcu_height - 1) / d->mcu_height;
+
+    // Per-component coefficient grid. The stored grid is MCU-padded (coeff_w/h)
+    // so interleaved DC scans can address every block; non-interleaved scans
+    // iterate the component's own real block extent (comp_bx/comp_by) but use
+    // coeff_w as the row stride. Compute the total size in 64-bit and REJECT if
+    // it exceeds the budget, so a crafted dimension cannot exhaust the heap.
+    uint64_t total_bytes = 0;
+    for (int i = 0; i < comps; i++) {
+        int comp_px_w = (width  * d->comp_h[i] + max_h - 1) / max_h;
+        int comp_px_h = (height * d->comp_v[i] + max_v - 1) / max_v;
+        d->comp_bx[i] = (comp_px_w + 7) / 8;
+        d->comp_by[i] = (comp_px_h + 7) / 8;
+        d->coeff_w[i] = d->mcu_count_x * d->comp_h[i];
+        d->coeff_h[i] = d->mcu_count_y * d->comp_v[i];
+        total_bytes += (uint64_t)d->coeff_w[i] * (uint64_t)d->coeff_h[i]
+                       * 64ULL * sizeof(int16_t);
+    }
+    if (total_bytes > JPEG_PROG_MAX_COEFF_BYTES) return JPEG_ERR_UNSUPPORTED;
+    for (int i = 0; i < comps; i++) {
+        size_t sz = (size_t)d->coeff_w[i] * (size_t)d->coeff_h[i] * 64 * sizeof(int16_t);
+        d->coeff[i] = kzalloc(sz);
+        if (!d->coeff[i]) return JPEG_ERR_NOMEM;
+    }
+    return JPEG_SUCCESS;
+}
+
+// Parse a scan header and leave d->pos at the first entropy byte. Sets the
+// per-scan component list + spectral/approximation params + table selectors.
+static int prog_parse_sos_header(jpeg_decoder_t *d) {
+    int l = hdr_read_u16(d->data, d->data_len, &d->pos);
+    if (l < 0) return JPEG_ERR_CORRUPT;
+    int ns = hdr_read_byte(d->data, d->data_len, &d->pos);
+    if (ns < 1 || ns > d->components) return JPEG_ERR_CORRUPT;
+    d->scan_ncomp = ns;
+    for (int i = 0; i < ns; i++) {
+        int id = hdr_read_byte(d->data, d->data_len, &d->pos);
+        int tables = hdr_read_byte(d->data, d->data_len, &d->pos);
+        if (id < 0 || tables < 0) return JPEG_ERR_CORRUPT;
+        int found = -1;
+        for (int j = 0; j < d->components; j++)
+            if (d->comp_id[j] == id) { found = j; break; }
+        if (found < 0) return JPEG_ERR_CORRUPT;
+        d->scan_comp[i] = found;
+        int td = tables >> 4;
+        int ta = tables & 0x0F;
+        if (td >= 4 || ta >= 4) return JPEG_ERR_CORRUPT;   // progressive Th 0..3
+        d->comp_dc[found] = td;
+        d->comp_ac[found] = ta;
+    }
+    int ss = hdr_read_byte(d->data, d->data_len, &d->pos);
+    int se = hdr_read_byte(d->data, d->data_len, &d->pos);
+    int ahal = hdr_read_byte(d->data, d->data_len, &d->pos);
+    if (ss < 0 || se < 0 || ahal < 0) return JPEG_ERR_CORRUPT;
+    if (ss > 63 || se > 63 || ss > se) return JPEG_ERR_CORRUPT;
+    d->scan_ss = ss;
+    d->scan_se = se;
+    d->scan_ah = ahal >> 4;
+    d->scan_al = ahal & 0x0F;
+    if (d->scan_ah > 13 || d->scan_al > 13) return JPEG_ERR_CORRUPT;
+    if (ss == 0) {
+        if (se != 0) return JPEG_ERR_CORRUPT;      // DC scan: band must be {0}
+    } else {
+        if (ns != 1) return JPEG_ERR_CORRUPT;      // AC scan: single component
+    }
+    // Require the Huffman tables this scan will actually use to be present.
+    for (int i = 0; i < ns; i++) {
+        int ci = d->scan_comp[i];
+        if (ss == 0) {
+            if (d->scan_ah == 0 && !d->huff_valid[0][d->comp_dc[ci]])
+                return JPEG_ERR_CORRUPT;           // DC first uses a DC table
+        } else {
+            if (!d->huff_valid[1][d->comp_ac[ci]])
+                return JPEG_ERR_CORRUPT;           // AC first/refine use an AC table
+        }
+    }
+    return JPEG_SUCCESS;
+}
+
+// --- The four progressive coefficient decoders (write coeff[], never pixels). ---
+
+static int prog_dc_first(jpeg_decoder_t *d, int comp, int16_t *blk) {
+    int s = decode_huff(d, 0, d->comp_dc[comp]);
+    if (s < 0 || s > 15) return JPEG_ERR_HUFFMAN;
+    int diff = 0;
+    if (s) diff = extend(get_bits(d, s), s);
+    d->dc_pred[comp] += diff;
+    blk[0] = (int16_t)(d->dc_pred[comp] * (1 << d->scan_al));   // no signed <<
+    return JPEG_SUCCESS;
+}
+
+static int prog_dc_refine(jpeg_decoder_t *d, int16_t *blk) {
+    if (get_bits(d, 1)) blk[0] |= (int16_t)(1 << d->scan_al);
+    return JPEG_SUCCESS;
+}
+
+static int prog_ac_first(jpeg_decoder_t *d, int comp, int16_t *blk) {
+    int ac = d->comp_ac[comp];
+    int Se = d->scan_se;
+    int Al = d->scan_al;
+    if (d->eob_run > 0) { d->eob_run--; return JPEG_SUCCESS; }
+    int k = d->scan_ss;
+    while (k <= Se) {
+        int rs = decode_huff(d, 1, ac);
+        if (rs < 0) return JPEG_ERR_HUFFMAN;
+        int r = rs >> 4;
+        int s = rs & 15;
+        if (s == 0) {
+            if (r != 15) {
+                d->eob_run = 1 << r;
+                if (r) d->eob_run += get_bits(d, r);
+                d->eob_run--;
+                break;
+            }
+            k += 16;   // ZRL: run of 16 zeros
+        } else {
+            k += r;
+            if (k > Se) return JPEG_ERR_CORRUPT;
+            blk[k] = (int16_t)(extend(get_bits(d, s), s) * (1 << Al));
+            k++;
+        }
+    }
+    return JPEG_SUCCESS;
+}
+
+// AC refinement (Ah>0), single component. Correction-bit machine per T.81
+// G.1.2.3 (matches libjpeg decode_mcu_AC_refine). p1 = +(1<<Al), m1 = -(1<<Al);
+// m1 is computed by negation, NOT a negative left-shift (which is UB).
+static int prog_ac_refine(jpeg_decoder_t *d, int comp, int16_t *blk) {
+    int ac = d->comp_ac[comp];
+    int Se = d->scan_se;
+    int p1 = 1 << d->scan_al;
+    int m1 = -(1 << d->scan_al);
+    int k = d->scan_ss;
+
+    if (d->eob_run == 0) {
+        for (; k <= Se; k++) {
+            int rs = decode_huff(d, 1, ac);
+            if (rs < 0) return JPEG_ERR_HUFFMAN;
+            int r = rs >> 4;
+            int s = rs & 15;
+            int newval = 0;
+            if (s == 0) {
+                if (r != 15) {
+                    d->eob_run = 1 << r;
+                    if (r) d->eob_run += get_bits(d, r);
+                    break;                 // eob_run-- handled by the tail below
+                }
+                // r==15, s==0: ZRL walks 16 zero-history positions (below).
+            } else {
+                // In refinement the magnitude size is always 1; the data bit is
+                // the sign of the newly-nonzero coefficient.
+                if (s != 1) return JPEG_ERR_CORRUPT;
+                newval = get_bits(d, 1) ? p1 : m1;
+            }
+            // Advance across r zero-history coefficients, applying a correction
+            // bit to every already-nonzero coefficient we pass.
+            while (k <= Se) {
+                if (blk[k] != 0) {
+                    if (get_bits(d, 1)) {
+                        if ((blk[k] & p1) == 0)
+                            blk[k] += (int16_t)((blk[k] > 0) ? p1 : m1);
+                    }
+                } else {
+                    if (r == 0) break;
+                    r--;
+                }
+                k++;
+            }
+            if (newval && k <= Se) blk[k] = (int16_t)newval;
+        }
+    }
+    if (d->eob_run > 0) {
+        for (; k <= Se; k++) {
+            if (blk[k] != 0) {
+                if (get_bits(d, 1)) {
+                    if ((blk[k] & p1) == 0)
+                        blk[k] += (int16_t)((blk[k] > 0) ? p1 : m1);
+                }
+            }
+        }
+        d->eob_run--;
+    }
+    return JPEG_SUCCESS;
+}
+
+// At a restart-interval boundary: reach the RSTn marker, and if it really is one
+// (0xD0..0xD7), reset the bit reader, EOB run and DC predictors for the next
+// interval. If some OTHER marker was reached (genuine end of scan on a full
+// final interval), leave it latched for the outer marker walk.
+static void jpeg_prog_restart(jpeg_decoder_t *d) {
+    if (d->code_bits < 24) jpeg_fill_bits(d);
+    if (d->marker >= 0xD0 && d->marker <= 0xD7) {
+        d->code_buffer = 0;
+        d->code_bits = 0;
+        d->marker = 0;
+        d->nomore = 0;
+        d->eob_run = 0;
+        for (int i = 0; i < d->components; i++) d->dc_pred[i] = 0;
+    }
+}
+
+// Decode one entire scan into the coefficient buffers.
+static int jpeg_decode_scan_prog(jpeg_decoder_t *d) {
+    d->code_buffer = 0;
+    d->code_bits = 0;
+    d->marker = 0;
+    d->nomore = 0;
+    d->eob_run = 0;
+    for (int i = 0; i < d->components; i++) d->dc_pred[i] = 0;
+
+    int todo = d->restart_interval ? d->restart_interval : 0x7FFFFFFF;
+
+    if (d->scan_ss == 0) {
+        // DC scan. Interleaved when it carries more than one component.
+        if (d->scan_ncomp == 1) {
+            int ci = d->scan_comp[0];
+            for (int by = 0; by < d->comp_by[ci]; by++) {
+                for (int bx = 0; bx < d->comp_bx[ci]; bx++) {
+                    int16_t *blk = d->coeff[ci] + 64 * ((int64_t)by * d->coeff_w[ci] + bx);
+                    int r = (d->scan_ah == 0) ? prog_dc_first(d, ci, blk)
+                                              : prog_dc_refine(d, blk);
+                    if (r != JPEG_SUCCESS) return r;
+                    if (--todo == 0) { jpeg_prog_restart(d); todo = d->restart_interval; }
+                }
+            }
+        } else {
+            for (int my = 0; my < d->mcu_count_y; my++) {
+                for (int mx = 0; mx < d->mcu_count_x; mx++) {
+                    for (int sc = 0; sc < d->scan_ncomp; sc++) {
+                        int ci = d->scan_comp[sc];
+                        for (int by = 0; by < d->comp_v[ci]; by++) {
+                            for (int bx = 0; bx < d->comp_h[ci]; bx++) {
+                                int block_col = mx * d->comp_h[ci] + bx;
+                                int block_row = my * d->comp_v[ci] + by;
+                                int16_t *blk = d->coeff[ci] +
+                                    64 * ((int64_t)block_row * d->coeff_w[ci] + block_col);
+                                int r = (d->scan_ah == 0) ? prog_dc_first(d, ci, blk)
+                                                          : prog_dc_refine(d, blk);
+                                if (r != JPEG_SUCCESS) return r;
+                            }
+                        }
+                    }
+                    if (--todo == 0) { jpeg_prog_restart(d); todo = d->restart_interval; }
+                }
+            }
+        }
+    } else {
+        // AC scan: always a single component, iterate its real block grid.
+        if (d->scan_ncomp != 1) return JPEG_ERR_CORRUPT;
+        int ci = d->scan_comp[0];
+        for (int by = 0; by < d->comp_by[ci]; by++) {
+            for (int bx = 0; bx < d->comp_bx[ci]; bx++) {
+                int16_t *blk = d->coeff[ci] + 64 * ((int64_t)by * d->coeff_w[ci] + bx);
+                int r = (d->scan_ah == 0) ? prog_ac_first(d, ci, blk)
+                                          : prog_ac_refine(d, ci, blk);
+                if (r != JPEG_SUCCESS) return r;
+                if (--todo == 0) { jpeg_prog_restart(d); todo = d->restart_interval; }
+            }
+        }
+    }
+    return JPEG_SUCCESS;
+}
+
+// Final pass: dequantize + IDCT every block from the accumulated coefficients,
+// upsample and color-convert into the BGRA output. Mirrors the baseline MCU
+// output loop but sources coefficients from d->coeff[] instead of decoding.
+static int jpeg_progressive_finish(jpeg_decoder_t *d, uint32_t *pixels) {
+    int mcu_size = d->mcu_width * d->mcu_height;
+    int *mcu_y  = kmalloc(mcu_size * sizeof(int));
+    int *mcu_cb = kmalloc(mcu_size * sizeof(int));
+    int *mcu_cr = kmalloc(mcu_size * sizeof(int));
+    if (!mcu_y || !mcu_cb || !mcu_cr) {
+        if (mcu_y) kfree(mcu_y);
+        if (mcu_cb) kfree(mcu_cb);
+        if (mcu_cr) kfree(mcu_cr);
+        return JPEG_ERR_NOMEM;
+    }
+    int block[64];
+    int coeff_zz[64];
+
+    for (int my = 0; my < d->mcu_count_y; my++) {
+        for (int mx = 0; mx < d->mcu_count_x; mx++) {
+            memset(mcu_y, 0, mcu_size * sizeof(int));
+            if (d->components == 3) {
+                memset(mcu_cb, 0, mcu_size * sizeof(int));
+                memset(mcu_cr, 0, mcu_size * sizeof(int));
+            }
+            for (int comp = 0; comp < d->components; comp++) {
+                int h = d->comp_h[comp];
+                int v = d->comp_v[comp];
+                int *target = (comp == 0) ? mcu_y : (comp == 1) ? mcu_cb : mcu_cr;
+                for (int by = 0; by < v; by++) {
+                    for (int bx = 0; bx < h; bx++) {
+                        int block_col = mx * h + bx;
+                        int block_row = my * v + by;
+                        int16_t *cf = d->coeff[comp] +
+                            64 * ((int64_t)block_row * d->coeff_w[comp] + block_col);
+                        for (int i = 0; i < 64; i++) coeff_zz[i] = cf[i];
+                        // Dequant (zigzag) + integer IDCT -> natural-order block.
+                        jpeg_dequant_idct(coeff_zz, d->quant[d->comp_qt[comp]], block);
+                        jpeg_upsample_block(d, target, block, bx, by, h, v);
+                    }
+                }
+            }
+            jpeg_mcu_to_rgb(d, mcu_y, mcu_cb, mcu_cr, mx, my, pixels);
+        }
+    }
+
+    kfree(mcu_y);
+    kfree(mcu_cb);
+    kfree(mcu_cr);
+    return JPEG_SUCCESS;
+}
+
+// Top-level progressive decode: own marker walk over SOI..EOI, decoding each
+// scan into d->coeff[], then one finishing pass into img->pixels.
+static int jpeg_decode_progressive(jpeg_decoder_t *d, const uint8_t *data,
+                                   uint32_t size, image_t *img) {
+    d->data = data;
+    d->data_len = size;
+    d->pos = 2;      // after SOI
+    d->marker = 0;
+    d->prog = 1;
+
+    int sof_seen = 0;
+    for (;;) {
+        int m = jpeg_prog_next_marker(d);
+        if (m < 0) break;
+        if (m == 0xD9) break;   // EOI
+        int ret = JPEG_SUCCESS;
+        switch (m) {
+            case 0xC2:   // SOF2 progressive
+                if (sof_seen) return JPEG_ERR_CORRUPT;
+                ret = prog_parse_sof2(d);
+                sof_seen = 1;
+                break;
+            case 0xC4: ret = prog_parse_dht(d); break;
+            case 0xDB: ret = prog_parse_dqt(d); break;
+            case 0xDD: ret = prog_parse_dri(d); break;
+            case 0xDA:  // SOS
+                if (!sof_seen) return JPEG_ERR_CORRUPT;
+                ret = prog_parse_sos_header(d);
+                if (ret == JPEG_SUCCESS) ret = jpeg_decode_scan_prog(d);
+                break;
+            // Any other frame header is a different (unsupported) coding process.
+            case 0xC0: case 0xC1: case 0xC3: case 0xC5: case 0xC6: case 0xC7:
+            case 0xC9: case 0xCA: case 0xCB: case 0xCD: case 0xCE: case 0xCF:
+                return JPEG_ERR_UNSUPPORTED;
+            default:
+                if (m == 0x01 || (m >= 0xD0 && m <= 0xD7)) break;  // standalone
+                {
+                    int l = hdr_read_u16(d->data, d->data_len, &d->pos);
+                    if (l < 2) return JPEG_ERR_CORRUPT;
+                    if ((uint64_t)d->pos + (uint32_t)(l - 2) > d->data_len)
+                        return JPEG_ERR_CORRUPT;
+                    d->pos += (uint32_t)(l - 2);   // skip APPn / COM / etc.
+                }
+                break;
+        }
+        if (ret != JPEG_SUCCESS) return ret;
+    }
+
+    if (!sof_seen) return JPEG_ERR_CORRUPT;
+    for (int i = 0; i < d->components; i++)
+        if (!d->quant_valid[d->comp_qt[i]]) return JPEG_ERR_CORRUPT;
+
+    img->width = d->width;
+    img->height = d->height;
+    img->pixels = kmalloc(d->width * d->height * 4);
+    if (!img->pixels) return JPEG_ERR_NOMEM;
+
+    int ret = jpeg_progressive_finish(d, img->pixels);
+    if (ret != JPEG_SUCCESS) {
+        kfree(img->pixels);
+        img->pixels = NULL;
+        img->width = 0;
+        img->height = 0;
+    }
+    return ret;
 }
 
 // Check JPEG signature
@@ -781,6 +1394,24 @@ int image_load_jpeg(const void *data, uint32_t size, image_t *img) {
     img->width = 0;
     img->height = 0;
     img->pixels = NULL;
+
+    // #332 root-cause fix: detect the frame type up front. Progressive (SOF2)
+    // takes the self-contained multi-scan path; baseline (SOF0) stays on the
+    // unchanged, Rust-seam-locked path below. Any other frame type (extended
+    // sequential, arithmetic, lossless, ...) is a clean UNSUPPORTED rather than
+    // a byte-crawl through the payload.
+    int sof = jpeg_scan_sof(p, size);
+    if (sof == 0xC2) {
+        jpeg_decoder_t *d = kzalloc(sizeof(jpeg_decoder_t));
+        if (!d) return JPEG_ERR_NOMEM;
+        int ret = jpeg_decode_progressive(d, p, size, img);
+        for (int i = 0; i < JPEG_MAX_COMPONENTS; i++)
+            if (d->coeff[i]) kfree(d->coeff[i]);
+        kfree(d);
+        return ret;
+    } else if (sof != 0xC0 && sof != -1) {
+        return JPEG_ERR_UNSUPPORTED;
+    }
 
     // #404 Phase W: parse ALL headers (SOI..SOS scan header) through the pure
     // seam (routes to jpeg_parse_headers_rs under -DRUST_JPEG, which bounds every
@@ -817,10 +1448,13 @@ int image_load_jpeg(const void *data, uint32_t size, image_t *img) {
     d->restart_interval = hdr.restart_interval;
     memcpy(d->quant, hdr.quant, sizeof(d->quant));
     for (int i = 0; i < 4; i++) d->quant_valid[i] = hdr.quant_valid[i];
-    memcpy(d->huff_bits, hdr.huff_bits, sizeof(d->huff_bits));
-    memcpy(d->huff_vals, hdr.huff_vals, sizeof(d->huff_vals));
+    // d->huff_* now has a 4-wide slot dimension (progressive), while hdr.huff_*
+    // is [2][2]; copy per (class,slot) so the strides map correctly. Baseline
+    // only ever populates slots 0..1 (the header parser rejects idx >= 2).
     for (int a = 0; a < 2; a++) {
         for (int b = 0; b < 2; b++) {
+            memcpy(d->huff_bits[a][b], hdr.huff_bits[a][b], sizeof(d->huff_bits[a][b]));
+            memcpy(d->huff_vals[a][b], hdr.huff_vals[a][b], sizeof(d->huff_vals[a][b]));
             d->huff_valid[a][b] = hdr.huff_valid[a][b];
             // MAYTERA-SEC-2026-00XX: a non-canonical DHT makes build_huffman's
             // fast-table index run past huff_fast[][][1024]. It now refuses to
@@ -913,7 +1547,6 @@ static inline uint64_t jpeg_tsc_serialized(void) {
 }
 
 void jpeg_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
 
     // Force-reference the Rust symbol so its archive member always links,
     // regardless of -DRUST_JPEG (matches the png/bmp pattern).
@@ -1015,7 +1648,6 @@ void jpeg_rust_selftest(void) {
 // #404 JPEG entropy dequant+IDCT seam boot self-test (PIECE 3).
 // ===========================================================================
 void jpeg_entropy_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
 
     /* genuine luma quant table (zigzag order) from the embedded baseline JPEG */
     static const uint8_t rq[64] = {

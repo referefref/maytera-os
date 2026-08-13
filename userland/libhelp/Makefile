@@ -6,7 +6,7 @@ AR = ar
 
 LIBC_DIR = ../libc
 
-CFLAGS = -ffreestanding -fno-builtin -nostdinc -nostdlib -fno-stack-protector \
+CFLAGS = -ffreestanding -fno-builtin -nostdinc -nostdlib -fstack-protector-strong -mstack-protector-guard=global \
          -mno-red-zone -O2 -Wall -Wextra \
          -isystem /usr/lib/gcc/x86_64-linux-gnu/12/include \
          -I$(LIBC_DIR)

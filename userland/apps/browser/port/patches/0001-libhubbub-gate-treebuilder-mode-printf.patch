@@ -1,0 +1,46 @@
+From: MayteraOS browser engine port
+Subject: [libhubbub] gate the per-token treebuilder mode printf (#245)
+
+hubbub_treebuilder_token_handler() prints its insertion-mode name via printf on
+every token. Upstream enables that whenever NDEBUG is undefined, and no
+MayteraOS build script defines NDEBUG, so it shipped ON. On MayteraOS one
+printf character costs a SYS_PUTCHAR syscall, a busy-wait on the 0x3F8 UART and
+a syslog ring entry, so a 1,000,090-byte page spent 133,880 ms of a 362,880 ms
+load emitting "IN_BODY" to the serial port.
+
+Gated on its own opt-in macro (-DHUBBUB_DEBUG_MODES) rather than by defining
+NDEBUG, because NDEBUG would also disable every assert() in all five NetSurf
+libraries.
+
+Applies to libhubbub at pin 6651b8cf87a4aa87bcdb2ff024a02659cd3f9402.
+---
+--- a/src/treebuilder/treebuilder.c
++++ b/src/treebuilder/treebuilder.c
+@@ -213,13 +213,23 @@
+ 	assert((signed) treebuilder->context.current_node >= 0);
+ 
+ /* A slightly nasty debugging hook, but very useful */
+-#ifdef NDEBUG
+-# define mode(x) \
+-		case x:
+-#else
++/* MAYTERAOS LOCAL PATCH (#245) - the ONLY change in this vendored file.
++ * Upstream leaves this printf ENABLED whenever NDEBUG is undefined, and no
++ * MayteraOS build script defines NDEBUG. It runs once per parsed token, and on
++ * this platform one printf character costs a SYS_PUTCHAR syscall, a busy-wait
++ * on the 0x3F8 UART and a 128-byte syslog ring entry, so a 1MB page spent
++ * minutes emitting insertion-mode names to the serial port instead of parsing.
++ * Gate it on its own opt-in macro: the diagnostic still exists (rebuild the
++ * engine with -DHUBBUB_DEBUG_MODES to get it back) but is OFF by default.
++ * Deliberately NOT fixed by defining NDEBUG, because that would also silently
++ * disable every assert() in all five NetSurf libraries. */
++#if defined(HUBBUB_DEBUG_MODES) && !defined(NDEBUG)
+ # define mode(x) \
+ 		case x: \
+ 			printf( #x "\n");
++#else
++# define mode(x) \
++		case x:
+ #endif
+ 
+ 	while (err == HUBBUB_REPROCESS) {

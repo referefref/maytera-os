@@ -162,7 +162,7 @@ void arena_start_bsp(void) {
  * ~0.0155 rad/px, ~2x the old max) so a noVNC session can crank it further
  * for testing via Settings -> Mouse Sensitivity without moving the default
  * that far on its own.                                                       */
-ArenaCfg g_arena_cfg = { 1, 12, 90, 7, 3, 1 };  /* fullscreen, sens 12, fov 90, vol 7, 3 bots, minimap on */
+ArenaCfg g_arena_cfg = { 1, 12, 90, 7, 3, 1, 1 };  /* fullscreen, sens 12, fov 90, vol 7, 3 bots, minimap on, render_scale 1=full */
 
 static int g_win = -1;
 static int g_nochrome = 0;     /* borderless flag applied (one-way in kernel)  */
@@ -203,8 +203,10 @@ static void cfg_clamp_apply(void) {
     g_arena_cfg.volume      = clampi(g_arena_cfg.volume, 0, 10);
     g_arena_cfg.bots        = clampi(g_arena_cfg.bots, 1, MAX_PLAYERS - 1);
     g_arena_cfg.minimap     = g_arena_cfg.minimap ? 1 : 0;
+    g_arena_cfg.render_scale = clampi(g_arena_cfg.render_scale, 1, 4);  /* T0(a) #578 */
     set_volume(g_arena_cfg.volume * 10);      /* 0..10 -> 0..100 master volume  */
     r_set_fov(g_arena_cfg.fov);
+    r_set_render_scale(g_arena_cfg.render_scale);  /* applies live if renderer up */
 }
 
 /* tiny int parser: reads an unsigned decimal, ignores leading spaces          */
@@ -244,6 +246,7 @@ static void arena_cfg_load(void) {
         else if ((v = cfg_match(line, "volume")))      g_arena_cfg.volume      = cfg_atoi(v);
         else if ((v = cfg_match(line, "bots")))        g_arena_cfg.bots        = cfg_atoi(v);
         else if ((v = cfg_match(line, "minimap")))     g_arena_cfg.minimap     = cfg_atoi(v);
+        else if ((v = cfg_match(line, "render_scale"))) g_arena_cfg.render_scale = cfg_atoi(v);
     }
     cfg_clamp_apply();
 }
@@ -271,6 +274,7 @@ void arena_cfg_save(void) {
     putkv(buf, &p, "volume",      g_arena_cfg.volume);
     putkv(buf, &p, "bots",        g_arena_cfg.bots);
     putkv(buf, &p, "minimap",     g_arena_cfg.minimap);
+    putkv(buf, &p, "render_scale", g_arena_cfg.render_scale);
     int fd = sys_open(CFG_PATH, O_WRONLY | O_CREAT | O_TRUNC);
     if (fd < 0) return;
     sys_write(fd, buf, (unsigned long)p);

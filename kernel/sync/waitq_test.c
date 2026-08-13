@@ -20,6 +20,7 @@
 // in this file, and the whole test is bounded at roughly 4.5 seconds.
 
 #include "waitq.h"
+#include "noblock.h"
 #include "../proc/process.h"
 #include "../serial.h"
 
@@ -55,6 +56,48 @@ static uint64_t st_ms_since(uint64_t t0_ticks) {
     uint32_t hz = g_timer_hz ? g_timer_hz : 250;
     return ((timer_ticks - t0_ticks) * 1000) / hz;
 }
+
+// ---------------------------------------------------------------------------
+// #426 Phase 2: the deliberate violation.
+//
+// An assertion nobody has watched fire is not an assertion. This is the
+// negative control for wq_assert_may_block(): a REAL wait_event() call, on the
+// real chokepoint, made with interrupts off, i.e. exactly the state a
+// cli+spinlock section or an ISR is in.
+//
+// It must not actually hang, or the proof costs a boot. The trick is the same
+// window wait_event() already has: the macro is
+//     while (!(cond)) { __wait_prepare(); if (cond) { __wait_finish(); break; } ... }
+// so a condition that is FALSE on its first evaluation and TRUE on its second
+// enters the loop (running __wait_prepare, where the assert lives) and then
+// breaks out at the re-check WITHOUT ever parking. waitq.h rightly says `cond`
+// must be free of side effects; this file is the one place that deliberately
+// breaks that, which is why it is compiled only under -DWQ_NOBLOCK_SELFTEST
+// and is never in a shipped kernel.
+//
+// BUILD:  make NOBLOCKTEST=1                 (report mode: expect [WQBLOCK], boot continues)
+//         make NOBLOCKTEST=1 NOBLOCKPANIC=1  (fatal mode: expect a kpanic here)
+// ---------------------------------------------------------------------------
+#ifdef WQ_NOBLOCK_SELFTEST
+static wait_queue_head_t nb_wq;
+static volatile int nb_evals;
+
+static void nb_deliberate_violation(void) {
+    wait_queue_head_init(&nb_wq);
+    nb_evals = 0;
+    kprintf("[WQBLOCK-TEST] arming a wait_event() with interrupts OFF; "
+            "expect exactly one [WQBLOCK] VIOLATION line naming INTERRUPTS-OFF\n");
+    __asm__ volatile("cli" ::: "memory");
+    (void)wait_event(&nb_wq, (nb_evals++ >= 1));
+    __asm__ volatile("sti" ::: "memory");
+    kprintf("[WQBLOCK-TEST] returned alive; violations counted so far = %lu "
+            "(expected >= 1)\n", (unsigned long)g_wq_noblock_violations);
+    if (g_wq_noblock_violations == 0)
+        kprintf("[WQBLOCK-TEST] FAIL: the assert did NOT fire\n");
+    else
+        kprintf("[WQBLOCK-TEST] PASS: wq_assert_may_block() caught it\n");
+}
+#endif
 
 static void waitq_selftest_worker(void *arg) {
     (void)arg;
@@ -120,6 +163,14 @@ static void waitq_selftest_worker(void *arg) {
                 rc, el, WAIT_EINTR, ST_LONG_TIMEOUT_MS);
         fails++;
     }
+
+#ifdef WQ_NOBLOCK_SELFTEST
+    nb_deliberate_violation();
+#endif
+
+#ifdef PROCWAIT_BENCH
+    { extern void procwait_bench(void); procwait_bench(); }
+#endif
 
     if (fails == 0) {
         kprintf("[WAITQ] self-test: 3/3 PASS (cond-wake, timeout, signal)\n");

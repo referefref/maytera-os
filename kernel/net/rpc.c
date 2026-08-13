@@ -8,6 +8,8 @@
 #include "../mm/heap.h"
 #include "../string.h"
 #include "../serial.h"
+#include "../cpu/mono.h"   // #499: sched_now_ms() - THE shared real-elapsed-ms clock
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // ============================================================================
 // Global State
@@ -35,10 +37,12 @@ extern void proc_sleep(uint32_t ms);   // yield to scheduler
 extern int arp_resolve(uint32_t ip, uint8_t *mac);
 extern void ip_print(uint32_t ip);
 
-static inline uint64_t rpc_ms_to_ticks(int ms) {
-    uint32_t hz = g_timer_hz ? g_timer_hz : 250;
-    uint64_t t = ((uint64_t)ms * hz) / 1000;
-    return t ? t : 1;
+// #499: every deadline below is now measured on sched_now_ms(), REAL elapsed
+// milliseconds, instead of timer_ticks (which counts ticks DELIVERED, so a KVM
+// tick burst collapsed each RPC connect/send/recv budget to zero). This helper
+// therefore became an identity with a 1ms floor, keeping the call sites intact.
+static inline uint64_t rpc_ms_span(int ms) {
+    return ms > 0 ? (uint64_t)ms : 1;
 }
 static inline void rpc_net_pump(void) {
     net_poll();
@@ -655,10 +659,10 @@ xdr_t *rpc_call_send(int client_idx, int timeout_ms) {
             // TCP gives up after ~5 SYN retransmits before ARP would resolve.
             {
                 uint8_t pmac[6];
-                uint64_t astart = timer_ticks;
+                uint64_t astart = sched_now_ms();
                 while (!arp_resolve(client->server_ip, pmac)) {
                     rpc_net_pump();
-                    if (timer_ticks - astart > rpc_ms_to_ticks(5000)) break;
+                    if (sched_now_ms() - astart > rpc_ms_span(5000)) break;
                 }
             }
             int connected = 0;
@@ -675,12 +679,12 @@ xdr_t *rpc_call_send(int client_idx, int timeout_ms) {
                     for (int k = 0; k < 50; k++) rpc_net_pump();
                     continue;
                 }
-                uint64_t cstart = timer_ticks;
-                uint64_t ctimeout = rpc_ms_to_ticks(6000);
+                uint64_t cstart = sched_now_ms();
+                uint64_t ctimeout = rpc_ms_span(6000);
                 while (!tcp_is_connected(client->tcp_socket)) {
                     rpc_net_pump();
                     if (tcp_get_state(client->tcp_socket) == TCP_STATE_CLOSED) break;
-                    if (timer_ticks - cstart > ctimeout) break;
+                    if (sched_now_ms() - cstart > ctimeout) break;
                 }
                 if (tcp_get_state(client->tcp_socket) == TCP_STATE_ESTABLISHED) {
                     connected = 1;
@@ -708,22 +712,22 @@ xdr_t *rpc_call_send(int client_idx, int timeout_ms) {
         {
             uint32_t total = (uint32_t)tx->send_len + 4;
             uint32_t sent = 0;
-            uint64_t sstart = timer_ticks;
-            uint64_t sdl = rpc_ms_to_ticks(10000);
+            uint64_t sstart = sched_now_ms();
+            uint64_t sdl = rpc_ms_span(10000);
             while (sent < total) {
                 uint16_t chunk = (total - sent) > 1400 ? 1400 : (uint16_t)(total - sent);
                 int s = tcp_send(client->tcp_socket, tcp_buf + sent, chunk);
-                if (s > 0) { sent += s; sstart = timer_ticks; rpc_net_pump(); }
+                if (s > 0) { sent += s; sstart = sched_now_ms(); rpc_net_pump(); }
                 else if (s == TCP_ERR_WOULD_BLOCK) { rpc_net_pump(); }
                 else { kprintf("[RPC] TCP send failed\n"); return NULL; }
-                if (timer_ticks - sstart > sdl) { kprintf("[RPC] TCP send timeout\n"); return NULL; }
+                if (sched_now_ms() - sstart > sdl) { kprintf("[RPC] TCP send timeout\n"); return NULL; }
             }
         }
 
         // Wait for response, pumping the stack each iteration.
         tx->recv_len = 0;
-        uint64_t rstart = timer_ticks;
-        uint64_t rdl = rpc_ms_to_ticks(timeout_ms);
+        uint64_t rstart = sched_now_ms();
+        uint64_t rdl = rpc_ms_span(timeout_ms);
         while (1) {
             rpc_net_pump();
             uint32_t want = (uint32_t)sizeof(tx->recv_buf) - (uint32_t)tx->recv_len;
@@ -731,7 +735,7 @@ xdr_t *rpc_call_send(int client_idx, int timeout_ms) {
             int n = tcp_recv(client->tcp_socket, tx->recv_buf + tx->recv_len, (uint16_t)want);
             if (n > 0) {
                 tx->recv_len += n;
-                rstart = timer_ticks;
+                rstart = sched_now_ms();
                 if (tx->recv_len >= 4) {
                     uint32_t rm2;
                     memcpy(&rm2, tx->recv_buf, 4);
@@ -747,7 +751,7 @@ xdr_t *rpc_call_send(int client_idx, int timeout_ms) {
                 kprintf("[RPC] TCP recv error %d\n", n);
                 return NULL;
             }
-            if (timer_ticks - rstart > rdl) {
+            if (sched_now_ms() - rstart > rdl) {
                 kprintf("[RPC] TCP receive timeout (%u bytes)\n", (unsigned)tx->recv_len);
                 return NULL;
             }
@@ -776,11 +780,11 @@ xdr_t *rpc_call_send(int client_idx, int timeout_ms) {
         
         // Wait for response with timeout (pump the NIC each iteration so the
         // UDP callback actually fires - task #317 pass 3).
-        uint64_t ustart = timer_ticks;
-        uint64_t udl = rpc_ms_to_ticks(timeout_ms);
+        uint64_t ustart = sched_now_ms();
+        uint64_t udl = rpc_ms_span(timeout_ms);
         while (!rpc_response_ready) {
             rpc_net_pump();
-            if (timer_ticks - ustart > udl) break;
+            if (sched_now_ms() - ustart > udl) break;
         }
 
         udp_unbind(local_port);
@@ -980,7 +984,6 @@ static inline uint64_t xdr_rdtsc(void) {
 }
 
 void xdr_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     static uint8_t b[128]; size_t p = 0; uint8_t fh[16];
     for (int i = 0; i < 16; i++) fh[i] = 0x10 + i;
     #define XDR_PU32(v) do{uint32_t _v=(v);uint32_t n=htonl(_v);memcpy(b+p,&n,4);p+=4;}while(0)

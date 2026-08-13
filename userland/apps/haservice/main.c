@@ -12,7 +12,7 @@
 //                        refresh=15
 // Widget-owned files:
 //   /HAENT.TXT    one entity_id per line (<=8) the widgets want cached
-//   /HA0.TXT..    per-slot cache: entity_id|friendly|state|unit|domain
+//   /HA0.TXT..    per-slot cache: entity_id|friendly|state|unit|domain|device_class (#723)
 //   /HALIST.REQ   presence requests a full entity list refresh (for the picker)
 //   /HALIST.TXT   compact catalog: entity_id|friendly|state  (one per line)
 //   /HACMD.TXT    pending control command: domain.service|entity_id  (widget writes)
@@ -27,7 +27,7 @@
 #define O_WRONLY  0x0001
 #define O_CREAT   0x0040
 
-static char g_url[192];       // base, e.g. http://<HOME_ASSISTANT_HOST>:8123
+static char g_url[192];       // base, e.g. http://192.0.2.1:8123
 static char g_token[512];
 static char g_hdr[600];       // "Authorization: Bearer <token>\r\n"
 static int  g_refresh = 15;
@@ -64,6 +64,45 @@ static int read_file(const char *path,char *dst,int cap){
 static void write_file(const char *path,const char *text,int len){
     int fd=sys_open(path,O_WRONLY|O_CREAT); if(fd<0) return;
     sys_write(fd,text,len); sys_close(fd);
+}
+// #748 WRITE ONLY ON CHANGE. This service polls Home Assistant on a timer and
+// rewrote /HA<slot>.TXT on EVERY poll, whether or not the entity had changed.
+// A poll is not an event: a thermostat that reads 21.5 all evening produced one
+// device write per slot per poll, forever, on a USB flash stick. The cache file
+// exists so the compositor widget can read the LAST KNOWN value without
+// blocking (#211/#381); it is a value, not a stream, so rewriting it with
+// identical bytes is pure cost.
+//
+// The memo is kept in RAM rather than read back from the file: a read-back
+// would cost a syscall + a block read per poll to avoid a write, and would
+// still race with anyone else touching the file. The service is long-lived and
+// is the only writer of these paths, so it simply remembers what it last wrote.
+// Anything larger than the memo slot falls through and is always written, so
+// the memo can never silently swallow an update it failed to record.
+#define MEMO_SLOTS 12
+#define MEMO_PATH  24
+#define MEMO_DATA  512
+static struct { char path[MEMO_PATH]; char data[MEMO_DATA]; int len; } g_memo[MEMO_SLOTS];
+static int g_memo_used = 0;
+static void write_file_if_changed(const char *path,const char *text,int len){
+    if(len < 0 || len > MEMO_DATA){ write_file(path,text,len); return; }
+    int pl=0; while(path[pl] && pl < MEMO_PATH-1) pl++;
+    if(path[pl]){ write_file(path,text,len); return; }        // path too long to memo
+    int i;
+    for(i=0;i<g_memo_used;i++){
+        int k=0; while(k<MEMO_PATH && g_memo[i].path[k]==path[k] && path[k]) k++;
+        if(k<MEMO_PATH && g_memo[i].path[k]==0 && path[k]==0) break;
+    }
+    if(i<g_memo_used && g_memo[i].len==len){
+        int same=1;
+        for(int k=0;k<len;k++) if(g_memo[i].data[k]!=text[k]){ same=0; break; }
+        if(same) return;                                      // identical: no device write
+    }
+    write_file(path,text,len);
+    if(i>=g_memo_used){ if(g_memo_used>=MEMO_SLOTS) return; i=g_memo_used++; }
+    for(int k=0;k<=pl;k++) g_memo[i].path[k]=path[k];
+    for(int k=0;k<len;k++)  g_memo[i].data[k]=text[k];
+    g_memo[i].len=len;
 }
 static int file_exists(const char *path){ int fd=sys_open(path,0); if(fd<0) return 0; sys_close(fd); return 1; }
 static void remove_file(const char *path){ /* truncate to empty as a delete surrogate */
@@ -110,7 +149,14 @@ static int is_power_switch(const char *eid){
     return has(eid,"outlet")||has(eid,"plug")||has(eid,"power");
 }
 
-// GET /api/states/<eid> -> write /HA<slot>.TXT as entity|friendly|state|unit|domain.
+// GET /api/states/<eid> -> write /HA<slot>.TXT as
+// entity|friendly|state|unit|domain|device_class.
+// (#723) device_class is the field the display formatter (ha_format.c) keys
+// on alongside domain - "cover" reads differently for device_class "garage"
+// vs "curtain", "binary_sensor" on/off reads differently for "door" vs
+// "motion" vs "problem", etc. It lives in the same top-level JSON object as
+// unit_of_measurement/friendly_name (both nested under "attributes"), so the
+// existing flat json_str() substring search picks it up exactly the same way.
 // The kernel TCP socket pool is small and shared with netinfo, so a single fetch
 // can transiently fail under contention; we retry a few times (spaced) and, on
 // total failure, KEEP the last good cache file rather than clobbering it with an
@@ -130,21 +176,22 @@ static void refresh_entity(const char *eid,int slot){
     if(!(r>=0&&status==200&&bytes>0)) return;   // keep last good cache on failure
 
     small_buf[bytes]=0;
-    char st[64],unit[24],fn[96]; st[0]=unit[0]=fn[0]=0;
+    char st[64],unit[24],fn[96],dc[24]; st[0]=unit[0]=fn[0]=dc[0]=0;
     json_str(small_buf,"state",st,sizeof(st));
     json_str(small_buf,"unit_of_measurement",unit,sizeof(unit));
     json_str(small_buf,"friendly_name",fn,sizeof(fn));
+    json_str(small_buf,"device_class",dc,sizeof(dc));
     if(slot==0) scopy(g_s0_state,st,sizeof(g_s0_state));   // #419 capture for sparkline
     char dom[16]; domain_of(eid,dom,sizeof(dom));
     char out[512]; int oi=0;
     #define AP(s) do{ for(int _i=0;(s)[_i]&&oi<(int)sizeof(out)-1;_i++) out[oi++]=(s)[_i]; }while(0)
     #define APC(c) do{ if(oi<(int)sizeof(out)-1) out[oi++]=(c); }while(0)
-    AP(eid); APC('|'); AP(fn[0]?fn:eid); APC('|'); AP(st[0]?st:"?"); APC('|'); AP(unit); APC('|'); AP(dom);
+    AP(eid); APC('|'); AP(fn[0]?fn:eid); APC('|'); AP(st[0]?st:"?"); APC('|'); AP(unit); APC('|'); AP(dom); APC('|'); AP(dc);
     APC('\n');
     #undef AP
     #undef APC
     char path[16]; path[0]='/'; path[1]='H'; path[2]='A'; path[3]=(char)('0'+slot); path[4]='.'; path[5]='T'; path[6]='X'; path[7]='T'; path[8]=0;
-    write_file(path,out,oi);
+    write_file_if_changed(path,out,oi);
 }
 
 // (#419) FALLBACK: /api/states GET -> compact /HALIST.TXT (id|friendly|state).
@@ -266,7 +313,7 @@ static void spark_push(const char *eid,long milli){
         while(tn) out[oi++]=t[--tn]; out[oi++]=' ';
     }
     out[oi++]='\n';
-    write_file("/HAHIST0.TXT",out,oi);
+    write_file_if_changed("/HAHIST0.TXT",out,oi);
 }
 
 // Execute a pending control command file (guarded).

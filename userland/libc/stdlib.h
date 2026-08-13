@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // stdlib.h - Standard library for MayteraOS userland
 #ifndef LIBC_STDLIB_H
 #define LIBC_STDLIB_H
@@ -7,6 +11,8 @@
 
 // Memory allocation
 void *malloc(size_t size);
+// #613: peak bytes the heap arena has ever grown to (never shrinks).
+size_t malloc_heap_highwater(void);
 void free(void *ptr);
 void *calloc(size_t nmemb, size_t size);
 void *realloc(void *ptr, size_t size);
@@ -14,6 +20,7 @@ void *realloc(void *ptr, size_t size);
 // Process control
 void exit(int status) __attribute__((noreturn));
 void abort(void) __attribute__((noreturn));
+int atexit(void (*func)(void));
 
 // String conversion
 int atoi(const char *str);
@@ -45,6 +52,22 @@ long long llabs(long long n);
 // File I/O functions (POSIX-style)
 int open(const char *path, int flags, ...);
 int close(int fd);
+// #695: commit fd's buffered bytes to the medium WITHOUT consuming the fd.
+// Returns 0 only if every byte is on the medium; negative on failure.
+//
+// USE THIS, NOT close(), TO DECIDE THAT A FILE IS SAFE. close() may report the
+// error, but it consumes the fd either way: by the time it tells you, you have
+// no handle to retry with, and calling close() again can close another thread's
+// fd. The pattern that protects data is:
+//     write(fd, ...) ; if (fsync(fd) != 0) { /* the destination is DESTROYED */ }
+//
+// ON A NON-ZERO RETURN the destination file may be EMPTY OR ABSENT and is NEVER
+// its previous contents (both filesystems free or delete the old data before
+// writing the new). Do NOT delete or overwrite the source you were copying from.
+//
+// fflush() is NOT this. fflush() only drains the stdio buffer into write(); the
+// bytes are then in the kernel, not on the medium.
+int fsync(int fd);
 long read(int fd, void *buf, size_t count);
 long write(int fd, const void *buf, size_t count);
 

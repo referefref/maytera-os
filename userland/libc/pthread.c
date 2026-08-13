@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // pthread.c - POSIX Threads implementation for MayteraOS
 // Part of Task #25 (Threading with clone() syscall)
 
@@ -86,6 +90,84 @@ typedef struct {
     int detached;
 } thread_start_t;
 
+// #28: per-thread bookkeeping. Before this existed, pthread_create() malloc'd
+// three things per thread - the stack (64 KB by default), the thread_start_t,
+// and the join word - and only the join word was ever freed, by pthread_join().
+// The stack pointer was a local variable that went out of scope the moment
+// clone() returned, so it was unreachable and leaked for EVERY thread, joined
+// or detached; the thread_start_t was labelled "will be freed by thread" and
+// never was, because pthread_exit() goes straight to SYS_EXIT. That is roughly
+// 64 KB per thread, which a long-running app that spawns workers cannot
+// survive.
+//
+// `tid` is deliberately the FIRST member, so &rec->tid == (void *)rec. The
+// pthread_t handle stays "the address of the join word" exactly as before, so
+// the kernel's CLONE_CHILD_CLEARTID write, futex_wait() on the handle, and
+// pthread_equal() are all unchanged. The record simply gives join/detach
+// something to free.
+typedef struct pthread_rec {
+    volatile unsigned int tid;      // MUST be first: the join/futex word
+    unsigned int          detached;
+    void                 *stack;
+    thread_start_t       *start_data;
+    struct pthread_rec   *next;     // detached-reaper list linkage
+} pthread_rec_t;
+
+// Detached threads are nobody's to join, so their records are reaped lazily.
+// This is safe and needs no extra thread: the kernel zeroes the tid word from
+// inside thread_exit() (kernel/proc/thread.c), on the exiting thread, AFTER it
+// has trapped into Ring 0 via SYS_EXIT and can never return to user mode. So a
+// tid word reading 0 PROVES the thread will never touch its stack again.
+static pthread_rec_t  *g_detached_list = NULL;
+static pthread_mutex_t g_detached_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void pthread_rec_free(pthread_rec_t *rec) {
+    if (!rec) return;
+    if (rec->stack)      free(rec->stack);
+    if (rec->start_data) free(rec->start_data);
+    free(rec);
+}
+
+// Free every detached record whose thread has exited. Called from the paths
+// that create or detach a thread, so the list is bounded by the number of
+// detached threads still running. No polling, no sleeping, no new thread.
+static void pthread_reap_detached(void) {
+    pthread_mutex_lock(&g_detached_lock);
+    pthread_rec_t **link = &g_detached_list;
+    while (*link) {
+        pthread_rec_t *rec = *link;
+        if (rec->tid == 0) {
+            *link = rec->next;
+            pthread_rec_free(rec);
+        } else {
+            link = &rec->next;
+        }
+    }
+    pthread_mutex_unlock(&g_detached_lock);
+}
+
+// A millisecond-resolution wall clock, for turning a POSIX absolute deadline
+// into the relative timeout futex_wait() actually takes.
+//
+// SYS_TIME has only 1-second resolution, which cannot express a 50 ms timeout;
+// SYS_UPTIME_MS has millisecond resolution but counts from boot, not from the
+// epoch. Latching the difference ONCE gives a wall clock with the resolution of
+// the monotonic counter, which is the standard way to derive a fine wall clock
+// from a coarse one. If the wall clock is later stepped, this drifts from
+// SYS_TIME by the step; that is a deliberate trade, and it is monotonic, which
+// matters more for a deadline than agreeing with a stepped clock.
+static unsigned long pthread_realtime_ms(void) {
+    static volatile unsigned long offset_ms  = 0;   // wall_ms - uptime_ms
+    static volatile int           have_offset = 0;
+    unsigned long up = uptime_ms();
+    if (!have_offset) {
+        unsigned long wall = (unsigned long)syscall0(SYS_TIME) * 1000UL;
+        offset_ms   = wall - up;   // benign race: any winner computes the same
+        have_offset = 1;
+    }
+    return up + offset_ms;
+}
+
 // #430: robust clone trampoline (clone_asm.asm). Stashes entry+arg on the
 // child stack so the child never depends on C stack locals surviving clone.
 extern long __clone_thread(unsigned int flags, void *child_stack_top,
@@ -145,15 +227,24 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
     start_data->arg = arg;
     start_data->detached = detached;
 
-    // Allocate the join word. It stays NONZERO while the thread runs and the
-    // kernel (CLONE_CHILD_CLEARTID) zeroes it + futex-wakes on thread exit;
-    // pthread_join() blocks on it. The pthread_t handle IS this address.
-    unsigned int *tid_ptr = (unsigned int *)malloc(sizeof(unsigned int));
-    if (!tid_ptr) {
+    // Reap any detached threads that have already exited (see pthread_rec_t).
+    pthread_reap_detached();
+
+    // Allocate the thread record. Its first member is the join word: it stays
+    // NONZERO while the thread runs and the kernel (CLONE_CHILD_CLEARTID)
+    // zeroes it + futex-wakes on thread exit; pthread_join() blocks on it. The
+    // pthread_t handle IS this address, which is also the record address.
+    pthread_rec_t *rec = (pthread_rec_t *)malloc(sizeof(pthread_rec_t));
+    if (!rec) {
         free(start_data);
         free(stack);
         return ENOMEM;
     }
+    rec->detached   = (detached == PTHREAD_CREATE_DETACHED) ? 1u : 0u;
+    rec->stack      = stack;
+    rec->start_data = start_data;
+    rec->next       = NULL;
+    unsigned int *tid_ptr = (unsigned int *)&rec->tid;
     *tid_ptr = 1;  // nonzero = alive (also overwritten with the real tid by
                    // CLONE_PARENT_SETTID); the kernel clears it to 0 on exit.
     start_data->tid_ptr = tid_ptr;
@@ -168,19 +259,33 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
     long ret = __clone_thread(flags, stack_top, tid_ptr, tid_ptr,
                               thread_entry_wrapper, start_data);
     if (ret < 0) {
-        free(tid_ptr);
-        free(start_data);
-        free(stack);
+        // pthread_rec_free() frees the stack and start_data too; they are owned
+        // by the record now, so freeing them separately would double-free.
+        pthread_rec_free(rec);
         return EAGAIN;
     }
 
-    // The join handle is the address of the tid word.
+    // A thread created detached is nobody's to join, so hand its record to the
+    // reaper immediately rather than leaking it.
+    if (rec->detached) {
+        pthread_mutex_lock(&g_detached_lock);
+        rec->next = g_detached_list;
+        g_detached_list = rec;
+        pthread_mutex_unlock(&g_detached_lock);
+    }
+
+    // The join handle is the address of the tid word, which is the record.
     *thread = (pthread_t)(uintptr_t)tid_ptr;
     return 0;
 }
 
 int pthread_join(pthread_t thread, void **retval) {
     if (thread == 0) {
+        return EINVAL;
+    }
+    // Joining a detached thread is undefined in POSIX and here would be a
+    // use-after-free race against the reaper, so refuse it explicitly.
+    if (((pthread_rec_t *)(uintptr_t)thread)->detached) {
         return EINVAL;
     }
 
@@ -200,8 +305,10 @@ int pthread_join(pthread_t thread, void **retval) {
         *retval = NULL;
     }
 
-    // The join word was malloc'd in pthread_create; the thread is gone now.
-    free((void *)(uintptr_t)thread);
+    // The thread is gone, so its stack, startup data and record can all go.
+    // Before #28 only the join word was freed here and the 64 KB stack and the
+    // thread_start_t leaked on every single join.
+    pthread_rec_free((pthread_rec_t *)(uintptr_t)thread);
     return 0;
 }
 
@@ -210,8 +317,26 @@ int pthread_detach(pthread_t thread) {
         return EINVAL;
     }
 
-    // Mark thread as detached via syscall
-    // For now, just return success (thread will clean up on exit)
+    // #28: this used to be a bare `return 0;` under a comment claiming the
+    // thread "will clean up on exit". Nothing did: pthread_join() was the only
+    // code that freed anything, and a detached thread is never joined, so every
+    // detached thread leaked its record, its thread_start_t and its 64 KB stack.
+    pthread_rec_t *rec = (pthread_rec_t *)(uintptr_t)thread;
+    if (rec->detached) return EINVAL;   // already detached
+
+    pthread_mutex_lock(&g_detached_lock);
+    rec->detached = 1u;
+    if (rec->tid == 0) {
+        // Already exited: nothing will ever wake to reap it, so free it here.
+        pthread_mutex_unlock(&g_detached_lock);
+        pthread_rec_free(rec);
+        return 0;
+    }
+    rec->next = g_detached_list;
+    g_detached_list = rec;
+    pthread_mutex_unlock(&g_detached_lock);
+
+    pthread_reap_detached();
     return 0;
 }
 
@@ -507,12 +632,33 @@ int pthread_cond_timedwait(pthread_cond_t *cond, pthread_mutex_t *mutex,
     // Unlock the mutex
     pthread_mutex_unlock(mutex);
 
-    // Calculate timeout in milliseconds
-    // Note: This is a simplification - real implementation would get current time
-    unsigned long timeout_ms = abstime->tv_sec * 1000 + abstime->tv_nsec / 1000000;
+    // #28: `abstime` is an ABSOLUTE POSIX deadline; futex_wait() takes a
+    // RELATIVE timeout in milliseconds. This used to pass the absolute value
+    // straight through:
+    //     timeout_ms = abstime->tv_sec * 1000 + abstime->tv_nsec / 1000000;
+    // which turns a real deadline (tv_sec ~1.8e9) into a ~20-day timeout. It
+    // could not fail loudly - it blocked, released and reacquired the mutex
+    // correctly, returned no error, and simply never timed out.
+    unsigned long deadline_ms = (unsigned long)abstime->tv_sec * 1000UL +
+                                (unsigned long)abstime->tv_nsec / 1000000UL;
+    unsigned long now_ms      = pthread_realtime_ms();
+    long ret;
+
+    if (deadline_ms <= now_ms) {
+        // Already expired. Returning without this check would hand futex_wait()
+        // a huge unsigned value (deadline - now underflows) or, once clamped, a
+        // 0 - and 0 means WAIT FOREVER, so an expired deadline would become an
+        // infinite wait. POSIX requires the mutex held on return, so retake it.
+        atomic_fetch_add(&cond->waiters, -1);
+        pthread_mutex_lock(mutex);
+        return ETIMEDOUT;
+    }
+
+    unsigned long timeout_ms = deadline_ms - now_ms;
+    if (timeout_ms == 0) timeout_ms = 1;   // 0 means FOREVER to futex_wait()
 
     // Wait with timeout
-    long ret = futex_wait(&cond->seq, seq, timeout_ms);
+    ret = futex_wait(&cond->seq, seq, timeout_ms);
 
     // Decrement waiter count
     atomic_fetch_add(&cond->waiters, -1);

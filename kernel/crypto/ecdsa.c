@@ -22,8 +22,8 @@
 // stack-resident bignum_t in point-add/double could overflow it. rsa.c's
 // rsa_crt() sets this same precedent.
 
-#pragma GCC diagnostic ignored "-Wunused-function"
 #include "ecdsa.h"
+#include "csprng.h"   // #tls-rngfix
 #include "rsa.h"
 #include "crypto.h"
 #include "../string.h"
@@ -448,7 +448,15 @@ int ecdh_generate_keypair(ecdsa_curve_id_t curve_id,
     // overwhelming probability; the bounded retry count means it can never spin.
     int ok = 0;
     for (int tries = 0; tries < 16; tries++) {
-        if (rng_get_bytes(priv, cl) != 0) break;
+        // #tls-rngfix: an ECDSA private key. Was rng_get_bytes(), which drew
+        // from the weak entropy pool on any machine without RDRAND. rng.c is a
+        // shim over this same DRBG now, so the fix landed either way; the DRBG
+        // is named directly here because a reader of a key-generation line
+        // should not have to go and check which generator is behind it.
+        // csprng_bytes() cannot fail (it self-instantiates and never blocks),
+        // which is why the old rng_get_bytes error arm is gone rather
+        // than kept as an unreachable branch.
+        csprng_bytes(priv, cl);
         bn_from_bytes(d, priv, cl);
         if (bn_compare(d, zero) == 0) continue;   // d != 0
         if (bn_compare(d, n) >= 0) continue;      // d < n

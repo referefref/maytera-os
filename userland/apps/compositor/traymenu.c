@@ -27,7 +27,10 @@ typedef struct {
 } tm_item;
 typedef struct {
     char    name[16];
-    tm_item items[14];
+    // #745 P2: 14 was sized for 13 widgets + the opacity slider. The registry
+    // now carries 15 widgets (Dog was missing, see widgets.c), so this holds
+    // 15 checks + 1 slider = 16. Bump this again if widget_registry() grows.
+    tm_item items[16];
     int     n;
 } tm_menu;
 
@@ -105,6 +108,15 @@ static void tm_set(const char *b, int v) {
     else if (!strncmp(b, "eq", 2)) { int i = b[2] - '0'; if (i >= 0 && i < 5) g_eq[i] = v; }
 }
 
+// #745 P2: the widget live-apply channel (main.c widgets_cfg_poll()) needs to
+// reach tm_set() from outside this file, and MUST go through it rather than
+// writing a widget_desc_t.flag pointer directly, because tm_set() is the only
+// place that knows show_aichat needs aichat_set_enabled() (spawn/stop the
+// external app) instead of a bare assignment. tm_set() itself stays static;
+// this is a thin, deliberate crack in that encapsulation for the one caller
+// that needs it, not a general-purpose export.
+void traymenu_set_bind(const char *b, int v) { tm_set(b, v); }
+
 // #372: run a TM_ACTION item. Actions are dispatched by their bind string.
 void traymenu_close(void);   // defined below
 static void tm_action(const char *bind) {
@@ -114,7 +126,7 @@ static void tm_action(const char *bind) {
     else if (!strcmp(bind, "wifi_settings")) tab = WIFI_SETTINGS_TAB;
     if (tab >= 0) {
         set_settings_tab(tab);               // one-shot: open Settings on that panel
-        sys_spawn("/APPS/settings");
+        sys_spawn("/APPS/SETTINGS");
         traymenu_close();
     }
 }
@@ -254,7 +266,11 @@ static void tm_force_widgets(void) {
     int wc = 0;
     const widget_desc_t *reg = widget_registry(&wc);
     m->n = 0;
-    for (int i = 0; i < wc && m->n < 13; i++) {   // leave room for the opacity slider
+    // #745 P2: was "< 13" against a 14-slot array, which silently dropped the
+    // LAST registry entry (AI Chat) once a 14th widget (Sheep) existed. items[]
+    // is now sized 16 (see tm_menu above); this cap must stay ONE LESS than
+    // that so the trailing opacity slider below always has a slot.
+    for (int i = 0; i < wc && m->n < 15; i++) {   // leave room for the opacity slider
         tm_item *it = &m->items[m->n++];
         it->type = TM_CHECK; tm_cpy(it->label, reg[i].label, 28); tm_cpy(it->bind, reg[i].bind, 20);
         it->vmin = 0; it->vmax = 100; it->nopt = 0;
@@ -304,13 +320,18 @@ static void tm_box(const tm_menu *m, int *bx, int *by, int *bw, int *bh) {
     int y;
     if (g_tray_bar_top) {
         y = g_tray_bar_y + g_tray_bar_h + 6;
-        if (y + h > g_fb_height - 4) y = g_fb_height - h - 4;
     } else if (g_dock_style == DOCK_DEFAULT) {
         y = (g_fb_height - TASKBAR_HEIGHT) - h - 6;
     } else {
         y = g_tray_bar_y - h - 6;
     }
-    if (y < 4) y = 4;
+    // (local 81) ONE clamp covering all three anchor branches. Only the
+    // top-bar branch used to clamp its bottom, and the "sound" panel's height
+    // is the hardcoded SND_H_FWD, so an upward-opening menu taller than the
+    // space above its bar was floored to y=4 and then simply ran off the
+    // bottom. The shared helper also keeps it off the dock, which this menu
+    // is drawn above.
+    popup_clamp_to_work_area(w, h, &x, &y);
     *bx = x; *by = y; *bw = w; *bh = h;
 }
 

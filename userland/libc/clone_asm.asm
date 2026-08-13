@@ -1,3 +1,7 @@
+; SPDX-License-Identifier: MIT
+; Copyright (c) MayteraOS contributors.
+; Full license text: userland/libc/LICENSE (MIT License).
+;
 ; clone_asm.asm - #430 robust clone() trampoline for MayteraOS pthreads.
 ;
 ; The raw clone() contract (child resumes at the same RIP with a fresh stack)

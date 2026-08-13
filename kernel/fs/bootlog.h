@@ -20,7 +20,30 @@
 //
 // Keep call sites to significant checkpoints/events, not per-instruction or
 // per-packet tracing - this is a lightweight text log, not a full trace.
-void bootlog_write(const char *fmt, ...);
+//
+// #742 RETURNS: 0 if the line is safe (either flushed to the medium, or buffered
+// with the log not yet armed, in which case bootlog_arm() will flush it);
+// negative if the log IS armed and the flush FAILED, meaning this line exists
+// only in RAM. Deliberately NOT MUST_CHECK - see the rationale in bootlog.c.
+// Use bootlog_persist_failures() if you want the aggregate rather than the
+// per-call answer.
+//
+// DO NOT re-declare this (or any other function here) with a private `extern`
+// in your own .c file. kernel/tools/persist-extern-gate FAILS THE BUILD if you
+// do, because a private extern silently opts the whole file out of this
+// header's MUST_CHECK attributes AND compiles happily against the wrong
+// signature. Two files really did declare this one as non-variadic
+// `extern void bootlog_write(const char *s)` and linked without a diagnostic.
+int bootlog_write(const char *fmt, ...);
+
+// #742: how many bootlog/heartbeat/usblog/audiolog flushes have FAILED this
+// boot, and the last failing return code. Non-zero means the on-disk breadcrumb
+// files are not trustworthy as evidence. Note the self-healing property: every
+// flush rewrites the WHOLE buffer, so a non-zero count with a later successful
+// flush means the content did land; it is the count, not the file, that records
+// that the medium misbehaved.
+uint32_t bootlog_persist_failures(void);
+int      bootlog_last_persist_rc(void);
 
 // Call once, as soon as the FAT root filesystem is mounted and writable
 // (works for both the #307 USB-MSC root path and the classic ATA root path).
@@ -43,6 +66,27 @@ int bootlog_is_armed(void);
 // next boot proves the OS is alive; where it stops is the last uptime reached.
 void bootlog_heartbeat(const char *line);
 
+// #748: the heartbeat ring is RAM-resident and reaches the medium only on a
+// 30-minute schedule, on a late-beat anomaly (the #373 starvation signature),
+// and on panic. Rationale in bootlog.c above HB_FLUSH_MS. These three let a
+// caller take part in that.
+//
+// bootlog_heartbeat_flush() persists the ring NOW and returns 0 if there was
+// nothing pending or the write succeeded, negative if the write FAILED. It
+// deliberately returns a value rather than being void: bootlog_write() is void-
+// like at 410 logging call sites where a status would be ceremony, but a
+// DEFERRED flush is different - it is the one write whose failure nobody would
+// otherwise notice, so the caller that asked for it gets the answer.
+int      bootlog_heartbeat_flush(void);
+// Beats recorded vs times the ring was actually written to the device. The
+// ratio IS the fix, and it is the honest way to state it (a claim that writes
+// went down should be measurable from inside the running system, not only from
+// the hypervisor's block counters).
+void     bootlog_heartbeat_stats(uint64_t *beats, uint64_t *flushes);
+// The live in-RAM ring, for a reader that wants it without touching the disk
+// (the kernel shell's `hblog`). Returns its length; *out points at the ring.
+uint32_t bootlog_heartbeat_ring(const char **out);
+
 // #433 (re-scoped) USB descriptor / HID-enumeration diagnostic. Appends a line
 // to /USBLOG.TXT (own RAM buffer, flushed by the same bootlog_arm()). Use for
 // per-device descriptor dumps and the runtime HID enumeration decisions
@@ -60,6 +104,21 @@ void usblog_write(const char *fmt, ...);
 // is enabled, and whether the output DMA runs. Mirrors to serial like
 // usblog_write(). Same durability design as /USBLOG.TXT.
 void audiolog_write(const char *fmt, ...);
+
+// #745 (task #62): OPEN A WINDOW IN WHICH LOGGING MUST NOT TOUCH THE MEDIUM.
+//
+// Take this around any work that the log's own flush path runs THROUGH. The
+// motivating case is usb_msc_transport(): /BOOTLOG.TXT lives on the USB-MSC
+// root device, so a bootlog_write() issued from inside a SCSI command re-enters
+// usb_msc_transport() and blocks on its own non-recursive command lock, at
+// which point that thread reparks every MSC_CMD_BLOCK_MS forever.
+//
+// Inside the window, bootlog_write() still writes to SERIAL and to the RAM
+// buffer; only the device flush is skipped, and the next call from a safe
+// context carries the accumulated delta down. Nesting is counted, so
+// begin/end pairs may nest. ALWAYS pair them on every return path.
+void bootlog_defer_begin(void);
+void bootlog_defer_end(void);
 
 // #71: bracket a multi-line audiolog dump (e.g. hda_audiolog_report()) so the
 // whole report is flushed to /AUDIOLOG.TXT in ONE write instead of a full-file

@@ -21,6 +21,7 @@
 #include "../string.h"
 #include "../mm/heap.h"
 #include "../serial.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 #define WAV_FMT_PCM         0x0001
 #define WAV_FMT_IEEE_FLOAT  0x0003
@@ -375,7 +376,6 @@ static uint32_t wav_st_build(uint8_t *buf, uint16_t fmt_tag, uint16_t ch,
 }
 
 void wav_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     uint8_t buf[512];
     int total = 0, mism = 0;
 

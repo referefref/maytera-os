@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // devinfo.h - userland mirror of the kernel device-enumeration structs (#325).
 // Source of truth: kernel/devinfo.h. Keep the layout byte-identical: these are
 // the wire format for the read-only SYS_DEV_* / SYS_SYSINFO syscalls used by the

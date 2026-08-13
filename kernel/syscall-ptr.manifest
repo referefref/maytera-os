@@ -1,0 +1,35 @@
+# syscall-ptr.manifest - the syscall-ptr-lint allowlist (#565, enforcing #500).
+#
+# tools/syscall-ptr-lint/syscall-ptr-lint auto-discovers every SYS_* whose
+# dispatcher case in proc/syscall.c casts an argument to a USER POINTER. Each
+# such syscall must have EITHER a flat descriptor in rustkern/argtab.rs (the
+# common case, 114 syscalls) OR an entry below. A pointer syscall that is in
+# neither FAILS THE BUILD. This file is that "OR": it is wired into the build
+# as an order-only prerequisite of kernel.elf (make syscall-ptr-lint), so the
+# hole #500 closed cannot silently reopen on the next syscall added.
+#
+# Two sections, and the distinction is the whole point of being honest here:
+#
+# [EXEMPT]    The handler validates the user pointer ITSELF, so a flat argtab
+#             descriptor is the wrong tool (the length is cmd-dependent, or the
+#             same handler has legitimate kernel-pointer callers, or it is a
+#             debug-only build). These are permanently correct, not debt.
+#
+# [KNOWN_GAP] A DEBT LEDGER: a real, currently-UNVALIDATED Ring-3 pointer hole
+#             that #500 missed and this lint surfaced (#565). It is TRACKED and
+#             printed loudly on every build, but tolerated (build not wedged)
+#             until a descriptor is added in argtab.rs. This is the opposite of
+#             a silent exemption: every entry names the unvalidated arg and the
+#             owning follow-up. CLOSE THESE, then delete the line.
+#
+# First token per line is the SYS_* name (must be a real #define, typo-guarded);
+# the rest is the reason. Add a name here only with a real justification, in the
+# same change; the CHANGELOG must say why.
+
+[EXEMPT]
+SYS_IOCTL           arg3 validated at the Ring-3 call site by tty_ioctl_validate_user_arg() in proc/syscall.c; length is cmd-dependent (termios/winsize/int) and file_ioctl() also has kernel-pointer callers, so a flat descriptor cannot describe it (#500).
+SYS_AUDIO_PCM_WRITE arg2 validated in audio_pcm_write() (drivers/audio_pcm.c) by pcm_user_range_ok() over frames*ch*sizeof(int16_t); the byte count depends on the stream's channel count, not a compile-time sizeof (#500).
+SYS_FUTEX           arg1/arg5 validated by validate_futex_addr() -> validate_user_ptr(ACCESS_RW_USER) on EVERY futex path (sync/futex.c: futex_wait/wake/requeue/cmp_requeue) before any *addr deref (#430).
+SYS_SECTEST         DEBUG-ONLY negative control, compiled only under -DSECTEST_SYSCALL and never shipped; it MUST receive its pointer untouched to build the boundary cases the validator self-test rejects (see the case comment in proc/syscall.c). No descriptor by design.
+
+[KNOWN_GAP]

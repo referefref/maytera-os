@@ -2,10 +2,10 @@
 CC = gcc
 LD = ld
 LIBC_DIR = ../../libc
-CFLAGS = -ffreestanding -fno-stack-protector -fno-pic -fno-pie -mno-red-zone -mcmodel=large \
+CFLAGS = -fPIE -ffreestanding -fstack-protector-strong -mstack-protector-guard=global -mno-red-zone \
          -nostdlib -nostdinc -fno-builtin -Wall -Wextra -O2 -g \
          -I. -I$(LIBC_DIR) -isystem /usr/lib/gcc/x86_64-linux-gnu/12/include
-LDFLAGS = -nostdlib -z max-page-size=0x1000 -T ../../user.ld
+LDFLAGS = -pie --no-dynamic-linker -z notext -nostdlib -z max-page-size=0x1000 -T ../../user-pie.ld
 TARGET = IDE
 SRCS = $(wildcard *.c)
 ASMS = $(wildcard *.asm)

@@ -191,5 +191,9 @@ void desktop_icon_activate(int index);
 void desktop_set_session(uint32_t uid, uint32_t gid);
 uint32_t desktop_get_session_uid(void);
 uint32_t desktop_get_session_gid(void);
+// #566 kernel-owned session lock state (single authority; Ring-3 cannot forge unlocked)
+void desktop_set_locked(int locked);
+int desktop_is_locked(void);
+int desktop_session_authenticated(void);
 
 #endif // DESKTOP_H

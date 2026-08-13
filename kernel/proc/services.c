@@ -51,6 +51,16 @@ static service_t *svc_register(const char *name, const char *exec,
         memset(svc, 0, sizeof(*svc));
         svc->pid = 0;
     }
+    // (#785) A SERVICES.CFG line naming an existing service overrides it, and
+    // that must not leave built-in hooks attached to what is now an ELF
+    // service: svc_start() would then call the kernel start hook and ignore
+    // exec[] entirely, so the operator's config line would silently do nothing
+    // like what it says. Overriding by name means becoming a userland service.
+    svc->builtin   = 0;
+    svc->b_start   = 0;
+    svc->b_stop    = 0;
+    svc->b_running = 0;
+    svc->b_persist = 0;
     strncpy(svc->name, name, SVC_NAME_MAX - 1);
     svc->name[SVC_NAME_MAX - 1] = '\0';
     strncpy(svc->exec, exec, SVC_EXEC_MAX - 1);
@@ -62,6 +72,27 @@ static service_t *svc_register(const char *name, const char *exec,
     svc->autostart = autostart ? 1 : 0;
     svc->enabled   = enabled ? 1 : 0;
     return svc;
+}
+
+// Register an in-kernel service (#785). See services.h for why built-ins live
+// in the shared registry instead of each growing a private on/off switch.
+int svc_register_builtin(const char *name, const char *account, uint32_t uid,
+                         uint32_t perms, int autostart, int enabled,
+                         svc_start_fn start, svc_stop_fn stop,
+                         svc_running_fn running, svc_persist_fn persist) {
+    if (!name || !start) return -1;
+    // exec[] is empty for a built-in: there is no ELF. It is left as the empty
+    // string rather than something decorative like "(kernel)" so that any code
+    // that tries to open it fails loudly instead of reading a stray file.
+    service_t *svc = svc_register(name, "", account, uid, perms, autostart, enabled);
+    if (!svc) return -2;
+    svc->builtin   = 1;
+    svc->pid       = 0;
+    svc->b_start   = start;
+    svc->b_stop    = stop;
+    svc->b_running = running;
+    svc->b_persist = persist;
+    return 0;
 }
 
 // ---- permission string parsing/formatting ---------------------------------
@@ -206,6 +237,15 @@ void svc_init(void) {
     svc_register("heartbeat", "/APPS/SVCHB", "svc_hb", 0,
                  SVC_PERM_FSWRITE, /*autostart*/1, /*enabled*/1);
 
+#ifdef MAYTERA_SSHD
+    // (#785) The in-kernel SSH server registers as a BUILT-IN service so an
+    // operator gets the same start/stop/enable/disable verbs for it as for any
+    // other service. Compiled out entirely unless the kernel was built with
+    // MAYTERA_SSHD=1, so on a default build there is no sshd to register, no
+    // listener to enable, and no code on the image to regress.
+    { extern void sshd_service_register(void); sshd_service_register(); }
+#endif
+
     // Merge/override with declarations from /CONFIG/SERVICES.CFG if present.
     svc_load_config();
 
@@ -213,6 +253,9 @@ void svc_init(void) {
 }
 
 int svc_is_running(service_t *svc) {
+    // (#785) A built-in has no pid, so the pid test below would report it
+    // permanently stopped and svc_start() would happily start it a second time.
+    if (svc && svc->builtin) return svc->b_running ? svc->b_running() : 0;
     if (!svc || svc->pid <= 0) { if (svc) svc->pid = 0; return 0; }
     process_t *p = proc_get((uint32_t)svc->pid);
     if (!p || p->state == PROC_STATE_ZOMBIE || p->state == PROC_STATE_UNUSED) {
@@ -228,6 +271,17 @@ int svc_start(const char *name) {
     if (!svc->enabled) return -2;
     if (svc_is_running(svc)) return svc->pid;  // already running
 
+    if (svc->builtin) {
+        int r = svc->b_start();
+        kprintf("[SVC] built-in '%s' start -> %d (running=%d)\n",
+                svc->name, r, svc_is_running(svc));
+        // Report what actually happened, not what was requested. A built-in
+        // that refuses to start (sshd with enable=0 in its own config, or no
+        // host key) must not be reported as started.
+        if (r < 0) return r;
+        return svc_is_running(svc) ? 0 : -9;
+    }
+
     if (!g_fat_fs.mounted) return -3;
     uint32_t sz = 0;
     void *data = fat_read_file(&g_fat_fs, svc->exec, &sz);
@@ -240,7 +294,12 @@ int svc_start(const char *name) {
     // as services start), which is also when the iMac crash was observed.
     stage_set(STAGE_SVC_SPAWN, svc->name);
 
-    int pid = proc_create_user(svc->name, data, sz, 0, 0);
+    // #692: a service runs as its own service account, named here. It used
+    // to be spawned with an inherited identity and then have uid and euid
+    // stamped on afterwards while gid and egid were left inherited, which
+    // produced the incoherent pair uid 0 / gid 1000. proc_as_uid() resolves
+    // the gid from /CONFIG/PASSWD, so both now move together.
+    int pid = proc_create_user_as(svc->name, data, sz, 0, 0, proc_as_uid(svc->uid));
     kfree(data);
     if (pid <= 0) return -6;
 
@@ -249,17 +308,25 @@ int svc_start(const char *name) {
     if (p) {
         p->is_service = 1;
         p->svc_perms  = svc->perms;
-        p->uid  = svc->uid;
-        p->euid = svc->uid;
+        // uid/gid/euid/egid were set coherently at spawn (#692); do not
+        // re-stamp them here, that half-stamp was the bug.
     }
     svc->pid = pid;
-    kprintf("[SVC] started '%s' pid %d uid %u\n", svc->name, pid, svc->uid);
+    kprintf("[SVC] started '%s' pid %d uid %u gid %u\n", svc->name, pid,
+            p ? p->uid : svc->uid, p ? p->gid : 0);
     return pid;
 }
 
 int svc_stop(const char *name) {
     service_t *svc = svc_find(name);
     if (!svc) return -1;
+    if (svc->builtin) {
+        if (!svc->b_stop) return -7;
+        int r = svc->b_stop();
+        kprintf("[SVC] built-in '%s' stop -> %d (running=%d)\n",
+                svc->name, r, svc_is_running(svc));
+        return r;
+    }
     if (!svc_is_running(svc)) { svc->pid = 0; return 0; }
 
     process_t *p = proc_get((uint32_t)svc->pid);
@@ -269,11 +336,35 @@ int svc_stop(const char *name) {
     return 0;
 }
 
+// (#785) THIS FUNCTION USED TO LIE BY OMISSION. It set svc->enabled in RAM and
+// returned 0, and nothing anywhere wrote /CONFIG/SERVICES.CFG back, so the
+// change vanished at the next boot while the caller was told it succeeded. It
+// was never noticed because it had ZERO callers: the only surface that was ever
+// documented to reach it, the remote-control "svc" command, had been deleted
+// two tickets earlier. A function with no callers is not a working feature.
+//
+// It now persists through the service's own config file, and when it cannot it
+// says so instead of returning 0. "Enable/disable as needed" is only true if it
+// survives the reboot, which is the whole point of the verb.
 int svc_enable(const char *name, int enable) {
     service_t *svc = svc_find(name);
     if (!svc) return -1;
+
+    // Persist FIRST. If the durable state cannot be written there is no point
+    // changing the RAM state: that would leave the running system and the disk
+    // disagreeing, which is worse than refusing, and the operator would only
+    // find out at the next boot.
+    if (!svc->b_persist) return -7;   // no durable backing: refuse, do not pretend
+    int pr = svc->b_persist(enable ? 1 : 0);
+    if (pr != 0) {
+        kprintf("[SVC] '%s' %s NOT persisted (%d) - refusing\n",
+                svc->name, enable ? "enable" : "disable", pr);
+        return -8;
+    }
+
     svc->enabled = enable ? 1 : 0;
     if (!enable && svc_is_running(svc)) svc_stop(name);
+    kprintf("[SVC] '%s' %s (persisted)\n", svc->name, enable ? "enabled" : "disabled");
     return 0;
 }
 

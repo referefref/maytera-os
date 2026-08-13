@@ -1,0 +1,337 @@
+#!/usr/bin/env python3
+"""
+syscall-ptr-lint - FAILS THE BUILD if a syscall that hands Ring 3 a USER POINTER
+has no user-pointer validation: neither a flat descriptor in
+rustkern/argtab.rs, nor an entry on the checked-in allowlist
+(kernel/syscall-ptr.manifest).
+
+WHY THIS EXISTS (#565, the enforcement half of #500 / MAYTERA-SEC-2026-0016)
+--------------------------------------------------------------------------
+Every SYSCALL from Ring 3 flows through the single chokepoint in
+proc/syscall.c: `syscall_validate_args(num, ...)` walks the argtab and, for a
+syscall with a descriptor, proves each user pointer lands in the CALLER's own
+user pages (U/S bit set, +W for writes) BEFORE the handler dereferences it.
+
+The load-bearing weakness, stated in argtab.rs itself:
+
+    "A syscall with NO descriptor is NOT validated. syscall_validate_args()
+     returns 0 for it."
+
+So a new `case SYS_X:` that casts an argN to a pointer and dereferences it,
+but that nobody remembered to give a descriptor, is validated by NOTHING. That
+is the exact Ring-3 -> kernel arbitrary read/write hole #500 just spent 114
+descriptors closing. A missing descriptor BUILDS CLEAN: the compiler is happy,
+the kernel links, userland's call works, and the only tell is that the
+attacker's pointer is never checked. #500 was a one-time manual audit; without
+a gate the hole reopens on the very next syscall added. This is the gate.
+
+Same philosophy and placement as tools/syscall-dispatch-gate (#565 dispatch
+guard) and tools/rust-symbol-gate (#404 FFI export guard): a checked-in fact
+diffed against the source on EVERY build, because "deletes/omits clean" bugs
+are exactly the ones the compiler cannot catch. argtab.rs names this tool
+directly ("the undeclared set is the tools/syscall-ptr-lint allowlist"), and
+the SYS_WAITPID comment in syscall.c documents that the ledger "keys on
+`case SYS_<NAME>:`" - which is precisely how this lint enumerates.
+
+HOW IT ENUMERATES POINTER SYSCALLS (auto-discovery, not a hand list)
+--------------------------------------------------------------------
+It parses the dispatcher switch in proc/syscall.c. For each `case SYS_X:`
+block (fallthrough labels share the following body) it looks, in comment-
+stripped code, for either:
+  * a cast of a syscall argument to a pointer:  ( <type> * )argN  /  ( <type> ** )argN
+  * SANITIZE_USER_PTR(argN)
+If the block casts any argN to a pointer, SYS_X takes a user pointer. This is
+self-updating: a NEW pointer syscall is discovered the moment its case is
+added, with no second list to forget. (Cross-checked: this discovers all 114
+syscalls that already carry an argtab descriptor, zero false negatives, plus
+the handful still undeclared.)
+
+THE RULES
+---------
+For every discovered pointer syscall SYS_X:
+  1. It has a descriptor in argtab.rs (its number appears as `Desc { num: N`)
+     => COVERED. Good.
+  2. Else it is listed under [EXEMPT] in the manifest => the handler validates
+     the pointer itself (documented, legitimate: e.g. SYS_IOCTL's
+     tty_ioctl_validate_user_arg, SYS_FUTEX's validate_futex_addr). Good.
+  3. Else it is listed under [KNOWN_GAP] in the manifest => a DEBT-LEDGER entry:
+     a real, currently-unvalidated hole that is TRACKED and reported loudly on
+     every build, but tolerated so the build is not wedged while it is being
+     closed. This is NOT a silent exemption: the count and each name are
+     printed on every build and the entries carry a reason + owning task.
+  4. Else => the build FAILS, naming SYS_X. A pointer syscall that is neither
+     described, nor exempt, nor a tracked known gap is an undeclared Ring-3
+     pointer hole. Give it a descriptor in argtab.rs (preferred), or, if the
+     handler genuinely validates the pointer itself, add it under [EXEMPT] with
+     the validating function named.
+
+Manifest hygiene is also enforced: a name under [EXEMPT]/[KNOWN_GAP] that is
+not a real SYS_* #define fails the build (typo guard, cf. winswitch/winswtch).
+A manifest name that argtab now COVERS, or that the dispatcher no longer takes
+a pointer for, is a resolved/stale entry: reported as an advisory to remove it
+(non-fatal).
+
+USAGE
+  syscall-ptr-lint --header <syscall.h> --dispatch <syscall.c> \
+                   --argtab <argtab.rs> --manifest <syscall-ptr.manifest>
+  syscall-ptr-lint ... --self-test    # prove RED on a broken fixture, GREEN on the real tree
+"""
+import argparse, os, re, sys, tempfile
+
+DEFINE_RE = re.compile(r'^\s*#\s*define\s+(SYS_[A-Z0-9_]+)\s+(\d+)', re.M)
+LABEL_RE  = re.compile(r'\bcase\s+(SYS_[A-Z0-9_]+)\s*:|\bdefault\s*:')
+# ( <optional qualifiers> <ident...> *+ ) argN   -- a pointer cast of a syscall arg
+PTR_CAST_RE = re.compile(
+    r'\(\s*(?:const\s+|volatile\s+|struct\s+|unsigned\s+|signed\s+)*'
+    r'[A-Za-z_][A-Za-z0-9_]*(?:\s+[A-Za-z_][A-Za-z0-9_]*)*\s*\*+\s*\)\s*arg([1-6])')
+SANITIZE_RE = re.compile(r'SANITIZE_USER_PTR\s*\(\s*arg([1-6])')
+ARGTAB_NUM_RE = re.compile(r'Desc\s*\{\s*num:\s*(\d+)')
+
+
+def read(path):
+    with open(path, 'r') as f:
+        return f.read()
+
+
+def strip_comments(s):
+    s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
+    s = re.sub(r'//[^\n]*', '', s)
+    return s
+
+
+def parse_defines(header_src):
+    name2num, num2name = {}, {}
+    for m in DEFINE_RE.finditer(header_src):
+        name2num[m.group(1)] = int(m.group(2))
+        num2name.setdefault(int(m.group(2)), m.group(1))
+    return name2num, num2name
+
+
+def parse_pointer_syscalls(dispatch_src):
+    """Return {SYS_X: sorted[arg indices]} for every case that casts an arg to a
+    pointer. Fallthrough labels (an empty body before the next label) inherit the
+    following body's pointer args."""
+    try:
+        body = dispatch_src[dispatch_src.index('switch (num)'):]
+    except ValueError:
+        body = dispatch_src
+    labels = [(m.start(), m.end(), (m.group(1) or '__default__'))
+              for m in LABEL_RE.finditer(body)]
+    out, pending = {}, []
+    for i, (s, e, name) in enumerate(labels):
+        nxt = labels[i + 1][0] if i + 1 < len(labels) else len(body)
+        seg = strip_comments(body[e:nxt])
+        pending.append(name)
+        if seg.strip():
+            idxs = set(PTR_CAST_RE.findall(seg)) | set(SANITIZE_RE.findall(seg))
+            if idxs:
+                for nm in pending:
+                    if nm != '__default__':
+                        out.setdefault(nm, set()).update(idxs)
+            pending = []
+    return {k: sorted(v) for k, v in out.items()}
+
+
+def parse_argtab_nums(argtab_src):
+    return set(int(m.group(1)) for m in ARGTAB_NUM_RE.finditer(argtab_src))
+
+
+def parse_manifest(path):
+    """Return (exempt, known_gap): each an ordered list of (name, reason).
+    Sections keyed by [EXEMPT] / [KNOWN_GAP] headers; blank/`#` lines ignored;
+    first whitespace token on a line is the SYS_* name, the rest is the reason."""
+    exempt, gap = [], []
+    if not os.path.exists(path):
+        return exempt, gap
+    section = None
+    for raw in read(path).splitlines():
+        line = raw.split('#', 1)[0].rstrip()
+        st = line.strip()
+        if not st:
+            continue
+        up = st.upper()
+        if up == '[EXEMPT]':
+            section = exempt; continue
+        if up == '[KNOWN_GAP]':
+            section = gap; continue
+        parts = st.split(None, 1)
+        name = parts[0]
+        reason = parts[1] if len(parts) > 1 else ''
+        if section is None:
+            # Names before any section header default to EXEMPT for safety, but
+            # this manifest always uses explicit sections.
+            section = exempt
+        section.append((name, reason))
+    return exempt, gap
+
+
+def run(header, dispatch, argtab, manifest, out=sys.stdout):
+    name2num, num2name = parse_defines(read(header))
+    ptr = parse_pointer_syscalls(read(dispatch))
+    covered_nums = parse_argtab_nums(read(argtab))
+    exempt, gap = parse_manifest(manifest)
+    exempt_names = {n for n, _ in exempt}
+    gap_names = {n for n, _ in gap}
+
+    def p(*a):
+        print(*a, file=out)
+
+    if not ptr:
+        p("syscall-ptr-lint: ERROR - found NO pointer syscalls in %s." % dispatch)
+        p("   The dispatcher parse failed; a lint that checks nothing is worse")
+        p("   than no lint. Refusing to pass.")
+        return 1
+
+    ptr_names = sorted(ptr.keys(), key=lambda n: name2num.get(n, 9999))
+
+    covered, ex, gp, undeclared = [], [], [], []
+    for n in ptr_names:
+        num = name2num.get(n)
+        if num is None:
+            # A case label whose SYS_* has no #define. The dispatch-gate owns
+            # that failure mode; here just treat as undeclared so it is loud.
+            undeclared.append(n); continue
+        if num in covered_nums:
+            covered.append(n)
+        elif n in exempt_names:
+            ex.append(n)
+        elif n in gap_names:
+            gp.append(n)
+        else:
+            undeclared.append(n)
+
+    # --- manifest hygiene -------------------------------------------------
+    fatal = False
+    bad_names = [n for n in (exempt_names | gap_names) if n not in name2num]
+    if bad_names:
+        fatal = True
+        p("syscall-ptr-lint: FAIL - manifest names that are not SYS_* #defines")
+        p("   (typo? a mis-spelled allowlist entry silently protects nothing):")
+        for n in sorted(bad_names):
+            p("   BAD NAME: %s" % n)
+
+    stale = [n for n in (exempt_names | gap_names)
+             if n in name2num and name2num[n] in covered_nums]
+    for n in stale:
+        p("syscall-ptr-lint: note - %s is now COVERED by an argtab descriptor;"
+          " remove it from the manifest allowlist (resolved)." % n)
+    not_ptr = [n for n in (exempt_names | gap_names)
+               if n in name2num and n not in ptr]
+    for n in not_ptr:
+        p("syscall-ptr-lint: note - %s is on the allowlist but the dispatcher no"
+          " longer casts an arg to a pointer for it; remove it (stale)." % n)
+
+    # --- the debt ledger, printed LOUDLY on every build -------------------
+    if gp:
+        p("")
+        p("syscall-ptr-lint: KNOWN GAP LEDGER - %d pointer syscall(s) are"
+          " UNVALIDATED and tracked as debt (NOT silently exempt):" % len(gp))
+        greason = dict(gap)
+        for n in sorted(gp, key=lambda x: name2num[x]):
+            p("   DEBT %-20s args=%s  %s"
+              % (n, ptr[n], greason.get(n, '')))
+        p("   These are real Ring-3 pointer holes to be closed (add a descriptor")
+        p("   in argtab.rs). They do NOT fail the build, but they are on the")
+        p("   record every build until closed.")
+
+    # --- the hard failure -------------------------------------------------
+    if undeclared:
+        fatal = True
+        p("")
+        p("syscall-ptr-lint: FAIL - %d pointer syscall(s) have NO validation:"
+          " not in argtab.rs, not [EXEMPT], not [KNOWN_GAP]:" % len(undeclared))
+        for n in sorted(undeclared, key=lambda x: name2num.get(x, 9999)):
+            p("   UNVALIDATED POINTER SYSCALL: %s (num %s) casts arg(s) %s to a"
+              " user pointer" % (n, name2num.get(n, '?'), ptr.get(n)))
+        p("")
+        p("   A user pointer that reaches a handler unvalidated is a Ring-3 ->")
+        p("   kernel arbitrary read/write (#500 / MAYTERA-SEC-2026-0016). FIX:")
+        p("     - PREFERRED: add a `Desc { num: <n>, args: [...] }` in")
+        p("       rustkern/argtab.rs describing each pointer arg; OR")
+        p("     - if the handler validates the pointer itself (validate_user_ptr")
+        p("       / a range check), add the syscall under [EXEMPT] in")
+        p("       %s naming the validating function." % os.path.basename(manifest))
+
+    if fatal:
+        return 1
+
+    p("")
+    p("syscall-ptr-lint: OK - %d pointer syscall(s): %d argtab-covered, %d"
+      " in-handler exempt, %d tracked known-gap. No undeclared holes."
+      % (len(ptr_names), len(covered), len(ex), len(gp)))
+    return 0
+
+
+def self_test(header, dispatch, argtab, manifest):
+    """Prove the gate goes GREEN on the real tree and RED on a fixture with an
+    undeclared pointer syscall. Same contract as invariant-gate.sh --self-test /
+    the dispatch-gate self-test: a gate you cannot see fail is not a gate."""
+    import io
+    ok_all = True
+
+    # GREEN: the real, current tree must pass.
+    buf = io.StringIO()
+    rc = run(header, dispatch, argtab, manifest, out=buf)
+    green_ok = (rc == 0)
+    print("self-test GREEN (real tree): rc=%d -> %s"
+          % (rc, "PASS" if green_ok else "FAIL (expected 0)"))
+    if not green_ok:
+        print(buf.getvalue())
+    ok_all = ok_all and green_ok
+
+    # RED: inject a fake pointer syscall with no descriptor and no allowlist
+    # entry; the gate MUST fail and name it.
+    FAKE = "SYS_PTRLINT_SELFTEST_VICTIM"
+    name2num, num2name = parse_defines(read(header))
+    fake_num = max(name2num.values()) + 4242
+    hdr_src = read(header) + "\n#define %s %d\n" % (FAKE, fake_num)
+    # a dispatcher case that casts arg1 to a pointer and derefs it
+    disp_src = read(dispatch)
+    inject = ("\n        case %s:\n"
+              "            return sys_fake_victim((char *)arg1, (int)arg2);\n"
+              % FAKE)
+    marker = "    switch (num) {"
+    idx = disp_src.index(marker) + len(marker)
+    disp_src = disp_src[:idx] + inject + disp_src[idx:]
+
+    with tempfile.TemporaryDirectory() as td:
+        hp = os.path.join(td, "h.h"); dp = os.path.join(td, "d.c")
+        with open(hp, 'w') as f: f.write(hdr_src)
+        with open(dp, 'w') as f: f.write(disp_src)
+        buf = io.StringIO()
+        rc = run(hp, dp, argtab, manifest, out=buf)
+        text = buf.getvalue()
+        red_ok = (rc != 0) and (FAKE in text) and ("UNVALIDATED POINTER" in text)
+        print("self-test RED (injected undeclared pointer syscall): rc=%d -> %s"
+              % (rc, "PASS" if red_ok else "FAIL (expected non-zero naming the victim)"))
+        if not red_ok:
+            print(text)
+        else:
+            for line in text.splitlines():
+                if FAKE in line:
+                    print("   proof:%s" % line)
+        ok_all = ok_all and red_ok
+
+    print("")
+    if ok_all:
+        print("syscall-ptr-lint --self-test: PASS (RED on broken, GREEN on real tree)")
+        return 0
+    print("syscall-ptr-lint --self-test: FAIL - the gate is not trustworthy")
+    return 1
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--header', required=True)
+    ap.add_argument('--dispatch', required=True)
+    ap.add_argument('--argtab', required=True)
+    ap.add_argument('--manifest', required=True)
+    ap.add_argument('--self-test', action='store_true')
+    a = ap.parse_args()
+    if a.self_test:
+        return self_test(a.header, a.dispatch, a.argtab, a.manifest)
+    return run(a.header, a.dispatch, a.argtab, a.manifest)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

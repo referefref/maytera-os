@@ -1,3 +1,7 @@
+; SPDX-License-Identifier: MIT
+; Copyright (c) MayteraOS contributors.
+; Full license text: userland/libc/LICENSE (MIT License).
+;
 ; sig_trampoline.asm - signal trampoline for MayteraOS userland
 ; When the kernel delivers a signal, it rewrites the saved user IRET frame:
 ;   rip = user handler, rdi = signo, rsp = sigframe + trampoline-return
@@ -16,3 +20,8 @@ __sig_trampoline:
     syscall
     ; rt_sigreturn should never return. If it does, crash loudly.
     ud2
+
+; #640 leg 4: mark the stack NON-EXECUTABLE. ld marks PT_GNU_STACK RWE for
+; the WHOLE link if ANY input object lacks this note, so every hand-written
+; NASM object needs it, not just crt0. gcc emits it automatically for C.
+section .note.GNU-stack noalloc noexec nowrite progbits

@@ -5,6 +5,8 @@
 #include "../../libc/maytera.h"
 #include "../../libc/gui.h"
 #include "../../libc/gui_font.h"
+#include "../../libc/gui_menu.h"
+#include "../../libc/userconf.h"   // #743: checked whole-file write + per-user paths
 
 // Editor dimensions
 static int g_ed_w = 640, g_ed_h = 480;  // live content size (EVENT_RESIZE)
@@ -49,8 +51,23 @@ static void ed_apply_font(void) {
     if (g_cell_h < 6) g_cell_h = 6;
 }
 
-// Title-bar inset used for screen->local coordinate conversion.
-#define TITLEBAR_INSET  22
+// #528: window chrome. win_create() takes the OUTER window size and the kernel
+// subtracts the chrome to get the drawable canvas, so the chrome is ADDED ON at
+// create time and the canvas is then re-read with win_get_size(). Same constants
+// and same convention as Settings (SET_CHROME_W/H), which is the reference app.
+// An app that passes its exact content size to win_create() silently loses its
+// bottom row with no error.
+//
+// This replaces a TITLEBAR_INSET of 22 whose own comment said it was for
+// "screen->local coordinate conversion": a leftover from before the kernel began
+// delivering content-relative mouse coords. That conversion is long gone from the
+// event handlers, but the stale constant survived as a fudge subtracted from the
+// window HEIGHT. It was wrong in both directions: 22 understates the real 24px
+// chrome, so the status bar lost its bottom 2 rows; and after an EVENT_RESIZE set
+// g_ed_h to the true CONTENT height it became 22px of pure dead space with the
+// status bar floating above the bottom edge.
+#define ED_CHROME_W      4
+#define ED_CHROME_H     24
 #define BORDER_INSET    2
 
 // Content area dimensions (recomputed per-frame so the find bar can push it down)
@@ -184,6 +201,51 @@ static bool have_cur_match = false;
 static int win_x = 50;
 static int win_y = 30;
 
+// --- Menu bar (#562: fixed via the shared gui_menu primitive, #512) --------
+// Previously four menus were DRAWN (File, Edit, Search, Font) but only two
+// (Search, Font) were hit-tested, via a hand-coded array of x-ranges that had
+// drifted out of sync with what was drawn - File and Edit were pure
+// decoration. Fixing that "locally" would have meant hand-rolling a fourth
+// slightly-different dropdown in this file; gui_menu_bar_t (built on the
+// shared gui_list_t, #512) is the one place that owns menu geometry and hit
+// testing instead, so a mismatch like that structurally cannot happen again.
+typedef enum {
+    ID_FILE_NEW = 1, ID_FILE_SAVE, ID_FILE_EXIT,
+    ID_EDIT_CUT, ID_EDIT_COPY, ID_EDIT_PASTE, ID_EDIT_SELECT_ALL,
+    ID_SEARCH_FIND, ID_SEARCH_FIND_NEXT, ID_SEARCH_REPLACE,
+    ID_FONT_CHOOSE
+} menu_action_id_t;
+
+static const gui_menu_item_t FILE_ITEMS[] = {
+    { "New",  "Ctrl+N", ID_FILE_NEW,  true },
+    { "Save", "Ctrl+S", ID_FILE_SAVE, true },
+    { NULL,   NULL,     0,            false },   // separator
+    { "Exit", NULL,     ID_FILE_EXIT, true },
+};
+static const gui_menu_item_t EDIT_ITEMS[] = {
+    { "Cut",         "Ctrl+X", ID_EDIT_CUT,        true },
+    { "Copy",        "Ctrl+C", ID_EDIT_COPY,       true },
+    { "Paste",       "Ctrl+V", ID_EDIT_PASTE,      true },
+    { NULL,          NULL,     0,                  false },   // separator
+    { "Select All",  "Ctrl+A", ID_EDIT_SELECT_ALL, true },
+};
+static const gui_menu_item_t SEARCH_ITEMS[] = {
+    { "Find...",     "Ctrl+F", ID_SEARCH_FIND,      true },
+    { "Find Next",   "Ctrl+G", ID_SEARCH_FIND_NEXT, true },
+    { "Replace...",  "Ctrl+H", ID_SEARCH_REPLACE,   true },
+};
+static const gui_menu_item_t FONT_ITEMS[] = {
+    { "Font...", NULL, ID_FONT_CHOOSE, true },
+};
+static const gui_menu_t EDITOR_MENUS[] = {
+    { "File",   FILE_ITEMS,   4 },
+    { "Edit",   EDIT_ITEMS,   5 },
+    { "Search", SEARCH_ITEMS, 3 },
+    { "Font",   FONT_ITEMS,   1 },
+};
+#define EDITOR_MENU_COUNT 4
+static gui_menu_bar_t g_menu;
+
 // Lint cues
 static int bracket_balance = 0;        // net (open - close) over the whole file
 static bool have_bracket_match = false;
@@ -205,7 +267,7 @@ static int content_y(void) {
     return MENU_HEIGHT + (find_open ? FIND_HEIGHT : 0);
 }
 static int content_h(void) {
-    return EDITOR_HEIGHT - content_y() - STATUS_HEIGHT - TITLEBAR_INSET;
+    return EDITOR_HEIGHT - content_y() - STATUS_HEIGHT;
 }
 static int visible_rows(void) { return content_h() / CHAR_H; }
 static int visible_cols(void) { return CONTENT_W / CHAR_W; }
@@ -510,22 +572,38 @@ static bool is_trailing_ws(uint32_t pos, uint32_t line) {
 // editor wants monospace even when the desktop is set to a sans.
 #define ED_FONT_CFG "/CONFIG/EDFONT.CFG"
 
+// #743: set when a save did not reach the disk, cleared by a save that did.
+// The editor's only previous signal was the "*" next to the filename, and that
+// was cleared unconditionally by file_save(), so a failed save looked exactly
+// like a successful one.
+static bool save_failed = false;
+
 static void ed_save_font(void) {
     char buf[160];
     snprintf(buf, sizeof(buf), "%s|%s|%d\n",
              g_font.family[0] ? g_font.family : "Default",
              g_font.style[0] ? g_font.style : "Regular", g_font.size);
-    int fd = open(ED_FONT_CFG, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) return;
-    write(fd, buf, strlen(buf));
-    close(fd);
+    // #743: write() and close() were both discarded. On an ext2-backed fd the
+    // bytes are buffered and the real write happens inside close(), so the
+    // discarded close() result was the only error report there was.
+    // Also now a per-user path (#683): /CONFIG is not writable by a non-root
+    // session, so this preference could never be saved by one.
+    int fd = userconf_open_write("EDFONT.CFG");
+    if (userconf_finish_write(fd, buf, strlen(buf)) != 0) {
+        // A font preference is cosmetic and there is no sensible recovery, but
+        // it must not be silent: the status bar shows the same alarm as a
+        // failed document save.
+        save_failed = true;
+    }
 }
 
 static void ed_load_font(void) {
     memset(&g_font, 0, sizeof(g_font));
     g_font.size = 16;
     strncpy(g_font.style, "Regular", GUI_FONT_STYLE_MAX - 1);
-    int fd = open(ED_FONT_CFG, O_RDONLY);
+    // #743: per-user copy first, falling back to the legacy path so an existing
+    // install keeps its editor font (#683).
+    int fd = userconf_open_read("EDFONT.CFG", ED_FONT_CFG);
     if (fd >= 0) {
         char buf[160];
         int n = read(fd, buf, sizeof(buf) - 1);
@@ -550,18 +628,30 @@ static void ed_load_font(void) {
     ed_apply_font();
 }
 
+// Refresh g_menu's colors from the editor's own theme palette (called after
+// apply_theme(), which sets MENU_BG/MENU_TEXT/etc.). gui_menu is deliberately
+// colour-agnostic (see gui_menu.h) so the editor keeps its existing
+// VSCode-style look instead of switching to the kernel THEME_COLOR_* palette.
+static void sync_menu_theme(void) {
+    gui_menu_palette_t p;
+    p.bar_bg             = MENU_BG;
+    p.bar_text            = MENU_TEXT;
+    p.bar_hover_bg        = gui_lighten(MENU_BG, 24);
+    p.popup_bg            = MENU_BG;
+    p.popup_border        = MENU_HINT;
+    p.item_text           = MENU_TEXT;
+    p.item_text_disabled  = MENU_HINT;
+    p.item_hover_bg       = STATUS_BG;      // accent fill, matches the style
+    p.item_hover_text     = STATUS_TEXT;    // guide's menu hover contract
+    p.shortcut_text       = MENU_HINT;
+    p.separator           = MENU_HINT;
+    gui_menu_set_palette(&g_menu, &p);
+}
+
 // Draw the menu bar
 static void draw_menu_bar(void) {
     win_draw_rect(window_handle, 0, 0, EDITOR_WIDTH, MENU_HEIGHT, MENU_BG);
-
-    const char *menus[] = { "File", "Edit", "Search", "Font" };
-    int menu_x[] = { 8, 56, 112, 176 };
-    int menu_w[] = { 40, 48, 56, 44 };
-
-    for (int i = 0; i < 4; i++) {
-        win_draw_rect(window_handle, menu_x[i] - 4, 2, menu_w[i], MENU_HEIGHT - 4, MENU_BG);
-        win_draw_text(window_handle, menu_x[i], 4, menus[i], MENU_TEXT);
-    }
+    gui_menu_bar_draw(window_handle, &g_menu);
 
     // Compact hint on the right.
     const char *hint = "Ctrl+F Find  Ctrl+H Replace  Ctrl+S Save";
@@ -741,7 +831,7 @@ static void draw_content(void) {
 
 // Draw status bar
 static void draw_status_bar(void) {
-    int y = EDITOR_HEIGHT - STATUS_HEIGHT - TITLEBAR_INSET;
+    int y = EDITOR_HEIGHT - STATUS_HEIGHT;
     win_draw_rect(window_handle, 0, y, EDITOR_WIDTH, STATUS_HEIGHT, STATUS_BG);
 
     // Left: filename + modified flag
@@ -767,9 +857,14 @@ static void draw_status_bar(void) {
             snprintf(mid, sizeof(mid), "Brackets balanced");
         }
     }
+    // #743: a failed save outranks the lint cue. Without this the only signal
+    // was the "*", which is indistinguishable from "not saved yet".
+    if (save_failed)
+        snprintf(mid, sizeof(mid), "SAVE FAILED - document NOT written to disk");
+
     if (mid[0]) {
         int mw = gui_string_width(mid);
-        uint32_t mc = (bracket_balance != 0) ? WARN_COLOR : STATUS_TEXT;
+        uint32_t mc = (bracket_balance != 0 || save_failed) ? WARN_COLOR : STATUS_TEXT;
         win_draw_text(window_handle, (EDITOR_WIDTH - mw) / 2, y + 2, mid, mc);
     }
 
@@ -789,6 +884,9 @@ static void editor_redraw(void) {
     draw_line_numbers();
     draw_content();
     draw_status_bar();
+    // LAST: overlay the open menu popup (if any) on top of everything else,
+    // same overlay convention as Settings' dropdown_render().
+    gui_menu_popup_draw(window_handle, &g_menu, EDITOR_WIDTH, EDITOR_HEIGHT);
     win_invalidate(window_handle);
 }
 
@@ -995,12 +1093,49 @@ static void file_open(const char *path) {
 static void file_save(void) {
     if (!filename[0]) return;  // Need filename
 
-    int fd = open(filename, 1);  // O_WRONLY (simplified)
-    if (fd < 0) return;
+    // #743: THE DATA-LOSS SITE. This was:
+    //
+    //     int fd = open(filename, 1);   // O_WRONLY, no O_CREAT, no O_TRUNC
+    //     if (fd < 0) return;
+    //     write(fd, buffer, buffer_len);   // result discarded
+    //     close(fd);                       // result discarded
+    //     modified = false;                // UNCONDITIONAL
+    //
+    // Four separate faults, and the last one is what turns the others into lost
+    // work:
+    //
+    //  1. `modified = false` ran whatever happened. The status bar's "*" is the
+    //     only thing telling the user there is unsaved work, so a save that
+    //     failed looked EXACTLY like one that succeeded. The user then closes
+    //     the editor and the document is gone. No hardware fault is needed: a
+    //     full volume is enough.
+    //
+    //  2. close() was discarded, which on this kernel is the important one. An
+    //     ext2-backed fd buffers the bytes and does the REAL write inside
+    //     close() (kernel/proc/syscall.c: the e2fd family calls
+    //     ext2_write_file() from sys_close and returns its rc). So the one call
+    //     that could report "the disk is full" was the one being ignored.
+    //
+    //  3. No O_CREAT: saving to a filename that does not exist yet failed at
+    //     the open and returned silently.
+    //
+    //  4. No O_TRUNC. On the ext2 root this happens to be harmless, because the
+    //     ext2 write path replaces the whole file anyway; on a FAT-backed path
+    //     the write is POSITIONAL, so saving a shorter document over a longer
+    //     one left the tail of the old one behind and the file kept its old
+    //     length. Stated as measured: filesystem-dependent, not universal.
+    //
+    // userconf_write_all() supplies O_CREAT|O_TRUNC, writes every byte, fsyncs,
+    // and checks the close, returning 0 only if the bytes actually landed.
+    if (userconf_write_all(filename, buffer, buffer_len) != 0) {
+        // Keep `modified` TRUE. The document stays marked unsaved, the "*"
+        // stays in the status bar, and the buffer is untouched, so the user can
+        // fix the problem and press Ctrl+S again.
+        save_failed = true;
+        return;
+    }
 
-    write(fd, buffer, buffer_len);
-    close(fd);
-
+    save_failed = false;
     modified = false;
 }
 
@@ -1057,18 +1192,89 @@ static bool find_bar_key(gui_event_t *ev) {
     return false;
 }
 
+// Dispatch a menu_action_id_t returned by gui_menu_bar_click()/gui_menu_key().
+// Every action here already existed as a keyboard shortcut (Ctrl+N/S/X/C/V/A/
+// F/G/H) or the Font-menu click; the menu is a second way to reach the same
+// code, not new behaviour.
+static void handle_menu_action(int id, int *running) {
+    switch (id) {
+        case ID_FILE_NEW:
+            file_new(); kbd_sel_mode = false;
+            break;
+        case ID_FILE_SAVE:
+            file_save();
+            break;
+        case ID_FILE_EXIT:
+            *running = 0;
+            break;
+        case ID_EDIT_CUT:
+            clip_cut(); recompute_lint();
+            break;
+        case ID_EDIT_COPY:
+            clip_copy();
+            break;
+        case ID_EDIT_PASTE:
+            clip_paste(); recompute_lint();
+            break;
+        case ID_EDIT_SELECT_ALL:
+            select_all();
+            break;
+        case ID_SEARCH_FIND:
+            find_open = true; replace_mode = false; find_field = 0;
+            have_cur_match = false; recompute_matches();
+            break;
+        case ID_SEARCH_FIND_NEXT:
+            if (find_len > 0) find_next(have_cur_match ? cur_match_pos + 1 : cursor_pos, true);
+            break;
+        case ID_SEARCH_REPLACE:
+            find_open = true; replace_mode = true; find_field = 0;
+            have_cur_match = false; recompute_matches();
+            break;
+        case ID_FONT_CHOOSE:
+            // Font menu: the SHARED picker (#351). The editor owns no font UI;
+            // it hands its current selection in and takes the new one back.
+            g_font.title = "Editor Font";
+            g_font.preview_text = "int main(void) { return 0; }";
+            if (gui_font_dialog(&g_font)) {
+                ed_apply_font();
+                ed_save_font();
+            }
+            break;
+        default:
+            break;
+    }
+}
+
 int main(int argc, char **argv) {
     (void)argc;
 
-    window_handle = win_create("Editor", win_x, win_y, EDITOR_WIDTH, EDITOR_HEIGHT);
+    // g_ed_w/g_ed_h are the CONTENT size (that is what EVENT_RESIZE delivers and
+    // what every layout helper below assumes), so add the chrome to get the OUTER
+    // size win_create() wants. Passing the content size directly, as this did,
+    // made the kernel carve the chrome back out of it and silently clipped the
+    // bottom of the layout.
+    window_handle = win_create("Editor", win_x, win_y,
+                               EDITOR_WIDTH + ED_CHROME_W, EDITOR_HEIGHT + ED_CHROME_H);
     ed_load_font();   // #351: restore the saved face before the first paint
     if (window_handle < 0) {
         return 1;
     }
 
+    // Authoritative canvas size: ask the kernel what the canvas actually is rather
+    // than inferring it from the create arguments (Settings does the same). This
+    // keeps g_ed_w/g_ed_h honest even if the kernel clamps the window.
+    {
+        int cw = 0, chh = 0;
+        if (win_get_size(window_handle, &cw, &chh) == 0 && cw > 0 && chh > 0) {
+            g_ed_w = cw; g_ed_h = chh;
+        }
+    }
+
     printf("Editor window created (handle=%d)\n", window_handle);
 
+    gui_menu_bar_init(&g_menu, EDITOR_MENUS, EDITOR_MENU_COUNT, 0, 0, MENU_HEIGHT);
     apply_theme();
+    sync_menu_theme();
     g_theme_last = get_theme();
 
     file_new();
@@ -1088,7 +1294,7 @@ int main(int argc, char **argv) {
         // Live-apply a theme change made in Settings while we are running.
         {
             int th = get_theme();
-            if (th != g_theme_last) { g_theme_last = th; apply_theme(); editor_redraw(); }
+            if (th != g_theme_last) { g_theme_last = th; apply_theme(); sync_menu_theme(); editor_redraw(); }
         }
 
         if (event_type == 0) {
@@ -1118,6 +1324,16 @@ int main(int argc, char **argv) {
                     uint32_t keycode = event.keycode;
                     bool ext = kbd_sel_mode;   // extend selection in keyboard-select mode
                     bool handled = false;
+
+                    // An open menu owns the keyboard: Esc/arrows/Enter navigate
+                    // it, and every other key is swallowed rather than typed
+                    // into the document underneath.
+                    if (gui_menu_is_open(&g_menu)) {
+                        int mid = gui_menu_key(&g_menu, keycode, c);
+                        if (mid >= 0) handle_menu_action(mid, &running);
+                        editor_redraw();
+                        break;
+                    }
 
                     // --- find/replace bar focus eats most keys ----------------
                     if (find_open) {
@@ -1232,6 +1448,17 @@ int main(int argc, char **argv) {
                     int local_x = event.mouse_x;
                     int local_y = event.mouse_y;
 
+                    // The menu bar (gui_menu, #562/#512) gets first refusal on
+                    // every click, open or closed: an open popup can extend
+                    // well below MENU_HEIGHT, over the find bar or content.
+                    int mid = gui_menu_bar_click(&g_menu, local_x, local_y,
+                                                 EDITOR_WIDTH, EDITOR_HEIGHT);
+                    if (mid != -1) {
+                        if (mid >= 0) handle_menu_action(mid, &running);
+                        editor_redraw();
+                        break;
+                    }
+
                     // Find bar buttons (prev/next) when open.
                     if (find_open && local_y >= MENU_HEIGHT && local_y < MENU_HEIGHT + FIND_HEIGHT) {
                         int y = MENU_HEIGHT;
@@ -1248,24 +1475,9 @@ int main(int argc, char **argv) {
                     }
 
                     if (local_y >= 0 && local_y < MENU_HEIGHT) {
-                        // Menu clicks: Search menu toggles find bar.
-                        if (local_x >= 108 && local_x < 168) {
-                            find_open = !find_open;
-                            if (find_open) { replace_mode = false; find_field = 0; recompute_matches(); }
-                        }
-                        // Font menu: the SHARED picker (#351). The editor owns no
-                        // font UI; it hands its current selection in and takes the
-                        // new one back. Adding a font UI here would be the exact
-                        // duplication this dialog exists to prevent.
-                        else if (local_x >= 172 && local_x < 224) {
-                            g_font.title = "Editor Font";
-                            g_font.preview_text = "int main(void) { return 0; }";
-                            if (gui_font_dialog(&g_font)) {
-                                ed_apply_font();   // re-metric the cell grid
-                                ed_save_font();
-                            }
-                        }
-                        editor_redraw();
+                        // gui_menu_bar_click() above already owns every top-level
+                        // label; a click here landed in blank bar space (e.g. the
+                        // hint text region) and is deliberately a no-op.
                     } else {
                         uint32_t pos;
                         if (click_to_pos(local_x, local_y, &pos)) {
@@ -1282,27 +1494,39 @@ int main(int argc, char **argv) {
                 break;
 
             case EVENT_MOUSE_MOVE:
-                if (mouse_selecting) {
-                    // Already content-relative (kernel b330). Subtracting the
-                    // window origin here again double-offsets every click.
+                {
                     int local_x = event.mouse_x;
                     int local_y = event.mouse_y;
-                    uint32_t pos;
-                    if (click_to_pos(local_x, local_y, &pos)) {
-                        cursor_pos = pos;
-                        has_selection = (pos != sel_anchor);
-                        update_cursor_pos();
-                        ensure_visible();
-                        editor_redraw();
+                    if (gui_menu_is_open(&g_menu)) {
+                        if (gui_menu_motion(&g_menu, local_x, local_y, EDITOR_WIDTH, EDITOR_HEIGHT))
+                            editor_redraw();
+                        break;
+                    }
+                    if (mouse_selecting) {
+                        uint32_t pos;
+                        if (click_to_pos(local_x, local_y, &pos)) {
+                            cursor_pos = pos;
+                            has_selection = (pos != sel_anchor);
+                            update_cursor_pos();
+                            ensure_visible();
+                            editor_redraw();
+                        }
                     }
                 }
                 break;
 
             case EVENT_MOUSE_UP:
+                gui_menu_release(&g_menu);
                 mouse_selecting = false;
                 break;
 
             case EVENT_MOUSE_SCROLL:
+                if (gui_menu_is_open(&g_menu)) {
+                    if (gui_menu_wheel(&g_menu, event.mouse_x, event.mouse_y,
+                                       EDITOR_WIDTH, EDITOR_HEIGHT, event.scroll_delta))
+                        editor_redraw();
+                    break;
+                }
                 {
                     int delta = event.scroll_delta;
                     int rows = visible_rows();

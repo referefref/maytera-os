@@ -10,11 +10,14 @@
 #include "icons.h"
 #include "../types.h"
 #include "../string.h"
+#include "../fs/ext2.h"
+#include "../fs/blockdev.h"
+#include "../drivers/usb_msc.h"
+#include "../drivers/ahci.h"
 #include "../serial.h"
 #include "../mm/heap.h"
 #include "../video/framebuffer.h"
 #include "../drivers/ata.h"
-#include "../drivers/ahci.h"
 #include "../fs/fat.h"
 
 // The booted/source FAT filesystem (defined in main.c). The installer reads its
@@ -689,6 +692,25 @@ void installer_draw_complete(installer_t *inst) {
 // Disk Detection
 // ============================================================================
 
+// Human-readable fallback label for a target with no IDENTIFY model string
+// (AHCI ports and USB disks). Kept deliberately tiny: no snprintf in this
+// translation unit, and an unlabelled disk in a DESTRUCTIVE picker is worse
+// than an ugly one.
+static void inst_bus_label(const inst_target_t *t, char *out, uint32_t cap) {
+    if (!out || cap < 8) return;
+    const char *bus = (t->kind == INST_KIND_ATA)  ? "ATA disk "
+                    : (t->kind == INST_KIND_AHCI) ? "AHCI port "
+                    : (t->kind == INST_KIND_USB)  ? "USB disk "
+                                                  : "disk ";
+    uint32_t i = 0;
+    while (bus[i] && i + 5 < cap) { out[i] = bus[i]; i++; }
+    uint8_t v = t->index;
+    if (v >= 100 && i + 1 < cap) out[i++] = (char)('0' + (v / 100));
+    if (v >= 10  && i + 1 < cap) out[i++] = (char)('0' + ((v / 10) % 10));
+    if (i + 1 < cap) out[i++] = (char)('0' + (v % 10));
+    out[i] = '\0';
+}
+
 void installer_detect_disks(installer_t *inst) {
     if (!inst) return;
 
@@ -696,40 +718,65 @@ void installer_detect_disks(installer_t *inst) {
     inst->disk_count = 0;
     inst->selected_disk = -1;
 
-    for (int ch = 0; ch < 2 && inst->disk_count < INSTALLER_MAX_DISKS; ch++) {
-        for (int dr = 0; dr < 2 && inst->disk_count < INSTALLER_MAX_DISKS; dr++) {
-            ata_drive_t *drive = ata_get_drive(ch, dr);
-            if (drive && drive->exists && drive->type == ATA_TYPE_ATA) {
-                installer_disk_t *disk = &inst->disks[inst->disk_count];
+    // #306: enumerate EVERY bus we can write to, not just the two ATA channels.
+    // The old loop was the reason the iMac showed "no disks": its internal
+    // drive is AHCI, and ata_get_drive() cannot see it at all.
+    inst_target_t targets[INST_MAX_TARGETS];
+    int n = inst_enumerate_targets(targets, INST_MAX_TARGETS);
+    if (n < 0) n = 0;
 
-                char name[8] = "sd";
-                name[2] = 'a' + (char)inst->disk_count;
-                name[3] = '\0';
-                int i = 0;
-                while (name[i]) {
-                    disk->name[i] = name[i];
-                    i++;
-                }
-                disk->name[i] = '\0';
+    // A disk smaller than the source ESP alone can never hold the install, so
+    // it is worth hiding. This is a FLOOR, not the authoritative capacity
+    // check: installer_do_install_target() computes the real ESP + ext2-root
+    // requirement and returns -6 if the disk does not fit. Two checks with two
+    // different jobs, deliberately not merged.
+    uint64_t min_sectors = (uint64_t)g_fat_fs.part_sectors + 66;
 
-                i = 0;
-                while (drive->model[i] && i < 63) {
-                    disk->model[i] = drive->model[i];
-                    i++;
-                }
-                disk->model[i] = '\0';
+    for (int ti = 0; ti < n && inst->disk_count < INSTALLER_MAX_DISKS; ti++) {
+        inst_target_t *t = &targets[ti];
 
-                disk->size_bytes = drive->sectors * 512ULL;
-                disk->sector_size = 512;
-                disk->removable = false;
-                disk->selected = false;
-                disk->drive_id = ch * 2 + dr;   // ATA drive id used by the engine
-
-                kprintf("[INSTALLER] Found disk: %s - %s (%llu bytes)\n",
-                        disk->name, disk->model, disk->size_bytes);
-                inst->disk_count++;
-            }
+        if (!inst_target_installable(t, min_sectors)) {
+            kprintf("[INSTALLER] skipping kind=%u idx=%u sectors=%llu (%s)\n",
+                    t->kind, t->index, (unsigned long long)t->sectors,
+                    t->is_boot ? "boot disk" : "below minimum size");
+            continue;
         }
+
+        installer_disk_t *disk = &inst->disks[inst->disk_count];
+
+        disk->name[0] = 's';
+        disk->name[1] = 'd';
+        disk->name[2] = (char)('a' + (char)inst->disk_count);
+        disk->name[3] = '\0';
+
+        // Prefer the real IDENTIFY model string where we have one; otherwise
+        // name the bus and index so two disks are never indistinguishable.
+        const char *model = NULL;
+        if (t->kind == INST_KIND_ATA) {
+            ata_drive_t *drive = ata_get_drive((uint8_t)((t->index >> 1) & 1),
+                                               (uint8_t)(t->index & 1));
+            if (drive && drive->exists && drive->model[0])
+                model = drive->model;
+        }
+        if (model) {
+            int i = 0;
+            while (model[i] && i < 63) { disk->model[i] = model[i]; i++; }
+            disk->model[i] = '\0';
+        } else {
+            inst_bus_label(t, disk->model, sizeof(disk->model));
+        }
+
+        disk->size_bytes  = t->sectors * 512ULL;
+        disk->sector_size = 512;
+        disk->removable   = (t->kind == INST_KIND_USB);
+        disk->selected    = false;
+        disk->kind        = t->kind;
+        disk->index       = t->index;
+        disk->drive_id    = (t->kind == INST_KIND_ATA) ? (int)t->index : -1;
+
+        kprintf("[INSTALLER] Found disk: %s - %s (%llu bytes, kind=%u idx=%u)\n",
+                disk->name, disk->model, disk->size_bytes, t->kind, t->index);
+        inst->disk_count++;
     }
 
     kprintf("[INSTALLER] Detected %u disk(s)\n", inst->disk_count);
@@ -782,19 +829,38 @@ void installer_prev_step(installer_t *inst) {
 // ============================================================================
 // Install engine
 //
-// Strategy (phase 2, proven to boot): the live image is a single GPT disk with
-// one EF00 FAT32 ESP at LBA 2048 that is BOTH the EFI System Partition and the
-// MayteraOS root (no /ROOTEXT2, so FAT is root). To install we reproduce exactly
-// that layout on the target: write a fresh protective MBR + GPT describing one
-// EF00 ESP at LBA 2048, then raw-clone the source ESP sector-for-sector onto the
-// target. The cloned partition is byte-identical, so it already contains
-// EFI/BOOT/BOOTX64.EFI, kernel.elf (all four paths), /APPS, /CONFIG, wallpapers
-// and fonts, and is guaranteed mountable + bootable. This reuses the proven
-// filesystem image rather than re-formatting + per-file copy.
+// Strategy: reproduce the live image's TWO-PARTITION layout on the target and
+// raw-clone both partitions sector-for-sector.
+//
+// The comment that used to sit here described a single GPT disk with one EF00
+// FAT32 ESP that was "BOTH the EFI System Partition and the MayteraOS root (no
+// /ROOTEXT2, so FAT is root)". That was true when it was written and has been
+// FALSE since #365/b788. Every golden since then is 256MiB FAT ESP + ext2 root,
+// and the invariant gate asserts exactly that ("ESP has no /APPS directory -
+// userland is off the ESP"). Cloning only the ESP therefore produced a disk
+// carrying the kernel and BOOTX64.EFI but NO /APPS, /CONFIG, wallpapers or
+// fonts - and, because the cloned ESP still carries the ROOTEXT2 marker, one
+// that actively told the kernel to mount an ext2 root that had never been
+// written. It booted the kernel into nothing.
+//
+// Nothing caught it because the only trigger is a /CONFIG/AUTOINST.CFG marker
+// that nothing sets, so the layout change sailed straight past this code.
+//
+// Cloning rather than formatting is still the right call: this kernel has no
+// mkfs for FAT32 or ext2, so a filesystem cannot be created from scratch. Both
+// source partitions are already proven-good images.
 // ============================================================================
 
 // EFI System Partition type GUID (C12A7328-F81F-11D2-BA4B-00A0C93EC93B) in the
 // mixed-endian on-disk GPT byte order.
+// Linux filesystem data (0FC63DAF-8483-4772-8E79-3D69D8477DE4) in the same
+// mixed-endian on-disk GPT byte order as the ESP GUID below: first three fields
+// little-endian, last two big-endian. This is p2's type code, 8300.
+static const uint8_t INST_LINUX_TYPE_GUID[16] = {
+    0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47,
+    0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4
+};
+
 static const uint8_t INST_ESP_TYPE_GUID[16] = {
     0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11,
     0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B
@@ -839,19 +905,101 @@ static void inst_make_guid(uint8_t *out, uint64_t salt) {
     }
 }
 
-static int inst_disk_read(int ch, int u, uint32_t lba, uint8_t cnt, void *buf) {
-    if (ata_dma_available((uint8_t)ch, (uint8_t)u))
-        return ata_read_sectors_dma((uint8_t)ch, (uint8_t)u, lba, cnt, buf);
-    return ata_read_sectors((uint8_t)ch, (uint8_t)u, lba, cnt, buf);
+// ---------------------------------------------------------------------------
+// #306: thin accessors for rustkern/instdisk.rs. These exist rather than
+// mirroring ata_drive_t / usb_msc_device_t in Rust, because a second copy of a
+// C struct layout is a second thing to drift (the ext2_get_is_dir reasoning).
+// ---------------------------------------------------------------------------
+int inst_ata_exists(uint8_t channel, uint8_t drive) {
+    ata_drive_t *d = ata_get_drive(channel, drive);
+    return (d && d->exists && d->type == ATA_TYPE_ATA) ? 1 : 0;
 }
-static int inst_disk_write(int ch, int u, uint32_t lba, uint8_t cnt, const void *buf) {
-    if (ata_dma_available((uint8_t)ch, (uint8_t)u))
-        return ata_write_sectors_dma((uint8_t)ch, (uint8_t)u, lba, cnt, buf);
-    return ata_write_sectors((uint8_t)ch, (uint8_t)u, lba, cnt, buf);
+uint64_t inst_ata_sectors(uint8_t channel, uint8_t drive) {
+    ata_drive_t *d = ata_get_drive(channel, drive);
+    return (d && d->exists) ? (uint64_t)d->sectors : 0;
+}
+// #306/#32: device IDENTITY for dedup. The ATA driver and the AHCI driver can
+// both claim the SAME PCI function - on q35 the ATA driver logs "Found PCI
+// storage controller: 8086:2922 at 00:1f.2 ... Secondary in compatibility
+// mode" for the very controller AHCI initializes - so one physical disk gets
+// enumerated twice. Capacity alone cannot separate a duplicate from two
+// genuinely identical drives; the IDENTIFY serial can.
+//
+// Both copy at most 20 chars + NUL into a caller-supplied 21-byte buffer, and
+// write an empty string rather than leaving the buffer untouched, so the Rust
+// side never reads uninitialised bytes.
+void inst_ata_serial(uint8_t channel, uint8_t drive, char *out) {
+    if (!out) return;
+    out[0] = '\0';
+    ata_drive_t *d = ata_get_drive(channel, drive);
+    if (!d || !d->exists) return;
+    int i = 0;
+    while (i < 20 && d->serial[i]) { out[i] = d->serial[i]; i++; }
+    out[i] = '\0';
 }
 
-// Build a 512-byte GPT header sector. parr_crc is the CRC32 of the partition
-// entry array. disk_guid is the (shared) 16-byte disk GUID.
+void inst_ahci_serial(int port, char *out) {
+    if (!out) return;
+    out[0] = '\0';
+    const char *sn = ahci_get_serial(port);
+    if (!sn) return;
+    int i = 0;
+    while (i < 20 && sn[i]) { out[i] = sn[i]; i++; }
+    out[i] = '\0';
+}
+
+uint64_t inst_usb_sectors(int index) {
+    extern usb_msc_device_t *usb_msc_get_device(int index);
+    usb_msc_device_t *d = usb_msc_get_device(index);
+    if (!d || !d->ready) return 0;
+    return (uint64_t)d->num_blocks;
+}
+// Which device did we boot from? The installer must never offer it: cloning a
+// disk onto itself corrupts the source it is still reading.
+int inst_boot_kind(void) {
+    extern int blk_root_is_usb(void);
+    return blk_root_is_usb() ? 2 /*INST_KIND_USB*/ : 0 /*INST_KIND_ATA*/;
+}
+int inst_boot_index(void) {
+    extern int blk_root_usb_index(void);
+    if (blk_root_is_usb()) return blk_root_usb_index();
+    return g_fat_fs.drive;   /* already a combined 0-3 index */
+}
+
+// ---------------------------------------------------------------------------
+// Sector I/O dispatched by TARGET KIND. Previously ATA-only, which is why
+// widening enumeration alone would have changed nothing: an AHCI disk could be
+// listed and still not written.
+// ---------------------------------------------------------------------------
+static int inst_kind_read(uint8_t kind, uint8_t index, uint32_t lba, uint8_t cnt, void *buf) {
+    if (kind == 1) {            /* AHCI */
+        return ahci_read((int)index, lba, cnt, buf) == 0 ? cnt : -1;
+    }
+    if (kind == 2) {            /* USB mass storage */
+        extern usb_msc_device_t *usb_msc_get_device(int index);
+        usb_msc_device_t *d = usb_msc_get_device((int)index);
+        if (!d) return -1;
+        return usb_msc_read(d, 0, lba, buf, cnt) == 0 ? cnt : -1;
+    }
+    uint8_t ch = (uint8_t)(index >> 1), u = (uint8_t)(index & 1);
+    if (ata_dma_available(ch, u)) return ata_read_sectors_dma(ch, u, lba, cnt, buf);
+    return ata_read_sectors(ch, u, lba, cnt, buf);
+}
+static int inst_kind_write(uint8_t kind, uint8_t index, uint32_t lba, uint8_t cnt, const void *buf) {
+    if (kind == 1) {            /* AHCI */
+        return ahci_write((int)index, lba, cnt, buf) == 0 ? cnt : -1;
+    }
+    if (kind == 2) {            /* USB mass storage */
+        extern usb_msc_device_t *usb_msc_get_device(int index);
+        usb_msc_device_t *d = usb_msc_get_device((int)index);
+        if (!d) return -1;
+        return usb_msc_write(d, 0, lba, buf, cnt) == 0 ? cnt : -1;
+    }
+    uint8_t ch = (uint8_t)(index >> 1), u = (uint8_t)(index & 1);
+    if (ata_dma_available(ch, u)) return ata_write_sectors_dma(ch, u, lba, cnt, buf);
+    return ata_write_sectors(ch, u, lba, cnt, buf);
+}
+
 static void inst_build_gpt_header(uint8_t *sec, uint64_t disk_sectors,
                                   uint64_t my_lba, uint64_t alt_lba,
                                   uint64_t entry_lba, uint32_t parr_crc,
@@ -875,7 +1023,35 @@ static void inst_build_gpt_header(uint8_t *sec, uint64_t disk_sectors,
     inst_put_le32(sec + 16, inst_crc32(sec, 92));// HeaderCRC32
 }
 
+// inst_disk_read/inst_disk_write (ATA-only) removed: every call site now
+// goes through inst_kind_read/inst_kind_write, which dispatch on target kind.
+
+
+// Legacy ATA-only entry point, kept so the #306 boot selftest and any other
+// drive-id caller still work. It builds a descriptor and defers.
 int installer_do_install(int target_drive_id, installer_progress_fn cb, void *ctx) {
+    if (target_drive_id < 0 || target_drive_id > 3) {
+        if (cb) cb(ctx, 0, "ERROR: invalid target drive id");
+        kprintf("[INSTALLER] invalid target drive id %d\n", target_drive_id);
+        return -2;
+    }
+    ata_drive_t *td = ata_get_drive((uint8_t)((target_drive_id >> 1) & 1),
+                                    (uint8_t)(target_drive_id & 1));
+    if (!td || !td->exists || td->type != ATA_TYPE_ATA) {
+        if (cb) cb(ctx, 0, "ERROR: target disk not present");
+        kprintf("[INSTALLER] target ATA drive %d not present\n", target_drive_id);
+        return -4;
+    }
+    inst_target_t t;
+    t.kind    = INST_KIND_ATA;
+    t.index   = (uint8_t)target_drive_id;
+    t.is_boot = 0;
+    t._pad    = 0;
+    t.sectors = td->sectors;
+    return installer_do_install_target(&t, cb, ctx);
+}
+
+int installer_do_install_target(const inst_target_t *t, installer_progress_fn cb, void *ctx) {
     uint8_t *sec = NULL, *parr = NULL, *buf = NULL;
 
     #define INST_PROG(p, m) do { \
@@ -894,32 +1070,71 @@ int installer_do_install(int target_drive_id, installer_progress_fn cb, void *ct
         INST_FAIL(-1, "ERROR: no source filesystem mounted");
 
     int src_drive = g_fat_fs.drive;
-    if (target_drive_id < 0 || target_drive_id > 3)
-        INST_FAIL(-2, "ERROR: invalid target drive id");
-    if (target_drive_id == src_drive)
-        INST_FAIL(-3, "ERROR: refusing to install onto the source/boot disk");
+    if (!t)
+        INST_FAIL(-2, "ERROR: no install target given");
 
     uint8_t src_ch = (uint8_t)((src_drive >> 1) & 1), src_u = (uint8_t)(src_drive & 1);
-    uint8_t tgt_ch = (uint8_t)((target_drive_id >> 1) & 1), tgt_u = (uint8_t)(target_drive_id & 1);
 
-    ata_drive_t *td = ata_get_drive(tgt_ch, tgt_u);
-    if (!td || !td->exists || td->type != ATA_TYPE_ATA)
-        INST_FAIL(-4, "ERROR: target disk not present");
+    // Address BOTH sides by KIND rather than by ATA channel/drive. The source
+    // is a USB stick on every live boot, and the target is AHCI on every iMac;
+    // the old ata_* calls could reach neither.
+    uint8_t src_kind = (uint8_t)inst_boot_kind();
+    uint8_t src_idx  = (uint8_t)inst_boot_index();
+    uint8_t tgt_kind = t->kind;
+    uint8_t tgt_idx  = t->index;
 
-    uint64_t disk_sectors = td->sectors;
+    // Refuse the disk we booted from, by DESCRIPTOR rather than by ATA id.
+    // Two independent guards: the enumerator flags the boot disk, and we
+    // re-derive it here, because a caller can hand us a hand-built target
+    // that never went through inst_enumerate_targets().
+    if (t->is_boot)
+        INST_FAIL(-3, "ERROR: refusing to install onto the source/boot disk");
+    if (tgt_kind == src_kind && tgt_idx == src_idx)
+        INST_FAIL(-3, "ERROR: refusing to install onto the source/boot disk");
+
+    uint64_t disk_sectors = t->sectors;
+    if (disk_sectors == 0)
+        INST_FAIL(-4, "ERROR: target disk reports zero capacity");
     uint32_t src_start = g_fat_fs.part_start_lba;
     uint32_t part_sectors = g_fat_fs.part_sectors;
     if (part_sectors == 0) part_sectors = g_fat_fs.total_sectors;
     if (part_sectors == 0)
         INST_FAIL(-5, "ERROR: source partition size unknown");
 
-    uint32_t tgt_start = 2048;
-    if (disk_sectors < (uint64_t)tgt_start + part_sectors + 64)
-        INST_FAIL(-6, "ERROR: target disk is too small");
+    // ---- ext2 ROOT geometry on the SOURCE disk (#365 two-partition layout) --
+    // ext2_find_partition() parses the source GPT for the Linux partition;
+    // ext2_end_bytes() is part_start*512 + blocks_count*block_size, i.e. the
+    // absolute end of the mounted volume. Their difference is its length.
+    uint32_t root_start = 0, root_sectors = 0;
+    int have_root = 0;
+    if (ext2_is_mounted() && ext2_find_partition(src_ch, src_u, &root_start) == 0) {
+        uint64_t end_b = ext2_end_bytes();
+        if (end_b > (uint64_t)root_start * 512ULL) {
+            uint64_t len = (end_b / 512ULL) - (uint64_t)root_start;
+            if (len > 0 && len < 0xFFFFFFFFULL) {
+                root_sectors = (uint32_t)len;
+                have_root = 1;
+            }
+        }
+    }
+    if (!have_root)
+        INST_FAIL(-15, "ERROR: could not locate the ext2 root partition to clone");
 
-    kprintf("[INSTALLER] src drive=%d (ch%d u%d) lba=%u sectors=%u -> tgt drive=%d (ch%d u%d) disk_sectors=%llu\n",
-            src_drive, src_ch, src_u, src_start, part_sectors,
-            target_drive_id, tgt_ch, tgt_u, (unsigned long long)disk_sectors);
+    uint32_t tgt_start = 2048;                       // p1 (ESP)
+    uint32_t tgt_root_start = tgt_start + part_sectors;
+    // 4KiB-align p2 so the ext2 volume starts on an 8-sector boundary.
+    tgt_root_start = (tgt_root_start + 7u) & ~7u;
+
+    // Budget BOTH partitions plus the 33-sector backup GPT at the end of the
+    // disk. The old check counted only the ESP, so a disk large enough for p1
+    // and too small for p2 passed and then failed mid-clone.
+    uint64_t need = (uint64_t)tgt_root_start + root_sectors + 33 + 1;
+    if (disk_sectors < need)
+        INST_FAIL(-6, "ERROR: target disk is too small for the ESP + root partitions");
+
+    kprintf("[INSTALLER] src kind=%u idx=%u (ch%d u%d) lba=%u sectors=%u -> tgt kind=%u idx=%u disk_sectors=%llu\n",
+            src_kind, src_idx, src_ch, src_u, src_start, part_sectors,
+            tgt_kind, tgt_idx, (unsigned long long)disk_sectors);
 
     sec  = (uint8_t *)kmalloc(512);
     parr = (uint8_t *)kmalloc(128 * 128);   // 128 entries * 128 bytes = 16 KB
@@ -929,15 +1144,27 @@ int installer_do_install(int target_drive_id, installer_progress_fn cb, void *ct
 
     INST_PROG(2, "Writing partition table (GPT)...");
 
-    // ---- Partition entry array (entry 0 = our ESP, rest zero) ----
+    // ---- Partition entry array: entry 0 = ESP, entry 1 = ext2 root --------
+    // Two entries, matching what the invariant gate requires of every golden:
+    // exactly 2 GPT partitions, p1=EF00(ESP), p2=8300(root).
     memset(parr, 0, 128 * 128);
+
     memcpy(parr + 0, INST_ESP_TYPE_GUID, 16);
     inst_make_guid(parr + 16, 0x1111);
     inst_put_le64(parr + 32, tgt_start);
     inst_put_le64(parr + 40, (uint64_t)tgt_start + part_sectors - 1);
     inst_put_le64(parr + 48, 0);
-    { const char *nm = "MAYTERAOS";
+    { const char *nm = "MAYTERA_ESP";
       for (int i = 0; nm[i]; i++) inst_put_le16(parr + 56 + i * 2, (uint16_t)nm[i]); }
+
+    uint8_t *e1 = parr + 128;
+    memcpy(e1 + 0, INST_LINUX_TYPE_GUID, 16);
+    inst_make_guid(e1 + 16, 0x3333);
+    inst_put_le64(e1 + 32, tgt_root_start);
+    inst_put_le64(e1 + 40, (uint64_t)tgt_root_start + root_sectors - 1);
+    inst_put_le64(e1 + 48, 0);
+    { const char *nm = "MAYTERA_ROOT";
+      for (int i = 0; nm[i]; i++) inst_put_le16(e1 + 56 + i * 2, (uint16_t)nm[i]); }
     uint32_t parr_crc = inst_crc32(parr, 128 * 128);
 
     uint8_t disk_guid[16];
@@ -948,18 +1175,18 @@ int installer_do_install(int target_drive_id, installer_progress_fn cb, void *ct
 
     // ---- Primary GPT header (LBA 1) + array (LBA 2..33) ----
     inst_build_gpt_header(sec, disk_sectors, 1, backup_hdr_lba, 2, parr_crc, disk_guid);
-    if (inst_disk_write(tgt_ch, tgt_u, 1, 1, sec) != 1)
+    if (inst_kind_write(tgt_kind, tgt_idx, 1, 1, sec) != 1)
         INST_FAIL(-8, "ERROR: failed to write primary GPT header");
     for (uint32_t i = 0; i < 32; i++)
-        if (inst_disk_write(tgt_ch, tgt_u, 2 + i, 1, parr + i * 512) != 1)
+        if (inst_kind_write(tgt_kind, tgt_idx, 2 + i, 1, parr + i * 512) != 1)
             INST_FAIL(-9, "ERROR: failed to write GPT partition array");
 
     // ---- Backup array + header at end of disk ----
     for (uint32_t i = 0; i < 32; i++)
-        if (inst_disk_write(tgt_ch, tgt_u, (uint32_t)backup_arr_lba + i, 1, parr + i * 512) != 1)
+        if (inst_kind_write(tgt_kind, tgt_idx, (uint32_t)backup_arr_lba + i, 1, parr + i * 512) != 1)
             INST_FAIL(-10, "ERROR: failed to write backup GPT array");
     inst_build_gpt_header(sec, disk_sectors, backup_hdr_lba, 1, backup_arr_lba, parr_crc, disk_guid);
-    if (inst_disk_write(tgt_ch, tgt_u, (uint32_t)backup_hdr_lba, 1, sec) != 1)
+    if (inst_kind_write(tgt_kind, tgt_idx, (uint32_t)backup_hdr_lba, 1, sec) != 1)
         INST_FAIL(-11, "ERROR: failed to write backup GPT header");
 
     // ---- Protective MBR (LBA 0) ----
@@ -972,25 +1199,44 @@ int installer_do_install(int target_drive_id, installer_progress_fn cb, void *ct
     { uint64_t sz = disk_sectors - 1; if (sz > 0xFFFFFFFFu) sz = 0xFFFFFFFFu;
       inst_put_le32(sec + 458, (uint32_t)sz); }
     sec[510] = 0x55; sec[511] = 0xAA;
-    if (inst_disk_write(tgt_ch, tgt_u, 0, 1, sec) != 1)
+    if (inst_kind_write(tgt_kind, tgt_idx, 0, 1, sec) != 1)
         INST_FAIL(-12, "ERROR: failed to write protective MBR");
 
-    // ---- Raw-clone the source ESP onto the target ESP ----
-    INST_PROG(10, "Copying system files...");
-    uint32_t remaining = part_sectors;
-    uint32_t soff = src_start, toff = tgt_start, copied = 0, since_yield = 0;
-    while (remaining > 0) {
-        uint8_t cnt = remaining > 64 ? 64 : (uint8_t)remaining;
-        if (inst_disk_read(src_ch, src_u, soff, cnt, buf) != cnt)
-            INST_FAIL(-13, "ERROR: read from source disk failed");
-        if (inst_disk_write(tgt_ch, tgt_u, toff, cnt, buf) != cnt)
-            INST_FAIL(-14, "ERROR: write to target disk failed");
-        soff += cnt; toff += cnt; remaining -= cnt; copied += cnt; since_yield += cnt;
-        if (since_yield >= 4096) {  // ~2 MB between progress/yield
-            since_yield = 0;
-            int pct = 10 + (int)((uint64_t)copied * 85 / part_sectors);
-            INST_PROG(pct, "Copying system files...");
-            proc_sleep(1);          // keep desktop/net alive during the long copy
+    // ---- Raw-clone BOTH partitions ----------------------------------------
+    // Progress is split across the two by their real sector counts, so the bar
+    // reflects work done rather than partitions finished.
+    uint64_t total_sectors = (uint64_t)part_sectors + (uint64_t)root_sectors;
+    uint64_t copied_all = 0;
+
+    for (int part = 0; part < 2; part++) {
+        uint32_t remaining = (part == 0) ? part_sectors : root_sectors;
+        uint32_t soff      = (part == 0) ? src_start    : root_start;
+        uint32_t toff      = (part == 0) ? tgt_start    : tgt_root_start;
+        uint32_t since_yield = 0;
+
+        INST_PROG(10 + (int)(copied_all * 85 / total_sectors),
+                  part == 0 ? "Copying boot partition..."
+                            : "Copying system files...");
+
+        while (remaining > 0) {
+            uint8_t cnt = remaining > 64 ? 64 : (uint8_t)remaining;
+            if (inst_kind_read(src_kind, src_idx, soff, cnt, buf) != cnt)
+                INST_FAIL(-13, "ERROR: read from source disk failed");
+            if (inst_kind_write(tgt_kind, tgt_idx, toff, cnt, buf) != cnt)
+                INST_FAIL(-14, "ERROR: write to target disk failed");
+            soff += cnt; toff += cnt; remaining -= cnt;
+            copied_all += cnt; since_yield += cnt;
+            if (since_yield >= 4096) {  // ~2 MB between progress updates
+                since_yield = 0;
+                int pct = 10 + (int)(copied_all * 85 / total_sectors);
+                INST_PROG(pct, part == 0 ? "Copying boot partition..."
+                                         : "Copying system files...");
+                // Cooperative yield inside a BULK COPY, not a poll: there is no
+                // condition being waited on, so a wait-queue is not the right
+                // primitive here. This bounds how long the copy monopolises the
+                // CPU between progress updates.
+                proc_sleep(1);
+            }
         }
     }
 
@@ -1033,13 +1279,28 @@ void installer_start_install(installer_t *inst) {
     inst->progress.complete = false;
     inst->progress.error = false;
 
-    int target = -1;
-    if (inst->selected_disk >= 0 && inst->selected_disk < (int)inst->disk_count)
-        target = inst->disks[inst->selected_disk].drive_id;
+    // #306: hand the engine the DESCRIPTOR the user actually picked. This used
+    // to pass an ATA drive_id, which is -1 for every AHCI and USB disk, so
+    // selecting one of those silently installed nowhere.
+    inst_target_t tgt;
+    bool have_target = false;
+    if (inst->selected_disk >= 0 && inst->selected_disk < (int)inst->disk_count) {
+        installer_disk_t *d = &inst->disks[inst->selected_disk];
+        tgt.kind    = d->kind;
+        tgt.index   = d->index;
+        tgt.is_boot = 0;
+        tgt._pad    = 0;
+        tgt.sectors = d->size_bytes / 512ULL;
+        have_target = true;
+    }
 
     window_invalidate(inst->window);
 
-    int rc = installer_do_install(target, installer_gui_progress, inst);
+    int rc = have_target
+           ? installer_do_install_target(&tgt, installer_gui_progress, inst)
+           : -2;
+    if (!have_target)
+        kprintf("[INSTALLER] install requested with no disk selected\n");
 
     inst->installing = false;
     if (rc == 0) {
@@ -1070,22 +1331,40 @@ static void installer_autoinstall_worker(void *arg) {
     if (!cfg) return;  // no marker -> silent no-op
     kfree(cfg);
 
-    int target = -1;
-    for (int d = 0; d < 4; d++) {
-        if (d == g_fat_fs.drive) continue;
-        uint8_t ch = (uint8_t)((d >> 1) & 1), u = (uint8_t)(d & 1);
-        ata_drive_t *dr = ata_get_drive(ch, u);
-        if (dr && dr->exists && dr->type == ATA_TYPE_ATA) { target = d; break; }
+    kprintf("\n========== OS INSTALL SELFTEST (task #306) ==========\n");
+
+    // #306: this worker used to scan the two ATA channels with ata_get_drive()
+    // and report "need a second ATA disk". That made the automated install
+    // path blind to AHCI and USB in exactly the way the GUI path was, so on the
+    // iMac - whose internal disk is AHCI - it could never find a target. Use
+    // the same enumerator the picker uses.
+    inst_target_t targets[INST_MAX_TARGETS];
+    int n = inst_enumerate_targets(targets, INST_MAX_TARGETS);
+    kprintf("[OSINSTALL] enumerated %d target(s)\n", n);
+
+    // Same floor the picker applies; the engine still owns the authoritative
+    // ESP + root capacity check and returns -6 if the disk does not fit.
+    uint64_t min_sectors = (uint64_t)g_fat_fs.part_sectors + 66;
+    int pick = -1;
+    for (int i = 0; i < n; i++) {
+        int ok = inst_target_installable(&targets[i], min_sectors);
+        kprintf("[OSINSTALL]   kind=%u idx=%u sectors=%llu boot=%u installable=%d\n",
+                targets[i].kind, targets[i].index,
+                (unsigned long long)targets[i].sectors, targets[i].is_boot, ok);
+        if (pick < 0 && ok) pick = i;
     }
 
-    kprintf("\n========== OS INSTALL SELFTEST (task #306) ==========\n");
-    if (target < 0) {
-        kprintf("[OSINSTALL] no target disk found (need a second ATA disk)\n");
+    if (pick < 0) {
+        kprintf("[OSINSTALL] no installable target disk found\n");
         kprintf("========== OS INSTALL SELFTEST END ==========\n");
         return;
     }
-    int r = installer_do_install(target, NULL, NULL);
-    if (r == 0) kprintf("[OSINSTALL] RESULT: SUCCESS - drive %d is now bootable\n", target);
+
+    kprintf("[OSINSTALL] installing to kind=%u idx=%u\n",
+            targets[pick].kind, targets[pick].index);
+    int r = installer_do_install_target(&targets[pick], NULL, NULL);
+    if (r == 0) kprintf("[OSINSTALL] RESULT: SUCCESS - kind=%u idx=%u is now bootable\n",
+                        targets[pick].kind, targets[pick].index);
     else        kprintf("[OSINSTALL] RESULT: FAILED rc=%d\n", r);
     kprintf("========== OS INSTALL SELFTEST END ==========\n");
 }

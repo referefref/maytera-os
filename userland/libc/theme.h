@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // theme.h - Runtime Theme System for MayteraOS Userland Applications
 // Provides both static fallback colors and runtime theme query via syscalls
 // Updated by P14 - Theme Specialist
@@ -63,6 +67,46 @@ typedef enum {
     THEME_COLOR_TOOLTIP_TEXT,
     THEME_COLOR_PROGRESS_BG,
     THEME_COLOR_PROGRESS_FG,
+    // (#704) Four fields already existed in the live kernel theme_t
+    // (color_error/warning/success/info, parseable from a .mtheme file's
+    // legacy color_* keys via the offset table in kernel/gui/themes.c) but
+    // were never reachable from userland: theme_get_color_by_id()'s switch
+    // stopped at case 51 and fell through to window_bg for anything past it.
+    // These four ids extend the switch rather than adding new theme_t
+    // fields or new file keys, so every existing .mtheme file already has
+    // real values for them. APPEND ONLY; never renumber.
+    THEME_COLOR_ERROR,
+    THEME_COLOR_WARNING,
+    THEME_COLOR_SUCCESS,
+    THEME_COLOR_INFO,
+    // (#704) c_on_surface_muted existed only in the v2 semantic struct with
+    // no reader anywhere (kernel or userland). Wired here for "muted/hint"
+    // text (secondary labels, disabled-adjacent hints) that is not quite
+    // BUTTON_DISABLED and had no other legitimate home; apps were choosing a
+    // raw gray literal for exactly this instead.
+    THEME_COLOR_MUTED,
+    // (#745) Ink for the taskbar SURFACE. taskbar_bg is drawn by the
+    // compositor's taskbar, by Settings' left nav and by solitaire's status
+    // strip, and until now had no companion foreground token: text on it was
+    // either derived per-app or borrowed from a token contracted against a
+    // different background. APPEND ONLY; never renumber.
+    THEME_COLOR_TASKBAR_TEXT,
+    THEME_COLOR_TASKBAR_TEXT_MUTED,
+    THEME_COLOR_TASKBAR_SELECTED_TEXT,
+    // (#745) The keyboard focus ring. color.focus_ring has been parsed out of
+    // every one of the 14 shipped .mtheme files into theme_t.c_focus_ring
+    // since #711, and had ZERO readers: theme_get_color_by_id() had no case
+    // for it, so no userland app could ask for it and the shared style engine
+    // drew its ring from `accent` instead. This id is the reader.
+    // APPEND ONLY; never renumber.
+    THEME_COLOR_FOCUS_RING,
+    // (#745) The two titlebar gradient stops (color.titlebar_top /
+    // color.titlebar_bottom). Parsed since #711, decorator-only until now.
+    // A theme preview that cannot read these has to invent the gradient.
+    // APPEND ONLY; never renumber. Kernel side: theme_get_color_by_id() cases
+    // 61 and 62 in kernel/gui/themes.c.
+    THEME_COLOR_TITLEBAR_TOP,
+    THEME_COLOR_TITLEBAR_BOTTOM,
     THEME_COLOR_COUNT
 } theme_color_id_t;
 
@@ -70,20 +114,49 @@ typedef enum {
 // Theme Metric IDs (must match kernel)
 // ============================================================================
 
+// (#711) mtheme v2 integer metrics. MUST match kernel gui/themes.h
+// theme_metric_v2_t exactly - these ids are the SYS_THEME_METRIC wire values.
+// APPEND ONLY; never renumber.
 typedef enum {
-    THEME_METRIC_BORDER_WIDTH = 0,
-    THEME_METRIC_TITLEBAR_HEIGHT,
-    THEME_METRIC_BUTTON_WIDTH,
-    THEME_METRIC_BUTTON_HEIGHT,
-    THEME_METRIC_SCROLLBAR_WIDTH,
-    THEME_METRIC_MENU_ITEM_HEIGHT,
-    THEME_METRIC_ICON_SIZE,
-    THEME_METRIC_CORNER_RADIUS,
-    THEME_METRIC_PADDING,
-    THEME_METRIC_SPACING,
-    THEME_METRIC_TAB_HEIGHT,
+    THEME_METRIC_TITLEBAR_H = 0,
+    THEME_METRIC_BORDER_W,
+    THEME_METRIC_BTN_H,
+    THEME_METRIC_INPUT_H,
+    THEME_METRIC_PAD,
+    THEME_METRIC_GAP,
+    THEME_METRIC_FOCUS_W,
+    THEME_METRIC_WINMENU_ROWW,
+    THEME_METRIC_WINMENU_ROWH,
+    THEME_METRIC_WINMENU_HDR,
+    THEME_METRIC_TITLEBAR_BTN,
+    THEME_METRIC_TITLEBAR_BTN_GAP,
+    THEME_METRIC_GRIP,
+    THEME_METRIC_SCROLLBAR_W,
+    THEME_METRIC_MENU_ROW_H,
+    THEME_METRIC_RADIUS_BTN,
+    THEME_METRIC_RADIUS_INPUT,
+    THEME_METRIC_RADIUS_MENU,
+    THEME_METRIC_RADIUS_CARD,
+    THEME_METRIC_DECOR_STYLE,
+    THEME_METRIC_DECOR_TITLEBAR_GRADIENT,
+    THEME_METRIC_DECOR_GRIP,
+    THEME_METRIC_TYPE_CAPTION,  THEME_METRIC_TYPE_CAPTION_LH, THEME_METRIC_TYPE_CAPTION_W,
+    THEME_METRIC_TYPE_BODY,     THEME_METRIC_TYPE_BODY_LH,    THEME_METRIC_TYPE_BODY_W,
+    THEME_METRIC_TYPE_TITLE,    THEME_METRIC_TYPE_TITLE_LH,   THEME_METRIC_TYPE_TITLE_W,
+    THEME_METRIC_TYPE_HEADING,  THEME_METRIC_TYPE_HEADING_LH, THEME_METRIC_TYPE_HEADING_W,
+    THEME_METRIC_TYPE_DISPLAY,  THEME_METRIC_TYPE_DISPLAY_LH, THEME_METRIC_TYPE_DISPLAY_W,
+    THEME_METRIC_TITLE_INSET,   // #711 loop 2 (designer 1): appended, never renumber
+    // #27: outer window corner chamfer extent in px (0 = square corners).
+    // The kernel window decorator is the only consumer today; exposed here so
+    // the two enums stay in lockstep, which is the whole ABI contract above.
+    THEME_METRIC_RADIUS_WINDOW,
     THEME_METRIC_COUNT
 } theme_metric_id_t;
+
+// decor.style values (kernel gui/themes.h TDECOR_*)
+#define THEME_DECOR_BEVELED   0
+#define THEME_DECOR_FLAT      1
+#define THEME_DECOR_GRADIENT  2
 
 // ============================================================================
 // Theme Syscall Numbers (must match kernel syscall.h)
@@ -147,22 +220,27 @@ static inline int theme_get_name(int index, char *buf, int buf_size) {
     return i;
 }
 
-// Theme metrics: sensible CDE/Motif defaults (no syscall; old id 125==GETEGID).
+// (#711) Theme metrics now come from the ACTIVE .mtheme FILE, through the same
+// live kernel table SYS_THEME_COLOR reads, so a metric edit needs no rebuild.
+// This replaces a hardcoded switch of eleven compiled-in constants that no
+// theme file could influence. The old SYS_THEME_GET_METRIC(125) collided with
+// GETEGID and is still not used; the getter is SYS_THEME_METRIC(357).
+//
+// A 0 return means "this kernel does not know that id"; callers that care must
+// substitute their own default (see theme_metric_or()).
 static inline int theme_metric(theme_metric_id_t id) {
-    switch (id) {
-        case THEME_METRIC_BORDER_WIDTH:     return 1;
-        case THEME_METRIC_TITLEBAR_HEIGHT:  return 24;
-        case THEME_METRIC_BUTTON_WIDTH:     return 20;
-        case THEME_METRIC_BUTTON_HEIGHT:    return 18;
-        case THEME_METRIC_SCROLLBAR_WIDTH:  return 16;
-        case THEME_METRIC_MENU_ITEM_HEIGHT: return 22;
-        case THEME_METRIC_ICON_SIZE:        return 32;
-        case THEME_METRIC_CORNER_RADIUS:    return 0;
-        case THEME_METRIC_PADDING:          return 8;
-        case THEME_METRIC_SPACING:          return 6;
-        case THEME_METRIC_TAB_HEIGHT:       return 24;
-        default:                            return 0;
-    }
+    return (int)syscall2(SYS_THEME_METRIC, (uint64_t)(-1), (uint64_t)id);
+}
+
+// Same, from a specific theme id rather than the active one.
+static inline int theme_metric_of(int theme_id, theme_metric_id_t id) {
+    return (int)syscall2(SYS_THEME_METRIC, (uint64_t)theme_id, (uint64_t)id);
+}
+
+// Metric with a caller-supplied fallback for the 0 ("unknown id") case.
+static inline int theme_metric_or(theme_metric_id_t id, int fallback) {
+    int v = theme_metric(id);
+    return v ? v : fallback;
 }
 
 // ============================================================================
@@ -186,6 +264,14 @@ static inline int theme_metric(theme_metric_id_t id) {
 #define THEME_SELECTION_TEXT        theme_color(THEME_COLOR_SELECTION_TEXT)
 #define THEME_SCROLLBAR_BG          theme_color(THEME_COLOR_SCROLLBAR_BG)
 #define THEME_SCROLLBAR_THUMB       theme_color(THEME_COLOR_SCROLLBAR_THUMB)
+// (#704) semantic status/hint tokens, newly reachable (see THEME_COLOR_ERROR
+// et al above). Use these instead of a raw red/green/amber/gray literal for
+// error text, success checks, warnings, and muted/hint captions.
+#define THEME_COLOR_ERROR_C         theme_color(THEME_COLOR_ERROR)
+#define THEME_COLOR_WARNING_C       theme_color(THEME_COLOR_WARNING)
+#define THEME_COLOR_SUCCESS_C       theme_color(THEME_COLOR_SUCCESS)
+#define THEME_COLOR_INFO_C          theme_color(THEME_COLOR_INFO)
+#define THEME_COLOR_MUTED_C         theme_color(THEME_COLOR_MUTED)
 
 // ============================================================================
 // Static Fallback Colors (used if syscalls fail or for compatibility)

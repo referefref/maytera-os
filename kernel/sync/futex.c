@@ -6,11 +6,14 @@
 // what makes userland pthread mutex/cond/join actually block and wake.
 
 #include "futex.h"
-#include "waitq.h"          // #426: wq_ms_to_ticks() (the ONE ms->ticks helper)
+#include "noblock.h"
+#include "waitq.h"          // #426: the ONE shared wait/deadline helper set
+#include "../cpu/mono.h"    // #499: sched_now_ms() - THE shared real-elapsed-ms clock
 #include "../security/validate.h"   // #503: futex addrs are USER memory, U/S-checked
 #include "../proc/process.h"
 #include "../serial.h"
 #include "../string.h"
+#include "../security/uaccess_smap.h"  // #19/#645: AC brackets for Ring-3 out-params
 
 // External timer + frequency (ticks -> ms conversion).
 extern volatile uint64_t timer_ticks;
@@ -157,7 +160,7 @@ void futex_init(void) {
 // #426 RECONCILIATION VERDICT (2026-07-16): this timed park and
 // sync/waitq.h's wait_event_timeout() are NOT a "forked private copy" of one
 // primitive, and must not be merged. Recorded here because the wait-migration
-// plan (the internal wait-migration plan, Phase 0 follow-up 2) proposes exactly that
+// plan (docs/WAIT_MIGRATION_PLAN.md, Phase 0 follow-up 2) proposes exactly that
 // merge, and the CLAUDE.md rule against duplicating a shared primitive makes it
 // look mandatory. It is not. Evidence, all from source:
 //
@@ -207,13 +210,27 @@ int futex_wait(uint32_t *addr, uint32_t val, uint64_t timeout, uint32_t bitset) 
     process_t *self = proc_current();
     if (!self) return -FUTEX_EINVAL;
 
+    // #426 Phase 2: the futex layer is the OTHER sanctioned way to block, so it
+    // gets the same chokepoint check as wait_event. Checked BEFORE the bucket
+    // lock below, or the irqsave we are about to do would make every call look
+    // like a violation.
+    wq_assert_may_block("futex_wait", __builtin_return_address(0));
+
     futex_bucket_t *bucket = &futex_buckets[futex_hash(addr)];
 
     uint64_t f = spinlock_acquire_irqsave(&bucket->lock);
 
     // Atomically (under the bucket lock) re-check the value: if it no longer
     // equals val, the caller lost the race and must retry in userspace.
-    if (*addr != val) {
+    // #19/#645: `addr` is the Ring-3 futex word (validate_futex_addr above
+    // proved ACCESS_RW_USER, i.e. U/S=1), so this ONE load needs AC. The
+    // bracket is deliberately around the load only: the bucket lock is held
+    // with interrupts off here, and AC must not span the wait that follows.
+    uint32_t __cur;
+    {   uaccess_ac_t __ac = uaccess_begin();
+        __cur = *addr;
+        uaccess_end(__ac); }
+    if (__cur != val) {
         spinlock_release_irqrestore(&bucket->lock, f);
         return -FUTEX_EAGAIN;
     }
@@ -228,7 +245,12 @@ int futex_wait(uint32_t *addr, uint32_t val, uint64_t timeout, uint32_t bitset) 
     waiter->bitset    = bitset;
     waiter->timed_out = false;
     waiter->done      = 0;
-    waiter->timeout   = timeout ? (timer_ticks + wq_ms_to_ticks(timeout)) : 0;
+    // #499: the caller's timeout is WALL-CLOCK milliseconds, so the deadline
+    // must be too. It used to be `timer_ticks + wq_ms_to_ticks(timeout)`, and
+    // timer_ticks counts ticks DELIVERED, not time ELAPSED: a KVM tick-replay
+    // burst expired futex waits far early, which surfaces in userspace as a
+    // lock-retry spin. sched_now_ms() (cpu/mono.h) is real elapsed ms.
+    waiter->timeout_ms = timeout ? (sched_now_ms() + timeout) : 0;
 
     add_waiter(bucket, waiter);
     futex_wait_count++;
@@ -245,7 +267,7 @@ int futex_wait(uint32_t *addr, uint32_t val, uint64_t timeout, uint32_t bitset) 
     for (;;) {
         __asm__ volatile("cli");
         if (waiter->done) { __asm__ volatile("sti"); break; }
-        self->state = PROC_STATE_BLOCKED;
+        sched_self_block(self, PROC_STATE_BLOCKED); // #75: arm+set, one op
         sched_schedule();
     }
 
@@ -347,7 +369,12 @@ int futex_requeue(uint32_t *addr, uint32_t *addr2, int wake_count, int requeue_c
 int futex_cmp_requeue(uint32_t *addr, uint32_t *addr2, uint32_t expected,
                       int wake_count, int requeue_count) {
     if (!validate_futex_addr(addr)) return -FUTEX_EFAULT;
-    if (*addr != expected) return -FUTEX_EAGAIN;
+    // #19/#645: one load of the Ring-3 futex word.
+    uint32_t __cur;
+    {   uaccess_ac_t __ac = uaccess_begin();
+        __cur = *addr;
+        uaccess_end(__ac); }
+    if (__cur != expected) return -FUTEX_EAGAIN;
     return futex_requeue(addr, addr2, wake_count, requeue_count);
 }
 
@@ -380,6 +407,8 @@ int64_t sys_futex(uint32_t *addr, int op, uint32_t val, uint64_t timeout,
 // ============================================================================
 
 void futex_tick(void) {
+    // #499: fire against REAL elapsed time, sampled once for the whole sweep.
+    uint64_t now_ms = sched_now_ms();
     for (int i = 0; i < FUTEX_HASH_BUCKETS; i++) {
         futex_bucket_t *bucket = &futex_buckets[i];
         if (bucket->waiter_count == 0) continue;   // cheap unlocked early-out
@@ -388,7 +417,8 @@ void futex_tick(void) {
         futex_waiter_t *waiter = bucket->waiters;
         while (waiter) {
             futex_waiter_t *next = waiter->next;
-            if (waiter->timeout > 0 && timer_ticks >= waiter->timeout && !waiter->done) {
+            if (waiter->timeout_ms > 0 &&
+                (int64_t)(now_ms - waiter->timeout_ms) >= 0 && !waiter->done) {
                 remove_waiter(bucket, waiter);
                 waiter->timed_out = true;
                 waiter->done = 1;
@@ -423,11 +453,12 @@ void futex_print_waiters(void) {
             uint64_t f = spinlock_acquire_irqsave(&bucket->lock);
             kprintf("Bucket %d (%u waiters):\n", i, bucket->waiter_count);
             for (futex_waiter_t *w = bucket->waiters; w; w = w->next) {
-                kprintf("  addr=%p pid=%u bitset=0x%x timeout=%lu\n",
-                        w->addr, w->proc ? w->proc->pid : 0, w->bitset, w->timeout);
+                kprintf("  addr=%p pid=%u bitset=0x%x timeout_ms=%lu\n",
+                        w->addr, w->proc ? w->proc->pid : 0, w->bitset, w->timeout_ms);
             }
             spinlock_release_irqrestore(&bucket->lock, f);
         }
     }
     kprintf("=====================\n\n");
 }
+

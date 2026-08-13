@@ -1,0 +1,28 @@
+--- /root/cpython-p2-backup/errno.h.orig	2026-07-07 16:27:23.216605773 +0000
++++ <workspace>	2026-07-07 16:31:17.096127727 +0000
+@@ -38,6 +38,25 @@
+ #define ENOSYS          38
+ #define ENOTEMPTY       39
+ #define ELOOP           40
++#define EDOM            33
++#define EDEADLK         35
++#define ENOLCK          37
++#define ENOMSG          42
++#define EIDRM           43
++#define EILSEQ          84
++#define EOVERFLOW       75
++#define ENOTSUP         95
++#define EOPNOTSUPP      95
++#define EADDRINUSE      98
++#define EADDRNOTAVAIL   99
++#define ENETDOWN        100
++#define ENETUNREACH     101
++#define ECONNABORTED    103
++#define ENOBUFS         105
++#define EISCONN         106
++#define ETIMEDOUT       110
++#define EALREADY        114
++#define EINPROGRESS     115
+ #define ENOTSOCK        88
+ #define ENOTCONN        107
+ #define ECONNRESET      104

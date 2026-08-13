@@ -16,41 +16,37 @@
 #define F_DF 0x0400
 #define F_OF 0x0800
 
-static x86_16_int_fn g_int_handler = 0;
 
-// I/O port hooks (#201 DOS). When set, IN/OUT instructions route here instead of
-// the default (read 0xFF, write ignored). Lets the DOS layer capture VGA DAC
-// palette writes (ports 0x3C8/0x3C9) and serve VGA status reads. width = 1 or 2.
-typedef uint16_t (*x86_16_in_fn)(struct x86_16_cpu *cpu, uint16_t port, int width);
-typedef void     (*x86_16_out_fn)(struct x86_16_cpu *cpu, uint16_t port, uint16_t val, int width);
-static x86_16_in_fn  g_in_handler  = 0;
-static x86_16_out_fn g_out_handler = 0;
-void x86_16_set_io_handlers(x86_16_in_fn infn, x86_16_out_fn outfn) {
-    g_in_handler = infn; g_out_handler = outfn;
+// #736 Stage 1b: the I/O, interrupt, memory-hook and far-call hooks now live on
+// the CPU (see the header). Every setter names the instance it configures, so
+// "the last guest to call a setter owns them all" is no longer expressible.
+void x86_16_set_io_handlers(x86_16_cpu_t *cpu, x86_16_in_fn infn, x86_16_out_fn outfn) {
+    if (!cpu) return;
+    cpu->in_fn = infn; cpu->out_fn = outfn;
 }
 
 // Software x87 FPU state reset (defined further below near the FPU helpers).
-static void fp_reset(void);
+static void fp_reset(x86_16_cpu_t *cpu);
 
-void x86_16_set_int_handler(x86_16_int_fn fn) { g_int_handler = fn; }
+void x86_16_set_int_handler(x86_16_cpu_t *cpu, x86_16_int_fn fn) {
+    if (cpu) cpu->int_fn = fn;
+}
 
 // (#256 VB1) Optional abort hook: x86_16_call_far's resume loop polls this between
 // slices and stops resuming a long-running callee when it returns nonzero (the
 // Win16 layer wires it to its close-request latch, so a titlebar-X / F4 can break
 // out of the VB runtime's in-wndproc message loop). NULL = never abort.
-static int (*g_callfar_abort_fn)(void) = 0;
-void x86_16_set_callfar_abort(int (*fn)(void)) { g_callfar_abort_fn = fn; }
+void x86_16_set_callfar_abort(x86_16_cpu_t *cpu, int (*fn)(void)) {
+    if (cpu) cpu->callfar_abort_fn = fn;
+}
 
-// Far-call trap (see x86_16.h). g_farcall_active gates the comparison so a 0x0000
+// Far-call trap (see x86_16.h). cpu->farcall_active gates the comparison so a 0x0000
 // trap seg does not accidentally trap real far calls when no trap is registered.
-static x86_16_farcall_fn g_farcall_fn  = 0;
-static uint16_t          g_farcall_seg = 0;
-static int               g_farcall_active = 0;
-
-void x86_16_set_farcall_trap(uint16_t seg, x86_16_farcall_fn fn) {
-    g_farcall_seg = seg;
-    g_farcall_fn  = fn;
-    g_farcall_active = (fn != 0);
+void x86_16_set_farcall_trap(x86_16_cpu_t *cpu, uint16_t seg, x86_16_farcall_fn fn) {
+    if (!cpu) return;
+    cpu->farcall_seg    = seg;
+    cpu->farcall_fn     = fn;
+    cpu->farcall_active = (fn != 0);
 }
 
 // --- one-function instruction trace (see x86_16.h) ---
@@ -157,13 +153,27 @@ void x86_16_init(x86_16_cpu_t *cpu, uint8_t *mem1mb) {
     cpu->halted = 0;
     cpu->exit_code = 0;
     cpu->insn_count = 0;
-    fp_reset();
+    fp_reset(cpu);
+    // #736 Stage 1b: A FRESH CPU OWNS A FRESH ENVIRONMENT, and that has to be
+    // explicit. The env fields are not covered by the field-by-field reset
+    // above, and every self-test in this file builds its CPU ON THE STACK, so
+    // leaving them alone means int_fn is whatever was on the stack: an INT or a
+    // divide-by-zero inside a self-test would call a garbage function pointer.
+    // pmode stays 0 here on purpose; a caller that wants protected mode calls
+    // win16_pmode_enable(cpu, 1) AFTER init, so a CPU can never silently
+    // inherit another guest's address space.
+    cpu->owner = 0;
+    cpu->int_fn = 0; cpu->in_fn = 0; cpu->out_fn = 0;
+    cpu->mh_lo = 0; cpu->mh_hi = 0; cpu->mh_w = 0; cpu->mh_r = 0;
+    cpu->farcall_fn = 0; cpu->farcall_seg = 0; cpu->farcall_active = 0;
+    cpu->callfar_abort_fn = 0;
+    cpu->pmode = 0;
 }
 
 // ===========================================================================
 // (#289 Phase 1) Protected-mode selector / LDT model + arena. See x86_16.h.
 //
-// DESIGN: a single switch point. In REAL mode (g_win16_pmode==0) lin() is the
+// DESIGN: a single switch point. In REAL mode (cpu->pmode==0) lin() is the
 // classic (seg<<4)+off masked to 1 MiB and the rd/wr helpers index cpu->mem
 // (the 1 MiB buffer) exactly as before - byte-for-byte identical, zero added
 // work on the hot path beyond one predictable-branch test. In PROTECTED mode
@@ -179,8 +189,41 @@ void x86_16_init(x86_16_cpu_t *cpu, uint8_t *mem1mb) {
 // Any unallocated selector maps to a 64 KiB guard region at the TOP of the arena
 // so stray accesses neither fault nor corrupt live blocks.
 // ===========================================================================
-int g_win16_pmode = 0;              // default 0 => real-mode, regression-safe
+int g_win16_pmode = 0;          // the WIN16 LAYER's flag; see the header
 
+// ===========================================================================
+// #736 Stage 1b: STILL PROCESS-WIDE. READ THIS BEFORE ALLOWING A SECOND WIN16
+// GUEST.
+//
+// Everything a guest needs to run its own program moved onto x86_16_cpu_t: the
+// interrupt handler, the I/O hooks, the memory hook, the far-call trap, the
+// translation mode and the x87 stack. THE FOLLOWING DID NOT, and the reason is
+// narrow: at most one Win16 guest exists at a time (proc/syscall.c enforces it
+// with g_win16_busy), so no two guests can reach these. That is a property of
+// the LAUNCHERS, not of this file, and it is the whole of the argument.
+//
+//   g_ldt[]                the descriptor table
+//   g_win16_arena[]        the 48 MiB protected-mode backing store
+//   g_arena_next           its bump pointer
+//   g_sel80_base           the anomalous-selector backing
+//   g_x86_ring / g_x86_stop  diagnostics (see further down)
+//
+// The moment a second Win16 guest is permitted, these become the identical
+// class of bug that made a Win16 launch kill a running DOS game: two guests
+// sharing one selector space, one arena and one bump pointer, silently reading
+// and writing each other's memory. They are not a live bug today. They are NOT
+// safe to assume, and "it worked before" will not be evidence, because before
+// there was only ever one of them.
+//
+// If you are here to lift that restriction: move these onto a per-guest arena
+// object first, and prove it with two Win16 guests holding overlapping
+// selectors, the same way #736 proved the DOS/Win16 case with Keen 5 and
+// FreeCell in one boot.
+//
+// (Separately, and not a correctness issue: g_win16_arena is a static, so it
+// reserves 48 MiB of real RAM at boot on every machine whether a Win16 app runs
+// or not. That is its own piece of work.)
+// ===========================================================================
 // Arena: a large contiguous backing store for all protected-mode selectors.
 // 48 MiB is enough for Word6 + the OLE2 DLL set with room for huge GlobalAllocs.
 #define WIN16_ARENA_SIZE   (48u * 1024u * 1024u)
@@ -254,9 +297,13 @@ int ldt_valid(uint16_t sel) {
     int i = sel_index(sel);
     return (i > 0 && i < WIN16_LDT_ENTRIES && g_ldt[i].present);
 }
-void win16_pmode_enable(int on) {
+void win16_pmode_enable(x86_16_cpu_t *cpu, int on) {
+    // Writes the CPU's translation mode (what the interpreter uses) and the
+    // Win16 layer's flag (what ne.c / win16api.c read) together. Nothing else
+    // writes either, so they cannot disagree.
     if (on) { ldt_reset(); win16_arena_reset(); g_win16_pmode = 1; }
     else    { g_win16_pmode = 0; }
+    if (cpu) cpu->pmode = on ? 1 : 0;
 }
 
 // (#278 Word6) Pre-format the anomalous sel-0x0080 far-heap as a real, usable
@@ -342,25 +389,28 @@ static inline uint32_t lin_pmode(uint16_t sel, uint16_t off) {
 // ---------------------------------------------------------------------------
 // Linear memory access (seg:off -> physical, wrapped to 1 MiB)
 // ---------------------------------------------------------------------------
-static inline uint32_t lin(uint16_t seg, uint16_t off) {
-    if (g_win16_pmode) return lin_pmode(seg, off);
+// #736 Stage 1b: takes the cpu, because WHICH address space a seg:off names is
+// a property of the GUEST, not of the process. It used to read a global, so a
+// Win16 guest switching to protected mode moved a concurrently running DOS
+// guest's every memory access into the Win16 arena.
+static inline uint32_t lin(x86_16_cpu_t *cpu, uint16_t seg, uint16_t off) {
+    if (cpu->pmode) return lin_pmode(seg, off);
     return (((uint32_t)seg << 4) + off) & 0xFFFFF;
 }
 // Select the backing byte array for the current mode (arena in pmode, else the
 // caller-supplied 1 MiB buffer). One predictable branch; real mode unchanged.
 static inline uint8_t *membase(x86_16_cpu_t *cpu) {
-    return g_win16_pmode ? g_win16_arena : cpu->mem;
+    return cpu->pmode ? g_win16_arena : cpu->mem;
 }
 
 // ---- Memory-mapped I/O hook (#202 EGA planar VGA) ------------------------
-static uint32_t          g_mh_lo = 0, g_mh_hi = 0;
-static x86_16_mem_w_fn   g_mh_w = 0;
-static x86_16_mem_r_fn   g_mh_r = 0;
-void x86_16_set_mem_hook(uint32_t lo, uint32_t hi, x86_16_mem_w_fn wfn, x86_16_mem_r_fn rfn) {
-    g_mh_lo = lo; g_mh_hi = hi; g_mh_w = wfn; g_mh_r = rfn;
+void x86_16_set_mem_hook(x86_16_cpu_t *cpu, uint32_t lo, uint32_t hi,
+                         x86_16_mem_w_fn wfn, x86_16_mem_r_fn rfn) {
+    if (!cpu) return;
+    cpu->mh_lo = lo; cpu->mh_hi = hi; cpu->mh_w = wfn; cpu->mh_r = rfn;
 }
-static inline int mh_hit(uint32_t a) { return g_mh_r && a >= g_mh_lo && a < g_mh_hi; }
-static inline int mh_hit_w(uint32_t a) { return g_mh_w && a >= g_mh_lo && a < g_mh_hi; }
+static inline int mh_hit  (x86_16_cpu_t *cpu, uint32_t a) { return cpu->mh_r && a >= cpu->mh_lo && a < cpu->mh_hi; }
+static inline int mh_hit_w(x86_16_cpu_t *cpu, uint32_t a) { return cpu->mh_w && a >= cpu->mh_lo && a < cpu->mh_hi; }
 
 // (#278 P54 REVERSE-FIELD) log the FIRST read of each view-object field during
 // the forced-formatter diagnostic. Deduped by relative offset; annotates which
@@ -381,18 +431,18 @@ static void w6rf_note(x86_16_cpu_t *cpu, uint32_t a, uint16_t v, int sz) {
             cpu->cs, cpu->ip, (v==0)?"  <ZERO>":"");
 }
 uint8_t x86_16_rd8(x86_16_cpu_t *cpu, uint16_t seg, uint16_t off) {
-    uint32_t a = lin(seg, off);
-    if (!g_win16_pmode && mh_hit(a)) return (uint8_t)g_mh_r(cpu, a, 1);
+    uint32_t a = lin(cpu, seg, off);
+    if (!cpu->pmode && mh_hit(cpu, a)) return (uint8_t)cpu->mh_r(cpu, a, 1);
     uint8_t vv = membase(cpu)[a];
     if (g_w6fmt_read) w6rf_note(cpu, a, vv, 1);
     return vv;
 }
 uint16_t x86_16_rd16(x86_16_cpu_t *cpu, uint16_t seg, uint16_t off) {
-    uint32_t a = lin(seg, off);
-    uint32_t b = lin(seg, (uint16_t)(off + 1));
-    if (!g_win16_pmode && mh_hit(a)) {
-        if (a + 1 == b) return g_mh_r(cpu, a, 2);
-        return (uint16_t)(g_mh_r(cpu, a, 1) | (g_mh_r(cpu, b, 1) << 8));
+    uint32_t a = lin(cpu, seg, off);
+    uint32_t b = lin(cpu, seg, (uint16_t)(off + 1));
+    if (!cpu->pmode && mh_hit(cpu, a)) {
+        if (a + 1 == b) return cpu->mh_r(cpu, a, 2);
+        return (uint16_t)(cpu->mh_r(cpu, a, 1) | (cpu->mh_r(cpu, b, 1) << 8));
     }
     uint8_t *m = membase(cpu);
     uint16_t vv = (uint16_t)(m[a] | (m[b] << 8));
@@ -410,14 +460,14 @@ static void wp_check(x86_16_cpu_t *cpu, uint32_t a, uint16_t v, int sz) {
 }
 void x86_16_set_watch(uint32_t lin_addr) { g_wp_lin = lin_addr; }
 void x86_16_wr8(x86_16_cpu_t *cpu, uint16_t seg, uint16_t off, uint8_t v) {
-    uint32_t a = lin(seg, off);
+    uint32_t a = lin(cpu, seg, off);
     wp_check(cpu, a, v, 1);
     { extern int g_w6life; extern uint32_t g_w6view_tab[]; extern int g_w6view_n, g_w6rlz_reported;
       if (g_w6life && (v&0x08)) { uint8_t _ob=membase(cpu)[a];
         if(!(_ob&0x08)) for(int _i=0;_i<g_w6view_n;_i++) if(a==g_w6view_tab[_i]+0x0b){
           kprintf("[W6BOOT] *** REALIZE SET view#%d(lin=%05lx) +0xb %02x->%02x cs:ip=%04x:%04x ***\n",
             _i,(unsigned long)g_w6view_tab[_i],_ob,v,cpu->cs,cpu->ip); g_w6rlz_reported=1; } } }
-    { extern int g_w6life, g_win16_pmode; extern uint32_t g_w6obj_lin;
+    { extern int g_w6life; extern uint32_t g_w6obj_lin;
       if (g_w6life && g_w6obj_lin && a >= g_w6obj_lin+0x0a && a <= g_w6obj_lin+0x0d) {
         uint8_t oldb = membase(cpu)[a];
         kprintf("[W6VFLAG8] obj+0x%02x %02x->%02x cs:ip=%04x:%04x%s%s\n",
@@ -449,8 +499,8 @@ void x86_16_wr8(x86_16_cpu_t *cpu, uint16_t seg, uint16_t off, uint8_t v) {
         }
       }
     }
-    { extern int g_w6life, g_win16_pmode; extern uint16_t win16_dgroup_sel;
-      if (g_w6life && g_win16_pmode && seg==win16_dgroup_sel && off==0x0344)
+    { extern int g_w6life; extern uint16_t win16_dgroup_sel;
+      if (g_w6life && cpu->pmode && seg==win16_dgroup_sel && off==0x0344)
         kprintf("[W6LIFE8] [0344]<-%02x cs:ip=%04x:%04x\n", v, cpu->cs, cpu->ip);
       // (#278 P47) CORRECTED realize probe. Pass 46's version caught Pascal-string
       // builders (length byte / char writes that happen to have bit3), NOT realize
@@ -459,7 +509,7 @@ void x86_16_wr8(x86_16_cpu_t *cpu, uint16_t seg, uint16_t off, uint8_t v) {
       // +0x0b displacement (modrm mod=01, disp8==0x0b). Verify the WRITING INSTRUCTION
       // targets [reg+0x0b] by decoding its bytes, which excludes movs/[di]/stosb
       // string copies (no +0xb disp). This reveals the true realize routine(s).
-      if (g_w6life && g_win16_pmode && seg==win16_dgroup_sel && (v & 0x08)) {
+      if (g_w6life && cpu->pmode && seg==win16_dgroup_sel && (v & 0x08)) {
         uint8_t oldb = membase(cpu)[a];
         if (!(oldb & 0x08)) {
           int is_flag_write = 0;
@@ -474,12 +524,12 @@ void x86_16_wr8(x86_16_cpu_t *cpu, uint16_t seg, uint16_t off, uint8_t v) {
         }
       }
     }
-    if (!g_win16_pmode && mh_hit_w(a)) { g_mh_w(cpu, a, v, 1); return; }
+    if (!cpu->pmode && mh_hit_w(cpu, a)) { cpu->mh_w(cpu, a, v, 1); return; }
     membase(cpu)[a] = v;
 }
 void x86_16_wr16(x86_16_cpu_t *cpu, uint16_t seg, uint16_t off, uint16_t v) {
-    uint32_t a = lin(seg, off);
-    uint32_t b = lin(seg, (uint16_t)(off + 1));
+    uint32_t a = lin(cpu, seg, off);
+    uint32_t b = lin(cpu, seg, (uint16_t)(off + 1));
     wp_check(cpu, a, v, 2);
     { extern int g_w6life; extern uint32_t g_w6view_tab[]; extern int g_w6view_n, g_w6rlz_reported;
       if (g_w6life) for(int _i=0;_i<g_w6view_n;_i++){ uint32_t _base=g_w6view_tab[_i];
@@ -487,7 +537,7 @@ void x86_16_wr16(x86_16_cpu_t *cpu, uint16_t seg, uint16_t off, uint16_t v) {
           kprintf("[W6BOOT] *** REALIZE SET(word-lo) view#%d +0xb ->%02x cs:ip=%04x:%04x ***\n",_i,(v&0xff),cpu->cs,cpu->ip); g_w6rlz_reported=1; } }
         if(a==_base+0x0a && ((v>>8)&0x08)){ uint8_t _oh=membase(cpu)[b]; if(!(_oh&0x08)){
           kprintf("[W6BOOT] *** REALIZE SET(word-hi) view#%d +0xb ->%02x cs:ip=%04x:%04x ***\n",_i,(v>>8),cpu->cs,cpu->ip); g_w6rlz_reported=1; } } } }
-    { extern int g_w6life, g_win16_pmode; extern uint32_t g_w6obj_lin;
+    { extern int g_w6life; extern uint32_t g_w6obj_lin;
       // (#278 P50) word-write into the view sub-object flag region [+0xa..+0xd].
       if (g_w6life && g_w6obj_lin && ((a >= g_w6obj_lin+0x0a && a <= g_w6obj_lin+0x0d)
                                    || (b >= g_w6obj_lin+0x0a && b <= g_w6obj_lin+0x0d))) {
@@ -513,18 +563,18 @@ void x86_16_wr16(x86_16_cpu_t *cpu, uint16_t seg, uint16_t off, uint16_t v) {
         }
       }
     }
-    { extern int g_w6life, g_win16_pmode; extern uint16_t win16_dgroup_sel;
-      if (g_w6life && g_win16_pmode && seg==win16_dgroup_sel &&
+    { extern int g_w6life; extern uint16_t win16_dgroup_sel;
+      if (g_w6life && cpu->pmode && seg==win16_dgroup_sel &&
           (off==0x15fe||off==0x0344||off==0x1d18||off==0x04ce))
         kprintf("[W6LIFE] [%04x]<-%04x cs:ip=%04x:%04x ds=%04x\n", off, v, cpu->cs, cpu->ip, cpu->ds);
       // (#278 P40) watch the doc-view object table [0x1408..0x1420] (indexed
       // far-ptr array; seg194:0x2580 formats view #si only if [0x1408+si*4] != 0).
-      if (g_w6life && g_win16_pmode && seg==win16_dgroup_sel && off>=0x1408 && off<=0x1420 && v!=0) {
+      if (g_w6life && cpu->pmode && seg==win16_dgroup_sel && off>=0x1408 && off<=0x1420 && v!=0) {
         static int nvt=0; if(nvt<24){nvt++;
           kprintf("[W6VOTBL] [%04x]<-%04x cs:ip=%04x:%04x\n", off, v, cpu->cs, cpu->ip); } }
       // (#278 P40) the two repaginate-gate DGROUP words: [0x36a] (doc gate) + [0x3e16]
       // (repaginate request). Both are 0 in a gray run; log any write.
-      if (g_w6life && g_win16_pmode && seg==win16_dgroup_sel && (off==0x036a||off==0x3e16)) {
+      if (g_w6life && cpu->pmode && seg==win16_dgroup_sel && (off==0x036a||off==0x3e16)) {
         static int ng=0; if(ng<20){ng++;
           kprintf("[W6GATE] [%04x]<-%04x cs:ip=%04x:%04x\n", off, v, cpu->cs, cpu->ip); } }
       // (#278 P58 REAL DISPLAY-LIST PRODUCER WATCH, signature-based / compaction-robust)
@@ -533,7 +583,7 @@ void x86_16_wr16(x86_16_cpu_t *cpu, uint16_t seg, uint16_t off, uint16_t v) {
       // ANY word write to <view>+0x48 where the destination base carries the CView
       // signature (+0x00=0x0001, +0xb8=0x0001, +0xbc=0x0058 - the savestate p57 sig).
       // Log producer cs:ip + value; skip the compactor cs=0x073f to isolate real writers.
-      if (g_w6life && g_win16_pmode && seg==win16_dgroup_sel && off>=0x48) {
+      if (g_w6life && cpu->pmode && seg==win16_dgroup_sel && off>=0x48) {
         uint32_t base=a-0x48; uint8_t *m=membase(cpu);
         if (m[base]==0x01 && m[base+1]==0x00 && m[base+0xb8]==0x01 && m[base+0xb9]==0x00 && m[base+0xbc]==0x58) {
           static int npr=0; if(npr<60){npr++;
@@ -544,19 +594,19 @@ void x86_16_wr16(x86_16_cpu_t *cpu, uint16_t seg, uint16_t off, uint16_t v) {
               x86_16_rd16(cpu,cpu->ss,(uint16_t)(cpu->sp+2)), x86_16_rd16(cpu,cpu->ss,cpu->sp)); }
         }
       }
-      if (g_w6life && g_win16_pmode && seg==win16_dgroup_sel && (off==0x48c6||(off>=0x48be&&off<=0x48c4))) {
+      if (g_w6life && cpu->pmode && seg==win16_dgroup_sel && (off==0x48c6||(off>=0x48be&&off<=0x48c4))) {
         static int np=0; if(np<40){np++;
           kprintf("[W6CTX] [%04x]<-%04x cs:ip=%04x:%04x\n", off, v, cpu->cs, cpu->ip); } }
       // (#278 P46) word-write variant of the realize probe: catches `or [X+0xa],0x08xx`
       // style writes that flip bit3 of the HIGH byte (offset off+1).
-      if (g_w6life && g_win16_pmode && seg==win16_dgroup_sel && (v & 0x0800)) {
+      if (g_w6life && cpu->pmode && seg==win16_dgroup_sel && (v & 0x0800)) {
         uint8_t oldhi = membase(cpu)[b];
         if (!(oldhi & 0x08) && !((v>>8) >= 0x20 && (v>>8) <= 0x7e)) {
           static int nw=0; if(nw<40){nw++;
             kprintf("[W6BIT3W] DGROUP[%04x](hi=+%04x) word<-%04x cs:ip=%04x:%04x (obj~%04x)\n",
                     off, (uint16_t)(off+1), v, cpu->cs, cpu->ip, (uint16_t)(off+1-0x0b)); } }
       }
-      if (g_w6life && g_win16_pmode && seg==win16_dgroup_sel && off==0x4a82) {
+      if (g_w6life && cpu->pmode && seg==win16_dgroup_sel && off==0x4a82) {
         extern uint32_t g_wp_lin; static int ns=0; if(ns<12){ns++;
           // (#278 P46) arm the write-watch on the VISIBILITY byte [sub+0x0b]
           // (bit3 0x08 = view realized/visible) instead of +0x0c (bit1). Pass 45
@@ -564,16 +614,16 @@ void x86_16_wr16(x86_16_cpu_t *cpu, uint16_t seg, uint16_t off, uint16_t v) {
           // (if anyone) sets the realize bit at +0x0b.
           kprintf("[W6SUB] view[0x4a82] data-block <-%04x cs:ip=%04x:%04x (armed VISBYTE watch on %04x+0xb)\n",
             v, cpu->cs, cpu->ip, v);
-          g_wp_lin = lin(win16_dgroup_sel,(uint16_t)(v+0x0b));
+          g_wp_lin = lin(cpu, win16_dgroup_sel,(uint16_t)(v+0x0b));
           // (#278 P50) re-arm the sub-object flag-region watch on the (possibly moved)
           // object so [+0xa..+0xd] writes are caught across heap compaction.
-          { extern uint32_t g_w6obj_lin; g_w6obj_lin = lin(win16_dgroup_sel, v);
+          { extern uint32_t g_w6obj_lin; g_w6obj_lin = lin(cpu, win16_dgroup_sel, v);
             kprintf("[W6VFLAG] armed obj flag-watch base=lin(%04x:%04x)=%05lx (+0xb realize, +0xc bit1)\n",
                     win16_dgroup_sel, v, (unsigned long)g_w6obj_lin); } } }
     }
-    if (!g_win16_pmode && mh_hit_w(a)) {
-        if (a + 1 == b) { g_mh_w(cpu, a, v, 2); }
-        else { g_mh_w(cpu, a, (uint16_t)(v & 0xFF), 1); g_mh_w(cpu, b, (uint16_t)(v >> 8), 1); }
+    if (!cpu->pmode && mh_hit_w(cpu, a)) {
+        if (a + 1 == b) { cpu->mh_w(cpu, a, v, 2); }
+        else { cpu->mh_w(cpu, a, (uint16_t)(v & 0xFF), 1); cpu->mh_w(cpu, b, (uint16_t)(v >> 8), 1); }
         return;
     }
     uint8_t *m = membase(cpu);
@@ -1089,13 +1139,15 @@ static uint32_t shift_op(x86_16_cpu_t *cpu, int op, uint32_t val, int size, uint
 // rectangle (the playfield well becomes visible).
 //
 // Representation: each stack slot holds the raw 64-bit IEEE-754 double bits.
-// ST(0) is g_fp[g_fp_top]; the stack grows DOWNWARD (top decrements on push),
+// ST(0) is cpu->fp[cpu->fp_top]; the stack grows DOWNWARD (top decrements on push),
 // matching x87 semantics where FILD/FLD decrement TOP.
-#define FP_STACK_SIZE 8
-static uint64_t g_fp[FP_STACK_SIZE];
-static int      g_fp_top = FP_STACK_SIZE;   // empty when == FP_STACK_SIZE
+// #736 Stage 1b: the stack itself now lives on the CPU (x86_16.h), because a
+// SHARED x87 stack is the worst of the shared-state set: its errors are stack
+// DEPTH errors, so the moment two guests interleave pushes the top pointer is
+// wrong for BOTH and every later result drifts arbitrarily rather than failing
+// cleanly. X86_16_FP_STACK is defined in the header alongside the array.
 
-static void fp_reset(void) { g_fp_top = FP_STACK_SIZE; }
+static void fp_reset(x86_16_cpu_t *cpu) { cpu->fp_top = X86_16_FP_STACK; }
 
 // signed 64-bit integer -> IEEE-754 double bits.
 static uint64_t fp_from_i64(int64_t v) {
@@ -1345,8 +1397,69 @@ int g_win16_iptrace = 0;   // diagnostic: sample cs:ip:op periodically
 
 // #202 diagnostic: lets an INT handler end the current burst immediately so the
 // host run loop regains control (e.g. to switch into single-step mode).
+// #736 Stage 1b: process-wide; see the note above g_x86_ring. This stops the
+// next burst on whichever guest checks it first, which is fine for the
+// single-guest debugging it exists for and wrong for anything else.
 static volatile int g_x86_stop = 0;
 void x86_16_request_stop(void) { g_x86_stop = 1; }
+
+
+// ---- diagnostic instruction ring ----------------------------------------
+// dosexec.c has declared g_x86_dbgring for a long time, but the interpreter
+// stopped referencing it, so the DOS path had NO instruction recorder at all:
+// when a title exited for no visible reason, there was nothing to look at
+// between the last INT and the 4Ch. This is that recorder. It is compiled in
+// always and costs one predictable branch per instruction when off; when on it
+// stores a fixed-size record with no allocation and no locking (the interpreter
+// is single-threaded per DOS task).
+#define X86_RING_N 4096                     // power of two
+typedef struct {
+    uint16_t cs, ip, ax, bx, cx, dx, ds, es, ss, sp, flags;
+    uint8_t  op[3];
+} x86_ring_ent_t;
+// #736 Stage 1b: PROCESS-WIDE, deliberately. The instruction ring and the stop
+// flag are DIAGNOSTICS, and one ring shared by every guest is what you want
+// when you are chasing "which guest derailed": interleaved is more useful than
+// two separate rings you have to correlate by hand. But it does mean a ring
+// dump taken while two guests are live is a mixture, and x86_16_request_stop()
+// ends the next burst on WHICHEVER guest reaches the check first. Do not build
+// anything load-bearing on either.
+static x86_ring_ent_t g_x86_ring[X86_RING_N];
+static uint32_t       g_x86_ring_head;      // next slot to write
+static uint32_t       g_x86_ring_count;     // total recorded (saturating view)
+volatile int          g_x86_ring_on = 0;
+
+void x86_16_ring_enable(int on) {
+    g_x86_ring_on = on;
+    if (on) { g_x86_ring_head = 0; g_x86_ring_count = 0; }
+}
+
+static inline void x86_ring_record(x86_16_cpu_t *cpu) {
+    x86_ring_ent_t *e = &g_x86_ring[g_x86_ring_head & (X86_RING_N - 1)];
+    e->cs = cpu->cs; e->ip = cpu->ip;
+    e->ax = cpu->ax; e->bx = cpu->bx; e->cx = cpu->cx; e->dx = cpu->dx;
+    e->ds = cpu->ds; e->es = cpu->es; e->ss = cpu->ss; e->sp = cpu->sp;
+    e->flags = cpu->flags;
+    e->op[0] = x86_16_rd8(cpu, cpu->cs, cpu->ip);
+    e->op[1] = x86_16_rd8(cpu, cpu->cs, (uint16_t)(cpu->ip + 1));
+    e->op[2] = x86_16_rd8(cpu, cpu->cs, (uint16_t)(cpu->ip + 2));
+    g_x86_ring_head++; g_x86_ring_count++;
+}
+
+void x86_16_ring_dump(const char *tag, int n) {
+    if (n <= 0 || n > X86_RING_N) n = X86_RING_N;
+    uint32_t have = g_x86_ring_count < X86_RING_N ? g_x86_ring_count : X86_RING_N;
+    if ((uint32_t)n > have) n = (int)have;
+    kprintf("[x86ring] %s: last %d of %u recorded instructions (oldest first)\n",
+            tag ? tag : "-", n, (unsigned)g_x86_ring_count);
+    for (int i = n; i > 0; i--) {
+        x86_ring_ent_t *e = &g_x86_ring[(g_x86_ring_head - (uint32_t)i) & (X86_RING_N - 1)];
+        kprintf("[x86ring] %04x:%04x %02x %02x %02x  ax=%04x bx=%04x cx=%04x dx=%04x ds=%04x es=%04x ss:sp=%04x:%04x fl=%04x\n",
+                e->cs, e->ip, e->op[0], e->op[1], e->op[2],
+                e->ax, e->bx, e->cx, e->dx, e->ds, e->es, e->ss, e->sp, e->flags);
+    }
+    kprintf("[x86ring] --- end %s ---\n", tag ? tag : "-");
+}
 
 int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
     unsigned long executed = 0;
@@ -1354,6 +1467,7 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
     while (!cpu->halted) {
         if (g_x86_stop) { g_x86_stop = 0; return 1; }
         if (max_insns && executed >= max_insns) return 1;
+        if (g_x86_ring_on) x86_ring_record(cpu);
 
         // Diagnostic IP sampler: when enabled, log a cs:ip:op snapshot every
         // 32768 instructions so an early spin shows up as a repeated address.
@@ -1375,8 +1489,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // (B) DS-drift: for the doc/view/format code segments, log whenever
         // ds != ss (a half-fixed drift bug from pass 33-35; check whether it is
         // unpatched in the realize region and its neighbours).
-        { extern int g_w6life, g_win16_pmode;
-          if (g_w6life && g_win16_pmode) {
+        { extern int g_w6life;
+          if (g_w6life && cpu->pmode) {
             if (g_w6callf_npend > 0) {
               int top = g_w6callf_npend - 1;
               if (cpu->cs == g_w6callf_pend[top].cs && cpu->ip == g_w6callf_pend[top].ip) {
@@ -1410,8 +1524,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         //  - seg17 bit1-clear paginate sites 0x1338/0x177f/0x191c (clear needs-layout)
         //  - seg17:0x4fb0 redisplay reader: log bx (view base) + [bx+0x48] display list
         //  - seg139:0x080a paginate engine entry
-        { extern int g_w6life, g_win16_pmode;
-          if (g_w6life && g_win16_pmode) {
+        { extern int g_w6life;
+          if (g_w6life && cpu->pmode) {
             if (cpu->cs==0x008f) {
               uint16_t ip=cpu->ip;
               if (ip==0x67d0) { static int n=0; if(n<12){n++;
@@ -1423,15 +1537,15 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                   x86_16_rd16(cpu,cpu->ss,cpu->sp), cpu->bx); } }
               else if (ip==0x6831||ip==0x6836||ip==0x6846||ip==0x6861||ip==0x6898) { static int n=0; if(n<30){n++;
                 kprintf("[W6DL] seg17:67d0 path reached ip=%04x (es:si=%04x:%04x flag[si+5]=%02x) #%d\n",
-                  ip, cpu->es, cpu->si, membase(cpu)[lin(cpu->es,(uint16_t)(cpu->si+5))], n); } }
+                  ip, cpu->es, cpu->si, membase(cpu)[lin(cpu, cpu->es,(uint16_t)(cpu->si+5))], n); } }
               else if (ip==0x6b74) { static int n=0; if(n<12){n++;
                 kprintf("[W6DL] seg17:6b74 FMT-SETUP BAIL/return #%d ax=%04x\n", n, cpu->ax); } }
               else if (ip==0x1338||ip==0x177f||ip==0x191c) { static int n=0; if(n<20){n++;
                 kprintf("[W6DL] seg17:%04x BIT1-CLEAR paginate site #%d bx=%04x [bx+c]=%02x\n",
-                  ip, n, cpu->bx, membase(cpu)[lin(cpu->ds,(uint16_t)(cpu->bx+0x0c))]); } }
+                  ip, n, cpu->bx, membase(cpu)[lin(cpu, cpu->ds,(uint16_t)(cpu->bx+0x0c))]); } }
               else if (ip==0x4fb0) { static int n=0; if(n<20){n++;
                 uint16_t dl=x86_16_rd16(cpu,cpu->ds,(uint16_t)(cpu->bx+0x48));
-                uint32_t dlb=lin(cpu->ds,dl); uint8_t *mdl=membase(cpu);
+                uint32_t dlb=lin(cpu, cpu->ds,dl); uint8_t *mdl=membase(cpu);
                 int dlisv=dl?(mdl[dlb]==0x01&&mdl[dlb+1]==0x00&&mdl[dlb+0xb8]==0x01&&mdl[dlb+0xbc]==0x58):0;
                 kprintf("[W6DL] seg17:4fb0 REDISPLAY-reader #%d view-base bx=%04x view+0x48(DL)=%04x %s\n",
                   n, cpu->bx, dl, dl?(dlisv?"NON-NULL[is-VIEW=next-link]":"NON-NULL[not-view=DL-array]"):"NULL(skips->gray)"); 
@@ -1440,7 +1554,7 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
             else if (cpu->cs==0x06ff && cpu->ip==0x0042) { static int n=0; if(n<40){n++;
               uint16_t a2=x86_16_rd16(cpu,cpu->ss,(uint16_t)(cpu->sp+4));
               uint16_t a1=x86_16_rd16(cpu,cpu->ss,(uint16_t)(cpu->sp+6));
-              uint32_t vb=lin(cpu->ds,a2);
+              uint32_t vb=lin(cpu, cpu->ds,a2);
               int isview=(membase(cpu)[vb]==0x01&&membase(cpu)[vb+1]==0x00&&membase(cpu)[vb+0xb8]==0x01&&membase(cpu)[vb+0xbc]==0x58);
               kprintf("[W6ADDV] seg223:42 AddView(list=%04x view=%04x) isview=%d caller=%04x:%04x %s\n",
                 a1,a2,isview,x86_16_rd16(cpu,cpu->ss,(uint16_t)(cpu->sp+2)),x86_16_rd16(cpu,cpu->ss,cpu->sp),
@@ -1469,8 +1583,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         }
 
         // (#278 P39DIAG) doc-view paint-gate + bit3-OR + msg10 lifecycle probes.
-        { extern int g_w6life, g_win16_pmode;
-          if (g_w6life && g_win16_pmode) {
+        { extern int g_w6life;
+          if (g_w6life && cpu->pmode) {
             // (#278 P46) seg173 (sel 0x056f) = the pane/view object segment. The ONLY
             // `or [reg+0xb],8` (view REALIZE/visible bit3) in WINWORD.EXE is seg173:0x1e40,
             // inside routine seg173:0x1c82 (the split/duplicate-realize path, reached from
@@ -1491,7 +1605,7 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
               }
               if (g_w6ctor_pending && cpu->cs==g_w6ctor_rcs && cpu->ip==g_w6ctor_rip) {
                 g_w6ctor_pending = 0;
-                uint16_t _obj = cpu->ax; uint32_t _vl = lin(win16_dgroup_sel, _obj);
+                uint16_t _obj = cpu->ax; uint32_t _vl = lin(cpu, win16_dgroup_sel, _obj);
                 if (_obj && g_w6view_n < 24) {
                   uint8_t _bb=membase(cpu)[_vl+0x0b], _cc=membase(cpu)[_vl+0x0c];
                   kprintf("[W6BOOT] view#%d CONSTRUCTED obj=%04x lin=%05lx [+0]=%04x [+b]=%02x(realize=%d) [+c]=%02x(bit1=%d)\n",
@@ -1835,7 +1949,7 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                   for(int k=0;k<12;k++) kprintf(" %04x", x86_16_rd16(cpu,cpu->ds,(uint16_t)(sub+k*2)));
                   kprintf("\n");
                   /* P44: do NOT re-arm here (would clobber the early [0x4a82]->sub bit1 watch) */
-                  kprintf("[W694C] (P44 re-arm suppressed) sub+0xc lin would be %05lx\n",(unsigned long)lin(cpu->ds,(uint16_t)(sub+0x0c)));
+                  kprintf("[W694C] (P44 re-arm suppressed) sub+0xc lin would be %05lx\n",(unsigned long)lin(cpu, cpu->ds,(uint16_t)(sub+0x0c)));
                 } } }
               if (cpu->ip==0x0985){ static int n=0; if(n<8){n++;
                 // si = [[0x1d18]]; test bit1 of [si+0xc]. bail(jne 0x9ff) if set.
@@ -2089,7 +2203,7 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                 kprintf("[W6CTOR] seg223:df1 obj-alloc handle=%04x obj=%04x [obj+b]=%02x (arming early realize watch)\n",
                   h,obj, obj?x86_16_rd8(cpu,cpu->ds,(uint16_t)(obj+0x0b)):0);
                 { extern uint32_t g_wp_lin; extern uint16_t win16_dgroup_sel;
-                  if (obj && g_wp_lin==0) g_wp_lin = lin(win16_dgroup_sel,(uint16_t)(obj+0x0b)); } } }
+                  if (obj && g_wp_lin==0) g_wp_lin = lin(cpu, win16_dgroup_sel,(uint16_t)(obj+0x0b)); } } }
               if (ip==0x12ec){ static int n=0; if(n<20){n++;
                 kprintf("[W6ACTV] SetActiveView@12ec cur[1d18]=%04x arg[bp+8]=%04x caller=%04x:%04x\n",
                   x86_16_rd16(cpu,cpu->ds,0x1d18),
@@ -2102,7 +2216,7 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                 { extern uint32_t g_wp_lin; extern uint16_t win16_dgroup_sel;
                   if (cpu->si){
                     uint16_t sub=x86_16_rd16(cpu,win16_dgroup_sel,cpu->si);
-                    g_wp_lin = lin(win16_dgroup_sel,(uint16_t)(sub+0x0c));
+                    g_wp_lin = lin(cpu, win16_dgroup_sel,(uint16_t)(sub+0x0c));
                     kprintf("[W6P44] view=%04x sub=%04x flag[+c]=%04x armed watch lin=%05lx\n",
                       cpu->si, sub, x86_16_rd16(cpu,win16_dgroup_sel,(uint16_t)(sub+0x0c)),
                       (unsigned long)g_wp_lin);
@@ -2131,8 +2245,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // (#278 Word6 EXPERIMENT) seg15:0x0fb4 init returns 0 (resource/config load
         // A+B both failed). Force it to SUCCEED to probe the next blocker: at the
         // failure exit 0x0fee `xor ax,ax;leave;retf`, set ax=1 and skip to 0x0ff0.
-        { extern int g_ole2_k334log; extern int g_win16_pmode; static int nfx=0;
-          if (g_win16_pmode && cpu->cs==0x007f && cpu->ip==0x0fee) {
+        { extern int g_ole2_k334log; static int nfx=0;
+          if (cpu->pmode && cpu->cs==0x007f && cpu->ip==0x0fee) {
             cpu->ax=1; cpu->ip=0x0ff0;
             if (g_ole2_k334log && nfx<2){ nfx++; kprintf("[FB4FIX] forced seg15:0x0fb4 -> ax=1 (skip fail-exit)\n"); }
             continue; } }
@@ -2145,8 +2259,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // immediately so Word proceeds into its message loop / window creation.
         // The function takes no stack args (plain retf at 0x98d); at entry the top of
         // stack is the far return frame, so set ax=1 and pop ip:cs.
-        { extern int g_ole2_k334log; extern int g_win16_pmode; static int nsh=0;
-          if (g_win16_pmode && cpu->cs==0x0447 && cpu->ip==0x095e) {
+        { extern int g_ole2_k334log; static int nsh=0;
+          if (cpu->pmode && cpu->cs==0x0447 && cpu->ip==0x095e) {
             cpu->ax=1;
             cpu->ip=x86_16_rd16(cpu,cpu->ss,cpu->sp);
             cpu->cs=x86_16_rd16(cpu,cpu->ss,(uint16_t)(cpu->sp+2));
@@ -2164,9 +2278,9 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // the snapshot so the enumeration runs over the REAL (small) table. Gated
         // Word-only (pmode). NOTE: relies on the grow not physically moving the block
         // (observed: it grows by extending, not compacting this block).
-        { extern int g_ole2_k334log; extern int g_win16_pmode;
+        { extern int g_ole2_k334log;
           static uint16_t w6_tbl_blk = 0;
-          if (g_win16_pmode) {
+          if (cpu->pmode) {
             if (cpu->cs==0x051f && cpu->ip==0x71e1 && cpu->ax==0x368c) {
               uint16_t v = x86_16_rd16(cpu, cpu->ds, 0x368c);
               if (v >= 0x0200) w6_tbl_blk = v;   // snapshot valid block ptr
@@ -2186,8 +2300,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // Each gate is `call sub-init; or ax,ax; jnz ok; jmp 0x900/0x907(fail)`. Logging
         // the FIRST failure-jmp source reached identifies the failing sub-init. The 0x884
         // site is a `jz 0x900` so it fails only when ax==0. Gated Word-only (pmode+k334log).
-        { extern int g_ole2_k334log; extern int g_win16_pmode;
-          if (g_win16_pmode && g_ole2_k334log && cpu->cs==0x0447) {
+        { extern int g_ole2_k334log;
+          if (cpu->pmode && g_ole2_k334log && cpu->cs==0x0447) {
             uint16_t aip=cpu->ip; static int w6ai=0;
             if (w6ai<24 && (aip==0x550||aip==0x561||aip==0x60b||aip==0x623||aip==0x62f||
                 aip==0x63b||aip==0x64c||aip==0x670||aip==0x68f||aip==0x6d4||aip==0x719||
@@ -2211,8 +2325,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // SS==DS) for THIS call and repair the [0x40ea] global for future calls.
         // Gated Word-only (pmode). NOTE: 0 is never a valid heap segment, so this is
         // safe for any malloc that would otherwise dereference a null segment.
-        { extern int g_ole2_k334log; extern int g_win16_pmode;
-          if (g_win16_pmode && cpu->cs==0x073f && cpu->ip==0x010a) {
+        { extern int g_ole2_k334log;
+          if (cpu->pmode && cpu->cs==0x073f && cpu->ip==0x010a) {
             uint16_t hp = x86_16_rd16(cpu, cpu->ss, (uint16_t)(cpu->bp+8));
             if (hp == 0) {
               x86_16_wr16(cpu, cpu->ss, (uint16_t)(cpu->bp+8), cpu->ss); // fix this call
@@ -2228,10 +2342,10 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // ds=1127 but Word's DGROUP/near-heap is 075f (SS==DS invariant). Confirm
         // ds vs ss, read the handle via BOTH, and watch the REAL handle word at
         // the ds used by the view ctor (arm at the view's 0x406 entry where ds==1127).
-        { extern int g_ole2_k334log; extern int g_win16_pmode; extern uint32_t g_wp_lin;
-          if (g_win16_pmode && g_ole2_k334log) {
+        { extern int g_ole2_k334log; extern uint32_t g_wp_lin;
+          if (cpu->pmode && g_ole2_k334log) {
             if (cpu->cs==0x06ff && cpu->ip==0x0406 && cpu->ds==0x1127) {
-              g_wp_lin = lin(cpu->ds, 0x4a82);
+              g_wp_lin = lin(cpu, cpu->ds, 0x4a82);
               kprintf("[W6VIEW] ARM(view) watch ds:4a82 lin=%05lx ds=%04x ss=%04x\n",
                 (unsigned long)g_wp_lin, cpu->ds, cpu->ss);
             }
@@ -2275,7 +2389,7 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // ES-only); seg222 (06f7) edit-pane [0x1f6a,0x2454) and doc-child
         // [0x178a,0x1e62) have no ds-load except their own prologue. The ds!=ss
         // guard is a NO-OP for games (SS==DS, and these selectors need >200 segs).
-        if (g_win16_pmode && cpu->ds != cpu->ss) {
+        if (cpu->pmode && cpu->ds != cpu->ss) {
             if ((cpu->cs==0x06ff && cpu->ip < 0x21a0) ||
                 (cpu->cs==0x06f7 && ((cpu->ip>=0x178a && cpu->ip<0x1e62) ||
                                      (cpu->ip>=0x1f6a && cpu->ip<0x2454))))
@@ -2287,9 +2401,9 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // fields: pLast[+0], pFirst[+2], rover[+4], freecount[+0x1e]. If freecount
         // >= requested, the space exists but the rover can't reach it (corruption);
         // if < requested, the near heap is genuinely exhausted. Gated Word-only.
-        { extern int g_ole2_k334log; extern int g_win16_pmode;
+        { extern int g_ole2_k334log;
           static int w6mflag=0; static int w6mn=0;
-          if (g_win16_pmode && g_ole2_k334log) {
+          if (cpu->pmode && g_ole2_k334log) {
             if (cpu->cs==0x0627 && cpu->ip==0x444) w6mflag=1;
             if (cpu->cs==0x073f && cpu->ip==0x010a && w6mflag && w6mn<3) {
               w6mn++; w6mflag=0;
@@ -2306,8 +2420,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // app-init's final gate (seg136:0x87d) calls; it returns 0 -> app-init fails.
         // Log entry, each allocation return, and the failure/success exits to find the
         // first failing sub-allocation. Gated Word-only.
-        { extern int g_ole2_k334log; extern int g_win16_pmode;
-          if (g_win16_pmode && g_ole2_k334log && cpu->cs==0x0627) {
+        { extern int g_ole2_k334log;
+          if (cpu->pmode && g_ole2_k334log && cpu->cs==0x0627) {
             uint16_t aip=cpu->ip; static int w6f=0;
             if (w6f<80) {
               if (aip==0x444){ w6f++; kprintf("[W6F196] ENTER cnt[20aa]=%04x\n", x86_16_rd16(cpu,cpu->ds,0x20aa)); }
@@ -2331,8 +2445,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // succeeds, WinMain (seg222:0x851) calls phase-2 (seg136:0x117e), whose
         // sub-init gates fail to 0x179c (OLE teardown + error display + return 0).
         // Log the FIRST failure-jmp source reached to identify the next blocker.
-        { extern int g_ole2_k334log; extern int g_win16_pmode;
-          if (g_win16_pmode && g_ole2_k334log && cpu->cs==0x0447) {
+        { extern int g_ole2_k334log;
+          if (cpu->pmode && g_ole2_k334log && cpu->cs==0x0447) {
             uint16_t p=cpu->ip; static int w6p2=0;
             if (w6p2<20 && (p==0x11d5||p==0x11e1||p==0x11ed||p==0x1206||p==0x1269||
                 p==0x12a3||p==0x12af||p==0x12c3||p==0x12d6||p==0x12e6||p==0x1307||
@@ -2356,8 +2470,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // all blocks) sits above the statics. Gated to the DGROUP init path (cs=seg231,
         // ip=0x1e, ds==dgroup selector), so OLE2 DLL / GlobalAlloc'd-segment LInits
         // are untouched. This is the durable root-cause fix the band-aids approximated.
-        { extern int g_win16_pmode; extern uint16_t win16_dgroup_sel; extern uint16_t win16_dgroup_heap_base;
-          if (g_win16_pmode && win16_dgroup_heap_base && cpu->cs==0x073f && cpu->ip==0x001e
+        {  extern uint16_t win16_dgroup_sel; extern uint16_t win16_dgroup_heap_base;
+          if (cpu->pmode && win16_dgroup_heap_base && cpu->cs==0x073f && cpu->ip==0x001e
               && cpu->ds==win16_dgroup_sel && cpu->di && cpu->di < win16_dgroup_heap_base) {
             static int hb=0; if (hb<4){ hb++;
               kprintf("[W6HEAPBASE] __LInit DGROUP pStart %04x -> %04x (heap now above static data)\n",
@@ -2371,8 +2485,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // At entry to each routine the caller far-return frame is [ss:sp]=ret_ip,
         // [ss:sp+2]=ret_cs (both CreatePane's `push cs;call` and seg136's 0x9A push cs
         // first), args follow at [ss:sp+4..].
-        { extern int g_w6life, g_win16_pmode;
-          if (g_w6life && g_win16_pmode && cpu->cs==0x06ff) {
+        { extern int g_w6life;
+          if (g_w6life && cpu->pmode && cpu->cs==0x06ff) {
             uint16_t ip0 = cpu->ip;
             if (ip0==0x0284) { static int n=0; if(n<40){n++;
               kprintf("[W6PANE] CreateDisplayListNode(0x284) ENTER #%d caller=%04x:%04x listSel=%04x [40ea]=%04x\n",
@@ -2397,8 +2511,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         //   ds:6c6=node1(fc34,+62=0000 PRIMARY, +44view=0be4 hwnd=0 +0c=0) = the doc view;
         //   ds:6c8=node2(fd58,+62=0007,+44view=0c1a hwnd=8930 +0c=86); node3(f2dc,+62=7,sel0).
         // Ours: doc view ends up as the sel=0 TAIL. Find where the role/order diverges.
-        { extern int g_w6life, g_win16_pmode;
-          if (g_w6life && g_win16_pmode) {
+        { extern int g_w6life;
+          if (g_w6life && cpu->pmode) {
             uint16_t seg=cpu->ds;
             if (cpu->cs==0x0447 && cpu->ip==0x0df8) { static int n=0; if(n<4){n++;
               uint16_t h=x86_16_rd16(cpu,seg,0x6c6); uint16_t obj=x86_16_rd16(cpu,seg,h);
@@ -2444,8 +2558,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // / ds:0x6cc list0) at the FIRST redisplay (seg17:0x4fb0). Diff vs real Word
         // ground truth (list0 = docview->fd58->f2dc, doc-view+0x48 NON-NULL). ds here =
         // DGROUP; handles deref via [h] to the object; +0x48 = next-in-chain.
-        { extern int g_w6life, g_win16_pmode;
-          if (g_w6life && g_win16_pmode && cpu->cs==0x008f && cpu->ip==0x4fb0) {
+        { extern int g_w6life;
+          if (g_w6life && cpu->pmode && cpu->cs==0x008f && cpu->ip==0x4fb0) {
             static int done=0; if(!done){done=1;
               uint16_t seg=cpu->ds;
               for (int L=0;L<2;L++){ uint16_t root=L?0x6ca:0x6cc;
@@ -2466,8 +2580,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // needs-layout bit1 at 0x1338 (`and [si+0xc],0xfd`) and builds content, GATED on
         // seg223:0x0cfa(view)!=0 (0x1334 je bails). Trace whether it runs for the doc
         // view (obj 9e3a, +0xc bit1 set) and where it bails vs clears bit1.
-        { extern int g_w6life, g_win16_pmode;
-          if (g_w6life && g_win16_pmode && cpu->cs==0x008f) {
+        { extern int g_w6life;
+          if (g_w6life && cpu->pmode && cpu->cs==0x008f) {
             uint16_t ip0=cpu->ip;
             if (ip0==0x128c) { static int n=0; if(n<30){n++;
               uint16_t bpa=x86_16_rd16(cpu,cpu->ss,(uint16_t)(cpu->sp+8));  /* [bp+0xa]=di source */
@@ -2504,8 +2618,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                 cpu->si, x86_16_rd16(cpu,cpu->ds,cpu->si)); } }
           } }
         // (#278 P60) seg223:0x0cfa GATE internals (far-call at seg17:0x132f).
-        { extern int g_w6life, g_win16_pmode;
-          if (g_w6life && g_win16_pmode && cpu->cs==0x06ff) {
+        { extern int g_w6life;
+          if (g_w6life && cpu->pmode && cpu->cs==0x06ff) {
             uint16_t ip0=cpu->ip;
             uint16_t retcs=x86_16_rd16(cpu,cpu->ss,(uint16_t)(cpu->bp+4));
             if (retcs==0x008f) {
@@ -2550,6 +2664,7 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
             if (op == 0xF3) { rep = 1; continue; }
             if (op == 0xF2) { rep = 2; continue; }
             if (op == 0xF0) { continue; } // LOCK: ignore
+            if (op == 0xF1) { continue; } // 8086/186/286 undocumented LOCK alias
             break;
         }
         // (#194) asize is threaded into decode_modrm_a for 32-bit ModR/M + SIB.
@@ -2567,13 +2682,13 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                 bs,bo, x86_16_rd16(cpu,bs,(uint16_t)(bo+0x1a)), x86_16_rd16(cpu,bs,(uint16_t)(bo+0x1c)),
                 x86_16_rd8(cpu,bs,(uint16_t)(bo+0x18)),x86_16_rd8(cpu,bs,(uint16_t)(bo+0x19)),x86_16_rd8(cpu,bs,(uint16_t)(bo+0x1a)),x86_16_rd8(cpu,bs,(uint16_t)(bo+0x1b)),
                 x86_16_rd8(cpu,bs,(uint16_t)(bo+0x1c)),x86_16_rd8(cpu,bs,(uint16_t)(bo+0x1d)),x86_16_rd8(cpu,bs,(uint16_t)(bo+0x1e)),x86_16_rd8(cpu,bs,(uint16_t)(bo+0x1f))); } }
-        { extern int g_win16_pmode; static unsigned long wild=0;
+        {  static unsigned long wild=0;
           // Wild-CS crash guard: a corrupted far-call lands either in segment 0 OR in
           // an INVALID LDT selector (no loaded segment) and spins executing op=00
           // (`add [bx+si],al`). Halt the interpreter so the OS stays live instead of
           // running millions of garbage writes. (#278 extended from cs==0 to any
           // invalid pmode code selector.)
-          int wildcs = g_win16_pmode && (cpu->cs == 0x0000 || !ldt_valid(cpu->cs));
+          int wildcs = cpu->pmode && (cpu->cs == 0x0000 || !ldt_valid(cpu->cs));
           if (wildcs) {
               if (++wild > 4096) {   // ~4K insns in a wild code segment => crashed; stop
                   extern int g_ole2_k334log;
@@ -2595,8 +2710,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
           // already the vtable (les bx,[es:bx] ran at 0x75a3); if the vtable selector is
           // 0 OR its Release slot (+8) has a NULL segment, SKIP the call far: set ax=0,
           // advance ip past `call far [es:bx+8]` (0x75a6, 4 bytes -> 0x75aa).
-          extern int g_win16_pmode;
-          if (g_win16_pmode && cpu->cs==0x0037 && cpu->ip==0x75a8) {
+          
+          if (cpu->pmode && cpu->cs==0x0037 && cpu->ip==0x75a8) {
             uint16_t vs=cpu->es, vo=cpu->bx;
             uint16_t rs=x86_16_rd16(cpu,vs,(uint16_t)(vo+0xa));   // Release method segment
             if (vs==0 || rs==0) {
@@ -3132,37 +3247,37 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
 
             if (is_reg_form) {
                 int i = modrm & 7;     // ST(i)
-                int sti = g_fp_top + i;   // index of ST(i) (top is ST(0))
-                int valid_top = (g_fp_top < FP_STACK_SIZE);
-                int valid_sti = (sti < FP_STACK_SIZE);
+                int sti = cpu->fp_top + i;   // index of ST(i) (top is ST(0))
+                int valid_top = (cpu->fp_top < X86_16_FP_STACK);
+                int valid_sti = (sti < X86_16_FP_STACK);
                 switch (op) {
                     case 0xDB:
-                        if (modrm == 0xE3) fp_reset();        // FNINIT/FINIT
+                        if (modrm == 0xE3) fp_reset(cpu);        // FNINIT/FINIT
                         // DB E1/E2/E4 (FNCLEX etc): no-op
                         break;
                     case 0xD9:
                         if (modrm == 0xC9 && valid_top) {     // FXCH ST(1)
-                            if (g_fp_top + 1 < FP_STACK_SIZE) {
-                                uint64_t t = g_fp[g_fp_top];
-                                g_fp[g_fp_top] = g_fp[g_fp_top+1];
-                                g_fp[g_fp_top+1] = t;
+                            if (cpu->fp_top + 1 < X86_16_FP_STACK) {
+                                uint64_t t = cpu->fp[cpu->fp_top];
+                                cpu->fp[cpu->fp_top] = cpu->fp[cpu->fp_top+1];
+                                cpu->fp[cpu->fp_top+1] = t;
                             }
                         } else if (reg == 1 && valid_sti) {   // FXCH ST(i)
-                            uint64_t t = g_fp[g_fp_top]; g_fp[g_fp_top]=g_fp[sti]; g_fp[sti]=t;
+                            uint64_t t = cpu->fp[cpu->fp_top]; cpu->fp[cpu->fp_top]=cpu->fp[sti]; cpu->fp[sti]=t;
                         } else if (reg == 0 && valid_sti) {   // FLD ST(i)
-                            uint64_t v = g_fp[sti];
-                            if (g_fp_top > 0) g_fp[--g_fp_top] = v;
+                            uint64_t v = cpu->fp[sti];
+                            if (cpu->fp_top > 0) cpu->fp[--cpu->fp_top] = v;
                         }
                         break;
                     case 0xD8:    // FADD/FMUL/.../FDIV ST(0), ST(i)
-                        if (valid_top && valid_sti) FP_ARITH(g_fp[g_fp_top], g_fp[sti], reg);
+                        if (valid_top && valid_sti) FP_ARITH(cpu->fp[cpu->fp_top], cpu->fp[sti], reg);
                         break;
                     case 0xDC:    // ST(i) op= ST(0)
                         if (valid_top && valid_sti) {
                             int rf = reg; // DC reg encoding mirrors D8 but SUB/SUBR,DIV/DIVR swap
                             if (rf == 4) rf = 5; else if (rf == 5) rf = 4;
                             else if (rf == 6) rf = 7; else if (rf == 7) rf = 6;
-                            FP_ARITH(g_fp[sti], g_fp[g_fp_top], rf);
+                            FP_ARITH(cpu->fp[sti], cpu->fp[cpu->fp_top], rf);
                         }
                         break;
                     case 0xDE:    // FADDP/.../FDIVP ST(i), ST(0) then pop
@@ -3170,14 +3285,14 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                             int rf = reg;
                             if (rf == 4) rf = 5; else if (rf == 5) rf = 4;
                             else if (rf == 6) rf = 7; else if (rf == 7) rf = 6;
-                            FP_ARITH(g_fp[sti], g_fp[g_fp_top], rf);
-                            g_fp_top++;   // pop ST(0)
+                            FP_ARITH(cpu->fp[sti], cpu->fp[cpu->fp_top], rf);
+                            cpu->fp_top++;   // pop ST(0)
                         }
                         break;
                     case 0xDD:    // FST/FSTP ST(i), FFREE
                         if ((reg == 2 || reg == 3) && valid_top && valid_sti) {
-                            g_fp[sti] = g_fp[g_fp_top];
-                            if (reg == 3) g_fp_top++;
+                            cpu->fp[sti] = cpu->fp[cpu->fp_top];
+                            if (reg == 3) cpu->fp_top++;
                         }
                         break;
                     default: break;   // DA/DF reg forms (FCMOV/FCOMI) unused
@@ -3190,7 +3305,7 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                     uint32_t f = (uint32_t)x86_16_rd16(cpu, m.seg, m.off) |
                                  ((uint32_t)x86_16_rd16(cpu, m.seg,(uint16_t)(m.off+2))<<16);
                     uint64_t b = f32_to_f64(f);
-                    if (g_fp_top < FP_STACK_SIZE) FP_ARITH(g_fp[g_fp_top], b, reg);
+                    if (cpu->fp_top < X86_16_FP_STACK) FP_ARITH(cpu->fp[cpu->fp_top], b, reg);
                     break;
                 }
                 case 0xD9:
@@ -3199,14 +3314,14 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                     else if (reg == 0) { // FLD m32 (real)
                         uint32_t f = (uint32_t)x86_16_rd16(cpu, m.seg, m.off) |
                                      ((uint32_t)x86_16_rd16(cpu, m.seg,(uint16_t)(m.off+2))<<16);
-                        if (g_fp_top > 0) g_fp[--g_fp_top] = f32_to_f64(f);
+                        if (cpu->fp_top > 0) cpu->fp[--cpu->fp_top] = f32_to_f64(f);
                     }
                     else if (reg == 2 || reg == 3) { // FST/FSTP m32
-                        if (g_fp_top < FP_STACK_SIZE) {
-                            uint32_t f = f64_to_f32(g_fp[g_fp_top]);
+                        if (cpu->fp_top < X86_16_FP_STACK) {
+                            uint32_t f = f64_to_f32(cpu->fp[cpu->fp_top]);
                             x86_16_wr16(cpu,m.seg,m.off,(uint16_t)f);
                             x86_16_wr16(cpu,m.seg,(uint16_t)(m.off+2),(uint16_t)(f>>16));
-                            if (reg == 3) g_fp_top++;
+                            if (reg == 3) cpu->fp_top++;
                         }
                     }
                     break;
@@ -3214,11 +3329,11 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                     if (reg == 0) { // FILD m32 (dword int)
                         int32_t v = (int32_t)((uint32_t)x86_16_rd16(cpu,m.seg,m.off) |
                                     ((uint32_t)x86_16_rd16(cpu,m.seg,(uint16_t)(m.off+2))<<16));
-                        if (g_fp_top > 0) g_fp[--g_fp_top] = fp_from_i64(v);
+                        if (cpu->fp_top > 0) cpu->fp[--cpu->fp_top] = fp_from_i64(v);
                     } else if (reg == 2 || reg == 3) { // FIST/FISTP m32
-                        if (g_fp_top < FP_STACK_SIZE) {
-                            int64_t r = fp_to_i64(g_fp[g_fp_top]);
-                            if (reg == 3) g_fp_top++;
+                        if (cpu->fp_top < X86_16_FP_STACK) {
+                            int64_t r = fp_to_i64(cpu->fp[cpu->fp_top]);
+                            if (reg == 3) cpu->fp_top++;
                             x86_16_wr16(cpu,m.seg,m.off,(uint16_t)r);
                             x86_16_wr16(cpu,m.seg,(uint16_t)(m.off+2),(uint16_t)(r>>16));
                         }
@@ -3226,17 +3341,17 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                     break;
                 case 0xDC: {  // arithmetic with m64 real
                     uint64_t b = rd64(cpu, m.seg, m.off);
-                    if (g_fp_top < FP_STACK_SIZE) FP_ARITH(g_fp[g_fp_top], b, reg);
+                    if (cpu->fp_top < X86_16_FP_STACK) FP_ARITH(cpu->fp[cpu->fp_top], b, reg);
                     break;
                 }
                 case 0xDD:
                     if (reg == 0) { // FLD m64 (real)
                         uint64_t b = rd64(cpu, m.seg, m.off);
-                        if (g_fp_top > 0) g_fp[--g_fp_top] = b;
+                        if (cpu->fp_top > 0) cpu->fp[--cpu->fp_top] = b;
                     } else if (reg == 2 || reg == 3) { // FST/FSTP m64
-                        if (g_fp_top < FP_STACK_SIZE) {
-                            wr64(cpu, m.seg, m.off, g_fp[g_fp_top]);
-                            if (reg == 3) g_fp_top++;
+                        if (cpu->fp_top < X86_16_FP_STACK) {
+                            wr64(cpu, m.seg, m.off, cpu->fp[cpu->fp_top]);
+                            if (reg == 3) cpu->fp_top++;
                         }
                     } else if (reg == 7) {
                         x86_16_wr16(cpu, m.seg, m.off, 0x0000);  // FNSTSW m16
@@ -3245,19 +3360,19 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                 case 0xDF:
                     if (reg == 0) { // FILD m16 (word int)
                         int16_t v = (int16_t)x86_16_rd16(cpu, m.seg, m.off);
-                        if (g_fp_top > 0) g_fp[--g_fp_top] = fp_from_i64(v);
+                        if (cpu->fp_top > 0) cpu->fp[--cpu->fp_top] = fp_from_i64(v);
                     } else if (reg == 2 || reg == 3) { // FIST/FISTP m16
-                        if (g_fp_top < FP_STACK_SIZE) {
-                            int64_t r = fp_to_i64(g_fp[g_fp_top]);
-                            if (reg == 3) g_fp_top++;
+                        if (cpu->fp_top < X86_16_FP_STACK) {
+                            int64_t r = fp_to_i64(cpu->fp[cpu->fp_top]);
+                            if (reg == 3) cpu->fp_top++;
                             x86_16_wr16(cpu, m.seg, m.off, (uint16_t)r);
                         }
                     } else if (reg == 5) { // FILD m64 (qword int)
                         int64_t v = (int64_t)rd64(cpu, m.seg, m.off);
-                        if (g_fp_top > 0) g_fp[--g_fp_top] = fp_from_i64(v);
+                        if (cpu->fp_top > 0) cpu->fp[--cpu->fp_top] = fp_from_i64(v);
                     } else if (reg == 7) { // FISTP m64 (qword int, pop)
-                        if (g_fp_top < FP_STACK_SIZE) {
-                            int64_t r = fp_to_i64(g_fp[g_fp_top]); g_fp_top++;
+                        if (cpu->fp_top < X86_16_FP_STACK) {
+                            int64_t r = fp_to_i64(cpu->fp[cpu->fp_top]); cpu->fp_top++;
                             wr64(cpu, m.seg, m.off, (uint64_t)r);
                         }
                     }
@@ -3379,8 +3494,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
             // (if any) consumes this frame itself when returning.
             push16(cpu, cpu->cs);
             push16(cpu, cpu->ip);
-            if (g_farcall_active && nseg == g_farcall_seg) {
-                if (g_farcall_fn(cpu, noff)) return 0;
+            if (cpu->farcall_active && nseg == cpu->farcall_seg) {
+                if (cpu->farcall_fn(cpu, noff)) return 0;
                 break;   // fn set cpu->cs:ip; continue from there.
             }
             { extern int g_ole2_k334log; static int nc=0;
@@ -3667,14 +3782,49 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                      cpu->sp = (uint16_t)(cpu->sp + n); break; }
         case 0xCB: { cpu->ip = pop16(cpu); cpu->cs = pop16(cpu); break; }
 
+        // ---- BOUND (80186) ----
+        case 0x62: {   // BOUND r16, m16&16 -> INT 5 when the index is out of range
+            // Turbo/Borland Pascal emit this for EVERY array index under {$R+},
+            // and shareware builds often shipped with range checks left on. It
+            // was the only other real gap found in the 1-byte map alongside INTO,
+            // and it had the same hard-abort failure mode.
+            int ow = osize;
+            modrm_t m; decode_modrm_a(cpu, &m, seg_ovr, asize);
+            if (m.is_reg) break;     // mod==3 is #UD on silicon; treat as pass
+            int32_t idx, lo, hi;
+            if (ow == 4) {
+                idx = (int32_t)get_reg32(cpu, m.reg);
+                lo  = (int32_t)rd32(cpu, m.seg, m.off);
+                hi  = (int32_t)rd32(cpu, m.seg, (uint16_t)(m.off + 4));
+            } else {
+                idx = (int16_t)get_reg16(cpu, m.reg);
+                lo  = (int16_t)x86_16_rd16(cpu, m.seg, m.off);
+                hi  = (int16_t)x86_16_rd16(cpu, m.seg, (uint16_t)(m.off + 2));
+            }
+            if (idx < lo || idx > hi) {
+                if (cpu->int_fn) { if (cpu->int_fn(cpu, 5)) return 0; }
+            }
+            break;
+        }
+
         // ---- int3 / int imm8 / iret ----
         case 0xCC: {
-            if (g_int_handler) { if (g_int_handler(cpu, 3)) return 0; }
+            if (cpu->int_fn) { if (cpu->int_fn(cpu, 3)) return 0; }
             break;
         }
         case 0xCD: {
             uint8_t intno = fetch8(cpu);
-            if (g_int_handler) { if (g_int_handler(cpu, intno)) return 0; }
+            if (cpu->int_fn) { if (cpu->int_fn(cpu, intno)) return 0; }
+            break;
+        }
+        case 0xCE: {   // INTO: INT 4 when OF is set, otherwise a no-op.
+            // Base 8086. Borland/Turbo emit it after signed arithmetic
+            // (Turbo Pascal {$Q+} overflow checks). Its absence fell through to
+            // the `default:` at the bottom of this switch, which returns -1 and
+            // kills the interpreter mid-run instead of degrading.
+            if (cpu->flags & F_OF) {
+                if (cpu->int_fn) { if (cpu->int_fn(cpu, 4)) return 0; }
+            }
             break;
         }
         case 0xCF: { // iret
@@ -3719,7 +3869,7 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         case 0xD4: {   // AAM ib - ASCII adjust AX after multiply
             uint8_t imm = fetch8(cpu);
             if (imm == 0) {   // AAM 0 raises #DE (divide error, INT 0)
-                if (g_int_handler) { if (g_int_handler(cpu, 0)) return 0; }
+                if (cpu->int_fn) { if (cpu->int_fn(cpu, 0)) return 0; }
                 break;
             }
             uint8_t al = (uint8_t)(cpu->ax & 0xFF);
@@ -3810,22 +3960,22 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // writes are discarded). Win16 games occasionally poke ports for sound or
         // joystick detection; treating them as inert keeps execution flowing. ----
         case 0xE4: { uint8_t p = fetch8(cpu);
-                     uint8_t v = g_in_handler ? (uint8_t)g_in_handler(cpu, p, 1) : 0xFF;
+                     uint8_t v = cpu->in_fn ? (uint8_t)cpu->in_fn(cpu, p, 1) : 0xFF;
                      cpu->ax = (uint16_t)((cpu->ax & 0xFF00) | v); break; } // in al, imm8
         case 0xE5: { uint8_t p = fetch8(cpu);
-                     cpu->ax = g_in_handler ? g_in_handler(cpu, p, 2) : 0xFFFF; break; } // in ax, imm8
+                     cpu->ax = cpu->in_fn ? cpu->in_fn(cpu, p, 2) : 0xFFFF; break; } // in ax, imm8
         case 0xE6: { uint8_t p = fetch8(cpu);
-                     if (g_out_handler) { g_out_handler(cpu, p, (uint16_t)(cpu->ax & 0xFF), 1); }
+                     if (cpu->out_fn) { cpu->out_fn(cpu, p, (uint16_t)(cpu->ax & 0xFF), 1); }
                      break; } // out imm8, al
         case 0xE7: { uint8_t p = fetch8(cpu);
-                     if (g_out_handler) { g_out_handler(cpu, p, cpu->ax, 2); }
+                     if (cpu->out_fn) { cpu->out_fn(cpu, p, cpu->ax, 2); }
                      break; } // out imm8, ax
-        case 0xEC: { uint8_t v = g_in_handler ? (uint8_t)g_in_handler(cpu, cpu->dx, 1) : 0xFF;
+        case 0xEC: { uint8_t v = cpu->in_fn ? (uint8_t)cpu->in_fn(cpu, cpu->dx, 1) : 0xFF;
                      cpu->ax = (uint16_t)((cpu->ax & 0xFF00) | v); break; }          // in al, dx
-        case 0xED: { cpu->ax = g_in_handler ? g_in_handler(cpu, cpu->dx, 2) : 0xFFFF; break; } // in ax, dx
-        case 0xEE: { if (g_out_handler) { g_out_handler(cpu, cpu->dx, (uint16_t)(cpu->ax & 0xFF), 1); }
+        case 0xED: { cpu->ax = cpu->in_fn ? cpu->in_fn(cpu, cpu->dx, 2) : 0xFFFF; break; } // in ax, dx
+        case 0xEE: { if (cpu->out_fn) { cpu->out_fn(cpu, cpu->dx, (uint16_t)(cpu->ax & 0xFF), 1); }
                      break; } // out dx, al
-        case 0xEF: { if (g_out_handler) { g_out_handler(cpu, cpu->dx, cpu->ax, 2); }
+        case 0xEF: { if (cpu->out_fn) { cpu->out_fn(cpu, cpu->dx, cpu->ax, 2); }
                      break; } // out dx, ax
         // String port I/O (INS/OUTS). Discard data, advance SI/DI per DF, honour REP.
         case 0x6C: case 0x6D: case 0x6E: case 0x6F: {
@@ -3874,7 +4024,7 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                 }
                 case 6: { // div: AL = AX / rm8, AH = AX % rm8
                     if (v == 0) {
-                        if (g_int_handler) { if (g_int_handler(cpu, 0)) return 0; }
+                        if (cpu->int_fn) { if (cpu->int_fn(cpu, 0)) return 0; }
                         break;
                     }
                     uint16_t dn = cpu->ax;
@@ -3883,7 +4033,7 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                 }
                 default: { // idiv (7)
                     if (v == 0) {
-                        if (g_int_handler) { if (g_int_handler(cpu, 0)) return 0; }
+                        if (cpu->int_fn) { if (cpu->int_fn(cpu, 0)) return 0; }
                         break;
                     }
                     int16_t dn = (int16_t)cpu->ax;
@@ -3943,7 +4093,7 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                     break;
                 }
                 case 6: { // div: (E)DX:(E)AX / rm
-                    if (v == 0) { if (g_int_handler) { if (g_int_handler(cpu, 0)) return 0; } break; }
+                    if (v == 0) { if (cpu->int_fn) { if (cpu->int_fn(cpu, 0)) return 0; } break; }
                     if (ow == 4) {
                         uint64_t dn = ((uint64_t)get_reg32(cpu, 2) << 32) | get_reg32(cpu, 0);
                         set_reg32(cpu, 0, (uint32_t)(dn / v));
@@ -3956,7 +4106,7 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                     break;
                 }
                 default: { // idiv (7)
-                    if (v == 0) { if (g_int_handler) { if (g_int_handler(cpu, 0)) return 0; } break; }
+                    if (v == 0) { if (cpu->int_fn) { if (cpu->int_fn(cpu, 0)) return 0; } break; }
                     if (ow == 4) {
                         int64_t dn = (int64_t)(((uint64_t)get_reg32(cpu, 2) << 32) | get_reg32(cpu, 0));
                         int32_t dv = (int32_t)v;
@@ -4004,8 +4154,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                     // (#278 P40 DIAG) Trace indirect far-calls (vtable/virtual dispatch)
                     // into the view-format segment (seg182=05b7). 0xd0a (the format
                     // trigger that sets bit3) is reachable ONLY via such a dispatch.
-                    { extern int g_w6life, g_win16_pmode;
-                      if (g_w6life && g_win16_pmode && nseg==0x05b7) { static int nvc=0;
+                    { extern int g_w6life;
+                      if (g_w6life && cpu->pmode && nseg==0x05b7) { static int nvc=0;
                         if (nvc<6){ nvc++;
                           kprintf("[W6VDISP] FF/3 -> seg182:%04x via EA=%04x:%04x caller=%04x:%04x ds=%04x [1d18]=%04x\n",
                             noff, m.seg, m.off, cpu->cs, cpu->ip, cpu->ds,
@@ -4033,8 +4183,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                     // seg223 (0x06ff). The view-region-layout function entry is NOT
                     // reachable by any static caller (dynamic dispatch) - this is how
                     // its true entry offset + driver become visible.
-                    { extern int g_w6life, g_win16_pmode;
-                      if (g_w6life && g_win16_pmode && nseg==0x06ff && cpu->cs!=0x06ff) {
+                    { extern int g_w6life;
+                      if (g_w6life && cpu->pmode && nseg==0x06ff && cpu->cs!=0x06ff) {
                         static int nd=0; if(nd<80){nd++;
                           kprintf("[W6DISP223] FF/3 -> seg223:%04x from %04x:%04x EA=%04x:%04x arg0=%04x arg1=%04x arg2=%04x\n",
                             noff, cpu->cs, cpu->ip, m.seg, m.off,
@@ -4042,8 +4192,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                             x86_16_rd16(cpu,cpu->ss,(uint16_t)(cpu->sp+4))); } } }
                     push16(cpu, cpu->cs);
                     push16(cpu, cpu->ip);
-                    if (g_farcall_active && nseg == g_farcall_seg) {
-                        if (g_farcall_fn(cpu, noff)) return 0;
+                    if (cpu->farcall_active && nseg == cpu->farcall_seg) {
+                        if (cpu->farcall_fn(cpu, noff)) return 0;
                         break;   // fn performed the Pascal return.
                     }
                     fnt_maybe_enter(cpu, nseg, noff);
@@ -4054,8 +4204,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                 case 5: { // jmp far m16:16
                     uint16_t noff = x86_16_rd16(cpu, m.seg, m.off);
                     uint16_t nseg = x86_16_rd16(cpu, m.seg, (uint16_t)(m.off + 2));
-                    { extern int g_w6life, g_win16_pmode;
-                      if (g_w6life && g_win16_pmode && nseg==0x05b7) { static int njv=0;
+                    { extern int g_w6life;
+                      if (g_w6life && cpu->pmode && nseg==0x05b7) { static int njv=0;
                         if (njv<40){ njv++;
                           kprintf("[W6VDISP] FF/5(jmpf) -> seg182:%04x via EA=%04x:%04x caller=%04x:%04x\n",
                             noff, m.seg, m.off, cpu->cs, cpu->ip); } } }
@@ -4200,7 +4350,7 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                     (void)modrm_read(cpu, &m, 2);
                 } else if (sub == 4 || sub == 5) {     // VERR / VERW: ZF=1 if selector usable
                     uint16_t sel = (uint16_t)modrm_read(cpu, &m, 2);
-                    int ok = g_win16_pmode ? ldt_valid(sel) : (sel != 0);
+                    int ok = cpu->pmode ? ldt_valid(sel) : (sel != 0);
                     if (ok) cpu->flags |= F_ZF; else cpu->flags &= ~F_ZF;
                 } else {
                     modrm_write(cpu, &m, 2, 0);
@@ -4221,7 +4371,7 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                 // segment-limit of a selector. STORAGE/OLE2 use LSL to size buffers.
                 modrm_t m; decode_modrm_a(cpu, &m, seg_ovr, asize);
                 uint16_t sel = (uint16_t)modrm_read(cpu, &m, 2);
-                int valid = g_win16_pmode ? ldt_valid(sel) : (sel != 0);
+                int valid = cpu->pmode ? ldt_valid(sel) : (sel != 0);
                 if (valid) {
                     cpu->flags |= F_ZF;
                     if (op2 == 0x02) {                 // LAR: access-rights byte<<8
@@ -4230,13 +4380,48 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                         if (ow == 4) set_reg32(cpu, m.reg, ar);
                         else         set_reg16(cpu, m.reg, (uint16_t)ar);
                     } else {                           // LSL: segment limit (bytes)
-                        uint32_t lim = g_win16_pmode ? ldt_limit(sel) : 0xFFFF;
+                        uint32_t lim = cpu->pmode ? ldt_limit(sel) : 0xFFFF;
                         if (ow == 4) set_reg32(cpu, m.reg, lim);
                         else         set_reg16(cpu, m.reg, (uint16_t)lim);
                     }
                 } else {
                     cpu->flags &= ~F_ZF;               // invalid selector
                 }
+            } else if (op2 == 0xA2) {
+                // ---- 0F A2: CPUID -------------------------------------------
+                //
+                // WHY THIS IS HERE AND WHAT IT IS NOT. A 32-bit extended
+                // DOS program's real-mode stub identifies the CPU before it does
+                // anything else, and CPUID is how anything past a 486 does that.
+                // Without it the interpreter stopped dead at the first one, so a
+                // program died BEFORE printing its own diagnostic and all anyone
+                // could see was "unimpl opcode 0x0fa2". Measured on a real
+                // extended title: 1660 instructions in, no output at all.
+                //
+                // This is ONE opcode writing four registers through the existing
+                // #194 32-bit accessors. It is NOT a step toward a 32-bit core:
+                // it does not change the execution mode, the address size, or
+                // anything else. It only stops the interpreter from dying with
+                // its mouth shut.
+                //
+                // PASS THROUGH THE REAL CPU rather than fabricate one. The guest
+                // is asking what machine it is on, and it IS on this machine; a
+                // synthesised vendor and family would be a lie that callers key
+                // off (plenty of period code compares the vendor string), and
+                // any constant we picked would be wrong on some host. Leaves
+                // above the host's own maximum return zero, which is what the
+                // hardware does.
+                //
+                // ECX is forced to 0 as the subleaf, matching the kernel's own
+                // cpuid() helper; subleaf-taking leaves are therefore reported
+                // at subleaf 0 only, which no DOS-era caller asks past.
+                uint32_t leaf = get_reg32(cpu, 0);      // EAX
+                uint32_t a = 0, b = 0, cx_ = 0, d = 0;
+                cpuid(leaf, &a, &b, &cx_, &d);
+                set_reg32(cpu, 0, a);                   // EAX
+                set_reg32(cpu, 3, b);                   // EBX
+                set_reg32(cpu, 1, cx_);                 // ECX
+                set_reg32(cpu, 2, d);                   // EDX
             } else {
                 kprintf("[x86_16] unimpl opcode 0x0f%02x at %04x:%04x\n",
                         op2, cpu->cs, (uint16_t)(cpu->ip - 2));
@@ -4292,7 +4477,7 @@ int x86_16_call_far(x86_16_cpu_t *cpu, uint16_t seg, uint16_t off,
         unsigned long spent = max_insns;
         const unsigned long CALLFAR_CAP = 400000000UL;   // ~400M total guard
         while (r == 1 && spent < CALLFAR_CAP) {
-            if (g_callfar_abort_fn && g_callfar_abort_fn()) break;  // close requested
+            if (cpu->callfar_abort_fn && cpu->callfar_abort_fn()) break;  // close requested
             r = x86_16_run(cpu, max_insns);
             spent += max_insns;
         }
@@ -4504,7 +4689,7 @@ int x86_16_selftest_386(void) {
 // ===========================================================================
 // (#289 Phase 1) PROTECTED-MODE SELECTOR self-test. The acceptance test for the
 // selector/LDT memory model. Runs entirely in-kernel (no NE file needed) and
-// proves, under g_win16_pmode:
+// proves, under cpu->pmode:
 //   (a) ldt_alloc + arena-backed selectors translate correctly;
 //   (b) a >64 KiB "GlobalAlloc"-style block backed by CONSECUTIVE tiled
 //       selectors (sel += 8 per 64 KiB) can be written across the 64 KiB tile
@@ -4517,7 +4702,9 @@ int x86_16_selftest_pmode(void) {
     int fails = 0;
     int saved_mode = g_win16_pmode;
 
-    win16_pmode_enable(1);   // resets LDT + arena
+    // NULL cpu: this call is only here for its LDT/arena reset and the layer
+    // flag; each throwaway CPU below adopts the mode after its own init.
+    win16_pmode_enable(0, 1);   // resets LDT + arena
 
     // ---- (a) basic selector translation ----
     uint32_t blkA = win16_arena_alloc(0x1000, 16);
@@ -4525,7 +4712,7 @@ int x86_16_selftest_pmode(void) {
     if (selA == 0) { kprintf("[pmode] FAIL ldt_alloc selA\n"); fails++; }
     if (ldt_base(selA) != blkA) { kprintf("[pmode] FAIL ldt_base\n"); fails++; }
     {
-        x86_16_cpu_t cpu; x86_16_init(&cpu, s_selftest_mem);
+        x86_16_cpu_t cpu; x86_16_init(&cpu, s_selftest_mem); cpu.pmode = g_win16_pmode;
         // write a marker via the selector, read it back via the raw arena ptr.
         x86_16_wr16(&cpu, selA, 0x10, 0xBEEF);
         uint16_t v = x86_16_rd16(&cpu, selA, 0x10);
@@ -4561,7 +4748,7 @@ int x86_16_selftest_pmode(void) {
         // Write a 32-byte ramp pattern straddling the tile0/tile1 boundary using
         // two selectors: bytes at selH0:0xFFF0..0xFFFF (tile0) and
         // (selH0+8):0x0000..0x000F (tile1). Then read back through BOTH.
-        x86_16_cpu_t cpu; x86_16_init(&cpu, s_selftest_mem);
+        x86_16_cpu_t cpu; x86_16_init(&cpu, s_selftest_mem); cpu.pmode = g_win16_pmode;
         uint16_t selH1 = (uint16_t)(selH0 + 8);
         for (int i = 0; i < 16; i++) x86_16_wr8(&cpu, selH0, (uint16_t)(0xFFF0 + i), (uint8_t)(0xA0 + i));
         for (int i = 0; i < 16; i++) x86_16_wr8(&cpu, selH1, (uint16_t)(0x0000 + i), (uint8_t)(0xB0 + i));
@@ -4589,7 +4776,7 @@ int x86_16_selftest_pmode(void) {
         uint16_t selC1 = ldt_alloc(cbA, 0x0FFF, 1);
         uint16_t selC2 = ldt_alloc(cbB, 0x0FFF, 1);
         uint16_t selSS = ldt_alloc(sbA, 0x0FFF, 0);
-        x86_16_cpu_t cpu; x86_16_init(&cpu, s_selftest_mem);
+        x86_16_cpu_t cpu; x86_16_init(&cpu, s_selftest_mem); cpu.pmode = g_win16_pmode;
         // caller code at selC1:0x0000
         uint8_t caller[] = {
             0xB8, 0x11, 0x11,                         // mov ax, 0x1111
@@ -4610,8 +4797,8 @@ int x86_16_selftest_pmode(void) {
         else kprintf("[pmode] inter-selector far CALL/RETF OK (ax=%04x)\n", cpu.ax);
     }
 
-    win16_pmode_enable(0);          // back to real mode
-    g_win16_pmode = saved_mode;     // (defensive; should be 0)
+    win16_pmode_enable(0, 0);          // back to real mode
+    g_win16_pmode = saved_mode;  // (defensive; should be 0)
 
     if (fails == 0) kprintf("[x86_16] PMODE selftest PASS (#289 Phase1: LDT + arena + 64K tiling + far-call)\n");
     else            kprintf("[x86_16] PMODE selftest: %d FAILURES\n", fails);

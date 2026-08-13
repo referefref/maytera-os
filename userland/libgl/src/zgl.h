@@ -147,8 +147,23 @@ typedef struct GLImage {
 
 #define TEXTURE_HASH_TABLE_SIZE 256
 #define TEXTURE_HASH_TABLE_MASK 255
+/* #421 phase 8 (AssaultCube port): intra-struct guard canary between the
+ * embedded fixed-size pixmap (images[], TGL_FEATURE_TEXTURE_DIM^2 PIXELs)
+ * and next/prev/handle. GPF #3 (see PORT-STATUS.md "Phase 7"/"Phase 8")
+ * found t->next corrupted with a pixel/color-shaped value at exactly the
+ * struct offset immediately following images[], which is also exactly
+ * where an overrun of the pixmap buffer ALONE (as opposed to a whole-
+ * allocation overflow into a neighboring malloc block, the shape GPF #1/#2
+ * were) would land. This field exists purely to catch that: checked on
+ * every hash-chain walk/alloc/free and immediately after every upload op,
+ * it pins the exact operation that first corrupts it instead of only ever
+ * observing the SECOND-order symptom (next itself garbled) an arbitrary
+ * number of operations later, which is what made GPF #3 hard to localize
+ * from static reading alone. See gltex_check_canary() in texture.c. */
+#define GLTEXTURE_CANARY_MAGIC 0x7A1EC0DEu
 typedef struct GLTexture {
 	GLImage images[MAX_TEXTURE_LEVELS];
+	GLuint canary;
 	struct GLTexture *next, *prev;
 	GLint handle;
 } GLTexture;
@@ -227,6 +242,16 @@ typedef struct GLContext {
 
 	GLint texture_2d_enabled;
 
+	/* AssaultCube port phase 2: glAlphaFunc / glScissor state (real,
+	   see clip.c gl_draw_triangle for how they are applied, and
+	   PORT-STATUS.md for the honest limits of each). */
+	GLint alpha_test_enabled;
+	GLenum alpha_test_func;
+	GLfloat alpha_test_ref;
+
+	GLint scissor_enabled;
+	GLint scissor_x, scissor_y, scissor_w, scissor_h;
+
 	/* current list */
 
 	GLint current_op_buffer_index;
@@ -294,6 +319,11 @@ typedef struct GLContext {
 	GLint normal_array_stride;
 	GLint color_array_size;
 	GLint color_array_stride;
+	/* #421 phase 9: real interleaved vertex-array support needs the real
+	 * per-array TYPE, not an assumed GL_FLOAT - AssaultCube's own vertex
+	 * struct packs color as 4 GL_UNSIGNED_BYTE, which glopArrayElement
+	 * must read as bytes (see arrays.c glColorPointer/glopArrayElement). */
+	GLenum color_array_type;
 
 	GLint texcoord_array_size;
 	GLint texcoord_array_stride;

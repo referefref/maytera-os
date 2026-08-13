@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 #ifndef _MAYTERA_NOTIFY_H
 #define _MAYTERA_NOTIFY_H
 // MayteraOS userland notifications (#168).

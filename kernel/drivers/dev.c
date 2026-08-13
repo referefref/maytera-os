@@ -6,6 +6,7 @@
 #include "../serial.h"
 #include "../mm/heap.h"
 #include "../crypto/csprng.h"
+#include "../security/uaccess_smap.h"  // #19/#645: AC bracket on the caller-buffer copy
 
 extern void *kmalloc(size_t);
 extern void kfree(void *);
@@ -72,8 +73,9 @@ static int64_t devnull_write(file_t *f, const void *buf, size_t count) {
     return (int64_t)count;  // silently discard
 }
 
-static void devnull_release(file_t *f) {
+static int devnull_release(file_t *f) {
     (void)f;
+    return 0;   // #695: nothing buffered
 }
 
 static const file_ops_t devnull_ops = {
@@ -95,7 +97,10 @@ static file_t *devnull_open(int flags) {
 
 static int64_t devzero_read(file_t *f, void *buf, size_t count) {
     (void)f;
-    memset(buf, 0, count);
+    // #19/#645: `buf` is the caller's buffer; Ring-3 on the sys_read path.
+    {   uaccess_ac_t __ac = uaccess_begin();
+        memset(buf, 0, count);
+        uaccess_end(__ac); }
     return (int64_t)count;
 }
 
@@ -104,8 +109,9 @@ static int64_t devzero_write(file_t *f, const void *buf, size_t count) {
     return (int64_t)count;
 }
 
-static void devzero_release(file_t *f) {
+static int devzero_release(file_t *f) {
     (void)f;
+    return 0;   // #695: nothing buffered
 }
 
 static const file_ops_t devzero_ops = {
@@ -140,7 +146,11 @@ static file_t *devzero_open(int flags) {
 
 static int64_t devurandom_read(file_t *f, void *buf, size_t count) {
     (void)f;
-    csprng_bytes(buf, count);
+    // #19/#645: the store lands in csprng_bytes(), which IS this path's copy
+    // engine, so the AC window is around the call.
+    {   uaccess_ac_t __ac = uaccess_begin();
+        csprng_bytes(buf, count);
+        uaccess_end(__ac); }
     return (int64_t)count;
 }
 
@@ -148,12 +158,16 @@ static int64_t devurandom_write(file_t *f, const void *buf, size_t count) {
     (void)f;
     // Stir caller-supplied bytes into the DRBG as additional entropy
     // instead of discarding them (previous behavior).
-    csprng_add_entropy(buf, count);
+    // #19/#645: the load happens inside csprng_add_entropy(). See above.
+    {   uaccess_ac_t __ac = uaccess_begin();
+        csprng_add_entropy(buf, count);
+        uaccess_end(__ac); }
     return (int64_t)count;
 }
 
-static void devurandom_release(file_t *f) {
+static int devurandom_release(file_t *f) {
     (void)f;
+    return 0;   // #695: nothing buffered
 }
 
 static const file_ops_t devurandom_ops = {

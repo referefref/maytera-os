@@ -4,6 +4,7 @@
 #define DEMAND_H
 
 #include "../types.h"
+#include "../sync/spinlock.h"   // #522 step 2: mm_struct_t::vma_lock
 
 // Page fault error codes (from CPU)
 #define PF_PRESENT      (1 << 0)    // Page was present (protection violation)
@@ -57,13 +58,64 @@ typedef struct {
     vma_t *vma_list;            // Linked list of VMAs
     uint32_t vma_count;         // Number of VMAs
 
+    // #522 step 2: guards vma_list / vma_count against concurrent mutation.
+    // MANDATORY, not advisory: CLONE_VM threads share this exact struct, and
+    // since step 1 made splitting real a mutator can kfree() a vma_t while
+    // another CPU walks the list in mm_fault(). Every reader and writer of
+    // vma_list takes it via mm_lock()/mm_unlock() below. See demand.c for the
+    // lock order and the no-allocation-inside rule.
+    spinlock_t vma_lock;
+
+    // #421 phase 5 follow-up: how many process_t's currently hold this mm.
+    // mm_create() sets this to 1 (the creator). A CLONE_VM thread (process.c
+    // proc_clone(), shares_vm=1) does NOT get its own mm; it shares this
+    // exact pointer, and proc_clone() calls mm_get() to bump this before the
+    // new thread is runnable. cleanup_proc_slot() (process.c) calls mm_put()
+    // instead of mm_destroy() directly; mm_put() only actually frees when
+    // the count reaches 0. Without this, whichever process_t happened to be
+    // !shares_vm (the thread GROUP LEADER) freed the mm unconditionally on
+    // its own exit/cleanup, even while a shares_vm sibling thread was still
+    // alive and holding the SAME pointer in its own p->mm - a real,
+    // reproduced use-after-free (a crashed AssaultCube leader was reaped
+    // while its just-cloned worker thread was still live; the next
+    // heartbeat's proc_snapshot() walked the sibling's now-dangling p->mm
+    // and panicked the kernel inside proc_mem_account_rs). All mutations of
+    // this field happen while the caller holds process.c's g_proc_mm_lock
+    // (proc_mm_lock()/proc_mm_unlock()), so it needs no lock of its own.
+    uint32_t mm_users;
+
     uint64_t brk_start;         // Start of heap (after data segment)
     uint64_t brk_current;       // Current heap end
 
     uint64_t stack_start;       // Stack bottom (highest address)
     uint64_t stack_end;         // Stack top (lowest address, grows down)
 
-    uint64_t mmap_base;         // Base address for mmap allocations
+    // #636 step 3: `mmap_base` was DELETED from here. It was a SECOND
+    // next-free-address base for the same address space, seeded to 0x20000000
+    // (512MB, an address in no arena this kernel uses) and consulted only by
+    // do_mmap(), while the syscall path allocated from mmap_next below. Two
+    // cursors over one address space is the #636 defect wearing a different
+    // name, so there is now exactly one.
+
+    // #522 step 2: the anonymous-mmap placement cursor. This lives in the mm,
+    // NOT in process_t, because the ADDRESS SPACE is what it allocates from.
+    // It used to be process_t::mmap_next, which is per-THREAD: proc_clone()
+    // memcpy's the parent process_t, so every CLONE_VM thread started with its
+    // own copy of the cursor over the SAME address space and they immediately
+    // diverged. Two threads mmap()ing concurrently were handed the SAME
+    // address. Before #522 step 1 that aliased silently (vma_add rejected the
+    // overlap and the eager fallback mapped over it anyway); after step 1 it
+    // became an outright mmap failure. Either way it is wrong, and it is only
+    // correct to fix here because allocation now happens under vma_lock.
+    //
+    // #636 step 3: it is now also only ever READ AND WRITTEN inside the SAME
+    // critical section that inserts the resulting VMA (do_mmap()), so placement
+    // and insertion are atomic with respect to each other. Advancing it in one
+    // critical section and inserting in a second (what the syscall path did)
+    // still leaked address space on every failed insert, and still let an
+    // explicit-address mapping land inside a range the cursor had already
+    // handed out. It is bounded by the arena: see MM_ANON_ARENA_* in demand.c.
+    uint64_t mmap_next;
 
     // Statistics
     uint64_t total_mapped;      // Total bytes mapped
@@ -112,9 +164,9 @@ int swap_init(const char *swap_path, uint64_t size_bytes);
 // Page Fault Handling
 // ============================================
 
-// Main page fault handler - called from interrupt handler
-// Returns 0 if fault was handled, -1 if process should be killed
-int demand_page_fault(uint64_t fault_addr, uint64_t error_code, void *context);
+// #630: demand_page_fault() was DELETED. It was a second, zero-caller page-fault
+// entry point that resolved every process against one shared `static mm_struct_t`.
+// The live handler is mm/fault.c -> mm_fault() below.
 
 // #429: per-process page-fault resolver used by the real #PF handler
 // (mm/fault.c). Resolves a COW write, a demand-zero / lazy mmap page or a
@@ -123,6 +175,14 @@ int demand_page_fault(uint64_t fault_addr, uint64_t error_code, void *context);
 // faults (the latter only for a write to a user COW page: copy_to_user).
 struct process;
 int mm_fault(struct process *p, uint64_t fault_addr, uint64_t error_code);
+
+// #510/#511: proactively resolve every page in [addr, addr+len) for process
+// `p` through the SAME resolver mm_fault() uses, before a Ring-0 syscall
+// handler memcpy()s real data into that user destination range. Fixes the
+// sys_read-into-a-fresh-buffer silent-zero-fill bug (see demand.c for the
+// full writeup) at its root: call this before the copy, not after. Best
+// effort / never makes a bad pointer worse - see demand.c.
+void mm_prefault_range(struct process *p, uint64_t addr, uint64_t len, int for_write);
 
 // #429: copy-on-write a single page on a write fault. Copies (or, if this is
 // the last owner, simply re-enables write on) the page mapped at page_addr in
@@ -153,50 +213,102 @@ mm_struct_t *mm_dup(mm_struct_t *src);
 // Handle different types of page faults
 int handle_lazy_fault(mm_struct_t *mm, vma_t *vma, uint64_t fault_addr);
 int handle_cow_fault(mm_struct_t *mm, vma_t *vma, uint64_t fault_addr);
-int handle_file_fault(mm_struct_t *mm, vma_t *vma, uint64_t fault_addr);
+// #630: handle_file_fault() was DELETED (unreachable, hardcoded to FAT while the
+// root is ext2, and it did blocking disk I/O from the interrupts-disabled #PF
+// handler). mm_fault() now refuses a VMA_FILE mapping explicitly.
 int handle_swap_fault(mm_struct_t *mm, vma_t *vma, uint64_t fault_addr);
 
 // ============================================
 // VMA Management
 // ============================================
+//
+// #629(c) LOCKING CONTRACT, and it is a CONTRACT, not a suggestion.
+//
+// EVERY function in this section below vma_create() operates directly on
+// mm->vma_list and REQUIRES the caller to already hold mm_lock(mm). They do not
+// take the lock themselves, because a caller almost always needs several of
+// them to be atomic with respect to each other (find-then-split-then-remove),
+// and because the pointer a lookup returns is only valid while the lock is
+// held: a CLONE_VM sibling in do_munmap() can kfree() that exact node the
+// instant it is dropped.
+//
+// They now CHECK, and report an unheld lock on serial with the caller's return
+// address (see mm_require_lock() in demand.c). The check is best-effort:
+// spinlock_is_locked() cannot tell "held by me" from "held by someone".
+//
+// The do_*() entry points below (do_mmap/do_munmap/do_mprotect/do_brk) take the
+// lock THEMSELVES and must NOT be called with it held.
 
-// Create a new VMA
+// Create a new VMA. Allocates; safe to call with the lock NOT held (and
+// preferable, so the critical section does no allocation).
 vma_t *vma_create(uint64_t start, uint64_t end, uint32_t flags);
 
-// Add VMA to process memory map
+// Add VMA to process memory map. CALLER HOLDS mm_lock(mm).
 int vma_add(mm_struct_t *mm, vma_t *vma);
 
-// Find VMA containing the given address
+// Find VMA containing the given address. CALLER HOLDS mm_lock(mm), and must
+// keep holding it while it uses the result.
 vma_t *vma_find(mm_struct_t *mm, uint64_t addr);
 
-// Find VMA for a range (checks overlap)
+// Find VMA for a range (checks overlap). CALLER HOLDS mm_lock(mm).
 vma_t *vma_find_range(mm_struct_t *mm, uint64_t start, uint64_t end);
 
-// Split VMA at the given address
+// Split VMA at the given address. CALLER HOLDS mm_lock(mm). Allocates inside
+// the critical section; prefer vma_node_alloc() + vma_split_using().
 int vma_split(mm_struct_t *mm, vma_t *vma, uint64_t addr);
 
-// Merge adjacent VMAs if possible
+// #522 step 2: allocation-free split for use INSIDE the mm lock. `node` must
+// come from vma_node_alloc(); it is consumed on success, still owned by the
+// caller on failure.
+vma_t *vma_node_alloc(void);
+int vma_split_using(mm_struct_t *mm, vma_t *vma, uint64_t addr, vma_t *node);
+
+// #522 step 2: acquire/release the mm's VMA-list lock (irqsave). EVERY read or
+// write of mm->vma_list must be inside one of these. mm_lock() returns the
+// saved interrupt flags to hand back to mm_unlock().
+uint64_t mm_lock(mm_struct_t *mm);
+void mm_unlock(mm_struct_t *mm, uint64_t flags);
+
+// Merge adjacent VMAs if possible. CALLER HOLDS mm_lock(mm).
+// WARNING: on the merge-with-previous path this FREES the vma_t you passed in
+// and still returns 0. Treat `vma` as consumed on return.
 int vma_merge(mm_struct_t *mm, vma_t *vma);
 
-// Remove and free VMA
+// Remove and free VMA. CALLER HOLDS mm_lock(mm).
 void vma_remove(mm_struct_t *mm, vma_t *vma);
 
-// Free all VMAs in memory map
+// Free all VMAs in memory map. Teardown only: called from mm_destroy() on an
+// mm whose refcount has already reached 0, i.e. one no other CPU can reach.
 void vma_free_all(mm_struct_t *mm);
 
 // ============================================
 // Memory Mapping (mmap)
 // ============================================
 
-// Map a region of virtual memory
-// Returns start address on success, (uint64_t)-1 on failure
+// Map an ANONYMOUS region of virtual memory. TAKES mm_lock() ITSELF; do not
+// call with it held. Returns the start address, or (uint64_t)-1 on failure.
+//
+// addr == 0  -> placed from the per-mm cursor inside the anonymous arena.
+// addr != 0  -> honoured at that address if it is a user address and the range
+//               is free. NEVER maps over an existing mapping: an occupied or
+//               out-of-bounds range FAILS. (`flags` MAP_FIXED is not
+//               distinguished; the userland libc heap relies on a plain
+//               explicit-address mmap being honoured.)
+// file != NULL -> refused: file-backed mmap is not implemented (#630), and a
+//               VMA_FILE VMA would be a region every access to which faults.
+//
+// Uses the CURRENT process's cr3 to punch identity backing out of the range.
 uint64_t do_mmap(mm_struct_t *mm, uint64_t addr, uint64_t length,
                  uint32_t prot, uint32_t flags, void *file, uint64_t offset);
 
-// Unmap a region of virtual memory
+// Unmap a region of virtual memory. TAKES mm_lock() ITSELF.
+// Clips/removes every VMA overlapping the range AND tears down the page tables
+// across the WHOLE range, including parts no VMA covered (the ELF image, the
+// brk heap and the user stack have no VMAs in this kernel). COW-aware, and
+// never hands the PMM a frame this address space does not own.
 int do_munmap(mm_struct_t *mm, uint64_t addr, uint64_t length);
 
-// Change protection of a memory region
+// Change protection of a memory region. TAKES mm_lock() ITSELF.
 int do_mprotect(mm_struct_t *mm, uint64_t addr, uint64_t length, uint32_t prot);
 
 // Synchronize memory-mapped file
@@ -206,8 +318,10 @@ int do_msync(mm_struct_t *mm, uint64_t addr, uint64_t length, int flags);
 // Heap Management (brk/sbrk)
 // ============================================
 
-// Set program break (heap end)
-// Returns new break on success, (uint64_t)-1 on failure
+// Set program break (heap end). TAKES mm_lock() ITSELF.
+// Returns new break on success, (uint64_t)-1 on failure.
+// NOTE: no caller today. proc/syscall.c's sys_brk() does its own eager
+// allocation and never touches the mm, which is why the brk heap has no VMA.
 uint64_t do_brk(mm_struct_t *mm, uint64_t addr);
 
 // Increment program break
@@ -260,8 +374,25 @@ void swap_get_stats(uint32_t *total, uint32_t *free, uint64_t *reads, uint64_t *
 // Create new memory map structure
 mm_struct_t *mm_create(void);
 
-// Destroy memory map and free all resources
+// Destroy memory map and free all resources. Unconditional: only safe to call
+// on an mm no other process_t has ever seen (fresh, still-being-built, or a
+// failed clone). Real teardown of a possibly-shared, already-live mm goes
+// through mm_put() below instead.
 void mm_destroy(mm_struct_t *mm);
+
+// #421 phase 5 follow-up: refcounted alternative to calling mm_destroy()
+// directly, for an mm a process_t may be SHARING (see mm_users above).
+// mm_get() bumps the count when a new process_t starts sharing an existing
+// mm (proc_clone()'s CLONE_VM thread path). mm_put() drops the count and
+// only calls mm_destroy() once it reaches 0, i.e. once the LAST process_t
+// referencing this mm has released it, regardless of which one (leader or
+// thread) happens to exit last. Callers are expected to hold whatever lock
+// guards concurrent mm teardown/lookup (process.c's g_proc_mm_lock, via
+// proc_mm_lock()/proc_mm_unlock()); neither function takes a lock itself.
+void mm_get(mm_struct_t *mm);
+void mm_put(mm_struct_t *mm);
+// #421 phase 7: refcount-decrement-and-detach; see demand.c.
+void *mm_put_detach(mm_struct_t *mm);
 
 // Clone memory map (for fork)
 mm_struct_t *mm_clone(mm_struct_t *src);

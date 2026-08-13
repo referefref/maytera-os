@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // gui_font.c - MayteraOS shared font picker (the ChooseFont common dialog).
 // See gui_font.h for the contract and the reasoning behind it (#351).
 #include "gui_font.h"
@@ -351,7 +355,8 @@ static void draw_list(dlg_t *d, gui_scroll_t *s, int x, int y, int w, int h,
         int fface = (i < g_nfam && g_fam[i].face[0] >= 0) ? g_fam[i].face[0] : 0;
         win_draw_text_ttf_ex(d->win, x + 6, ry + 3, lbl, fface, 14, FONT_STYLE_NORMAL, ink);
     }
-    gui_scroll_draw(d->win, s);
+    // The three lists are drawn inside list_frame(), i.e. on textbox_bg.
+    gui_scroll_draw_on(d->win, s, theme_color(THEME_COLOR_TEXTBOX_BG));
 }
 
 static const char *fam_label(int i, char *buf, int cap) {
@@ -384,7 +389,7 @@ static void draw_style_list(dlg_t *d) {
         }
         win_draw_text_ttf(d->win, STY_X + 6, ry + 3, f->style[i], 14, ink);
     }
-    gui_scroll_draw(d->win, &d->sty_s);
+    gui_scroll_draw_on(d->win, &d->sty_s, theme_color(THEME_COLOR_TEXTBOX_BG));
 }
 
 static void draw_size_list(dlg_t *d) {
@@ -410,7 +415,7 @@ static void draw_size_list(dlg_t *d) {
         snprintf(b, sizeof(b), "%d", g_sizes[i]);
         win_draw_text_ttf(d->win, SZ_X + 6, ry + 3, b, 14, ink);
     }
-    gui_scroll_draw(d->win, &d->sz_s);
+    gui_scroll_draw_on(d->win, &d->sz_s, theme_color(THEME_COLOR_TEXTBOX_BG));
 }
 
 // Resolve the current selection to something drawable.
@@ -423,6 +428,25 @@ static void cur_face(dlg_t *d, int *face, int *bits) {
     *bits = f->bits[d->sty_i];
 }
 
+// #711 loop 2 (D4, typography family): the preview box (PRE_Y/PRE_H, owned
+// by the dialog/modal family's geometry) was drawing the sample pinned to a
+// fixed top offset (PRE_Y+14) at a flat 44px size cap, so at the dialog's
+// own default selection (14pt, index 5 of g_sizes[]) the glyph occupies
+// only its own ~14-18px near the box's top-left and the remaining ~100px of
+// PRE_H's vertical span sits empty above the caption line - the "~150px
+// dead whitespace" the director's report measured. Fixed purely as
+// typography (line-height-driven fit + vertical centering, no change to
+// PRE_Y/PRE_H/M or any other box geometry, which stays this family's own):
+// the sample now scales up to fill the space actually available between the
+// top inset and the caption row (never past the user's own selected size,
+// so a small selection is never shown larger than it truly is) and is
+// centered within that band by its LINE HEIGHT, per this family's own
+// docs/UI_STYLE_GUIDE.md 4.5 rule ("vertical centering inside a fixed-height
+// area uses the role's line height, not its raw pixel size").
+#define PRE_CAP_SZ     12                       // caption row's own text size
+#define PRE_PAD_TOP    10                       // matches the existing M+10 left inset
+#define PRE_PAD_GAP     4                       // breathing room above the caption row
+
 static void draw_preview(dlg_t *d) {
     win_draw_rect(d->win, M, PRE_Y, DW - 2 * M, PRE_H, theme_color(THEME_COLOR_TEXTBOX_BG));
     gui_draw_rect_outline(d->win, M, PRE_Y, DW - 2 * M, PRE_H,
@@ -432,12 +456,37 @@ static void draw_preview(dlg_t *d) {
     cur_face(d, &face, &bits);
     int size = g_sizes[d->sz_i];
 
-    // Clamp the preview so a 72pt sample cannot spill out of the box. The
-    // selection keeps the real size; only the drawing is capped.
-    int draw_sz = size;
-    if (draw_sz > 44) draw_sz = 44;
+    // Band available to the big sample: from the top inset down to just
+    // above the caption row (whose own position is unchanged, still
+    // PRE_Y + PRE_H - 22, kept as a literal below so this stays a pure
+    // reflow of the SAME box, not a resize of it).
+    int band_top    = PRE_Y + PRE_PAD_TOP;
+    int band_bottom = PRE_Y + PRE_H - 22 - PRE_PAD_GAP;
+    int avail_h      = band_bottom - band_top;
+    if (avail_h < 11) avail_h = 11;             // renderer floor; never draw below it
 
-    win_draw_text_ttf_ex(d->win, M + 10, PRE_Y + 14, d->preview, face, draw_sz, bits,
+    // Fit by line height (round(sz*1.4)), never exceeding the user's actual
+    // selected size - this reclaims dead space for SMALL selections without
+    // ever showing a size the user did not pick.
+    int draw_sz = size;
+    int fit_sz  = (avail_h * 10) / 14;          // largest sz with round(sz*1.4) <= avail_h
+    if (draw_sz > fit_sz) draw_sz = fit_sz;
+    if (draw_sz < 11) draw_sz = 11;             // renderer's own AA-quality floor
+
+    // Also bound by the box's WIDTH so a long preview string at a large fit
+    // size does not spill past the right edge (unchanged box width, M+10
+    // inset each side).
+    int avail_w = (DW - 2 * M) - 20;
+    while (draw_sz > 11 &&
+           gui_ttf_render_width(d->preview, draw_sz) > avail_w) {
+        draw_sz--;
+    }
+
+    int line_h = (draw_sz * 14 + 5) / 10;       // round(draw_sz * 1.4)
+    int text_y = band_top + (avail_h - line_h) / 2;
+    if (text_y < band_top) text_y = band_top;
+
+    win_draw_text_ttf_ex(d->win, M + 10, text_y, d->preview, face, draw_sz, bits,
                          theme_color(THEME_COLOR_TEXTBOX_TEXT));
 
     // Name the resolved selection underneath, and say when a style is faked, so
@@ -449,7 +498,7 @@ static void draw_preview(dlg_t *d) {
                       ? g_fam[d->fam_i].style[d->sty_i] : "Regular";
     snprintf(cap, sizeof(cap), "%s  %s  %dpt%s", fam, sty, size,
              bits ? "   (synthesised style)" : "");
-    win_draw_text_ttf(d->win, M + 10, PRE_Y + PRE_H - 22, cap, 12,
+    win_draw_text_ttf(d->win, M + 10, PRE_Y + PRE_H - 22, cap, PRE_CAP_SZ,
                       theme_color(THEME_COLOR_LABEL_TEXT));
 }
 

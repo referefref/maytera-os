@@ -1,0 +1,43 @@
+# persist-extern.manifest - symbols for which a PRIVATE `extern` re-declaration
+# in a .c file is a BUILD FAILURE (kernel/tools/persist-extern-gate).
+#
+# Membership rule, so this list does not become a dumping ground: a symbol
+# belongs here if (a) its return value states whether bytes reached persistent
+# storage, and (b) the header that owns it marks it MUST_CHECK, or its return
+# type has changed and a stale private extern would bind silently.
+#
+# The kernel has ~960 private externs overall and this gate deliberately does
+# NOT care about them. A gate that fails on things nobody intends to fix is a
+# gate that gets switched off (#514).
+
+# --- the VFS description layer (fs/vfs.h) ---
+file_put
+file_flush
+file_write
+
+# --- filesystem write primitives ---
+blk_write                # fs/blockdev.h
+fat_write_file           # fs/fat.h
+fat_write                # fs/fat.h
+fat_write_sector         # fs/fat.h  (#742 changed its RETURN POLARITY)
+ext2_write_file          # fs/ext2.h
+ext2_append_file         # fs/ext2.h
+vfs_write_file           # fs/netfs.h
+exfat_write              # fs/exfat.h
+exfat_write_file         # fs/exfat.h
+exfat_sync               # fs/exfat.h
+xattr_set                # fs/xattr.h
+
+# --- config/state stores whose loss is silent data loss ---
+perms_sync               # fs/perms.h
+perms_sync_if_dirty      # fs/perms.h
+users_sync               # proc/users.h
+
+# --- the breadcrumb writers (#742) ---
+# bootlog_write went void -> int with 46 private externs live. Every one of them
+# would have kept compiling and linking against the old signature, and two of
+# them also had it non-variadic. This entry is the reason the gate exists.
+bootlog_write
+usblog_write
+audiolog_write
+bootlog_heartbeat

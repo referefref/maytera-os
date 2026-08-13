@@ -21,6 +21,12 @@
 #define TRACE_EPS      0.03125f   /* nudge back off a surface (1/32 unit)       */
 #define FLOOR_NORMAL_Z 0.7f       /* normal.z above this counts as "floor"      */
 #define MOVE_ITERS     4          /* slide/clip passes per move                 */
+/* #568: GoldSrc sv_stepsize equivalent. A vertical obstruction shorter than
+ * this (a stair riser, a curb, a low ledge) is auto-climbed by try_stepup()
+ * below instead of just blocking the mover outright - real CS maps (de_dust2
+ * has stairs into every bombsite, crates, window ledges) are unwalkable
+ * without this.                                                              */
+#define STEP_HEIGHT    18.0f
 
 /* ------------------------------------------------------------------ helpers  */
 static inline float fminf_(float a, float b){ return a < b ? a : b; }
@@ -368,17 +374,25 @@ int map_spawn_valid(World *w, vec3 spawn_pos)
                              SPAWN_MAX_DROP) < SPAWN_MAX_DROP;
 }
 
-/* --------------------------------------------------------- public: move+slide */
-int map_move_entity(World *w, Entity *ent, vec3 delta, float radius, float height)
+/* Core sweep+slide loop (up to MOVE_ITERS clip/bounce passes), shared by the
+ * real per-frame move in map_move_entity() below AND the speculative step-up
+ * trial moves in try_stepup() (#568). Slides `vel` from `start` through the
+ * world (box brushes, or the active BSP hull - see sweep_vs_world) and
+ * returns the final position.
+ *
+ * `vel_owner`: if non-NULL, its ->vel is ALSO clipped against each impact
+ * plane, exactly as the original inline loop here used to do (the "don't
+ * keep driving into the wall next frame" behaviour) - pass the real moving
+ * entity for an actual move. Pass NULL for a purely exploratory trial move
+ * (try_stepup's up/forward probes) so exploring a step attempt can never
+ * mutate real entity state, win or lose.
+ * `out_bumped`/`out_grounded`: optional out-params, OR'd in (never cleared)
+ * so a caller can accumulate across multiple slide_move() calls in one move. */
+static vec3 slide_move(World *w, vec3 start, vec3 vel, float hx, float hy,
+                       float height, Entity *vel_owner, int *out_bumped,
+                       int *out_grounded)
 {
-    if (!w || !ent) return 0;
-    const Level *lv = &w->level;
-    float hx = radius, hy = radius;
-    int   bumped = 0;
-    int   grounded = 0;
-
-    vec3  pos = ent->pos;
-    vec3  vel = delta;   /* remaining motion this frame                         */
+    vec3 pos = start;
 
     for (int iter = 0; iter < MOVE_ITERS; iter++) {
         float len2 = v3dot(vel, vel);
@@ -395,7 +409,7 @@ int map_move_entity(World *w, Entity *ent, vec3 delta, float radius, float heigh
             break;
         }
 
-        bumped = 1;
+        if (out_bumped) *out_bumped = 1;
 
         /* advance to just before the surface (leave a small epsilon gap)      */
         float adv = best_frac;
@@ -405,7 +419,7 @@ int map_move_entity(World *w, Entity *ent, vec3 delta, float radius, float heigh
         if (adv < 0.0f) adv = 0.0f;
         pos = v3add(pos, v3scale(vel, adv));
 
-        if (best_n.z > FLOOR_NORMAL_Z && vel.z < 0.0f) grounded = 1;
+        if (out_grounded && best_n.z > FLOOR_NORMAL_Z && vel.z < 0.0f) *out_grounded = 1;
 
         /* clip remaining velocity: subtract the component into the plane      */
         float into = v3dot(vel, best_n);
@@ -414,10 +428,115 @@ int map_move_entity(World *w, Entity *ent, vec3 delta, float radius, float heigh
 
         /* clip the entity's stored velocity on the same plane so we don't keep
          * driving into the wall next frame                                    */
-        if (into < 0.0f) {
-            ent->vel = v3sub(ent->vel, v3scale(best_n, v3dot(ent->vel, best_n)));
+        if (vel_owner && into < 0.0f) {
+            vel_owner->vel = v3sub(vel_owner->vel, v3scale(best_n, v3dot(vel_owner->vel, best_n)));
         }
     }
+
+    return pos;
+}
+
+/* #568: GoldSrc-style step-up (the fix for "can't climb stairs / gets stuck on
+ * ledges" - real CS maps like de_dust2 are laced with stairs, crates and
+ * window ledges, none of which the plain slide_move() above can climb since
+ * a stair riser is just a short vertical wall to it). Classic algorithm
+ * (Quake's SV_WalkMove / PM_StepSlideMove): if the flat move got blocked,
+ * retry from the SAME start point by tracing up to STEP_HEIGHT, sliding the
+ * original horizontal delta from there, then tracing back down onto a floor;
+ * take that result only if it made MORE horizontal progress than the flat
+ * move AND actually found a floor. Reuses sweep_vs_world/slide_move (the same
+ * primitives the flat move uses) rather than a second, parallel stairs-only
+ * mover.
+ *
+ * Deliberately does NOT special-case walking DOWN off a ledge: dropping off
+ * an edge is already correct once the hull trace itself is correct (#568's
+ * other fix, bsp.rs's side-based normal) - gravity plus the ordinary sweep
+ * across subsequent frames carries the mover down and off just fine. A
+ * down-trace here that finds NO floor within STEP_HEIGHT is treated as
+ * exactly that case (a real ledge, not a stair) and is deliberately left
+ * alone rather than "helpfully" snapping the mover down onto whatever is
+ * eventually beneath it - that would let a player glide over drop-offs the
+ * real map intends to be a fall.                                            */
+static vec3 try_stepup(World *w, vec3 start, vec3 delta, vec3 flat_pos,
+                       float hx, float hy, float height,
+                       int *out_bumped, int *out_grounded)
+{
+    float hlen2 = delta.x * delta.x + delta.y * delta.y;
+    if (hlen2 < 1e-8f) return flat_pos;          /* no horizontal intent         */
+    if (!out_bumped || !*out_bumped) return flat_pos; /* flat move already clear */
+
+    /* Only step up a mover that was already standing on/near a floor - reuses
+     * the SAME probe map_spawn_valid() trusts for "is there floor here".
+     * An airborne mover (mid-jump, falling) must never be snapped onto a
+     * ledge mid-flight.                                                       */
+    if (map_box_drop_dist(w, start, hx, height, STEP_HEIGHT + TRACE_EPS) >=
+        STEP_HEIGHT + TRACE_EPS)
+        return flat_pos;
+
+    /* 1. up: how far can we rise before hitting a ceiling/overhang?           */
+    float up_frac = 1.0f; vec3 up_n = v3(0,0,0);
+    vec3 up_delta = v3(0, 0, STEP_HEIGHT);
+    if (sweep_vs_world(w, start, up_delta, hx, hy, height, &up_frac, &up_n)) {
+        float back = TRACE_EPS / STEP_HEIGHT;
+        up_frac -= back;
+        if (up_frac < 0.0f) up_frac = 0.0f;
+    }
+    float up_dist = STEP_HEIGHT * up_frac;
+    if (up_dist < 1.0f) return flat_pos;         /* essentially no headroom     */
+    vec3 up_pos = v3add(start, v3(0, 0, up_dist));
+
+    /* 2. forward: slide the ORIGINAL horizontal delta from the raised start.
+     * NULL vel_owner: purely exploratory, must not mutate ent->vel.           */
+    vec3 fwd_delta = v3(delta.x, delta.y, 0.0f);
+    vec3 fwd_pos = slide_move(w, up_pos, fwd_delta, hx, hy, height, 0, 0, 0);
+
+    /* 3. down: settle back onto a floor. Capped at up_dist (+ a hair), so this
+     * can only climb UP to a step - never step DOWN a ledge (see the doc
+     * comment above: that stays gravity's job across subsequent frames).      */
+    float down_frac = 1.0f; vec3 down_n = v3(0,0,0);
+    vec3 down_delta = v3(0, 0, -(up_dist + TRACE_EPS * 2.0f));
+    int down_hit = sweep_vs_world(w, fwd_pos, down_delta, hx, hy, height, &down_frac, &down_n);
+    if (!down_hit || down_n.z <= FLOOR_NORMAL_Z) {
+        /* no floor within reach on the far side: a genuine ledge/drop-off,
+         * not a step - do NOT paper over it.                                  */
+        return flat_pos;
+    }
+    vec3 down_pos = v3add(fwd_pos, v3scale(down_delta, down_frac));
+
+    /* only take the stepped result if it made MORE horizontal progress than
+     * the flat move - otherwise "stepping" is pointless motion (e.g. a wall
+     * short enough to technically fit the up-trace but that isn't a stair).   */
+    float dx_step = down_pos.x - start.x, dy_step = down_pos.y - start.y;
+    float dx_flat = flat_pos.x - start.x, dy_flat = flat_pos.y - start.y;
+    float d2_step = dx_step * dx_step + dy_step * dy_step;
+    float d2_flat = dx_flat * dx_flat + dy_flat * dy_flat;
+    if (d2_step <= d2_flat + 1.0f) return flat_pos;
+
+    if (map_box_solid(w, down_pos, hx, height)) return flat_pos;   /* safety net */
+
+    if (out_grounded) *out_grounded = 1;
+    if (out_bumped) *out_bumped = 1;
+    return down_pos;
+}
+
+/* --------------------------------------------------------- public: move+slide */
+int map_move_entity(World *w, Entity *ent, vec3 delta, float radius, float height)
+{
+    if (!w || !ent) return 0;
+    const Level *lv = &w->level;
+    float hx = radius, hy = radius;
+    int   bumped = 0;
+    int   grounded = 0;
+
+    vec3  start = ent->pos;
+    vec3  pos = slide_move(w, start, delta, hx, hy, height, ent, &bumped, &grounded);
+
+    /* #568: stairs/ledges up to STEP_HEIGHT are auto-climbed rather than just
+     * blocking the mover - see try_stepup()'s doc comment. Only attempted
+     * when the flat slide above actually got blocked (it also early-outs on
+     * !bumped and on a purely vertical delta), so a clear path never pays
+     * for the extra probes.                                                  */
+    pos = try_stepup(w, start, delta, pos, hx, hy, height, &bumped, &grounded);
 
     /* Push out of any brush we ended up embedded in (numerical safety net).
      * 4 passes (was 2): the built-in levels intentionally overlap wall brushes
@@ -470,6 +589,24 @@ int map_move_entity(World *w, Entity *ent, vec3 delta, float radius, float heigh
             pos.z += dir * TRACE_EPS * 2.0f;
             bumped = 1;
             if (pass == 3) dir = -1.0f;
+        }
+
+        /* #568: the Z-only nudge above cannot resolve a HORIZONTAL embed (e.g.
+         * shoved sideways into a wall by the entity-vs-entity push below on a
+         * PRIOR call, or a corner the sweep grazed) since bsp_hull_point_solid
+         * exposes no penetration depth/axis to push along - unlike the
+         * box-brush pushout above, which can compute one. Try the 4 compass
+         * directions too, each in bounded TRACE_EPS steps, so a player is
+         * never left visibly clipped into a wall on an imported map either.
+         * Bounded at 4*8=32 point-solid queries total: never a spin (#426).  */
+        if (bsp_hull_point_solid(pos)) {
+            vec3 dirs[4] = { v3(1,0,0), v3(-1,0,0), v3(0,1,0), v3(0,-1,0) };
+            for (int d = 0; d < 4 && bsp_hull_point_solid(pos); d++) {
+                vec3 probe = pos;
+                for (int pass = 0; pass < 8 && bsp_hull_point_solid(probe); pass++)
+                    probe = v3add(probe, v3scale(dirs[d], TRACE_EPS * 2.0f));
+                if (!bsp_hull_point_solid(probe)) { pos = probe; bumped = 1; }
+            }
         }
     }
 

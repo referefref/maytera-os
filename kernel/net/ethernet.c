@@ -129,7 +129,13 @@ int eth_receive(void) {
     for (int i = 0; i < eth_handler_count; i++) {
         if (eth_handlers[i].type == type && eth_handlers[i].handler) {
             // kprintf("[ETH] Calling handler for type 0x%04x\n", type);
-            eth_handlers[i].handler(header->src, rx_buffer + ETH_HEADER_SIZE,
+
+            // #524: a frame reached a protocol handler (IP -> TCP/UDP). Wake any
+            // process blocked in a BSD socket recv/accept/connect so it re-checks
+            // readiness immediately instead of waiting out its poll slice. Safe
+            // from net_lock / cli context (touches only the wq's own spinlock).
+            extern void socket_net_wake(void);
+            socket_net_wake();            eth_handlers[i].handler(header->src, rx_buffer + ETH_HEADER_SIZE,
                                     length - ETH_HEADER_SIZE);
             return 1;
         }

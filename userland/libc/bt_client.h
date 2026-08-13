@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // bt_client.h - userland Bluetooth client + MOCK backend for the UI (#372)
 // =============================================================================
 // The Settings "Bluetooth" panel and the tray indicator code against THIS

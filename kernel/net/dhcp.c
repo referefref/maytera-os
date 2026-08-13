@@ -8,6 +8,7 @@
 #include "../string.h"
 #include "../cpu/isr.h"
 #include "../sync/spinlock.h"   // #522: atomic_cas64() for the timeout claim
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 extern uint32_t g_timer_hz;
 
@@ -104,7 +105,7 @@ static uint32_t dhcp_dns = 0;
 // Proof with ZERO kernel changes: booting the same kernel with
 // `-global kvm-pit.lost_tick_policy=discard` makes the retry spacing snap from
 // 19ms to a correct 5.07s and DORA completes (DISCOVER/OFFER/REQUEST/ACK, lease
-// <LAB_HOST> bound and used). The hypervisor flag is a DIAGNOSTIC, not our fix:
+// 192.0.2.1 bound and used). The hypervisor flag is a DIAGNOSTIC, not our fix:
 // it costs guest clock accuracy under load, and MayteraOS must not depend on the
 // hypervisor being configured a particular way.
 //
@@ -291,38 +292,49 @@ int dhcp_parse_c(const uint8_t *buf, uint32_t len, dhcp_parsed_t *out) {
     uint32_t subnet = 0, router = 0, dns = 0, lease = 0, server_id = 0;
     uint8_t  hsub = 0, hrtr = 0, hdns = 0, hlease = 0, hsid = 0;
 
-    // VERBATIM option walk (old dhcp_parse_options): FIXED 308-byte window that
-    // does NOT consult `len` - this is the reachable over-read the Rust confines.
-    // The lease (option 51) case is new (the old walk did not extract it) but is
-    // structurally identical to the other 4-byte options and does not change the
-    // bounds behavior; it is parsed identically by both the C ref and the Rust.
+    // Option TLV walk. #488 HARDENING (2026-07-26): brought up to the bounds
+    // safety of dhcp_parse_rs (rustkern/dhcp.rs, live under -DRUST_DHCP). The OLD
+    // walk ran the FIXED 308-byte options[] window WITHOUT consulting `len`, so a
+    // spoofed runt / non-END-terminated / lying-length OFFER read PAST the
+    // received bytes (reachable OOB read: the fixed-308 window is why opt[i+1] at
+    // i==307, or a 4-byte value read after checking only olen>=4, could leave the
+    // packet). This is the C FALLBACK that ships when -DRUST_DHCP is dropped, so
+    // it is hardened directly here (unlike elf_validate_full_c, which keeps its
+    // gaps as a separate differential reference). CONFINEMENT only: the walk now
+    // visits [240, min(len,548)) == the C's own fixed window INTERSECTED with the
+    // received bytes, and gates every read on the bytes ACTUALLY received, so it
+    // TERMINATES instead of over-reading. On any well-formed reply (every value
+    // byte present) it is byte-identical to the old walk. `avail` is the option-
+    // area byte count; len >= 240 is guaranteed by the header gate above.
     const uint8_t *opt = pkt->options;
-    int i = 0;
-    while (i < 308 && opt[i] != DHCP_OPT_END) {
-        if (opt[i] == DHCP_OPT_PAD) {
-            i++;
-            continue;
-        }
+    uint32_t avail = len - 240;                 // options[] starts at offset 240
+    uint32_t win   = (avail < 308) ? avail : 308;
+    uint32_t i = 0;
+    while (i < win) {
         uint8_t type = opt[i];
+        if (type == DHCP_OPT_PAD) { i++; continue; }
+        if (type == DHCP_OPT_END) break;
+        if (i + 1 >= avail) break;              // length byte not received
         uint8_t olen = opt[i + 1];
+        uint32_t vstart = i + 2;
         switch (type) {
             case DHCP_OPT_MSG_TYPE:
-                if (olen >= 1) msg_type = opt[i + 2];
+                if (olen >= 1 && vstart < avail) msg_type = opt[vstart];
                 break;
             case DHCP_OPT_SUBNET_MASK:
-                if (olen >= 4) { uint32_t t; memcpy(&t, &opt[i + 2], 4); subnet    = ntohl(t); hsub = 1; }
+                if (olen >= 4 && vstart + 4 <= avail) { uint32_t t; memcpy(&t, &opt[vstart], 4); subnet    = ntohl(t); hsub = 1; }
                 break;
             case DHCP_OPT_ROUTER:
-                if (olen >= 4) { uint32_t t; memcpy(&t, &opt[i + 2], 4); router    = ntohl(t); hrtr = 1; }
+                if (olen >= 4 && vstart + 4 <= avail) { uint32_t t; memcpy(&t, &opt[vstart], 4); router    = ntohl(t); hrtr = 1; }
                 break;
             case DHCP_OPT_DNS:
-                if (olen >= 4) { uint32_t t; memcpy(&t, &opt[i + 2], 4); dns       = ntohl(t); hdns = 1; }
+                if (olen >= 4 && vstart + 4 <= avail) { uint32_t t; memcpy(&t, &opt[vstart], 4); dns       = ntohl(t); hdns = 1; }
                 break;
             case DHCP_OPT_LEASE_TIME:
-                if (olen >= 4) { uint32_t t; memcpy(&t, &opt[i + 2], 4); lease     = ntohl(t); hlease = 1; }
+                if (olen >= 4 && vstart + 4 <= avail) { uint32_t t; memcpy(&t, &opt[vstart], 4); lease     = ntohl(t); hlease = 1; }
                 break;
             case DHCP_OPT_SERVER_ID:
-                if (olen >= 4) { uint32_t t; memcpy(&t, &opt[i + 2], 4); server_id = ntohl(t); hsid = 1; }
+                if (olen >= 4 && vstart + 4 <= avail) { uint32_t t; memcpy(&t, &opt[vstart], 4); server_id = ntohl(t); hsid = 1; }
                 break;
         }
         i += 2 + olen;
@@ -559,7 +571,7 @@ int dhcp_discover(void) {
     // (RFC 2131 4.1: "chosen by the client"), not a bump of a constant seed.
     // dhcp_init() ran `dhcp_xid = timer_ticks ^ 0xDEADBEEF` BEFORE sti(), when
     // timer_ticks is always 0, so every MayteraOS box on earth started at
-    // 0xDEADBEEF and sent its first DISCOVER as 0xDEADBEF0. OBSERVED on the build server
+    // 0xDEADBEEF and sent its first DISCOVER as 0xDEADBEF0. OBSERVED on the the build host
     // LAN: two independent MayteraOS VMs (bc:24:11:5f:d9:25 and bc:24:11:a9:3b:1e)
     // broadcasting DISCOVERs with the IDENTICAL xid 0xdeadbef0 at the same time.
     // Two consequences, both real:
@@ -579,6 +591,12 @@ int dhcp_discover(void) {
         if (x == 0 || x == 0xDEADBEEF) x ^= (uint32_t)timer_ticks ^ 0x5A5A5A5Au;
         dhcp_xid = x;
     }
+    // MAYTERA-SEC-2026-0015 verifiability: record the per-transaction random xid
+    // once at DORA start (rare event, existing kprintf path). Proves the xid is
+    // fresh + unpredictable per transaction and is NOT the historical constant
+    // 0xdeadbef0. Keep permanent so a future regression to a fixed/seeded xid is
+    // visible in the serial/BOOTLOG.
+    kprintf("[DHCP] DORA xid=%08x\n", (unsigned)dhcp_xid);
 
     dhcp_state = DHCP_STATE_DISCOVERING;   // publish LAST
 
@@ -715,6 +733,19 @@ int dhcp_get_state(void) {
 // Check if bound
 int dhcp_is_bound(void) {
     return dhcp_state == DHCP_STATE_BOUND;
+}
+
+// #431: reset the DHCP client to IDLE so a fresh DORA can run after a carrier
+// down->up edge (cable replug / network change). dhcp_discover() early-returns
+// when already BOUND, so a relink that still holds an old lease could otherwise
+// never re-acquire. Clears the transaction/offer/retry state only; it sends
+// nothing (the caller invokes dhcp_discover(), which also drops the live IP via
+// ip_set_address(0)). Call from top-level context (the net worker), NEVER from
+// inside a receive callback.
+void dhcp_reset(void) {
+    dhcp_state = DHCP_STATE_IDLE;
+    dhcp_offered_ip = 0;
+    dhcp_retries = 0;
 }
 
 // Get assigned IP
@@ -1091,7 +1122,6 @@ static int dhcp_build_long(uint8_t *buf, uint32_t *seed) {
 }
 
 void dhcp_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     // 2 KiB arena: big enough that Part 2's fixed-308 C over-read stays inside
     // OUR allocation (options[] tail is at offset 240+308 == 548 < 2048), so
     // demonstrating the over-read can never fault the boot.
@@ -1194,7 +1224,7 @@ void dhcp_rust_selftest(void) {
             // received options: just the message type, NO END terminator.
             buf[pos++] = DHCP_OPT_MSG_TYPE; buf[pos++] = 1; buf[pos++] = DHCP_OFFER;
             uint32_t kind = dhcpdiff_rng(&s2) % 3;
-            uint32_t poison = 0xC0A80101u + r;   // a distinctive "config" value
+            uint32_t poison = 0xC0000201u + r;   // a distinctive "config" value
             int runt_len;
             if (kind == 0) {
                 // runt: len ends right after msg-type, no END. Poison sits beyond.
@@ -1221,18 +1251,22 @@ void dhcp_rust_selftest(void) {
             int crc = dhcp_parse_c(buf, (uint32_t)runt_len, &co);
             int rrc = dhcp_parse_rs(buf, (uint32_t)runt_len, &ro);
             sec_n++;
-            // The C over-reads iff it (accepts and) extracts an option the Rust,
-            // confined to len, did not - i.e. the parsed views differ on the
-            // poison-derived field.
+            // #488 REGRESSION GUARD (2026-07-26). dhcp_parse_c is now hardened to
+            // the same bounds as dhcp_parse_rs, so on these attacker-spoofable
+            // runt / lying-length / mid-value-truncated OFFERs the C fallback must
+            // CONFINE to `len` and never adopt a poison byte past the received
+            // length. A surviving divergence (both OK yet differing parsed view)
+            // would mean the C over-read again == the #488 vuln regressed.
             if (crc == DHCP_PARSE_OK && rrc == DHCP_PARSE_OK && dhcp_parsed_eq(crc, &co, rrc, &ro)) {
                 overreads++;
             }
         }
-        kprintf("[RUST-SEC] dhcp: verbatim C over-read past received len on %u/%u crafted runt/lying-length OFFERs "
-                "(fixed-308 walk ignores len -> attacker-adjacent bytes parsed as config); Rust confined %u/%u\n",
-                overreads, sec_n, sec_n, sec_n);
-        bootlog_write("[RUST-SEC] dhcp: C over-read past len on %u/%u crafted OFFERs (fixed-308 ignores len); Rust confined %u/%u (REACHABLE over-read removed)",
-                      overreads, sec_n, sec_n, sec_n);
+        const char *sverdict = (overreads == 0) ? "PASS" : "FAIL";
+        kprintf("[RUST-SEC] dhcp: #488 C fallback confined on %u/%u crafted runt/lying-length OFFERs "
+                "(dhcp_parse_c now bounds every read to len, matching Rust); residual over-reads=%u -> %s\n",
+                sec_n, sec_n, overreads, sverdict);
+        bootlog_write("[RUST-SEC] dhcp: #488 C fallback confined %u/%u crafted OFFERs residual over-reads=%u -> %s",
+                      sec_n, sec_n, overreads, sverdict);
     }
 
     // Part 3: RDTSC micro-benchmark over a fixed well-formed OFFER. LIGHT: 5k

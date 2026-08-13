@@ -6,6 +6,7 @@
 #include "../string.h"
 #include "../mm/heap.h"
 #include "../serial.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // #404 batch-2 / MAYTERA-SEC-2026-0011: on-disk xattr entry-walk seam. The
 // strangler flag -DRUST_XATTR routes the live get/list walk to the Rust port
@@ -850,7 +851,6 @@ int64_t sys_listxattr(const char *path, char *list, size_t size) {
 // one [RUST-DIFF] + one [RUST-SEC] xattr_entry line to serial + /BOOTLOG.
 // ============================================================================
 void xattr_entry_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     // One well-formed 2-entry block (entries region only).
     static const uint8_t good[] = {
         // entry0: name_len=5 value_len=3 ns=0 resv=0 | "user\0" (5 bytes) | val

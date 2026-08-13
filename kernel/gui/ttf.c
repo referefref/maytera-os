@@ -17,7 +17,6 @@
 #include "../video/framebuffer.h"
 #include "../cpu/mono.h"
 
-extern void bootlog_write(const char *fmt, ...);
 
 // ============================================================================
 // Configure stb_truetype for freestanding kernel environment
@@ -65,6 +64,7 @@ extern double fabs(double x);
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
 #include "stb_truetype.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 #pragma GCC diagnostic pop
 
 // ============================================================================
@@ -77,7 +77,7 @@ extern double fabs(double x);
 // Glyph cache (per size, per face)
 // ============================================================================
 #define MAX_CACHED_GLYPHS 128
-#define NUM_SIZE_CACHES   8
+#define NUM_SIZE_CACHES   10
 
 typedef struct {
     int codepoint;
@@ -120,7 +120,16 @@ static const int size_cache_sizes[NUM_SIZE_CACHES] = {
     20,              // browser h3
     TTF_SIZE_LARGE,  // 24
     28,              // browser h1
-    TTF_SIZE_XLARGE  // 32
+    TTF_SIZE_XLARGE, // 32
+    // #569: DISPLAY sizes. get_size_cache() snaps every request to the CLOSEST
+    // entry in this table, so before these existed a request for a 64px or
+    // 100px face silently rendered at 32px - which is why the login/lock clock
+    // looked small no matter what size the caller asked for (the userland
+    // compositor hits the same renderer through SYS_DRAW_TTF, so its "size 64"
+    // clock was really 32 too). Two extra slots cost ~5 KB of glyph cache per
+    // face and unlock genuine display-size text.
+    48,              // display small
+    96               // display large (login / lock clock)
 };
 
 static size_cache_t *get_size_cache(font_face_t *f, int size) {
@@ -801,6 +810,26 @@ int ttf_get_kerning(int cp1, int cp2, int size) {
     return ttf_get_kerning_f(g_active, cp1, cp2, size);
 }
 
+// #589: single shared per-glyph cursor step used by ttf_measure_string() AND
+// every draw path (ttf_draw_string, sys_win_draw_text_ttf[_ex]). Because all of
+// them advance the cursor by THIS one function, measured width == drawn width by
+// construction (the #575 kerning fix is now structural, not four hand-kept copies).
+// step = the glyph's cached (styled) advance every drawer already uses, + the
+// kerning to next_cp. g==NULL (glyph unavailable) falls back to size/2 as the
+// draw paths historically did; a zero-advance glyph falls back to the recomputed
+// advance, matching sys_win_draw_text_ttf's original 'g->advance ? : ' guard.
+int ttf_cursor_step_f(int face, const ttf_glyph_t *g, int cp, int next_cp, int size) {
+    int step;
+    if (!g)               step = size / 2;
+    else if (g->advance)  step = g->advance;
+    else                  step = ttf_get_advance_f(face, cp, size);
+    if (next_cp)          step += ttf_get_kerning_f(face, cp, next_cp, size);
+    return step;
+}
+int ttf_cursor_step(const ttf_glyph_t *g, int cp, int next_cp, int size) {
+    return ttf_cursor_step_f(g_active, g, cp, next_cp, size);
+}
+
 // ============================================================================
 // Convenience framebuffer drawing (default face, used by the kernel desktop)
 // ============================================================================
@@ -828,8 +857,9 @@ void ttf_draw_string(int x, int y, const char *str, int size, uint32_t color) {
             continue;
         }
         ttf_glyph_t *glyph = ttf_get_glyph((unsigned char)str[i], size, TTF_STYLE_NORMAL);
+        int next = str[i + 1] ? (unsigned char)str[i + 1] : 0;   // #589
         if (!glyph || !glyph->bitmap) {
-            cursor_x += glyph ? glyph->advance : (size / 2);
+            cursor_x += ttf_cursor_step(glyph, (unsigned char)str[i], next, size);   // #589
             continue;
         }
         int gx = cursor_x + glyph->xoff;
@@ -854,9 +884,8 @@ void ttf_draw_string(int x, int y, const char *str, int size, uint32_t color) {
                 }
             }
         }
-        cursor_x += glyph->advance;
-        if (str[i + 1])
-            cursor_x += ttf_get_kerning((unsigned char)str[i], (unsigned char)str[i + 1], size);
+        // #589: one shared cursor-step (advance + kerning) for measure and all draws
+        cursor_x += ttf_cursor_step(glyph, (unsigned char)str[i], next, size);
     }
 }
 
@@ -864,9 +893,12 @@ int ttf_measure_string(const char *str, int size) {
     if (!ttf_ready || !str) return 0;
     int width = 0;
     for (int i = 0; str[i]; i++) {
-        width += ttf_get_advance((unsigned char)str[i], size);
-        if (str[i + 1])
-            width += ttf_get_kerning((unsigned char)str[i], (unsigned char)str[i + 1], size);
+        // #589: measure through the SAME shared cursor-step every draw path uses,
+        // resolving the glyph exactly as a normal-style active-face draw would, so
+        // measured width == drawn width by construction (structural #575).
+        ttf_glyph_t *g = ttf_get_glyph((unsigned char)str[i], size, TTF_STYLE_NORMAL);
+        width += ttf_cursor_step(g, (unsigned char)str[i],
+                                 str[i + 1] ? (unsigned char)str[i + 1] : 0, size);
     }
     return width;
 }

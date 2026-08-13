@@ -1,0 +1,607 @@
+598 docs/web/hardening.html
+<!DOCTYPE html>
+<html lang="en" class="no-js">
+<head>
+<meta charset="utf-8">
+<script>document.documentElement.className = document.documentElement.className.replace("no-js", "js");</script>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Hardening &amp; Exploit Mitigations &middot; MayteraOS Docs</title>
+<meta name="description" content="What MayteraOS actually enforces today: PIE, ASLR, W^X, stack canaries, SMEP, syscall pointer validation and TLS certificate validation, each with the evidence and the gaps.">
+<meta property="og:title" content="Hardening &amp; Exploit Mitigations &middot; MayteraOS Docs">
+<meta property="og:description" content="Every hardening claim with its verification evidence and an honest status: enforced, partial, or planned.">
+<meta property="og:type" content="article">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<link rel="stylesheet" href="../css/style.css">
+<link rel="icon" type="image/png" sizes="32x32" href="../img/favicon-32.png">
+<link rel="icon" type="image/png" sizes="64x64" href="../img/favicon-64.png">
+<link rel="apple-touch-icon" href="../img/favicon-180.png">
+<style>
+/* Status pills. Scoped to this page; nothing else on the site uses them. */
+.st{display:inline-block;padding:.1em .6em;border-radius:999px;font-size:.78em;
+    font-weight:600;letter-spacing:.02em;white-space:nowrap;line-height:1.5;
+    font-family:"IBM Plex Mono",ui-monospace,monospace;border:1px solid currentColor}
+.st-on{color:#0b6b3a;background:rgba(16,150,80,.12)}
+.st-part{color:#8a5a00;background:rgba(200,140,0,.14)}
+.st-plan{color:#5a5a68;background:rgba(110,110,130,.14)}
+.st-no{color:#8a2a2a;background:rgba(180,50,50,.12)}
+@media (prefers-color-scheme:dark){
+  .st-on{color:#5fd39a;background:rgba(16,150,80,.18)}
+  .st-part{color:#e6b455;background:rgba(200,140,0,.18)}
+  .st-plan{color:#a6a6b8;background:rgba(140,140,165,.18)}
+  .st-no{color:#f08a8a;background:rgba(180,50,50,.18)}
+}
+.claims{width:100%;border-collapse:collapse;font-size:.94rem}
+.claims th,.claims td{text-align:left;vertical-align:top;padding:.55rem .7rem;
+    border-bottom:1px solid rgba(128,128,150,.28)}
+.claims th{font-weight:600;white-space:nowrap}
+.claims td:nth-child(2){white-space:nowrap}
+.tablewrap{overflow-x:auto;margin:1.2rem 0}
+.keynum{display:flex;flex-wrap:wrap;gap:1.4rem;margin:1.4rem 0;padding:1rem 1.2rem;
+    border:1px solid rgba(128,128,150,.3);border-radius:10px}
+.keynum div{min-width:8rem}
+.keynum .n{display:block;font-family:"Space Grotesk",system-ui,sans-serif;
+    font-size:1.6rem;font-weight:700;line-height:1.1}
+.keynum .l{display:block;font-size:.82rem;opacity:.75;margin-top:.2rem}
+</style>
+</head>
+<body>
+<a class="skip" href="#doc">Skip to content</a>
+
+<header class="menubar" id="top">
+  <a class="brand" href="../index.html" aria-label="MayteraOS home">
+    <img class="brand-mark" src="../img/logo-mark-light.png" alt="" aria-hidden="true" width="30" height="30">
+    <span class="brand-name">MayteraOS</span>
+  </a>
+  <nav class="menu" id="menu" aria-label="Primary">
+    <a href="../index.html">Home</a>
+    <a href="../features.html">Features</a>
+    <a href="../docs.html" aria-current="page">Docs</a>
+    <a href="../changelog.html">Changelog</a>
+    <a href="../security.html">Security</a>
+    <a href="../about.html">About</a>
+    <a href="https://github.com/referefref/maytera-os" target="_blank" rel="noopener">GitHub</a>
+    <a class="menu-cta" href="../downloads.html">Get&nbsp;it</a>
+  </nav>
+  <button class="menu-toggle" aria-expanded="false" aria-controls="menu" aria-label="Menu">&#8801;</button>
+</header>
+
+<main>
+<div class="doc-layout" id="doc">
+  <aside class="doc-side" aria-label="Documentation">
+    <details class="doc-side-wrap" open>
+      <summary><span class="doc-side-toggle">Browse all docs &#9662;</span></summary>
+      <nav class="doc-side-nav">
+      <div class="side-group">Start here</div>
+      <a href="user-guide.html">User guide</a>
+      <div class="side-group">Overview</div>
+      <a href="deploy-architecture.html">Deployment &amp; Architecture</a>
+      <a href="ui-style-guide.html">UI Style Guide</a>
+      <a href="window-manager.html">Window Manager</a>
+      <a href="ui-primitives.html">UI Primitives</a>
+      <a href="notifications.html">Notifications</a>
+      <a href="settings.html">Settings</a>
+      <a href="theming.html">Theming</a>
+      <div class="side-group">System &amp; Networking</div>
+      <a class="active" href="hardening.html">Hardening &amp; Mitigations</a>
+      <a href="tls.html">TLS 1.2/1.3 Stack</a>
+      <a href="ssh.html">SSH Subsystem</a>
+      <a href="ssh-client.html">SSH Client Design</a>
+      <a href="browser.html">Web Browser</a>
+      <a href="security-audit.html">Security Audit</a>
+      <div class="side-group">Compatibility &amp; Apps</div>
+      <a href="doom.html">DOOM Port</a>
+      <a href="python.html">Python Support</a>
+      <a href="python-progress.html">Python Progress</a>
+      <a href="win16.html">Windows 3.x Compatibility</a>
+      <a href="win16-assessment.html">Win16 Assessment</a>
+      <a href="word6.html">Word Processor Bring-up</a>
+      <div class="side-group">AI &amp; Future</div>
+      <a href="llm-contracts.html">AI / LLM Contracts</a>
+      <a href="self-reprogrammable.html">Self-Reprogrammable OS</a>
+      <div class="side-group">Reference</div>
+      <a href="licenses.html">Licenses</a>
+      <a href="deployment-notes.html">Deployment Notes</a>
+      </nav>
+    </details>
+  </aside>
+  <article>
+    <p class="crumbs"><a href="../index.html">Home</a> / <a href="../docs.html">Docs</a> / Hardening &amp; Mitigations</p>
+    <div class="prose">
+
+<h1>Hardening and exploit mitigations</h1>
+
+<p class="fineprint">Measured against golden build 1713 (commit <code>6c0e140</code>), 2026-08-06.
+Individual figures on this page (binary counts, syscall counts, canary sites) will drift as the
+kernel and app fleet grow; the methodology and the honest ENFORCED / PARTIAL / PLANNED status of
+each mitigation is the part that should not.</p>
+
+<p><strong>This page is written to be falsifiable.</strong> Every claim below carries the
+evidence that supports it and a status of <span class="st st-on">ENFORCED</span>,
+<span class="st st-part">PARTIAL</span> or <span class="st st-plan">PLANNED</span>. Where a
+mitigation is missing, this page says it is missing rather than leaving it out. If you
+download an image you can re-run most of the checks yourself; the commands are in the last
+section.</p>
+
+<p>The reason for that framing is specific. This project has repeatedly found its own
+documentation describing code that did not run: a filesystem module with dozens of declared
+functions and none implemented, a driver that linked but had no caller, a pointer-validation
+routine with zero call sites, and a build script named after a job it did not do. A security
+feature with no caller provides no security. So the standard used here is not "the flag is in
+the makefile" but "the symbol is linked, something calls it, and it was observed doing work
+in a running system".</p>
+
+<div class="keynum" role="group" aria-label="Measured summary">
+  <div><span class="n">153 / 153</span><span class="l">shipped app and game binaries are position-independent</span></div>
+  <div><span class="n">0</span><span class="l">of those have a writable and executable segment</span></div>
+  <div><span class="n">132 / 132</span><span class="l">pointer-taking syscalls validated at one chokepoint</span></div>
+  <div><span class="n">1,317</span><span class="l">stack-canary check sites compiled into the kernel</span></div>
+</div>
+
+<h2>How each claim was checked</h2>
+
+<p>Source flags were treated as the weakest form of evidence and never as proof on their own.
+The order of preference was:</p>
+
+<ol>
+<li><strong>Observed in a running system.</strong> The current image was booted twice, on two
+  different virtual CPU models, and the serial console captured. Runtime counters and per-boot random
+  values come from those captures.</li>
+<li><strong>Measured on the shipped artifact.</strong> The image was mounted read-only and every
+  ELF binary inspected with <code>readelf</code>. Counts on this page are from that scan, not
+  from a source listing.</li>
+<li><strong>Proven reachable in the linked binary.</strong> Where the question was "does anything
+  call this", the answer came from the call graph of the linked kernel, not from the source.</li>
+<li><strong>Negative controls.</strong> A check that has never been observed failing is not
+  evidence. Where a build gate or self-test is cited, it is cited because it has been watched
+  going red on a deliberately broken input as well as green on a good one.</li>
+</ol>
+
+<h2>Status at a glance</h2>
+
+<div class="tablewrap">
+<table class="claims">
+<thead><tr><th>Mitigation</th><th>Status</th><th>Evidence, and the gap where there is one</th></tr></thead>
+<tbody>
+<tr><td>Position-independent executables</td><td><span class="st st-on">ENFORCED</span></td>
+<td>All 153 ELF binaries shipped under the application and game directories are <code>ET_DYN</code>. A build gate derives the launched set from the launcher sources and fails the build on a non-PIE launched binary.</td></tr>
+
+<tr><td>User image base randomisation</td><td><span class="st st-part">PARTIAL</span></td>
+<td>Every process load base is drawn per spawn from the system DRBG. Two boots produced 14 launches and 14 distinct 2&nbsp;MB-aligned bases. Ceiling is about 9 bits.</td></tr>
+
+<tr><td>Stack, heap and mapping randomisation</td><td><span class="st st-plan">PLANNED</span></td>
+<td>Not implemented. The kernel prints this itself at boot rather than leaving it to be inferred.</td></tr>
+
+<tr><td>Kernel base randomisation (KASLR)</td><td><span class="st st-plan">PLANNED</span></td>
+<td>Not implemented. The kernel adopts the firmware identity map, so this is structural work rather than a flag.</td></tr>
+
+<tr><td>W^X for user processes</td><td><span class="st st-on">ENFORCED</span></td>
+<td>The loader re-protects every page after relocation. Runtime counters report zero writable-and-executable pages for every live process, and a synthetic hostile image in the same boot reports a non-zero count, so the counter discriminates. A whole-image gate fails the build on any shipped binary with a writable and executable segment.</td></tr>
+
+<tr><td>Kernel stack canaries</td><td><span class="st st-on">ENFORCED</span></td>
+<td>1,317 check sites across 211 of 338 kernel objects. A fresh random guard is installed early in boot; it differed across the two captured boots.</td></tr>
+
+<tr><td>Userland stack canaries</td><td><span class="st st-on">ENFORCED</span></td>
+<td>Every non-vendored userland build file enables them, and the guard is seeded before <code>main</code>. <code>libc</code> itself is now compiled with them - it had been unprotected while linking into every application on the image - with a per-file exemption for <code>stack_guard.c</code>, which defines the handler and would otherwise check its own canary while reporting an overflow. A build gate now fails the build when any non-vendored build file omits the flag; it is proven to go red by removing one, and it names the offending file. 156 build files checked; 6 vendored game trees skipped and counted.</td></tr>
+
+<tr><td>NX / no-execute</td><td><span class="st st-on">ENFORCED</span></td>
+<td>Reported live at boot and required for the W^X counters above to mean anything.</td></tr>
+
+<tr><td>SMEP</td><td><span class="st st-on">ENFORCED</span> where the CPU has it</td>
+<td>Enabled by a control-register write that is then read back; the feature is only reported enabled if the read-back confirms it. On a CPU without SMEP the system says so instead of claiming it.</td></tr>
+
+<tr><td>SMAP</td><td><span class="st st-plan">PLANNED</span> (built, deliberately off)</td>
+<td>Fully implemented and wired, and deliberately not armed. Turning it on today would fault during normal operation. A lint refuses to build with the switch removed until the remaining work is done, so the ordering is enforced rather than remembered.</td></tr>
+
+<tr><td>Ring 0 / Ring 3 separation</td><td><span class="st st-on">ENFORCED</span></td>
+<td>User processes enter at ring 3 through descriptors built with privilege level 3, and return through <code>SYSRET</code> with the interrupt, trap, direction and alignment-check flags masked on entry.</td></tr>
+
+<tr><td>Syscall pointer validation</td><td><span class="st st-on">ENFORCED</span></td>
+<td>Validation runs at a single dispatcher chokepoint before the handler switch, driven by a machine-checked descriptor table. 132 of 132 pointer-taking syscalls are covered out of 275 total. The lint is a link prerequisite, so a new pointer-taking syscall with no descriptor fails the build.</td></tr>
+
+<tr><td>Filesystem permission enforcement</td><td><span class="st st-part">PARTIAL</span></td>
+<td>Implemented and self-tested at boot. It was inert as shipped because the desktop ran as root; the first-boot wizard now creates a uid-1000 account and disables autologin, which removes that premise. Whether the checks actually bite in a completed non-root session has NOT yet been re-measured, so this stays partial until it is.</td></tr>
+
+<tr><td>Non-root desktop session</td><td><span class="st st-part">PARTIAL</span></td>
+<td>A first-boot setup wizard (<code>/APPS/SETUP</code>) now creates a real account through <code>users_create_first_admin</code> and writes <code>autologin</code> off, verified end to end on a booted image: the new account appears in <code>SHADOW</code> as a <code>pbkdf2$50000$</code> record at a kernel-allocated uid, and <code>LOGIN.CFG</code> reads <code>autologin disabled</code>. Until that wizard is COMPLETED the machine still runs the shipped <code>autologin=root</code> session, so this is partial rather than enforced. That account-creation path existed before but had never once run on a shipping image, because <code>autologin=root</code> short-circuited the only caller.</td></tr>
+
+<tr><td>Password storage</td><td><span class="st st-on">ENFORCED</span></td>
+<td>PBKDF2-HMAC-SHA256, 50,000 iterations, 16-byte salt drawn from the system DRBG, self-describing records so the iteration count is upgradeable, with rate limiting and escalating lockout on the interactive path.</td></tr>
+<tr><td>Password strength policy</td><td><span class="st st-on">ENFORCED</span></td>
+<td>This entry used to read "there is no password-strength policy at all", and that was accurate: <code>user_set_password</code> refused only an empty password, and the only length rule was a 6-character minimum on the first-boot screen. There is now one policy, applied at the single chokepoint every password-setting path reaches (<code>user_set_password</code>), so <code>passwd</code>, Settings' Add User, <code>SYS_USER_CREATE_PW</code> and first-boot account creation all get the same rules: a minimum of 8 bytes, a rejection of low-variety strings and keyboard or counting runs, a rejection of any password containing the account name, and a check against the rockyou top 50,000. There is deliberately no character-class requirement, following NIST SP 800-63B, which finds composition rules make passwords worse rather than better. Rejections are distinguishable, so the UI says which rule was broken instead of "could not set password". The breached-password check is a membership test over a 66 KB table of sorted 32-bit truncated hashes: false negatives are structurally impossible for a listed password, and the false-positive rate is about 1 in 129,000, measured at 1 in 200,000 over random 12-character passwords. Honest limits: it is a membership test over one list, not a strength estimator, so it knows nothing about a password that is bad but absent from the list; it does no leetspeak normalisation; and it applies when a password is SET, so an account already holding a weak password keeps it until it is changed. PARTIAL rather than ENFORCED because the claim above has been proven at the source and linked-kernel level (the table is byte-identical inside the shipped <code>kernel.elf</code>, and all 49,999 list entries are refused by the kernel's own module in a host harness) but has NOT yet been observed running on a booted golden image.</td></tr>
+
+<tr><td>TLS certificate chain validation</td><td><span class="st st-on">ENFORCED</span></td>
+<td>Real signature verification against the issuer key, reachable from both the 1.3 and 1.2 handshakes, proven by the call graph of the linked kernel. Every failure path aborts the handshake; none warn and continue.</td></tr>
+
+<tr><td>TLS version and cipher floor</td><td><span class="st st-on">ENFORCED</span></td>
+<td>Only TLS 1.3 and 1.2 are reachable. On 1.2 exactly two forward-secret AEAD suites are accepted and anything else is refused. The RFC 8446 downgrade sentinel is checked first, before anything else the server said.</td></tr>
+
+<tr><td>Certificate revocation</td><td><span class="st st-no">NOT IMPLEMENTED</span></td>
+<td>No CRL and no OCSP consumption.</td></tr>
+
+<tr><td>Release secret gate</td><td><span class="st st-on">ENFORCED</span></td>
+<td>Byte-level, decompressing scanner run against the artifact about to be published. Its self-test is 25 of 25 and includes a negative control showing the older text-based gate passing a compressed artifact full of credentials.</td></tr>
+
+<tr><td>Audit logging</td><td><span class="st st-part">PARTIAL</span></td>
+<td>A kernel-side event sink exists and records an actor. It is not append-only and not tamper-evident.</td></tr>
+
+<tr><td>AI capability and consent gating</td><td><span class="st st-part">PARTIAL</span></td>
+<td>Real, enforced before tool dispatch, with a genuine consent dialog that denies by default on timeout. It runs inside the same unprivileged process it constrains, so it is a policy layer, not yet a trust boundary.</td></tr>
+
+<tr><td>Prompt-injection screening</td><td><span class="st st-plan">PLANNED</span></td>
+<td>A keyword matcher exists and self-tests, but nothing calls it, so nothing is screened today.</td></tr>
+
+<tr><td>Read-only kernel text after boot</td><td><span class="st st-plan">PLANNED</span></td>
+<td>Not implemented.</td></tr>
+
+<tr><td>Protected immutable security core</td><td><span class="st st-plan">PLANNED</span></td>
+<td>Design only. No code.</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>Position independence and address-space randomisation</h2>
+
+<p>Every application and game binary the system ships is a static position-independent
+executable. That was measured on the image rather than assumed from build files: 153 ELF
+files under the application and game directories, all of them <code>ET_DYN</code>, none
+<code>ET_EXEC</code>.</p>
+
+<p>This is held in place by a build gate rather than by convention. The gate derives the set of
+binaries the system actually launches by scanning the launcher sources at gate time, so adding
+an application to the desktop automatically puts it under the gate, and it refuses to report
+success if that scan comes back empty. A separate shape check encodes exactly the rule the
+kernel loader enforces, and its self-test proves it goes red on the real historical bad shape,
+a binary linked without the correct linker script.</p>
+
+<p><strong>The randomisation is modest and this page will not call it "full ASLR".</strong> The
+kernel places each position-independent image at a randomly chosen slot inside a 1&nbsp;GB
+window at 2&nbsp;MB granularity. That is at most 512 slots, about 9 bits, and the slot count
+shrinks as the image grows. Two boots of the current image produced seven process launches
+each and fourteen distinct load bases with no repeats. The bytes come from the system
+HMAC-DRBG, which is also what seeds password salts, rather than from a private mixer.</p>
+
+<p>The stack, the heap and the mapping region are <strong>not</strong> randomised, and neither
+is the kernel. The system reports this itself on every boot, in the same log line that reports
+what is randomised. That was a deliberate decision: an earlier version of this subsystem
+exposed a whole per-process randomisation interface that had never had a single caller, and
+that interface was deleted rather than left standing as an implied feature.</p>
+
+<h2>W^X</h2>
+
+<p>No page in a user process is both writable and executable. The loader maps segments
+writable, copies and relocates, and only then walks every page of the image and applies the
+protection derived from the segment flags, clearing write or setting no-execute as
+appropriate. That ordering is the only one that works given the loader writes through the
+target mapping.</p>
+
+<p>Three independent forms of evidence agree:</p>
+
+<ul>
+<li><strong>The binaries have the right shape.</strong> Applications link with a script that
+  emits a read-plus-execute segment and a separate read-write segment, instead of the single
+  read-write-execute segment they historically used.</li>
+<li><strong>The running system counts it.</strong> Each launch reports the number of pages made
+  read-only, the number made no-execute, and the number left writable and executable. The last
+  number is zero for every process observed. In the same boot, a synthetic deliberately
+  hostile image reports a non-zero count and is flagged, which is what makes the zero
+  meaningful.</li>
+<li><strong>A build gate enforces it.</strong> Every shipped ELF under the application and game
+  directories is inspected and the build fails if any has a writable and executable segment.</li>
+</ul>
+
+<p><strong>Known gap, stated because the gate's scope is narrower than "the image".</strong> The
+gate scans the application and game directories. One stale binary elsewhere on the image, left
+behind by an older build and never launched by anything, is still a non-PIE binary with a
+writable and executable segment. It is dead weight rather than an active component, but "no
+writable and executable binary anywhere on the image" would be an overstatement, so it is not
+made here.</p>
+
+<h2>Stack canaries</h2>
+
+<p>The kernel and userland have different postures and this page does not merge them.</p>
+
+<p><strong>Kernel.</strong> Built with <code>-fstack-protector-strong</code> and a global guard
+variable, because the kernel has no thread-local storage block for the compiler's default
+guard location. The instrumentation is real and was counted in the compiled objects rather
+than inferred from the flag: 1,317 calls to the failure handler across 211 of the 338 kernel
+objects. A random 64-bit guard is installed early in boot, before any protected frame that
+outlives the call exists, and the two captured boots produced different guards. There is a
+build variant that arms a deliberate 16-byte buffer overflow specifically so the canary can be
+watched catching it; it is never armed in a shipped image.</p>
+
+<p><strong>Userland.</strong> Every non-vendored userland build file enables the same combination.
+The guard is seeded before <code>main</code> runs, on a path that the startup code really
+takes, from the kernel DRBG mixed with the timestamp counter and the randomised image base,
+with the low byte forced to zero so that an overflow driven through a string copy cannot
+rewrite the canary with its own correct value.</p>
+
+<p><strong>Two honest limits.</strong> First, <code>-fstack-protector-strong</code> instruments
+functions with arrays or address-taken locals, not every function; in a representative
+application translation unit that was 6 of 20 functions. Second, and more important:
+<strong>the shared C library is compiled without the stack protector</strong>, so library code
+linked into every application is not canary-protected. There is also no build gate enforcing
+the flag on application build files, so this was by convention rather than by
+construction. Both are the kind of gap that a reader would otherwise find in five minutes.</p>
+
+<h2>CPU protection features</h2>
+
+<p>SMEP and no-execute are enabled where the processor provides them. The enable path writes
+the control register and then <strong>reads it back</strong>, and the feature is only reported
+as enabled if the read-back shows the bit took. That detail exists because a hypervisor can
+silently drop the write, and a system that assumed success would pay the cost of the
+protection while having none of it. On a virtual CPU without the feature the system reports
+"not supported by this CPU" rather than claiming it.</p>
+
+<p><strong>SMAP is implemented and deliberately switched off.</strong> The control-register
+write, the read-back, the user-copy brackets, the interrupt-entry clearing and a boot-time
+pre-flight probe that refuses to arm if the kernel's own memory is user-accessible all exist
+and are wired together. They are held off by a single compile-time switch, because a
+substantial number of ring-0 accesses to user memory in the tree still bypass the four
+user-copy primitives, and they sit on paths taken during normal operation. Turning SMAP on
+today would not harden the system, it would produce one that faults before it reaches a
+desktop. A lint refuses to build with the switch removed until that ledger is empty, and a
+stale entry in the ledger also fails the build, so it cannot rot into a list of things that
+used to be true.</p>
+
+<h2>The syscall boundary</h2>
+
+<p>This is the strongest single control in the system, and the interesting part is how it was
+fixed rather than what it does.</p>
+
+<p>An audit found 171 user-supplied pointer arguments spread across the syscall surface and
+exactly five validated call sites. The response was not to fix 166 handlers. Validation was
+moved to <strong>one chokepoint</strong> at the top of the dispatcher, before the handler
+switch, driven by a descriptor table that says what each syscall's arguments are. Structure
+sizes in that table are locked to the real structure sizes by compile-time assertions, so a
+structure cannot grow past its validated length without the build failing.</p>
+
+<p>Measured today: 275 syscalls, 132 of which take a user pointer, and <strong>132 of 132 are
+covered</strong>. Four are validated inside their handler with a written justification each;
+the rest are covered by the table. The debt ledger for known gaps is empty. The lint that
+checks this is an order-only prerequisite of the kernel link, so adding a pointer-taking
+syscall without a descriptor fails the build rather than producing a quiet hole. Rejections
+are rate-limited and audited rather than silent.</p>
+
+<h2>Privilege separation, and an important caveat about it</h2>
+
+<p>User processes genuinely run in ring 3. The descriptors are built at privilege level 3, the
+initial entry pushes those selectors, and the syscall path masks the interrupt, trap,
+direction and alignment-check flags on entry, the last two because omitting the direction flag
+had been exploitable.</p>
+
+<p>Per-process user and group identity exists, and it is not decorative: there are roughly
+forty explicit privilege checks across the syscall layer, plus a filesystem permission layer
+with 49 call sites whose path canonicalisation is self-tested at boot against directory
+traversal and alternate spellings of the same path.</p>
+
+<p><strong>And it does not currently gate anything, because the shipped desktop auto-logs in as
+root.</strong> The permission check returns success immediately for the root user, so with
+every process running as root the layer short-circuits on its first line. This is stated
+plainly because any permission claim on this page would otherwise be misleading. The
+mechanism is built and tested; the shipped configuration means it is not yet load-bearing.
+Interactive first-boot account creation exists, and switching the default is a configuration
+change rather than new code, but it has not been made and this page will not describe it as
+shipped.</p>
+
+<h2>TLS and certificate validation</h2>
+
+<p>The TLS stack is written from scratch in this project. It validates.</p>
+
+<p><strong>Chain signatures are actually verified</strong>, not merely parsed. The chain
+verification path was traced through the call graph of the linked kernel, not read from
+source: the handshake calls chain verification, which calls hostname matching, validity
+checking, signature verification and the trust-anchor test, and signature verification
+dispatches to real RSA PKCS#1, RSA-PSS and ECDSA verify code against the issuer's key. Both
+the 1.3 and the 1.2 handshake reach it, and the separate proof-of-possession signature, the
+CertificateVerify in 1.3 and the ServerKeyExchange signature in 1.2, is verified as well.</p>
+
+<p><strong>Failure aborts.</strong> Every validation failure path frees the context and returns
+an error; none warn and continue. A handshake that omits CertificateVerify entirely cannot
+complete, and a compressed-certificate message is explicitly rejected rather than skipped,
+which closes a bypass that skipping would have created. There is no runtime switch, config
+file or command anywhere in the system that turns verification off.</p>
+
+<p><strong>Versions and suites.</strong> Only TLS 1.3 and 1.2 are reachable; 1.0, 1.1 and SSLv3
+cannot be negotiated. On 1.2 exactly two forward-secret AEAD cipher suites are accepted and
+everything else, including all static-RSA and CBC suites, is refused. The RFC 8446 downgrade
+sentinel is checked first, before anything else in the server's hello is acted on.</p>
+
+<p><strong>Trust anchors and the clock.</strong> A bundle of public root certificates ships on
+the image; 150 certificates are present and 125 currently load, the remainder being older
+SHA-1-signed roots whose signature algorithm the parser does not accept. That fails closed,
+with fewer anchors rather than more, but it is a real shortfall and is stated as one. Validity
+dates are checked for every certificate in the chain against the hardware real-time clock.
+There is no time synchronisation client, so a machine with a badly wrong clock will make
+correspondingly wrong expiry decisions.</p>
+
+<p><strong>What has been observed going red.</strong> A boot-time self-test in every shipped
+image checks the key schedule against vectors generated by independent tooling, accepts a real
+signature and <em>rejects a forged one</em>, and detects the downgrade sentinel. Separately, a
+three-way differential across three distinct kernels against real internet hosts showed that
+flipping one bit of the server's signature causes the current kernel to abort while a
+pre-fix kernel completed the fetch. That disagreement is what proves the check is
+load-bearing rather than decorative. A bad-hostname certificate has also been observed being
+rejected against a real server.</p>
+
+<p><strong>What has not.</strong> There is no test anywhere that a chain signed by an untrusted
+root is rejected, and none that an expired certificate is rejected. Both properties follow
+from reading the code and from the call graph, but neither has ever been watched failing, and
+by this page's own standard that makes them less well established than the ones above.</p>
+
+<p><strong>Not implemented, stated as scope rather than omitted:</strong> no certificate
+revocation checking of any kind, no CRL and no OCSP consumption; no name constraints; no
+client certificates; no Ed25519 certificates. Certificate policy checking beyond basic
+constraints, subject alternative names and validity dates is not implemented. Hostname
+matching covers DNS names and falls back to the common name, which is more permissive than
+RFC 6125 requires.</p>
+
+<h2>Cryptographic primitives</h2>
+
+<p>AES, SHA-256, SHA-512, HMAC, ChaCha20, GHASH, MD4, MD5, the RSA and ECDSA verification
+paths and the DRBG are implemented in this project from their specifications. The Ed25519
+verification path is adopted from a public-domain implementation, and is reported as an
+adoption rather than counted as our own work.</p>
+
+<p>Known-answer tests run at boot in the shipped image, against published vectors, and are
+reported per algorithm: AES against the FIPS-197 appendix vectors, HMAC against RFC 4231 and
+RFC 2202, and the hashes and stream cipher against their own published vectors. Each runs as a
+differential between two independent implementations <em>and</em> a known-answer check, so a
+fault shared by both implementations is still caught by the vector half. That distinction
+matters here: a differential where both sides share the same wrong assumption is green and
+means nothing, which this project has been bitten by before.</p>
+
+<p><strong>The gaps.</strong> There is no known-answer test for the ECDSA point arithmetic; it
+is exercised only implicitly by real handshakes. The DRBG's boot self-test is a liveness check,
+two samples must differ and neither be all zero, not a NIST SP 800-90A known-answer vector.</p>
+
+<h2>Release engineering as a control</h2>
+
+<p>Public artifacts are scanned by a byte-level secret gate before publication, and the gate is
+run against the artifact that is about to be uploaded rather than against a source tree.</p>
+
+<p>The reason it works that way is a real incident. The previous gate was a text search over
+the source directory. It passed an artifact that contained live credentials, for two
+independent reasons, either of which alone leaks: the search skipped binary files, so it never
+read a byte of the disk image, and the artifact was compressed, so a plain-text search finds
+nothing even if it does read it. There is a third lesson in the same incident: deleting a file
+from a FAT filesystem does not erase its bytes, so a credential that was deleted before
+packaging was still recoverable from the artifact. Public images are therefore built on a
+fresh filesystem and never by removing files from an internal one.</p>
+
+<p>The replacement decompresses, scans bytes rather than text, fails closed if a decompressor
+is missing, and carries a self-test that is currently 25 of 25 and includes a negative control
+demonstrating the old gate passing a compressed artifact full of credentials. If the self-test
+does not pass in full, the gate is treated as broken and nothing is published.</p>
+
+<p>The same philosophy applies more broadly. Several checks are order-only prerequisites of the
+kernel link, so a violation stops the build rather than producing a warning someone has to
+notice: the syscall pointer lint, a concurrency lint that fails on new busy-wait loops, the
+user-copy ledger lint, and the image invariant gate that must pass before a build is allowed to
+produce an image at all. Where a gate exists, its self-test is expected to demonstrate a red
+result on a deliberately broken input, because a check that has only ever been green is
+indistinguishable from a check that cannot fail.</p>
+
+<h2>Audit logging and the AI capability layer</h2>
+
+<p>A kernel-side security event sink exists, starts at boot, records an actor and a process
+identifier, and reports its own overruns honestly rather than hiding them. Unprivileged code
+cannot inject records into the in-kernel ring.</p>
+
+<p><strong>It is not append-only and it is not tamper-evident.</strong> The on-disk logs are
+rewritten whole rather than appended, and there is no hash chain and no message authentication
+code, so the trail can be rewritten by anything that can write the file. Combined with the
+root-session note above, that means the audit trail should be read as a diagnostic record, not
+as evidence. Making it append-only and tamper-evident with an actor identity is planned work,
+and this page will not describe it as done.</p>
+
+<p>The capability and consent layer for AI tool calls is real code that runs: capability tokens
+with expiry, use limits and scope constraints, a consent dialog with distinct deny, allow-once,
+allow-for-session and persist choices, and a timeout that denies by default. Enforcement
+happens before tool dispatch, and low-risk tools are audited even when they are not gated.</p>
+
+<p><strong>Its structural limit is that it lives in the same unprivileged process it
+constrains.</strong> There is no kernel-side capability check. That makes it a policy layer
+that stops an AI model from doing something it was not permitted to do, which is the threat it
+was built for, and not a boundary that would stop a compromised process from lying about its
+own permissions. Relocating that logic into a protected core is designed and not built.</p>
+
+<p>A keyword matcher for prompt-injection patterns exists and passes its own rule self-test at
+boot. <strong>Nothing calls it</strong>, so nothing is currently screened, and this page does
+not claim prompt-injection protection. Even once it is wired in, keyword matching against a
+small ruleset is a speed bump against known phrasings and not a defence; the semantic and
+model-judge layers of the upstream ruleset are not evaluated here.</p>
+
+<h2>Not implemented</h2>
+
+<p>Listed so that their absence is not mistaken for an oversight:</p>
+
+<ul>
+<li>Kernel address-space randomisation, and read-only kernel text after boot.</li>
+<li>Stack, heap and mapping randomisation for user processes.</li>
+<li>Stack guard pages. Nothing in the kernel has one.</li>
+<li>Control-flow integrity, of any kind.</li>
+<li>Application sandboxing. A user process is confined by ring 3 and the syscall surface,
+    nothing narrower.</li>
+<li>SMAP, which is built but deliberately not armed.</li>
+<li>Certificate revocation, name constraints and client certificates.</li>
+<li>A tamper-evident audit trail.</li>
+<li>A protected immutable security core.</li>
+</ul>
+
+<h2>Check it yourself</h2>
+
+<p>Most of the claims on this page are properties of the artifact, which means you can test them
+on a downloaded image without trusting this page. Mount the root partition read-only and run:</p>
+
+<pre><code># Every shipped application and game binary should report DYN, not EXEC.
+find /mnt/APPS /mnt/GAMES -type f -exec sh -c \
+  'head -c4 "$1" | grep -q ELF && readelf -hW "$1" | grep -q "Type:.*DYN" || echo "NOT PIE: $1"' _ {} \;
+
+# No shipped binary should have a segment that is both writable and executable.
+find /mnt/APPS /mnt/GAMES -type f -exec sh -c \
+  'readelf -lW "$1" 2>/dev/null | awk "/^  LOAD/ && \$7 ~ /W/ && \$7 ~ /E/ {print \"W+X: \" FILENAME}"' _ {} \;
+
+# The stack-smash handler should be linked into application binaries.
+strings -a /mnt/APPS/CALC | grep 'stack smashing'
+</code></pre>
+
+<p>And on a booted system, the serial console reports the posture directly, including the
+things that are <em>not</em> enabled. The randomisation line names what is randomised and what
+is not; the SMAP line says whether the brackets are armed or inert; the per-launch protection
+counters report writable-and-executable page counts. If any of those disagree with this page,
+the page is wrong and we would like to know.</p>
+
+<div class="note">
+<p><strong>Scope.</strong> This is a hobby operating system. It has not had an external security
+audit, it carries no formal vulnerability-response commitment beyond the
+<a href="../security.html">advisories page</a>, and the mitigations described here are the
+beginning of a hardening effort rather than the end of one. The value of the list above is that
+it is accurate, not that it is long.</p>
+</div>
+
+    </div>
+  </article>
+</div>
+</main>
+
+<footer class="footer">
+  <div class="footer-in">
+    <div class="footer-brand">
+      <img src="../img/logo-mark-light.png" alt="" width="34" height="34">
+      <div>
+        <p class="fb-name">MayteraOS</p>
+        <p class="muted">a 64-bit OS written from scratch</p>
+      </div>
+    </div>
+    <div class="footer-cols">
+      <div>
+        <h4>Project</h4>
+        <a href="../features.html">Features</a>
+        <a href="../docs.html">Documentation</a>
+        <a href="../changelog.html">Changelog</a>
+        <a href="../security.html">Security</a>
+        <a href="../about.html">About</a>
+      </div>
+      <div>
+        <h4>Get it</h4>
+        <a href="../downloads.html">Downloads</a>
+        <a href="../downloads.html#updates">Update server</a>
+        <a href="user-guide.html#install">Install guide</a>
+      </div>
+      <div>
+        <h4>Docs</h4>
+        <a href="user-guide.html">User guide</a>
+        <a href="hardening.html">Hardening &amp; mitigations</a>
+        <a href="llm-contracts.html">AI &amp; contracts</a>
+        <a href="win16.html">Win16 layer</a>
+      </div>
+    </div>
+  </div>
+  <p class="footer-bottom">maytera.net</p>
+</footer>
+
+<script src="../js/main.js" defer></script>
+</body>
+</html>

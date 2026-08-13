@@ -55,13 +55,26 @@ void file_get(file_t *f) {
     f->refcount++;
 }
 
-void file_put(file_t *f) {
-    if (!f) return;
+// #695 Phase 2: returns the final flush status. Not-the-last-reference is 0,
+// and so is a file kind with no release op. kfree() happens unconditionally: a
+// failed flush must not leak the description.
+int file_put(file_t *f) {
+    if (!f) return 0;
     f->refcount--;
     if (f->refcount <= 0) {
-        if (f->ops && f->ops->release) f->ops->release(f);
+        int rc = 0;
+        if (f->ops && f->ops->release) rc = f->ops->release(f);
         kfree(f);
+        return rc;
     }
+    return 0;
+}
+
+// #695 Phase 1: flush without releasing. A file kind with no flush op buffers
+// nothing, so 0 is the truth for it and not a stub.
+int file_flush(file_t *f) {
+    if (!f || !f->ops || !f->ops->flush) return 0;
+    return f->ops->flush(f);
 }
 
 // ============================================================================
@@ -99,6 +112,21 @@ int file_poll(file_t *f, int events) {
     return f->ops->poll(f, events);
 }
 
+// #745 (local 82): "does this file kind answer readiness questions at all?"
+// Deliberately NOT folded into file_poll()'s return value: changing that to
+// report always-ready for a NULL op would silently change select()'s answer
+// for every existing caller, including the one live select() user. The
+// distinction is exposed instead, and poll(2) applies the POSIX regular-file
+// rule itself.
+int file_has_poll(file_t *f) {
+    return (f && f->ops && f->ops->poll) ? 1 : 0;
+}
+
+struct wait_queue_head *file_poll_wq(file_t *f, int events) {
+    if (!f || !f->ops || !f->ops->poll_wq) return 0;
+    return f->ops->poll_wq(f, events);
+}
+
 // ============================================================================
 // Per-process fd table
 // ============================================================================
@@ -128,7 +156,12 @@ int fd_install(int fd, file_t *f) {
     // If the slot is already occupied, close the old one first. This matches
     // dup2 semantics; ordinary callers should target an empty slot.
     if (p->fds[fd]) {
-        file_put(p->fds[fd]);
+        // #695: slot eviction must SUCCEED even when the evicted description's
+        // final flush failed, or dup2 / shell redirection would start failing on
+        // a full disk. There is no recipient for this error here; log and go on.
+        int frc = file_put(p->fds[fd]);
+        if (frc != 0)
+            kprintf("[VFS] fd_install: evicted fd %d final flush failed rc=%d\n", fd, frc);
         p->fds[fd] = NULL;
     }
     p->fds[fd] = f;
@@ -161,16 +194,23 @@ int fd_close(int fd) {
     p->fds[fd] = NULL;
     // Clear CLOEXEC bit for this fd.
     p->fd_cloexec &= ~(1ULL << fd);
-    file_put(f);
-    return 0;
+    // #695 Phase 2: THIS is the close() a user program sees (sys_close routes
+    // here for every per-process fd), so the final flush status propagates.
+    return file_put(f);
 }
 
+// #695 Phase 2: proc_exit() calls this, under cli(), with nobody left to tell.
+// It therefore LOGS AND CONTINUES and stays void on purpose: propagating from
+// here would turn "the disk is full" into a fault on every process exit, and
+// stopping early would leak every remaining description.
 void fd_close_all(void) {
     process_t *p = proc_current();
     if (!p) return;
     for (int i = 0; i < MAX_FDS; i++) {
         if (p->fds[i]) {
-            file_put(p->fds[i]);
+            int frc = file_put(p->fds[i]);
+            if (frc != 0)
+                kprintf("[VFS] proc exit: fd %d final flush failed rc=%d (data lost)\n", i, frc);
             p->fds[i] = NULL;
         }
     }
@@ -215,7 +255,11 @@ int fd_dup2(int oldfd, int newfd) {
     // POSIX: dup2 with oldfd == newfd is a no-op that returns newfd.
     if (oldfd == newfd) return newfd;
     if (p->fds[newfd]) {
-        file_put(p->fds[newfd]);
+        // #695: same rule as fd_install - dup2 must still succeed when the
+        // description it evicts could not be flushed.
+        int frc = file_put(p->fds[newfd]);
+        if (frc != 0)
+            kprintf("[VFS] dup2: evicted fd %d final flush failed rc=%d\n", newfd, frc);
         p->fds[newfd] = NULL;
     }
     file_get(f);
@@ -224,12 +268,16 @@ int fd_dup2(int oldfd, int newfd) {
     return newfd;
 }
 
+// #695 Phase 2: runs inside execve, which has already committed to replacing
+// the image. Same reasoning as fd_close_all: log and continue, stay void.
 void fd_close_cloexec(void) {
     process_t *p = proc_current();
     if (!p || p->fd_cloexec == 0) return;
     for (int i = 0; i < MAX_FDS; i++) {
         if ((p->fd_cloexec & (1ULL << i)) && p->fds[i]) {
-            file_put(p->fds[i]);
+            int frc = file_put(p->fds[i]);
+            if (frc != 0)
+                kprintf("[VFS] execve: cloexec fd %d final flush failed rc=%d (data lost)\n", i, frc);
             p->fds[i] = NULL;
         }
     }

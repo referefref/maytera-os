@@ -18,6 +18,8 @@
 
 #include "compositor.h"
 #include "../../libc/syscall.h"
+#include "../../libc/stdio.h"    // #742: printf, the disk-independent report channel
+#include "../../libc/notify.h"   // #742: notify_post (best effort, needs the disk)
 
 #define STICKY_MAX     24
 #define STICKY_W       150
@@ -83,13 +85,39 @@ static char *st_itoa(char *b, int v) {
 }
 
 // ---- persistence ---------------------------------------------------------
+// #742: a failed save is REPORTED and RETRIED, and the note keeps its unsaved
+// text. g_st[] is the live copy and it is never touched by a failure, so the
+// user's edit is retained for as long as the compositor runs; s_dirty staying
+// set means the next stickies_tick() tries again, which is what makes a
+// transient failure (a momentarily full or busy volume) self-correcting.
+int  g_stickies_save_failed = 0;      // drawn as an indicator on every note
+static unsigned s_fail_count = 0;
+
+static void stickies_save_failed(const char *stage, int rc) {
+    s_dirty = 1;                      // NEVER clear it: this is the retry
+    if (!g_stickies_save_failed) {
+        // First failure only. stickies_tick() runs on the compositor's profile
+        // cadence, so reporting every attempt would be a flood, and the on-note
+        // indicator is already permanent for as long as it is true.
+        printf("[stickies] SAVE FAILED at %s rc=%d - notes are UNSAVED and will "
+               "be retried; do not shut down until this clears\n", stage, rc);
+        notify_post("Sticky Notes",
+                    "Could not save your notes. They are still on screen and "
+                    "will be retried, but they are NOT on disk yet.",
+                    NOTIFY_ERROR);
+    }
+    g_stickies_save_failed = 1;
+    s_fail_count++;
+}
+
 static void stickies_save(void) {
-    // O_WRONLY | O_CREAT | O_TRUNC (kernel uses 0x01|0x40|0x200 elsewhere; here
-    // we unlink first then create for a clean truncate, matching profile.c).
-    sys_unlink("/CONFIG/STICKIES.DAT");
-    int fd = sys_open("/CONFIG/STICKIES.DAT", 0x41);   // O_WRONLY | O_CREAT
-    if (fd < 0) fd = sys_open("/STICKIES.DAT", 0x41);  // fall back to FAT root
-    if (fd < 0) { s_dirty = 0; return; }
+    // #742: O_WRONLY|O_CREAT|O_TRUNC in ONE call. This used to sys_unlink() the
+    // file FIRST and then open it, so a failure to re-create destroyed every
+    // saved note and lost the edit in the same breath. O_TRUNC has no window in
+    // which the old file is already gone and the new one does not exist.
+    int fd = sys_open("/CONFIG/STICKIES.DAT", 0x241);
+    if (fd < 0) fd = sys_open("/STICKIES.DAT", 0x241);  // fall back to FAT root
+    if (fd < 0) { stickies_save_failed("open", fd); return; }
     static char out[STICKY_MAX * (STICKY_TEXTMAX + 48)];
     int o = 0;
     for (int i = 0; i < STICKY_MAX; i++) {
@@ -108,9 +136,25 @@ static void stickies_save(void) {
         }
         out[o++] = '\n';
     }
-    if (o > 0) sys_write(fd, out, (unsigned long)o);
-    sys_close(fd);
-    s_dirty = 0;
+    if (o > 0) {
+        long w = sys_write(fd, out, (unsigned long)o);
+        if (w != (long)o) { sys_close(fd); stickies_save_failed("write", (int)w); return; }
+    }
+    // fsync BEFORE close, because close() consumes the fd whether or not it
+    // reports an error: a caller that only learns from close() has no handle
+    // left to retry with. 0 here means and only means every byte is on the
+    // medium.
+    int fr = sys_fsync(fd);
+    if (fr != 0) { sys_close(fd); stickies_save_failed("fsync", fr); return; }
+    int cr = sys_close(fd);
+    if (cr != 0) { stickies_save_failed("close", cr); return; }
+    if (g_stickies_save_failed) {
+        printf("[stickies] save recovered after %u failed attempt(s)\n", s_fail_count);
+        notify_post("Sticky Notes", "Your notes have been saved.", NOTIFY_SUCCESS);
+        g_stickies_save_failed = 0;
+        s_fail_count = 0;
+    }
+    s_dirty = 0;                      // ONLY on a proven-durable save
 }
 
 void stickies_load(void) {
@@ -292,7 +336,17 @@ static void sticky_draw(int idx) {
     draw_fill_rect(s->x + 3, s->y + 3, s->w, s->h, 0x40000000);
     draw_fill_rect(s->x, s->y, s->w, s->h, c->body);
     draw_fill_rect(s->x, s->y, s->w, STICKY_TITLE_H, c->title);
-    draw_rect_outline(s->x, s->y, s->w, s->h, editing ? 0x00404040 : 0x00808060);
+    // #742: while the save is failing, EVERY note says so, permanently and
+    // without touching the disk. A toast scrolls away and the notification
+    // spool is itself on the volume that just failed; this cannot be missed and
+    // cannot fail. Red border + a red title strip.
+    if (g_stickies_save_failed) {
+        draw_fill_rect(s->x, s->y, s->w, STICKY_TITLE_H, 0x00B03030);
+        draw_text(s->x + STICKY_TITLE_H, s->y, "UNSAVED", 0x00FFFFFF);
+    }
+    draw_rect_outline(s->x, s->y, s->w, s->h,
+                      g_stickies_save_failed ? 0x00FF2020
+                                             : (editing ? 0x00404040 : 0x00808060));
 
     // Color swatch (left) and close [x] (right) in the title strip.
     int bx, by, bw, bh;

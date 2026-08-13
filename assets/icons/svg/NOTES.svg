@@ -1,0 +1,4 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <path fill="#ffffff" d="M112 152h288v32H112zm0 88h288v32H112zm0 88h152v32H112z" class="ci-primary"/>
+  <path fill="#ffffff" d="M480 48H32v416h448Zm-32 384H64V80h384Z" class="ci-primary"/>
+</svg>

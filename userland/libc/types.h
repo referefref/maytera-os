@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // types.h - Basic type definitions for MayteraOS libc
 // This header provides types when system headers are not available,
 // but defers to system headers when they are included.

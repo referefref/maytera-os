@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // gui_scroll.h - MayteraOS shared scrollable-viewport primitive
 //
 // WHY THIS EXISTS (#291 / #261 / #438 / #386):
@@ -28,7 +32,18 @@
 #ifndef _GUI_SCROLL_H
 #define _GUI_SCROLL_H
 
+// The compositor cannot include libc's types.h: compositor.h carries its own
+// `typedef int bool;` and types.h typedefs bool to _Bool, which is a hard
+// conflict. It still needs the scrollbar CONTRAST RULE declared at the bottom
+// of this header, and a second declaration of that rule living in the
+// compositor is exactly the divergence this header exists to prevent. Defining
+// GUI_SCROLL_STDINT_ONLY before including takes the stdint route instead, so
+// the tree still holds exactly ONE declaration of these functions.
+#ifdef GUI_SCROLL_STDINT_ONLY
+#include <stdint.h>
+#else
 #include "types.h"
+#endif
 
 // Width of the scrollbar gutter, in pixels. Matches the Files/Settings design
 // language (a 14px gutter with a 10px thumb inset 2px each side).
@@ -114,9 +129,33 @@ int  gui_scroll_reveal(gui_scroll_t *s, int top_px, int h_px);
 // --- Drawing ---------------------------------------------------------------
 // Draw the themed scrollbar in the gutter at the right edge of the viewport.
 // Draws nothing when the content fits, so the gutter is only spent when needed.
-// Colors come from theme_color(THEME_COLOR_SCROLLBAR_*) at draw time, so a new
-// theme needs no change here and both light and dark themes are correct.
+// Colors come from theme_color(THEME_COLOR_SCROLLBAR_*) at draw time AND are
+// raised to the 3:1 non-text contrast floor against both the trough and the
+// surface, because 13 of the 14 shipped themes author a thumb below it (#745,
+// local queue item 77; see gui_scroll.c for the measurement and the rule).
+// This form assumes the gutter sits on THEME_COLOR_WINDOW_BG.
 void gui_scroll_draw(int handle, const gui_scroll_t *s);
+// Same, for a gutter on any other surface: menu_bg in a popup, textbox_bg in a
+// field-style list, taskbar_bg in the Settings left nav. Pass the colour the
+// caller actually painted behind the gutter; the repair needs it, and only the
+// caller knows it.
+void gui_scroll_draw_on(int handle, const gui_scroll_t *s, uint32_t surface);
+
+// --- The contrast rule, for apps that draw their own gutter ----------------
+// Several apps predate this widget and own their scrollbar geometry. They must
+// NOT restate the rule below; they call these, so there is one definition.
+// gui_scroll_colors(): the themed (track, thumb) pair for a gutter on `surface`,
+//   already repaired. `hot` selects the hover/drag thumb.
+// gui_scroll_thumb_ink(): the rule alone, for a drawer whose track and thumb
+//   come from tokens other than THEME_COLOR_SCROLLBAR_* (the compositor's start
+//   menu paints its gutter from the menu palette).
+// gui_scroll_hover_ink(): the hover thumb, guaranteed to read as a change
+//   against the already-repaired rest ink rather than collapsing onto it.
+void     gui_scroll_colors(int hot, uint32_t surface,
+                           uint32_t *track_out, uint32_t *thumb_out);
+uint32_t gui_scroll_thumb_ink(uint32_t thumb, uint32_t track, uint32_t surface);
+uint32_t gui_scroll_hover_ink(uint32_t hover, uint32_t rest_ink,
+                              uint32_t track, uint32_t surface);
 
 // X of the scrollbar gutter (right-aligned inside the viewport). Useful when the
 // app needs to keep its content clear of the gutter.

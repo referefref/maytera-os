@@ -49,9 +49,9 @@ static void init_interfaces(void) {
     
     const char *eth_name = "eth0";
     const char *eth_mac = "52:54:00:AB:CD:EF";
-    const char *eth_ip = "10.0.0.100";
+    const char *eth_ip = "192.0.2.1";
     const char *eth_mask = "255.255.255.0";
-    const char *eth_gw = "10.0.0.1";
+    const char *eth_gw = "192.0.2.1";
     
     int i = 0;
     while (eth_name[i]) { interfaces[0].name[i] = eth_name[i]; i++; }

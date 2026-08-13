@@ -310,6 +310,13 @@ typedef struct {
 #define ELF_ERR_SEGMENT_OVERFLOW -11 // Segment offset/size overflow
 #define ELF_ERR_ALLOC_FAILED   -12  // Memory allocation failed
 #define ELF_ERR_LOAD_FAILED    -13  // Failed to load segment
+// #633: a user image asked to be loaded outside the userland image window
+// (typically an app linked without -T user.ld, which defaults to 0x400000),
+// declared an absurd span, or has an entry point outside its own code.
+#define ELF_ERR_BAD_LOAD_ADDR  -14
+// #633: the destination pages are not present/user/writable in the target
+// address space. Writing anyway would be a kernel #PF, not a user fault.
+#define ELF_ERR_DEST_NOT_WRITABLE -15
 
 // ============================================================================
 // ELF Loader Structures
@@ -506,6 +513,16 @@ static inline const Elf64_Shdr *elf_get_shdr(const void *elf_data, uint16_t inde
  */
 int elf_load_user(void *elf_data, uint32_t size, uint64_t pml4_phys,
                   uint64_t *entry_point, uint64_t *load_base, uint64_t *load_end);
+
+/**
+ * As elf_load_user(), plus an app name used ONLY in diagnostics (may be NULL).
+ * #640: every #633 rejection message names the offending app, because "load
+ * range 0x400000-0x40F000 is outside the permitted window" is a puzzle and
+ * "HELLO: load range ..." is a work item. Also labels the [ELFCOST] line.
+ */
+int elf_load_user_named(void *elf_data, uint32_t size, uint64_t pml4_phys,
+                        uint64_t *entry_point, uint64_t *load_base, uint64_t *load_end,
+                        const char *name);
 
 /**
  * Debug: print ELF header information

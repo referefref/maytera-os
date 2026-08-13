@@ -231,7 +231,11 @@ void blob_store_shutdown(blob_store_t *store) {
     header.total_data_size = store->total_size;
     header.dedup_savings = store->dedup_savings;
 
-    fat_write_file(store->fs, index_path, &header, sizeof(header));
+    // #693: shutdown is void and has no recipient; a lost index header means the
+    // blob store cannot be reopened, so this has to be loud.
+    if (fat_write_file(store->fs, index_path, &header, sizeof(header)) != 0)
+        kprintf("[BLOB] FAILED to write the index header to %s: the blob store "
+                "will NOT reopen\n", index_path);
 
     store->initialized = 0;
     kprintf("[BLOB] Blob store shutdown complete\n");

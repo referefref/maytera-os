@@ -1,0 +1,327 @@
+name=Forest
+author=MayteraOS
+version=1
+style=mixed
+dark=0
+titlebar_active=0x00205020
+titlebar_inactive=0x00303830
+titlebar_text=0x00e0ffe0
+window_bg=0x00f0f8f0
+window_border=0x00408040
+close_button=0x00506050
+close_button_hover=0x00c04040
+minimize_button=0x00608060
+maximize_button=0x00608060
+button_bg=0x0080c080
+button_bg_hover=0x0090d090
+button_bg_pressed=0x00609060
+button_border=0x00306030
+button_text=0x00103010
+button_disabled=0x00808080
+label_text=0x00203020
+textbox_bg=0x00ffffff
+textbox_border=0x00609060
+textbox_text=0x00203020
+textbox_cursor=0x00205020
+checkbox_bg=0x00ffffff
+checkbox_border=0x00609060
+checkbox_check=0x00205020
+desktop_bg=0x00306830
+taskbar_bg=0x00203820
+taskbar_hover=0x00304830
+taskbar_active=0x00405840
+start_button=0x00406040
+gauge_bg=0x00101810
+gauge_fg=0x0060a060
+menu_bg=0x00f0fff0
+menu_border=0x00609060
+menu_item_hover=0x00408040
+menu_text=0x00203020
+menu_text_disabled=0x00809080
+menu_separator=0x00c0d0c0
+scrollbar_bg=0x00d0e0d0
+scrollbar_thumb=0x0080a080
+scrollbar_thumb_hover=0x00608060
+selection_bg=0x00408040
+selection_text=0x00ffffff
+color_error=0x00a03030
+color_warning=0x00a08020
+color_success=0x00306030
+color_info=0x00306060
+link_color=0x00205020
+link_visited=0x00405040
+link_hover=0x00408040
+tooltip_bg=0x00f0fff0
+tooltip_text=0x00203020
+tooltip_border=0x00609060
+
+# --- mtheme v2 (#711) -------------------------------------------------
+# Namespaced tokens. A key omitted here falls back to a value derived
+# from the 51 legacy colours above, so this block is documentation as
+# much as configuration. Values are literal ints and 0x00RRGGBB hexes
+# only: the Ring 0 parser is a dumb line reader and resolves nothing.
+
+# color.* : semantic colour tokens
+color.surface_sunken=0x00FFFFFF
+color.surface=0x00F0F8F0
+color.surface_raised=0x0080C080
+color.surface_overlay=0x00F0FFF0
+color.on_surface=0x00203020
+color.on_surface_muted=0x00809080
+color.on_surface_disabled=0x00808080
+color.accent=0x00408040
+color.on_accent=0x00FFFFFF
+color.accent_hover=0x00408040
+color.accent_active=0x00408040
+color.danger=0x00A03030
+color.on_danger=0x00FFFFFF
+color.border_subtle=0x00C0D0C0
+color.border_strong=0x00408040
+color.focus_ring=0x00326532
+color.sel_bg=0x00408040
+color.sel_fg=0x00FFFFFF
+color.titlebar_top=0x00205020
+color.titlebar_bottom=0x00205020
+color.titlebar_inactive_top=0x00303830
+color.titlebar_inactive_bottom=0x00303830
+color.titlebar_text=0x00E0FFE0
+color.titlebar_text_inactive=0x00E0FFE0
+
+# state.* : six explicit states per control family. No state is an alpha
+# of another, because there is no per-pixel alpha to derive one with.
+state.btn_rest_bg=0x0080C080
+state.btn_rest_fg=0x00103010
+state.btn_hover_bg=0x0090D090
+state.btn_hover_fg=0x00103010
+state.btn_active_bg=0x00609060
+state.btn_active_fg=0x00103010
+state.btn_focus_ring=0x00326532
+state.btn_disabled_bg=0x0080C080
+state.btn_disabled_fg=0x00808080
+state.btn_selected_bg=0x00408040
+state.btn_selected_fg=0x00FFFFFF
+state.item_rest_bg=0x00F0FFF0
+state.item_rest_fg=0x00203020
+state.item_hover_bg=0x00408040
+state.item_hover_fg=0x00203020
+state.item_active_bg=0x00408040
+state.item_active_fg=0x00FFFFFF
+state.item_focus_ring=0x00326532
+state.item_disabled_bg=0x00F0FFF0
+state.item_disabled_fg=0x00809080
+state.item_selected_bg=0x00408040
+state.item_selected_fg=0x00FFFFFF
+state.input_rest_bg=0x00FFFFFF
+state.input_rest_fg=0x00203020
+state.input_rest_border=0x00609060
+state.input_hover_border=0x00609060
+state.input_active_border=0x00408040
+state.input_focus_ring=0x00326532
+state.input_disabled_bg=0x00FFFFFF
+state.input_disabled_fg=0x00808080
+state.input_selected_bg=0x00408040
+state.input_selected_fg=0x00FFFFFF
+
+# metric.* : geometry, in pixels. These were #defines in kernel
+# gui/window.h and userland libc/gui_style.h until #711.
+metric.titlebar_h=20
+metric.border_w=2
+metric.btn_h=24
+metric.input_h=24
+metric.pad=10
+metric.gap=8
+metric.focus_w=2
+metric.winmenu_roww=210
+metric.winmenu_rowh=26
+metric.winmenu_hdr=22
+metric.titlebar_btn=16
+metric.titlebar_btn_gap=2
+metric.grip=10
+metric.scrollbar_w=16
+metric.menu_row_h=22
+
+# radius.* : scale is none=0 sm=3 md=6 lg=10 (window outer corners are
+# always 0; frames are kernel-drawn rects over wallpaper, no alpha).
+radius.btn=6
+radius.input=6
+radius.menu=6
+radius.card=10
+
+# decor.* : beveled | flat | gradient. Before #711 this was inferred
+# from a substring match on the theme NAME in kernel gui/window.c.
+decor.style=gradient
+decor.titlebar_gradient=1
+decor.grip=1
+
+# type.* : whole px on the glyph-cache ladder; lineheight = round(px*1.4);
+# weights are regular and faux-bold only.
+type.caption=11
+type.caption_lineheight=15
+type.caption_weight=regular
+type.body=14
+type.body_lineheight=20
+type.body_weight=regular
+# body_strong: 14 bold, the emphasized-inline / selected-row / summary-value
+# role. Same 14px box as body (identical line grid, no reflow when a row goes
+# from rest to selected) but bold weight so it reads as an upgrade in
+# EMPHASIS, not in size. Use for: focused list-row primary column, dialog
+# summary values ("3 items selected"), inline emphasis inside body copy.
+# Do not use it as a heading substitute; that is what type.title is for.
+type.body_strong=14
+type.body_strong_lineheight=20
+type.body_strong_weight=bold
+type.title=16
+type.title_lineheight=22
+type.title_weight=regular
+type.heading=20
+type.heading_lineheight=28
+type.heading_weight=bold
+type.display=28
+type.display_lineheight=39
+type.display_weight=bold
+
+# Pre-#711 theme: its scale/contrast findings are grandfathered by the
+# repo-side design-contract lint (build/assets/theme-scale-lint.sh). Remove
+# this line and the theme must satisfy the published scales.
+lint.baseline=legacy-v1
+
+# --- window-decoration state tokens (#711 follow-up, designer 1 loop 1) ---
+# window.c currently draws titlebar min/max/filter buttons in ONE state
+# (rest) only, and the close button in two (rest/hover, via the legacy
+# close_button/close_button_hover keys). These three keys give it the
+# hover/active fills needed for the full six-state contract (focus is
+# already expressed at the WINDOW level via the active/inactive titlebar
+# swap, not per-button; disabled = button simply omitted, e.g. non-CLOSABLE
+# windows already skip drawing the close button; selected does not apply
+# to these momentary action buttons). Values are NOT new invented colours:
+# btn_hover/btn_active are copied verbatim from the existing generic
+# state.btn_hover_bg/state.btn_active_bg tokens above, and close_active is
+# close_button mechanically darkened 15% (the same kind of deterministic
+# derivation as the existing titlebar gradient's "lift 22% toward white",
+# not an aesthetic pick).
+# STATUS: data only, AWAITING ENGINEERING WIRING - kernel/gui/themes.h's
+# TM_* enum and kernel/gui/themes.c's g_theme_fields table have no entries
+# for these three keys yet, so the parser reads past them and stores them
+# nowhere. window.c's titlebar-button draw calls also do not yet track
+# mouse-over/pressed state per button. See loop-1 report, family 1.
+color.titlebar_btn_hover=0x0090D090
+color.titlebar_btn_active=0x00609060
+color.titlebar_close_active=0x00445244
+# Title text left inset from the border, replacing window.c's hardcoded
+# "title_x = x + BORDER_WIDTH + 4". Reproduces this theme's current pixel output exactly (4), so wiring it is a no-op here.
+# AWAITING ENGINEERING WIRING - see loop-1 report, family 1.
+metric.title_inset=4
+
+# --- space.* : the 4px spacing grid (surfaces family, loop 1, #711
+# follow-on). Universal across every theme incl. this legacy one: metric.pad
+# above is space.md, metric.gap is space.sm. xs/lg/xl/xxl have no reader yet
+# in kernel/gui/themes.c; staged as forward-compatible literal data (unknown
+# keys are ignored). See build/assets/themes/maytera_dark.mtheme and
+# docs/UI_STYLE_GUIDE.md, "Surfaces & Foundation Spec", for the full model.
+space.xs=4
+space.sm=8
+space.md=12
+space.lg=16
+space.xl=24
+space.xxl=32
+
+# --- #711 Loop 3 / Family 3 (Form Controls): propagated extension keys ------
+# This theme predates #711 (lint.baseline=legacy-v1) and never received the
+# checkbox/radio/dropdown/slider/scrollbar/text-field extension keys that
+# maytera_dark/maytera_light got in loop 1/2 (was 2/14 files, now 14/14).
+# Every value is a LITERAL COPY of a token already defined elsewhere in THIS
+# theme (see the "# = tokenname" comment per line) - no invented hex, same
+# discipline as the maytera_* files. STATUS: zero consumers today, same as
+# in maytera_dark/light (documented there, #711 loop2) - this is data
+# completeness for whichever future loop wires the draw code, not a claim
+# that anything on screen changes. This legacy theme's accent/accent_hover/
+# accent_active already coincide (a pre-#711 flat-palette limitation,
+# grandfathered, not introduced or fixed here), so slider_thumb_hover below
+# reuses plain accent rather than a distinct hover tint that does not exist
+# in this file.
+color.placeholder=0x00809080          # = color.on_surface_muted (this theme
+                                           #   has no finer-grained distinction)
+state.field_invalid_border=0x00A03030     # = color.danger
+state.field_placeholder_fg=0x00809080  # = color.on_surface_muted
+state.field_caret=0x00408040              # = color.accent
+metric.checkbox_box=16
+radius.control=6                          # = radius.btn (this theme uses one radius
+                                           #   for every control shape)
+radius.selection=6                        # = radius.btn (director section 1 shared
+                                           #   selected-row treatment)
+metric.selection_inset=4                  # = space.xs
+metric.radio_d=14
+metric.radio_dot=6
+metric.radio_ring_w=2
+state.radio_bg=0x00FFFFFF            # = state.input_rest_bg
+state.radio_ring_rest=0x00609060      # = state.input_rest_border
+state.radio_ring_hover=0x00609060     # = state.input_hover_border
+state.radio_ring_active=0x00408040    # = color.accent_active
+state.radio_ring_focus_ring=0x00326532   # = color.focus_ring
+state.radio_ring_disabled=0x00808080 # = color.on_surface_disabled
+state.radio_ring_selected=0x00408040         # = color.accent
+state.radio_dot_selected=0x00408040          # = color.accent
+state.radio_dot_disabled=0x00808080  # = color.on_surface_disabled
+metric.dropdown_row_h=32
+metric.slider_track_h=4
+metric.slider_thumb_w=12
+metric.slider_thumb_h=18
+radius.slider_thumb=3                   # = 0 on a flat/hard-edge theme, else 3
+state.slider_track=0x00FFFFFF       # = color.surface_sunken
+state.slider_fill=0x00408040                # = color.accent
+state.slider_fill_disabled=0x00808080 # = color.on_surface_disabled
+state.slider_thumb_rest=0x00408040          # = color.accent
+state.slider_thumb_hover=0x00408040         # = color.accent_hover (== color.accent in this
+                                           #   legacy theme - grandfathered, not a new gap)
+state.slider_thumb_active=0x00408040 # = color.accent_active
+state.slider_thumb_focus_ring=0x00326532 # = color.focus_ring
+state.slider_thumb_disabled=0x00808080 # = color.on_surface_disabled
+metric.scrollbar_thumb_min=24
+radius.scrollbar_thumb=8                # = 0 on a flat/hard-edge theme, else 8
+state.scrollbar_track=0x00FFFFFF    # = color.surface_sunken
+state.scrollbar_thumb_rest=0x0080a080       # = legacy scrollbar_thumb (unchanged)
+state.scrollbar_thumb_hover=0x00608060 # = legacy scrollbar_thumb_hover (unchanged)
+state.scrollbar_thumb_active=0x00408040     # = color.accent
+state.scrollbar_thumb_focus_ring=0x00326532 # = color.focus_ring
+state.scrollbar_thumb_disabled=0x00C0D0C0 # = color.border_subtle
+
+# --- #711 Loop 3 / Family 1 (window decorations): elevation shadow + outer
+# corner radius (director redirect, section 1), propagated to this legacy
+# theme. Mechanism, precedent (decor_fill_rounded_rect already shipping via
+# login.c; wm_draw_winmenu's existing offset-silhouette edge band; the
+# 3-step fb_fill_rect_alpha ramp standing in for a real blur this renderer
+# cannot draw) and the modal-shadow variant are documented in full once, in
+# maytera_dark.mtheme's copy of this block. This theme is decor.style=
+# gradient, so it takes the same modern default numbers as maytera_dark/
+# maytera_light: not a per-theme colour judgement, radius.window/shadow.*
+# are geometry+flag tokens, identical across every gradient-style theme.
+radius.window=4
+decor.window_shadow=1
+shadow.color=0x00000000
+shadow.alpha=90
+shadow.offset_y=4
+shadow.blur=12
+shadow.modal_alpha=120
+shadow.modal_blur=16
+
+# --- #745: taskbar-surface ink -----------------------------------------------
+# The Settings left nav paints its labels, icons and version line on
+# taskbar_bg / taskbar_hover / taskbar_active. Before these three keys existed
+# it borrowed label_text (contracted against window_bg), button_disabled
+# (against button_bg) and menu_text_disabled (against menu_bg), which on a
+# theme with a light window and a dark bar rendered dark ink on a dark
+# surface. These state this theme's own ink for that surface.
+# Checked at build time by build/assets/theme-scale-lint.sh check #9 and at
+# load time by kernel/gui/themes.c theme_ensure_all_contrast().
+taskbar_text=0x00E0F0E0
+taskbar_text_muted=0x00AAC4AA
+taskbar_selected_text=0x00E8F4E8
+
+# --- #745: keyboard focus ring raised to the WCAG 1.4.11 3:1 non-text
+# floor. color.focus_ring was 0x00408040, measuring 4.43/2.23:1 against this theme's own
+# color.surface / color.surface_raised. It had never been visible as a
+# defect because nothing READ it: theme_get_color_by_id() had no case for
+# c_focus_ring until #745, so libc drew every focus ring from `accent`.
+# New value is the same hue lifted the minimum distance that clears the
+# floor with headroom on BOTH surfaces. Enforced by check #10 in
+# build/assets/theme-scale-lint.sh, which is NOT baseline-suppressible.

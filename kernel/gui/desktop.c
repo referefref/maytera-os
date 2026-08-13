@@ -5,7 +5,6 @@
 #include "icons.h"
 #include "themes.h"
 #include "ttf.h"
-#include "background.h"
 #include "../types.h"
 #include "../serial.h"
 #include "../mm/heap.h"
@@ -16,30 +15,18 @@
 #include "../drivers/mouse.h"
 #include "../cpu/isr.h"
 #include "../fs/fat.h"
+#include "../fs/bootlog.h"
 #include "../net/net.h"
 #include "../version.h"
 #include "terminal.h"
-#include "calculator.h"
 #include "settings.h"
-#include "pong.h"
 #include "clock.h"
-#include "irc.h"
-#include "imageviewer.h"
-#include "paint.h"
-#include "taskmanager.h"
 #include "recyclebin.h"
 #include "syslog.h"
 #include "screensaver.h"
-#include "netsettings.h"
-#include "solitaire.h"
-#include "mediaplayer.h"
-#include "lemmings.h"
-#include "browser.h"
 // Forward declarations for app launchers
-extern void editor_launch(void);
 extern void filebrowser_launch(void);
 extern void settings_launch(void);
-extern void solitaire_launch(void);
 #include "../exec/elf.h"
 #include "../proc/process.h"
 
@@ -84,9 +71,24 @@ extern fat_fs_t g_fat_fs;
 static uint32_t g_session_uid = 0;
 static uint32_t g_session_gid = 0;
 
+// #566: KERNEL-OWNED session lock state. This is the single authority for
+// "is the current session locked". A Ring-3 app (including the compositor)
+// cannot forge "unlocked": it can only READ this via SYS_SESSION_IS_LOCKED and
+// can only CLEAR it through SYS_SESSION_UNLOCK, which itself calls the
+// rate-limited users_authenticate(). The compositor's own g_logged_in-style
+// globals are a display cache of this fact, never the fact itself. Locking
+// (setting to 1) is always allowed; only unlocking requires a verified password.
+static volatile int g_session_locked = 0;
+// Has any session authenticated this boot? Gates the post-login kernel_shell
+// fallback out of existence (#566, decision 3): once true, a dead desktop
+// returns to the login gate, never to an unauthenticated Ring-0 shell.
+static volatile int g_session_authenticated = 0;
+
 void desktop_set_session(uint32_t uid, uint32_t gid) {
     g_session_uid = uid;
     g_session_gid = gid;
+    g_session_locked = 0;            // a fresh session starts unlocked
+    g_session_authenticated = 1;     // an authenticated session now exists
     kprintf("[DESKTOP] Session UID=%u, GID=%u\n", uid, gid);
 }
 
@@ -96,6 +98,24 @@ uint32_t desktop_get_session_uid(void) {
 
 uint32_t desktop_get_session_gid(void) {
     return g_session_gid;
+}
+
+// Set/clear the kernel-owned lock flag. `locked` is treated as a boolean.
+// Callers that CLEAR the flag must have already verified the password; the
+// only sanctioned clear path is sys_session_unlock().
+void desktop_set_locked(int locked) {
+    g_session_locked = locked ? 1 : 0;
+    bootlog_write("[SESSION] lock state -> %s (uid=%u)",
+                  g_session_locked ? "LOCKED" : "unlocked", g_session_uid);
+    kprintf("[DESKTOP] Session %s\n", g_session_locked ? "LOCKED" : "unlocked");
+}
+
+int desktop_is_locked(void) {
+    return g_session_locked;
+}
+
+int desktop_session_authenticated(void) {
+    return g_session_authenticated;
 }
 
 // ============================================================================
@@ -134,41 +154,38 @@ static int launch_userspace_app(const char *path) {
     }
 
     // Create user-space process
-    int pid = proc_create_user(name, data, size, NULL, NULL);
+    // #692: the desktop launches on behalf of the logged-in session user.
+    // The identity is now named AT the spawn instead of being patched onto
+    // the child afterwards, so there is no window in which the child is
+    // root and no second place to forget.
+    int pid = proc_create_user_as(name, data, size, NULL, NULL, proc_as_session());
     if (pid > 0) {
-        // Apply session UID/GID to launched process
-        extern process_t *proc_get(uint32_t pid);
-        process_t *child = proc_get(pid);
-        if (child) {
-            child->uid  = g_session_uid;
-            child->gid  = g_session_gid;
-            child->euid = g_session_uid;
-            child->egid = g_session_gid;
-        }
+        // #692: the session uid/gid used to be stamped onto the child HERE,
+        // after it already existed. Removed: the identity is now part of the
+        // spawn itself, and a second place to set it is a second place to
+        // forget it.
         LOG_INFO("[UserSpace] Process created successfully");
     } else {
-        LOG_ERROR("[UserSpace] proc_create_user failed");
+        LOG_ERROR("[UserSpace] proc_create_user_as failed");
     }
 
     kfree(data);
     return pid;
 }
 
-// User-space Calculator launcher
-static void userspace_calc_launch(void) {
-    LOG_INFO("[Calculator] Loading from /apps/calc (user-space)");
-    int pid = launch_userspace_app("/apps/calc");
-    if (pid > 0) {
-        LOG_INFO("[Calculator] User-space process started successfully");
-    } else {
-        // Fallback to kernel calculator if user-space fails
-        LOG_INFO("[Calculator] User-space failed - using kernel version");
-        calculator_launch();
-    }
-}
+// #552: these userspace_*_launch wrappers were the kernel start menu's
+// app-launch callbacks (g_apps_items / g_games_items / g_system_items,
+// now removed). Marked unused rather than deleted: they are small,
+// self-contained, and this fallback desktop may grow its own icon-based
+// launcher for them later instead of a start menu.
+// #703: the wrappers whose kernel-side fallback has been deleted (calculator,
+// editor, browser, imageviewer, mediaplayer, irc, syslog viewer, solitaire,
+// pong, lemmings, DOOM) went with it. Each of those apps ships as a userland
+// ELF that the compositor start menu spawns; the kernel copies were reachable
+// only from gui/registry.c, which had no caller.
 
 // User-space Test launcher (Debug app with extensive logging)
-static void userspace_test_launch(void) {
+__attribute__((unused)) static void userspace_test_launch(void) {
     kprintf("[TEST] Loading from /apps/test (user-space debug app)\n");
     int pid = launch_userspace_app("/apps/test");
     if (pid > 0) {
@@ -180,7 +197,7 @@ static void userspace_test_launch(void) {
 
 
 // User-space Terminal launcher
-static void userspace_terminal_launch(void) {
+__attribute__((unused)) static void userspace_terminal_launch(void) {
     LOG_INFO("[Terminal] Loading from /apps/terminal (user-space)");
     int pid = launch_userspace_app("/apps/terminal");
     if (pid > 0) {
@@ -192,7 +209,7 @@ static void userspace_terminal_launch(void) {
 }
 
 // User-space Files launcher
-static void userspace_files_launch(void) {
+__attribute__((unused)) static void userspace_files_launch(void) {
     LOG_INFO("[Files] Loading from /apps/files (user-space)");
     int pid = launch_userspace_app("/apps/files");
     if (pid > 0) {
@@ -203,20 +220,8 @@ static void userspace_files_launch(void) {
     }
 }
 
-// User-space Editor launcher
-static void userspace_editor_launch(void) {
-    LOG_INFO("[Editor] Loading from /apps/editor (user-space)");
-    int pid = launch_userspace_app("/apps/editor");
-    if (pid > 0) {
-        LOG_INFO("[Editor] User-space process started successfully");
-    } else {
-        LOG_INFO("[Editor] User-space failed - using kernel version");
-        editor_launch();
-    }
-}
-
 // User-space Settings launcher
-static void userspace_settings_launch(void) {
+__attribute__((unused)) static void userspace_settings_launch(void) {
     LOG_INFO("[Settings] Loading from /apps/settings (user-space)");
     int pid = launch_userspace_app("/apps/settings");
     if (pid > 0) {
@@ -228,21 +233,9 @@ static void userspace_settings_launch(void) {
 }
 
 // User-space App Store launcher (#402)
-static void userspace_appstore_launch(void) {
+__attribute__((unused)) static void userspace_appstore_launch(void) {
     LOG_INFO("[AppStore] Loading from /apps/appstore (user-space)");
     launch_userspace_app("/apps/appstore");
-}
-
-// User-space Solitaire launcher
-static void userspace_solitaire_launch(void) {
-    LOG_INFO("[Solitaire] Loading from /apps/solitr (user-space)");
-    int pid = launch_userspace_app("/apps/solitr");
-    if (pid > 0) {
-        LOG_INFO("[Solitaire] User-space process started successfully");
-    } else {
-        LOG_INFO("[Solitaire] User-space failed - using kernel version");
-        solitaire_launch();
-    }
 }
 
 // User-space Python launcher
@@ -256,81 +249,17 @@ __attribute__((unused)) static void userspace_python_launch(void) {
     }
 }
 
-// User-space System Log launcher
-static void userspace_syslog_launch(void) {
-    LOG_INFO("[SysLog] Loading from /apps/syslog (user-space)");
-    int pid = launch_userspace_app("/apps/syslog");
-    if (pid > 0) {
-        LOG_INFO("[SysLog] User-space process started successfully");
-    } else {
-        LOG_INFO("[SysLog] User-space failed - using kernel version");
-        syslog_viewer_launch();
-    }
-}
-
-// #447: in-kernel Cybersecurity app (BadUSB / USB threat scan + keystroke monitor)
-extern void cybersecurity_launch(void);
 // Global desktop state
 
 // Forward declarations for kernel-mode app launchers used as fallbacks
-extern void browser_launch(void);
-extern void browser_launch_kernel(void);
-extern void doom_launch(void);
-extern void lemmings_launch(void);
-extern void pong_launch(void);
-extern void netsettings_launch(void);
-extern void taskmanager_launch(void);
 extern void recyclebin_launch(void);
-extern void audio_config_launch(void);
-extern void nethack_launch(void);
-extern void imageviewer_launch(const char *path);
-extern void paint_launch(const char *path);
-static void imageviewer_launch_default(void);
-static void paint_launch_default(void);
 
-// Browser launcher - uses kernel browser directly (userland stub has no networking)
-static void userspace_browser_launch(void) {
-    browser_launch_kernel();
-}
-
-// User-space Paint launcher
-static void userspace_paint_launch(void) {
-    LOG_INFO("[Paint] Loading from /apps/paint");
-    int pid = launch_userspace_app("/apps/paint");
-    if (pid > 0) {
-        LOG_INFO("[Paint] User-space process started successfully");
-    } else {
-        LOG_INFO("[Paint] User-space failed, using kernel version");
-        paint_launch_default();
-    }
-}
-
-// User-space Image Viewer launcher
-static void userspace_imageviewer_launch(void) {
-    LOG_INFO("[ImageViewer] Loading from /apps/imgview");
-    int pid = launch_userspace_app("/apps/imgview");
-    if (pid > 0) {
-        LOG_INFO("[ImageViewer] User-space process started successfully");
-    } else {
-        LOG_INFO("[ImageViewer] User-space failed, using kernel version");
-        imageviewer_launch_default();
-    }
-}
-
-// User-space Media Player launcher
-static void userspace_mediaplayer_launch(void) {
-    LOG_INFO("[MediaPlayer] Loading from /apps/mplayer");
-    int pid = launch_userspace_app("/apps/mplayer");
-    if (pid > 0) {
-        LOG_INFO("[MediaPlayer] User-space process started successfully");
-    } else {
-        LOG_INFO("[MediaPlayer] User-space failed, using kernel version");
-        mediaplayer_launch_simple();
-    }
-}
+// #694: the user-space Paint launcher wrapper is gone with the kernel Paint
+// it fell back to. The shipping desktop is the userland compositor, whose
+// start menu spawns /APPS/PAINT directly.
 
 // User-space Clock launcher
-static void userspace_clock_launch(void) {
+__attribute__((unused)) static void userspace_clock_launch(void) {
     LOG_INFO("[Clock] Loading from /apps/clock");
     int pid = launch_userspace_app("/apps/clock");
     if (pid > 0) {
@@ -341,80 +270,8 @@ static void userspace_clock_launch(void) {
     }
 }
 
-// User-space IRC launcher
-static void userspace_irc_launch(void) {
-    LOG_INFO("[IRC] Loading from /apps/irc");
-    int pid = launch_userspace_app("/apps/irc");
-    if (pid > 0) {
-        LOG_INFO("[IRC] User-space process started successfully");
-    } else {
-        LOG_INFO("[IRC] User-space failed, using kernel version");
-        irc_launch();
-    }
-}
-
-// User-space DOOM launcher
-static void userspace_doom_launch(void) {
-    LOG_INFO("[DOOM] Loading from /apps/DOOM.ELF");
-    int pid = launch_userspace_app("/apps/DOOM.ELF");
-    if (pid > 0) {
-        LOG_INFO("[DOOM] User-space process started successfully");
-    } else {
-        LOG_INFO("[DOOM] User-space failed, using kernel version");
-        doom_launch();
-    }
-}
-
-// User-space Lemmings launcher
-static void userspace_lemmings_launch(void) {
-    LOG_INFO("[Lemmings] Loading from /apps/lemmings");
-    int pid = launch_userspace_app("/apps/lemmings");
-    if (pid > 0) {
-        LOG_INFO("[Lemmings] User-space process started successfully");
-    } else {
-        LOG_INFO("[Lemmings] User-space failed, using kernel version");
-        lemmings_launch();
-    }
-}
-
-// User-space Pong launcher
-static void userspace_pong_launch(void) {
-    LOG_INFO("[Pong] Loading from /apps/pong");
-    int pid = launch_userspace_app("/apps/pong");
-    if (pid > 0) {
-        LOG_INFO("[Pong] User-space process started successfully");
-    } else {
-        LOG_INFO("[Pong] User-space failed, using kernel version");
-        pong_launch();
-    }
-}
-
-// User-space Network launcher
-static void userspace_network_launch(void) {
-    LOG_INFO("[Network] Loading from /apps/network");
-    int pid = launch_userspace_app("/apps/network");
-    if (pid > 0) {
-        LOG_INFO("[Network] User-space process started successfully");
-    } else {
-        LOG_INFO("[Network] User-space failed, using kernel version");
-        netsettings_launch();
-    }
-}
-
-// User-space Task Manager launcher
-static void userspace_taskmanager_launch(void) {
-    LOG_INFO("[TaskManager] Loading from /apps/taskmgr");
-    int pid = launch_userspace_app("/apps/taskmgr");
-    if (pid > 0) {
-        LOG_INFO("[TaskManager] User-space process started successfully");
-    } else {
-        LOG_INFO("[TaskManager] User-space failed, using kernel version");
-        taskmanager_launch();
-    }
-}
-
 // User-space Recycle Bin launcher
-static void userspace_recyclebin_launch(void) {
+__attribute__((unused)) static void userspace_recyclebin_launch(void) {
     LOG_INFO("[RecycleBin] Loading from /apps/recycle");
     int pid = launch_userspace_app("/apps/recycle");
     if (pid > 0) {
@@ -422,18 +279,6 @@ static void userspace_recyclebin_launch(void) {
     } else {
         LOG_INFO("[RecycleBin] User-space failed, using kernel version");
         recyclebin_launch();
-    }
-}
-
-// User-space Audio Config launcher
-static void userspace_audioconfig_launch(void) {
-    LOG_INFO("[AudioConfig] Loading from /apps/aconfig");
-    int pid = launch_userspace_app("/apps/aconfig");
-    if (pid > 0) {
-        LOG_INFO("[AudioConfig] User-space process started successfully");
-    } else {
-        LOG_INFO("[AudioConfig] User-space failed, using kernel version");
-        audio_config_launch();
     }
 }
 
@@ -450,81 +295,18 @@ static desktop_t g_desktop;
 
 // Background image storage
 static image_t g_bg_image_data;
+// #552: the kernel's own start menu (draw_start_menu and friends) has been
+// removed. It only ever ran when /APPS/COMPOSIT was missing (see desktop_run
+// below): the userland compositor's start menu, toggled by the taskbar start
+// button and the Super/Windows key, is the only start menu in MayteraOS now.
+// g_start_menu_open stays declared (and permanently false) because a few
+// harmless reads of it remain below (desktop_init logging, and
+// desktop_handle_right_click's "close any open menus" reset).
+static bool g_start_menu_open = false;
 
-// Start menu state
-static bool g_start_menu_open = false;  // DEBUG: Auto-open start menu
-
-// ============================================================================
-// Enhanced Start Menu - Recent Files, View Modes, Sorting, Submenus
-// ============================================================================
-
-// Recent files tracking
-#define MAX_RECENT_FILES 10
-#define RECENT_FILE_PATH_LEN 256
-#define RECENT_FILE_NAME_LEN 64
-
-typedef struct {
-    char path[RECENT_FILE_PATH_LEN];
-    char name[RECENT_FILE_NAME_LEN];
-    uint64_t timestamp;         // Timer ticks when accessed
-    uint32_t access_count;      // Frequency counter
-} recent_file_t;
-
-static recent_file_t g_recent_files[MAX_RECENT_FILES];
-static int g_recent_file_count = 0;
-
-// View modes for start menu
-typedef enum {
-    VIEW_GRID,      // Icons in grid (4 columns)
-    VIEW_LIST,      // Text list with icons
-    VIEW_COMPACT    // Small icons, more items per row
-} menu_view_t;
-
-// Sorting modes
-typedef enum {
-    SORT_NAME,      // Alphabetical
-    SORT_DATE,      // Most recent first
-    SORT_FREQUENCY  // Most used first
-} menu_sort_t;
-
-// Menu configuration (persisted to /CONFIG/MENU.CFG)
-typedef struct {
-    int height;             // Adjustable height (300-600)
-    menu_view_t view;       // Current view mode
-    menu_sort_t sort;       // Current sort mode
-    bool show_recent;       // Show recent files section
-    bool show_search;       // Show search bar
-    bool categories_expanded[8];  // Which categories are expanded
-} menu_config_t;
-
-static menu_config_t g_menu_config = {
-    .height = 450,
-    .view = VIEW_LIST,
-    .sort = SORT_NAME,
-    .show_recent = true,
-    .show_search = true,
-    .categories_expanded = {true, true, true, false, true, false, false, false}
-};
-
-// Search state
-#define MENU_SEARCH_MAX 32
-static char g_menu_search[MENU_SEARCH_MAX] = {0};
-static int g_menu_search_len = 0;
-static bool g_menu_search_focused = false;
-
-// Submenu state (for cascading menus)
-static int g_submenu_category = -1;   // Which category has open submenu
-static int g_expanded_category = 0;   // Which category is expanded (0=Apps, 1=Games, 2=System)
-static bool g_category_header_clicked = false;  // True if click was on a category header
-static int g_submenu_x = 0;
-static int g_submenu_y = 0;
-
-// Hover tracking for visual feedback
-static int g_menu_hover_category = -1;
-static int g_menu_hover_item = -1;
-static int g_menu_hover_recent = -1;
-
-// Menu item definition with icon support
+// Menu item definition with icon support. Kept: still used by the
+// right-click context menu's cascading submenus (context_item_t.submenu),
+// even though the kernel start menu itself is gone.
 typedef struct {
     const char *name;
     int icon_id;
@@ -532,739 +314,15 @@ typedef struct {
     const char *userspace_path;  // If set, launch this ELF from disk
 } menu_item_t;
 
-// Menu category definition
-typedef struct {
-    const char *name;
-    int icon_id;
-    menu_item_t *items;
-    int item_count;
-    bool is_separator;
-} menu_category_t;
-
-// Forward declarations for app launchers (defined in respective app files)
-
-
-// Wrapper for imageviewer_launch (takes filepath param, but we want no-arg version)
-static void imageviewer_launch_default(void) {
-    imageviewer_launch(NULL);
-}
-
-// Wrapper for paint_launch
-static void paint_launch_default(void) {
-    paint_launch(NULL);
-}
-
-// Forward declarations for power options
-static void do_shutdown(void);
-static void do_restart(void);
-
-// task #306: launch the graphical install-to-disk wizard (kernel GUI app).
-static void installer_launch_action(void) {
-    extern void installer_run(void);
-    installer_run();
-}
-
-// Application menu items
-static menu_item_t g_apps_items[] = {
-    {"Terminal",     ICON_TERMINAL,    userspace_terminal_launch, NULL},
-
-    {"Browser",      ICON_NETWORK,     userspace_browser_launch, NULL},
-
-    {"Files",        ICON_FOLDER,      userspace_files_launch, NULL},
-
-    {"Editor",       ICON_HIGHLIGHT,   userspace_editor_launch, NULL},
-
-    {"Calculator",   ICON_CALCULATOR,  userspace_calc_launch, NULL},
-
-    {"Paint",        ICON_PAINT,       userspace_paint_launch, NULL},
-
-    {"Image Viewer", ICON_IMAGE,       userspace_imageviewer_launch, NULL},
-
-    {"Media Player", ICON_PLAY,        userspace_mediaplayer_launch, NULL},
-
-    {"Clock",        ICON_CLOCK,       userspace_clock_launch, NULL},
-
-    {"IRC",          ICON_NETWORK,     userspace_irc_launch, NULL},
-
-    {"Python", ICON_TERMINAL, userspace_python_launch, NULL},
-
-    {"Debug User-Space", ICON_TERMINAL, userspace_test_launch, NULL},
-
-    {NULL, -1, NULL, NULL}
-
-};
-
-// Games menu items
-static menu_item_t g_games_items[] = {
-    {"DOOM",        ICON_GAME_DOOM,       userspace_doom_launch, NULL},
-
-    {"Lemmings",    ICON_GAME_LEMMINGS,   userspace_lemmings_launch, NULL},
-
-    {"Solitaire",   ICON_GAME_SOLITAIRE,  userspace_solitaire_launch, NULL},
-
-    {"Pong",        ICON_GAME_PONG,       userspace_pong_launch, NULL},
-
-    {"NetHack",     ICON_GAME,            nethack_launch, NULL},
-
-    {NULL, -1, NULL, NULL}
-
-};
-
-// System menu items
-static menu_item_t g_system_items[] = {
-    {"Settings",     ICON_COG,           userspace_settings_launch, NULL},
-
-    {"Network",      ICON_NETWORK,       userspace_network_launch, NULL},
-
-    {"Task Manager", ICON_TASK_MANAGER,  userspace_taskmanager_launch, NULL},
-
-    {"Recycle Bin",  ICON_TRASH,         userspace_recyclebin_launch, NULL},
-
-    {"System Log",   ICON_LOG_VIEWER,    userspace_syslog_launch, NULL},
-
-    {"Install MayteraOS", ICON_SAVE,    installer_launch_action, NULL},
-
-    {"Wallpaper",    ICON_PALETTE,       NULL, NULL},  // Will open wallpaper picker
-    {"Security",     ICON_COG,           cybersecurity_launch, NULL},
-    {NULL, -1, NULL, NULL}
-
-};
-
-// Power menu items
-static menu_item_t g_power_items[] = {
-    {"Restart",     ICON_REFRESH,     do_restart, NULL},
-
-    {"Shutdown",    ICON_POWER,       do_shutdown, NULL},
-
-    {NULL, -1, NULL, NULL}
-
-};
-
-// Count items in array
-static int count_menu_items(menu_item_t *items) {
-    int count = 0;
-    while (items[count].name) count++;
-    return count;
-}
-
-
-#define MAX_MENU_CATEGORIES 10
-static menu_category_t g_start_menu_categories[MAX_MENU_CATEGORIES] = {
-    {"Applications", ICON_CATEGORIES, g_apps_items, 0, false},
-    {"Games",        ICON_GAME,       g_games_items, 0, false},
-    {"System",       ICON_COG,        g_system_items, 0, false},
-    {NULL,           -1,              NULL, 0, true},  // Separator
-    {"Power",        ICON_POWER,      g_power_items, 0, false},
-    {NULL, -1, NULL, 0, false}  // Terminator
-};
-
-// Store clicked category and item for action execution
-static int g_clicked_category = -1;
+// Set by the context menu's submenu click handling (get_context_menu_item_at).
 static int g_clicked_item = -1;
 
-// Enhanced start menu dimensions
-#define START_MENU_WIDTH        300     // Wider for grid view
-#define START_MENU_MIN_HEIGHT   300     // Minimum height
-#define START_MENU_MAX_HEIGHT   600     // Maximum height
-#define START_MENU_ITEM_H       26      // Item height
-#define START_MENU_CAT_H        28      // Category header height
-#define START_MENU_PADDING      8       // Padding
-#define START_MENU_SEP_H        12      // Separator height
-#define START_MENU_SEARCH_H     32      // Search bar height
-#define START_MENU_RECENT_H     24      // Recent file item height
-#define START_MENU_GRID_COLS    5       // Columns in grid view
-#define START_MENU_GRID_ITEM_W  52      // Grid item width
-#define START_MENU_GRID_ITEM_H  72      // Grid item height (icon + label)
-#define START_MENU_POWER_H      40      // Power buttons area height
-#define SUBMENU_WIDTH           180     // Cascading submenu width
-#define SUBMENU_ARROW_SIZE      8       // Arrow indicator size
-
-// Forward declarations for start menu functions
-static void draw_start_menu(void);
-static int get_start_menu_item_at(int x, int y);
-static bool is_start_button_click(int x, int y);
-static void start_menu_add_recent(const char *path, const char *name);
-static void start_menu_save_config(void);
-static void start_menu_load_config(void);
-static void __attribute__((unused)) start_menu_toggle_view(void);
-static void start_menu_cycle_sort(void);
-static void draw_start_menu_search(int x, int y, int width);
-static void draw_start_menu_recent(int x, int *y, int width);
-static void draw_start_menu_grid(int x, int *y, int width, menu_item_t *items, int count);
-static void draw_start_menu_list(int x, int *y, int width, menu_item_t *items, int count);
-// static void draw_cascading_submenu(int cat_index); // Unused - using accordion now
-
-
-// ============================================================================
-// STRTMENU.CFG - Config-driven start menu
-// ============================================================================
-
-#define CFG_MAX_ITEMS_PER_CAT 16
-#define CFG_MAX_CATS 8
-#define CFG_NAME_LEN 32
-#define CFG_PATH_LEN 64
-
-// Storage for dynamically loaded menu items from STRTMENU.CFG
-static menu_item_t g_cfg_items[CFG_MAX_CATS][CFG_MAX_ITEMS_PER_CAT + 1];
-static char g_cfg_names[CFG_MAX_CATS * CFG_MAX_ITEMS_PER_CAT][CFG_NAME_LEN];
-static char g_cfg_paths[CFG_MAX_CATS * CFG_MAX_ITEMS_PER_CAT][CFG_PATH_LEN];
-static char g_cfg_cat_names[CFG_MAX_CATS][CFG_NAME_LEN];
-static int g_cfg_name_idx = 0;
-static bool g_startmenu_cfg_loaded = false;
-
-// Map icon name string to ICON_* constant
-static int cfg_lookup_icon(const char *name) {
-    if (!name || !name[0]) return ICON_FILE;
-    if (strcmp(name, "terminal") == 0) return ICON_TERMINAL;
-    if (strcmp(name, "network") == 0) return ICON_NETWORK;
-    if (strcmp(name, "folder") == 0) return ICON_FOLDER;
-    if (strcmp(name, "highlight") == 0) return ICON_HIGHLIGHT;
-    if (strcmp(name, "calculator") == 0) return ICON_CALCULATOR;
-    if (strcmp(name, "paint") == 0) return ICON_PAINT;
-    if (strcmp(name, "image") == 0) return ICON_IMAGE;
-    if (strcmp(name, "music") == 0) return ICON_MUSIC;
-    if (strcmp(name, "play") == 0) return ICON_PLAY;
-    if (strcmp(name, "clock") == 0) return ICON_CLOCK;
-    if (strcmp(name, "cog") == 0) return ICON_COG;
-    if (strcmp(name, "game_doom") == 0) return ICON_GAME_DOOM;
-    if (strcmp(name, "game_solitaire") == 0) return ICON_GAME_SOLITAIRE;
-    if (strcmp(name, "game_pong") == 0) return ICON_GAME_PONG;
-    if (strcmp(name, "game_lemmings") == 0) return ICON_GAME_LEMMINGS;
-    if (strcmp(name, "game") == 0) return ICON_GAME;
-    if (strcmp(name, "power") == 0) return ICON_POWER;
-    if (strcmp(name, "refresh") == 0) return ICON_REFRESH;
-    if (strcmp(name, "trash") == 0) return ICON_TRASH;
-    if (strcmp(name, "log") == 0) return ICON_LOG_VIEWER;
-    if (strcmp(name, "task_manager") == 0) return ICON_TASK_MANAGER;
-    if (strcmp(name, "palette") == 0) return ICON_PALETTE;
-    if (strcmp(name, "categories") == 0) return ICON_CATEGORIES;
-    if (strcmp(name, "home") == 0) return ICON_HOME;
-    if (strcmp(name, "info") == 0) return ICON_INFO_CIRCLE;
-    if (strcmp(name, "window") == 0) return ICON_WINDOW;
-    if (strcmp(name, "file") == 0) return ICON_FILE;
-    return ICON_FILE;
-}
-
-// Map kernel app name to launch function
-typedef void (*cfg_launch_fn)(void);
-
-static cfg_launch_fn cfg_lookup_kernel(const char *name) {
-    if (!name || !name[0]) return NULL;
-    if (strcmp(name, "terminal") == 0) return userspace_terminal_launch;
-    if (strcmp(name, "ssh") == 0) { extern void sshterm_launch(void); return sshterm_launch; }
-    if (strcmp(name, "browser") == 0) return userspace_browser_launch;
-    if (strcmp(name, "files") == 0) return userspace_files_launch;
-    if (strcmp(name, "editor") == 0) return userspace_editor_launch;
-    if (strcmp(name, "calculator") == 0) return userspace_calc_launch;
-    if (strcmp(name, "paint") == 0) return userspace_paint_launch;
-    if (strcmp(name, "image") == 0) return userspace_imageviewer_launch;
-    if (strcmp(name, "media") == 0) return userspace_mediaplayer_launch;
-    if (strcmp(name, "clock") == 0) return userspace_clock_launch;
-    if (strcmp(name, "irc") == 0) return userspace_irc_launch;
-    if (strcmp(name, "doom") == 0) return userspace_doom_launch;
-    if (strcmp(name, "lemmings") == 0) return userspace_lemmings_launch;
-    if (strcmp(name, "solitaire") == 0) return userspace_solitaire_launch;
-    if (strcmp(name, "pong") == 0) return userspace_pong_launch;
-    if (strcmp(name, "nethack") == 0) return nethack_launch;
-    if (strcmp(name, "settings") == 0) return userspace_settings_launch;
-    if (strcmp(name, "netsettings") == 0) return userspace_network_launch;
-    if (strcmp(name, "taskmanager") == 0) return userspace_taskmanager_launch;
-    if (strcmp(name, "recyclebin") == 0) return userspace_recyclebin_launch;
-    if (strcmp(name, "syslog") == 0) return userspace_syslog_launch;
-    if (strcmp(name, "cybersecurity") == 0) return cybersecurity_launch;
-    if (strcmp(name, "audio_config") == 0) return userspace_audioconfig_launch;
-    if (strcmp(name, "restart") == 0) return do_restart;
-    if (strcmp(name, "shutdown") == 0) return do_shutdown;
-    return NULL;
-}
-
-// Map category name to default icon
-static int cfg_cat_icon(const char *name) {
-    if (!name) return ICON_CATEGORIES;
-    if (strcmp(name, "Applications") == 0) return ICON_CATEGORIES;
-    if (strcmp(name, "Games") == 0) return ICON_GAME;
-    if (strcmp(name, "System") == 0) return ICON_COG;
-    if (strcmp(name, "Power") == 0) return ICON_POWER;
-    return ICON_CATEGORIES;
-}
-
-// Helper: trim trailing whitespace in place
-static void cfg_trim(char *s, int len) {
-    while (len > 0 && (s[len-1] == ' ' || s[len-1] == '\t' || s[len-1] == '\r'))
-        s[--len] = '\0';
-}
-
-// Load start menu entries from /STRTMENU.CFG and append user-installed apps
-// from /APPS/REGINI.CFG so that installs/uninstalls made over the remote
-// shell show up on the next menu load (either at boot or after an
-// explicit desktop_menu_reload() call from remote_ctrl).
-static void start_menu_load_startmenu_cfg(void) {
-    if (!g_fat_fs.mounted) return;
-
-    uint32_t size = 0;
-    char *data = (char *)fat_read_file(&g_fat_fs, "/STRTMENU.CFG", &size);
-
-    // Try to merge /APPS/REGINI.CFG. Entries there should use the same
-    // CATEGORY=.../APP=... syntax; conventionally they begin with
-    // CATEGORY=Installed so they land in their own section.
-    uint32_t reg_size = 0;
-    char *reg_data = (char *)fat_read_file(&g_fat_fs, "/APPS/REGINI.CFG", &reg_size);
-    if (reg_data && reg_size > 0) {
-        uint32_t base_size = data ? size : 0;
-        uint32_t combined_size = base_size + 1 + reg_size + 1;
-        char *combined = (char *)kmalloc(combined_size);
-        if (combined) {
-            if (data) memcpy(combined, data, base_size);
-            combined[base_size] = '\n';
-            memcpy(combined + base_size + 1, reg_data, reg_size);
-            combined[combined_size - 1] = '\0';
-            if (data) kfree(data);
-            data = combined;
-            size = combined_size - 1;
-            kprintf("[StartMenu] REGINI.CFG merged (%u bytes)\n", reg_size);
-        }
-        kfree(reg_data);
-    }
-    if (!data || size == 0) {
-        kprintf("[StartMenu] No STRTMENU.CFG found, using built-in defaults\n");
-        return;
-    }
-
-    g_cfg_name_idx = 0;
-    int cat_count = 0;     // Total categories built so far
-    int current_cat = -1;  // Index of current category being populated
-    int item_counts[CFG_MAX_CATS];
-    memset(item_counts, 0, sizeof(item_counts));
-
-    char *line = data;
-    while (*line) {
-        // Skip whitespace
-        while (*line == ' ' || *line == '\t') line++;
-
-        // Skip comments and blank lines
-        if (*line == '#' || *line == '\n' || *line == '\r' || *line == '\0') {
-            while (*line && *line != '\n') line++;
-            if (*line == '\n') line++;
-            continue;
-        }
-
-        // Find end of line for length calculation
-        char *eol = line;
-        while (*eol && *eol != '\n' && *eol != '\r') eol++;
-
-        // Display settings (backwards compatible)
-        if (strncmp(line, "HEIGHT=", 7) == 0) {
-            g_menu_config.height = atoi(line + 7);
-            if (g_menu_config.height < START_MENU_MIN_HEIGHT)
-                g_menu_config.height = START_MENU_MIN_HEIGHT;
-            if (g_menu_config.height > START_MENU_MAX_HEIGHT)
-                g_menu_config.height = START_MENU_MAX_HEIGHT;
-        } else if (strncmp(line, "VIEW=", 5) == 0) {
-            int v = atoi(line + 5);
-            if (v >= 0 && v <= 2) g_menu_config.view = (menu_view_t)v;
-        } else if (strncmp(line, "SORT=", 5) == 0) {
-            int s = atoi(line + 5);
-            if (s >= 0 && s <= 2) g_menu_config.sort = (menu_sort_t)s;
-        } else if (strncmp(line, "RECENT=", 7) == 0) {
-            g_menu_config.show_recent = (atoi(line + 7) != 0);
-        } else if (strncmp(line, "SEARCH=", 7) == 0) {
-            g_menu_config.show_search = (atoi(line + 7) != 0);
-        }
-        // SEPARATOR line
-        else if (strncmp(line, "SEPARATOR", 9) == 0) {
-            if (cat_count < CFG_MAX_CATS) {
-                // Add a separator entry
-                g_cfg_cat_names[cat_count][0] = '\0';
-                g_cfg_items[cat_count][0] = (menu_item_t){NULL, -1, NULL, NULL};
-                item_counts[cat_count] = 0;
-                cat_count++;
-            }
-        }
-        // CATEGORY=Name or CATEGORY=Name,icon
-        else if (strncmp(line, "CATEGORY=", 9) == 0) {
-            if (cat_count < CFG_MAX_CATS) {
-                char *p = line + 9;
-                int len = 0;
-                while (p[len] && p[len] != '\n' && p[len] != '\r' && p[len] != ',' && len < CFG_NAME_LEN - 1)
-                    len++;
-                memcpy(g_cfg_cat_names[cat_count], p, len);
-                g_cfg_cat_names[cat_count][len] = '\0';
-                cfg_trim(g_cfg_cat_names[cat_count], len);
-
-                g_cfg_items[cat_count][0] = (menu_item_t){NULL, -1, NULL, NULL};
-                item_counts[cat_count] = 0;
-                current_cat = cat_count;
-                cat_count++;
-            }
-        }
-        // APP=Name,icon,command
-        else if (strncmp(line, "APP=", 4) == 0 && current_cat >= 0) {
-            if (item_counts[current_cat] < CFG_MAX_ITEMS_PER_CAT &&
-                g_cfg_name_idx < CFG_MAX_CATS * CFG_MAX_ITEMS_PER_CAT) {
-
-                char *p = line + 4;
-
-                // Parse display name (until comma)
-                char name[CFG_NAME_LEN];
-                int ni = 0;
-                while (*p && *p != ',' && *p != '\n' && *p != '\r' && ni < CFG_NAME_LEN - 1)
-                    name[ni++] = *p++;
-                name[ni] = '\0';
-                if (*p == ',') p++;
-
-                // Parse icon name (until comma)
-                char icon_name[32];
-                int ii = 0;
-                while (*p && *p != ',' && *p != '\n' && *p != '\r' && ii < 31)
-                    icon_name[ii++] = *p++;
-                icon_name[ii] = '\0';
-                if (*p == ',') p++;
-
-                // Parse command (rest of line)
-                char command[CFG_PATH_LEN];
-                int ci = 0;
-                while (*p && *p != '\n' && *p != '\r' && ci < CFG_PATH_LEN - 1)
-                    command[ci++] = *p++;
-                command[ci] = '\0';
-                cfg_trim(command, ci);
-
-                // Build menu item
-                int idx = item_counts[current_cat];
-                menu_item_t *item = &g_cfg_items[current_cat][idx];
-
-                // Store name string persistently
-                strncpy(g_cfg_names[g_cfg_name_idx], name, CFG_NAME_LEN - 1);
-                g_cfg_names[g_cfg_name_idx][CFG_NAME_LEN - 1] = '\0';
-                item->name = g_cfg_names[g_cfg_name_idx];
-
-                // Look up icon
-                item->icon_id = cfg_lookup_icon(icon_name);
-
-                // Determine launch method
-                item->action = NULL;
-                item->userspace_path = NULL;
-
-                if (strncmp(command, "kernel:", 7) == 0) {
-                    // Kernel built-in app
-                    item->action = cfg_lookup_kernel(command + 7);
-                } else if (strcmp(command, "wallpicker") == 0) {
-                    // Special wallpaper picker (detected by ICON_PALETTE + NULL action)
-                    item->icon_id = ICON_PALETTE;
-                } else if (command[0] == '/') {
-                    // Userspace ELF path
-                    strncpy(g_cfg_paths[g_cfg_name_idx], command, CFG_PATH_LEN - 1);
-                    g_cfg_paths[g_cfg_name_idx][CFG_PATH_LEN - 1] = '\0';
-                    item->userspace_path = g_cfg_paths[g_cfg_name_idx];
-                    // Try to find a kernel fallback using the filename
-                    const char *app_name = command;
-                    for (const char *s = command; *s; s++) {
-                        if (*s == '/') app_name = s + 1;
-                    }
-                    item->action = cfg_lookup_kernel(app_name);
-                }
-
-                g_cfg_name_idx++;
-                item_counts[current_cat]++;
-
-                // Keep NULL terminator after last item
-                g_cfg_items[current_cat][item_counts[current_cat]] =
-                    (menu_item_t){NULL, -1, NULL, NULL};
-            }
-        }
-
-        // Advance to next line
-        while (*line && *line != '\n') line++;
-        if (*line == '\n') line++;
-    }
-
-    kfree(data);
-
-    if (cat_count == 0) {
-        kprintf("[StartMenu] STRTMENU.CFG: no categories found\n");
-        return;
-    }
-
-    // Rebuild g_start_menu_categories from parsed config
-    int i;
-    for (i = 0; i < cat_count && i < MAX_MENU_CATEGORIES - 1; i++) {
-        if (g_cfg_cat_names[i][0] == '\0') {
-            // Separator
-            g_start_menu_categories[i] = (menu_category_t){NULL, -1, NULL, 0, true};
-        } else {
-            g_start_menu_categories[i] = (menu_category_t){
-                g_cfg_cat_names[i],
-                cfg_cat_icon(g_cfg_cat_names[i]),
-                g_cfg_items[i],
-                0,
-                false
-            };
-        }
-    }
-    // Terminator
-    g_start_menu_categories[i] = (menu_category_t){NULL, -1, NULL, 0, false};
-
-    g_startmenu_cfg_loaded = true;
-    kprintf("[StartMenu] STRTMENU.CFG loaded: %d categories\n", cat_count);
-    for (i = 0; i < cat_count; i++) {
-        if (g_cfg_cat_names[i][0])
-            kprintf("[StartMenu]   %s: %d items\n", g_cfg_cat_names[i], item_counts[i]);
-    }
-}
-
-
-// Menu categories
-// Runtime menu initialization (workaround for .data section loading issue)
-static void init_start_menu_items(void) {
-    kprintf("[StartMenu] Runtime init of menu items...\n");
-    g_apps_items[0] = (menu_item_t){"Terminal", ICON_TERMINAL, userspace_terminal_launch, NULL};
-    g_apps_items[1] = (menu_item_t){"Browser", ICON_NETWORK, userspace_browser_launch, NULL};
-    g_apps_items[2] = (menu_item_t){"Files", ICON_FOLDER, userspace_files_launch, NULL};
-    g_apps_items[3] = (menu_item_t){"Editor", ICON_HIGHLIGHT, userspace_editor_launch, NULL};
-    g_apps_items[4] = (menu_item_t){"Calculator", ICON_CALCULATOR, userspace_calc_launch, NULL};
-    g_apps_items[5] = (menu_item_t){"Paint", ICON_PAINT, userspace_paint_launch, NULL};
-    g_apps_items[6] = (menu_item_t){"Images", ICON_IMAGE, userspace_imageviewer_launch, NULL};
-    g_apps_items[7] = (menu_item_t){"Media", ICON_PLAY, userspace_mediaplayer_launch, NULL};
-    g_apps_items[8] = (menu_item_t){"Clock", ICON_CLOCK, userspace_clock_launch, NULL};
-    g_apps_items[9] = (menu_item_t){"IRC", ICON_NETWORK, userspace_irc_launch, NULL};
-    g_apps_items[10] = (menu_item_t){"App Store", ICON_NETWORK, userspace_appstore_launch, NULL};
-    g_apps_items[11] = (menu_item_t){NULL, -1, NULL, NULL};
-    g_games_items[0] = (menu_item_t){"DOOM", ICON_GAME_DOOM, userspace_doom_launch, NULL};
-    g_games_items[1] = (menu_item_t){"Solitaire", ICON_GAME_SOLITAIRE, userspace_solitaire_launch, NULL};
-    g_games_items[2] = (menu_item_t){"Pong", ICON_GAME_PONG, userspace_pong_launch, NULL};
-    g_games_items[3] = (menu_item_t){"Lemmings", ICON_GAME_LEMMINGS, userspace_lemmings_launch, NULL};
-    g_games_items[4] = (menu_item_t){"NetHack", ICON_GAME, nethack_launch, NULL};
-    g_games_items[5] = (menu_item_t){NULL, -1, NULL, NULL};
-    g_system_items[0] = (menu_item_t){"Settings", ICON_COG, userspace_settings_launch, NULL};
-    g_system_items[1] = (menu_item_t){"Network", ICON_NETWORK, userspace_network_launch, NULL};
-    g_system_items[2] = (menu_item_t){"Task Mgr", ICON_TASK_MANAGER, userspace_taskmanager_launch, NULL};
-    g_system_items[3] = (menu_item_t){"Recycle", ICON_TRASH, userspace_recyclebin_launch, NULL};
-    g_system_items[4] = (menu_item_t){"Sys Log", ICON_LOG_VIEWER, userspace_syslog_launch, NULL};
-    g_system_items[5] = (menu_item_t){"Audio Cfg", ICON_MUSIC, userspace_audioconfig_launch, NULL};
-    g_system_items[6] = (menu_item_t){"Security", ICON_COG, cybersecurity_launch, NULL};
-    g_system_items[7] = (menu_item_t){NULL, -1, NULL, NULL};
-    g_power_items[0] = (menu_item_t){"Restart", ICON_REFRESH, do_restart, NULL};
-    g_power_items[1] = (menu_item_t){"Shutdown", ICON_POWER, do_shutdown, NULL};
-    g_power_items[2] = (menu_item_t){NULL, -1, NULL, NULL};
-    g_start_menu_categories[0] = (menu_category_t){"Applications", ICON_CATEGORIES, g_apps_items, 0, false};
-    g_start_menu_categories[1] = (menu_category_t){"Games", ICON_GAME, g_games_items, 0, false};
-    g_start_menu_categories[2] = (menu_category_t){"System", ICON_COG, g_system_items, 0, false};
-    g_start_menu_categories[3] = (menu_category_t){NULL, -1, NULL, 0, true};
-    g_start_menu_categories[4] = (menu_category_t){"Power", ICON_POWER, g_power_items, 0, false};
-    g_start_menu_categories[5] = (menu_category_t){NULL, -1, NULL, 0, false};
-
-    // Initialize recent files list
-    for (int i = 0; i < MAX_RECENT_FILES; i++) {
-        g_recent_files[i].path[0] = '\0';
-        g_recent_files[i].name[0] = '\0';
-        g_recent_files[i].timestamp = 0;
-        g_recent_files[i].access_count = 0;
-    }
-    g_recent_file_count = 0;
-
-    // Load menu configuration from disk
-    start_menu_load_config();
-
-    // Load app entries from STRTMENU.CFG (overrides built-in defaults if present)
-    start_menu_load_startmenu_cfg();
-
-    kprintf("[StartMenu] Menu items initialized (view=%d, sort=%d, height=%d)\n",
-            g_menu_config.view, g_menu_config.sort, g_menu_config.height);
-}
-
-// Public reload hook. Called from net/remote_ctrl.c after an install or
-// uninstall mutates /APPS/REGINI.CFG, so the new entries appear in the
-// start menu without a reboot.
+// #552: public reload hook, called from net/remote_ctrl.c after an install
+// or uninstall mutates /APPS/REGINI.CFG. It used to reload the kernel start
+// menu's config-driven entries; the kernel start menu is gone, so this is
+// now a no-op, kept only so remote_ctrl.c and the SYS_DESKTOP_MENU_RELOAD
+// syscall do not need to change.
 void desktop_menu_reload(void) {
-    start_menu_load_startmenu_cfg();
-    for (int c = 0;
-         g_start_menu_categories[c].name || g_start_menu_categories[c].is_separator;
-         c++) {
-        if (g_start_menu_categories[c].items) {
-            g_start_menu_categories[c].item_count =
-                count_menu_items(g_start_menu_categories[c].items);
-        }
-    }
-    kprintf("[StartMenu] reload complete\n");
-}
-
-// ============================================================================
-// Recent Files Management
-// ============================================================================
-
-// Add a file to recent files list (called by file opener apps)
-// Exported so other modules can call it
-__attribute__((unused))
-void start_menu_add_recent(const char *path, const char *name) {
-    if (!path || !name) return;
-
-    // Check if already in list - if so, update timestamp and move to front
-    for (int i = 0; i < g_recent_file_count; i++) {
-        if (strcmp(g_recent_files[i].path, path) == 0) {
-            g_recent_files[i].timestamp = timer_ticks;
-            g_recent_files[i].access_count++;
-            // Move to front
-            if (i > 0) {
-                recent_file_t temp = g_recent_files[i];
-                for (int j = i; j > 0; j--) {
-                    g_recent_files[j] = g_recent_files[j-1];
-                }
-                g_recent_files[0] = temp;
-            }
-            return;
-        }
-    }
-
-    // Add new entry - shift everything down
-    if (g_recent_file_count < MAX_RECENT_FILES) {
-        g_recent_file_count++;
-    }
-    for (int i = g_recent_file_count - 1; i > 0; i--) {
-        g_recent_files[i] = g_recent_files[i-1];
-    }
-
-    // Copy to first slot
-    strncpy(g_recent_files[0].path, path, RECENT_FILE_PATH_LEN - 1);
-    g_recent_files[0].path[RECENT_FILE_PATH_LEN - 1] = '\0';
-    strncpy(g_recent_files[0].name, name, RECENT_FILE_NAME_LEN - 1);
-    g_recent_files[0].name[RECENT_FILE_NAME_LEN - 1] = '\0';
-    g_recent_files[0].timestamp = timer_ticks;
-    g_recent_files[0].access_count = 1;
-
-    kprintf("[StartMenu] Added recent file: %s\n", name);
-}
-
-// Format relative time string (e.g., "just now", "1 hour ago")
-static void format_relative_time(uint64_t timestamp, char *buf, int buflen) {
-    uint64_t now = timer_ticks;
-    uint64_t diff = now - timestamp;
-
-    // Timer is 1000 Hz, so 1000 ticks = 1 second
-    uint64_t seconds = diff / g_timer_hz;
-
-    if (seconds < 60) {
-        strncpy(buf, "just now", buflen);
-    } else if (seconds < 3600) {
-        int minutes = seconds / 60;
-        if (minutes == 1) {
-            strncpy(buf, "1 min ago", buflen);
-        } else {
-            snprintf(buf, buflen, "%d min ago", minutes);
-        }
-    } else if (seconds < 86400) {
-        int hours = seconds / 3600;
-        if (hours == 1) {
-            strncpy(buf, "1 hour ago", buflen);
-        } else {
-            snprintf(buf, buflen, "%d hours ago", hours);
-        }
-    } else {
-        int days = seconds / 86400;
-        if (days == 1) {
-            strncpy(buf, "yesterday", buflen);
-        } else {
-            snprintf(buf, buflen, "%d days ago", days);
-        }
-    }
-    buf[buflen - 1] = '\0';
-}
-
-// ============================================================================
-// Menu Configuration (Save/Load)
-// ============================================================================
-
-// Save menu configuration to /CONFIG/MENU.CFG
-static void start_menu_save_config(void) {
-    if (!g_fat_fs.mounted) return;
-
-    // Create config string
-    char config[512];
-    snprintf(config, sizeof(config),
-        "HEIGHT=%d\nVIEW=%d\nSORT=%d\nRECENT=%d\nSEARCH=%d\n",
-        g_menu_config.height,
-        (int)g_menu_config.view,
-        (int)g_menu_config.sort,
-        g_menu_config.show_recent ? 1 : 0,
-        g_menu_config.show_search ? 1 : 0
-    );
-
-    // Write to file
-    int result = fat_write_file(&g_fat_fs, "/CONFIG/MENU.CFG", config, strlen(config));
-    if (result >= 0) {
-        kprintf("[StartMenu] Config saved to /CONFIG/MENU.CFG\n");
-    } else {
-        kprintf("[StartMenu] Failed to save config\n");
-    }
-}
-
-// Load menu configuration from /CONFIG/MENU.CFG
-static void start_menu_load_config(void) {
-    if (!g_fat_fs.mounted) return;
-
-    uint32_t size = 0;
-    char *data = (char *)fat_read_file(&g_fat_fs, "/CONFIG/MENU.CFG", &size);
-    if (!data || size == 0) {
-        kprintf("[StartMenu] No config file found, using defaults\n");
-        return;
-    }
-
-    // Parse config (simple key=value format)
-    char *line = data;
-    while (*line) {
-        // Skip whitespace
-        while (*line == ' ' || *line == '\t') line++;
-
-        if (strncmp(line, "HEIGHT=", 7) == 0) {
-            g_menu_config.height = atoi(line + 7);
-            if (g_menu_config.height < START_MENU_MIN_HEIGHT)
-                g_menu_config.height = START_MENU_MIN_HEIGHT;
-            if (g_menu_config.height > START_MENU_MAX_HEIGHT)
-                g_menu_config.height = START_MENU_MAX_HEIGHT;
-        } else if (strncmp(line, "VIEW=", 5) == 0) {
-            int v = atoi(line + 5);
-            if (v >= 0 && v <= 2) g_menu_config.view = (menu_view_t)v;
-        } else if (strncmp(line, "SORT=", 5) == 0) {
-            int s = atoi(line + 5);
-            if (s >= 0 && s <= 2) g_menu_config.sort = (menu_sort_t)s;
-        } else if (strncmp(line, "RECENT=", 7) == 0) {
-            g_menu_config.show_recent = (atoi(line + 7) != 0);
-        } else if (strncmp(line, "SEARCH=", 7) == 0) {
-            g_menu_config.show_search = (atoi(line + 7) != 0);
-        }
-
-        // Move to next line
-        while (*line && *line != '\n') line++;
-        if (*line == '\n') line++;
-    }
-
-    kfree(data);
-    kprintf("[StartMenu] Config loaded: height=%d view=%d sort=%d\n",
-            g_menu_config.height, g_menu_config.view, g_menu_config.sort);
-}
-
-// Toggle between view modes
-static void __attribute__((unused)) start_menu_toggle_view(void) {
-    g_menu_config.view = (menu_view_t)((g_menu_config.view + 1) % 3);
-    start_menu_save_config();
-    kprintf("[StartMenu] View mode changed to %d\n", g_menu_config.view);
-}
-
-// Cycle through sort modes (for future use in settings)
-__attribute__((unused))
-static void start_menu_cycle_sort(void) {
-    g_menu_config.sort = (menu_sort_t)((g_menu_config.sort + 1) % 3);
-    start_menu_save_config();
-    kprintf("[StartMenu] Sort mode changed to %d\n", g_menu_config.sort);
-}
-
-// Adjust menu height (for future use in settings or drag-to-resize)
-__attribute__((unused))
-static void start_menu_adjust_height(int delta) {
-    g_menu_config.height += delta;
-    if (g_menu_config.height < START_MENU_MIN_HEIGHT)
-        g_menu_config.height = START_MENU_MIN_HEIGHT;
-    if (g_menu_config.height > START_MENU_MAX_HEIGHT)
-        g_menu_config.height = START_MENU_MAX_HEIGHT;
-    start_menu_save_config();
 }
 
 // ============================================================================
@@ -1367,7 +425,6 @@ static wallpaper_entry_t g_wallpapers[] = {
     {"Default Blue", "BACK.BMP"},
     // Eberhard Grossgasteiger landscapes
     {"Mountain Vista 1", "EBERG01.BMP"},
-    {"Mountain Vista 2", "EBERG02.BMP"},
     {"Mountain Vista 3", "EBERG03.BMP"},
     {"Mountain Vista 4", "EBERG04.BMP"},
     {"Mountain Vista 5", "EBERG05.BMP"},
@@ -1909,8 +966,14 @@ static void load_background_image(void) {
 
     kprintf("[Desktop] Searching for background image...\n");
 
-    // Try different possible filenames
-    const char *bg_files[] = {"/BACK.BMP", "/BACKGROUND.BMP", "/BG.BMP", "BACK.BMP", NULL};
+    // Try different possible filenames. "/MAYTERA_MODERN.BMP" is the current
+    // out-of-box default (#745, second pass - see userland/apps/compositor/
+    // wallpaper.c's WP_DEFAULT_FILE); tried first so this rarely-used kernel
+    // fallback desktop (see the comment above load_background_image's caller
+    // chain: it only runs when /APPS/COMPOSIT is missing) still shows a real
+    // wallpaper instead of falling through to the gradient. Old names kept as
+    // further fallbacks.
+    const char *bg_files[] = {"/MAYTERA_MODERN.BMP", "/BACK.BMP", "/BACKGROUND.BMP", "/BG.BMP", "BACK.BMP", NULL};
 
     for (int i = 0; bg_files[i] != NULL; i++) {
         kprintf("[Desktop] Trying %s...\n", bg_files[i]);
@@ -2083,7 +1146,6 @@ static void desktop_init_default_icons(void) {
     desktop_add_icon("Recycle Bin",  ICON_TRASH,     0, 1, recyclebin_launch);
     desktop_add_icon("Terminal",     ICON_TERMINAL,  0, 2, terminal_launch);
     desktop_add_icon("Settings",     ICON_COG,       0, 3, settings_launch);
-    desktop_add_icon("DOOM",         ICON_GAME_DOOM, 0, 4, doom_launch);
 
     kprintf("[Desktop] Initialized %u default desktop icons\n", g_desktop.icon_count);
 }
@@ -2096,7 +1158,6 @@ void desktop_init(void) {
     ttf_init();
     ttf_selfcheck_digits();  // #302: verify digits 0-9 (esp. '7') render OK
 
-    init_start_menu_items();  // Initialize menu items at runtime
     kprintf("[Desktop] Initializing desktop manager...\n");
 
     // Initialize the theme system
@@ -2135,13 +1196,7 @@ void desktop_init(void) {
     // Context menu no longer needs Applications submenu (now has direct items)
 
 
-    // Pre-initialize menu category item counts
-    for (int c = 0; g_start_menu_categories[c].name || g_start_menu_categories[c].is_separator; c++) {
-        if (g_start_menu_categories[c].items) {
-            g_start_menu_categories[c].item_count = count_menu_items(g_start_menu_categories[c].items);
-            kprintf("[Desktop] Menu category %d item_count=%d\n", c, g_start_menu_categories[c].item_count);
-        }
-    }
+    // #552: kernel start menu category init removed along with the menu.
     g_desktop.initialized = true;
     kprintf("[Desktop] g_start_menu_open at init end: %d\n", g_start_menu_open);
 
@@ -2348,58 +1403,9 @@ void desktop_handle_click(int x, int y) {
         return;
     }
 
-    // Check if start menu is open and click is on menu item
-    if (g_start_menu_open) {
-        int menu_item = get_start_menu_item_at(x, y);
-        if (menu_item >= 0 && g_clicked_category >= 0) {
-            menu_item_t *item = &g_start_menu_categories[g_clicked_category].items[g_clicked_item];
-            kprintf("[Desktop] Menu item clicked: %s (cat %d, item %d)\n",
-                   item->name, g_clicked_category, g_clicked_item);
-
-            g_start_menu_open = false;
-            wm_invalidate_all();  // Close menu before launching
-
-            // Handle wallpaper picker specially
-            if (item->icon_id == ICON_PALETTE && item->action == NULL) {
-                open_wallpaper_picker();
-                return;
-            }
-
-            if (item->userspace_path && item->userspace_path[0]) {
-                kprintf("[Desktop] Launching userspace: %s -> %s\n",
-                        item->name, item->userspace_path);
-                int pid = launch_userspace_app(item->userspace_path);
-                if (pid <= 0 && item->action) {
-                    kprintf("[Desktop] Userspace failed, kernel fallback\n");
-                    item->action();
-                }
-            } else if (item->action) {
-                kprintf("[Desktop] Calling action for: %s\n", item->name);
-                for (volatile int i = 0; i < 100000; i++);
-                item->action();
-                kprintf("[Desktop] Action returned for: %s\n", item->name);
-            }
-            return;
-        }
-        // Check if we clicked a category header (accordion toggle)
-        if (g_category_header_clicked) {
-            g_category_header_clicked = false;  // Reset flag
-            // Don't close - just toggled a category
-            return;
-        }
-        // Click outside menu - close it
-        g_start_menu_open = false;
-        wm_invalidate_all();
-        return;
-    }
-
-    // Check if click is on start button
-    if (is_start_button_click(x, y)) {
-        kprintf("[Desktop] Start button clicked\n");
-        g_start_menu_open = !g_start_menu_open;
-        wm_invalidate_all();
-        return;
-    }
+    // #552: kernel start menu removed (click-on-menu-item and
+    // click-on-start-button branches both gone; see the block comment
+    // above g_start_menu_open near the top of this file).
 
     // Check if click is on dock app
     int app_index = dock_get_app_at(x, y);
@@ -2660,599 +1666,11 @@ void dock_clear(void) {
     kprintf("[Dock] Cleared all apps\n");
 }
 
-// Power management functions
-static void do_shutdown(void) {
-    kprintf("[Desktop] Shutdown requested\n");
-    // For QEMU: use ACPI shutdown (port 0x604)
-    outw(0x604, 0x2000);
-    // Fallback: halt the CPU
-    __asm__ volatile("cli; hlt");
-}
-
-static void do_restart(void) {
-    kprintf("[Desktop] Restart requested\n");
-    // Use keyboard controller to reset
-    outb(0x64, 0xFE);
-    // Fallback: halt
-    __asm__ volatile("cli; hlt");
-}
-
-// ============================================================================
-// Enhanced Start Menu Drawing Functions
-// ============================================================================
-
-// Draw search bar at top of menu
-static void draw_start_menu_search(int x, int y, int width) {
-    // Search box background
-    fb_fill_rect(x + 4, y + 4, width - 8, START_MENU_SEARCH_H - 8, argb_to_fb(0xFF404040));
-    fb_draw_rect(x + 4, y + 4, width - 8, START_MENU_SEARCH_H - 8, argb_to_fb(0xFF606060));
-
-    // Search icon (using ZOOM_IN as search icon)
-    int icon_x = x + 10;
-    int icon_y = y + (START_MENU_SEARCH_H - 12) / 2;
-    icon_draw_scaled(ICON_ZOOM_IN, icon_x, icon_y, 12, 0x888888);
-
-    // Search text or placeholder
-    if (g_menu_search_len > 0) {
-        draw_string(x + 28, y + (START_MENU_SEARCH_H - FONT_HEIGHT) / 2,
-                   g_menu_search, argb_to_fb(0xFFE0E0E0));
-    } else {
-        draw_string(x + 28, y + (START_MENU_SEARCH_H - FONT_HEIGHT) / 2,
-                   "Search...", argb_to_fb(0xFF707070));
-    }
-
-    // Close button (X) - draw as text
-    draw_string(x + width - 20, y + (START_MENU_SEARCH_H - FONT_HEIGHT) / 2, "X", argb_to_fb(0xFF888888));
-}
-
-// Draw recent files section
-static void draw_start_menu_recent(int x, int *y, int width) {
-    if (!g_menu_config.show_recent || g_recent_file_count == 0) return;
-
-    // Section header
-    draw_string(x + START_MENU_PADDING, *y, "RECENT FILES", argb_to_fb(0xFF888888));
-    *y += START_MENU_CAT_H;
-
-    // Draw recent file items (max 5 shown)
-    int shown = (g_recent_file_count > 5) ? 5 : g_recent_file_count;
-    for (int i = 0; i < shown; i++) {
-        bool hover = (g_menu_hover_recent == i);
-
-        // Item background
-        uint32_t bg_color = hover ? 0xFF4A4A4A : 0xFF383838;
-        fb_fill_rect(x + 4, *y, width - 8, START_MENU_RECENT_H - 2, argb_to_fb(bg_color));
-
-        // File icon (based on extension)
-        int icon_id = ICON_FILE;
-        const char *ext = strrchr(g_recent_files[i].name, '.');
-        if (ext) {
-            if (strcmp(ext, ".txt") == 0 || strcmp(ext, ".TXT") == 0) icon_id = ICON_FILE;
-            else if (strcmp(ext, ".c") == 0 || strcmp(ext, ".C") == 0) icon_id = ICON_HIGHLIGHT;
-            else if (strcmp(ext, ".bmp") == 0 || strcmp(ext, ".BMP") == 0) icon_id = ICON_IMAGE;
-        }
-        icon_draw_scaled(icon_id, x + 8, *y + 2, 16, 0xDDDDDD);
-
-        // File name (truncated if needed)
-        char truncated_name[24];
-        strncpy(truncated_name, g_recent_files[i].name, 20);
-        truncated_name[20] = '\0';
-        if (strlen(g_recent_files[i].name) > 20) {
-            strcat(truncated_name, "...");
-        }
-        draw_string(x + 30, *y + (START_MENU_RECENT_H - FONT_HEIGHT) / 2,
-                   truncated_name, argb_to_fb(0xFFD0D0D0));
-
-        // Time ago
-        char time_str[16];
-        format_relative_time(g_recent_files[i].timestamp, time_str, sizeof(time_str));
-        int time_w = strlen(time_str) * FONT_WIDTH;
-        draw_string(x + width - time_w - 8, *y + (START_MENU_RECENT_H - FONT_HEIGHT) / 2,
-                   time_str, argb_to_fb(0xFF707070));
-
-        *y += START_MENU_RECENT_H;
-    }
-
-    // Separator after recent files
-    fb_fill_rect(x + 12, *y + START_MENU_SEP_H / 2 - 1, width - 24, 1, argb_to_fb(0xFF505050));
-    *y += START_MENU_SEP_H;
-}
-
-// Draw items in grid view (4 columns)
-static void draw_start_menu_grid(int x, int *y, int width, menu_item_t *items, int count) {
-    int col = 0;
-    int start_x = x + (width - START_MENU_GRID_COLS * START_MENU_GRID_ITEM_W) / 2;
-
-    for (int i = 0; i < count; i++) {
-        if (!items[i].name) break;
-
-        int item_x = start_x + col * START_MENU_GRID_ITEM_W;
-        int item_y = *y;
-
-        // Check hover state
-        bool hover = (g_menu_hover_item == i);
-        if (hover) {
-            fb_fill_rect(item_x, item_y, START_MENU_GRID_ITEM_W - 4,
-                        START_MENU_GRID_ITEM_H - 4, argb_to_fb(0xFF4A4A4A));
-        }
-
-        // Draw icon (32x32 centered)
-        int icon_x = item_x + (START_MENU_GRID_ITEM_W - 32) / 2;
-        int icon_y = item_y + 8;
-        if (items[i].icon_id >= 0) {
-            icon_draw_scaled(items[i].icon_id, icon_x, icon_y, 32, 0xFFFFFF);
-        }
-
-        // Draw name below icon (centered, truncated)
-        char short_name[9];
-        strncpy(short_name, items[i].name, 8);
-        short_name[8] = '\0';
-        if (strlen(items[i].name) > 8) {
-            short_name[7] = '.';
-            short_name[8] = '.';
-            short_name[8] = '\0';
-        }
-        int name_w = strlen(short_name) * FONT_WIDTH;
-        int name_x = item_x + (START_MENU_GRID_ITEM_W - name_w) / 2;
-        draw_string(name_x, item_y + 48, short_name, argb_to_fb(0xFFD0D0D0));
-
-        col++;
-        if (col >= START_MENU_GRID_COLS) {
-            col = 0;
-            *y += START_MENU_GRID_ITEM_H;
-        }
-    }
-
-    // Finish last row if not complete
-    if (col > 0) {
-        *y += START_MENU_GRID_ITEM_H;
-    }
-}
-
-// Draw items in list view (icons + text)
-static void draw_start_menu_list(int x, int *y, int width, menu_item_t *items, int count) {
-    for (int i = 0; i < count; i++) {
-        if (!items[i].name) break;
-
-        bool hover = (g_menu_hover_item == i);
-        uint32_t bg_color = hover ? 0xFF4A4A4A : 0xFF383838;
-
-        // Item background
-        fb_fill_rect(x + 4, *y, width - 8, START_MENU_ITEM_H - 2, argb_to_fb(bg_color));
-
-        // Draw icon
-        if (items[i].icon_id >= 0) {
-            int icon_size = 18;
-            int icon_x = x + 10;
-            int icon_y = *y + (START_MENU_ITEM_H - icon_size) / 2;
-            icon_draw_scaled(items[i].icon_id, icon_x, icon_y, icon_size, 0xDDDDDD);
-        }
-
-        // Item name
-        draw_string(x + 36, *y + (START_MENU_ITEM_H - FONT_HEIGHT) / 2,
-                   items[i].name, argb_to_fb(0xFFE0E0E0));
-
-        *y += START_MENU_ITEM_H;
-    }
-}
-
-// Draw cascading submenu for a category (appears to the right)
-__attribute__((unused)) static void draw_cascading_submenu(int cat_index) {
-    if (cat_index < 0 || !g_start_menu_categories[cat_index].items) return;
-
-    int item_count = count_menu_items(g_start_menu_categories[cat_index].items);
-    if (item_count == 0) return;
-
-    int submenu_height = item_count * START_MENU_ITEM_H + START_MENU_PADDING * 2;
-
-    // Draw submenu background (shadow effect)
-    fb_fill_rect(g_submenu_x + 2, g_submenu_y + 2, SUBMENU_WIDTH, submenu_height, argb_to_fb(0xFF1A1A1A));
-    fb_fill_rect(g_submenu_x, g_submenu_y, SUBMENU_WIDTH, submenu_height, argb_to_fb(0xFF2D2D2D));
-    fb_draw_rect(g_submenu_x, g_submenu_y, SUBMENU_WIDTH, submenu_height, argb_to_fb(0xFF606060));
-
-    // Draw items
-    int y = g_submenu_y + START_MENU_PADDING;
-    menu_item_t *items = g_start_menu_categories[cat_index].items;
-    for (int i = 0; i < item_count; i++) {
-        bool hover = (g_menu_hover_item == i && g_submenu_category == cat_index);
-        uint32_t bg_color = hover ? 0xFF4A4A4A : 0xFF383838;
-
-        fb_fill_rect(g_submenu_x + 4, y, SUBMENU_WIDTH - 8, START_MENU_ITEM_H - 2, argb_to_fb(bg_color));
-
-        if (items[i].icon_id >= 0) {
-            icon_draw_scaled(items[i].icon_id, g_submenu_x + 10, y + 3, 16, 0xDDDDDD);
-        }
-        draw_string(g_submenu_x + 32, y + (START_MENU_ITEM_H - FONT_HEIGHT) / 2,
-                   items[i].name, argb_to_fb(0xFFE0E0E0));
-
-        y += START_MENU_ITEM_H;
-    }
-}
-
-// Draw the enhanced start menu with all features
-static void draw_start_menu(void) {
-    if (!g_start_menu_open) return;
-
-    dock_t *dock = &g_desktop.dock;
-    int menu_height = g_menu_config.height;
-    
-    // CRITICAL FIX: If height is 0 or invalid, use default
-    if (menu_height <= 0 || menu_height > 800) {
-        kprintf("[StartMenu] WARNING: Invalid menu_height=%d, using default 450\n", menu_height);
-        menu_height = 450;
-        g_menu_config.height = 450;  // Fix the corrupted config
-    }
-    
-    int menu_width = START_MENU_WIDTH;
-
-    
-    // Safety check: ensure dock is properly initialized
-    if (dock->y == 0 && g_desktop.screen_height > 0) {
-        kprintf("[StartMenu] WARNING: dock->y is 0, recalculating dock position\n");
-        dock->y = g_desktop.screen_height - TASKBAR_HEIGHT;
-        dock->height = TASKBAR_HEIGHT;
-        dock->width = g_desktop.screen_width / 2;
-    }
-    int menu_x = dock->x + TASKBAR_PADDING;
-    int menu_y = dock->y - menu_height - 4;
-    if (menu_y < 0) { kprintf("[StartMenu] ERROR: menu_y=%d is negative, fixing\n", menu_y); menu_y = 10; }
-    kprintf("[StartMenu] Drawing: dock_y=%d, menu_height=%d, menu_y=%d, menu_x=%d\n", dock->y, menu_height, menu_y, menu_x);
-
-    // Initialize category item counts
-    for (int c = 0; g_start_menu_categories[c].name || g_start_menu_categories[c].is_separator; c++) {
-        if (g_start_menu_categories[c].items) {
-            g_start_menu_categories[c].item_count = count_menu_items(g_start_menu_categories[c].items);
-        }
-    }
-
-    // Draw menu background with shadow effect
-    fb_fill_rect(menu_x + 3, menu_y + 3, menu_width, menu_height, argb_to_fb(0xFF1A1A1A));  // Shadow
-    fb_fill_rect(menu_x, menu_y, menu_width, menu_height, argb_to_fb(0xFF2D2D2D));
-    fb_draw_rect(menu_x, menu_y, menu_width, menu_height, argb_to_fb(0xFF606060));
-
-    int y = menu_y;
-
-    // Draw search bar at top (if enabled)
-    if (g_menu_config.show_search) {
-        draw_start_menu_search(menu_x, y, menu_width);
-        y += START_MENU_SEARCH_H;
-    }
-
-    // Draw recent files section
-    draw_start_menu_recent(menu_x, &y, menu_width);
-
-    // APPLICATIONS - Accordion header (collapses when Games/System is opened)
-    bool apps_expanded = (g_expanded_category == 0);
-    uint32_t apps_header_bg = apps_expanded ? 0xFF404050 : 0xFF2D2D2D;
-    fb_fill_rect(menu_x + 4, y + 2, menu_width - 8, START_MENU_CAT_H - 4, argb_to_fb(apps_header_bg));
-    draw_string(menu_x + START_MENU_PADDING, y + (START_MENU_CAT_H - FONT_HEIGHT) / 2,
-               "APPLICATIONS", argb_to_fb(0xFF888888));
-    draw_string(menu_x + menu_width - 16, y + (START_MENU_CAT_H - FONT_HEIGHT) / 2,
-               apps_expanded ? "v" : ">", argb_to_fb(0xFF888888));
-    y += START_MENU_CAT_H;
-
-    // Draw applications only when expanded
-    if (apps_expanded) {
-        if (g_menu_config.view == VIEW_GRID) {
-            { int c = count_menu_items(g_apps_items); kprintf("[StartMenu] Drawing %d apps in grid view\n", c); draw_start_menu_grid(menu_x, &y, menu_width, g_apps_items, c); }
-        } else {
-            { int c = count_menu_items(g_apps_items); kprintf("[StartMenu] Drawing %d apps in list view\n", c); draw_start_menu_list(menu_x, &y, menu_width, g_apps_items, c); }
-        }
-    }
-
-    // Separator
-    fb_fill_rect(menu_x + 12, y + START_MENU_SEP_H / 2 - 1, menu_width - 24, 1, argb_to_fb(0xFF505050));
-    y += START_MENU_SEP_H;
-
-    // GAMES - Accordion header (click to expand)
-    bool games_expanded = (g_expanded_category == 1);
-    uint32_t games_header_bg = games_expanded ? 0xFF404050 : 0xFF2D2D2D;
-    fb_fill_rect(menu_x + 4, y + 2, menu_width - 8, START_MENU_CAT_H - 4, argb_to_fb(games_header_bg));
-    draw_string(menu_x + START_MENU_PADDING, y + (START_MENU_CAT_H - FONT_HEIGHT) / 2,
-               "GAMES", argb_to_fb(0xFF888888));
-    draw_string(menu_x + menu_width - 16, y + (START_MENU_CAT_H - FONT_HEIGHT) / 2,
-               games_expanded ? "v" : ">", argb_to_fb(0xFF888888));
-    y += START_MENU_CAT_H;
-    
-    // If Games expanded, show games grid
-    if (games_expanded) {
-        int c = count_menu_items(g_games_items);
-        draw_start_menu_grid(menu_x, &y, menu_width, g_games_items, c);
-    }
-
-    // SYSTEM - Accordion header (click to expand)
-    bool system_expanded = (g_expanded_category == 2);
-    uint32_t system_header_bg = system_expanded ? 0xFF404050 : 0xFF2D2D2D;
-    fb_fill_rect(menu_x + 4, y + 2, menu_width - 8, START_MENU_CAT_H - 4, argb_to_fb(system_header_bg));
-    draw_string(menu_x + START_MENU_PADDING, y + (START_MENU_CAT_H - FONT_HEIGHT) / 2,
-               "SYSTEM", argb_to_fb(0xFF888888));
-    draw_string(menu_x + menu_width - 16, y + (START_MENU_CAT_H - FONT_HEIGHT) / 2,
-               system_expanded ? "v" : ">", argb_to_fb(0xFF888888));
-    y += START_MENU_CAT_H;
-    
-    // If System expanded, show system grid
-    if (system_expanded) {
-        int c = count_menu_items(g_system_items);
-        draw_start_menu_grid(menu_x, &y, menu_width, g_system_items, c);
-    }
-
-    // Separator before power section
-    fb_fill_rect(menu_x + 12, y + START_MENU_SEP_H / 2 - 1, menu_width - 24, 1, argb_to_fb(0xFF505050));
-    y += START_MENU_SEP_H;
-
-    // Power buttons at bottom (horizontal layout)
-    int power_y = menu_y + menu_height - START_MENU_POWER_H; kprintf("[StartMenu] power_y=%d\n", power_y);
-    int btn_width = (menu_width - 24) / 2;
-
-    // Restart button
-    bool restart_hover = (g_menu_hover_category == 4 && g_menu_hover_item == 0);
-    uint32_t restart_bg = restart_hover ? 0xFF4A4A4A : 0xFF383838;
-    fb_fill_rect(menu_x + 8, power_y + 4, btn_width - 4, START_MENU_POWER_H - 8, argb_to_fb(restart_bg));
-    icon_draw_scaled(ICON_REFRESH, menu_x + 16, power_y + 10, 16, 0xDDDDDD);
-    draw_string(menu_x + 38, power_y + (START_MENU_POWER_H - FONT_HEIGHT) / 2, "Restart", argb_to_fb(0xFFD0D0D0));
-
-    // Shutdown button
-    bool shutdown_hover = (g_menu_hover_category == 4 && g_menu_hover_item == 1);
-    uint32_t shutdown_bg = shutdown_hover ? 0xFF4A4A4A : 0xFF383838;
-    fb_fill_rect(menu_x + btn_width + 12, power_y + 4, btn_width - 4, START_MENU_POWER_H - 8, argb_to_fb(shutdown_bg));
-    icon_draw_scaled(ICON_POWER, menu_x + btn_width + 20, power_y + 10, 16, 0xE06060);
-    draw_string(menu_x + btn_width + 42, power_y + (START_MENU_POWER_H - FONT_HEIGHT) / 2, "Shutdown", argb_to_fb(0xFFD0D0D0));
-
-    // Accordion menus - no cascading submenu needed
-}
-
-// Get menu item at position for enhanced start menu
-// Sets g_clicked_category and g_clicked_item for use by click handler
-// Also handles hover state updates and cascading submenu triggers
-static int get_start_menu_item_at(int x, int y) {
-    if (!g_start_menu_open) return -1;
-
-    dock_t *dock = &g_desktop.dock;
-    int menu_height = g_menu_config.height;
-    int menu_width = START_MENU_WIDTH;
-    int menu_x = dock->x + TASKBAR_PADDING;
-    
-    // Safety check: ensure dock is properly initialized
-    if (dock->y == 0 && g_desktop.screen_height > 0) {
-        kprintf("[StartMenu] WARNING: dock->y is 0, recalculating dock position\n");
-        dock->y = g_desktop.screen_height - TASKBAR_HEIGHT;
-        dock->height = TASKBAR_HEIGHT;
-        dock->width = g_desktop.screen_width / 2;
-    }
-    int menu_y = dock->y - menu_height - 4;
-    if (menu_y < 0) { kprintf("[StartMenu] ERROR: menu_y=%d is negative, fixing\n", menu_y); menu_y = 10; }
-    kprintf("[StartMenu] Drawing: dock_y=%d, menu_height=%d, menu_y=%d, menu_x=%d\n", dock->y, menu_height, menu_y, menu_x);
-
-    // Reset hover state
-    g_menu_hover_category = -1;
-    g_menu_hover_item = -1;
-    g_menu_hover_recent = -1;
-
-    // First check if click is in cascading submenu
-    if (g_submenu_category >= 0) {
-        int item_count = count_menu_items(g_start_menu_categories[g_submenu_category].items);
-        int submenu_height = item_count * START_MENU_ITEM_H + START_MENU_PADDING * 2;
-
-        if (x >= g_submenu_x && x < g_submenu_x + SUBMENU_WIDTH &&
-            y >= g_submenu_y && y < g_submenu_y + submenu_height) {
-
-            int rel_y = y - g_submenu_y - START_MENU_PADDING;
-            int item_idx = rel_y / START_MENU_ITEM_H;
-            if (item_idx >= 0 && item_idx < item_count) {
-                g_clicked_category = g_submenu_category;
-                g_clicked_item = item_idx;
-                return item_idx;
-            }
-        }
-    }
-
-    // Check if outside main menu bounds
-    if (x < menu_x || x >= menu_x + menu_width) {
-        g_submenu_category = -1;  // Close submenu
-        return -1;
-    }
-    if (y < menu_y || y >= menu_y + menu_height) return -1;
-
-    int cur_y = menu_y;
-
-    // Search bar area
-    if (g_menu_config.show_search) {
-        if (y >= cur_y && y < cur_y + START_MENU_SEARCH_H) {
-            // Check if close button clicked
-            if (x >= menu_x + menu_width - 28 && x < menu_x + menu_width - 4) {
-                g_start_menu_open = false;
-                return -1;
-            }
-            // Search area clicked - could focus search
-            g_menu_search_focused = true;
-            return -1;
-        }
-        cur_y += START_MENU_SEARCH_H;
-    }
-
-    // Recent files section
-    if (g_menu_config.show_recent && g_recent_file_count > 0) {
-        cur_y += START_MENU_CAT_H;  // Header
-
-        int shown = (g_recent_file_count > 5) ? 5 : g_recent_file_count;
-        for (int i = 0; i < shown; i++) {
-            if (y >= cur_y && y < cur_y + START_MENU_RECENT_H) {
-                g_menu_hover_recent = i;
-                // Click opens the recent file (would need file opener)
-                kprintf("[StartMenu] Recent file clicked: %s\n", g_recent_files[i].path);
-                return -1;  // Handled specially
-            }
-            cur_y += START_MENU_RECENT_H;
-        }
-        cur_y += START_MENU_SEP_H;  // Separator
-    }
-
-    // Applications header - click to toggle accordion
-    if (y >= cur_y && y < cur_y + START_MENU_CAT_H) {
-        g_expanded_category = (g_expanded_category == 0) ? -1 : 0;
-        g_category_header_clicked = true;
-        wm_invalidate_all();
-        return -1;
-    }
-    cur_y += START_MENU_CAT_H;
-
-    // Applications items (only when expanded)
-    if (g_expanded_category == 0) {
-        int apps_count = count_menu_items(g_apps_items);
-        if (g_menu_config.view == VIEW_GRID) {
-            // Grid view hit testing
-            int rows = (apps_count + START_MENU_GRID_COLS - 1) / START_MENU_GRID_COLS;
-            int grid_height = rows * START_MENU_GRID_ITEM_H;
-            int start_grid_x = menu_x + (menu_width - START_MENU_GRID_COLS * START_MENU_GRID_ITEM_W) / 2;
-
-            if (y >= cur_y && y < cur_y + grid_height) {
-                int col = (x - start_grid_x) / START_MENU_GRID_ITEM_W;
-                int row = (y - cur_y) / START_MENU_GRID_ITEM_H;
-
-                if (col >= 0 && col < START_MENU_GRID_COLS) {
-                    int idx = row * START_MENU_GRID_COLS + col;
-                    if (idx >= 0 && idx < apps_count) {
-                        g_clicked_category = 0;  // Applications
-                        g_clicked_item = idx;
-                        g_menu_hover_category = 0;
-                        g_menu_hover_item = idx;
-                        return idx;
-                    }
-                }
-            }
-            cur_y += grid_height;
-        } else {
-            // List view hit testing
-            for (int i = 0; i < apps_count; i++) {
-                if (y >= cur_y && y < cur_y + START_MENU_ITEM_H) {
-                    g_clicked_category = 0;  // Applications
-                    g_clicked_item = i;
-                    g_menu_hover_category = 0;
-                    g_menu_hover_item = i;
-                    return i;
-                }
-                cur_y += START_MENU_ITEM_H;
-            }
-        }
-    }
-
-    // Separator
-    cur_y += START_MENU_SEP_H;
-
-    // Games category header - toggle accordion
-    if (y >= cur_y && y < cur_y + START_MENU_CAT_H) {
-        g_expanded_category = (g_expanded_category == 1) ? 0 : 1;  // Toggle Games
-        g_category_header_clicked = true;  // Don't close menu
-        wm_invalidate_all();
-        return -1;
-    }
-    cur_y += START_MENU_CAT_H;
-    
-    // If Games is expanded, hit-test the games grid
-    if (g_expanded_category == 1) {
-        int games_count = count_menu_items(g_games_items);
-        int games_rows = (games_count + START_MENU_GRID_COLS - 1) / START_MENU_GRID_COLS;
-        int games_grid_h = games_rows * START_MENU_GRID_ITEM_H;
-        int start_grid_x = menu_x + (menu_width - START_MENU_GRID_COLS * START_MENU_GRID_ITEM_W) / 2;
-
-        if (y >= cur_y && y < cur_y + games_grid_h) {
-            int col = (x - start_grid_x) / START_MENU_GRID_ITEM_W;
-            int row = (y - cur_y) / START_MENU_GRID_ITEM_H;
-            if (col >= 0 && col < START_MENU_GRID_COLS) {
-                int idx = row * START_MENU_GRID_COLS + col;
-                if (idx >= 0 && idx < games_count) {
-                    g_clicked_category = 1;  // Games
-                    g_clicked_item = idx;
-                    g_menu_hover_category = 1;
-                    g_menu_hover_item = idx;
-                    return idx;
-                }
-            }
-        }
-        cur_y += games_grid_h;
-    }
-
-    // System category header - toggle accordion
-    if (y >= cur_y && y < cur_y + START_MENU_CAT_H) {
-        g_expanded_category = (g_expanded_category == 2) ? 0 : 2;  // Toggle System
-        g_category_header_clicked = true;
-        wm_invalidate_all();
-        return -1;
-    }
-    cur_y += START_MENU_CAT_H;
-    
-    // System items (only if expanded)
-    if (g_expanded_category == 2) {
-        int system_count = count_menu_items(g_system_items);
-        int rows = (system_count + START_MENU_GRID_COLS - 1) / START_MENU_GRID_COLS;
-        int grid_height = rows * START_MENU_GRID_ITEM_H;
-        int start_grid_x = menu_x + (menu_width - START_MENU_GRID_COLS * START_MENU_GRID_ITEM_W) / 2;
-
-        if (y >= cur_y && y < cur_y + grid_height) {
-            int col = (x - start_grid_x) / START_MENU_GRID_ITEM_W;
-            int row = (y - cur_y) / START_MENU_GRID_ITEM_H;
-
-            if (col >= 0 && col < START_MENU_GRID_COLS) {
-                int idx = row * START_MENU_GRID_COLS + col;
-                if (idx >= 0 && idx < system_count) {
-                    g_clicked_category = 2;  // System
-                    g_clicked_item = idx;
-                    g_menu_hover_category = 2;
-                    g_menu_hover_item = idx;
-                    return idx;
-                }
-            }
-        }
-        cur_y += grid_height;
-    }
-
-    // Power buttons at bottom
-    int power_y = menu_y + menu_height - START_MENU_POWER_H; kprintf("[StartMenu] power_y=%d\n", power_y);
-    if (y >= power_y && y < power_y + START_MENU_POWER_H) {
-        int btn_width = (menu_width - 24) / 2;
-
-        // Restart button
-        if (x >= menu_x + 8 && x < menu_x + 8 + btn_width) {
-            g_clicked_category = 4;  // Power
-            g_clicked_item = 0;      // Restart
-            g_menu_hover_category = 4;
-            g_menu_hover_item = 0;
-            return 0;
-        }
-
-        // Shutdown button
-        if (x >= menu_x + btn_width + 12 && x < menu_x + btn_width * 2 + 8) {
-            g_clicked_category = 4;  // Power
-            g_clicked_item = 1;      // Shutdown
-            g_menu_hover_category = 4;
-            g_menu_hover_item = 1;
-            return 1;
-        }
-    }
-
-    g_clicked_category = -1;
-    g_clicked_item = -1;
-    return -1;
-}
-
-// Check if click is on start button
-static bool is_start_button_click(int x, int y) {
-    dock_t *dock = &g_desktop.dock;
-    // Match the start button position from dock_draw()
-    int32_t start_size = TASKBAR_HEIGHT - 4;  // Same as in dock_draw
-    int32_t start_x = dock->x + TASKBAR_PADDING;
-    
-    // Safety check: ensure dock is properly initialized
-    if (dock->y == 0 && g_desktop.screen_height > 0) {
-        kprintf("[StartMenu] WARNING: dock->y is 0, recalculating dock position\n");
-        dock->y = g_desktop.screen_height - TASKBAR_HEIGHT;
-        dock->height = TASKBAR_HEIGHT;
-        dock->width = g_desktop.screen_width / 2;
-    }
-    int32_t start_y = dock->y + 2;
-
-    return (x >= start_x && x < start_x + start_size &&
-            y >= start_y && y < start_y + start_size);
-}
+// #552: draw_start_menu() and its helpers (draw_start_menu_search/_recent/
+// _grid/_list), get_start_menu_item_at(), and is_start_button_click() were
+// removed here along with the rest of the kernel start menu. do_shutdown()
+// and do_restart() were removed too: they had no caller left once the start
+// menu's Power buttons were gone (the compositor has its own shutdown path).
 
 // ============================================================================
 // Context Menu Implementation
@@ -4381,10 +2799,23 @@ static void autorun_worker(void *arg) {
     uint32_t sz = 0;
     char *cfg = (char *)fat_read_file(&g_fat_fs, "/CONFIG/AUTORUN.CFG", &sz);
     if (!cfg) return;
-    char path[128]; int i = 0;
-    while (cfg[i] && cfg[i] != '\n' && cfg[i] != '\r' && i < 127) { path[i] = cfg[i]; i++; }
+    // #595: the scan MUST be bounded by the byte count fat_read_file returned.
+    // It previously stopped only at '\n'/'\r'/NUL, so an AUTORUN.CFG with no
+    // trailing newline (the buffer is NOT NUL-terminated by fat_read_file) ran
+    // straight off the end of the allocation into adjacent heap and appended
+    // whatever bytes were there to the path. OBSERVED: a file containing
+    // exactly "/APPS/OPENARENA" made the kernel try to spawn
+    // "/APPS/OPENARENAjPAEH". Real out-of-bounds read + wrong-path spawn.
+    char path[128];
+    uint32_t i = 0;
+    while (i < sz && i < sizeof(path) - 1 &&
+           cfg[i] && cfg[i] != '\n' && cfg[i] != '\r') {
+        path[i] = cfg[i];
+        i++;
+    }
     path[i] = 0;
     kfree(cfg);
+    kprintf("[Autorun] AUTORUN.CFG %u bytes, path='%s'\n", sz, path);
     if (path[0] == '/') launch_userspace_app(path);
 }
 
@@ -4396,11 +2827,22 @@ void desktop_run(void) {
 
     kprintf("[Desktop] Starting desktop environment...\n");
 
+    // #569 repaint-artifact fix: the desktop/compositor owns the display from
+    // here on. Release the boot splash so late background boot logging (e.g.
+    // the periodic xHCI rescan worker's gfx_boot_log() calls) can never repaint
+    // the boot-log console over a live UI. An explicit splash (shutdown /
+    // restart screen) re-acquires it.
+    {
+        extern void gfx_boot_release_display(void);
+        gfx_boot_release_display();
+    }
+
     // Auto-launch the userland compositor. While it starts we KEEP THE BOOT
     // SPLASH on screen (do not draw the kernel desktop) so the handoff to the
     // usermode compositor is seamless - no flash of the kernel taskbar/icons.
     // The kernel desktop is only drawn as a fallback if the compositor is absent.
     extern int g_compositor_launched;
+    int compositor_pid = 0;   // #566: track compositor pid to detect its death
     {
         // #430 verification gate: if /PTTEST.RUN exists on the FAT ESP, launch
         // the signals+pthreads test app INSTEAD of the compositor. This runs it
@@ -4423,12 +2865,28 @@ void desktop_run(void) {
                 goto pttest_after_launch;
             }
         }
+        // #745 task #59: ARM THE FRAMEBUFFER CLAIM BEFORE THE LAUNCH.
+        // The claim window has to be open before the child can possibly run,
+        // or a compositor scheduled on another core between these two lines
+        // would be refused and the desktop would never come up. So: open it
+        // for "the next claimant", then narrow it to the real pid the instant
+        // we know it. fb_owner_arm() is a no-op once there is an owner, so if
+        // the compositor claimed inside that microscopic window the second
+        // call changes nothing. See gui/fbown.h.
+        extern void fb_owner_arm(uint32_t pid);
+        extern void fb_owner_disarm(void);
+        fb_owner_arm(0);
         int cpid = launch_userspace_app("/APPS/COMPOSIT");
         if (cpid > 0) {
+            fb_owner_arm((uint32_t)cpid);
             g_compositor_launched = 1;
+            compositor_pid = cpid;   // #566
             proc_create_ex("autorun", autorun_worker, 0, PRIO_LOW, 64*1024);
             kprintf("[Desktop] Compositor launched (pid %d); keeping splash until it renders\n", cpid);
         } else {
+            // Nothing will claim the framebuffer, so do not leave a window open
+            // for whatever Ring 3 process happens to ask first.
+            fb_owner_disarm();
             kprintf("[Desktop] WARNING: compositor not found; falling back to kernel desktop\n");
             wm_invalidate_all();
             desktop_draw();
@@ -4446,8 +2904,15 @@ pttest_after_launch:;   // #430: gate jumps here, skipping the compositor path
     // compositor (the first user process) is up and the allocator is in
     // steady state. svc_init() already built the registry in main().
     {
-        extern void svc_autostart(void);
-        svc_autostart();
+        // #566: autostart background services ONCE per boot, so re-entering
+        // desktop_run() after a Log Out / compositor restart does not spawn
+        // duplicate service processes.
+        static int s_svc_autostarted = 0;
+        if (!s_svc_autostarted) {
+            extern void svc_autostart(void);
+            svc_autostart();
+            s_svc_autostarted = 1;
+        }
     }
 
     // Store last mouse position and button state
@@ -4481,6 +2946,22 @@ pttest_after_launch:;   // #430: gate jumps here, skipping the compositor path
         // Check if exclusive mode is active (DOOM fullscreen, etc.)
         // If so, yield CPU and skip desktop processing
         if (wm_is_exclusive_mode() || g_compositor_launched) {
+            // #566 decision 3: if the compositor process has DIED (Log Out,
+            // crash, kill), RETURN from desktop_run() so the kernel re-enters the
+            // login gate (main.c's #566 login-gate loop), NEVER the
+            // unauthenticated Ring-0 shell. Death = the pid is gone, or its slot
+            // is now a zombie/unused entry.
+            if (g_compositor_launched && compositor_pid > 0) {
+                extern process_t *proc_get(uint32_t pid);
+                process_t *cp = proc_get((uint32_t)compositor_pid);
+                if (!cp || cp->state == PROC_STATE_ZOMBIE ||
+                    cp->state == PROC_STATE_UNUSED) {
+                    kprintf("[Desktop] Compositor (pid %d) exited; returning to "
+                            "login gate (no shell fallback)\n", compositor_pid);
+                    g_compositor_launched = 0;
+                    return;
+                }
+            }
             // The userland compositor owns the screen (or was just launched and is
             // about to render): idle, do NOT draw the kernel desktop, so the boot
             // splash persists seamlessly until the compositor's first frame (#268).
@@ -4517,13 +2998,11 @@ pttest_after_launch:;   // #430: gate jumps here, skipping the compositor path
                 continue;
             }
 
-            // F12 launches DOOM
-            if (c == 0x86) {
-                kprintf("[Desktop] F12 - launching DOOM\n");
-                extern void doom_launch(void);
-                doom_launch();
-                continue;
-            }
+            // #703: F12 used to launch the in-kernel DOOM. The kernel DOOM
+            // port has been removed; DOOM ships as the userland ELF
+            // /GAMES/DOOM/DOOM.ELF, which the compositor start menu and its
+            // desktop icon spawn. This fallback desktop has no launcher for
+            // it, so F12 is now unbound rather than pointing at nothing.
 
             // F11 toggles maximize of the focused window
             if (c == 0x85) {
@@ -4554,13 +3033,9 @@ pttest_after_launch:;   // #430: gate jumps here, skipping the compositor path
                 continue;
             }
 
-            // F1 or Space toggles start menu for testing
-            if (c == 32 && window_get_focused() == NULL) { // Space key
-                kprintf("[Desktop] Space pressed - toggling start menu\n");
-                g_start_menu_open = !g_start_menu_open;
-                wm_invalidate_all();
-                continue;
-            }
+            // #552: Space "toggle start menu" shortcut removed with the
+            // kernel start menu. (Space now falls through to the normal
+            // key-event queue below, same as any other printable key.)
 
             // Queue key event for window manager
             gui_event_t key_event = {0};
@@ -4768,10 +3243,8 @@ pttest_after_launch:;   // #430: gate jumps here, skipping the compositor path
             draw_string(version_x + 1, version_y + 1, version_text, argb_to_fb(0xFF000000)); // Shadow
             draw_string(version_x, version_y, version_text, argb_to_fb(0xFFCCCCCC)); // Light gray text
 
-            // Draw start menu AFTER windows so it appears on top
-            if (g_start_menu_open) {
-                draw_start_menu();
-            }
+            // #552: kernel start menu draw call removed (draw_start_menu()
+            // no longer exists).
 
             // Draw context menu AFTER windows so it appears on top
             if (g_context_menu_open) {

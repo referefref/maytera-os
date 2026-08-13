@@ -307,8 +307,25 @@ void glBufferData(GLenum target, GLsizei size, const void* data,
 		memcpy(buf->data, data, size);
 }
 
+/* #421 phase 9: real OpenGL vertex-array semantics: `stride` is the BYTE
+ * distance between the start of consecutive elements (0 means "tightly
+ * packed", i.e. stride == size * sizeof(component)) - NOT an extra float
+ * count added on top of `size`, which is what this function computed
+ * before (`i = idx * (size + stride)`, then indexed a GLfloat* with that
+ * `i`). That old formula only ever happened to work for non-interleaved,
+ * stride==0, GL_FLOAT-only arrays. AssaultCube (like any real renderer)
+ * uses the standard interleaved-vertex idiom: one struct per vertex,
+ * sizeof(struct) as the byte stride, float position/texcoord and
+ * GL_UNSIGNED_BYTE color packed together. With the old formula this
+ * walked the array at roughly (size+sizeof(struct)) elements per index
+ * instead of sizeof(struct) BYTES per index, a huge overshoot that grew
+ * with idx - a real, reproduced wild read (#PF, arrays.c:320, CR2 far
+ * past the real vertex buffer) the first time AssaultCube's world
+ * geometry (an interleaved, byte-colored vertex array) reached
+ * glDrawArrays. Rewritten to real byte-stride addressing, plus real
+ * GL_UNSIGNED_BYTE color support (see glColorPointer/color_array_type)
+ * instead of always reinterpreting the color array as floats. */
 void glopArrayElement(GLParam* param) {
-	GLint i;
 	GLContext* c = gl_get_context();
 	GLint states = c->client_states;
 	GLint idx = param[1].i;
@@ -316,36 +333,48 @@ void glopArrayElement(GLParam* param) {
 	if (states & COLOR_ARRAY) {
 		GLParam p[5];
 		GLint size = c->color_array_size;
-		i = idx * (size + c->color_array_stride);
-		p[1].f = c->color_array[i];
-		p[2].f = c->color_array[i + 1];
-		p[3].f = c->color_array[i + 2];
-		p[4].f = (size > 3) ? c->color_array[i + 3] : 1.0f;
+		if (c->color_array_type == GL_UNSIGNED_BYTE) {
+			GLint stride = c->color_array_stride ? c->color_array_stride : size * (GLint)sizeof(GLubyte);
+			const GLubyte* base = (const GLubyte*)c->color_array + (GLint)idx * stride;
+			p[1].f = base[0] * (1.0f / 255.0f);
+			p[2].f = base[1] * (1.0f / 255.0f);
+			p[3].f = base[2] * (1.0f / 255.0f);
+			p[4].f = (size > 3) ? base[3] * (1.0f / 255.0f) : 1.0f;
+		} else {
+			GLint stride = c->color_array_stride ? c->color_array_stride : size * (GLint)sizeof(GLfloat);
+			const GLfloat* base = (const GLfloat*)((const GLubyte*)c->color_array + (GLint)idx * stride);
+			p[1].f = base[0];
+			p[2].f = base[1];
+			p[3].f = base[2];
+			p[4].f = (size > 3) ? base[3] : 1.0f;
+		}
 		glopColor(p);
 	}
 	if (states & NORMAL_ARRAY) {
-		i = idx * (3 + c->normal_array_stride);
-		c->current_normal.X = c->normal_array[i];
-		c->current_normal.Y = c->normal_array[i + 1];
-		c->current_normal.Z = c->normal_array[i + 2];
-		
+		GLint stride = c->normal_array_stride ? c->normal_array_stride : 3 * (GLint)sizeof(GLfloat);
+		const GLfloat* base = (const GLfloat*)((const GLubyte*)c->normal_array + (GLint)idx * stride);
+		c->current_normal.X = base[0];
+		c->current_normal.Y = base[1];
+		c->current_normal.Z = base[2];
 	}
 	if (states & TEXCOORD_ARRAY) {
 		GLint size = c->texcoord_array_size;
-		i = idx * (size + c->texcoord_array_stride);
-		c->current_tex_coord.X = c->texcoord_array[i];
-		c->current_tex_coord.Y = c->texcoord_array[i + 1];
-		c->current_tex_coord.Z = (size > 2) ? c->texcoord_array[i + 2] : 0.0f;
-		c->current_tex_coord.W = (size > 3) ? c->texcoord_array[i + 3] : 1.0f;
+		GLint stride = c->texcoord_array_stride ? c->texcoord_array_stride : size * (GLint)sizeof(GLfloat);
+		const GLfloat* base = (const GLfloat*)((const GLubyte*)c->texcoord_array + (GLint)idx * stride);
+		c->current_tex_coord.X = base[0];
+		c->current_tex_coord.Y = base[1];
+		c->current_tex_coord.Z = (size > 2) ? base[2] : 0.0f;
+		c->current_tex_coord.W = (size > 3) ? base[3] : 1.0f;
 	}
 	if (states & VERTEX_ARRAY) {
 		GLParam p[5];
 		GLint size = c->vertex_array_size;
-		i = idx * (size + c->vertex_array_stride);
-		p[1].f = c->vertex_array[i];
-		p[2].f = c->vertex_array[i + 1];
-		p[3].f = (size > 2) ? c->vertex_array[i + 2] : 0.0f;
-		p[4].f = (size > 3) ? c->vertex_array[i + 3] : 1.0f;
+		GLint stride = c->vertex_array_stride ? c->vertex_array_stride : size * (GLint)sizeof(GLfloat);
+		const GLfloat* base = (const GLfloat*)((const GLubyte*)c->vertex_array + (GLint)idx * stride);
+		p[1].f = base[0];
+		p[2].f = base[1];
+		p[3].f = (size > 2) ? base[2] : 0.0f;
+		p[4].f = (size > 3) ? base[3] : 1.0f;
 		glopVertex(p);
 	}
 }
@@ -361,12 +390,35 @@ void glArrayElement(GLint i) {
 void glDrawArrays(GLenum mode, GLint first, GLsizei count) {
 	GLint i;
 	GLint end;
-	
+
 #include "error_check_no_context.h"
 	end = first + count;
 	glBegin(mode);
 	for (i = first; i < end; i++)
 		glArrayElement(i);
+	glEnd();
+}
+
+/* AssaultCube port phase 3 (docs/ASSAULTCUBE_PORT_PLAN.md,
+ * userland/apps/assaultcube/PORT-STATUS.md): indexed drawing, used by
+ * rendermodel.cpp/renderparticles.cpp. Real, not stubbed: the exact same
+ * glBegin/glArrayElement/glEnd pattern glDrawArrays already uses above,
+ * just walking an index buffer instead of a sequential range, so it reuses
+ * all the existing vertex-array plumbing rather than adding a second one. */
+void glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices) {
+	GLsizei i;
+#include "error_check_no_context.h"
+	glBegin(mode);
+	for (i = 0; i < count; i++) {
+		GLint idx;
+		switch (type) {
+			case GL_UNSIGNED_BYTE:  idx = ((const GLubyte *)indices)[i]; break;
+			case GL_UNSIGNED_SHORT: idx = ((const GLushort *)indices)[i]; break;
+			case GL_UNSIGNED_INT:   idx = (GLint)((const GLuint *)indices)[i]; break;
+			default:                idx = 0; break;
+		}
+		glArrayElement(idx);
+	}
 	glEnd();
 }
 
@@ -456,23 +508,34 @@ void glopColorPointer(GLParam* p) {
 	c->color_array_size = p[1].i;
 	c->color_array_stride = p[2].i;
 	c->color_array = p[3].p;
+	c->color_array_type = (GLenum)p[4].i;
 }
 
+/* #421 phase 9: real OpenGL allows GL_UNSIGNED_BYTE (as well as GL_FLOAT)
+ * color arrays - AssaultCube's own interleaved vertex struct packs color
+ * as 4 GL_UNSIGNED_BYTE, exactly the standard "byte colors, float
+ * position/texcoord" interleaved-vertex idiom every real renderer uses.
+ * Previously this function only accepted GL_FLOAT and glopArrayElement
+ * only ever read the array as GLfloat*, so a GL_UNSIGNED_BYTE call either
+ * got silently rejected (error-checked builds) or, on this build (error
+ * checking compiled out), got its byte pointer stored and reinterpreted
+ * as a GLfloat* with a byte-stride wrongly treated as a float-stride -
+ * see the glopArrayElement rewrite below for the actual crash this
+ * caused (a wild read walking megabytes past the real vertex buffer). */
 void glColorPointer(GLint size, GLenum type, GLsizei stride, const GLvoid* pointer) {
-	GLParam p[4];
+	GLParam p[5];
 #define NEED_CONTEXT
 #include "error_check_no_context.h"
 #if TGL_FEATURE_ERROR_CHECK == 1
-	if (type != GL_FLOAT)
+	if (type != GL_FLOAT && type != GL_UNSIGNED_BYTE)
 #define ERROR_FLAG GL_INVALID_ENUM
 #include "error_check.h"
-#else
-	/* assert(type == GL_FLOAT);*/
 #endif
 		p[0].op = OP_ColorPointer;
 	p[1].i = size;
 	p[2].i = stride;
 	p[3].p = (void*)pointer;
+	p[4].i = (GLint)type;
 	gl_add_op(p);
 }
 

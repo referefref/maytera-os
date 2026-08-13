@@ -22,6 +22,7 @@
 #define JPEG_MARKER_SOS  0xFFDA  // Start of scan
 #define JPEG_MARKER_DQT  0xFFDB  // Define quantization table
 #define JPEG_MARKER_SOF0 0xFFC0  // Start of frame (baseline DCT)
+#define JPEG_MARKER_SOF2 0xFFC2  // Start of frame (progressive DCT)
 #define JPEG_MARKER_DHT  0xFFC4  // Define Huffman table
 #define JPEG_MARKER_DRI  0xFFDD  // Define restart interval
 #define JPEG_MARKER_APP0 0xFFE0  // Application marker
@@ -70,12 +71,12 @@ int jpeg_parse_headers(const uint8_t *data, uint32_t len, jpeg_hdr_t *out);
  *
  * Supports:
  * - Baseline DCT JPEG (SOF0)
+ * - Progressive DCT JPEG (SOF2), #332 root-cause fix
  * - 8-bit precision
  * - YCbCr color space (converted to RGB)
  * - Grayscale images
  *
  * Does NOT support:
- * - Progressive JPEG
  * - Arithmetic coding
  * - 12-bit or 16-bit precision
  *

@@ -8,13 +8,20 @@
 extern uint32_t proc_current_pid(void);
 
 // External timer ticks (from ISR)
-extern volatile uint64_t timer_ticks;
+extern volatile uint64_t timer_ticks;   // ISN/PRNG entropy only - NEVER a deadline (#499)
+#include "../cpu/mono.h"                // #499: sched_now_ms() - THE shared real-elapsed-ms clock
+#include "../cpu/dlprof.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 extern void net_lock(void);   // #297: global net serialization
 extern void net_unlock(void);
 
 // Per-segment TX/RX serial tracing. OFF by default: it printed 2 synchronous
 // COM1 lines per packet (hundreds/sec under load), throttling throughput.
 int g_tcp_dbg = 0;
+// #745 (task #69): remote-triggerable events that used to print one serial line
+// each from inside net_lock (interrupts off). Counted here, reported by
+// [NETSTARVE] in main.c, printed only when g_tcp_dbg is on.
+uint64_t g_tcp_bad_cksum = 0;
 
 // Connection table
 static tcp_conn_t connections[TCP_MAX_CONNECTIONS];
@@ -135,7 +142,6 @@ static inline uint32_t tcp_rustdiff_rng(uint32_t *s) {
 }
 
 void tcp_checksum_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     static uint8_t buf[1500];
 
     uint32_t seed = 0x7c9e2b15;
@@ -186,8 +192,8 @@ void tcp_checksum_rust_selftest(void) {
         };
         for (int i = 0; i < 20; i++) buf[i] = syn[i];
         int sizes[6] = { 20, 21, 40, 100, 513, 1460 };
-        uint32_t s = htonl(0xC0A8010A); // a private-range test address
-        uint32_t d = htonl(0xC0A80102); // a private-range test address
+        uint32_t s = htonl(0xC0000201); // 192.0.2.1
+        uint32_t d = htonl(0xC0000201); // 192.0.2.1
         for (int k = 0; k < 6; k++) {
             int len = sizes[k];
             for (int i = 20; i < len; i++) buf[i] = (uint8_t)(0x40 + (i & 0x3F));
@@ -317,7 +323,17 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
     static uint8_t packet[TCP_MSS + 60];  // Room for TCP header + options
     tcp_header_t *header = (tcp_header_t *)packet;
 
-    uint16_t header_len = 20;  // No options for now
+    // #615: ADVERTISE OUR MSS ON EVERY SYN. This header carried "no options for
+    // now", which means we never sent an MSS option - and RFC 1122 says a peer
+    // that receives no MSS option MUST assume 536. Measured on the wire against
+    // nginx on the same LAN: every response segment came back 536 bytes instead
+    // of 1460, so the stack moved 2.7x fewer bytes per packet processed, and
+    // since the receive path costs a fixed amount of TIME per packet (see
+    // recv_with_timeout in net/wget.c) that translated directly into 2.7x less
+    // throughput. The option is 4 bytes (kind=2, len=4, mss) and only ever rides
+    // on a SYN, so nothing else in the stack changes size.
+    uint16_t header_len = 20;
+    if (flags & TCP_FLAG_SYN) header_len = 24;
     uint16_t total_len = header_len + data_len;
 
     if (total_len > sizeof(packet)) {
@@ -334,6 +350,14 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
     header->window = htons((uint16_t)conn->rcv_wnd);
     header->checksum = 0;
     header->urgent_ptr = 0;
+
+    // #615: MSS option on SYN (kind 2, length 4, value TCP_MSS).
+    if (header_len == 24) {
+        packet[20] = 2;                       // kind = Maximum Segment Size
+        packet[21] = 4;                       // length
+        packet[22] = (uint8_t)(TCP_MSS >> 8); // value, network order
+        packet[23] = (uint8_t)(TCP_MSS & 0xFF);
+    }
 
     // Copy data if present
     if (data && data_len > 0) {
@@ -355,7 +379,7 @@ static int tcp_send_segment(tcp_conn_t *conn, uint8_t flags,
     }
 
     // Record send time for retransmission
-    conn->last_send_time = timer_ticks;
+    conn->last_send_time_ms = sched_now_ms();
 
     // Send via IP
     if (g_tcp_dbg) {
@@ -493,7 +517,8 @@ int tcp_accept(int sock) {
             // handlers on one connection, corrupting the SSH stream.
             conn->accepted = 1;
             // Found an established connection, return it
-            kprintf("[TCP] Accept: returning socket %d (established)\n", i);
+            // #745 (task #69): under net_lock via ssh2_server.c's L_tcp_accept.
+            if (g_tcp_dbg) kprintf("[TCP] Accept: returning socket %d (established)\n", i);
             return i;
         }
     }
@@ -530,9 +555,13 @@ int tcp_connect(int sock, uint32_t remote_ip, uint16_t remote_port) {
     conn->snd_una = conn->iss;
     conn->snd_nxt = conn->iss;
 
-    kprintf("[TCP] Connecting socket %d to ", sock);
-    ip_print(remote_ip);
-    kprintf(":%d (ISS=%u)\n", remote_port, conn->iss);
+    // #745 (task #69): three serial lines under net_lock (ipp.c:201 and the
+    // socket layer both call tcp_connect() with the lock held).
+    if (g_tcp_dbg) {
+        kprintf("[TCP] Connecting socket %d to ", sock);
+        ip_print(remote_ip);
+        kprintf(":%d (ISS=%u)\n", remote_port, conn->iss);
+    }
 
     // Send SYN
     conn->state = TCP_STATE_SYN_SENT;
@@ -601,7 +630,15 @@ int tcp_send(int sock, const void *data, uint16_t length) {
 }
 
 // Receive data from a connection
-int tcp_recv(int sock, void *buffer, uint16_t length) {
+static int tcp_recv_inner(int sock, void *buffer, uint32_t length);
+int tcp_recv(int sock, void *buffer, uint32_t length) {
+    uint64_t _dp_t0 = dp_tsc();
+    int _dp_r = tcp_recv_inner(sock, buffer, length);
+    g_dp_tcprx_cyc += dp_tsc() - _dp_t0; g_dp_tcprx_calls++;
+    if (_dp_r > 0) g_dp_tcprx_bytes += (uint64_t)_dp_r;
+    return _dp_r;
+}
+static int tcp_recv_inner(int sock, void *buffer, uint32_t length) {
     tcp_conn_t *conn = tcp_get_conn(sock);
     if (!conn) {
         return TCP_ERR_INVALID;
@@ -626,10 +663,12 @@ int tcp_recv(int sock, void *buffer, uint16_t length) {
         return 0;  // No data available
     }
 
-    // Copy data from receive buffer
-    uint16_t copy_len = length;
-    if (copy_len > conn->recv_len) {
-        copy_len = conn->recv_len;
+    // Copy data from receive buffer. #608: copy_len is uint32_t so a caller
+    // asking for more than 65535 bytes is served (clamped to what is buffered)
+    // instead of having its request silently truncated to 16 bits.
+    uint32_t copy_len = length;
+    if (copy_len > (uint32_t)conn->recv_len) {
+        copy_len = (uint32_t)conn->recv_len;
     }
 
     memcpy(buffer, conn->recv_buffer, copy_len);
@@ -657,7 +696,7 @@ int tcp_recv(int sock, void *buffer, uint16_t length) {
         tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
     }
 
-    return copy_len;
+    return (int)copy_len;
 }
 
 // Close a connection
@@ -667,7 +706,9 @@ int tcp_close(int sock) {
         return TCP_ERR_INVALID;
     }
 
-    kprintf("[TCP] Closing socket %d (state=%s)\n", sock, tcp_state_name(conn->state));
+    // #745 (task #69): under net_lock at ipp.c:205/220/239/263 and
+    // ssh2_server.c:180.
+    if (g_tcp_dbg) kprintf("[TCP] Closing socket %d (state=%s)\n", sock, tcp_state_name(conn->state));
 
     switch (conn->state) {
         case TCP_STATE_CLOSED:
@@ -714,6 +755,40 @@ tcp_state_t tcp_get_state(int sock) {
         return TCP_STATE_CLOSED;
     }
     return conn->state;
+}
+
+// #524: non-blocking readiness probe for the BSD socket layer's wait_event
+// condition. Pure BSS read (no NIC), so it is safe on any CR3 and cheap enough
+// to evaluate between sleeps. Returns bytes queued in the receive buffer (>0),
+// 0 if connected with no data yet, or -1 for a terminal/invalid socket (so a
+// blocked recv wakes and returns EOF/error rather than sleeping forever).
+int tcp_rx_pending(int sock) {
+    tcp_conn_t *conn = tcp_get_conn(sock);
+    if (!conn) return -1;
+    if (conn->recv_len > 0) return conn->recv_len;
+    switch (conn->state) {
+        case TCP_STATE_CLOSED:
+        case TCP_STATE_CLOSE_WAIT:
+        case TCP_STATE_LAST_ACK:
+        case TCP_STATE_TIME_WAIT:
+            return -1;   // terminal: report readable so recv returns EOF
+        default:
+            return 0;    // connected, no data
+    }
+}
+
+// #524: connected peer endpoint accessor for accept(). Fills *ip_host and
+// *port_host with this socket's remote endpoint in HOST byte order (the TCB
+// stores remote_ip/remote_port in host order on both the connect and the
+// inbound-SYN paths). Pure BSS read (no NIC), so it is safe on any CR3. Returns
+// 0 on success, -1 for an invalid/unconnected slot. Added so the BSD socket
+// layer can return the real peer sockaddr from accept() instead of a zeroed one.
+int tcp_get_peer(int sock, uint32_t *ip_host, uint16_t *port_host) {
+    tcp_conn_t *conn = tcp_get_conn(sock);
+    if (!conn) return -1;
+    if (ip_host)   *ip_host   = conn->remote_ip;
+    if (port_host) *port_host = conn->remote_port;
+    return 0;
 }
 
 // Get last error
@@ -772,7 +847,14 @@ void tcp_handle(uint32_t src_ip_raw, const void *data, uint16_t length) {
     uint32_t our_ip = ip_get_address();
     uint16_t computed = tcp_checksum(htonl(src_ip), htonl(our_ip), data, length);
     if (computed != 0) {
-        kprintf("[TCP] Bad checksum, dropping\n");
+        // #745 (task #69): COUNTER, NOT A LINE. tcp_handle() runs inside
+        // net_poll()'s 64-packet drain, which holds net_lock with interrupts
+        // OFF, and every kprintf byte is a bounded-but-real UART wait. A remote
+        // host sending malformed segments therefore chose how long this machine
+        // spent unable to schedule. The count is the diagnostic; it is reported
+        // off this path by [NETSTARVE].
+        g_tcp_bad_cksum++;
+        if (g_tcp_dbg) kprintf("[TCP] Bad checksum, dropping\n");
         return;
     }
 
@@ -941,7 +1023,7 @@ void tcp_handle(uint32_t src_ip_raw, const void *data, uint16_t length) {
                     if (flags & TCP_FLAG_FIN) {
                         conn->rcv_nxt++;
                         conn->state = TCP_STATE_TIME_WAIT;
-                        conn->last_send_time = timer_ticks;
+                        conn->last_send_time_ms = sched_now_ms();
                         tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
                     } else {
                         conn->state = TCP_STATE_FIN_WAIT_2;
@@ -958,7 +1040,7 @@ void tcp_handle(uint32_t src_ip_raw, const void *data, uint16_t length) {
             if (flags & TCP_FLAG_FIN) {
                 conn->rcv_nxt++;
                 conn->state = TCP_STATE_TIME_WAIT;
-                conn->last_send_time = timer_ticks;
+                conn->last_send_time_ms = sched_now_ms();
                 tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
             }
             break;
@@ -971,7 +1053,7 @@ void tcp_handle(uint32_t src_ip_raw, const void *data, uint16_t length) {
             if (flags & TCP_FLAG_ACK) {
                 if (ack_num == conn->snd_nxt) {
                     conn->state = TCP_STATE_TIME_WAIT;
-                    conn->last_send_time = timer_ticks;
+                    conn->last_send_time_ms = sched_now_ms();
                 }
             }
             break;
@@ -990,7 +1072,7 @@ void tcp_handle(uint32_t src_ip_raw, const void *data, uint16_t length) {
             // Handle retransmitted FIN
             if (flags & TCP_FLAG_FIN) {
                 tcp_send_segment(conn, TCP_FLAG_ACK, NULL, 0);
-                conn->last_send_time = timer_ticks;
+                conn->last_send_time_ms = sched_now_ms();
             }
             break;
 
@@ -1001,7 +1083,7 @@ void tcp_handle(uint32_t src_ip_raw, const void *data, uint16_t length) {
 
 // Process TCP timers
 void tcp_timer(void) {
-    uint64_t now = timer_ticks;
+    uint64_t now_ms = sched_now_ms();   // #499: REAL elapsed ms
 
     for (int i = 0; i < TCP_MAX_CONNECTIONS; i++) {
         tcp_conn_t *conn = &connections[i];
@@ -1013,7 +1095,7 @@ void tcp_timer(void) {
             case TCP_STATE_SYN_SENT:
             case TCP_STATE_SYN_RECEIVED:
                 // Retransmit SYN
-                if (now - conn->last_send_time > TCP_RETRANSMIT_TIMEOUT) {
+                if ((int64_t)(now_ms - conn->last_send_time_ms) > (int64_t)TCP_RETRANSMIT_TIMEOUT_MS) {
                     if (conn->retries >= TCP_MAX_RETRIES) {
                         kprintf("[TCP] Connection timeout\n");
                         conn->state = TCP_STATE_CLOSED;
@@ -1034,7 +1116,7 @@ void tcp_timer(void) {
             case TCP_STATE_ESTABLISHED:
                 // Retransmit unacknowledged data
                 if (conn->snd_una < conn->snd_nxt &&
-                    now - conn->last_send_time > TCP_RETRANSMIT_TIMEOUT) {
+                    (int64_t)(now_ms - conn->last_send_time_ms) > (int64_t)TCP_RETRANSMIT_TIMEOUT_MS) {
                     if (conn->retries >= TCP_MAX_RETRIES) {
                         kprintf("[TCP] Retransmit timeout, closing\n");
                         conn->state = TCP_STATE_CLOSED;
@@ -1087,7 +1169,7 @@ void tcp_timer(void) {
             case TCP_STATE_CLOSING:
             case TCP_STATE_LAST_ACK:
                 // Retransmit FIN
-                if (now - conn->last_send_time > TCP_RETRANSMIT_TIMEOUT) {
+                if ((int64_t)(now_ms - conn->last_send_time_ms) > (int64_t)TCP_RETRANSMIT_TIMEOUT_MS) {
                     if (conn->retries >= TCP_MAX_RETRIES) {
                         conn->state = TCP_STATE_CLOSED;
                         conn->active = 0;
@@ -1104,7 +1186,7 @@ void tcp_timer(void) {
                 // peer's FIN. Some servers (and lost-FIN cases) never send it,
                 // leaving the slot active forever. Reap after a bounded wait so
                 // repeated HTTPS POSTs cannot slowly leak connection slots.
-                if (now - conn->last_send_time > TCP_TIME_WAIT_TIMEOUT) {
+                if ((int64_t)(now_ms - conn->last_send_time_ms) > (int64_t)TCP_TIME_WAIT_TIMEOUT_MS) {
                     kprintf("[TCP] FIN_WAIT_2 reaped (no peer FIN)\n");
                     conn->state = TCP_STATE_CLOSED;
                     conn->active = 0;
@@ -1115,7 +1197,7 @@ void tcp_timer(void) {
                 // #297: peer closed; we owe a FIN once the app calls close().
                 // If the owning task died without closing, this lingers forever.
                 // Reap stale CLOSE_WAIT slots after a bounded wait.
-                if (now - conn->last_send_time > TCP_TIME_WAIT_TIMEOUT * 2) {
+                if ((int64_t)(now_ms - conn->last_send_time_ms) > (int64_t)TCP_TIME_WAIT_TIMEOUT_MS * 2) {
                     kprintf("[TCP] CLOSE_WAIT reaped (app never closed)\n");
                     conn->state = TCP_STATE_CLOSED;
                     conn->active = 0;
@@ -1124,7 +1206,7 @@ void tcp_timer(void) {
 
             case TCP_STATE_TIME_WAIT:
                 // Timeout after 2*MSL
-                if (now - conn->last_send_time > TCP_TIME_WAIT_TIMEOUT) {
+                if ((int64_t)(now_ms - conn->last_send_time_ms) > (int64_t)TCP_TIME_WAIT_TIMEOUT_MS) {
                     kprintf("[TCP] TIME_WAIT expired, closing\n");
                     conn->state = TCP_STATE_CLOSED;
                     conn->active = 0;

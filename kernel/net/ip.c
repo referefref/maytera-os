@@ -4,6 +4,7 @@
 #include "arp.h"
 #include "../serial.h"
 #include "../string.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // Network configuration
 static uint32_t our_ip = 0;
@@ -107,7 +108,6 @@ static inline uint32_t rustdiff_rng(uint32_t *s) {
 }
 
 void ip_checksum_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
 
     uint32_t seed = 0x1a2b3c4d;
     uint32_t vectors = 0;

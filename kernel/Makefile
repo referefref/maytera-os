@@ -7,7 +7,22 @@ LD = ld
 OBJCOPY = objcopy
 
 # Target
+# #670 KERNEL ADDRESS DISCLOSURE. $(TARGET) is the SHIPPED kernel and is
+# STRIPPED; $(DEBUG_TARGET) is the full unstripped link output and stays in the
+# build tree, OFF the image. Before this, the ELF placed on the ESP (and thus at
+# world-readable /KERNEL.ELF, /boot/kernel.elf, /EFI/BOOT/kernel.elf) carried
+# ~10,340 .symtab entries plus 11 DWARF sections: the exact address of every
+# kernel function, handed to any Ring-3 process that can open a file.
+# Nothing in this tree reads symbols from the ELF at RUNTIME. Every addr2line
+# workflow (mm/demand.c, sync/noblock.c, security/stack_guard.c) prints a raw
+# address to SERIAL and is resolved on the BUILD host, so those now resolve
+# against $(DEBUG_TARGET). The UEFI loader (uefi/bootloader.c) walks program
+# headers only and never dereferences e_shoff, and strip leaves every PT_LOAD's
+# file offset, vaddr, filesz, memsz and flags plus the entry point untouched
+# (measured: the three LOAD segments are byte-identical pre/post strip;
+# 15,227,808 -> 4,225,104 bytes, x3 boot paths off the 256 MiB ESP).
 TARGET = kernel.elf
+DEBUG_TARGET = kernel.dbg.elf
 
 # Directories
 SRCDIR = .
@@ -16,12 +31,13 @@ MM_DIR = mm
 CPU_DIR = cpu
 VIDEO_DIR = video
 DRIVERS_DIR = drivers
+VIRTIO_DIR = drivers/virtio
 NET_DIR = net
 NET_TLS_DIR = net/tls
 FS_DIR = fs
+GRAPHFS_DIR = fs/graphfs
 SHELL_DIR = shell
 GUI_DIR = gui
-GUI_SETTINGS_DIR = gui/settings
 EXEC_DIR = exec
 DOS_DIR = dos
 PROC_DIR = proc
@@ -30,10 +46,7 @@ SECURITY_DIR = security
 IPC_DIR = ipc
 SYNC_DIR = sync
 CRYPTO_DIR = crypto
-GAMES_DIR = games
-DOOM_DIR = games/doom
 VFS_DIR = vfs
-APPS_DIR = apps
 BT_DIR = bt
 WIFI_DIR = drivers/net/wifi
 
@@ -41,8 +54,103 @@ WIFI_DIR = drivers/net/wifi
 GCC_INCLUDE = $(shell $(CC) -print-file-name=include)
 
 # Compiler flags for freestanding 64-bit kernel
-CFLAGS = -ffreestanding \
-         -fno-stack-protector \
+# --- Header dependency tracking (#600) -------------------------------------
+# WITHOUT -MMD -MP make knows NOTHING about headers: an object depends only on
+# its .c and the flags stamp, so editing a header and running an INCREMENTAL
+# make recompiles NOTHING. Measured on this Makefile: editing net/tcp.h (a
+# #define used by net/tcp.c) and re-running make produced a BYTE-IDENTICAL
+# kernel.elf (md5 1206f09b...). That is not merely a stale build: if the header
+# change moves a struct field, changes an enum value, or edits an inline
+# function, the TUs that DO get rebuilt later are linked against a DIFFERENT
+# definition than the ones that were not, i.e. a silent cross-TU ABI mismatch
+# that presents as random memory corruption at runtime. It has been masked only
+# because ship builds run `make clean` first.
+#
+# -MMD makes every compile emit a matching obj/<path>.d listing the headers it
+# actually included (quoted/project headers only; -nostdinc means there are no
+# system headers anyway). -MP adds a phony target for each header so DELETING a
+# header does not break the build with "No rule to make target". Both are
+# preprocessor-output-only: they do not change generated code (verified by md5
+# against the pre-fix clean build). The `# #617 BUILD TRAP (the real cause of the long-standing "make succeeds in 0.1 s
+# and produces a BYTE-IDENTICAL kernel.elf from modified sources", #614):
+# `-include $(DEPFILES)` below is read BEFORE the `all:` rule is defined, so the
+# FIRST target make sees is whatever happens to be first in the first .d file.
+# That became the default goal, and a bare `make` silently "built" it, printed
+# NOTHING, exited 0 and left the previous kernel.elf in place. It only looked
+# correct after `make clean` (which deletes the .d files, so `all` wins again).
+# Pin the default goal explicitly so a bare `make` can never be hijacked.
+.DEFAULT_GOAL := all
+
+-include $(DEPFILES)` below is what
+# makes make actually READ them.
+#
+# Sibling of the #526 CFLAGS stamp: that made a -D change rebuild; this makes a
+# header change rebuild. Neither is a substitute for the other.
+# --- #618 REPRODUCIBLE BUILD ------------------------------------------------
+# -ffile-prefix-map makes DWARF comp_dir/__FILE__ independent of WHERE the tree
+# was unpacked, and REPRO_DATE/REPRO_TIME pin the __DATE__/__TIME__ strings that
+# panic.c/devlog.c/settings.c embed. Without both, two builds of the SAME commit
+# produce different bytes and no gate can prove a shipped kernel came from its
+# stamped source. Leave REPRO_* empty for a normal dev build.
+REPRO_DATE ?=
+REPRO_TIME ?=
+REPRO_DEFS =
+ifneq ($(REPRO_DATE),)
+REPRO_DEFS = -DMAYTERA_BUILD_DATE='"$(REPRO_DATE)"' -DMAYTERA_BUILD_TIME='"$(REPRO_TIME)"'
+endif
+
+# -DCONFIG_NO_SMAP (#645) IS NOT A LEFTOVER DEBUG SWITCH. DO NOT DELETE IT
+# CASUALLY. SMAP is fully implemented and wired: the CR4.SMAP write with a
+# readback (rustkern/seccore.rs), the stac/clac brackets on all four user-copy
+# primitives including every fault-fixup path (mm/uaccess.asm), CLAC+CLD at the
+# single interrupt chokepoint (cpu/idt.asm), AC and DF cleared on SYSCALL entry
+# (proc/syscall.c IA32_FMASK, #668), a boot-time pre-flight probe that refuses
+# to arm if the kernel's own memory is user-accessible, and a /NOSMAP.TXT ESP
+# escape hatch. All of that is DELIBERATELY NOT ARMED, and this flag is what
+# holds it off.
+#
+# WHY, REWRITTEN FROM MEASUREMENT AT #19 (2026-08-11). The three checks this
+# comment used to list as prerequisites have now been RUN, on a machine, with
+# CR4.SMAP actually set. Two of them are done and the third came back clean.
+# What is left is ONE class, and it is the only thing holding this flag on.
+#
+#   1. DONE. The ledger's 125 entries were re-derived: about 35 were already
+#      fixed and never delisted, about 25 were never user accesses at all, and
+#      it MISSED several real ones. The genuine sites are converted, to
+#      copy_*_user or to a uaccess_begin()/uaccess_end() bracket around the
+#      ACCESS. See kernel/smap-uaccess.manifest for the whole accounting.
+#   2. DONE. The manifest's UNDETECTABLE section (the VFS/driver `void *buf`
+#      route the lint structurally cannot see) is converted and still listed,
+#      as prose, because nothing in the build can notice if one is deleted.
+#   3. CLEAN, MEASURED. An armed boot prints
+#        [SECURITY] SMAP pre-flight: kernel .data/stack/text ... U/S=supervisor
+#      so the firmware's adopted identity map does NOT make SMAP unusable here.
+#      SMEP and SMAP both take the CR4 write (cr4=0x300668, read back).
+#
+# THE ONE REMAINING BLOCKER: a Ring-3 PATH STRING reaches the filesystem raw,
+# and the FS walks it with plain Ring-0 loads (fat_read_file's /SMB and /NFS
+# prefix tests, syscall_path.h's predicates, ext2, perms). Measured on an armed
+# boot: #PF at RIP inside fat_read_file, CR2 in the user window, err=0x1. It is
+# a class of hundreds of loads, so the fix is a dispatcher-level string bounce,
+# not a list of brackets. That bounce was built and is NOT in the tree: it
+# regressed the desktop for a reason that was not root-caused. The manifest's
+# gap section carries the full writeup, including the two real bugs found in it
+# and the leading unproven suspect. Read it before trying again.
+#
+# TWO THINGS THE ARMED BOOT ALSO PROVED, both now fixed and both worth knowing:
+#   * CR4 is PER-CPU and cpu/smp.c's ap_entry() never set SMEP or SMAP, so on a
+#     2-core box half the machine ran unprotected while the banner said ENABLED.
+#   * `make SMAPTEST=1` arms a deliberate unsanctioned Ring-0 user read; with
+#     SMAP armed it now #PFs (err=0x1 P|R|S, CR2 = the probed user VA). That
+#     negative control is what caught the AP hole and a test-harness VM that had
+#     no SMAP in CPUID at all, both of which had produced clean green boots.
+#
+# `make smap-uaccess-lint` refuses to build with this flag removed while the
+# manifest carries a gap entry, so the ordering is enforced, not remembered.
+CFLAGS = -ffile-prefix-map=$(CURDIR)=/maytera-kernel $(REPRO_DEFS) \
+-ffreestanding \
+         -fstack-protector-strong \
+         -mstack-protector-guard=global \
          -fno-pic \
          -mno-red-zone \
          -mcmodel=kernel \
@@ -57,8 +165,12 @@ CFLAGS = -ffreestanding \
          -Werror \
          -O2 \
          -g \
+         -MMD -MP \
+         -DCONFIG_NO_SMAP \
          -DRUST_IP_CHECKSUM \
          -DRUST_EXT2_DIRFIND \
+         -DRUST_EXT2_DIRADD \
+         -DRUST_EXT2_DIRREPOINT \
          -DRUST_TCP_CHECKSUM \
          -DRUST_UDP_CHECKSUM \
          -DRUST_SHA256 \
@@ -67,6 +179,7 @@ CFLAGS = -ffreestanding \
          -DRUST_MD4 \
          -DRUST_CHACHA20 \
          -DRUST_AES \
+         -DRUST_GHASH \
          -DRUST_HMAC \
          -DRUST_ICMP \
          -DRUST_ARP \
@@ -82,6 +195,7 @@ CFLAGS = -ffreestanding \
          -DRUST_JPEG \
          -DRUST_INFLATE \
          -DRUST_TLS_PARSE \
+         -DRUST_TLS_POOL \
          -DRUST_HTTP_PARSE \
          -DRUST_MP4 \
          -DRUST_JPEG_ENTROPY \
@@ -99,6 +213,8 @@ CFLAGS = -ffreestanding \
          -DRUST_VFS_PATH \
          -DRUST_CONN_OWNER \
          -DRUST_PROCINFO \
+         -DRUST_SECCORE \
+         -DRUST_ISO9660 \
          -I$(SRCDIR) \
          -isystem $(GCC_INCLUDE)
 
@@ -136,6 +252,166 @@ ifeq ($(CVBASELINE),1)
 CFLAGS += -DSECTEST_CV_FETCH -DSECTEST_CV_BASELINE
 endif
 
+# ============================================================================
+# #785: MAYTERA_SSHD - does the SSH SERVER ship in this kernel AT ALL?
+#
+# Usage:  make MAYTERA_SSHD=1
+#
+# THERE ARE TWO SWITCHES AND THEY ARE NOT THE SAME SWITCH. Which is which:
+#
+#   COMPILE TIME (this flag) decides whether the sshd CODE IS ON THE IMAGE.
+#     Default OFF. With it off, net/ssh/ssh2_server.c is not compiled at all,
+#     main.c contains no call to ssh_server_start(), and proc/services.c
+#     registers no "sshd" service. There is no listener on the image to enable,
+#     to misconfigure, or to regress. The SSH CLIENT (net/ssh/ssh2.c, used by
+#     /APPS/SSH) is unaffected and always builds: connecting OUT is not the
+#     same risk as accepting IN.
+#
+#   RUN TIME (/CONFIG/SSHD.CFG, enable=1) decides whether a kernel that HAS the
+#     code actually LISTENS. Default OFF, and an absent or malformed config
+#     means no listener (#697). This is changeable on a running system without
+#     a rebuild, which is what makes "enable/disable as needed" true.
+#
+# MAYTERA_SSHD=1 ON ITS OWN DOES NOT OPEN A PORT. It ships a service an operator
+# can then enable. Both switches have to say yes. That is deliberate: #697 was
+# caused by exactly one condition (a host key exists) being treated as consent
+# to expose a network service.
+#
+# NOTE: this flag CHANGES THE KERNEL BYTES, so build-golden.sh stamps its value
+# into /BUILDINFO.TXT and invariant-gate.sh --verify-kernel replays it. A
+# reproducibility check that rebuilt with a different flag would compare two
+# different kernels and report drift that is not there.
+#
+# Appended to the real CFLAGS rather than passed as `make CFLAGS+=...`, because
+# that form REPLACES CFLAGS wholesale (blame.md) and would silently build the
+# whole kernel without -ffreestanding. Kept at TOP LEVEL, never nested inside
+# another ifeq: #624 records a flag that was nested by accident and therefore
+# built a byte-identical kernel while appearing to be set.
+ifeq ($(MAYTERA_SSHD),1)
+CFLAGS += -DMAYTERA_SSHD
+endif
+
+# #426 Phase 2 (wq_assert_may_block). DEBUG ONLY - never for a golden/shipped
+# kernel. Same append-to-CFLAGS form and same reason as SECTEST above.
+#   make NOBLOCKPANIC=1 - a no-block context that blocks kpanic()s on the FIRST
+#                         offence instead of printing a [WQBLOCK] report and
+#                         continuing. Use when hunting one.
+#   make NOBLOCKTEST=1  - compile in sync/waitq_test.c's DELIBERATE VIOLATION
+#                         (a real wait_event() issued with interrupts off), the
+#                         negative control that PROVES the assert fires. An
+#                         assertion nobody has watched go off is not one.
+#   make SMAPTEST=1     - arm a DELIBERATE unsanctioned Ring-0 read of a user
+#                         page (exec/elf.c), the negative control that PROVES
+#                         CR4.SMAP traps. Never for a golden.
+ifeq ($(NOBLOCKPANIC),1)
+CFLAGS += -DWQ_NOBLOCK_PANIC
+endif
+ifeq ($(NOBLOCKTEST),1)
+CFLAGS += -DWQ_NOBLOCK_SELFTEST
+endif
+
+# #624 step 2: `make CANARYTEST=1` arms a DELIBERATE stack smash so the canary
+# can be SEEN to fire, exactly as `make NOBLOCKTEST=1` arms a deliberate
+# wait_event violation. A canary that has never been observed catching anything
+# is not a canary, it is a comment. This must NEVER be set for a golden build.
+#
+# THIS BLOCK MUST STAY AT TOP LEVEL. It was first written nested inside the
+# NOBLOCKTEST conditional above, so -DCANARY_SELFTEST was only ever added when
+# BOTH flags were set. `make CANARYTEST=1` therefore built a byte-identical
+# kernel and the box booted straight to the desktop with no test at all. A test
+# flag that silently does nothing is the same defect class #624 exists to fix;
+# it was caught only because the proof-of-fire boot was actually RUN and the
+# expected panic did not appear.
+ifeq ($(CANARYTEST),1)
+CFLAGS += -DCANARY_SELFTEST
+endif
+
+# #19/#645: `make SMAPTEST=1` arms ONE deliberate, UNSANCTIONED Ring-0 read of a
+# user page in exec/elf.c, immediately after the correctly-bracketed PT_LOAD
+# copy. It is the negative half of the SMAP proof and follows NOBLOCKTEST/
+# CANARYTEST above for the same reason: a guard that has never been watched
+# firing and a guard that is switched off produce identical evidence, namely a
+# clean boot. With CR4.SMAP armed this must produce a #PF (err P|S, W clear,
+# CR2 = the user VA the line above prints). MUST NEVER be set for a golden.
+# This block must stay at TOP LEVEL (see the CANARYTEST note above: nesting it
+# is how a test flag comes to silently do nothing).
+ifeq ($(SMAPTEST),1)
+CFLAGS += -DSMAPTEST
+endif
+
+# #746 fatlock. DEBUG ONLY - never for a golden/shipped kernel.
+#   make FATLOCKTEST=1     - compile in fs/fat_lock_test.c: 4 kernel threads
+#                            hammer the FAT ESP concurrently while fs/fat.c
+#                            counts critical-section occupancy. Expect
+#                            "[FATLOCKTEST] RESULT: PASS".
+#   make FATLOCKTEST=red   - the NEGATIVE CONTROL. Also defines
+#                            FAT_LOCK_SELFTEST_RED, which makes fat_lock_try()
+#                            claim the lock unconditionally, i.e. a lock that
+#                            excludes nobody. Expect "RESULT: FAIL". A safety
+#                            test that has never been seen to fail is not a
+#                            test, it is a comment (the #624 lesson).
+ifeq ($(FATLOCKTEST),1)
+CFLAGS += -DFAT_LOCK_SELFTEST
+endif
+ifeq ($(FATLOCKTEST),red)
+CFLAGS += -DFAT_LOCK_SELFTEST -DFAT_LOCK_SELFTEST_RED
+endif
+#   make PROCWAITBENCH=1 - compile in the #230 A/B benchmark (proc/process.c):
+#                         the pre-#230 spin and the new wait_event() version each
+#                         wait on an identical 2s child, and the parent's own
+#                         per-process CPU ticks are printed for both.
+ifeq ($(PROCWAITBENCH),1)
+CFLAGS += -DPROCWAIT_BENCH
+endif
+#   make FLIPNETCLI=1   - #632 NEGATIVE CONTROL: restore the pre-#632 placement
+#                         of the throttled net_poll() INSIDE sys_fb_flip()s
+#                         interrupts-off region, with byte-identical
+#                         instrumentation, so the before/after [FLIPPROF]
+#                         numbers are directly comparable. Not a supported
+#                         configuration; it is the bug, kept buildable so the
+#                         measurement can be reproduced.
+ifeq ($(FLIPNETCLI),1)
+CFLAGS += -DFLIP_NET_INSIDE_CLI=1
+endif
+
+#   make FLIPNETBLOCK=1 - #745 (task #62) NEGATIVE CONTROL: restore the pre-fix
+#                         mechanism where sys_fb_flip() BLOCKS on net_lock via
+#                         net_poll(), and the dedicated netpump thread is not
+#                         started. Every counter on the [NETSTARVE] line and in
+#                         the /HEARTBEAT.TXT record stays byte-identical, so the
+#                         before/after numbers are directly comparable. Not a
+#                         supported configuration; it is the bug, kept buildable
+#                         so the measurement can be reproduced. Same role, and
+#                         the same reason, as FLIPNETCLI above.
+ifeq ($(FLIPNETBLOCK),1)
+CFLAGS += -DFLIP_NET_BLOCKING=1
+endif
+
+# #647 verification builds. DEBUG ONLY - never set for a golden/shipped kernel.
+# Same append-to-CFLAGS form and same reason as SECTEST above (`make CFLAGS+=...`
+# on the command line REPLACES CFLAGS wholesale, see blame.md).
+#
+#   make PTWALKTEST=1      - compile in vmm_ptwalk_selftest(): drain the physical
+#                            allocator to exhaustion at boot and assert that not
+#                            one page it hands out is a live UEFI page table.
+#                            Also cross-checks the fast drain against the real
+#                            pmm_alloc_page() on a 4096-page prefix.
+#
+#   make PTWALKNORESERVE=1 - the NEGATIVE CONTROL: identical build with the
+#                            reservation in vmm_reserve_boot_page_tables()
+#                            REMOVED. This is the #647 bug, kept buildable, so
+#                            the self-test can be WATCHED TO FAIL. Combine with
+#                            PTWALKTEST=1. A self-test that has only ever been
+#                            seen to pass is decorative; #624's CANARYTEST=1
+#                            silently built a byte-identical kernel for exactly
+#                            this reason and the "proof" was vacuous.
+ifeq ($(PTWALKTEST),1)
+CFLAGS += -DPTWALK_SELFTEST
+endif
+ifeq ($(PTWALKNORESERVE),1)
+CFLAGS += -DPTWALK_NO_RESERVE
+endif
+
 # -DRUST_IP_CHECKSUM (#404 / #479 Phase B): route the live ip_checksum() symbol
 # in net/ip.c to the Rust port ip_checksum_rs (rustkern.rs) instead of the
 # original C (kept as ip_checksum_c). This is the strangler flag; REMOVE this
@@ -148,6 +424,22 @@ endif
 # hardened C (kept as ext2_dirblock_find_c). This is the strangler flag; REMOVE
 # this one line and rebuild to roll straight back to C. The boot-time
 # [RUST-DIFF] ext2_dir self-test in fs/ext2.c compares the two regardless.
+
+# -DRUST_EXT2_DIRADD (#605, extends the #485 seam): route the live ext2
+# directory-entry INSERT (ext2_dirblock_insert in fs/ext2.c, called per block by
+# ext2_dir_add) to the Rust port ext2_dirblock_insert_rs (rustkern/ext2.rs)
+# instead of the C reference (kept as ext2_dirblock_insert_c). This is the WRITE
+# twin of RUST_EXT2_DIRFIND and it exists because #597 fixed a real MEMORY-SAFETY
+# bug in that C loop: `slack = rec - used` is unsigned, so a record whose own
+# name_len did not fit its own rec_len wrapped it to ~4e9, the room test always
+# passed, and the code wrote a rec_len outside the block and memcpy'd the name
+# past the end of the kmalloc(block_size) buffer. In Rust that subtraction is
+# `checked_sub` and the whole walk is bounds-checked slice access, so the class
+# is gone by construction rather than by a hand-added guard. ONLY the pure
+# buffer logic crosses the FFI; locking, block I/O, inode/bitmap allocation and
+# i_size stay in C. Strangler flag; REMOVE this one line and rebuild to roll
+# straight back to C. The boot-time [RUST-DIFF] / [RUST-SEC] ext2_dirinsert
+# self-tests in fs/ext2.c compare the two regardless.
 
 # -DRUST_TCP_CHECKSUM (#404 / #486 Phase D): route the live tcp_checksum() symbol
 # in net/tcp.c to the Rust port tcp_checksum_rs (rustkern.rs) instead of the
@@ -673,8 +965,32 @@ endif
 # harness's "0 of them with len==512" is a property of its random corpus, NOT a
 # proof of unreachability - a crafted vector reaches it.
 
+# -DRUST_ISO9660 (#196 / #404 filesystem tier): routes the three ISO 9660 parse
+# entry points used by the disk-image layer (iso_vd_parse / iso_dirrec_at /
+# iso_name_decode in dos/diskimg.c) to the Rust ports in rustkern/iso9660.rs
+# instead of the verbatim C references (kept as iso_*_c). Drop this one line to
+# revert every ISO parse to C.
+#
+# WHY THIS ONE MATTERS: the input is a CD image the user downloaded. Record
+# length, extent length, name length and the name bytes are all disc-controlled,
+# and this tree has shipped three heap over-reads in C parsers of that exact
+# shape (#476 ext2 dirent, #490 FAT LFN, #597). Every read in the Rust goes
+# through a slice spanning exactly the caller buffer, so a lying length is a
+# rejected record rather than a read off the end of a heap block.
+#
+# SPLIT: parse in Rust, I/O in C. dos/imgfile.c (the seekable, 256 KiB-cached
+# reader that makes a 653 MB image usable on a 256 MB heap) stays C because it
+# is entangled with ext2_read_file_range, the fat_file_t streaming handle and
+# the sleeping locks both take.
+#
+# The boot [RUST-DIFF] iso9660 self-test proves rs == c on this build over
+# hand-built malformed vectors plus a 12,000-case fuzz, regardless of the flag.
+# HONEST LIMIT: a differential cannot catch a bug both arms share, so format
+# correctness is proved separately by the /CDTEST.TXT harness reading a real
+# disc and matching a host-computed checksum.
+
 # Assembler flags
-ASFLAGS = -f elf64 -g
+ASFLAGS = -f elf64
 
 # Linker flags
 # -z noexecstack (#404 Phase A): a Rust staticlib member can omit the
@@ -709,6 +1025,12 @@ VIDEO_SOURCES = $(wildcard $(VIDEO_DIR)/*.c)
 # Driver sources
 DRIVER_SOURCES = $(wildcard $(DRIVERS_DIR)/*.c)
 
+# #703: drivers/virtio/ likewise escaped $(wildcard drivers/*.c). It is a
+# complete virtio 1.0+ stack (modern PCI cap transport, split+packed queues,
+# blk/gpu/input/console). It is COMPILED AND LINKED but NOT INVOKED: nothing
+# calls virtio_subsystem_init(). Turning it on is a separate, verified change.
+VIRTIO_SOURCES = $(wildcard $(VIRTIO_DIR)/*.c)
+
 # Network sources
 NET_SOURCES = $(wildcard $(NET_DIR)/*.c)
 
@@ -716,10 +1038,24 @@ NET_SOURCES = $(wildcard $(NET_DIR)/*.c)
 NET_TLS_SOURCES = $(wildcard $(NET_TLS_DIR)/*.c)
 
 # SSH sources (new ssh2 client + server; the legacy net/ssh/*.c are dead scaffolding)
-NET_SSH_SOURCES = net/ssh/ssh2.c net/ssh/ssh2_server.c
+# #785: the CLIENT always builds; the SERVER only with MAYTERA_SSHD=1 (see the
+# two-switches block near the top of this file). This is a hardcoded list rather
+# than a $(wildcard) precisely so that adding a file to net/ssh/ cannot quietly
+# put a network listener back into every kernel.
+NET_SSH_SOURCES = net/ssh/ssh2.c
+ifeq ($(MAYTERA_SSHD),1)
+NET_SSH_SOURCES += net/ssh/ssh2_server.c
+endif
 
 # Filesystem sources
 FS_SOURCES = $(wildcard $(FS_DIR)/*.c)
+
+# #703: fs/graphfs/ has NEVER been in the build: $(wildcard fs/*.c) does not
+# recurse, so these two files silently escaped every kernel build in recorded
+# history. Only the content-addressed BLOB STORE is implemented; the ~96 gfs_*
+# node/query/version prototypes in fs/graphfs/{node,query,version}.h have no
+# implementation anywhere, so wiring this in ships blob storage, NOT a graph FS.
+GRAPHFS_SOURCES = $(wildcard $(GRAPHFS_DIR)/*.c)
 
 # Shell sources
 SHELL_SOURCES = $(wildcard $(SHELL_DIR)/*.c)
@@ -727,8 +1063,6 @@ SHELL_SOURCES = $(wildcard $(SHELL_DIR)/*.c)
 # GUI sources
 GUI_SOURCES = $(wildcard $(GUI_DIR)/*.c)
 
-# GUI Settings panel sources
-GUI_SETTINGS_SOURCES = $(wildcard $(GUI_SETTINGS_DIR)/*.c)
 
 # Exec sources (ELF loader)
 EXEC_SOURCES = $(wildcard $(EXEC_DIR)/*.c)
@@ -756,12 +1090,7 @@ SYNC_SOURCES = $(wildcard $(SYNC_DIR)/*.c)
 CRYPTO_SOURCES = $(wildcard $(CRYPTO_DIR)/*.c)
 
 # Games sources
-GAMES_SOURCES = $(wildcard $(GAMES_DIR)/*.c)
 
-# DOOM sources (compiled with relaxed flags: legacy code)
-DOOM_SOURCES = $(filter-out $(DOOM_DIR)/i_video.c,$(wildcard $(DOOM_DIR)/*.c))
-DOOM_CFLAGS = $(filter-out -Wall -Wextra -Werror,$(CFLAGS)) -w
-DOOM_OBJECTS = $(patsubst %.c,$(OBJDIR)/%.o,$(DOOM_SOURCES))
 
 # libmad MP3 decoder (vendored, integer FPM_64BIT, relaxed warnings + compat shims)
 LIBMAD_SOURCES = $(wildcard media/libmad/*.c)
@@ -799,14 +1128,13 @@ FAAD2_OBJECTS = $(patsubst %.c,$(OBJDIR)/%.o,$(FAAD2_SOURCES))
 VFS_SOURCES = $(wildcard $(VFS_DIR)/*.c)
 
 # Apps sources
-APPS_SOURCES = $(wildcard $(APPS_DIR)/*.c)
 
 # Bluetooth stack sources (#372)
 BT_SOURCES = $(wildcard $(BT_DIR)/*.c)
 WIFI_SOURCES = $(wildcard $(WIFI_DIR)/*.c)
 
 # All C sources
-ALL_C_SOURCES = media/audio_decode.c media/mp3.c media/vorbis.c media/flac.c media/wav.c media/opus.c media/aac.c media/audio_selftest.c \
+ALL_C_SOURCES = media/audio_decode.c media/mp3.c media/vorbis.c media/flac.c media/wav.c media/opus.c media/aac.c \
                 $(LIBMAD_SOURCES) \
                 $(TREMOR_SOURCES) \
                 $(DRFLAC_SOURCES) \
@@ -817,13 +1145,14 @@ ALL_C_SOURCES = media/audio_decode.c media/mp3.c media/vorbis.c media/flac.c med
                 $(CPU_SOURCES) \
                 $(VIDEO_SOURCES) \
                 $(DRIVER_SOURCES) \
+                $(VIRTIO_SOURCES) \
                 $(NET_SOURCES) \
                 $(NET_TLS_SOURCES) \
                 $(NET_SSH_SOURCES) \
                 $(FS_SOURCES) \
+                $(GRAPHFS_SOURCES) \
                 $(SHELL_SOURCES) \
                 $(GUI_SOURCES) \
-                $(GUI_SETTINGS_SOURCES) \
                 $(EXEC_SOURCES) \
                 $(DOS_SOURCES) \
                 $(PROC_SOURCES) \
@@ -832,9 +1161,7 @@ ALL_C_SOURCES = media/audio_decode.c media/mp3.c media/vorbis.c media/flac.c med
                 $(IPC_SOURCES) \
                 $(SYNC_SOURCES) \
                 $(CRYPTO_SOURCES) \
-                $(GAMES_SOURCES) \
                 $(VFS_SOURCES) \
-                $(APPS_SOURCES) \
                 $(BT_SOURCES) \
                 $(WIFI_SOURCES) \
 
@@ -848,7 +1175,16 @@ ALL_ASM_SOURCES = $(ASM_SOURCES) \
 # Use _asm.o suffix for assembly to avoid collision with C files
 C_OBJECTS = $(patsubst %.c,$(OBJDIR)/%.o,$(ALL_C_SOURCES))
 ASM_OBJECTS = $(patsubst %.asm,$(OBJDIR)/%_asm.o,$(ALL_ASM_SOURCES))
-OBJECTS = $(C_OBJECTS) $(ASM_OBJECTS) $(DOOM_OBJECTS)
+OBJECTS = $(C_OBJECTS) $(ASM_OBJECTS)
+
+# Header dependency files emitted by -MMD (#600). Every C object list gets one:
+# C_OBJECTS covers the whole kernel plus the vendored media decoders, and
+# (#703 removed DOOM_OBJECTS, the last separate relaxed-profile object list). ASM
+# objects are built by nasm and have no depfiles, so they are deliberately not
+# listed. `-include` (leading dash) is silent on the first build when no .d
+# exists yet, and -MP keeps a deleted header from wedging make.
+DEPFILES = $(C_OBJECTS:.o=.d)
+-include $(DEPFILES)
 
 # Default target
 .PHONY: all
@@ -862,12 +1198,13 @@ dirs:
 	@mkdir -p $(OBJDIR)/$(CPU_DIR)
 	@mkdir -p $(OBJDIR)/$(VIDEO_DIR)
 	@mkdir -p $(OBJDIR)/$(DRIVERS_DIR)
+	@mkdir -p $(OBJDIR)/$(VIRTIO_DIR)
 	@mkdir -p $(OBJDIR)/$(NET_DIR)
 	@mkdir -p $(OBJDIR)/$(NET_TLS_DIR)
 	@mkdir -p $(OBJDIR)/$(FS_DIR)
+	@mkdir -p $(OBJDIR)/$(GRAPHFS_DIR)
 	@mkdir -p $(OBJDIR)/$(SHELL_DIR)
 	@mkdir -p $(OBJDIR)/$(GUI_DIR)
-	@mkdir -p $(OBJDIR)/$(GUI_SETTINGS_DIR)
 	@mkdir -p $(OBJDIR)/$(EXEC_DIR)
 	@mkdir -p $(OBJDIR)/$(DOS_DIR)
 	@mkdir -p $(OBJDIR)/$(PROC_DIR)
@@ -876,10 +1213,7 @@ dirs:
 	@mkdir -p $(OBJDIR)/$(IPC_DIR)
 	@mkdir -p $(OBJDIR)/$(SYNC_DIR)
 	@mkdir -p $(OBJDIR)/$(CRYPTO_DIR)
-	@mkdir -p $(OBJDIR)/$(GAMES_DIR)
-	@mkdir -p $(OBJDIR)/$(DOOM_DIR)
 	@mkdir -p $(OBJDIR)/$(VFS_DIR)
-	@mkdir -p $(OBJDIR)/$(APPS_DIR)
 	@mkdir -p $(OBJDIR)/$(BT_DIR)
 	@mkdir -p $(OBJDIR)/$(WIFI_DIR)
 
@@ -892,6 +1226,26 @@ dirs:
 # change the golden build path. x86_64-unknown-none already matches the C
 # kernel ABI (code-model=kernel, redzone off, -mmx/-sse/-sse2 + soft-float,
 # panic=abort) - no custom target JSON needed.
+# --- #75 SMP context-corruption REPRODUCER -----------------------------------
+# `make SCHEDRACE=1` widens the two race windows in the context-switch path with
+# a bounded, clock-based delay and turns the first corrupt incoming context into
+# a kpanic carrying both cores' switch history. It exists to make a fault that
+# appears in 2 boots out of 5 appear in every run, quickly, with the machine
+# state at the moment it happens.
+#
+# NEVER ship this. The delay is deliberate and large. The DETECTOR and its
+# self-test are compiled in unconditionally (they are cheap and the fault is
+# silent without them); only the widening and the panic are gated here, the same
+# split sync/noblock.c uses.
+#   make SCHEDRACE=1              - reproducer build, 40us per site
+#   make SCHEDRACE=1 SCHEDRACE_US=200 - wider still
+ifdef SCHEDRACE
+CFLAGS += -DSCHEDRACE
+ifdef SCHEDRACE_US
+CFLAGS += -DSCHEDRACE_US=$(SCHEDRACE_US)
+endif
+endif
+
 RUST_LIB         = librustkern.a
 RUSTC            = rustc
 RUST_PIN_VERSION = 1.97.0
@@ -905,8 +1259,14 @@ RUSTFLAGS = --edition 2021 --crate-type staticlib --target x86_64-unknown-none \
 # invocation, so EVERY module is a prerequisite: touching rustkern/mono.rs must
 # rebuild the archive.
 RUST_MODULES = $(wildcard rustkern/*.rs)
+# Data blobs pulled in with include_bytes!. They are NOT .rs files, so the
+# wildcard above misses them: without this line a regenerated pwbreach.bin
+# would leave the previously-linked table in the archive, and the kernel
+# would enforce the OLD breached-password list while the file on disk said
+# otherwise. That is the silent-staleness class this project keeps hitting.
+RUST_BLOBS   = rustkern/pwbreach.bin
 
-$(RUST_LIB): rustkern.rs $(RUST_MODULES) rust-toolchain.toml
+$(RUST_LIB): rustkern.rs $(RUST_MODULES) $(RUST_BLOBS) rust-toolchain.toml
 	@echo "Compiling Rust static lib $(RUST_LIB) (pinned rustc $(RUST_PIN_VERSION))..."
 	@ver=`$(RUSTC) --version | awk '{print $$2}'`; \
 	 if [ "$$ver" != "$(RUST_PIN_VERSION)" ]; then \
@@ -925,11 +1285,12 @@ $(RUST_LIB): rustkern.rs $(RUST_MODULES) rust-toolchain.toml
 # (a whole-file push about to delete #502's six live TLS 1.2 functions; a
 # "clobber" whose only tell was nm vs grep disagreeing).
 #
-# The tool lives INSIDE kernel/ on purpose. `make lint` reaches for
+# The tool lives INSIDE kernel/ on purpose. `make lint` USED to reach for
 # ../tools/concurrency-lint, which resolves to source/tools on the build
-# container and DOES NOT EXIST there, so that lint cannot run where the kernel
-# is actually built. A gate that silently skips is worse than no gate, so this
-# one travels with the Makefile that invokes it.
+# container and DID NOT EXIST there, so that lint could not run where the
+# kernel is actually built. A gate that silently skips is worse than no gate,
+# so this one travels with the Makefile that invokes it, and #514 moved the
+# concurrency lint into kernel/tools/ for exactly the same reason.
 RUST_SYMGATE  = tools/rust-symbol-gate/rust-symbol-gate
 RUST_MANIFEST = rust-symbols.manifest
 
@@ -948,6 +1309,255 @@ rust-symbol-gate: $(RUST_LIB)
 rust-symbol-update: $(RUST_LIB)
 	@python3 $(RUST_SYMGATE) --archive $(RUST_LIB) --manifest $(RUST_MANIFEST) --nm nm --update
 
+# --- Syscall dispatch gate (#565 regression guard) -------------------------
+# FAILS THE BUILD if a syscall listed in syscall-dispatch.manifest loses its
+# `case SYS_*:` in proc/syscall.c while its number is still #defined in
+# proc/syscall.h. A dropped case BUILDS CLEAN (the number, the header define,
+# and the kernel impl all remain; the call just falls through the switch), so
+# the compiler is no backstop. This is how 68199dd (#565 theme loader) silently
+# dropped SYS_APP_VERIFY_SIG and defeated the #563 app/kernel signing-key split.
+# Same rationale and placement as rust-symbol-gate above: the tool travels
+# INSIDE kernel/ so it can run where the kernel is actually built.
+SYSCALL_GATE     = tools/syscall-dispatch-gate/syscall-dispatch-gate
+SYSCALL_HEADER   = proc/syscall.h
+SYSCALL_DISPATCH = proc/syscall.c
+SYSCALL_MANIFEST = syscall-dispatch.manifest
+
+.PHONY: syscall-dispatch-gate
+syscall-dispatch-gate:
+	@if [ ! -f $(SYSCALL_GATE) ]; then \
+	   echo "ERROR: $(SYSCALL_GATE) is missing. The syscall dispatch gate cannot"; \
+	   echo "       run, and a gate that skips silently is how a case disappears."; \
+	   exit 1; \
+	 fi
+	@python3 $(SYSCALL_GATE) --header $(SYSCALL_HEADER) --dispatch $(SYSCALL_DISPATCH) --manifest $(SYSCALL_MANIFEST)
+
+# Refresh the manifest from the current cases (run when you ADD a syscall case).
+.PHONY: syscall-dispatch-update
+syscall-dispatch-update:
+	@python3 $(SYSCALL_GATE) --header $(SYSCALL_HEADER) --dispatch $(SYSCALL_DISPATCH) --manifest $(SYSCALL_MANIFEST) --update
+
+# --- Syscall user-pointer lint (#565, enforcing #500) ----------------------
+# FAILS THE BUILD if a syscall whose dispatcher case casts an arg to a USER
+# POINTER has no validation: neither a descriptor in rustkern/argtab.rs nor an
+# allowlist entry in syscall-ptr.manifest. A missing descriptor BUILDS CLEAN
+# (syscall_validate_args() returns 0 for an undescribed syscall, so the pointer
+# reaches the handler unchecked) - the exact Ring-3 -> kernel arbitrary R/W hole
+# #500 closed with 114 descriptors. #500 was a one-time manual audit; this is
+# the gate that keeps it closed as syscalls are added. Same rationale and
+# placement as syscall-dispatch-gate above: the tool travels INSIDE kernel/ so
+# it runs where the kernel is actually built.
+SYSCALL_PTRLINT  = tools/syscall-ptr-lint/syscall-ptr-lint
+SYSCALL_ARGTAB   = rustkern/argtab.rs
+SYSCALL_PTRMAN   = syscall-ptr.manifest
+
+.PHONY: syscall-ptr-lint
+syscall-ptr-lint:
+	@if [ ! -f $(SYSCALL_PTRLINT) ]; then \
+	   echo "ERROR: $(SYSCALL_PTRLINT) is missing. The syscall pointer lint"; \
+	   echo "       cannot run, and a gate that skips silently is how an"; \
+	   echo "       unvalidated Ring-3 pointer syscall ships (#500/#565)."; \
+	   exit 1; \
+	 fi
+	@python3 $(SYSCALL_PTRLINT) --header $(SYSCALL_HEADER) --dispatch $(SYSCALL_DISPATCH) --argtab $(SYSCALL_ARGTAB) --manifest $(SYSCALL_PTRMAN)
+
+# Prove the gate is trustworthy: RED on a broken fixture, GREEN on the real tree.
+.PHONY: syscall-ptr-lint-selftest
+syscall-ptr-lint-selftest:
+	@python3 $(SYSCALL_PTRLINT) --header $(SYSCALL_HEADER) --dispatch $(SYSCALL_DISPATCH) --argtab $(SYSCALL_ARGTAB) --manifest $(SYSCALL_PTRMAN) --self-test
+
+# --- Syscall copy_*_user adoption lint (#566, enforcing #509) ---------------
+# FAILS THE BUILD if a syscall handler in proc/syscall.c DIRECTLY DEREFERENCES a
+# user pointer (`*p`, `p->f`, `p[i]`, or a bare memcpy/memset on it) instead of
+# routing that access through the #509 TOCTOU-safe copy_*_user primitives -
+# unless it is on the checked-in manifest (adopted needs no entry; already-safe
+# goes [EXEMPT]; honestly-deferred goes [KNOWN_GAP], a loud debt ledger printed
+# every build). syscall-ptr-lint (#565) proves each pointer syscall is VALIDATED
+# AT ENTRY (the check half of the TOCTOU pair); THIS lint proves the USE half is
+# atomic too - that the handler does not then raw-deref the pointer it just
+# validated. A raw deref after an entry check BUILDS CLEAN: the compiler is happy
+# and only a racing sibling thread that remaps the page in between reveals it.
+# Same rationale and placement as syscall-ptr-lint above: the tool travels
+# INSIDE kernel/ so it runs where the kernel is actually built.
+COPYUSER_LINT    = tools/copy-user-lint/copy-user-lint
+COPYUSER_MAN     = syscall-copyuser.manifest
+# #746b: THE SYSCALL LAYER IS TWO FILES NOW. The legacy fd layer moved to
+# proc/fdlayer.c, and this lint only ever analysed functions defined in the file
+# given as --dispatch. Without naming fdlayer.c here, SYS_OPEN, SYS_READ,
+# SYS_WRITE and SYS_READDIR leave the analysed set: the build stays green, the
+# tracked SYS_READ TOCTOU debt DISAPPEARS from the output, and the lint prints a
+# note inviting you to delete the manifest entry as stale. That was measured
+# before the split, not guessed. Add every new file that defines syscall
+# handlers here; a path that does not exist is a hard failure, by design.
+COPYUSER_HANDLERS = proc/fdlayer.c
+
+.PHONY: copy-user-lint
+copy-user-lint:
+	@if [ ! -f $(COPYUSER_LINT) ]; then \
+	   echo "ERROR: $(COPYUSER_LINT) is missing. The copy_*_user adoption lint"; \
+	   echo "       cannot run, and a gate that skips silently is how a"; \
+	   echo "       TOCTOU-unsafe direct user-pointer deref ships (#509/#566)."; \
+	   exit 1; \
+	 fi
+	@python3 $(COPYUSER_LINT) --header $(SYSCALL_HEADER) --dispatch $(SYSCALL_DISPATCH) $(addprefix --handlers ,$(COPYUSER_HANDLERS)) --manifest $(COPYUSER_MAN)
+
+# Prove the gate is trustworthy: RED on a direct-deref fixture, GREEN on the real tree.
+.PHONY: copy-user-lint-selftest
+copy-user-lint-selftest:
+	@python3 $(COPYUSER_LINT) --header $(SYSCALL_HEADER) --dispatch $(SYSCALL_DISPATCH) $(addprefix --handlers ,$(COPYUSER_HANDLERS)) --manifest $(COPYUSER_MAN) --self-test
+
+# --- SMAP user-access lint (#645, enforcing the CR4.SMAP contract) ----------
+# FAILS THE BUILD on (A) any regression in the SMAP mechanism itself and (B) any
+# NEW Ring-0 access to user memory that is neither routed through copy_*_user
+# nor bracketed by uaccess_begin()/uaccess_end() nor on the manifest.
+#
+# It closes the two documented blind spots of copy-user-lint above, BOTH of
+# which are load-bearing once SMAP is on. That lint reasons about the syscall
+# layer ONLY (proc/syscall.c plus the files named in COPYUSER_HANDLERS, #746b)
+# and traces ONE call level; measured against this tree, 43 of the 122
+# copy_*_user call sites are in other files, every heavy unwrapped site (ELF
+# loader, argv builder, signal frames) is outside syscall.c, and sc_copy_str()
+# reads a user string with NO validation two levels down from three dispatcher
+# cases. This lint's watch set is DERIVED (any file that validates or copies a
+# user pointer joins automatically) and it follows same-file calls to depth 3.
+#
+# SMAP_DEFAULT is computed from CFLAGS, not hand-set, so it cannot drift from
+# what is actually being compiled: removing -DCONFIG_NO_SMAP flips it to `on`,
+# and the lint then FAILS while the manifest still lists a KNOWN_GAP. That
+# interlock is the whole point - it makes "do not arm SMAP yet" a build failure
+# instead of a promise someone has to remember.
+SMAP_LINT    = tools/smap-uaccess-lint/smap-uaccess-lint
+SMAP_MAN     = smap-uaccess.manifest
+SMAP_DEFAULT = $(if $(findstring -DCONFIG_NO_SMAP,$(CFLAGS)),off,on)
+
+.PHONY: smap-uaccess-lint
+smap-uaccess-lint:
+	@if [ ! -f $(SMAP_LINT) ]; then \
+	   echo "ERROR: $(SMAP_LINT) is missing. The SMAP user-access lint cannot"; \
+	   echo "       run, and an unwrapped Ring-0 access to user memory is a #PF"; \
+	   echo "       the moment CR4.SMAP is set (#645)."; \
+	   exit 1; \
+	 fi
+	@python3 $(SMAP_LINT) --root . --manifest $(SMAP_MAN) --smap-default $(SMAP_DEFAULT)
+
+# Prove the gate is trustworthy: RED on each synthetic violation, GREEN on
+# correct code. A gate nobody has watched go red is not a gate.
+.PHONY: smap-uaccess-lint-selftest
+smap-uaccess-lint-selftest:
+	@python3 $(SMAP_LINT) --self-test
+
+# Re-anchor the manifest's LINE NUMBERS after an unrelated edit shifted them
+# (#695). Any change that inserts or deletes lines in a listed file moves every
+# entry below it, and rule B1 then fails the build with a wall of errors that
+# have nothing to do with the change. That happened at #692 and again at #695;
+# the fix was written ad hoc and thrown away both times, so it is checked in.
+# It maps old line -> new line by DIFFING against the committed baseline, which
+# is exact, and then VERIFIES the substring is really there. It does not search
+# for the substring as its primary locator: at #695 the shift was ~130 lines and
+# a 24-character key like "process_t *p = proc_current();" matched 28 places, so
+# nearest-occurrence collapsed three distinct sites onto one line. Run
+# `--check` first to see the blast radius; an entry it cannot map is REPORTED
+# and never guessed at.
+SMAP_REANCHOR = tools/smap-uaccess-lint/reanchor-manifest
+.PHONY: smap-uaccess-reanchor smap-uaccess-reanchor-check
+smap-uaccess-reanchor:
+	@python3 $(SMAP_REANCHOR) --root . --manifest $(SMAP_MAN)
+smap-uaccess-reanchor-check:
+	@python3 $(SMAP_REANCHOR) --root . --manifest $(SMAP_MAN) --check
+
+# --- Concurrency lint (#426, made real at #514) -----------------------------
+# FAILS THE BUILD on any NEW hand-rolled busy-wait / spin / poll loop: the bug
+# class behind the freeze/hang tickets #211 #212 #230 #231 #347 #381 #419 #420,
+# and the single most-repeated rule in CLAUDE.md ("ALL sleeping/waiting goes
+# through the kernel wait-queue or futex; NEVER hand-roll a busy-wait").
+#
+# #514: this lint EXISTED and was DOCUMENTED as a build guardrail for weeks
+# while being incapable of running in a build. It lived at <repo>/tools/ and
+# was invoked as `../tools/concurrency-lint/...`, but build-golden.sh ships
+# ONLY `git archive <commit> kernel` to the kernel build container, so on the
+# machine where the kernel is actually built that path did not exist and
+# `make lint` died with "No such file or directory". It was also never a
+# prerequisite of anything, so a normal `make` never called it. Two independent
+# reasons it could not fail. The tool now travels INSIDE kernel/ and is an
+# order-only prerequisite of the link, exactly like rust-symbol-gate,
+# syscall-dispatch-gate, syscall-ptr-lint and copy-user-lint.
+#
+# Scoped to `--dirs kernel` on purpose: the build container only has kernel/,
+# so a gate that also scanned userland would give a DIFFERENT verdict depending
+# on where it ran. Use `make lint-all` from a full checkout for kernel+userland.
+# --- Syscall number lint (#745) ---------------------------------------------
+# FAILS THE BUILD when two SYS_* names share a number, when SYS_MAX is not
+# strictly past the top, when kernel and libc disagree on a shared name, or when
+# argtab.rs holds two descriptors for one syscall.
+#
+# It exists because on 2026-08-10 two agent branches each allocated 373 and git
+# merged BOTH with no conflict, because the #defines sat at different line
+# numbers. It compiled. One of the two features would simply never have run.
+# Nothing in the build would have caught it; it was found by hand.
+#
+# `make syscall-number-lint-selftest` PROVES it goes red on each of the four
+# rules and green on the real tree. A gate only ever seen green is not evidence.
+SYSNUM_LINT = tools/syscall-number-lint/syscall-number-lint
+
+.PHONY: syscall-number-lint
+syscall-number-lint:
+	@bash $(SYSNUM_LINT) ..
+
+.PHONY: syscall-number-lint-selftest
+syscall-number-lint-selftest:
+	@bash tools/syscall-number-lint/selftest
+
+CONC_LINT = tools/concurrency-lint/concurrency-lint
+
+.PHONY: concurrency-lint
+concurrency-lint:
+	@if [ ! -f $(CONC_LINT) ]; then \
+	   echo "ERROR: $(CONC_LINT) is missing. The concurrency lint cannot run,"; \
+	   echo "       and a gate that skips silently is how the next hand-rolled"; \
+	   echo "       spin loop ships (#426/#514)."; \
+	   exit 1; \
+	 fi
+	@python3 $(CONC_LINT) --root .. --dirs kernel
+
+# Prove the gate is trustworthy: RED on a synthetic spin of every rule, GREEN
+# on correct wait_event code. A gate nobody has watched go red is not a gate.
+.PHONY: concurrency-lint-selftest
+concurrency-lint-selftest:
+	@python3 $(CONC_LINT) --self-test
+
+# --- Private-extern gate (#742, closing #693's one hole) -------------------
+# FAILS THE BUILD if a .c file re-declares a guarded persistence symbol with
+# its own `extern` instead of including the owning header. That pattern opts
+# the whole file out of MUST_CHECK (warn_unused_result), permanently and
+# silently, AND binds to a signature the author invented: void vs int, and a
+# wrong pointer type or width, are all ABI-compatible on x86-64 SysV and link
+# with no diagnostic. #693 measured the cost: its first attribute build found
+# 41 discarded results when the truth was 57, the missing 16 hidden behind
+# exactly this. #742 changed bootlog_write() from void to int with 46 such
+# declarations live, two of them also non-variadic.
+#
+# The compiler cannot defend its own attribute here, so this gate does. Same
+# rationale and placement as the gates above: the tool travels INSIDE kernel/
+# so it runs where the kernel is actually built.
+PERSIST_EXTGATE = tools/persist-extern-gate/persist-extern-gate
+PERSIST_EXTMAN  = persist-extern.manifest
+
+.PHONY: persist-extern-gate
+persist-extern-gate:
+	@if [ ! -f $(PERSIST_EXTGATE) ]; then \
+	   echo "ERROR: $(PERSIST_EXTGATE) is missing. The private-extern gate"; \
+	   echo "       cannot run, and a gate that skips silently is how a whole"; \
+	   echo "       file opts out of MUST_CHECK without anybody noticing."; \
+	   exit 1; \
+	 fi
+	@python3 $(PERSIST_EXTGATE) --root . --manifest $(PERSIST_EXTMAN)
+
+# Prove it: RED on a planted private extern of EVERY guarded symbol, in both
+# the file-scope and the inside-a-function form, and GREEN on the real tree.
+.PHONY: persist-extern-gate-selftest
+persist-extern-gate-selftest:
+	@python3 $(PERSIST_EXTGATE) --root . --manifest $(PERSIST_EXTMAN) --self-test
+
 # Link kernel
 # librustkern.a is linked LAST (after all C objects) - the proven strangler
 # link order from the PoC, so archive members are pulled to satisfy C
@@ -965,14 +1575,27 @@ RUST_FORCE = -u rust_marker
 # but being order-only it does not mark kernel.elf out of date, so it never
 # forces a needless 15 MB relink. If the gate fails, make stops here and the
 # kernel is not linked.
-$(TARGET): $(OBJECTS) $(RUST_LIB) | rust-symbol-gate
-	@echo "Linking $(TARGET)..."
-	$(LD) $(LDFLAGS) -o $@ $(OBJECTS) $(RUST_FORCE) $(RUST_LIB)
+$(TARGET): $(OBJECTS) $(RUST_LIB) | increment_build dirs rust-symbol-gate syscall-dispatch-gate syscall-ptr-lint copy-user-lint smap-uaccess-lint concurrency-lint persist-extern-gate syscall-number-lint
+	@echo "Linking $(DEBUG_TARGET)..."
+	$(LD) $(LDFLAGS) -o $(DEBUG_TARGET) $(OBJECTS) $(RUST_FORCE) $(RUST_LIB)
+	@# #670: the SHIPPED kernel is the stripped copy. Link once, strip into
+	@# $(TARGET), so build-golden.sh and invariant-gate.sh keep consuming
+	@# "kernel.elf" unchanged and the #618 byte-for-byte rebuild gate still
+	@# compares like with like (objcopy is deterministic for a given input and
+	@# binutils version, and both sides of that gate build in the same CT).
+	@# Debug with: addr2line -e $(DEBUG_TARGET) <address from serial>
+	$(OBJCOPY) --strip-debug --strip-unneeded $(DEBUG_TARGET) $@
 	@echo "Kernel built successfully!"
-	@ls -lh $(TARGET)
+	@ls -lh $(TARGET) $(DEBUG_TARGET)
 	@echo ""
-	@echo "Kernel sections:"
+	@echo "Kernel sections (shipped):"
 	@size $(TARGET)
+	@# The gate, not the prose (#514): fail the build rather than ship symbols.
+	@if readelf -SW $(TARGET) | grep -qE '\.(symtab|debug_)'; then \
+	   echo ">>> #670 STRIP GATE FAILED: $(TARGET) still carries .symtab/.debug_*"; \
+	   rm -f $(TARGET); exit 1; \
+	 fi
+	@echo "#670 strip gate: shipped $(TARGET) has no .symtab / .debug_* section"
 
 
 # --- CFLAGS stamp (#526): a -D change MUST rebuild -------------------------
@@ -991,7 +1614,7 @@ $(TARGET): $(OBJECTS) $(RUST_LIB) | rust-symbol-gate
 # flags actually differ, so its mtime moves only on a real change and a no-op
 # make stays a no-op. Every C compile rule below depends on it.
 #
-# NOTE: all the derived profiles (TTF_CFLAGS, DOOM_CFLAGS, LIBMAD_CFLAGS, ...)
+# NOTE: all the derived profiles (TTF_CFLAGS, LIBMAD_CFLAGS, TREMOR_CFLAGS, ...)
 # are $(subst)-ed from CFLAGS, so this one stamp covers them all.
 FLAGS_STAMP = $(OBJDIR)/.cflags-stamp
 
@@ -1021,12 +1644,6 @@ $(OBJDIR)/gui/ttf.o: gui/ttf.c gui/stb_truetype.h gui/ttf.h $(FLAGS_STAMP)
 	@echo "Compiling $< (SSE enabled, relaxed warnings)..."
 	@mkdir -p $(dir $@)
 	$(CC) $(TTF_CFLAGS_RELAXED) -c $< -o $@
-
-# Compile DOOM files with relaxed warnings (legacy code)
-$(OBJDIR)/$(DOOM_DIR)/%.o: $(DOOM_DIR)/%.c $(FLAGS_STAMP)
-	@echo "Compiling $< (DOOM, relaxed)..."
-	@mkdir -p $(dir $@)
-	$(CC) $(DOOM_CFLAGS) -c $< -o $@
 
 # Compile libmad core (integer fixed-point, relaxed warnings)
 $(OBJDIR)/media/libmad/%.o: media/libmad/%.c $(FLAGS_STAMP)
@@ -1110,7 +1727,10 @@ $(OBJDIR)/%_asm.o: %.asm
 .PHONY: clean
 clean:
 	@echo "Cleaning..."
-	rm -rf $(OBJDIR) $(TARGET) $(RUST_LIB)
+	rm -rf $(OBJDIR) $(TARGET) $(DEBUG_TARGET) $(RUST_LIB)
+	@# depfiles (#600) live inside $(OBJDIR) so the rm -rf above already
+	@# takes them; belt and braces in case OBJDIR is ever flattened.
+	rm -f $(DEPFILES)
 	@echo "Clean complete."
 
 # Show info
@@ -1120,24 +1740,23 @@ info:
 	@echo "ASM Sources: $(ALL_ASM_SOURCES)"
 	@echo "Objects: $(OBJECTS)"
 
-# Concurrency lint (#426): fail on any NEW hand-rolled busy-wait / spin /
-# poll loop that should use the shared wait-queue (sync/waitq.h) or futex
-# (sync/futex.c). Scans kernel/ + userland/ from the source root. Does NOT
-# depend on any build artifact, so it never triggers a kernel rebuild.
-.PHONY: lint
-lint:
-	@python3 ../tools/concurrency-lint/concurrency-lint --root ..
+# Concurrency lint over kernel/ AND userland/ (#426). Needs a FULL checkout;
+# the kernel build container only has kernel/, which is why the build gate
+# above is kernel-scoped. `lint` is kept as the historical alias.
+.PHONY: lint lint-all
+lint lint-all:
+	@python3 $(CONC_LINT) --root .. --dirs kernel,userland
 
 # Re-baseline the concurrency-lint allowlist to the current tree (run only
 # when knowingly accepting reviewed legacy sites; commit the allowlist).
 .PHONY: lint-baseline
 lint-baseline:
-	@python3 ../tools/concurrency-lint/concurrency-lint --root .. --update-allowlist
+	@python3 $(CONC_LINT) --root .. --update-allowlist
 
 # Full categorized backlog of every hit (allowlisted or not).
 .PHONY: lint-report
 lint-report:
-	@python3 ../tools/concurrency-lint/concurrency-lint --root .. --report
+	@python3 $(CONC_LINT) --root .. --report
 
 # Install to UEFI boot directory
 .PHONY: install
@@ -1149,4 +1768,40 @@ install: $(TARGET)
 # Increment build number before building
 increment_build:
 	@./increment_build.sh
-	@rm -f obj/main.o obj/video/graphics.o obj/proc/syscall.o obj/gui/desktop.o  # Force recompile of version-dependent files
+
+# #742: the four version-dependent objects are declared to DEPEND on version.h
+# instead of being `rm`-ed by increment_build's recipe.
+#
+# The rm was unsound under -j by construction, and no amount of order-only
+# prerequisite fixes it. Order-only says "update increment_build before you
+# BUILD this object". If make decides an object does NOT need building, it never
+# builds it, so the rm lands AFTER that decision and the link then dies with
+# `ld: cannot find obj/main.o`. Intermittent, indistinguishable from a corrupt
+# tree, and serial `make` always hides it. Two order-only fixes in a row failed
+# to close it, which is the tell that the mechanism was wrong rather than
+# mis-wired: a recipe that deletes another target's inputs is racing make's own
+# scheduler.
+#
+# A declared prerequisite is what make is FOR. build-golden.sh seds version.h
+# before invoking make, so these four rebuild exactly when the build number
+# changes and never otherwise. main.c is listed even though it does not
+# currently #include version.h, preserving the rm's intent rather than quietly
+# narrowing it.
+obj/main.o obj/video/graphics.o obj/proc/syscall.o obj/gui/desktop.o: version.h
+
+# #742 (incidental, found while building): `all: increment_build dirs $(TARGET)`
+# does NOT order its prerequisites under -j. GNU make runs prerequisites of the
+# SAME target in parallel, so with `make -j8` the link could start while
+# increment_build was still `rm`-ing the four version-dependent objects, and the
+# build died with `ld: cannot find obj/main.o`. It is intermittent, it looks
+# like a corrupt tree rather than a race, and `make` alone (serial) always
+# hides it.
+#
+# Order-only on the OBJECTS is necessary and NOT sufficient, which cost a second
+# failing build to find: when every object is already up to date, $(TARGET)
+# never waits for anything, so make happily runs increment_build's `rm` AT THE
+# SAME TIME as the link, and ld dies on a file that existed when it started. So
+# $(TARGET) carries the order-only dependency too (see its rule below). Both are
+# needed: the OBJECTS one covers the compile, the TARGET one covers the link.
+# Being order-only, neither marks anything out of date.
+$(OBJECTS): | increment_build dirs

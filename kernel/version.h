@@ -89,7 +89,7 @@
 // LIVE-VERIFIED TLS certificate-validation kernel. Valid public HTTPS sites
 // (coingecko/yahoo/wttr.in/musicbrainz/archive.org) verify OK + fetch 200;
 // a self-signed and a wrong-host cert are both REJECTED with a certificate
-// error (proven on VM 2299 against an openssl s_server bad-cert endpoint).
+// error (proven on a test VM against an openssl s_server bad-cert endpoint).
 // #433 xHCI HID enumeration race fix: mark-port-enumerated-on-success +
 // bounded retry, warm-reboot per-port PP off->on power-cycle, CONFIG_EP return
 // check + retry for HID interrupt-IN, and a periodic port re-scan worker.
@@ -131,7 +131,7 @@
 // wget_fetch/wget_execute_with_redirects) previously followed a 3xx
 // Location header with NO scheme or host validation at all, letting a
 // remote page redirect the kernel HTTP client at internal targets
-// (192.168.x.x, 127.0.0.1, 169.254.x.x/cloud-metadata). Added
+// (a private LAN address, 127.0.0.1, 169.254.x.x/cloud-metadata). Added
 // https_host_is_private()/wget_host_is_private() (resolve + check
 // 10/8,172.16/12,192.168/16,127/8,169.254/16,0/8) gating every redirect
 // site in both clients; a public-origin request can never be redirected
@@ -332,7 +332,7 @@
 // no core burn) + the job worker on g_post_job_wq; sync/futex.c duplicate
 // ms_to_ticks merged (the timed park deliberately stays separate).
 // #515 (ipc/msg.c wq conversion) and #514 (audio_drain dead poll) are
-// deliberately NOT done here; see the internal wait-migration tickets.
+// deliberately NOT done here; see docs/WAIT_MIGRATION_TICKETS.md.
 // b831 (#497 net/TLS): TLS_MAX_RECORD_SIZE bounded the CIPHERTEXT record with
 // the PLAINTEXT limit (2^14), so every full-size TLS record was rejected and
 // every HTTPS response over ~16 KB failed (h2 "status=200 len=0"; #333's "no
@@ -340,7 +340,96 @@
 // tls_parse seam. Also: http->https redirects now re-dispatch to the TLS
 // client instead of replaying plaintext at port 443, and the #333 net
 // self-test is actually CALLED at boot for the first time (it was dead code).
-#define MAYTERA_BUILD_NUMBER 851
+// b863 (Win16 #278-toolbar): Word 6 toolbar-icon BLACK SQUARES, root-caused
+// and fixed. legacy-app-re method on a test VM: u_peekmessage (win16api.c) had
+// no win16_trace flush (Word's WinMain loop is PeekMessage-based, per the
+// pre-existing gated [W6PMSG] trace; only u_getmessage flushed, #205), so
+// /WIN16LOG.TXT stayed stale for an entire Word 6 run - fixed that first
+// (mirrors u_getmessage's growth-gated flush) to get a real trace at all.
+// With the trace working, added pixel-sampling diagnostics to BitBlt and
+// SelectObject(bitmap) and traced CreatePatternBrush/CreateDIBPatternBrush's
+// previously-ignored arguments. MEASURED root cause: GDI.442 CreateDIBitmap
+// (g_createdibitmap) was a stub that discarded lpInit/lpInitInfo entirely
+// and returned a fake 1x1 handle with NO pixel buffer allocated at all
+// (confirmed: "SelectObject dc=3 <- bmp obj=54 1x1 px0=deaddead", our
+// NULL-pix sentinel). Word calls it with CBM_INIT to decode its toolbar's
+// resource bitmap strip; getting back a bogus 1x1/no-buffer handle meant the
+// following StretchBlt (stretching that "bitmap" to the real 624x23 strip
+// size) stretched one missing (-> black) source pixel across the whole
+// strip (measured: "SB d2<-s3 @0,0 624x23 src0,0 1x1 ... smem=0"), so every
+// later SRCAND/SRCPAINT transparent-bitmap blit pair combined black with
+// black (rop_combine/blt_copy_rop were already correct). Fixed
+// CreateDIBitmap to actually decode the DIB (same marshal-then-decode_dib
+// approach SetDIBitsToDevice already used for a header+bits pair in separate
+// guest far pointers), falling back to the old dummy-handle behaviour only
+// for a plain size/format query (dwInit without CBM_INIT). Also added the
+// one other ROP value Word's toolbar init actually uses and we were missing,
+// DSna (0x00220326 = D & ~S; the icon strip's own compose step), verified
+// against the standard ROP3 truth-table (matches how the other 10 entries in
+// rop_combine were each derived). Also gave GDI.106 SetBitmapBits a real
+// handler (moved from the dead g_stub_table entry into g_api_table): a
+// general GDI correctness fix for the standard "CreateBitmap(NULL) then
+// SetBitmapBits()" idiom, verified this pass NOT to be what Word 6 calls for
+// the toolbar (measured zero calls even with the real handler in place), but
+// correct and worth keeping for any app that does use it.
+//
+// MEASURED result (a test VM, two screendumps + advancing clock each stage):
+// toolbar buttons no longer render as solid black squares; real bitmap pixel
+// data (including the source DIB's own magenta/0xFF00FF colour-key marker)
+// now reaches the screen. Regression-clean: FreeCell and Golf (MS
+// Entertainment Pack) both still render full, correct card layouts; Word 6
+// chrome/menus/typing (Col 1 -> Col 6 typing "hello") all unaffected.
+//
+// NOT YET FIXED (next divergence, precisely localized, not forced): a
+// residual colour-key/monochrome-conversion gap remains. Real Win16 GDI
+// quantizes a colour source to black/white (via SetBkColor colour-keying)
+// when BitBlt's DESTINATION is bound to a genuinely 1bpp bitmap (Word's
+// mask strip, obj type 4 bpp=1); our BitBlt/blt_copy_rop/dc_plot pipeline
+// writes full 32-bit colour into any destination regardless of its nominal
+// bpp, so the "mask" strip ends up holding a raw colour copy instead of a
+// true black/white mask, and the DSna compose step (D&~S with D==S at that
+// moment) yields all-zero (an always-paint mask) rather than a real cutout.
+// Net effect: some toolbar icons show flat grey (no icon drawn on top of
+// the button face) and others show the source DIB's magenta background
+// colour-key literally, instead of a transparent icon like real Word 6.
+// This needs a destination-bpp-aware BitBlt/StretchBlt change (quantize via
+// bk_color when dst bitmap bpp==1), scoped narrowly enough not to touch the
+// SRCCOPY fast path or any bpp>1 destination, so FreeCell/games (which never
+// blit into a monochrome destination) stay byte-identical. Left for a
+// follow-up pass rather than forced/hacked in this one. See CHANGELOG.md
+// and blame.md for the full writeup and trace evidence.
+//
+// #278 FOLLOW-ON FIXED (build 864): the residual above is now fixed. Added
+// win16_dc_t.mbpp (the bit depth of the bitmap currently bound via
+// SelectObject) and blt_quantize_mono() (source pixel == src DC's bk_color ->
+// white, else black), and wired both into blt_copy_rop (BitBlt) and
+// StretchBlt: when the destination bitmap is genuinely 1bpp, each source
+// pixel is quantized to a real black/white value via the SOURCE DC's
+// background colour before the ROP combine, exactly the documented GDI
+// colour->mono BitBlt contract. Every bpp>1 destination (the SRCCOPY memmove
+// fast path included) is completely untouched. See CHANGELOG.md and
+// blame.md for MEASURED verification (bk_color/colour-key values, before/
+// after screendumps, FreeCell + Golf regression check).
+// Build 932 (#597 + #598): serialize the ext2 write path behind a recursive,
+// yields-while-contended ext2_lock() (the FAT #150 fix, finally applied to
+// ext2), make the directory-block append POPULATE-BEFORE-PUBLISH with a
+// non-optional i_size grow, guard the rec_len underflow that turned a lost
+// update into out-of-block writes + heap overrun, stop a stale block image
+// being installed in the ext2 cache as valid, and honor O_APPEND instead of
+// treating it as O_TRUNC (fopen(path,"a") was destroying the file).
+// Build 952 (#605): port the ext2 directory-entry record parse/insert to Rust,
+// extending the #485 seam to the WRITE side. #597 fixed a MEMORY-SAFETY bug in
+// that C loop by hand (`slack = rec - used` is unsigned, so a record whose own
+// name_len did not fit its own rec_len wrapped it to ~4e9, the room test always
+// passed, and the code wrote a rec_len outside the block and memcpy'd the name
+// past the end of the kmalloc(block_size) buffer). The pure, I/O-free buffer
+// logic now lives in rustkern/ext2.rs behind ONE #[repr(C)] FFI function
+// (ext2_dirblock_insert_rs) whose parsing module is #![forbid(unsafe_code)] and
+// panic-free; `checked_sub` makes the underflow unrepresentable. Locking, block
+// I/O, inode/bitmap allocation and i_size stay in C. Live under
+// -DRUST_EXT2_DIRADD, C kept as ext2_dirblock_insert_c for one-line rollback.
+// Build numbers 944..951 were burned by the #446 FPU differential builds.
+#define MAYTERA_BUILD_NUMBER 1862
 
 // Version string helper macros
 #define STRINGIFY(x) STRINGIFY_HELPER(x)
@@ -349,8 +438,12 @@
 #define MAYTERA_VERSION_STRING "1.95.0"
 
 // Build date (set at compile time)
+#ifndef MAYTERA_BUILD_DATE
 #define MAYTERA_BUILD_DATE       __DATE__
+#endif
+#ifndef MAYTERA_BUILD_TIME
 #define MAYTERA_BUILD_TIME       __TIME__
+#endif
 
 // Full version string
 #define MAYTERA_FULL_VERSION     "MayteraOS v" MAYTERA_VERSION_STRING

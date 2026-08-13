@@ -154,7 +154,16 @@ static const char *exception_names[] = {
 static void isr_handler_impl(interrupt_frame_t *frame);
 void isr_handler(interrupt_frame_t *frame) {  // #279 3b-3C BKL wrapper
     extern int g_smp_bkl_full; extern void bkl_acquire(void); extern void bkl_release(void);
-    if (g_smp_bkl_full) { bkl_acquire(); isr_handler_impl(frame); bkl_release(); }
+    // #67 pass 5: tag what this core is doing so a long BKL hold can be blamed
+    // on a VECTOR rather than on this wrapper, which is the same address every
+    // time. One per-cpu store; no shared cacheline.
+    extern void bkl_set_reason(uint32_t r);
+    if (g_smp_bkl_full) {
+        bkl_acquire();
+        bkl_set_reason(0x0100u | (uint32_t)(frame->int_no & 0xFF));
+        isr_handler_impl(frame);
+        bkl_release();
+    }
     else { isr_handler_impl(frame); }
 }
 static void isr_handler_impl(interrupt_frame_t *frame) {

@@ -1,0 +1,149 @@
+#!/bin/bash
+# syscall-number-gate - no two syscalls may share a number (#708).
+#
+# WHY THIS EXISTS. Syscall numbers are allocated first-come-first-served with no
+# registry. Two concurrent agents both claimed 357 once, and on 2026-08-07 two
+# more both claimed 363 (SYS_GFS_QUERY from the GraphFS work and
+# SYS_THEME_CONTRAST_CORRECTIONS from the themes work). The second collision made
+# dev unbuildable with a `duplicate case value` error, and it was found by an
+# unrelated agent trying to build, not by any gate.
+#
+# The compiler DOES catch it, but only at the dispatch switch, only if both
+# numbers reach a case label, and only after a full kernel build. This runs in
+# milliseconds and names both claimants.
+#
+# It also checks that userland/libc/syscall.h agrees with the kernel, because a
+# silent divergence there is worse than a collision: the call compiles on both
+# sides and invokes the WRONG HANDLER at runtime.
+#
+# Usage: syscall-number-gate [--root <repo>] [--self-test]
+set -euo pipefail
+
+ROOT=""
+SELFTEST=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --root) ROOT="${2:-}"; shift 2 ;;
+    --self-test) SELFTEST=1; shift ;;
+    *) echo "usage: $0 [--root <repo>] [--self-test]" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$ROOT" ]; then
+  HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  ROOT="$(cd "$HERE/../../.." && pwd)"
+fi
+
+# Fail closed: a gate that cannot read its input must never report success.
+# This exact bug shipped here once (#622), so it is checked rather than assumed.
+if [ ! -d "$ROOT" ]; then
+  echo "syscall-number-gate: --root '$ROOT' does not exist, refusing to report" >&2
+  exit 2
+fi
+
+KHDR="$ROOT/kernel/proc/syscall.h"
+UHDR="$ROOT/userland/libc/syscall.h"
+
+# SYS_MAX is a sentinel, not a syscall: it deliberately equals the highest
+# allocated number and would otherwise be a permanent false positive.
+# Anything else added here needs a written reason, not a quiet append.
+SENTINELS="SYS_MAX"
+
+extract() {
+  # name<TAB>number, decimal literals only. A #define whose value is an
+  # expression is not a plain allocation and is reported separately.
+  grep -hoE '^#define[[:space:]]+SYS_[A-Z_0-9]+[[:space:]]+[0-9]+' "$1" 2>/dev/null \
+    | awk '{print $2"\t"$3}' \
+    | grep -vE "^($(echo "$SENTINELS" | tr ' ' '|'))	" || true
+}
+
+fail=0
+
+for hdr in "$KHDR" "$UHDR"; do
+  [ -f "$hdr" ] || { echo "  FAIL  missing header: $hdr" >&2; fail=1; continue; }
+  n=$(extract "$hdr" | wc -l)
+  if [ "$n" -eq 0 ]; then
+    echo "  FAIL  no SYS_* numbers found in $hdr. Either the file moved or the" >&2
+    echo "        pattern changed and this gate has been checking nothing." >&2
+    fail=1
+    continue
+  fi
+  # Compare DISTINCT names per number. Two different names on one number is
+  # the collision that breaks the build. The same name defined twice with the
+  # same value is untidy, reported, and not fatal.
+  dupes=$(extract "$hdr" | sort -u | cut -f2 | sort -n | uniq -d)
+  redef=$(extract "$hdr" | cut -f1 | sort | uniq -d)
+  if [ -n "$redef" ]; then
+    for r in $redef; do
+      echo "  note  $r is #defined more than once in $(basename "$hdr") (same value; untidy, not fatal)"
+    done
+  fi
+  if [ -n "$dupes" ]; then
+    for d in $dupes; do
+      echo "  FAIL  syscall number $d is claimed by more than one name in $(basename "$hdr"):" >&2
+      extract "$hdr" | awk -v d="$d" -F'\t' '$2==d {print "          " $1}' >&2
+    done
+    fail=1
+  else
+    echo "  ok    $n syscall numbers unique in $(basename "$hdr")"
+  fi
+done
+
+# Cross-header agreement. A name defined on both sides must agree, or a call
+# compiles cleanly and dispatches to the wrong handler at runtime.
+if [ -f "$KHDR" ] && [ -f "$UHDR" ]; then
+  mismatch=0
+  while IFS=$'\t' read -r name num; do
+    unum=$(extract "$UHDR" | awk -v n="$name" -F'\t' '$1==n {print $2}' | sort -u)
+    # A name defined twice with the SAME value is untidy but harmless; two
+    # DIFFERENT values in one header is its own defect, so count distinct.
+    if [ "$(echo "$unum" | grep -c .)" -gt 1 ]; then
+      echo "  FAIL  $name has MORE THAN ONE value in userland: $(echo $unum | tr '\n' ' ')" >&2
+      mismatch=1
+      continue
+    fi
+    if [ -n "$unum" ] && [ "$unum" != "$num" ]; then
+      echo "  FAIL  $name is $num in the kernel but $unum in userland." >&2
+      echo "        A call to it would compile and dispatch to the WRONG handler." >&2
+      mismatch=1
+    fi
+  done < <(extract "$KHDR")
+  [ "$mismatch" = 0 ] && echo "  ok    every shared SYS_* name agrees across kernel and userland"
+  [ "$mismatch" = 1 ] && fail=1
+fi
+
+if [ "$SELFTEST" = 1 ]; then
+  echo
+  echo "=== self-test: the gate must go RED on a real collision ==="
+  tmp=$(mktemp -d)
+  trap 'rm -rf "$tmp"' EXIT
+  mkdir -p "$tmp/kernel/proc" "$tmp/userland/libc"
+  printf '#define SYS_ALPHA 10\n#define SYS_BETA 11\n#define SYS_MAX 11\n' > "$tmp/kernel/proc/syscall.h"
+  cp "$tmp/kernel/proc/syscall.h" "$tmp/userland/libc/syscall.h"
+  if "$0" --root "$tmp" >/dev/null 2>&1; then
+    echo "  GREEN ok   clean fixture passes"
+  else
+    echo "  SELFTEST FAIL: clean fixture did not pass" >&2; exit 1
+  fi
+  printf '#define SYS_ALPHA 10\n#define SYS_BETA 10\n#define SYS_MAX 10\n' > "$tmp/kernel/proc/syscall.h"
+  if "$0" --root "$tmp" >/dev/null 2>&1; then
+    echo "  SELFTEST FAIL: a duplicate number did NOT fail the gate" >&2; exit 1
+  else
+    echo "  RED   ok   duplicate number fails"
+  fi
+  printf '#define SYS_ALPHA 10\n#define SYS_BETA 11\n#define SYS_MAX 11\n' > "$tmp/kernel/proc/syscall.h"
+  printf '#define SYS_ALPHA 99\n' > "$tmp/userland/libc/syscall.h"
+  if "$0" --root "$tmp" >/dev/null 2>&1; then
+    echo "  SELFTEST FAIL: a kernel/userland mismatch did NOT fail the gate" >&2; exit 1
+  else
+    echo "  RED   ok   kernel/userland disagreement fails"
+  fi
+  if "$0" --root "$tmp/nonexistent" >/dev/null 2>&1; then
+    echo "  SELFTEST FAIL: a nonexistent root did NOT fail (gate can pass by scanning nothing)" >&2; exit 1
+  else
+    echo "  RED   ok   nonexistent root refuses to report"
+  fi
+  echo "  self-test: 4/4"
+fi
+
+exit "$fail"

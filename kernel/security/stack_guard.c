@@ -1,251 +1,123 @@
-// stack_guard.c - Stack Canary Protection implementation for MayteraOS
+// stack_guard.c - kernel stack canary protection for MayteraOS.
+// See stack_guard.h for the measured statement of what is live, and for the
+// list of zero-caller machinery deleted in the #646 honesty pass.
 #include "stack_guard.h"
-#include "aslr.h"
 #include "../serial.h"
-#include "../string.h"
-#include "../mm/vmm.h"
+#include "../fs/panic.h"
 
 // ============================================================================
 // Module State
 // ============================================================================
 
-// Global canary value (used by GCC's -fstack-protector)
+// Global canary value (used by GCC's -fstack-protector-strong).
 uint64_t __stack_chk_guard = STACK_CANARY_MAGIC;
 
-// Stack guard configuration
-static uint32_t g_stack_guard_flags = STACK_GUARD_DEFAULT;
 static bool g_stack_guard_initialized = false;
-static stack_overflow_handler_t g_overflow_handler = NULL;
-
-// Statistics
-static uint64_t g_stack_checks_performed = 0;
 static uint64_t g_stack_smashes_detected = 0;
-static uint64_t g_guard_pages_allocated = 0;
 
 // ============================================================================
 // Initialization
 // ============================================================================
 
+// #624 step 2. Until build 996 this function had no callers (it ran only from
+// security_init(), which itself had none), AND the kernel was compiled
+// -fno-stack-protector, so even a perfect canary would have been checked by
+// nothing. Both halves are now fixed: the Makefile builds with
+// -fstack-protector-strong -mstack-protector-guard=global, and this runs.
+//
+// MUST BE no_stack_protector, AND SO MUST EVERY FRAME LIVE BELOW IT.
+// GCC's epilogue RE-READS __stack_chk_guard and compares it against the copy
+// the prologue saved (verified in the emitted code: `mov __stack_chk_guard(%rip)`
+// on entry, `sub __stack_chk_guard(%rip)` on exit). Any protected function that
+// is already on the stack when the global changes will therefore compare an old
+// saved copy against the new global and trip a FALSE stack-smash panic. The
+// live chain at flip time is entry.asm -> kernel_main -> security_canary_init
+// -> here, so kernel_main and security_canary_init carry the same attribute.
+// Changing where this is called from means re-checking that chain.
+__attribute__((no_stack_protector))
 void stack_guard_init(void) {
-    kprintf("[STACK_GUARD] Initializing stack protection...\n");
+    extern uint64_t sec_canary_generate_rs(void);
+    extern uint32_t sec_entropy_source_rs(void);
 
-    // Generate a random canary value
-    uint64_t canary = stack_guard_generate_canary();
-    __stack_chk_guard = canary;
-
+    extern void sec_mark_canary_live_rs(void);
+    __stack_chk_guard = sec_canary_generate_rs();
+    sec_mark_canary_live_rs();
     g_stack_guard_initialized = true;
 
-    kprintf("[STACK_GUARD] Global canary set: 0x%016lx\n", __stack_chk_guard);
-    kprintf("[STACK_GUARD] Stack protection enabled with flags: 0x%x\n", g_stack_guard_flags);
-}
-
-// ============================================================================
-// Canary Generation
-// ============================================================================
-
-uint64_t stack_guard_generate_canary(void) {
-    uint64_t canary;
-
-    // Try to get random value from ASLR subsystem
-    canary = aslr_get_random();
-
-    // Apply protective characters in specific byte positions
-    // This makes it harder to exploit with string operations
-
-    uint8_t *bytes = (uint8_t *)&canary;
-
-    // Include a null terminator (byte 0)
-    // This stops string-based overflows
-    if (g_stack_guard_flags & STACK_GUARD_TERMINATOR) {
-        bytes[0] = STACK_CANARY_TERMINATOR;  // 0x00
-
-        // Also include newline and carriage return to catch line-based overflows
-        bytes[1] = STACK_CANARY_NEWLINE;     // 0x0A
-        bytes[7] = STACK_CANARY_CR;          // 0x0D
-    }
-
-    return canary;
-}
-
-uint64_t stack_guard_get_canary(void) {
-    return __stack_chk_guard;
-}
-
-// ============================================================================
-// Thread Stack Guard
-// ============================================================================
-
-void stack_guard_init_thread(stack_guard_t *guard, uint64_t stack_base, size_t stack_size) {
-    if (!guard) return;
-
-    // Generate per-thread canary if random canaries are enabled
-    if (g_stack_guard_flags & STACK_GUARD_RANDOM_CANARY) {
-        guard->canary = stack_guard_generate_canary();
-    } else {
-        guard->canary = __stack_chk_guard;
-    }
-
-    guard->stack_base = stack_base;
-    guard->stack_limit = stack_base - stack_size;
-    guard->guard_page = 0;
-    guard->guard_page_enabled = false;
-}
-
-bool stack_guard_check(const stack_guard_t *guard, const uint64_t *canary_location) {
-    g_stack_checks_performed++;
-
-    if (!guard || !canary_location) {
-        return false;
-    }
-
-    // Check if canary matches
-    if (*canary_location != guard->canary) {
-        g_stack_smashes_detected++;
-        return false;
-    }
-
-    return true;
+    static const char *const src[3] = { "TSC-JITTER (no RDRAND/RDSEED)",
+                                        "RDRAND", "RDSEED" };
+    uint32_t s = sec_entropy_source_rs();
+    kprintf("[CANARY] __stack_chk_guard = 0x%016lx (entropy: %s)\n",
+            __stack_chk_guard, src[s < 3 ? s : 0]);
 }
 
 // ============================================================================
 // Stack Smashing Handler
 // ============================================================================
 
-void stack_guard_fail(uint64_t fault_addr) {
-    g_stack_smashes_detected++;
-
-    // Disable interrupts to prevent further damage
-    cli();
-
-    kprintf("\n");
-    kprintf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
-    kprintf("!!!                    STACK SMASHING DETECTED                  !!!\n");
-    kprintf("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n");
-    kprintf("\n");
-    kprintf("  Fault address: 0x%016lx\n", fault_addr);
-    kprintf("  Canary value:  0x%016lx (expected)\n", __stack_chk_guard);
-    kprintf("\n");
-    kprintf("  This indicates a buffer overflow or stack corruption.\n");
-    kprintf("  The system will halt to prevent further damage.\n");
-    kprintf("\n");
-
-    // Call custom handler if set
-    if (g_overflow_handler) {
-        g_overflow_handler(0, "unknown", fault_addr);  // TODO: get actual pid/name
-    }
-
-    // Halt the system
-    kprintf("System halted.\n");
-    for (;;) {
-        hlt();
-    }
-}
-
-// GCC stack protector failure function
+// GCC stack protector failure function. THIS IS THE ONLY ENTRY POINT: with
+// -fstack-protector-strong every protected function's epilogue calls it on a
+// canary mismatch.
+//
+// #480/#624: routed through kpanic(), the ONE canonical fatal primitive, rather
+// than a private kprintf-and-spin loop. kpanic() logs to serial AND persists to
+// /PANIC.TXT, so a stack smash on real hardware leaves evidence behind instead
+// of a silent frozen screen.
+//
+// #646: the rival stack_guard_fail() that did the kprintf-and-spin is deleted.
+// One smash, one exit.
+__attribute__((no_stack_protector))
 void __stack_chk_fail(void) {
-    // Get approximate fault address from stack
     uint64_t rsp;
     __asm__ volatile("mov %%rsp, %0" : "=r"(rsp));
+    g_stack_smashes_detected++;
 
-    stack_guard_fail(rsp);
+    // __builtin_return_address(0) is the protected function that caught it,
+    // which is the single most useful thing to know: run it through addr2line.
+    kpanic("STACK SMASHING DETECTED: canary mismatch in caller %p (rsp=%p, "
+           "expected guard 0x%016llx). A kernel stack buffer was overflowed.",
+           __builtin_return_address(0), (void *)rsp, __stack_chk_guard);
 }
+
+#ifdef CANARY_SELFTEST
+// #624 step 2 PROOF-OF-FIRE. Armed only by `make CANARYTEST=1`, never in a
+// golden. Deliberately overflows a 16-byte stack buffer by 64 bytes so the
+// canary can be OBSERVED catching it. The length comes through a volatile
+// global specifically to defeat GCC's interprocedural constant propagation,
+// which would otherwise see the overflow at compile time and reject the build
+// under -Werror=array-bounds instead of letting it happen at runtime.
+volatile unsigned g_canary_overflow_len = 80;
+
+__attribute__((noinline))
+static void canary_victim(const volatile char *src, unsigned n) {
+    char buf[16];
+    for (unsigned i = 0; i < n; i++) buf[i] = src[i];
+    __asm__ volatile("" :: "r"(buf) : "memory");
+}
+
+void security_canary_selftest(void) {
+    volatile char pattern[96];
+    for (int i = 0; i < 96; i++) pattern[i] = (char)('A' + (i % 26));
+    kprintf("[CANARY-TEST] arming a deliberate 16-byte buffer overflow (+%u bytes)\n",
+            g_canary_overflow_len - 16);
+    kprintf("[CANARY-TEST] if the canary works, the NEXT line is a kpanic\n");
+    canary_victim(pattern, g_canary_overflow_len);
+    kprintf("[CANARY-TEST] *** FAILED *** overflow was NOT caught, canary is INERT\n");
+}
+#endif
 
 // ============================================================================
-// Configuration
-// ============================================================================
-
-void stack_guard_set_handler(stack_overflow_handler_t handler) {
-    g_overflow_handler = handler;
-}
-
-void stack_guard_set_flags(uint32_t flags) {
-    g_stack_guard_flags = flags;
-}
-
-uint32_t stack_guard_get_flags(void) {
-    return g_stack_guard_flags;
-}
-
-// ============================================================================
-// Guard Pages
-// ============================================================================
-
-int stack_guard_setup_page(uint64_t stack_bottom) {
-    // The guard page is at the very bottom of the stack
-    // We mark it as not present so any access causes a page fault
-    uint64_t guard_addr = ALIGN_DOWN(stack_bottom, PAGE_SIZE);
-
-    // Unmap the guard page (or mark as not present)
-    vmm_unmap_page(guard_addr);
-
-    g_guard_pages_allocated++;
-
-    kprintf("[STACK_GUARD] Guard page set up at 0x%lx\n", guard_addr);
-    return 0;
-}
-
-void stack_guard_remove_page(uint64_t stack_bottom) {
-    // Would need to remap the page - typically not done
-    // as guard pages remain until thread exits
-    (void)stack_bottom;
-}
-
-bool stack_guard_is_guard_page(uint64_t addr) {
-    // Check if address is in an unmapped guard page region
-    // This would need to track allocated guard pages
-    // For now, check if address is unmapped and in stack region
-    uint64_t page = ALIGN_DOWN(addr, PAGE_SIZE);
-    return !vmm_is_mapped(page);
-}
-
-// ============================================================================
-// Stack Usage Monitoring
-// ============================================================================
-
-size_t stack_guard_get_usage(const stack_guard_t *guard, uint64_t current_sp) {
-    if (!guard) return 0;
-
-    // Stack grows down, so usage = base - current_sp
-    if (current_sp >= guard->stack_base) {
-        return 0;  // Stack pointer above base (shouldn't happen)
-    }
-    if (current_sp < guard->stack_limit) {
-        return guard->stack_base - guard->stack_limit;  // Overflow
-    }
-
-    return guard->stack_base - current_sp;
-}
-
-uint32_t stack_guard_get_usage_percent(const stack_guard_t *guard, uint64_t current_sp) {
-    if (!guard) return 0;
-
-    size_t total = guard->stack_base - guard->stack_limit;
-    if (total == 0) return 0;
-
-    size_t used = stack_guard_get_usage(guard, current_sp);
-
-    return (uint32_t)((used * 100) / total);
-}
-
-bool stack_guard_near_overflow(const stack_guard_t *guard, uint64_t current_sp) {
-    return stack_guard_get_usage_percent(guard, current_sp) >= 90;
-}
-
-// ============================================================================
-// Debug / Info
+// Reporting
 // ============================================================================
 
 void stack_guard_print_info(void) {
-    kprintf("[STACK_GUARD] Stack Protection Status:\n");
-    kprintf("  Initialized:      %s\n", g_stack_guard_initialized ? "Yes" : "No");
+    kprintf("[STACK_GUARD] Stack protection posture (measured, #646):\n");
+    kprintf("  Compiler:         -fstack-protector-strong, guard=global\n");
+    kprintf("  Per-boot canary:  %s\n", g_stack_guard_initialized ? "installed" : "NOT INSTALLED");
     kprintf("  Global canary:    0x%016lx\n", __stack_chk_guard);
-    kprintf("  Flags:            0x%x\n", g_stack_guard_flags);
-    kprintf("    Random canary:  %s\n", (g_stack_guard_flags & STACK_GUARD_RANDOM_CANARY) ? "Yes" : "No");
-    kprintf("    Terminator:     %s\n", (g_stack_guard_flags & STACK_GUARD_TERMINATOR) ? "Yes" : "No");
-    kprintf("    Kernel stacks:  %s\n", (g_stack_guard_flags & STACK_GUARD_KERNEL) ? "Yes" : "No");
-    kprintf("    User stacks:    %s\n", (g_stack_guard_flags & STACK_GUARD_USER) ? "Yes" : "No");
-    kprintf("  Statistics:\n");
-    kprintf("    Checks:         %lu\n", g_stack_checks_performed);
-    kprintf("    Smashes:        %lu\n", g_stack_smashes_detected);
-    kprintf("    Guard pages:    %lu\n", g_guard_pages_allocated);
+    kprintf("  Smashes caught:   %lu\n", g_stack_smashes_detected);
+    kprintf("  Per-thread canary: not implemented\n");
+    kprintf("  Stack guard pages: not implemented\n");
+    kprintf("  User-stack canary: not implemented (Ring-3 apps carry their own,\n");
+    kprintf("                     built by the userland toolchain)\n");
 }

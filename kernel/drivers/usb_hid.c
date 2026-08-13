@@ -23,52 +23,28 @@ extern volatile int xhci_iso_quiet;
 volatile int usb_hid_report_log = 0;
 
 // =============================================================================
-// #307: HID usage code -> PS/2 set-1 scancode translation
+// #307/#763: HID usage code -> PS/2 set-1 scancode
 // =============================================================================
 // USB HID keyboards report boot-protocol "usage" codes. The rest of MayteraOS
 // consumes PS/2 set-1 scancodes (translated in cpu/isr.c). We convert here and
 // feed keyboard_process_scancode() so USB and PS/2 keyboards are identical to
-// every app/compositor downstream. Table maps HID usage (0x00-0x73) -> set-1
-// make code (0 == no mapping). Extended (0xE0-prefixed) keys handled separately.
-static const uint8_t hid_to_set1[0x74] = {
-    [0x04]=0x1E,[0x05]=0x30,[0x06]=0x2E,[0x07]=0x20,[0x08]=0x12,[0x09]=0x21,
-    [0x0A]=0x22,[0x0B]=0x23,[0x0C]=0x17,[0x0D]=0x24,[0x0E]=0x25,[0x0F]=0x26,
-    [0x10]=0x32,[0x11]=0x31,[0x12]=0x18,[0x13]=0x19,[0x14]=0x10,[0x15]=0x13,
-    [0x16]=0x1F,[0x17]=0x14,[0x18]=0x16,[0x19]=0x2F,[0x1A]=0x11,[0x1B]=0x2D,
-    [0x1C]=0x15,[0x1D]=0x2C,
-    [0x1E]=0x02,[0x1F]=0x03,[0x20]=0x04,[0x21]=0x05,[0x22]=0x06,[0x23]=0x07,
-    [0x24]=0x08,[0x25]=0x09,[0x26]=0x0A,[0x27]=0x0B,
-    [0x28]=0x1C,[0x29]=0x01,[0x2A]=0x0E,[0x2B]=0x0F,[0x2C]=0x39,
-    [0x2D]=0x0C,[0x2E]=0x0D,[0x2F]=0x1A,[0x30]=0x1B,[0x31]=0x2B,
-    [0x33]=0x27,[0x34]=0x28,[0x35]=0x29,[0x36]=0x33,[0x37]=0x34,[0x38]=0x35,
-    [0x39]=0x3A,
-    [0x3A]=0x3B,[0x3B]=0x3C,[0x3C]=0x3D,[0x3D]=0x3E,[0x3E]=0x3F,[0x3F]=0x40,
-    [0x40]=0x41,[0x41]=0x42,[0x42]=0x43,[0x43]=0x44,[0x44]=0x57,[0x45]=0x58,
-    [0x53]=0x45,   // Num Lock
-    [0x54]=0x35,   // Keypad / (approx)
-    [0x55]=0x37,   // Keypad *
-    [0x56]=0x4A,   // Keypad -
-    [0x57]=0x4E,   // Keypad +
-};
+// every app, the compositor and any DOS guest downstream.
+//
+// #763: the TABLE that does the converting used to live in this file, with a
+// byte-for-byte copy of it in bt/hid.c carrying a comment promising a merge.
+// Both are gone; the one table is rustkern/hidmap.rs and both drivers call it.
+// A copy with a note promising a merge is still a copy, and these two had
+// already drifted. They also shared two real bugs, fixed in the shared
+// version: keypad / was emitted as a BARE 0x35 (indistinguishable from the
+// main-block slash; it is E0 35 on real hardware), and the entire numeric
+// keypad, usages 0x59..0x63, was absent and emitted nothing at all.
+extern uint8_t hid_usage_to_set1_rs(uint8_t usage, uint8_t *out_ext);   // rustkern/hidmap.rs
+extern int     hidmap_selftest_rs(uint32_t *out_checks);                // rustkern/hidmap.rs
 
-// Extended (E0-prefixed) navigation keys: HID usage -> set-1 code.
-static uint8_t hid_ext_set1(uint8_t usage) {
-    switch (usage) {
-        case 0x49: return 0x52; // Insert
-        case 0x4A: return 0x47; // Home
-        case 0x4B: return 0x49; // Page Up
-        case 0x4C: return 0x53; // Delete
-        case 0x4D: return 0x4F; // End
-        case 0x4E: return 0x51; // Page Down
-        case 0x4F: return 0x4D; // Right
-        case 0x50: return 0x4B; // Left
-        case 0x51: return 0x50; // Down
-        case 0x52: return 0x48; // Up
-        case 0x58: return 0x1C; // Keypad Enter
-        default:   return 0x00;
-    }
-}
-
+// Emit one set-1 transition into the shared kernel scancode path. That path
+// (cpu/isr.c keyboard_process_scancode) is also where the DOS raw-scancode tap
+// lives, which is what makes a DOS guest work on a USB-keyboard machine at all
+// (#763); do not add a second, private route to the input ring here.
 static void emit_set1(uint8_t code, int extended, int pressed) {
     if (!code) return;
     if (extended) keyboard_process_scancode(0xE0);
@@ -80,24 +56,13 @@ static void emit_set1(uint8_t code, int extended, int pressed) {
 // HID usage code.
 static void hid_kernel_key_cb(uint8_t keycode, int pressed, uint8_t modifiers) {
     (void)modifiers;
-    if (keycode >= 0xE0 && keycode <= 0xE7) {
-        switch (keycode) {
-            case 0xE0: emit_set1(0x1D, 0, pressed); break; // Left Ctrl
-            case 0xE1: emit_set1(0x2A, 0, pressed); break; // Left Shift
-            case 0xE2: emit_set1(0x38, 0, pressed); break; // Left Alt
-            case 0xE3: emit_set1(0x5B, 1, pressed); break; // Left GUI
-            case 0xE4: emit_set1(0x1D, 1, pressed); break; // Right Ctrl
-            case 0xE5: emit_set1(0x36, 0, pressed); break; // Right Shift
-            case 0xE6: emit_set1(0x38, 1, pressed); break; // Right Alt (AltGr)
-            case 0xE7: emit_set1(0x5C, 1, pressed); break; // Right GUI
-        }
-        return;
-    }
-    uint8_t ext = hid_ext_set1(keycode);
-    if (ext) { emit_set1(ext, 1, pressed); return; }
-    if (keycode < sizeof(hid_to_set1)) {
-        emit_set1(hid_to_set1[keycode], 0, pressed);
-    }
+    // keycode 0xE0..0xE7 are the eight modifier bits, synthesised by
+    // usb_hid_process_keyboard() from the report's modifier byte; everything
+    // else is a usage from the report's keycode array. The shared translator
+    // handles both, so there is no modifier special case here any more.
+    uint8_t ext = 0;
+    uint8_t code = hid_usage_to_set1_rs(keycode, &ext);
+    emit_set1(code, ext, pressed);
 }
 
 // =============================================================================
@@ -134,6 +99,12 @@ void usb_hid_init(void) {
     memset(hid_devices, 0, sizeof(hid_devices));
     // #307: route USB keyboard transitions into the shared kernel input path.
     global_key_callback = hid_kernel_key_cb;
+    // #763: prove the ONE usage->set-1 table on THIS build before a key is
+    // pressed. A wrong entry is otherwise only visible as "that key does
+    // nothing", which is exactly how the keypad stayed broken.
+    { uint32_t checks = 0; int fails = hidmap_selftest_rs(&checks);
+      kprintf("[HIDMAP] usage->set1 selftest: %u checks, %d failures\n", checks, fails);
+      bootlog_write("[HIDMAP] usage->set1 selftest: %u checks, %d failures", checks, fails); }
 }
 
 // =============================================================================

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // signal.h - POSIX signals for MayteraOS userland
 #ifndef LIBC_SIGNAL_H
 #define LIBC_SIGNAL_H

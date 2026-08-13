@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // termios.c - POSIX terminal control wrappers
 #include "termios.h"
 #include "syscall.h"

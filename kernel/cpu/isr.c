@@ -4,6 +4,8 @@
 #include "pic.h"
 #include "../serial.h"
 #include "../proc/process.h"
+#include "../drivers/keymod.h"   // KEY_MOD_*: one definition, shared with drivers/keyboard.h
+#include "../sync/spinlock.h"  // shared lock primitive: the DOS tap now has >1 writer
 
 // Timer tick count
 volatile uint64_t timer_ticks = 0;
@@ -17,6 +19,16 @@ static char keyboard_buffer[KEYBOARD_BUFFER_SIZE];
 static volatile uint16_t kb_read_idx = 0;
 static volatile uint16_t kb_write_idx = 0;
 
+// #334: total cooked keys drained by keyboard_get_char(), so the serial test-
+// input channel can confirm an injected key was actually CONSUMED, not just
+// queued. Monotonic; harmless to wrap.
+volatile uint64_t g_kbd_consumed = 0;
+
+// #334: raw scancode BYTES seen by the IRQ1 handler at port 0x60. If this does
+// not advance under qm sendkey, QEMU never delivered the scancode (the drop is
+// QEMU-side, not in our ring).
+volatile uint64_t g_kbd_irq_scancodes = 0;
+
 // ---- Raw scancode tap (#202 DOS games) -----------------------------------
 // When a DOS task (dos/dosexec.c) is running it sets g_dos_scancode_tap=1.
 // The keyboard ISR then mirrors every RAW scancode byte (press, release, and
@@ -28,9 +40,56 @@ static volatile uint16_t kb_write_idx = 0;
 volatile int      g_dos_scancode_tap = 0;
 static volatile uint8_t  dos_sc_ring[DOS_SC_RING];
 static volatile uint16_t dos_sc_rd = 0, dos_sc_wr = 0;
-static inline void dos_sc_push(uint8_t b) {
+// #763: the ring used to have exactly ONE producer (the IRQ1 ISR), so an
+// unlocked SPSC push was sound. It now has several (see dos_scancode_tap
+// below), and a producer running in a thread can be preempted mid-push by the
+// IRQ1 ISR producing on the same ring. Guard the WRITE side only: the reader
+// (dos_scancode_get, called from the DOS interpreter thread) is still the sole
+// consumer, so reader-vs-writer stays exactly the SPSC pairing it always was.
+// The critical section is four instructions and never sleeps.
+static spinlock_t dos_sc_lock = SPINLOCK_INIT_NAMED("dos_sc_ring");
+static void dos_sc_push(uint8_t b) {
+    uint64_t fl = spinlock_acquire_irqsave(&dos_sc_lock);
     uint16_t nx = (uint16_t)((dos_sc_wr + 1) % DOS_SC_RING);
     if (nx != dos_sc_rd) { dos_sc_ring[dos_sc_wr] = b; dos_sc_wr = nx; }
+    spinlock_release_irqrestore(&dos_sc_lock, fl);
+}
+
+// #763: THE ONE PLACE A SET-1 SCANCODE BYTE ENTERS THE DOS TAP.
+//
+// It used to be a single call inside keyboard_handler(), the PS/2 IRQ1 ISR,
+// and that was the whole bug: on any machine whose keyboard is USB (which is
+// EVERY real iMac, and the #307 target) IRQ1 never fires, so nothing ever
+// pushed and every DOS guest waited forever for a key. Not just guests with
+// their own INT 9 handler either: dos_keyq_pump() fills the guest's BDA
+// keyboard ring from this same tap, so INT 16h, the INT 21h console input
+// group and a direct BDA read were ALL dead on a USB keyboard.
+//
+// The fix is not "call it from usb_hid.c too", which would have left the
+// Bluetooth HID path (bt/hid.c) and the #334 test-input channel broken in
+// exactly the same way and invited a fourth copy. It is called from
+// keyboard_process_scancode(), which is ALREADY the single function every
+// scancode source in the kernel funnels through:
+//
+//   cpu/isr.c        keyboard_handler()      real PS/2 IRQ1
+//   cpu/isr.c        keyboard_poll_i8042()   polled i8042 (early boot, IF=0)
+//   drivers/usb_hid.c emit_set1()            USB HID keyboards
+//   bt/hid.c          emit_set1()            Bluetooth HID keyboards
+//   drivers/testinput.c                      the #334 host->guest test channel
+//
+// so a DOS guest now sees keys from all five, and any SIXTH source added later
+// is tapped by construction rather than by someone remembering.
+//
+// THE CONTROLLER STATUS-BYTE FILTER IS NOT DUPLICATED HERE ON PURPOSE. 0xFA
+// (ACK), 0xFE (resend), 0xFC/0x00/0xFF (self-test / error / overrun) and 0xEE
+// (echo) are i8042 CONTROLLER responses, not scancodes; they cannot occur on
+// the USB or Bluetooth paths at all. keyboard_process_scancode() already
+// drops them at its top, and this is called AFTER that early return, so the
+// bytes reaching the tap are byte-identical to what the PS/2 path pushed
+// before this change, with one filter in the kernel instead of two copies.
+static void dos_scancode_tap(uint8_t b) {
+    if (!g_dos_scancode_tap) return;
+    dos_sc_push(b);
 }
 // Drain one raw scancode byte. Returns -1 if empty.
 int dos_scancode_get(void) {
@@ -63,6 +122,48 @@ static const char scancode_to_ascii_shift[128] = {
     0,    0,   0,   0,   0,   0,   0,   0,   0,
 };
 
+// ---------------------------------------------------------------------------
+// The two shared keyboard primitives. drivers/keyboard.h has DECLARED both
+// since the driver was written and NOTHING EVER DEFINED THEM, so the first
+// caller to use one got a link error rather than a working function. That is
+// why the tables above have no other consumer: everything that needed a
+// scancode-to-character mapping had no shared one to call.
+//
+// They are defined HERE, in the same translation unit as the tables and the
+// modifier state, so a caller can never see a keymap that disagrees with the
+// one the ISR itself uses. Declared in drivers/keyboard.h; the forward
+// declarations of the statics below keep them where they already are.
+// ---------------------------------------------------------------------------
+static volatile uint8_t shift_pressed;
+static volatile uint8_t ctrl_pressed;
+static volatile uint8_t alt_pressed;
+static volatile uint8_t caps_lock;
+
+char keyboard_scancode_to_char(uint8_t scancode, uint32_t modifiers) {
+    if (scancode >= 128) return 0;
+    char c = (modifiers & KEY_MOD_SHIFT) ? scancode_to_ascii_shift[scancode]
+                                         : scancode_to_ascii[scancode];
+    if ((modifiers & KEY_MOD_CAPS) && c >= 'a' && c <= 'z')
+        c = (char)(c - 'a' + 'A');
+    else if ((modifiers & KEY_MOD_CAPS) && (modifiers & KEY_MOD_SHIFT) &&
+             c >= 'A' && c <= 'Z')
+        c = (char)(c - 'A' + 'a');
+    if (modifiers & KEY_MOD_CTRL) {
+        if (c >= 'a' && c <= 'z')      c = (char)(c - 'a' + 1);
+        else if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 1);
+    }
+    return c;
+}
+
+uint32_t keyboard_get_modifiers(void) {
+    uint32_t m = 0;
+    if (shift_pressed) m |= KEY_MOD_SHIFT;
+    if (ctrl_pressed)  m |= KEY_MOD_CTRL;
+    if (alt_pressed)   m |= KEY_MOD_ALT;
+    if (caps_lock)     m |= KEY_MOD_CAPS;
+    return m;
+}
+
 // Modifier key states
 static volatile uint8_t shift_pressed = 0;
 static volatile uint64_t shift_press_tick = 0;  // tick when shift was last pressed
@@ -89,6 +190,9 @@ static volatile uint8_t extended_scancode = 0;  // For 0xE0 extended keys
 #define KEY_F10     0x87
 #ifndef KEY_F6
 #define KEY_F6      0x8A
+#endif
+#ifndef KEY_SUPER
+#define KEY_SUPER   0x9B
 #endif
 
 // #525 DIAGNOSTIC: measure how fast ticks are actually DELIVERED, in real time.
@@ -157,6 +261,14 @@ void keyboard_process_scancode(uint8_t scancode) {
         return;
     }
 
+    // Raw scancode tap for DOS guests (#202, fixed for non-PS/2 keyboards by
+    // #763). Mirror every byte VERBATIM, including 0xE0 extended prefixes and
+    // release codes, before the cooked translation below: the DOS layer
+    // replays these through the guest's INT 9 and fills its BDA key ring from
+    // them. This is a MIRROR with no other consumer, so the guest does not
+    // race the desktop for a keystroke.
+    dos_scancode_tap(scancode);
+
     // Handle extended scancode prefix (0xE0)
     if (scancode == 0xE0) {
         extended_scancode = 1;
@@ -173,9 +285,16 @@ void keyboard_process_scancode(uint8_t scancode) {
             char c = 0;
             switch (key) {
                 case 0x48: c = KEY_UP + 0x10; break;    // Up release
-                case 0x50: c = KEY_DOWN + 0x10; break;  // Down release  
+                case 0x50: c = KEY_DOWN + 0x10; break;  // Down release
                 case 0x4B: c = KEY_LEFT + 0x10; break;  // Left release
                 case 0x4D: c = KEY_RIGHT + 0x10; break; // Right release
+                // (Word6 divergence catalog #2, Alt-menu) Right Alt/AltGr
+                // (HID 0xE6) and real PS/2 Right Alt both arrive as extended
+                // (0xE0-prefixed) scancode 0x38, same byte as Left Alt's
+                // non-extended release below. Route both to the same
+                // KEY_ALT_UP so either Alt key drives WM_SYSKEYUP/menu-mnemonic
+                // gating in exec/win16api.c.
+                case 0x38: c = KEY_ALT_UP; break;       // Right Alt release
             }
             if (c != 0) {
                 uint16_t next_write = (kb_write_idx + 1) % KEYBOARD_BUFFER_SIZE;
@@ -204,6 +323,22 @@ void keyboard_process_scancode(uint8_t scancode) {
             }
         } else if (key == 0x38) {
             alt_pressed = 0;    // Alt released
+            // (Word6 divergence catalog #2, Alt-menu, ROOT CAUSE part 1) This
+            // used to ONLY clear the local `alt_pressed` flag, which is a
+            // file-static variable with ZERO external readers (grepped this
+            // file: nothing outside keyboard_process_scancode ever reads it).
+            // So Alt release was completely invisible to every consumer,
+            // including exec/win16api.c: Alt was never tracked as a modifier
+            // at all, and every Alt-chord degraded to a plain character
+            // keystroke (Alt+F typed "f" into the document instead of opening
+            // the File menu). Push KEY_ALT_UP exactly like Ctrl does above so
+            // win16api.c can see real Alt up/down transitions.
+            char c = KEY_ALT_UP;
+            uint16_t next_write = (kb_write_idx + 1) % KEYBOARD_BUFFER_SIZE;
+            if (next_write != kb_read_idx) {
+                keyboard_buffer[kb_write_idx] = c;
+                kb_write_idx = next_write;
+            }
         } else {
             // Regular key release - convert scancode to ASCII, then add release bit
             if (key < 128) {
@@ -234,12 +369,17 @@ void keyboard_process_scancode(uint8_t scancode) {
         // Key press
         if (extended_scancode) {
             // Extended key - arrow keys plus the cursor-editing extended
-            // keys (#299). Arrows are remapped to KEY_UP/DOWN/LEFT/RIGHT
-            // (0x80-0x83); Home/End/Delete/PgUp/PgDn/Insert are forwarded as
-            // their raw PS/2 make codes, which is exactly what the shared libc
-            // textfield.h cursor helper expects (Home=0x47, End=0x4F,
-            // Delete=0x53, PgUp=0x49, PgDn=0x51, Insert=0x52). These values are
-            // all below 0x80 so they do not collide with the KEY_* range.
+            // keys (#299), plus the Super/GUI/Windows key (#552). Arrows are
+            // remapped to KEY_UP/DOWN/LEFT/RIGHT (0x80-0x83); Home/End/Delete/
+            // PgUp/PgDn/Insert are forwarded as their raw PS/2 make codes,
+            // which is exactly what the shared libc textfield.h cursor helper
+            // expects (Home=0x47, End=0x4F, Delete=0x53, PgUp=0x49, PgDn=0x51,
+            // Insert=0x52). These values are all below 0x80 so they do not
+            // collide with the KEY_* range. Left GUI (0x5B) and Right GUI
+            // (0x5C) both map to KEY_SUPER: real PS/2 hardware sends these
+            // set-1 extended make codes directly, and usb_hid.c's HID usage
+            // 0xE3/0xE7 -> set-1 0x5B/0x5C translation (emit_set1) feeds the
+            // exact same path, so one switch case covers both keyboard types.
             char c = 0;
             switch (scancode) {
                 case 0x48: c = KEY_UP; break;
@@ -252,6 +392,18 @@ void keyboard_process_scancode(uint8_t scancode) {
                 case 0x49: c = 0x49; break;  // Page Up
                 case 0x51: c = 0x51; break;  // Page Down
                 case 0x52: c = 0x52; break;  // Insert
+                case 0x5B: c = KEY_SUPER; break;  // Left GUI/Windows/Command
+                case 0x5C: c = KEY_SUPER; break;  // Right GUI/Windows/Command
+                // #763: the two keypad keys that are E0-prefixed on real set-1
+                // hardware. Neither had a case, so keypad Enter and keypad /
+                // produced NOTHING on this desktop, for PS/2 keyboards as much
+                // as USB ones. Map them to the same characters as their main
+                // block twins, which is what every other OS does.
+                case 0x1C: c = '\n'; break;      // Keypad Enter
+                case 0x35: c = '/';  break;      // Keypad /
+                // (Word6 divergence catalog #2, Alt-menu) Right Alt/AltGr: see
+                // the matching comment on the release switch above.
+                case 0x38: c = KEY_ALT; break;    // Right Alt press
             }
             extended_scancode = 0;
 
@@ -283,6 +435,17 @@ void keyboard_process_scancode(uint8_t scancode) {
             }
         } else if (scancode == 0x38) {
             alt_pressed = 1;    // Alt pressed
+            // (Word6 divergence catalog #2, Alt-menu, ROOT CAUSE part 2) Push
+            // KEY_ALT so exec/win16api.c can translate it to real VK_MENU and
+            // generate WM_SYSKEYDOWN/WM_SYSCHAR (not WM_KEYDOWN/WM_CHAR) while
+            // Alt is held, and drive Alt+mnemonic menu access. See the release
+            // branch above for why this was previously a silent no-op.
+            char c = KEY_ALT;
+            uint16_t next_write = (kb_write_idx + 1) % KEYBOARD_BUFFER_SIZE;
+            if (next_write != kb_read_idx) {
+                keyboard_buffer[kb_write_idx] = c;
+                kb_write_idx = next_write;
+            }
         } else if (scancode == 0x3F) {
             // F5 key pressed
             char c = KEY_F5;
@@ -421,22 +584,20 @@ void keyboard_process_scancode(uint8_t scancode) {
     }
 }
 
-// Real PS/2 keyboard IRQ1 handler: read the byte, mirror it to the DOS raw tap,
-// run the shared scancode processor, then acknowledge the PIC.
+// Real PS/2 keyboard IRQ1 handler: read the byte, run the shared scancode
+// processor, then acknowledge the PIC.
+//
+// #763: this used to mirror the byte into the DOS tap itself, behind its own
+// copy of the controller-status-byte filter. Both moved into
+// keyboard_process_scancode(), which every keyboard source already calls, so
+// a USB or Bluetooth keyboard feeds a DOS guest too. The bytes this path puts
+// in the tap, and their order, are unchanged.
 static void keyboard_handler(interrupt_frame_t *frame) {
     (void)frame;
 
     // Read scancode from keyboard controller
     uint8_t scancode = inb(0x60);
-
-    // Raw scancode tap for DOS games (#202). Mirror every byte verbatim,
-    // including 0xE0 extended prefixes and release codes, before the normal
-    // ASCII translation below. The DOS layer replays these via the guest INT 9.
-    if (g_dos_scancode_tap) {
-        if (scancode != 0xFA && scancode != 0xFE && scancode != 0xFC &&
-            scancode != 0x00 && scancode != 0xFF && scancode != 0xEE)
-            dos_sc_push(scancode);
-    }
+    g_kbd_irq_scancodes++;   // #334 delivery instrument
 
     keyboard_process_scancode(scancode);
 
@@ -445,6 +606,43 @@ static void keyboard_handler(interrupt_frame_t *frame) {
 }
 
 // Check if keyboard has a character
+// #616: POLLED i8042 drain, for contexts that run with interrupts DISABLED.
+//
+// keyboard_has_char() below reads a ring buffer that ONLY keyboard_handler()
+// (the IRQ1 ISR) fills, so it is permanently false anywhere RFLAGS.IF == 0.
+// The whole early-boot window is such a context: main() does not sti() until
+// long after the filesystem check, so the boot fsck's "press ESC to skip"
+// prompt polled a buffer nothing could ever write to.
+//
+// The failure was doubly silent, and worth understanding before adding any
+// other early-boot prompt. The i8042 output buffer holds exactly ONE byte:
+// with nothing reading port 0x60, the first keypress latches in OBF and the
+// controller then DROPS every subsequent scancode. So the prompt produced no
+// effect AND no side effect no matter how many times the key was pressed
+// (measured: 40 ESC presses over the check window, zero response), which reads
+// exactly like a key-delivery problem and is not one.
+//
+// This drains pending bytes by hand and feeds them through the SAME scancode
+// state machine and the SAME cooked ring buffer the ISR uses, so
+// keyboard_has_char()/keyboard_get_char() keep working unchanged and no second,
+// divergent keyboard path exists. keyboard_process_scancode() calls no other
+// function and touches only this file's statics, so it is safe with interrupts
+// in any state; a byte consumed here is simply one the ISR never sees.
+//
+// BOUNDED (#426): at most KBD_POLL_DRAIN_MAX bytes per call, so a wedged
+// controller that permanently asserts OBF degrades to "we read 32 bytes and
+// move on", never to a hang.
+#define KBD_POLL_DRAIN_MAX 32
+void keyboard_poll_i8042(void) {
+    for (int i = 0; i < KBD_POLL_DRAIN_MAX; i++) {
+        uint8_t st = inb(0x64);
+        if (!(st & 0x01)) return;      // OBF clear: nothing pending
+        uint8_t data = inb(0x60);
+        if (st & 0x20) continue;       // bit 5 = AUX: a mouse byte, not ours
+        keyboard_process_scancode(data);
+    }
+}
+
 int keyboard_has_char(void) {
     return kb_read_idx != kb_write_idx;
 }
@@ -459,7 +657,29 @@ int keyboard_get_char(void) {
     // Return as unsigned to preserve KEY_UP etc values
     int c = (unsigned char)keyboard_buffer[kb_read_idx];
     kb_read_idx = (kb_read_idx + 1) % KEYBOARD_BUFFER_SIZE;
+    g_kbd_consumed++;   // #334: an injected or real key was actually CONSUMED
     return c;
+}
+
+// #334: current occupancy of the cooked-key ring (queued but not yet drained).
+int keyboard_buffer_depth(void) {
+    return (int)((kb_write_idx - kb_read_idx + KEYBOARD_BUFFER_SIZE) % KEYBOARD_BUFFER_SIZE);
+}
+
+// #334: reverse of the scancode->ASCII tables so the serial test-input channel
+// can TYPE a string by synthesizing set-1 scancodes through the identical
+// keyboard_process_scancode() path the PS/2 IRQ uses. Reuses the SAME tables as
+// the forward path so the two can never drift. Returns the set-1 scancode and
+// sets *need_shift, or -1 if the char is not typeable from these tables.
+int keyboard_ascii_to_scancode(char c, int *need_shift) {
+    for (int sc = 0; sc < 128; sc++) {
+        if (scancode_to_ascii[sc] == c) { if (need_shift) *need_shift = 0; return sc; }
+    }
+    for (int sc = 0; sc < 128; sc++) {
+        if (scancode_to_ascii_shift[sc] == c) { if (need_shift) *need_shift = 1; return sc; }
+    }
+    if (need_shift) *need_shift = 0;
+    return -1;
 }
 
 // Clear interrupt flag

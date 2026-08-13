@@ -3,7 +3,7 @@ CC = gcc
 AR = ar
 LIBC_DIR = ../libc
 
-CFLAGS = -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone -msse -msse2 \
+CFLAGS = -ffreestanding -fstack-protector-strong -mstack-protector-guard=global -fno-pic -mno-red-zone -msse -msse2 \
          -nostdlib -nostdinc -fno-builtin -O2 -g -mcmodel=large -fno-pie \
          -DNO_DEBUG_OUTPUT -DNDEBUG \
          -I. -Iinclude -I$(LIBC_DIR) -isystem /usr/lib/gcc/x86_64-linux-gnu/12/include

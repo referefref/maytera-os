@@ -4,6 +4,7 @@
 // MayteraOS kernel. It supports loading standard ELF64 executables and
 // position-independent executables (PIE) for x86_64 architecture.
 
+#include "../security/aslr.h"
 #include "elf.h"
 #include "../types.h"
 #include "../serial.h"
@@ -11,6 +12,8 @@
 #include "../mm/vmm.h"
 #include "../mm/pmm.h"
 #include "../string.h"
+#include "../security/uaccess_smap.h"  // #19/#645: AC bracket for the two foreign-CR3 user writes
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // ============================================================================
 // Constants
@@ -32,10 +35,71 @@
 // 0x80000000 - just offset from it so a PIE image's own layout is visibly
 // distinct. See the elf_load_user() comment at its use site for why the
 // previous choice (USER_SPACE_START, 4MB) silently faulted on first write.
-#define PIE_USER_BASE       0x90000000ULL  // 2.25GB - within PDPT[2]
+#define PIE_USER_BASE_LEGACY 0x90000000ULL  // 2.25GB - within PDPT[2]. RETIRED, see below.
+
+// ===========================================================================
+// #640 stage 2: PIE images load in the DEDICATED USERLAND WINDOW, at
+// USER_WIN_IMAGE_BASE (mm/vmm.h) = 512GB, NOT at the 0x90000000 above.
+//
+// 0x90000000 was never a safe address and the comment above it, written for
+// #427, is now known to be wrong in the one way that matters. MEASURED on the
+// user's iMac14,4: the firmware's GOP framebuffer is at 0x90000000. That single
+// address was simultaneously this PIE base AND libc's old HEAP_START, which is
+// most of what #522/#650 are about. The 2-3GB window holds device MMIO whose
+// address is chosen by FIRMWARE, so no layout that assumes any address in it is
+// correct; #511 also pre-fills that window with identity huge pages, which is
+// its own hazard for anything mapped there.
+//
+// USER_WIN_IMAGE_BASE is the stage-5 slot of the window #522 stage 0 created,
+// in PML4[1], which the kernel's own address space leaves ABSENT. Stages 0, 2
+// and 3 (window, mmap arena, libc heap) are already shipped and proven, so this
+// is moving into a room that is already furnished, not opening a new one.
+// USER_WIN_HEAP_BASE sits 1GB above the image base; the largest image in the
+// tree is ~13MB, and ELF_USER_IMAGE_MAX_SPAN caps it at 256MB, so they cannot
+// collide.
+// ===========================================================================
+#define PIE_USER_BASE       USER_WIN_IMAGE_BASE
 
 // Page size for alignment calculations
 #define ELF_PAGE_SIZE       4096ULL
+
+// ===========================================================================
+// #633: the address window a FIXED-BASE (ET_EXEC) user image may declare.
+//
+// USER_SPACE_START (4MB) / USER_SPACE_END (128TB) are the bounds of the whole
+// lower half. They are NOT a policy: an ET_EXEC that declares p_vaddr =
+// 0x400000 (what `ld` emits when an app Makefile forgets -T user.ld) passed
+// that check and then took the loader into memory the fresh address space
+// still carries KERNEL mappings for, which is how an unprivileged Ring 3
+// launch could panic Ring 0.
+//
+// The real policy is narrow and is what every correctly-linked app already
+// satisfies: the image lives in the userland window user.ld targets. MEASURED
+// 2026-08-03 on the repo tree: 42 of 43 built app binaries are single-PT_LOAD
+// ET_EXEC at exactly 0x80000000; the one exception (hello) is the #633 bug
+// itself. Nothing legitimate is anywhere else, so this window costs nothing.
+//
+// #640 stage 3 tightens this further: once apps are PIE the kernel picks the
+// base and a self-declared fixed base is refused outright, because honouring
+// one would leave binaries in the identity/MMIO region we are vacating.
+// ===========================================================================
+// The LEGACY window: where every fixed-base (ET_EXEC) app still lives. This is
+// also the reserved identity/MMIO window, which is exactly why #640 is moving
+// userland out of it. Once the fleet is PIE, a self-declared base in here is
+// REJECTED outright (stage 3) rather than merely tolerated, because honouring
+// one would leave binaries in the region being vacated.
+#define ELF_USER_IMAGE_MIN  0x80000000ULL   // 2GB, the user.ld base
+#define ELF_USER_IMAGE_MAX  0xC0000000ULL   // 3GB, end of the PDPT[2] window
+
+// The DESTINATION window for position-independent images (#640 stage 2).
+#define ELF_USER_WIN_MIN    USER_WIN_BASE   // 512GB, PML4[1]
+#define ELF_USER_WIN_MAX    USER_WIN_END    // 768GB
+
+// Largest total virtual span (lowest..highest PT_LOAD page) a single user
+// image may declare. Without this, an ELF with two PT_LOADs a terabyte apart
+// asks the loader for a terabyte of page tables: an unprivileged OOM/DoS.
+// The largest real image in the tree is ASSAULTCUBE at ~13MB.
+#define ELF_USER_IMAGE_MAX_SPAN (256ULL * 1024 * 1024)
 
 // ============================================================================
 // Error Messages
@@ -56,6 +120,8 @@ static const char *elf_error_messages[] = {
     "Segment offset/size overflow",             // ELF_ERR_SEGMENT_OVERFLOW (-11)
     "Memory allocation failed",                 // ELF_ERR_ALLOC_FAILED (-12)
     "Failed to load segment",                   // ELF_ERR_LOAD_FAILED (-13)
+    "Load address outside the userland image window",  // ELF_ERR_BAD_LOAD_ADDR (-14)
+    "Load destination not mapped writable",     // ELF_ERR_DEST_NOT_WRITABLE (-15)
 };
 
 #define ELF_ERROR_COUNT (sizeof(elf_error_messages) / sizeof(elf_error_messages[0]))
@@ -129,6 +195,47 @@ static inline uint64_t align_down(uint64_t value, uint64_t alignment) {
         return value;
     }
     return value & ~(alignment - 1);
+}
+
+// Defined with the self-tests further down; declared here so the loader can
+// time itself with the SAME primitive the benchmarks use rather than growing a
+// second copy of rdtsc.
+static inline uint64_t elf_tsc_serialized(void);
+
+// ===========================================================================
+// #633: the loader dereferences user virtual addresses at CPL 0 with CR3
+// temporarily pointed at the target address space (segment copies, relocation
+// fix-ups). With CR0.WP set, a supervisor write to a page that is not mapped
+// WRITABLE is a #PF, and a #PF taken in that window is a KERNEL page fault:
+// the process cannot be blamed, so it panics. That is how a Ring 3 launch of a
+// malformed ELF took down Ring 0.
+//
+// Returns true only if EVERY page of [va, va+len) is present, user-accessible
+// AND writable in the address space rooted at pml4_phys. vmm_get_effective_flags_in
+// (not vmm_get_physical_in) is used deliberately: it ANDs U/S and R/W across
+// all four levels, which is the only computation that matches what the CPU
+// will do when the write actually happens.
+// ===========================================================================
+static bool elf_user_range_writable(uint64_t pml4_phys, uint64_t va, uint64_t len) {
+    if (len == 0) {
+        return true;
+    }
+    if (va + len < va) {            // wrap
+        return false;
+    }
+    const uint64_t need = VMM_FLAG_PRESENT | VMM_FLAG_USER | VMM_FLAG_WRITABLE;
+    uint64_t page = align_down(va, ELF_PAGE_SIZE);
+    uint64_t last = align_down(va + len - 1, ELF_PAGE_SIZE);
+    for (;;) {
+        if ((vmm_get_effective_flags_in(pml4_phys, page) & need) != need) {
+            return false;
+        }
+        if (page == last) {
+            break;
+        }
+        page += ELF_PAGE_SIZE;
+    }
+    return true;
 }
 
 // ============================================================================
@@ -281,44 +388,133 @@ typedef struct {
     bool is_user;
     uint64_t pml4_phys;    // valid if is_user
     uint8_t *kernel_base;  // valid if !is_user: backing memory for the image
+    uint64_t kernel_size;  // valid if !is_user: byte size of kernel_base (#633)
 } elf_reloc_target_t;
 
-static void elf_reloc_write64(const elf_reloc_target_t *tgt, uint64_t r_offset,
-                               uint64_t relocation_offset, uint64_t low_addr,
-                               uint64_t value) {
-    if (tgt->is_user) {
-        uint64_t dest_vaddr = r_offset + relocation_offset;
-        uint64_t old_cr3, rflags;
-        __asm__ volatile("pushfq; pop %0" : "=r"(rflags) :: "memory");
-        __asm__ volatile("cli");
-        __asm__ volatile("mov %%cr3, %0" : "=r"(old_cr3));
-        __asm__ volatile("mov %0, %%cr3" : : "r"(tgt->pml4_phys) : "memory");
-        *(volatile uint64_t *)dest_vaddr = value;
-        __asm__ volatile("mov %0, %%cr3" : : "r"(old_cr3) : "memory");
-        __asm__ volatile("push %0; popfq" : : "r"(rflags) : "cc", "memory");
-    } else {
-        uint64_t dest_off = r_offset - low_addr;
-        *(uint64_t *)(tgt->kernel_base + dest_off) = value;
-    }
-}
+// ===========================================================================
+// #640 stage 2b: BATCHED relocation writes.
+//
+// These two writers used to do, PER 8-BYTE STORE: pushfq, cli, save CR3, load
+// the target CR3, store, restore CR3, popfq. Writing CR3 flushes the entire
+// TLB, so that is TWO FULL TLB FLUSHES PER RELOCATION.
+//
+// MEASURED (VM2641, golden 998, kernel-only replacement): a PIE HEAPTEST with
+// 743 relocations spent ~6.6M cycles in the relocation phase against ~2.1M for
+// the same app built fixed-base with zero relocations, i.e. ~6,100 cycles to
+// write eight bytes, 1,486 TLB flushes for one 53KB utility. The #633
+// writability walk was suspected and exonerated: removing it entirely produced
+// a number INSIDE the run-to-run spread of the unmodified build.
+//
+// The fix is the pattern the segment copier twenty lines away has always used:
+// ONE interrupt-safe foreign-CR3 window around a BOUNDED batch of work, not one
+// window per unit. Values are computed and destinations verified with the
+// normal CR3 in place; then a single window applies up to ELF_RELOC_BATCH
+// stores. Interrupt latency stays bounded by the batch size, exactly as the
+// copier bounds it by the 64KB chunk.
+//
+// SAFETY OF REORDERING: batching would be wrong if one relocation's result were
+// an input to another's. It is not. Every value comes from the FILE (r_addend,
+// or for Elf64_Rel the implicit addend read from the file image via
+// elf_vaddr_to_fileptr) plus the symbol table, never from the loaded image, so
+// no entry reads a location another entry writes. Two entries targeting the
+// same address still resolve in table order within a batch.
+// ===========================================================================
+// 64 entries * 24 bytes = 1.5KB of kernel stack. The binding constraint is NOT
+// interrupt latency (64 stores is far shorter than the 64KB segment-copy window
+// next door) but PROCESS_STACK_SIZE, which is 16KB: a 256-entry batch would be
+// 6KB, over a third of the kernel stack, on a path that already has frames
+// beneath it. 64 still removes 96% of the CR3 switches (743 relocations goes
+// from 1,486 TLB flushes to 24), so the extra risk buys almost nothing.
+#define ELF_RELOC_BATCH 64
 
-static void elf_reloc_write32(const elf_reloc_target_t *tgt, uint64_t r_offset,
-                               uint64_t relocation_offset, uint64_t low_addr,
-                               uint32_t value) {
-    if (tgt->is_user) {
-        uint64_t dest_vaddr = r_offset + relocation_offset;
+typedef struct {
+    uint64_t r_offset;   // link-time vaddr of the location to fix up
+    uint64_t value;      // value to store
+    bool     is32;       // 4-byte store instead of 8
+} elf_reloc_pending_t;
+
+// Apply a queued batch. Returns how many were actually written; the caller
+// counts the remainder as skipped.
+//
+// #633 is preserved and, if anything, cheaper: the destination-writability walk
+// happens HERE, before the CR3 window opens, so a page that is not
+// present+user+writable in the target is dropped rather than turned into a
+// kernel #PF with CR3 pointing at a foreign address space.
+static uint32_t elf_reloc_flush(const elf_reloc_target_t *tgt,
+                                elf_reloc_pending_t *batch, uint32_t n,
+                                uint64_t relocation_offset, uint64_t low_addr) {
+    if (n == 0) {
+        return 0;
+    }
+
+    if (!tgt->is_user) {
+        // Kernel-owned buffer: no address space to switch to, so there was
+        // never a per-write cost here. Bounds-check and store.
+        uint32_t done = 0;
+        for (uint32_t i = 0; i < n; i++) {
+            uint64_t r_offset = batch[i].r_offset;
+            uint64_t width = batch[i].is32 ? sizeof(uint32_t) : sizeof(uint64_t);
+            uint64_t dest_off = r_offset - low_addr;
+            if (r_offset < low_addr || dest_off + width > tgt->kernel_size) {
+                kprintf("[ELF] Warning: relocation offset 0x%llX past the %llu-byte "
+                        "load buffer; skipping\n", r_offset, tgt->kernel_size);
+                continue;
+            }
+            if (batch[i].is32) {
+                *(uint32_t *)(tgt->kernel_base + dest_off) = (uint32_t)batch[i].value;
+            } else {
+                *(uint64_t *)(tgt->kernel_base + dest_off) = batch[i].value;
+            }
+            done++;
+        }
+        return done;
+    }
+
+    // Phase 1, normal CR3: verify every destination and compact the survivors
+    // to the front of the batch, so the interrupts-off window below contains
+    // stores and nothing else.
+    uint32_t good = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t dest_vaddr = batch[i].r_offset + relocation_offset;
+        uint64_t width = batch[i].is32 ? sizeof(uint32_t) : sizeof(uint64_t);
+        if (!elf_user_range_writable(tgt->pml4_phys, dest_vaddr, width)) {
+            kprintf("[ELF] Warning: relocation target 0x%llX is not mapped "
+                    "writable in the target address space; skipping\n", dest_vaddr);
+            continue;
+        }
+        batch[good++] = batch[i];
+    }
+    if (good == 0) {
+        return 0;
+    }
+
+    // Phase 2: ONE foreign-CR3 window for the whole batch.
+    {
         uint64_t old_cr3, rflags;
         __asm__ volatile("pushfq; pop %0" : "=r"(rflags) :: "memory");
         __asm__ volatile("cli");
         __asm__ volatile("mov %%cr3, %0" : "=r"(old_cr3));
         __asm__ volatile("mov %0, %%cr3" : : "r"(tgt->pml4_phys) : "memory");
-        *(volatile uint32_t *)dest_vaddr = value;
+
+        // #19/#645: every store below lands on a USER page (U/S=1), so with
+        // CR4.SMAP set each one is a #PF without AC. The bracket is around the
+        // STORE LOOP and nothing else: phase 1 above already did the walking and
+        // validation under the normal CR3, so this window is stores only.
+        uaccess_ac_t __ac = uaccess_begin();
+        for (uint32_t i = 0; i < good; i++) {
+            uint64_t dest_vaddr = batch[i].r_offset + relocation_offset;
+            if (batch[i].is32) {
+                *(volatile uint32_t *)dest_vaddr = (uint32_t)batch[i].value;
+            } else {
+                *(volatile uint64_t *)dest_vaddr = batch[i].value;
+            }
+        }
+        uaccess_end(__ac);
+
         __asm__ volatile("mov %0, %%cr3" : : "r"(old_cr3) : "memory");
         __asm__ volatile("push %0; popfq" : : "r"(rflags) : "cc", "memory");
-    } else {
-        uint64_t dest_off = r_offset - low_addr;
-        *(uint32_t *)(tgt->kernel_base + dest_off) = value;
     }
+    return good;
 }
 
 /**
@@ -350,6 +546,11 @@ static void elf_apply_reloc_table(const void *elf_data, uint32_t size, const Elf
         return;
     }
     uint64_t count = table_size / ent;
+
+    // On the stack, not static: this function is re-entered per relocation
+    // table (DT_RELA, DT_REL, DT_JMPREL). See ELF_RELOC_BATCH for the size.
+    elf_reloc_pending_t batch[ELF_RELOC_BATCH];
+    uint32_t nbatch = 0;
 
     const uint8_t *table = elf_vaddr_to_fileptr(elf_data, size, ehdr, table_off, table_size);
     if (!table) {
@@ -498,12 +699,38 @@ static void elf_apply_reloc_table(const void *elf_data, uint32_t size, const Elf
             continue;
         }
 
-        if (is_32bit) {
-            elf_reloc_write32(tgt, r_offset, relocation_offset, low_addr, (uint32_t)value);
-        } else {
-            elf_reloc_write64(tgt, r_offset, relocation_offset, low_addr, value);
+        // #633: the [low_addr, high_addr) test above accepts an r_offset in the
+        // LAST bytes of the image, where an 8-byte store still runs past the
+        // end. Re-check with the actual access width now that it is known.
+        uint64_t acc = is_32bit ? sizeof(uint32_t) : sizeof(uint64_t);
+        if (r_offset + acc > high_addr) {
+            kprintf("[ELF] Warning: %llu-byte relocation at r_offset=0x%llX "
+                    "straddles the end of the load range 0x%llX; skipping\n",
+                    acc, r_offset, high_addr);
+            if (skipped_count) (*skipped_count)++;
+            continue;
         }
-        if (applied_count) (*applied_count)++;
+
+        // #640 stage 2b: queue instead of writing. The batch is flushed inside
+        // ONE foreign-CR3 window rather than one window per store.
+        batch[nbatch].r_offset = r_offset;
+        batch[nbatch].value    = value;
+        batch[nbatch].is32     = is_32bit;
+        nbatch++;
+        if (nbatch == ELF_RELOC_BATCH) {
+            uint32_t w = elf_reloc_flush(tgt, batch, nbatch, relocation_offset, low_addr);
+            if (applied_count) (*applied_count) += w;
+            if (skipped_count) (*skipped_count) += (nbatch - w);
+            nbatch = 0;
+        }
+    }
+
+    // Flush the remainder.
+    if (nbatch) {
+        uint32_t w = elf_reloc_flush(tgt, batch, nbatch, relocation_offset, low_addr);
+        if (applied_count) (*applied_count) += w;
+        if (skipped_count) (*skipped_count) += (nbatch - w);
+        nbatch = 0;
     }
 }
 
@@ -676,6 +903,30 @@ int elf_validate_full_c(const void *elf_data, uint32_t size, elf_validated_t *ou
 // reference keeps the gaps on purpose so the differential can still demonstrate
 // what the Rust confines.
 int elf_validate(const void *elf_data, uint32_t size) {
+    // #489 HARDENING (2026-07-26): close the reachable OOB in the -DRUST_ELF-off
+    // (C fallback) path BEFORE dispatching. elf_validate_full_c is DELIBERATELY
+    // kept as the verbatim differential reference (it retains the three header
+    // gaps on purpose - see its banner), so the fix lives HERE in the shared
+    // dispatcher. This gate rejects an undersized e_phentsize, which otherwise
+    // makes elf_get_phdr() (called by both elf_validate_full_c AND the loader's
+    // calculate_load_bounds/elf_load) read a full 56-byte program header past the
+    // validated table and past EOF (reachable OOB read; matches
+    // elf_validate_full_rs confinement (2)). Gated on a plausible ELF64 header so
+    // non-ELF / wrong-class inputs still get their exact ELF_ERR_* code below. On
+    // every real ELF (e_phentsize == 56) this is a no-op. Confinements (1)
+    // oversized p_filesz and (3) p_memsz < p_filesz are enforced in
+    // calculate_load_bounds() before any allocation/copy (see there).
+    if (elf_data != NULL && size >= sizeof(Elf64_Ehdr)) {
+        const Elf64_Ehdr *eh = (const Elf64_Ehdr *)elf_data;
+        if (eh->e_ident[EI_MAG0] == ELF_MAGIC_0 && eh->e_ident[EI_MAG1] == ELF_MAGIC_1 &&
+            eh->e_ident[EI_MAG2] == ELF_MAGIC_2 && eh->e_ident[EI_MAG3] == ELF_MAGIC_3 &&
+            eh->e_ident[EI_CLASS] == ELFCLASS64 &&
+            eh->e_phnum != 0 && (size_t)eh->e_phentsize < sizeof(Elf64_Phdr)) {
+            kprintf("[ELF] Validation failed: %s (%d)\n",
+                    elf_strerror(ELF_ERR_PHDR_OVERFLOW), ELF_ERR_PHDR_OVERFLOW);
+            return ELF_ERR_PHDR_OVERFLOW;
+        }
+    }
     elf_validated_t v;
 #ifdef RUST_ELF
     int r = elf_validate_full_rs((const uint8_t *)elf_data, (uint64_t)size, &v);
@@ -738,6 +989,17 @@ static int calculate_load_bounds(const void *elf_data, uint32_t size,
         if (phdr->p_offset > size ||
             check_overflow_add(phdr->p_offset, phdr->p_filesz, size)) {
             kprintf("[ELF] Error: Segment %d file bounds overflow\n", i);
+            return ELF_ERR_SEGMENT_OVERFLOW;
+        }
+
+        // #489 HARDENING (2026-07-26): reject p_memsz < p_filesz (matches
+        // elf_validate_full_rs confinement (3)). The elf_load copy writes
+        // p_filesz bytes into a region sized from p_memsz; an inverted pair is a
+        // write-overflow past the load allocation. This runs before any alloc/copy
+        // in elf_load/elf_load_full/elf_load_user. Real ELFs always have
+        // p_memsz >= p_filesz, so this never fires on valid input.
+        if (phdr->p_memsz < phdr->p_filesz) {
+            kprintf("[ELF] Error: Segment %d memsz < filesz\n", i);
             return ELF_ERR_SEGMENT_OVERFLOW;
         }
 
@@ -865,7 +1127,9 @@ int elf_load(void *elf_data, uint32_t size, uint64_t *entry_point) {
     // against the kernel-owned buffer we just populated. #427 fix: this used
     // to be entirely skipped for PIE/dynamic images.
     {
-        elf_reloc_target_t tgt = { .is_user = false, .pml4_phys = 0, .kernel_base = (uint8_t *)load_mem };
+        elf_reloc_target_t tgt = { .is_user = false, .pml4_phys = 0,
+                                    .kernel_base = (uint8_t *)load_mem,
+                                    .kernel_size = total_size };
         elf_apply_all_relocations(elf_data, size, ehdr, relocation_offset, low_addr, high_addr, &tgt);
     }
 
@@ -994,7 +1258,8 @@ int elf_load_full(void *elf_data, uint32_t size, Elf64_LoadResult *result) {
     // this used to be entirely skipped for PIE/dynamic images.
     {
         elf_reloc_target_t tgt = { .is_user = false, .pml4_phys = 0,
-                                    .kernel_base = (uint8_t *)result->load_base };
+                                    .kernel_base = (uint8_t *)result->load_base,
+                                    .kernel_size = result->load_size };
         elf_apply_all_relocations(elf_data, size, ehdr, relocation_offset, low_addr, high_addr, &tgt);
     }
 
@@ -1040,8 +1305,136 @@ void elf_unload(Elf64_LoadResult *result) {
 // User-Space ELF Loading
 // ============================================================================
 
+// ===========================================================================
+// #633: PRE-FLIGHT. Everything an untrusted image can say about where it wants
+// to live is checked HERE, before a single page is allocated, mapped or
+// written. Ring 3 chooses this data (any user can drop a file in /APPS and
+// launch it), so a violation must produce an ELF_ERR_* the caller reports with
+// the app's name, never a fault in a foreign-CR3 window.
+//
+// This is deliberately a separate, pure function: it can be reasoned about and
+// tested without a live address space, and it runs to completion so the log
+// names every problem, not just the first.
+// ===========================================================================
+static int elf_check_user_image(const void *elf_data, const Elf64_Ehdr *ehdr,
+                                uint64_t reloc_off, uint64_t low_addr, uint64_t high_addr,
+                                const char *name) {
+    if (!name) name = "<unnamed>";
+    if (high_addr <= low_addr) {
+        kprintf("[ELF] Reject '%s': empty load range 0x%llX-0x%llX\n", name, low_addr, high_addr);
+        return ELF_ERR_BAD_LOAD_ADDR;
+    }
+    if (high_addr - low_addr > ELF_USER_IMAGE_MAX_SPAN) {
+        kprintf("[ELF] Reject '%s': image spans 0x%llX bytes, limit is 0x%llX\n",
+                name, high_addr - low_addr, ELF_USER_IMAGE_MAX_SPAN);
+        return ELF_ERR_BAD_LOAD_ADDR;
+    }
+
+    uint64_t base = low_addr + reloc_off;
+    uint64_t end  = high_addr + reloc_off;
+    if (end < base) {
+        kprintf("[ELF] Reject '%s': load range wraps (base=0x%llX end=0x%llX)\n",
+                name, base, end);
+        return ELF_ERR_BAD_LOAD_ADDR;
+    }
+
+    // #640 stage 2: a PIE is relocated by the KERNEL into the dedicated
+    // userland window, so its permitted range is that window, not the legacy
+    // one. A fixed-base ET_EXEC keeps the legacy window until the fleet is
+    // converted (stage 3 then rejects a declared base in there outright).
+    bool is_dyn = (ehdr->e_type == ET_DYN);
+    uint64_t win_min = is_dyn ? ELF_USER_WIN_MIN : ELF_USER_IMAGE_MIN;
+    uint64_t win_max = is_dyn ? ELF_USER_WIN_MAX : ELF_USER_IMAGE_MAX;
+
+    // THE #633 CHECK. A fixed-base ET_EXEC at 0x400000 (an app linked without
+    // -T user.ld) lands here. Previously it passed, because the only test was
+    // against USER_SPACE_START/END, i.e. the entire 128TB lower half.
+    if (base < win_min || end > win_max) {
+        kprintf("[ELF] Reject '%s': load range 0x%llX-0x%llX is outside the "
+                "permitted %s window 0x%llX-0x%llX. A fixed-base user binary "
+                "must be linked with -T user.ld (without it ld defaults to "
+                "0x400000, which is kernel-mapped in every address space); a "
+                "PIE is placed by the kernel and declares no base.\n",
+                name, base, end, is_dyn ? "PIE" : "legacy fixed-base",
+                win_min, win_max);
+        return ELF_ERR_BAD_LOAD_ADDR;
+    }
+
+    // Per-segment: no arithmetic wrap, and every segment inside the aggregate
+    // range calculate_load_bounds reported (which is what the relocation
+    // engine bounds-checks against, so a segment outside it would be a hole in
+    // that guarantee).
+    int rc = ELF_SUCCESS;
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        const Elf64_Phdr *phdr = elf_get_phdr(elf_data, i);
+        if (phdr == NULL || phdr->p_type != PT_LOAD) {
+            continue;
+        }
+        uint64_t v = phdr->p_vaddr + reloc_off;
+        if (v < phdr->p_vaddr || v + phdr->p_memsz < v) {
+            kprintf("[ELF] Reject '%s': segment %d vaddr/memsz wraps\n", name, i);
+            rc = ELF_ERR_BAD_LOAD_ADDR;
+            continue;
+        }
+        if (phdr->p_vaddr < low_addr || phdr->p_vaddr + phdr->p_memsz > high_addr) {
+            kprintf("[ELF] Reject '%s': segment %d [0x%llX,0x%llX) outside computed "
+                    "bounds [0x%llX,0x%llX)\n", name, i, phdr->p_vaddr,
+                    phdr->p_vaddr + phdr->p_memsz, low_addr, high_addr);
+            rc = ELF_ERR_BAD_LOAD_ADDR;
+        }
+    }
+    if (rc != ELF_SUCCESS) {
+        return rc;
+    }
+
+    // The entry point must land in a segment we are actually going to map and
+    // that is executable. A bad entry only kills the process (Ring 3 fault, not
+    // a panic), but rejecting it here turns a mystery crash into a message.
+    uint64_t entry = ehdr->e_entry;
+    bool entry_ok = false;
+    for (uint16_t i = 0; i < ehdr->e_phnum; i++) {
+        const Elf64_Phdr *phdr = elf_get_phdr(elf_data, i);
+        if (phdr == NULL || phdr->p_type != PT_LOAD || !(phdr->p_flags & PF_X)) {
+            continue;
+        }
+        if (entry >= phdr->p_vaddr && entry < phdr->p_vaddr + phdr->p_memsz) {
+            entry_ok = true;
+            break;
+        }
+    }
+    if (!entry_ok) {
+        kprintf("[ELF] Reject '%s': entry 0x%llX is not inside any executable "
+                "PT_LOAD segment\n", name, entry);
+        return ELF_ERR_BAD_LOAD_ADDR;
+    }
+
+    return ELF_SUCCESS;
+}
+
+// #640: the name is for DIAGNOSTICS ONLY and may be NULL. It exists because a
+// rejection that says "load range 0x400000-0x40F000 is outside the permitted
+// window" is a puzzle, and one that says which app it was is a work item. The
+// original 6-argument form is kept for the callers (and self-tests) that have
+// no name to give.
 int elf_load_user(void *elf_data, uint32_t size, uint64_t pml4_phys,
                   uint64_t *entry_point, uint64_t *load_base, uint64_t *load_end) {
+    return elf_load_user_named(elf_data, size, pml4_phys, entry_point, load_base,
+                               load_end, NULL);
+}
+
+int elf_load_user_named(void *elf_data, uint32_t size, uint64_t pml4_phys,
+                        uint64_t *entry_point, uint64_t *load_base, uint64_t *load_end,
+                        const char *name) {
+    // #640: cost instrumentation. #633 made every relocation write verify its
+    // destination with a four-level page walk, and a PIE has far more
+    // relocations than the zero every ET_EXEC in this tree has, so the cost of
+    // the migration has to be a measurement and not an opinion. Cycles, not
+    // microseconds: there is no calibrated TSC frequency here, and cycles are
+    // exactly comparable between two boots of the same VM, which is the only
+    // comparison being made.
+    uint64_t t_enter = elf_tsc_serialized();
+    uint64_t t_reloc = 0;
+
     // Validate parameters
     if (entry_point == NULL || load_base == NULL || load_end == NULL) {
         kprintf("[ELF] Error: output pointer is NULL\n");
@@ -1093,15 +1486,52 @@ int elf_load_user(void *elf_data, uint32_t size, uint64_t pml4_phys,
     uint64_t actual_base = low_addr;
 
     if (is_pie) {
+        // #640 stage 3: ASLR. The image slot runs from USER_WIN_IMAGE_BASE up to
+        // USER_WIN_HEAP_BASE (mm/vmm.h) = 1GB of room. Randomize the base within
+        // it at 2MB granularity: 2MB alignment keeps the mapping huge-page
+        // friendly, and 1GB/2MB = up to 512 slots (~9 bits). Modest, but it is
+        // the honest maximum this layout allows without moving the heap arena.
+        //
+        // The image must still fit, so the slot count is derived from the ACTUAL
+        // image span: a large image gets fewer slots, and an image that fills the
+        // window gets slot 0 and loads exactly where it did before ASLR.
         actual_base = PIE_USER_BASE;
+
+        uint64_t span      = (high_addr > low_addr) ? (high_addr - low_addr) : 0;
+        uint64_t slot_size = 0x200000ULL;                       // 2MB
+        uint64_t room      = USER_WIN_HEAP_BASE - USER_WIN_IMAGE_BASE;
+        // #646: this did not consult aslr_enabled(), so the one on/off switch
+        // in the tree did not switch its one live consumer. A policy knob that
+        // controls nothing is worse than no knob: it invites the belief that
+        // randomisation was turned off when it was not.
+        if (aslr_enabled() && span < room) {
+            uint64_t slots = (room - span) / slot_size;
+            if (slots > 1) {
+                // aslr_get_random_range() does rejection sampling, so this is
+                // free of the modulo bias a plain % would introduce.
+                uint64_t slot = aslr_get_random_range(slots);
+                actual_base = PIE_USER_BASE + slot * slot_size;
+            }
+        }
+
         relocation_offset = actual_base - low_addr;
-        kprintf("[ELF] PIE relocation: base=0x%llX, offset=0x%llX\n",
-                actual_base, relocation_offset);
+        kprintf("[ELF] PIE relocation: base=0x%llX, offset=0x%llX (ASLR span=0x%llX)\n",
+                actual_base, relocation_offset, span);
     }
 
     uint64_t actual_end = high_addr + relocation_offset;
 
-    // Validate addresses are in user space
+    // #633: full pre-flight on the untrusted image BEFORE anything is mapped.
+    // This replaces the old USER_SPACE_START/END test, which spanned the whole
+    // 128TB lower half and therefore accepted a 0x400000-based ET_EXEC.
+#ifndef ELF633_UNSAFE
+    result = elf_check_user_image(elf_data, ehdr, relocation_offset, low_addr, high_addr, name);
+    if (result != ELF_SUCCESS) {
+        return result;
+    }
+#else
+    (void)elf_check_user_image;   // -DELF633_UNSAFE: the "prove it can fail" build
+#endif
     if (actual_base < USER_SPACE_START || actual_end > USER_SPACE_END) {
         kprintf("[ELF] Error: Load addresses 0x%llX-0x%llX outside user space\n",
                 actual_base, actual_end);
@@ -1121,13 +1551,24 @@ int elf_load_user(void *elf_data, uint32_t size, uint64_t pml4_phys,
         uint64_t seg_end = align_up(seg_vaddr + phdr->p_memsz, ELF_PAGE_SIZE);
         uint64_t num_pages = (seg_end - seg_start) / ELF_PAGE_SIZE;
 
-        // Determine page flags from segment flags
+        // #633: the load destination is ALWAYS mapped writable, whatever the
+        // segment's PF_W says, because the loader itself writes the segment
+        // contents through this mapping at CPL 0 with CR0.WP set. Mapping a
+        // read-only PT_LOAD read-only and then memcpy'ing into it is a
+        // supervisor write fault, i.e. a kernel panic. That is precisely what
+        // an app linked without -T user.ld produced: its first PT_LOAD is
+        // R-only (MEASURED on hello: LOAD 0x400000 flags "R").
+        //
+        // This is NOT a W^X regression: the mapping was already RWX for every
+        // real app (user.ld forces a single PF_R|PF_W|PF_X PT_LOAD, and NX has
+        // never been set here). #526 owns making segments read-only/NX AFTER
+        // the copy completes, which is the only order that can work.
+#if defined(ELF633_UNSAFE) || defined(ELF633_UNSAFE_WP)
         uint64_t vmm_flags = VMM_FLAG_PRESENT | VMM_FLAG_USER;
-        if (phdr->p_flags & PF_W) {
-            vmm_flags |= VMM_FLAG_WRITABLE;
-        }
-        // Note: NX bit would be set if !(phdr->p_flags & PF_X), but we're
-        // not requiring NX for simplicity in this implementation
+        if (phdr->p_flags & PF_W) vmm_flags |= VMM_FLAG_WRITABLE;
+#else
+        uint64_t vmm_flags = VMM_FLAG_PRESENT | VMM_FLAG_USER | VMM_FLAG_WRITABLE;
+#endif
 
         kprintf("[ELF] Segment %d: vaddr=0x%llX, pages=%llu, flags=0x%llX\n",
                 i, seg_vaddr, num_pages, vmm_flags);
@@ -1160,6 +1601,22 @@ int elf_load_user(void *elf_data, uint32_t size, uint64_t pml4_phys,
         if (phdr->p_filesz > 0) {
             const uint8_t *src = (const uint8_t *)elf_data + phdr->p_offset;
 
+            // #633 BACKSTOP. The pre-flight says the image is well-formed and
+            // the mapping call above says it succeeded; this asks the page
+            // tables THEMSELVES whether the exact bytes we are about to write
+            // are present, user and writable in the target. If any answer is
+            // no, fail the load instead of taking a kernel #PF with CR3
+            // pointing at a foreign address space. Cost is one 4-level walk
+            // per page (~400 for the largest app), paid once per launch.
+#if !defined(ELF633_UNSAFE) && !defined(ELF633_UNSAFE_WP)
+            if (!elf_user_range_writable(pml4_phys, seg_vaddr, phdr->p_filesz)) {
+                kprintf("[ELF] Error: segment %d destination 0x%llX+0x%llX is not "
+                        "mapped writable in the target address space; refusing to "
+                        "copy\n", i, seg_vaddr, phdr->p_filesz);
+                return ELF_ERR_DEST_NOT_WRITABLE;
+            }
+#endif
+
             // Copy segment data into the child address space via a temporary
             // CR3 switch. CRITICAL: hardware interrupts MUST be masked while
             // CR3 points at the child, otherwise an IRQ handler runs against
@@ -1182,7 +1639,56 @@ int elf_load_user(void *elf_data, uint32_t size, uint64_t pml4_phys,
                 __asm__ volatile("mov %%cr3, %0" : "=r"(old_cr3));
                 __asm__ volatile("mov %0, %%cr3" : : "r"(pml4_phys) : "memory");
 
+                // #19/#645: the DESTINATION is a user page in the child address
+                // space (U/S=1), so under CR4.SMAP this memcpy is a #PF without
+                // AC. Measured: this exact instruction is where an armed kernel
+                // first died (RIP in memcpy_fast, CR2=0x80000000, err=0x3). The
+                // bracket covers the one copy, not the surrounding loop
+                // bookkeeping or the CR3 switch.
+                uaccess_ac_t __ac = uaccess_begin();
                 memcpy((void *)(seg_vaddr + copied), src + copied, n);
+                uaccess_end(__ac);
+
+#ifdef SMAPTEST
+                // #19/#645 THE NEGATIVE HALF OF THE PROOF, and it must never
+                // ship: `make SMAPTEST=1` arms ONE deliberate, unsanctioned
+                // Ring-0 read of a user page, right here where a correct one
+                // just happened inside a bracket. With CR4.SMAP armed this MUST
+                // take a #PF with err bit P set, S set, W clear, and CR2 equal
+                // to the address printed just below; if the kernel sails past
+                // it, the guard is not doing anything and every green boot
+                // above this line means nothing. Same discipline as
+                // `make NOBLOCKTEST=1` (kernel/sync/noblock.c), for the same
+                // reason: an assertion you have not watched fire is not an
+                // assertion.
+                {
+                    static int fired = 0;
+                    if (!fired) {
+                        fired = 1;
+                        extern uint64_t sec_cr4_read(void);
+                        extern volatile uint8_t g_smap_active;
+                        uint64_t __fl; __asm__ __volatile__("pushfq\n\tpopq %0" : "=r"(__fl));
+                        uint64_t __eff = vmm_get_effective_flags_in(pml4_phys,
+                                             (uint64_t)seg_vaddr & ~0xFFFULL);
+                        kprintf("[SMAPTEST] cr4=0x%llx (SMAP bit21=%d) "
+                                "rflags.AC=%d g_smap_active=%u eff=0x%llx "
+                                "(USER bit2=%d)\n",
+                                (unsigned long long)sec_cr4_read(),
+                                (int)((sec_cr4_read() >> 21) & 1),
+                                (int)((__fl >> 18) & 1),
+                                (unsigned)g_smap_active,
+                                (unsigned long long)__eff,
+                                (int)((__eff >> 2) & 1));
+                        kprintf("[SMAPTEST] about to read user VA 0x%llX from "
+                                "Ring 0 with NO stac; SMAP must #PF here\n",
+                                (unsigned long long)seg_vaddr);
+                        volatile uint8_t probe = *(volatile uint8_t *)seg_vaddr;
+                        kprintf("[SMAPTEST] FAILED: read returned 0x%02X, so "
+                                "SMAP did NOT trap an unsanctioned user access\n",
+                                (unsigned)probe);
+                    }
+                }
+#endif
 
                 __asm__ volatile("mov %0, %%cr3" : : "r"(old_cr3) : "memory");
                 __asm__ volatile("push %0; popfq" : : "r"(rflags) : "cc", "memory");
@@ -1213,17 +1719,124 @@ int elf_load_user(void *elf_data, uint32_t size, uint64_t pml4_phys,
     // link-time base, not the real runtime base. This is the prerequisite for
     // a real dlopen()-style loader and CPython C-extension loading (#359).
     {
-        elf_reloc_target_t tgt = { .is_user = true, .pml4_phys = pml4_phys, .kernel_base = NULL };
+        elf_reloc_target_t tgt = { .is_user = true, .pml4_phys = pml4_phys,
+                                    .kernel_base = NULL, .kernel_size = 0 };
+        uint64_t t_r0 = elf_tsc_serialized();
+#ifndef PIE_NORELOC
         elf_apply_all_relocations(elf_data, size, ehdr, relocation_offset, low_addr, high_addr, &tgt);
+#else
+        // #640 stage 1 CONTROL BUILD. -DPIE_NORELOC skips relocation for the
+        // USER path only. It exists to answer the question this engine could
+        // never answer before: does it actually DO anything? Before #640 no
+        // binary in the tree had a PT_DYNAMIC, so "relocations applied: 0" was
+        // indistinguishable from a broken engine. With /APPS/PIETEST loaded,
+        // the fixed kernel prints "[PIETEST] RESULT: PASS" and this build
+        // prints "[PIETEST] RESULT: FAIL (relocations not applied)" with the
+        // unrelocated link-time pointer values. Never ship this.
+        (void)tgt;
+        kprintf("[ELF] PIE_NORELOC control build: skipping user relocations\n");
+#endif
+        t_reloc = elf_tsc_serialized() - t_r0;
     }
+
+    // ------------------------------------------------------------------
+    // #640 leg 4 step 2: THE PROTECT PASS. Everything above deliberately ran
+    // with the whole image mapped writable, because the loader writes segment
+    // bytes and then relocations through these very mappings at CPL 0 with
+    // CR0.WP set (#633: enforcing PF_W any earlier is a kernel panic, not a
+    // hardening win). Now that no further kernel write to the image is
+    // pending, downgrade each page to what the ELF actually asked for.
+    //
+    // PER-PAGE UNION, not per-segment. A page can be covered by two PT_LOADs
+    // when the link did not page-align the split (every binary built before
+    // user-pie.ld gained its ALIGN, and any third-party ELF). Applying the
+    // segments in order would let the LAST one win, so a shared text/data page
+    // would end up writable+NX and the tail of .text would stop executing.
+    // Taking the union instead can only ever grant a permission, never remove
+    // one that some covering segment needs, so a badly-split image keeps
+    // working and merely gets weaker W^X on the one straddling page.
+    //
+    // Consequence worth stating plainly: an image whose single PT_LOAD is
+    // RWX (the pre-#640 layout, and the 30 carryover binaries still shipping)
+    // gets exactly what it asks for, which is no protection at all. The
+    // counters below make that visible per launch rather than assumed.
+#ifndef ELF_NO_WX_PROTECT
+    {
+        uint64_t img_lo = align_down(low_addr + relocation_offset, ELF_PAGE_SIZE);
+        uint64_t img_hi = align_up(high_addr + relocation_offset, ELF_PAGE_SIZE);
+        uint64_t n_ro = 0, n_nx = 0, n_wx = 0, n_pages = 0;
+
+        for (uint64_t pg = img_lo; pg < img_hi; pg += ELF_PAGE_SIZE) {
+            int any_w = 0, any_x = 0, covered = 0;
+
+            for (uint16_t k = 0; k < ehdr->e_phnum; k++) {
+                const Elf64_Phdr *ph = elf_get_phdr(elf_data, k);
+                if (ph == NULL || ph->p_type != PT_LOAD) continue;
+
+                uint64_t s0 = align_down(ph->p_vaddr + relocation_offset, ELF_PAGE_SIZE);
+                uint64_t s1 = align_up(ph->p_vaddr + relocation_offset + ph->p_memsz,
+                                       ELF_PAGE_SIZE);
+                if (pg < s0 || pg >= s1) continue;
+
+                covered = 1;
+                if (ph->p_flags & PF_W) any_w = 1;
+                if (ph->p_flags & PF_X) any_x = 1;
+            }
+            if (!covered) continue;
+
+            uint64_t keep = 0;
+            if (any_w)  keep |= VMM_FLAG_WRITABLE;
+            if (!any_x) keep |= VMM_FLAG_NX;
+
+            vmm_protect_user_range(pml4_phys, pg, 1, keep);
+
+            n_pages++;
+            if (!any_w)          n_ro++;
+            if (!any_x)          n_nx++;
+            if (any_w && any_x)  n_wx++;
+        }
+
+        // One line, and it reports the ARTIFACT rather than the intent: how
+        // many pages of THIS process actually came out read-only, no-execute,
+        // and still-both. n_wx > 0 means this binary defeats W^X by its own
+        // program headers; that is a property of the binary, not of the kernel.
+        kprintf("[WX] %s: pages=%llu ro=%llu nx=%llu wx=%llu%s\n",
+                name ? name : "?", n_pages, n_ro, n_nx, n_wx,
+                (n_wx > 0) ? "  <-- RWX segment, W^X not enforced for this image" : "");
+    }
+#else
+    // -DELF_NO_WX_PROTECT: the control build. Loads exactly as before the
+    // protect pass existed, so "does the protect pass do anything?" is a
+    // differential question with an answer, not an assumption.
+    kprintf("[WX] %s: protect pass DISABLED (ELF_NO_WX_PROTECT control build)\n",
+            name ? name : "?");
+#endif
 
     // Set output values
     *entry_point = ehdr->e_entry + relocation_offset;
     *load_base = actual_base;
     *load_end = actual_end;
 
-    kprintf("[ELF] User load complete: entry=0x%llX, base=0x%llX, end=0x%llX\n",
-            *entry_point, *load_base, *load_end);
+    {
+        uint64_t total = elf_tsc_serialized() - t_enter;
+        kprintf("[ELF] User load complete: entry=0x%llX, base=0x%llX, end=0x%llX\n",
+                *entry_point, *load_base, *load_end);
+        // #640 stage 2b, and read this before quoting any number it prints:
+        // THIS LINE COSTS MORE THAN THE WORK IT REPORTS. kprintf goes to a
+        // synchronous 115200-baud UART and is echoed again by the timestamped
+        // logger, so ONE line is ~1.9M cycles, while applying 743 relocations is
+        // ~52k. Every figure below therefore includes the cost of the loader's
+        // own logging (this line is outside the timed region, but the ~8 other
+        // [ELF] lines per load are inside it). To measure anything in here,
+        // silence the loader's kprintfs first and compare against a control that
+        // does the same; a serial-logging build cannot resolve anything smaller
+        // than a log line.
+        kprintf("[ELFCOST] %s %s total=%llu cyc reloc=%llu cyc (%llu%% of load) "
+                "image=0x%llX bytes\n",
+                name ? name : "<unnamed>", is_pie ? "PIE" : "fixed",
+                total, t_reloc, total ? (t_reloc * 100ULL / total) : 0ULL,
+                high_addr - low_addr);
+    }
 
     return ELF_SUCCESS;
 }
@@ -1426,8 +2039,132 @@ static uint32_t elf_build_wellformed(uint8_t *buf, uint32_t cap, uint32_t *seed)
     return need;
 }
 
+// ===========================================================================
+// #633 boot self-test. Builds synthetic user images with the exact shapes that
+// killed the kernel, loads each into a THROWAWAY user address space through the
+// live elf_load_user(), and asserts the verdict.
+//
+// PROVING IT CAN FAIL (both halves of the fix, MEASURED 2026-08-03 on VM2633
+// booting golden 998 with only the kernel replaced):
+//
+//   -DELF633_UNSAFE     removes the pre-flight AND the writable mapping. Vector
+//                       A panics: [KERNEL PANIC] Page Fault RIP=0x457be3
+//                       CR2=0x7bc03010 err=0x3 (P W S), DESKTOP_READY=0. Note
+//                       WHERE: the fault is inside vmm_alloc_user_pages, not the
+//                       copy. Mapping a page at 0x400000 has to write a PTE into
+//                       the page table the deep-copied PML4[0] still shares with
+//                       the FIRMWARE's identity map, and that table (physical
+//                       0x7bc03000) is READ-ONLY. This is why the check has to
+//                       run BEFORE the first mapping call: no amount of care
+//                       inside the copy loop could have caught it. The reported
+//                       #633 crash (RIP=0x455e83 CR2=0x7bc03010) is the same
+//                       fault, same CR2, from a different build.
+//
+//   -DELF633_UNSAFE_WP  keeps the pre-flight, restores only the old "map with
+//                       the segment's own PF_W" behaviour. Vector C then panics
+//                       with a WP write fault at the segment's own address:
+//                       proof that the forced-writable mapping is load-bearing
+//                       on its own, and not just belt-and-braces.
+//
+// A test that cannot be made to fail proves nothing, so the two failing builds
+// are the evidence that the passing one means something.
+// ===========================================================================
+
+// One synthetic user image. base/entry/flags are the knobs the attacker (or a
+// broken Makefile) controls. Returns the logical image length.
+static uint32_t elf633_build(uint8_t *buf, uint32_t cap, uint64_t base,
+                             uint64_t entry_off, uint32_t seg_flags,
+                             uint64_t second_seg_gap, uint16_t e_type) {
+    for (uint32_t i = 0; i < cap; i++) buf[i] = 0;
+    uint16_t nph = second_seg_gap ? 2 : 1;
+    Elf64_Ehdr *e = (Elf64_Ehdr *)buf;
+    e->e_ident[EI_MAG0] = ELF_MAGIC_0; e->e_ident[EI_MAG1] = ELF_MAGIC_1;
+    e->e_ident[EI_MAG2] = ELF_MAGIC_2; e->e_ident[EI_MAG3] = ELF_MAGIC_3;
+    e->e_ident[EI_CLASS] = ELFCLASS64; e->e_ident[EI_DATA] = ELFDATA2LSB;
+    e->e_ident[EI_VERSION] = EV_CURRENT;
+    e->e_type = e_type; e->e_machine = EM_X86_64; e->e_version = EV_CURRENT;
+    e->e_entry = base + entry_off;
+    e->e_phoff = 64; e->e_phentsize = 56; e->e_phnum = nph;
+
+    Elf64_Phdr *p = (Elf64_Phdr *)(buf + 64);
+    p->p_type = PT_LOAD; p->p_flags = seg_flags;
+    p->p_offset = 512; p->p_vaddr = base; p->p_paddr = base;
+    p->p_filesz = 256; p->p_memsz = 4096; p->p_align = 4096;
+    for (uint32_t i = 0; i < 256; i++) buf[512 + i] = (uint8_t)(i ^ 0xA5);
+
+    if (second_seg_gap) {
+        Elf64_Phdr *p2 = (Elf64_Phdr *)(buf + 64 + 56);
+        p2->p_type = PT_LOAD; p2->p_flags = PF_R | PF_W;
+        p2->p_offset = 768; p2->p_vaddr = base + second_seg_gap;
+        p2->p_paddr = p2->p_vaddr;
+        p2->p_filesz = 64; p2->p_memsz = 4096; p2->p_align = 4096;
+    }
+    return 1024;
+}
+
+static void elf_load_user_selftest(void) {
+    static uint8_t img[4096];
+    uint32_t pass = 0, total = 0;
+    const uint64_t GOOD = 0x80000000ULL;   // the user.ld base every real app uses
+
+    struct { const char *name; uint64_t base; uint64_t entry_off; uint32_t flags;
+             uint64_t gap; uint16_t etype; int want; uint64_t want_base; } v[] = {
+        // A: THE #633 BUG. An app linked without -T user.ld: 0x400000, and its
+        // first PT_LOAD is R-only (MEASURED on the shipping HELLO binary).
+        { "unlinked-base-0x400000", 0x400000ULL, 0x130, PF_R,          0, ET_EXEC, ELF_ERR_BAD_LOAD_ADDR, 0 },
+        // B: a correctly-linked app must still load. If this ever fails the gate
+        // has become a blanket reject and every app is broken.
+        { "well-formed-RWX",        GOOD,        0x100, PF_R|PF_W|PF_X, 0, ET_EXEC, ELF_SUCCESS, GOOD },
+        // C: correctly BASED but R-only. Pre-#633 this mapped the destination
+        // read-only and the CPL-0 copy then took a WP fault = panic. Must load.
+        { "read-only-segment",      GOOD,        0x100, PF_R|PF_X,      0, ET_EXEC, ELF_SUCCESS, GOOD },
+        // D: entry outside any executable segment.
+        { "entry-not-in-text",      GOOD,        0x9000, PF_R|PF_W|PF_X, 0, ET_EXEC, ELF_ERR_BAD_LOAD_ADDR, 0 },
+        // E: two PT_LOADs 320MB apart: a page-table exhaustion DoS.
+        { "absurd-span",            GOOD,        0x100, PF_R|PF_W|PF_X,
+                                    320ULL*1024*1024, ET_EXEC, ELF_ERR_BAD_LOAD_ADDR, 0 },
+        // F (#640 stage 2): a PIE declares base 0 and MUST land in the dedicated
+        // userland window, NOT at the old 0x90000000 (which is the iMac's live
+        // framebuffer address). want_base is checked, because "it loaded" and
+        // "it loaded where we intended" are different claims and only the
+        // second one retires the #522/#650 hazard.
+        { "pie-lands-in-user-window", 0,           0x100, PF_R|PF_W|PF_X, 0,
+                                    ET_DYN,  ELF_SUCCESS, USER_WIN_IMAGE_BASE },
+        // G: a PIE whose span would run past the end of the window.
+        { "pie-absurd-span",          0,           0x100, PF_R|PF_W|PF_X,
+                                    320ULL*1024*1024, ET_DYN, ELF_ERR_BAD_LOAD_ADDR, 0 },
+    };
+
+    for (uint32_t i = 0; i < sizeof(v)/sizeof(v[0]); i++) {
+        uint64_t cr3 = vmm_create_user_space();
+        if (cr3 == 0) {
+            kprintf("[ELF633] vector %s: could not create address space; skipped\n", v[i].name);
+            continue;
+        }
+        uint32_t len = elf633_build(img, sizeof(img), v[i].base, v[i].entry_off,
+                                    v[i].flags, v[i].gap, v[i].etype);
+        uint64_t entry = 0, lb = 0, le = 0;
+        int rc = elf_load_user_named(img, len, cr3, &entry, &lb, &le, v[i].name);
+        total++;
+        if (rc != v[i].want) {
+            kprintf("[ELF633] vector %s: got %d (%s), want %d\n",
+                    v[i].name, rc, elf_strerror(rc), v[i].want);
+        } else if (v[i].want == ELF_SUCCESS && v[i].want_base && lb != v[i].want_base) {
+            kprintf("[ELF633] vector %s: loaded at 0x%llX, expected base 0x%llX\n",
+                    v[i].name, lb, v[i].want_base);
+        } else {
+            pass++;
+        }
+        vmm_destroy_user_space(cr3);
+    }
+
+    kprintf("[ELF633] malformed-ELF loader gate: %u/%u vectors -> %s\n",
+            pass, total, (pass == total && total > 0) ? "PASS" : "FAIL");
+    bootlog_write("[ELF633] malformed-ELF loader gate: %u/%u -> %s",
+                  pass, total, (pass == total && total > 0) ? "PASS" : "FAIL");
+}
+
 void elf_rust_selftest(void) {
-    extern void bootlog_write(const char *fmt, ...);
     static uint8_t buf[4096];
     uint32_t seed = 0x7e1f0404u;
     uint32_t vectors = 0, mismatches = 0;
@@ -1526,6 +2263,60 @@ void elf_rust_selftest(void) {
                       c_filesz, n_filesz, c_phent, n_phent, c_memsz, n_memsz);
     }
 
+    // Part 2b: #489 HARDENING PROOF (2026-07-26). Part 2 above exercises the raw
+    // elf_validate_full_c REFERENCE, which KEEPS its three header gaps on purpose.
+    // The C FALLBACK the loader actually uses is elf_validate() (the dispatcher,
+    // now with the e_phentsize gate) + calculate_load_bounds() (now with the
+    // no-underflow file-bounds check and the p_memsz>=p_filesz check). This part
+    // feeds the SAME three crafted classes through those live loader-path
+    // functions and asserts each is REJECTED before any allocation/copy, i.e. the
+    // C fallback is now sound whether or not -DRUST_ELF is set. Vectors stay in
+    // buf[4096] with size <= 1024 so no craft can OOB the self-test itself.
+    {
+        uint32_t n_phent2 = 0,  ok_phent2 = 0;    // small e_phentsize -> elf_validate rejects
+        uint32_t n_filesz2 = 0, ok_filesz2 = 0;   // oversized p_filesz -> calculate_load_bounds rejects
+        uint32_t n_memsz2 = 0,  ok_memsz2 = 0;    // p_memsz<p_filesz  -> calculate_load_bounds rejects
+        uint32_t s2b = 0x489c0de1u;
+        for (uint32_t r = 0; r < 300; r++) {
+            uint32_t len = elf_build_wellformed(buf, sizeof(buf), &s2b);
+            if (len > 1024) len = 1024;
+            Elf64_Ehdr *e = (Elf64_Ehdr *)buf;
+            Elf64_Phdr *p0 = (Elf64_Phdr *)(buf + e->e_phoff);
+            uint32_t klass = r % 3;
+            if (klass == 0) {
+                // small-e_phentsize: the dispatcher gate must reject (PHDR_OVERFLOW)
+                uint16_t small = 8 + (uint16_t)(elfdiff_rng(&s2b) % 40);   // 8..47 < 56
+                e->e_phentsize = small; e->e_phnum = 1; e->e_phoff = 64;
+                if (64u + small > len) len = 64u + small;
+                n_phent2++;
+                if (elf_validate(buf, len) == ELF_ERR_PHDR_OVERFLOW) ok_phent2++;
+            } else if (klass == 1) {
+                // oversized p_filesz: calculate_load_bounds must reject (no underflow)
+                p0->p_offset = 8; p0->p_filesz = (uint64_t)len + 1 + (elfdiff_rng(&s2b) % 512);
+                p0->p_memsz = p0->p_filesz;
+                uint64_t lo = 0, hi = 0;
+                n_filesz2++;
+                if (calculate_load_bounds(buf, len, &lo, &hi) == ELF_ERR_SEGMENT_OVERFLOW) ok_filesz2++;
+            } else {
+                // p_memsz < p_filesz: calculate_load_bounds must reject
+                if (p0->p_filesz < 8) p0->p_filesz = 8;
+                if (p0->p_offset + p0->p_filesz > len) { p0->p_offset = 8; p0->p_filesz = (len > 16) ? 16 : 8; }
+                p0->p_memsz = 0;
+                uint64_t lo = 0, hi = 0;
+                n_memsz2++;
+                if (calculate_load_bounds(buf, len, &lo, &hi) == ELF_ERR_SEGMENT_OVERFLOW) ok_memsz2++;
+            }
+        }
+        int pass = (ok_phent2 == n_phent2) && (ok_filesz2 == n_filesz2) && (ok_memsz2 == n_memsz2);
+        kprintf("[RUST-SEC-C] elf: #489 C loader path REJECTS crafted OOBs - "
+                "small-phentsize %u/%u, oversized-filesz %u/%u, memsz<filesz %u/%u -> %s\n",
+                ok_phent2, n_phent2, ok_filesz2, n_filesz2, ok_memsz2, n_memsz2,
+                pass ? "PASS" : "FAIL");
+        bootlog_write("[RUST-SEC-C] elf: #489 C loader rejects phent %u/%u filesz %u/%u memsz %u/%u -> %s",
+                      ok_phent2, n_phent2, ok_filesz2, n_filesz2, ok_memsz2, n_memsz2,
+                      pass ? "PASS" : "FAIL");
+    }
+
     // Part 3: RDTSC micro-benchmark over a fixed well-formed ELF. LIGHT: 5k.
     {
         const int iters = 5000;
@@ -1553,4 +2344,11 @@ void elf_rust_selftest(void) {
                       (unsigned long long)c_cyc, (unsigned long long)r_cyc,
                       (unsigned long long)(ratio100 / 100), (unsigned long long)(ratio100 % 100));
     }
+
+    // Part 4: #633 - Ring 3 must never be able to panic Ring 0 with a malformed
+    // ELF. This is NOT a parser differential: it drives the REAL loader
+    // (elf_load_user) against a REAL, freshly created user address space, which
+    // is the only thing that exercises the mapping and the foreign-CR3 copy,
+    // i.e. the code that actually took the kernel down.
+    elf_load_user_selftest();
 }

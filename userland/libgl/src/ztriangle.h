@@ -166,11 +166,30 @@ Things to keep in mind:
 	} 
 	/* screen coordinates */
 
-	pp1 = (PIXEL*)(zb->pbuf) + zb->xsize * p0->y; 
+	pp1 = (PIXEL*)(zb->pbuf) + zb->xsize * p0->y;
 #if TGL_FEATURE_POLYGON_STIPPLE == 1
 	the_y = p0->y;
 #endif
 	pz1 = zb->zbuf + p0->y * zb->xsize;
+
+	/* #582: this rasterizer skeleton (shared by every ZB_fillTriangle*
+	 * variant that #includes this file, textured or not) had NO bounds
+	 * check anywhere against zb->xsize/zb->ysize before writing through
+	 * pp1/pz1. It is documented above as relying entirely on the CALLER
+	 * having already clipped the triangle to the viewport; when that
+	 * upstream clip is even one row/column off (measured live: OpenArena's
+	 * oa_dm1 load path), this loop writes straight past the end of
+	 * zb->pbuf/zb->zbuf into whatever gl_malloc'd block happens to sit
+	 * next, corrupting its heap header - reproduced and PROVEN with a
+	 * 512-byte canary written immediately after ZB_open's pbuf/zbuf: the
+	 * corruption's first bad byte is at offset 0 of the guard (i.e. the
+	 * very first byte past the buffer's logical end), which is exactly
+	 * what an off-by-one-row (or a last-row off-by-one-column, same
+	 * address arithmetic) write produces. zb_row_y tracks the true
+	 * current scanline (mirrors pp1/pz1's own trajectory across both
+	 * "part"s of the loop below, so it stays correct even though pp1/pz1
+	 * are never reset between parts). */
+	GLint zb_row_y = p0->y;
 
 	DRAW_INIT();
 	/*
@@ -283,6 +302,23 @@ Things to keep in mind:
 
 		while (nb_lines > 0) {
 			nb_lines--;
+			/* #582 fix: clamp this scanline's write span to the buffer's
+			 * real bounds before EITHER draw path below (the generic
+			 * block or the DRAW_LINE()/DRAW_LINE_TRI_TEXTURED() macro,
+			 * both read x1/x2/pp1/pz1 the same way) ever computes a
+			 * pixel pointer. x1/x2 are saved and restored around the
+			 * draw so the real interpolation trajectory used by the
+			 * left/right-edge update below is untouched - only the
+			 * pixels actually WRITTEN this scanline are bounded. A
+			 * fully out-of-range row (zb_row_y outside [0,ysize)) skips
+			 * the whole scanline; an in-range row has x1 floored to 0
+			 * and x2 ceilinged to zb->xsize. */
+			GLint zb_save_x1 = x1;
+			GLint zb_save_x2 = x2;
+			if (zb_row_y >= 0 && zb_row_y < zb->ysize) {
+				if (x1 < 0) x1 = 0;
+				if ((x2 >> 16) > zb->xsize) x2 = zb->xsize << 16;
+			if ((x2 >> 16) > x1) {
 #ifndef DRAW_LINE
 			/* generic draw line */
 			{
@@ -348,6 +384,15 @@ Things to keep in mind:
 #else
 			DRAW_LINE();
 #endif
+			} /* #582: end "if ((x2>>16) > x1)" */
+			} /* #582: end "if (zb_row_y in [0,ysize))" */
+			/* #582: restore the true (unclamped) x1/x2 trajectory before
+			 * the left/right-edge interpolation update below, so a
+			 * clamp applied only to bound THIS scanline's writes never
+			 * perturbs subsequent scanlines' math. */
+			x1 = zb_save_x1;
+			x2 = zb_save_x2;
+			zb_row_y++;
 
 			/* left edge */
 			error += derror;

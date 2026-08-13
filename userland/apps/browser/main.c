@@ -11,9 +11,10 @@
 #include "../../libc/gui.h"
 #include "../../libc/syscall.h"
 #include "../../libc/theme.h"
+#include "../../libc/gui_scroll.h"   // shared scrollbar contrast rule (#745 item 77)
 
 // NetSurf-backed render pipeline (hubbub->libdom parse, libcss style, our
-// MIT block+inline layout). See /opt/maytera/netsurf-port/.
+// MIT block+inline layout). See <workspace>
 #include "dom_hubbub_bind.h"
 #include "css_select_bind.h"
 #include "layout.h"
@@ -70,6 +71,18 @@ static int g_win_w = 800, g_win_h = 600;
 #define SB_W            12   // vertical scrollbar width (#245)
 
 #define HOME_URL        "https://example.com"
+
+// #25: mirrors kernel/net/http_progress.h's http_phase_t. Userland has no
+// access to that kernel header, so the values are restated here; they are
+// part of the SYS_HTTP_FETCH_PROGRESS ABI and do not change independently.
+#define HTTP_PHASE_IDLE       0
+#define HTTP_PHASE_RESOLVING  1
+#define HTTP_PHASE_CONNECTING 2
+#define HTTP_PHASE_TLS        3
+#define HTTP_PHASE_SENDING    4
+#define HTTP_PHASE_RECEIVING  5
+#define HTTP_PHASE_DONE       6
+#define HTTP_PHASE_ERROR      7
 
 // ============================================================================
 // Theme palette (mirrors the Settings app approach)
@@ -221,6 +234,7 @@ static int g_img_item = -1;   // layout item index the active job is for
 static void images_begin(void);
 static void poll_images(void);
 static void resolve_url(const char *href, char *out);
+static int  fetch_progress_text(char *out, int cap);   // #25
 static int  url_focused = 1;   // address bar focus state
 
 // Raw fetch buffer (64KB).
@@ -676,7 +690,13 @@ static int apply_external_css(mcs_ctx *css, const char *html, int html_len) {
 
 static char author_css[16384];
 
+// #245 perf: one line per page render, phase by phase, straight to serial.
+// This is the measurement harness the "browser is slow" work is judged on;
+// it costs one printf per LOAD (not per token), so it stays in permanently.
+extern int printf(const char *fmt, ...);
+
 static void render_page(const char *html, int html_len) {
+    unsigned long t_a = uptime_ms();
     g_content_len = html_len;   // #89: remember for re-layout on resize
     last_layout_w = g_win_w;
     g_have_layout = 0;
@@ -687,10 +707,12 @@ static void render_page(const char *html, int html_len) {
     if (!p) return;
     mdb_parse_chunk(p, (const unsigned char *) html, (unsigned long) html_len);
     mdb_parse_complete(p);
+    unsigned long t_parse = uptime_ms();
 
     // Run inline <script> elements under Duktape with the DOM bound.
     // DOM mutations are visible to the layout pass below.
     js_run_document(mdb_document(p), 0, 0);
+    unsigned long t_js = uptime_ms();
 
     mcs_ctx *css = mcs_create();
     if (!css) { mdb_destroy(p); return; }
@@ -698,11 +720,15 @@ static void render_page(const char *html, int html_len) {
     int css_len = extract_styles(html, html_len, author_css, sizeof(author_css));
     if (css_len > 0)
         mcs_add_author_css(css, author_css, (unsigned long) css_len);
+    unsigned long t_css = uptime_ms();
 
     // External stylesheets (#245): fetch + apply <link rel=stylesheet> sheets.
     // Synchronous; bounded by the fetch timeout per sheet and a total CSS budget.
     apply_external_css(css, html, html_len);
+    unsigned long t_ext = uptime_ms();
 
+    unsigned long m0 = g_layout_measure_calls;
+    unsigned long w0 = g_layout_measure_words;
     g_layout.items = g_items;
     int content_width = CONTENT_W - 24; // padding both sides
     if (layout_document(css, mdb_document(p), content_width,
@@ -710,6 +736,27 @@ static void render_page(const char *html, int html_len) {
         g_have_layout = 1;
         images_begin();
     }
+    unsigned long t_lay = uptime_ms();
+#ifdef BROWSER_PERF
+    printf("[BRPERF] bytes=%d parse=%lu js=%lu css=%lu extcss=%lu layout=%lu "
+           "total=%lu ms items=%d words=%lu measures=%lu\n",
+           html_len, t_parse - t_a, t_js - t_parse, t_css - t_js,
+           t_ext - t_css, t_lay - t_ext, t_lay - t_a,
+           g_layout.n_items, g_layout_measure_words - w0,
+           g_layout_measure_calls - m0);
+    printf("[BRPROF] Mcyc walk=%lu style=%lu text=%lu flow=%lu meas=%lu "
+           "attr=%lu elems=%lu texts=%lu\n",
+           (unsigned long)(g_lp_walk / 1000000ULL),
+           (unsigned long)(g_lp_style / 1000000ULL),
+           (unsigned long)(g_lp_text / 1000000ULL),
+           (unsigned long)(g_lp_flow / 1000000ULL),
+           (unsigned long)(g_lp_meas / 1000000ULL),
+           (unsigned long)(g_lp_attr / 1000000ULL),
+           g_lp_nelem, g_lp_ntext);
+#else
+    (void) t_parse; (void) t_js; (void) t_css; (void) t_ext;
+    (void) t_lay; (void) t_a; (void) m0; (void) w0;
+#endif
 
     // The document + styles stay referenced by p/css. We intentionally leak
     // them here (one page at a time, small) rather than risk the teardown
@@ -834,6 +881,17 @@ static void draw_refresh_icon(int bx, int by, int bw, int bh, uint32_t col) {
     }
 }
 
+// #25: Stop glyph (a thick X), drawn over the Reload button while a fetch is
+// in flight - the button morphs Reload <-> Stop the way every real browser's
+// does, rather than adding a fifth toolbar slot.
+static void draw_stop_icon(int bx, int by, int bw, int bh, uint32_t col) {
+    int cx = bx + bw / 2, cy = by + bh / 2, r = 6;
+    for (int d = -r; d <= r; d++) {
+        gui_fill_rect(window_handle, cx + d, cy + d, 2, 2, col);
+        gui_fill_rect(window_handle, cx + d, cy - d, 2, 2, col);
+    }
+}
+
 // Draw the toolbar band, nav buttons, address bar, and Go button.
 static void draw_toolbar(void) {
     // Toolbar background band + bottom separator.
@@ -849,18 +907,24 @@ static void draw_toolbar(void) {
         gui_button(window_handle, bx, by, bw, bh, labels[i],
                    GUI_BTN_SECONDARY, btn_state(i, en[i]));
         uint32_t ic = en[i] ? COL_TEXT : COL_TEXT_DIM;
-        if (i == 2) draw_refresh_icon(bx, by, bw, bh, ic);
-        else if (i == 3) draw_home_icon(bx, by, bw, bh, ic);
+        if (i == 2) {
+            if (is_loading) draw_stop_icon(bx, by, bw, bh, ic);   // #25
+            else draw_refresh_icon(bx, by, bw, bh, ic);
+        } else if (i == 3) draw_home_icon(bx, by, bw, bh, ic);
     }
 
     // Address bar: rounded field with a focus ring, TTF text and a caret.
     int fr = gui_active_style().radius;
     gui_fill_rounded(window_handle, URL_BAR_X, URL_BAR_Y, URL_BAR_W, URL_BAR_H, fr, COL_FIELD_BG);
     if (url_focused) {
-        // Focus ring drawn in the accent color (two passes for a 2px feel).
-        gui_rounded_border(window_handle, URL_BAR_X, URL_BAR_Y, URL_BAR_W, URL_BAR_H, fr, COL_ACCENT);
+        // (#745) was COL_ACCENT, the theme accent, which is 1.76:1 on the
+        // Dark theme's surface. gui_pal()->focus is the keyboard-position
+        // token and is repaired to the 3:1 non-text floor by
+        // gui_set_palette(). Still two passes for the 2px feel.
+        uint32_t ring = gui_pal()->focus;
+        gui_rounded_border(window_handle, URL_BAR_X, URL_BAR_Y, URL_BAR_W, URL_BAR_H, fr, ring);
         gui_rounded_border(window_handle, URL_BAR_X - 1, URL_BAR_Y - 1,
-                           URL_BAR_W + 2, URL_BAR_H + 2, fr + 1, COL_ACCENT);
+                           URL_BAR_W + 2, URL_BAR_H + 2, fr + 1, ring);
     } else {
         gui_rounded_border(window_handle, URL_BAR_X, URL_BAR_Y, URL_BAR_W, URL_BAR_H, fr, COL_FIELD_BORDER);
     }
@@ -913,10 +977,21 @@ static void draw_scrollbar(void) {
     int thumb_y, thumb_h;
     if (!sb_thumb_geo(&thumb_y, &thumb_h)) return;   // page fits: no bar
     int tx = CONTENT_X + CONTENT_W - SB_W, ty = CONTENT_Y + 1, th = CONTENT_H - 2;
-    gui_fill_rect(window_handle, tx, ty, SB_W, th, THEME_SCROLLBAR_BG);
+    // Colours via the shared rule (#745 item 77). The page bar sits on the
+    // page fill, which is the content surface, not window_bg.
+    uint32_t sb_track, sb_thumb;
+    // The page canvas is a deliberate hardcoded white (see draw_content):
+    // the document brings its own colours, so the surface under this gutter
+    // is white on EVERY theme, not window_bg.
+    gui_scroll_colors(0, 0x00FFFFFF, &sb_track, &sb_thumb);
+    gui_fill_rect(window_handle, tx, ty, SB_W, th, sb_track);
     gui_fill_rect(window_handle, tx, ty, 1, th, COL_SEPARATOR);
-    gui_fill_rect(window_handle, tx + 2, thumb_y, SB_W - 4, thumb_h, THEME_SCROLLBAR_THUMB);
-    gui_draw_rect_outline(window_handle, tx + 2, thumb_y, SB_W - 4, thumb_h, 0x00808080);
+    gui_fill_rect(window_handle, tx + 2, thumb_y, SB_W - 4, thumb_h, sb_thumb);
+    // The outline used to be a hardcoded mid-grey, which is invisible on a
+    // dark theme and fights the thumb on a light one. Derive it from the
+    // repaired thumb instead so it stays an edge, never a second colour.
+    gui_draw_rect_outline(window_handle, tx + 2, thumb_y, SB_W - 4, thumb_h,
+                          gui_scroll_thumb_ink(sb_thumb, sb_thumb, sb_track));
 }
 static int in_scrollbar(int mx, int my) {
     if (scroll_max() <= 0) return 0;
@@ -1029,7 +1104,11 @@ static void draw_content(void) {
     draw_scrollbar();
 }
 
-// Slim status bar pinned to the bottom of the window.
+// Slim status bar pinned to the bottom of the window. While a page is
+// loading this shows REAL progress (#25): the live phase from
+// SYS_HTTP_FETCH_PROGRESS, and a shared-style gui_progress() bar whenever the
+// server sent a Content-Length. No Content-Length means no bar - a guessed
+// percentage would be worse than none, so it is withheld, not faked.
 static void draw_status_bar(void) {
     int sy = WIN_HEIGHT - STATUS_H;
     gui_fill_rect(window_handle, 0, sy, WIN_WIDTH, STATUS_H, COL_STATUS_BG);
@@ -1043,17 +1122,37 @@ static void draw_status_bar(void) {
                        is_loading ? COL_ACCENT : (last_was_error ? COL_ERROR : COL_TEXT_DIM),
                        COL_STATUS_BG);
 
+    if (is_loading) {
+        char line[160];
+        int pct = fetch_progress_text(line, sizeof(line));
+        if (pct >= 0) {
+            int bar_w = 120;
+            int bar_x = WIN_WIDTH - TOOLBAR_PAD - bar_w;
+            int bar_y = sy + (STATUS_H - 8) / 2;
+            gui_progress(window_handle, bar_x, bar_y, bar_w, 8, pct);
+        }
+        br_text_sz(window_handle, 24, sy + (STATUS_H - 11) / 2, line, 11, ink);
+        return;
+    }
+
     const char *msg = status_msg[0] ? status_msg : "Ready";
     br_text_sz(window_handle, 24, sy + (STATUS_H - 11) / 2, msg, 11, ink);
 }
 
 // Redraw the whole window.
 static void redraw(void) {
+    unsigned long t_r0 = uptime_ms();
     gui_fill_rect(window_handle, 0, 0, WIN_WIDTH, WIN_HEIGHT, COL_WINDOW_BG);
     draw_toolbar();
     draw_content();
     draw_status_bar();
     win_invalidate(window_handle);
+#ifdef BROWSER_PERF
+    printf("[BRPERF] redraw=%lu ms items=%d\n", uptime_ms() - t_r0,
+           g_layout.n_items);
+#else
+    (void) t_r0;
+#endif
 }
 
 // ============================================================================
@@ -1105,14 +1204,103 @@ static int g_fetch_id = -1;
 static int g_fetch_retry = 0;
 static int g_fetch_record = 0;
 
+// #25: real, event-driven load progress (not a fake timer animation).
+// Refreshed from SYS_HTTP_FETCH_PROGRESS every poll_fetch() tick while a
+// fetch is in flight; drives both the status-bar text and its progress bar.
+static int          g_fetch_phase       = HTTP_PHASE_IDLE;
+static unsigned int g_fetch_bytes       = 0;
+static unsigned int g_fetch_content_len = 0;
+
+// Format a byte count as "N B" / "N.F KB" / "N.F MB" into buf (>=16 bytes).
+static void fmt_size(unsigned int n, char *buf) {
+    if (n < 1024) {
+        int_to_str((int) n, buf);
+        int p = str_len(buf); buf[p++] = ' '; buf[p++] = 'B'; buf[p] = 0;
+        return;
+    }
+    unsigned int whole, frac; const char *unit;
+    if (n < 1024u * 1024u) { whole = n / 1024; frac = (n % 1024) * 10 / 1024; unit = "KB"; }
+    else { whole = n / (1024u * 1024u); frac = (n % (1024u * 1024u)) * 10 / (1024u * 1024u); unit = "MB"; }
+    int_to_str((int) whole, buf);
+    int p = str_len(buf);
+    buf[p++] = '.'; buf[p++] = (char) ('0' + frac); buf[p++] = ' ';
+    buf[p++] = unit[0]; buf[p++] = unit[1]; buf[p] = 0;
+}
+
+static const char *phase_word(int phase) {
+    switch (phase) {
+        case HTTP_PHASE_RESOLVING:  return "Resolving host";
+        case HTTP_PHASE_CONNECTING: return "Connecting";
+        case HTTP_PHASE_TLS:        return "Securing connection";
+        case HTTP_PHASE_SENDING:    return "Sending request";
+        case HTTP_PHASE_RECEIVING:  return "Receiving";
+        default:                    return "Loading";
+    }
+}
+
+// Build the live status line ("Connecting..." / "Receiving 42 KB of 118 KB
+// (35%)") and return the known percentage, or -1 when the server did not
+// send a Content-Length (the caller then withholds the progress bar instead
+// of guessing one).
+static int fetch_progress_text(char *out, int cap) {
+    if (g_fetch_phase == HTTP_PHASE_RECEIVING && g_fetch_bytes > 0) {
+        char bb[16];
+        fmt_size(g_fetch_bytes, bb);
+        if (g_fetch_content_len > 0) {
+            char cb[16]; fmt_size(g_fetch_content_len, cb);
+            int pct = (int) (((unsigned long long) g_fetch_bytes * 100) / g_fetch_content_len);
+            if (pct > 100) pct = 100;
+            int p = 0;
+            const char *pfx = "Receiving ";
+            for (int i = 0; pfx[i] && p < cap - 1; i++) out[p++] = pfx[i];
+            for (int i = 0; bb[i] && p < cap - 1; i++) out[p++] = bb[i];
+            const char *of = " of ";
+            for (int i = 0; of[i] && p < cap - 1; i++) out[p++] = of[i];
+            for (int i = 0; cb[i] && p < cap - 1; i++) out[p++] = cb[i];
+            if (p < cap - 1) out[p++] = ' ';
+            if (p < cap - 1) out[p++] = '(';
+            char pb[8]; int_to_str(pct, pb);
+            for (int i = 0; pb[i] && p < cap - 1; i++) out[p++] = pb[i];
+            if (p < cap - 2) { out[p++] = '%'; out[p++] = ')'; }
+            out[p] = 0;
+            return pct;
+        }
+        int p = 0;
+        const char *pfx = "Receiving ";
+        for (int i = 0; pfx[i] && p < cap - 1; i++) out[p++] = pfx[i];
+        for (int i = 0; bb[i] && p < cap - 1; i++) out[p++] = bb[i];
+        out[p] = 0;
+        return -1;
+    }
+    const char *w = phase_word(g_fetch_phase);
+    int p = 0;
+    for (int i = 0; w[i] && p < cap - 1; i++) out[p++] = w[i];
+    if (p < cap - 3) { out[p++] = '.'; out[p++] = '.'; out[p++] = '.'; }
+    out[p] = 0;
+    return -1;
+}
+
 static void poll_fetch(void) {
     if (!is_loading || g_fetch_id < 0) return;
     int status = 0;
     int st = http_fetch_poll(g_fetch_id, &status, 0);
-    if (st == 0) return;                       // still downloading
+    if (st == 0) {
+        // #25: still downloading - pull the REAL phase/byte-count from the
+        // kernel job (net/http_progress.h) and redraw only when it actually
+        // changed, so this stays a live meter, not a fake tick-driven one.
+        int phase = g_fetch_phase;
+        unsigned int bytes = g_fetch_bytes, clen = g_fetch_content_len;
+        if (http_fetch_progress(g_fetch_id, &phase, &bytes, &clen) == 0 &&
+            (phase != g_fetch_phase || bytes != g_fetch_bytes || clen != g_fetch_content_len)) {
+            g_fetch_phase = phase; g_fetch_bytes = bytes; g_fetch_content_len = clen;
+            draw_status_bar(); win_invalidate(window_handle);
+        }
+        return;
+    }
     if (st == 1) {                             // complete
         int n = http_fetch_read(g_fetch_id, content_buffer, MAX_CONTENT - 1);
-        g_fetch_id = -1; is_loading = 0;
+        g_fetch_id = -1;
+        g_fetch_phase = HTTP_PHASE_DONE;
         if (n < 0) n = 0;
         content_buffer[n] = 0;
         if (status != 200 && status != 301 && status != 302) {
@@ -1131,7 +1319,19 @@ static void poll_fetch(void) {
             status_msg[p] = 0;
             last_was_error = 0;
         }
-        render_page(content_buffer, n);
+        // #25: a real (not timer-based) parsing/rendering phase. The fetch
+        // itself is over, but HTML/CSS/JS parse + layout (render_page(),
+        // which can take a visible moment on a heavy page) has not run yet.
+        // is_loading stays 1 through the call so the dot/bar keep reading
+        // "busy" instead of going idle and then jumping straight to "Done".
+        {
+            char final_msg[160]; str_cpy(final_msg, status_msg);
+            str_cpy(status_msg, "Parsing and rendering page...");
+            redraw();
+            render_page(content_buffer, n);
+            str_cpy(status_msg, final_msg);
+        }
+        is_loading = 0;
         if (g_fetch_record) hist_push(url_buffer);
         url_fresh = 1;
         redraw();
@@ -1140,10 +1340,12 @@ static void poll_fetch(void) {
         g_fetch_id = -1;
         if (g_fetch_retry < 1) {
             g_fetch_retry++;
+            g_fetch_phase = HTTP_PHASE_IDLE; g_fetch_bytes = 0; g_fetch_content_len = 0;
             g_fetch_id = http_fetch_start(url_buffer);
             if (g_fetch_id >= 0) return;
         }
         is_loading = 0;
+        g_fetch_phase = HTTP_PHASE_ERROR;
         str_cpy(status_msg, "Fetch failed");
         last_was_error = 1;
         str_cpy(display_buffer, status_msg);
@@ -1198,6 +1400,7 @@ static void navigate(int record_history) {
     // poll_fetch() in the main loop finishes it. (#277)
     g_fetch_record = record_history;
     g_fetch_retry = 0;
+    g_fetch_phase = HTTP_PHASE_IDLE; g_fetch_bytes = 0; g_fetch_content_len = 0;   // #25
     g_fetch_id = http_fetch_start(url_buffer);
     if (g_fetch_id < 0) {
         // Fallback: no free job slot / worker spawn failed -> do it inline.
@@ -1412,6 +1615,18 @@ static void go_home(void) {
     navigate(1);
 }
 
+// #25: cancel the in-flight fetch. http_fetch_cancel() / SYS_HTTP_FETCH_CANCEL
+// already existed (#277) but had no caller anywhere in the browser - progress
+// without a way to interrupt it is only half the feature.
+static void stop_load(void) {
+    if (g_fetch_id >= 0) { http_fetch_cancel(g_fetch_id); g_fetch_id = -1; }
+    is_loading = 0;
+    g_fetch_phase = HTTP_PHASE_IDLE; g_fetch_bytes = 0; g_fetch_content_len = 0;
+    str_cpy(status_msg, "Stopped");
+    last_was_error = 0;
+    redraw();
+}
+
 // ============================================================================
 // Event handlers
 // ============================================================================
@@ -1555,7 +1770,7 @@ static void handle_mouse_up(gui_event_t *event) {
         switch (idx) {
             case 0: go_back();    return;
             case 1: go_forward(); return;
-            case 2: load_current_url(); return;  // Reload
+            case 2: if (is_loading) stop_load(); else load_current_url(); return;  // Reload/Stop (#25)
             case 3: go_home();    return;
             case 4: load_current_url(); return;  // Go
         }
@@ -1624,7 +1839,15 @@ int main(int argc, char **argv) {
     // Adopt the running kernel theme so the browser matches Settings/Files.
     apply_theme(get_theme());
 
-    window_handle = win_create("Browser", 100, 100, WIN_WIDTH, WIN_HEIGHT);
+    // #25: SYS_WIN_CREATE takes OUTER (chrome-included) size, not the
+    // content size every layout constant in this file (CONTENT_W, STATUS_H,
+    // GO_BTN_X, ...) assumes it is drawing into. Requesting exactly
+    // WIN_WIDTH x WIN_HEIGHT silently clipped the bottom 24px - the whole
+    // status bar, so the new load-progress bar/text was being drawn
+    // almost entirely off the composited window. +4/+24 is the established
+    // idiom (see userland/apps/terminal/main.c); only the CREATE size needs
+    // it, draw calls stay content-relative.
+    window_handle = win_create("Browser", 100, 100, WIN_WIDTH + 4, WIN_HEIGHT + 24);
     if (window_handle < 0) return 1;
 
     redraw();
@@ -1649,7 +1872,17 @@ int main(int argc, char **argv) {
         poll_fetch();
         poll_images();
         int event_type = win_get_event(window_handle, &event, 50);
-        if (event_type < 0) continue;
+        // #548: event_type == 0 means the 50ms poll timed out with no event,
+        // and sys_win_get_event() leaves event_buf UNTOUCHED on a timeout (see
+        // kernel/proc/syscall.c sys_win_get_event). The old `< 0` check only
+        // skipped the error case, so every idle timeout fell straight into the
+        // switch below on the STALE `event` left over from the last real
+        // event - e.g. a single scroll notch kept re-adding scroll_offset
+        // every 50ms forever with no further input, and any other event type
+        // would similarly replay its handler on every idle tick. Skip both
+        // "error" (<0) and "no event" (==0); only a genuine event (>0) should
+        // reach the switch.
+        if (event_type <= 0) continue;
 
         switch (event.type) {
             case EVENT_WINDOW_CLOSE:

@@ -3,6 +3,7 @@
 
 #include "crypto.h"
 #include "../string.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // AES S-box
 static const uint8_t sbox[256] = {
@@ -486,7 +487,6 @@ static void aes_hex2bytes(const char *hex, uint8_t *out, int nbytes) {
 
 void aes_rust_selftest(void) {
     extern int kprintf(const char *fmt, ...);
-    extern void bootlog_write(const char *fmt, ...);
 
     uint32_t vectors = 0;
     uint32_t mismatches = 0;

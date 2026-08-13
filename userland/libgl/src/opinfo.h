@@ -89,4 +89,12 @@ ADD_OP(PlotPixel, 2, "%d %d")
 ADD_OP(TextSize, 1, "%d")
 ADD_OP(SetEnableSpecular, 1, "%d")
 
+/* AssaultCube port phase 2 TinyGL gap-fill: glOrtho, glDepthFunc,
+   glAlphaFunc, glScissor, glTexSubImage2D. See PORT-STATUS.md. */
+ADD_OP(Ortho, 6, "%f %f %f %f %f %f")
+ADD_OP(DepthFunc, 1, "%C")
+ADD_OP(AlphaFunc, 2, "%C %f")
+ADD_OP(Scissor, 4, "%d %d %d %d")
+ADD_OP(TexSubImage2D, 9, "%d %d  %d %d %d %d  %d %d %d")
+
 #undef ADD_OP

@@ -41,8 +41,28 @@ static GLfloat edgeFunction(GLfloat ax, GLfloat ay, GLfloat bx, GLfloat by, GLfl
 #define NODRAWTEST(c) /* a comment */
 #endif
 
-#define ZCMP(z, zpix, _a, c) (((!zbdt) || (z >= zpix)) STIPTEST(_a) NODRAWTEST(c))
-#define ZCMPSIMP(z, zpix, _a, crabapple) (((!zbdt) || (z >= zpix)) STIPTEST(_a))
+/* AssaultCube port phase 2: real glDepthFunc. Previously this whole file
+   hardcoded the depth comparison to "z >= zpix" (GL_GEQUAL-equivalent) with
+   no way to change it. zb->depth_func defaults to GL_GEQUAL (see init.c),
+   so any caller that never calls glDepthFunc gets byte-identical behavior
+   to before this change. One definition point, used by every rasterizer
+   variant in this file via ZCMP/ZCMPSIMP, so no per-variant duplication. */
+static inline GLint zb_depth_test(GLenum func, GLuint z, GLuint zpix) {
+	switch (func) {
+	case GL_NEVER:    return 0;
+	case GL_LESS:     return z < zpix;
+	case GL_EQUAL:    return z == zpix;
+	case GL_LEQUAL:   return z <= zpix;
+	case GL_GREATER:  return z > zpix;
+	case GL_NOTEQUAL: return z != zpix;
+	case GL_ALWAYS:   return 1;
+	case GL_GEQUAL:
+	default:          return z >= zpix; /* original TinyGL behavior */
+	}
+}
+
+#define ZCMP(z, zpix, _a, c) (((!zbdt) || zb_depth_test(zb->depth_func, (z), (zpix))) STIPTEST(_a) NODRAWTEST(c))
+#define ZCMPSIMP(z, zpix, _a, crabapple) (((!zbdt) || zb_depth_test(zb->depth_func, (z), (zpix))) STIPTEST(_a))
 
 void ZB_fillTriangleFlat(ZBuffer* zb, ZBufferPoint* p0, ZBufferPoint* p1, ZBufferPoint* p2) {
 	GLubyte zbdt = zb->depth_test;
@@ -332,6 +352,24 @@ void ZB_setTexture(ZBuffer* zb, PIXEL* texture) { zb->current_texture = texture;
 void ZB_fillTriangleMappingPerspective(ZBuffer* zb, ZBufferPoint* p0, ZBufferPoint* p1, ZBufferPoint* p2) {
 	PIXEL* texture;
 
+	// task #578: real, measured crash (a Page Fault, CR2 near NULL, live in
+	// OpenArena rendering the oa_dm1 world geometry) proved this function
+	// gets called with zb->current_texture == NULL - the caller selected the
+	// textured/perspective fill path for a surface whose shader stage has no
+	// bound image (e.g. a missing texture; this port's reduced pak subset
+	// does not include pak4-textures.pk3), but nothing here ever checked
+	// for that before TEXTURE_SAMPLE(texture, s, t) indexed off a NULL
+	// pointer. Every OTHER fill routine in this file (Flat/Smooth) draws a
+	// solid color with no texture involved at all, so they were never at
+	// risk; only the two texture-mapped variants (this one and its NOBLEND
+	// sibling below) read through `texture`. Bail out (skip the triangle,
+	// draw nothing) rather than crash - this is a shared TinyGL primitive
+	// used by every ported game (AssaultCube, Quake, OpenArena), so the fix
+	// belongs here, not forked into any one port. A deeper fix (make the
+	// caller fall back to flat-shaded white instead of skipping) is a
+	// reasonable follow-up but not required to stop the crash.
+	if (!zb->current_texture) return;
+
 	GLubyte zbdw = zb->depth_write;
 	GLubyte zbdt = zb->depth_test;
 	TGL_BLEND_VARS
@@ -412,7 +450,12 @@ void ZB_fillTriangleMappingPerspective(ZBuffer* zb, ZBufferPoint* p0, ZBufferPoi
 
 void ZB_fillTriangleMappingPerspectiveNOBLEND(ZBuffer* zb, ZBufferPoint* p0, ZBufferPoint* p1, ZBufferPoint* p2) {
 	PIXEL* texture;
-	
+
+	// task #578: same NULL-texture guard as ZB_fillTriangleMappingPerspective
+	// above (see that comment); this sibling reads through `texture` the
+	// same unchecked way.
+	if (!zb->current_texture) return;
+
 	GLubyte zbdw = zb->depth_write;
 	GLubyte zbdt = zb->depth_test;
 	TGL_STIPPLEVARS

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // assoc.c - OS-wide userland file associations (#84). See assoc.h.
 #include "assoc.h"
 #include "syscall.h"
@@ -28,11 +32,11 @@ static const defmap_t DEFAULTS[] = {
     {"txt","/APPS/editor"}, {"md","/APPS/editor"},  {"c","/APPS/editor"},   {"h","/APPS/editor"},
     {"cfg","/APPS/editor"}, {"log","/APPS/editor"}, {"ini","/APPS/editor"}, {"csv","/APPS/editor"},
     {"yml","/APPS/editor"}, {"sh","/APPS/editor"},  {"cpp","/APPS/editor"},
-    {"bmp","/APPS/imgview"},{"png","/APPS/imgview"},{"jpg","/APPS/imgview"},{"jpeg","/APPS/imgview"},
-    {"gif","/APPS/imgview"},{"ico","/APPS/imgview"},
+    {"bmp","/APPS/IMAGEVIEWER"},{"png","/APPS/IMAGEVIEWER"},{"jpg","/APPS/IMAGEVIEWER"},{"jpeg","/APPS/IMAGEVIEWER"},
+    {"gif","/APPS/IMAGEVIEWER"},{"ico","/APPS/IMAGEVIEWER"},
     {"wav","/APPS/musicplr"},{"mp3","/APPS/musicplr"},{"ogg","/APPS/musicplr"},{"flac","/APPS/musicplr"},
     {"m4a","/APPS/musicplr"},{"aac","/APPS/musicplr"},{"opus","/APPS/musicplr"},
-    {"mp4","/APPS/mplayer"},{"avi","/APPS/mplayer"},{"mkv","/APPS/mplayer"},{"mov","/APPS/mplayer"},
+    {"mp4","/APPS/MEDIAPLAYER"},{"avi","/APPS/MEDIAPLAYER"},{"mkv","/APPS/MEDIAPLAYER"},{"mov","/APPS/MEDIAPLAYER"},
     {"htm","/APPS/browser"},{"html","/APPS/browser"},
 };
 #define NDEF ((int)(sizeof(DEFAULTS) / sizeof(DEFAULTS[0])))
@@ -120,9 +124,9 @@ int assoc_set_default(const char *ext, const char *apppath) {
 }
 
 static const char *TEXT_APPS[] = {"/APPS/editor", "/APPS/mvi"};
-static const char *IMG_APPS[]  = {"/APPS/imgview", "/APPS/paint"};
-static const char *AUD_APPS[]  = {"/APPS/musicplr", "/APPS/mplayer"};
-static const char *VID_APPS[]  = {"/APPS/mplayer"};
+static const char *IMG_APPS[]  = {"/APPS/IMAGEVIEWER", "/APPS/paint"};
+static const char *AUD_APPS[]  = {"/APPS/musicplr", "/APPS/MEDIAPLAYER"};
+static const char *VID_APPS[]  = {"/APPS/MEDIAPLAYER"};
 static const char *WEB_APPS[]  = {"/APPS/browser", "/APPS/editor"};
 static const assoc_category_t CATS[] = {
     {"Documents", "txt md c h cfg log ini csv yml sh cpp", TEXT_APPS, 2},

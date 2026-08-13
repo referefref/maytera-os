@@ -1,4 +1,3 @@
-#pragma GCC diagnostic ignored "-Wunused-function"
 // rsa.c - RSA cryptographic operations for MayteraOS
 // Implements RSA using basic big number arithmetic
 

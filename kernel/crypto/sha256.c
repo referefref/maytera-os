@@ -3,6 +3,8 @@
 
 #include "crypto.h"
 #include "../string.h"
+#include "../cpu/dlprof.h"
+#include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 
 // SHA-256 constants (first 32 bits of fractional parts of cube roots of first 64 primes)
 static const uint32_t K[64] = {
@@ -133,6 +135,7 @@ void sha256_update(sha256_ctx_t *ctx, const void *data, size_t length) {
     size_t buffer_used;
 
     if (length == 0) return;
+    uint64_t _dp_t0 = dp_tsc(); g_dp_sha_bytes += length;
 
     buffer_used = (ctx->count >> 3) & 63;
     buffer_space = 64 - buffer_used;
@@ -159,6 +162,7 @@ void sha256_update(sha256_ctx_t *ctx, const void *data, size_t length) {
     if (length > 0) {
         memcpy(ctx->buffer + buffer_used, p, length);
     }
+    g_dp_sha_cyc += dp_tsc() - _dp_t0;
 }
 
 // Finalize and get digest
@@ -339,7 +343,6 @@ static int sha256diff_digcmp(const uint8_t *d, const char *hex) {
 
 void sha256_rust_selftest(void) {
     extern int kprintf(const char *fmt, ...);
-    extern void bootlog_write(const char *fmt, ...);
 
     uint32_t vectors = 0;
     uint32_t mismatches = 0;

@@ -95,6 +95,20 @@ void glTexCoord2f(GLfloat s, GLfloat t) { glTexCoord4f(s, t, 0, 1); }
 
 void glTexCoord2fv(GLfloat* v) { glTexCoord4f(v[0], v[1], 0, 1); }
 
+/* AssaultCube port phase 3 (docs/ASSAULTCUBE_PORT_PLAN.md): int overload,
+ * same pattern as every other gl*i-onto-gl*f wrapper in this file. */
+void glTexCoord2i(GLint s, GLint t) { glTexCoord4f((GLfloat)s, (GLfloat)t, 0, 1); }
+
+/* AssaultCube port phase 3: byte-color overloads, converting 0..255 into the
+ * 0..1 range glColor4f already expects. Real, not stubbed: every existing
+ * color op (state, interpolation, blending) is reached exactly as if the
+ * caller had used glColor4f directly. */
+void glColor4ub(GLubyte r, GLubyte g, GLubyte b, GLubyte a) {
+	glColor4f(r / 255.0f, g / 255.0f, b / 255.0f, a / 255.0f);
+}
+void glColor3ub(GLubyte r, GLubyte g, GLubyte b) { glColor4ub(r, g, b, 255); }
+void glColor4ubv(const GLubyte *v) { glColor4ub(v[0], v[1], v[2], v[3]); }
+
 void glEdgeFlag(GLint flag) {
 	GLParam p[2];
 #define NEED_CONTEXT
@@ -646,3 +660,42 @@ void glDebug(GLint mode) {
 #include "error_check.h"
 	c->print_flag = mode;
 }
+
+/* AssaultCube port phase 3 (docs/ASSAULTCUBE_PORT_PLAN.md): double-precision
+ * entry points. gl.h's PROTO_GL1/2/3/4 macros already DECLARE the full
+ * glVertex/glColor/glNormal/glTexCoord double-precision family (matching
+ * real desktop GL's own API, which always has both f and d forms), but
+ * nothing in this file ever DEFINED any of them: a genuine pre-existing gap
+ * that only surfaced once AC's editing.cpp called glVertex2d/glColor3d
+ * directly (most GL apps, including every other one in this tree, only ever
+ * use the float forms). Real, not stubbed: each converts to the existing
+ * float/OP_Vertex-family entry points, exactly the same relationship
+ * glVertex2f/glVertex3fv above already have to glVertex4f. */
+void glVertex2d(GLdouble x, GLdouble y) { glVertex4f((GLfloat)x, (GLfloat)y, 0, 1); }
+void glVertex2dv(GLdouble* v) { glVertex4f((GLfloat)v[0], (GLfloat)v[1], 0, 1); }
+void glVertex3d(GLdouble x, GLdouble y, GLdouble z) { glVertex4f((GLfloat)x, (GLfloat)y, (GLfloat)z, 1); }
+void glVertex3dv(GLdouble* v) { glVertex4f((GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2], 1); }
+void glVertex4d(GLdouble x, GLdouble y, GLdouble z, GLdouble w) { glVertex4f((GLfloat)x, (GLfloat)y, (GLfloat)z, (GLfloat)w); }
+void glVertex4dv(GLdouble* v) { glVertex4f((GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2], (GLfloat)v[3]); }
+
+void glColor3d(GLdouble r, GLdouble g, GLdouble b) { glColor4f((GLfloat)r, (GLfloat)g, (GLfloat)b, 1); }
+void glColor3dv(GLdouble* v) { glColor4f((GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2], 1); }
+void glColor4d(GLdouble r, GLdouble g, GLdouble b, GLdouble a) { glColor4f((GLfloat)r, (GLfloat)g, (GLfloat)b, (GLfloat)a); }
+void glColor4dv(GLdouble* v) { glColor4f((GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2], (GLfloat)v[3]); }
+
+void glNormal3d(GLdouble x, GLdouble y, GLdouble z) { glNormal3f((GLfloat)x, (GLfloat)y, (GLfloat)z); }
+void glNormal3dv(GLdouble* v) { glNormal3f((GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2]); }
+
+void glTexCoord4fv(GLfloat* v) { glTexCoord4f(v[0], v[1], v[2], v[3]); }
+void glTexCoord1f(GLfloat s) { glTexCoord4f(s, 0, 0, 1); }
+void glTexCoord1fv(GLfloat* v) { glTexCoord4f(v[0], 0, 0, 1); }
+void glTexCoord1d(GLdouble s) { glTexCoord4f((GLfloat)s, 0, 0, 1); }
+void glTexCoord1dv(GLdouble* v) { glTexCoord4f((GLfloat)v[0], 0, 0, 1); }
+void glTexCoord2d(GLdouble s, GLdouble t) { glTexCoord4f((GLfloat)s, (GLfloat)t, 0, 1); }
+void glTexCoord2dv(GLdouble* v) { glTexCoord4f((GLfloat)v[0], (GLfloat)v[1], 0, 1); }
+void glTexCoord3f(GLfloat s, GLfloat t, GLfloat r) { glTexCoord4f(s, t, r, 1); }
+void glTexCoord3fv(GLfloat* v) { glTexCoord4f(v[0], v[1], v[2], 1); }
+void glTexCoord3d(GLdouble s, GLdouble t, GLdouble r) { glTexCoord4f((GLfloat)s, (GLfloat)t, (GLfloat)r, 1); }
+void glTexCoord3dv(GLdouble* v) { glTexCoord4f((GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2], 1); }
+void glTexCoord4d(GLdouble s, GLdouble t, GLdouble r, GLdouble q) { glTexCoord4f((GLfloat)s, (GLfloat)t, (GLfloat)r, (GLfloat)q); }
+void glTexCoord4dv(GLdouble* v) { glTexCoord4f((GLfloat)v[0], (GLfloat)v[1], (GLfloat)v[2], (GLfloat)v[3]); }

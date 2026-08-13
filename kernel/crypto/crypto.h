@@ -171,6 +171,14 @@ void aes_cbc_decrypt(aes_cbc_ctx_t *ctx, const uint8_t *in, uint8_t *out, size_t
 // AES-GCM Mode (for TLS 1.2/1.3)
 // =============================================================================
 
+// #615: per-key GHASH nibble tables (16 entries of a 128-bit field element,
+// big-endian high/low halves). Built by ghash_key_init_rs(); consumed by
+// ghash_mul_rs()/ghash_update_rs(). Opaque to C apart from its size.
+typedef struct {
+    uint64_t hh[16];
+    uint64_t hl[16];
+} ghash_key_t;
+
 typedef struct {
     aes_ctx_t aes;
     uint8_t h[16];              // Hash subkey
@@ -179,7 +187,18 @@ typedef struct {
     uint8_t counter[16];        // Counter block
     uint64_t aad_len;           // AAD length in bits
     uint64_t cipher_len;        // Ciphertext length in bits
+    // #615: precomputed 4-bit GHASH nibble tables for this key (H * n for each
+    // nibble value n), built once per context in aes_gcm_init(). The bit-serial
+    // multiply that this replaces was measured at ~40% of one core for the
+    // WHOLE App Store download; see rustkern/ghash.rs.
+    ghash_key_t ghk;
 } aes_gcm_ctx_t;
+
+// The Rust GhashKey (rustkern/ghash.rs) is #[repr(C)] over exactly these two
+// arrays. Lock the layout rather than trusting it, per the tree's Rust-seam
+// convention.
+_Static_assert(sizeof(ghash_key_t) == 256, "ghash_key_t FFI size");
+_Static_assert(sizeof(uint64_t) == 8, "ghash_key_t FFI element width");
 
 // Initialize AES-GCM
 int aes_gcm_init(aes_gcm_ctx_t *ctx, const uint8_t *key, int key_bits,

@@ -126,6 +126,9 @@ int dhcp_get_state(void);
 // Check if DHCP is complete (bound)
 int dhcp_is_bound(void);
 
+// #431: reset to IDLE so a fresh DORA can run after a carrier down->up edge.
+void dhcp_reset(void);
+
 // Get assigned IP address
 uint32_t dhcp_get_ip(void);
 

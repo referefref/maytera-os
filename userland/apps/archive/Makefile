@@ -5,11 +5,11 @@ LD = ld
 LIBC_DIR = ../../libc
 BUILD_DIR = build
 
-CFLAGS = -ffreestanding -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=large \
+CFLAGS = -ffreestanding -fstack-protector-strong -mstack-protector-guard=global -fPIE -mno-red-zone \
          -nostdlib -nostdinc -fno-builtin -Wall -Wextra -O2 -g \
-         -I$(LIBC_DIR) -isystem /usr/lib/gcc/x86_64-linux-gnu/12/include
+         -I$(LIBC_DIR) -I../../libarchive -isystem /usr/lib/gcc/x86_64-linux-gnu/12/include
 
-LDFLAGS = -nostdlib -z max-page-size=0x1000 -T ../../user.ld
+LDFLAGS = -pie --no-dynamic-linker -z notext -nostdlib -z max-page-size=0x1000 -T ../../user-pie.ld
 
 TARGET = archive
 OBJECTS = $(BUILD_DIR)/main.o $(BUILD_DIR)/arc.o
@@ -26,10 +26,14 @@ $(TARGET): $(OBJECTS) $(CRT0) $(LIBC)
 	$(LD) $(LDFLAGS) -o $@ $(CRT0) $(OBJECTS) $(LIBC)
 	@echo "Built $(TARGET)"
 
-$(BUILD_DIR)/main.o: main.c arc.h arc_port.h
+$(BUILD_DIR)/main.o: main.c ../../libarchive/arc.h ../../libarchive/arc_port.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/arc.o: arc.c arc.h arc_port.h
+# #613: ONE canonical archiver source (userland/libarchive). This app used to
+# carry a byte-identical private copy of arc.c/arc.h/arc_port.h, which is the
+# forked-primitive pattern the reuse rule forbids: a fix (or a hardening) in
+# one copy reached none of the others.
+$(BUILD_DIR)/arc.o: ../../libarchive/arc.c ../../libarchive/arc.h ../../libarchive/arc_port.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:

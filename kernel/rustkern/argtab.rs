@@ -70,6 +70,19 @@ const ACCESS_READ_USER: u32 = ACCESS_READ | ACCESS_USER;
 const ACCESS_RW_USER: u32 = ACCESS_READ | ACCESS_WRITE | ACCESS_USER;
 
 const VALIDATE_OK: i32 = 0;
+// validate_error_t ordinals (kernel/security/validate.h). These three are the
+// only failures a legitimate, VMA-backed but NOT-YET-FAULTED user page can
+// produce; every other code (NULL, kernel-space, MMIO, non-canonical, ...) is a
+// genuine rejection and is never retried. #607.
+const VALIDATE_UNMAPPED: i32 = 5;  // page not present at all (fresh demand-zero VMA)
+const VALIDATE_NO_WRITE: i32 = 7;  // present read-only (COW page awaiting its write fault)
+const VALIDATE_NO_USER: i32 = 9;   // present but SUPERVISOR (inherited from a split
+                                   // kernel identity huge page in the 2-3GB window, #511)
+// Upper bound on a range we are willing to fault in on the retry path. A
+// syscall buffer larger than this is not a real request, and the retry loop is
+// the one place where an attacker-chosen length costs work per page instead of
+// bailing on the first bad page. 256MB = 65536 pages worst case.
+const PREFAULT_RETRY_MAX: u64 = 256 * 1024 * 1024;
 const EFAULT: i32 = -14;
 
 extern "C" {
@@ -79,6 +92,11 @@ extern "C" {
     // load address, so a range test proves nothing on this OS.
     fn validate_user_ptr(ptr: *const u8, size: usize, access: u32) -> i32;
     fn validate_user_string(s: *const u8, max_len: usize) -> i32;
+    // #607: the calling process, and the demand-paging resolver that #510/#511
+    // established as the ONLY correct way to bring a user page into the exact
+    // state a Ring-3 touch would have left it in. Both are existing C.
+    fn proc_current() -> *mut core::ffi::c_void;
+    fn mm_prefault_range(p: *mut core::ffi::c_void, addr: u64, len: u64, for_write: i32);
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -195,20 +213,55 @@ struct Desc {
 // instead. Values are compiler ground truth (nm -S on a probe TU built with the
 // real kernel CFLAGS), not hand-computed padding guesses.
 const SZ_DEVINFO_SYSINFO: u32 = 160;
+// #745 elevation. Locked in proc/syscall_argtab_lock.c.
+const SZ_ELEV_REQUEST: u32 = 160;
+const SZ_ELEV_VIEW: u32 = 296;
 const SZ_DEVINFO_PCI: u16 = 76;
 const SZ_DEVINFO_USB: u16 = 16;
 const SZ_DEVINFO_IRQ: u16 = 16;
 const SZ_PROC_INFO: u16 = 64;
-const SZ_WM_WINDOW_INFO: u16 = 96;
+// #711: gfsj_verify_t (fs/graphfs/journal.h), locked by a _Static_assert
+// there AND in proc/syscall_argtab_lock.c.
+const SZ_GFSJ_VERIFY: u32 = 80;
+// #711 slice 2: SYS_GFS_QUERY writes a caller-declared number of bytes, so its
+// descriptor uses wa(5) rather than a fixed size. These are the element sizes
+// the handler packs, locked by _Static_assert in proc/syscall_argtab_lock.c so
+// that a struct growing on the C side without this file noticing is a build
+// failure rather than an unchecked tail.
+// #306: inst_target_t (gui/installer.h), locked by a _Static_assert there AND
+// in proc/syscall_argtab_lock.c.
+const SZ_INST_TARGET: u16 = 16;
+const SZ_GFS_STATS: u32 = 128;
+const SZ_GFS_NODE_VIEW: u32 = 32;
+const SZ_GFS_EDGE_VIEW: u32 = 48;
+// #739: diskimg_info_t (dos/diskimg.h), locked by a _Static_assert in
+// proc/syscall_argtab_lock.c.
+const SZ_DISKIMG_INFO: u32 = 288;
+const SZ_WM_WINDOW_INFO: u16 = 136;   // #44: + int maximized; #41: + char app_id[32] (locked by syscall_argtab_lock.c)
 const SZ_CRON_JOB: u16 = 128;
 const SZ_SC_USER_INFO: u16 = 140;
 const SZ_FB_INFO_USER: u32 = 24;
 const SZ_KEY_EVENT: u32 = 24;
 const SZ_K_STAT: u32 = 88;
 const SZ_DIRENT: u32 = 264;
+// #554: k_fsperm_info_t (proc/syscall.c) / FsPermInfo (rustkern/fsperm.rs).
+const SZ_FSPERM_INFO: u32 = 16;
+// #610: ext2_fsck_report_t (fs/ext2.h) / E2fsckReport (rustkern/ext2fsck.rs).
+// Locked by a _Static_assert in proc/syscall_argtab_lock.c AND by the
+// ext2_fsck_sizeof_rs() boot check, so C, Rust and this table cannot drift
+// apart silently.
+const SZ_EXT2_FSCK_REPORT: u32 = 200;
+// #565: k_sigaction_t (proc/signal.h). Locked by a _Static_assert in
+// proc/signal.c. sa_handler(8) sa_mask(8) sa_flags(4) __pad(4) sa_restorer(8)
+// __reserved(8) = 40 bytes. The kernel READS all of new_act and WRITES all of
+// old_act (proc/signal.c sys_sigaction), so the descriptor is the FULL struct,
+// not "a handler pointer".
+const SZ_K_SIGACTION: u32 = 40;
 // #503 batch 2: proc/procinfo.h rows. Each already carries its own
 // _Static_assert at its definition; syscall_argtab_lock.c re-asserts them here
 // so a change to procinfo.h fails the build pointing at THIS table.
+// #745: net_status_t (proc/syscall.h), locked by its own _Static_assert there.
+const SZ_NET_STATUS: u32 = 48;
 const SZ_HANDLE_INFO: u16 = 112;
 const SZ_SVC_INFO: u16 = 80;
 const SZ_PROC_DETAIL: u32 = 112;
@@ -232,6 +285,9 @@ const CAP_PRINTERS: u16 = 8;
 // SYS_FONT_GLYPH arg3 is int meta[5]: the handler writes meta[0..4] (width,
 // height, xoff, yoff, advance) and nothing more.
 const SZ_FONT_GLYPH_META: u32 = 20;
+// #745 aiguard_verdict_t: 5 x i32 + 48 + 64 + 64. Locked by _Static_assert in
+// kernel/security/aiguard.h and a const assert in rustkern/aiguard.rs.
+const SZ_AIGUARD_VERDICT: u32 = 196;
 // The bound sys_svc_control itself scans the name to is procinfo.h PI_NAME_MAX,
 // which this file ALREADY defines for the procinfo builders (see PI_NAME_MAX
 // above). Reused rather than restated: a second copy of the same number is a
@@ -275,6 +331,11 @@ static TAB: &[Desc] = &[
     Desc { num: 128, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] },
     // sys_chown((const char *)arg1, uid, gid)
     Desc { num: 129, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] },
+    // #554 sys_fs_perm_info((const char *)arg1, (int)arg2 smb_or_nfs, (void *)arg3)
+    // arg3 is k_fsperm_info_t / rustkern::fsperm::FsPermInfo. Grouped here with
+    // the other fs-permission syscalls despite the high number (333, next free
+    // after 332 at the time this was added) - see rustkern/fsperm.rs.
+    Desc { num: 333, args: [s(PATH_MAX), NONE, wf(SZ_FSPERM_INFO), NONE, NONE, NONE] },
 
     // --- process ----------------------------------------------------------
     // sys_exec((const char *)arg1)
@@ -335,6 +396,13 @@ static TAB: &[Desc] = &[
     Desc { num: 131, args: [s(PATH_MAX), s(PATH_MAX), NONE, NONE, NONE, NONE] },
     // sys_adduser((const char *)arg1, uid, gid, (const char *)arg4, (const char *)arg5)
     Desc { num: 132, args: [s(PATH_MAX), NONE, NONE, s(PATH_MAX), s(PATH_MAX), NONE] },
+    // #745 sys_user_create_pw(username, password, uid, gid, home)
+    Desc { num: 362, args: [s(PATH_MAX), s(PATH_MAX), NONE, NONE, s(PATH_MAX), NONE] },
+    // #745 sys_pw_check(username, password). username may legitimately be NULL
+    // (it skips the contains-username rule), same as 362's `home` above.
+    Desc { num: 369, args: [s(PATH_MAX), s(PATH_MAX), NONE, NONE, NONE, NONE] },
+    // #745 sys_firstboot_admin(username, user_password, root_password)
+    Desc { num: 370, args: [s(PATH_MAX), s(PATH_MAX), s(PATH_MAX), NONE, NONE, NONE] },
     // sys_delete_user((const char *)arg1)
     Desc { num: 159, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] },
     // sys_list_users((sc_user_info_t *)arg1, (int)arg2)
@@ -349,8 +417,24 @@ static TAB: &[Desc] = &[
     Desc { num: 192, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] },
     // version string copy into (char *)arg1, cap (int)arg2.
     Desc { num: 246, args: [wa(2), NONE, NONE, NONE, NONE, NONE] },
+    // #610 SYS_FSCK: the read-only ext2 check writes one ext2_fsck_report_t
+    // into (void *)arg1. arg2 is the caller's declared capacity and the handler
+    // refuses anything under 200, so the fixed size is the exact write extent.
+    Desc { num: 356, args: [wf(SZ_EXT2_FSCK_REPORT), NONE, NONE, NONE, NONE, NONE] },
     // sys_bootlog_write((const char *)arg1)
     Desc { num: 298, args: [s(TEXT_MAX), NONE, NONE, NONE, NONE, NONE] },
+
+    // #711: gfs_journal_verify((gfsj_verify_t *)arg1). Fixed 80-byte write.
+    Desc { num: 360, args: [wf(SZ_GFSJ_VERIFY), NONE, NONE, NONE, NONE, NONE] },
+    // #711 slice 2: sys_gfs_query(cmd, a1, a2, out, out_bytes). arg4 is the
+    // only pointer and arg5 is the caller's declared capacity, which the
+    // handler never exceeds.
+    Desc { num: 363, args: [NONE, NONE, NONE, wa(5), NONE, NONE] },
+    // #739: sys_diskimg(cmd, path, out, letter). arg1/arg4 are scalars.
+    // Only ONE of the two pointers is used per command and the other is
+    // NULL; a NULL is SKIPPED here rather than rejected (judgement (1) at
+    // the top of this file), so one descriptor covers all four commands.
+    Desc { num: 361, args: [NONE, s(PATH_MAX), wf(SZ_DISKIMG_INFO), NONE, NONE, NONE] },
 
     // --- proc / device introspection (#487) --------------------------------
     // proc_snapshot((proc_info_t *)arg1, (int)arg2)
@@ -379,6 +463,8 @@ static TAB: &[Desc] = &[
     Desc { num: 216, args: [wf(4), NONE, NONE, NONE, NONE, NONE] },
     // net_format_info((char *)arg1, (unsigned long)arg2)
     Desc { num: 243, args: [wa(2), NONE, NONE, NONE, NONE, NONE] },
+    // (#745) sys_net_status((net_status_t *)arg1) - fixed 48-byte write.
+    Desc { num: 371, args: [wf(SZ_NET_STATUS), NONE, NONE, NONE, NONE, NONE] },
     // sys_http_fetch_start((const char *)arg1)
     Desc { num: 255, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] },
     // sys_http_fetch_poll((int)arg1, (int *)arg2, (uint32_t *)arg3) - both optional.
@@ -387,6 +473,10 @@ static TAB: &[Desc] = &[
     Desc { num: 257, args: [NONE, wa(3), NONE, NONE, NONE, NONE] },
     // sys_http_post_start((const char *)arg1, (const char *)arg2, (const char *)arg3)
     Desc { num: 265, args: [s(PATH_MAX), s(TEXT_MAX), s(TEXT_MAX), NONE, NONE, NONE] },
+    // (#745) sys_ai_scan((const char *)arg1 text, (aiguard_verdict_t *)arg2 out).
+    // arg1 is an arbitrary-length untrusted string, so TEXT_MAX; arg2 is a
+    // fixed 196-byte write the handler always performs on a non-negative return.
+    Desc { num: 383, args: [s(TEXT_MAX), wf(SZ_AIGUARD_VERDICT), NONE, NONE, NONE, NONE] },
     // sys_http_post_poll((int)arg1, (int *)arg2, (uint32_t *)arg3) - both optional.
     Desc { num: 266, args: [NONE, wf(4), wf(4), NONE, NONE, NONE] },
     // sys_http_post_read((int)arg1, (char *)arg2, (uint32_t)arg3)
@@ -507,6 +597,194 @@ static TAB: &[Desc] = &[
     // the descriptor it should always have had. Same shape as SYS_WAIT (num 3):
     // the status out-param is optional (POSIX), so NULL is skipped, not rejected.
     Desc { num: 98, args: [NONE, wf(4), NONE, NONE, NONE, NONE] },
+
+    // --- #566 secure session lock + autologin ------------------------------
+    // sys_session_unlock((const char*)user, (const char*)pass)
+    Desc { num: 337, args: [s(64), s(256), NONE, NONE, NONE, NONE] },
+    // sys_set_autologin((const char*)user, (const char*)pass, (int)enable)
+    Desc { num: 339, args: [s(64), s(256), NONE, NONE, NONE, NONE] },
+    // #745 SYS_SET_LOGIN_MODE(int mode, const char *user, const char *pass).
+    // Same two strings as 339 in the same shapes, one argument later: the mode
+    // is arg1 so the scalar is first and the credential pair keeps the caps the
+    // autologin pair already proved (USERNAME_MAX 64, password 256).
+    // SYS_GET_LOGIN_MODE (375) takes no arguments and therefore has no entry.
+    Desc { num: 374, args: [NONE, s(64), s(256), NONE, NONE, NONE] },
+    // #745 ELEVATION (proc/elevate.h). Three pointer syscalls:
+    //   378 SYS_ELEV_REQUEST  arg1 READ  elev_request_t, fixed 160 bytes
+    //   380 SYS_ELEV_VIEW     arg1 WRITE elev_view_t,    fixed 296 bytes
+    //   381 SYS_ELEV_RESOLVE  arg3 READ  the password, a NUL-terminated string
+    // Both sizes are locked by _Static_assert in proc/syscall_argtab_lock.c, so
+    // a struct that grows without these numbers growing FAILS THE BUILD rather
+    // than leaving the validator proving fewer bytes than the kernel touches.
+    // The password bound is SC_PASSWORD_MAX (proc/syscall.c), which is what
+    // sc_bounce_str() copies into.
+    Desc { num: 378, args: [rf(SZ_ELEV_REQUEST), NONE, NONE, NONE, NONE, NONE] },
+    Desc { num: 380, args: [wf(SZ_ELEV_VIEW), NONE, NONE, NONE, NONE, NONE] },
+    Desc { num: 381, args: [NONE, NONE, s(128), NONE, NONE, NONE] },
+    // sys_get_autologin((char*)buf, (int)cap) - writes cap bytes into buf
+    Desc { num: 340, args: [wa(2), NONE, NONE, NONE, NONE, NONE] },
+    // sys_auth_lockout((const char*)user)
+    Desc { num: 341, args: [s(64), NONE, NONE, NONE, NONE, NONE] },
+
+    // -----------------------------------------------------------------------
+    // #500 COMPLETION (MAYTERA-SEC-2026-0016). The pointer-taking syscalls the
+    // #503 batches did not reach, found by a dispatcher-vs-TAB cross-audit.
+    // FOUR were unvalidated USER WRITES (163, 259, 324, 331): a Ring-3 pointer
+    // naming kernel memory would have the kernel WRITE to it - the exact #500
+    // hole, still open on these paths. The rest are unvalidated reads (info
+    // leak / kernel-memory read), including the OTA/APP signature-verify inputs.
+    //
+    // Three syscalls are handled ELSEWHERE and deliberately have no flat
+    // descriptor, each for a stated structural reason:
+    //   - SYS_IOCTL (94): arg size is cmd-dependent (termios vs winsize vs int),
+    //     not statically knowable, and file_ioctl has kernel-internal callers
+    //     that legitimately pass kernel pointers. Validated per-cmd at the
+    //     Ring-3 boundary only: proc/syscall.c SYS_IOCTL -> tty_ioctl_validate_user_arg().
+    //   - SYS_AUDIO_PCM_WRITE (316): length is frames*channels*2, not a raw arg;
+    //     the handler already validates via validate_user_ptr()
+    //     (drivers/audio_pcm.c pcm_user_range_ok). Not a hole.
+    //   - SYS_SPAWN_ARGS/REDIR argv (arg2) is a char** (two-level deref); the
+    //     array and each inner string are validated in proc/syscall.c
+    //     spawn_impl(), which a flat descriptor cannot express. path/infile/
+    //     outfile ARE covered here.
+    // -----------------------------------------------------------------------
+
+    // --- fs / pkg ---------------------------------------------------------
+    // sys_pkg_write((const char *)arg1 path, (const void *)arg2 data, (uint32_t)arg3 len)
+    Desc { num: 301, args: [s(PATH_MAX), ra(3), NONE, NONE, NONE, NONE] },
+    // sys_theme_load_file((const char *)arg1)
+    Desc { num: 335, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] },
+
+    // --- process (path + redirect strings; argv validated in spawn_impl) ---
+    // sys_spawn_args((const char *)arg1 path, (char **)arg2 argv, (int)arg3 argc)
+    Desc { num: 198, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] },
+    // sys_spawn_redir(path, argv, argc, (const char *)arg4 in, (const char *)arg5 out, append)
+    Desc { num: 247, args: [s(PATH_MAX), NONE, NONE, s(PATH_MAX), s(PATH_MAX), NONE] },
+
+    // --- ipc messaging ----------------------------------------------------
+    // sys_msg_send((int)arg1, (const void *)arg2, (size_t)arg3) - READ of arg3.
+    Desc { num: 162, args: [NONE, ra(3), NONE, NONE, NONE, NONE] },
+    // sys_msg_recv((int)arg1, (void *)arg2, (size_t)arg3, (int)arg4) - WRITE arg3.
+    Desc { num: 163, args: [NONE, wa(3), NONE, NONE, NONE, NONE] },
+
+    // --- net: blocking HTTP + SSH -----------------------------------------
+    // sys_http_fetch(url, (char *)buf, (uint32_t)cap arg3, (uint32_t *)arg4 status,
+    //   (int *)arg5 len) - both out-params optional (NULL skipped centrally).
+    Desc { num: 86, args: [s(PATH_MAX), wa(3), NONE, wf(4), wf(4), NONE] },
+    // sys_http_post(url, (const char *)hdrs, (const char *)body, (char *)buf,
+    //   (uint32_t)cap arg5, (int *)arg6 status)
+    Desc { num: 239, args: [s(PATH_MAX), s(TEXT_MAX), s(TEXT_MAX), wa(5), NONE, wf(4)] },
+    // sys_http_fetch_hdr(url, (const char *)hdrs, (char *)buf, (uint32_t)cap arg4,
+    //   (uint32_t *)arg5 status, (int *)arg6 len)
+    Desc { num: 302, args: [s(PATH_MAX), s(TEXT_MAX), wa(4), NONE, wf(4), wf(4)] },
+    // ssh2_run_on_fds(ip, (const char *)user arg2, (const char *)pass arg3, ...)
+    Desc { num: 242, args: [NONE, s(256), s(256), NONE, NONE, NONE] },
+
+    // --- sys introspection: per-core CPU ----------------------------------
+    // sys_get_cpu_per_core((uint32_t *)arg1 buf): writes buf[0..n], n clamped to
+    // 64, so up to (1+64)*4 = 260 bytes. Both callers (taskbar g_cpu_cores[65],
+    // sysmon cb[MAXCORE+1]=65) pass exactly 260 bytes, so a fixed 260 neither
+    // underscopes the write nor false-rejects a real caller; there is no length
+    // arg to key on.
+    Desc { num: 259, args: [wf(260), NONE, NONE, NONE, NONE, NONE] },
+
+    // --- fonts + clipboard ------------------------------------------------
+    // ttf_face_style((int)arg1, (char *)arg2 buf, (int)arg3 cap) - WRITE cap.
+    Desc { num: 324, args: [NONE, wa(3), NONE, NONE, NONE, NONE] },
+    // ttf_face_by_path((const char *)arg1 path)
+    Desc { num: 329, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] },
+    // clip_set_rs((const unsigned char *)arg1 src, (unsigned long)arg2 len) - READ.
+    Desc { num: 330, args: [ra(2), NONE, NONE, NONE, NONE, NONE] },
+    // clip_get_rs((unsigned char *)arg1 dst, (unsigned long)arg2 cap) - WRITE cap.
+    Desc { num: 331, args: [wa(2), NONE, NONE, NONE, NONE, NONE] },
+
+    // --- OTA / signature verification (read-only inputs to the verifier) ---
+    // kernel_selfupdate_apply((const void *)img arg1, (uint32_t)len arg2,
+    //   (const uint8_t *)sha[32] arg3, build arg4, (const uint8_t *)sig arg5,
+    //   (uint32_t)sig_len arg6). Privilege- AND signature-gated in the handler;
+    //   the pointers are still dereferenced, so validate them. The chokepoint
+    //   runs before the handler's privilege gate, so a non-service caller with a
+    //   bad pointer now gets EFAULT rather than reaching the gate: still a
+    //   rejection, and it never dereferences the bad pointer.
+    Desc { num: 313, args: [ra(2), NONE, rf(32), NONE, ra(6), NONE] },
+    // kernel_ota_verify_sig((const uint8_t *)digest[32] arg1, (const uint8_t *)sig arg2, (uint32_t)len arg3)
+    Desc { num: 314, args: [rf(32), ra(3), NONE, NONE, NONE, NONE] },
+    // kernel_app_verify_sig((const uint8_t *)digest[32] arg1, (const uint8_t *)sig arg2, (uint32_t)len arg3)
+    Desc { num: 334, args: [rf(32), ra(3), NONE, NONE, NONE, NONE] },
+
+    // -----------------------------------------------------------------------
+    // #565: the three Ring-3 -> kernel pointer holes the syscall-ptr-lint
+    // surfaced (same class as #500; this completes #500's coverage). Each took
+    // a Ring-3 pointer, had NO descriptor, and only NULL-checked in the handler
+    // = an arbitrary kernel read/write. Now validated at the chokepoint.
+    // -----------------------------------------------------------------------
+    // sys_sigaction(signo, (const k_sigaction_t *)arg2 new_act,
+    //   (k_sigaction_t *)arg3 old_act). proc/signal.c READS all of *new_act
+    // (na->sa_handler/sa_mask/sa_flags/__reserved) and WRITES all of *old_act
+    // (oa->sa_handler=..., sa_mask, sa_flags, __pad, sa_restorer, __reserved):
+    // the full 40-byte struct each way, not just a handler pointer. arg3 was
+    // the arbitrary kernel WRITE. Both are optional (the handler NULL-checks
+    // `if (na)` / `if (oa)`), so NULL is skipped, not rejected.
+    Desc { num: 81, args: [NONE, rf(SZ_K_SIGACTION), wf(SZ_K_SIGACTION), NONE, NONE, NONE] },
+    // sys_sigprocmask(how, (const uint64_t *)arg2 set, (uint64_t *)arg3 oldset).
+    // proc/signal.c: `uint64_t nv = *set` (READ 8) and `*oldset = p->sig_mask`
+    // (the arbitrary 8-byte kernel WRITE). sigset_t here is one uint64_t = 8
+    // bytes. Both optional (`if (!set)` / `if (oldset)`).
+    Desc { num: 82, args: [NONE, rf(8), wf(8), NONE, NONE, NONE] },
+    // proc_clone(flags, (void *)arg2 user_stack, (uint32_t *)arg3 parent_tid,
+    //   (uint32_t *)arg4 child_tid, (void *)arg5 tls). arg3/arg4 are pid_t
+    // (uint32_t) out-params - `*parent_tid = child->pid`, `*child_tid =
+    // child->pid` - the arbitrary 4-byte kernel WRITEs. 4 bytes each, both
+    // optional (flag- AND NULL-gated by the handler).
+    //   arg2 user_stack is NOT a fixed-size buffer a flat descriptor can
+    // express: it is the child's stack POINTER (rsp points at the TOP; the
+    // usable region is BELOW it, and userland/libc/pthread.c passes
+    // stack_base + stack_size, one past the allocation, so validating bytes AT
+    // the pointer would false-reject a legal pthread_create). It is validated
+    // in proc_clone() itself (proc/process.c), which is a Ring-3-only caller.
+    //   arg5 tls is `(void)tls` in the handler (never dereferenced), so it needs
+    // no descriptor - the lint keys coverage on the syscall number, not per-arg.
+    Desc { num: 110, args: [NONE, NONE, wf(4), wf(4), NONE, NONE] },
+    // #524 - BSD sockets (net/socket.c). sockaddr_in is 16 bytes and struct
+    // timeval 16 bytes (both _Static_assert-locked in net/socket.c); fd_set is a
+    // single 8-byte mask (MAX_FDS==64). Handlers additionally copy via
+    // copy_*_user, so this is the entry-check half of the #500/#509 pair.
+    Desc { num: 344, args: [NONE, rf(16), NONE, NONE, NONE, NONE] }, // SYS_SOCK_BIND
+    Desc { num: 345, args: [NONE, rf(16), NONE, NONE, NONE, NONE] }, // SYS_SOCK_CONNECT
+    Desc { num: 347, args: [NONE, wf(16), wf(4), NONE, NONE, NONE] }, // SYS_SOCK_ACCEPT (addr/addrlen optional)
+    Desc { num: 348, args: [NONE, ra(3), NONE, NONE, NONE, NONE] }, // SYS_SOCK_SEND
+    Desc { num: 349, args: [NONE, wa(3), NONE, NONE, NONE, NONE] }, // SYS_SOCK_RECV
+    Desc { num: 350, args: [NONE, ra(3), NONE, NONE, rf(16), NONE] }, // SYS_SOCK_SENDTO
+    Desc { num: 351, args: [NONE, wa(3), NONE, NONE, wf(16), wf(4)] }, // SYS_SOCK_RECVFROM
+    Desc { num: 352, args: [NONE, NONE, NONE, ra(5), NONE, NONE] }, // SYS_SOCK_SETOPT (optval sized by arg5)
+    Desc { num: 353, args: [NONE, NONE, NONE, wf(4), wf(4), NONE] }, // SYS_SOCK_GETOPT (int out + optlen out)
+    Desc { num: 354, args: [NONE, wf(8), wf(8), wf(8), rf(16), NONE] }, // SYS_SOCK_SELECT
+    // SYS_POLL: nfds entries of 8 bytes each, READ (fd/events) and WRITTEN
+    // (revents), so it is Kind::W, which asks for ACCESS_RW_USER and covers
+    // both. The element count is arg2 and the handler REJECTS anything above
+    // 64 rather than clamping, so Elems (not ElemsClamped) is correct: there
+    // is no call the handler accepts whose bytes this would fail to validate.
+    Desc { num: 104, args: [we(2, 8), NONE, NONE, NONE, NONE, NONE] }, // SYS_POLL
+    // #306: SYS_INST_ENUM writes up to arg2 inst_target_t records into arg1.
+    // ElemsClamped because the handler caps arg2 at INST_MAX_TARGETS before
+    // writing; validating the raw count would reject a legal max=1000 call.
+    // arg3 is the caller's sizeof, checked by the handler, not a pointer.
+    Desc { num: 365, args: [wec(2, SZ_INST_TARGET, 16), NONE, NONE, NONE, NONE, NONE] }, // SYS_INST_ENUM
+    // SYS_INST_INSTALL (366) takes two scalars and no pointers by design:
+    // see sys_inst_install() on why a caller-supplied descriptor would be
+    // a privilege hole rather than a convenience.
+    // #25: sys_http_fetch_progress(id, int *phase, uint32_t *bytes_recv,
+    // uint32_t *content_len) - three fixed 4-byte WRITE out-params, all
+    // optional (the handler NULL-checks each before copy_to_user).
+    // #797: sys_ntp_sync_server(const char *server, uint32_t timeout_ms).
+    // arg1 is a NUL-terminated Ring-3 string naming the NTP server (the
+    // first-boot wizard's field). The handler ALSO bounces it through
+    // sc_bounce_str()/strncpy_from_user, so this is the entry-check half of
+    // the #500/#509 pair, not the only check. 128 = sizeof the handler's
+    // kernel-side buffer, so a longer string is rejected here rather than
+    // silently truncated later. arg2 is a scalar timeout.
+    Desc { num: 367, args: [s(128), NONE, NONE, NONE, NONE, NONE] }, // SYS_NTP_SYNC_SERVER
+    Desc { num: 368, args: [NONE, wf(4), wf(4), wf(4), NONE, NONE] }, // SYS_HTTP_FETCH_PROGRESS
 ];
 
 /// Resolve a Len to a byte count, or None if the caller's numbers cannot
@@ -637,7 +915,67 @@ pub extern "C" fn syscall_validate_args(
                 let access = if a.kind == Kind::W { ACCESS_RW_USER } else { ACCESS_READ_USER };
                 // SAFETY: validate_user_ptr does not dereference p. It walks the
                 // caller's CR3 and reports the effective U/S + R/W bits.
-                unsafe { validate_user_ptr(p as *const u8, n as usize, access) }
+                let first = unsafe { validate_user_ptr(p as *const u8, n as usize, access) };
+                if first == VALIDATE_OK {
+                    first
+                } else {
+                    // #607 ROOT-CAUSE FIX. A page-table walk answers "is this
+                    // page backed RIGHT NOW", but userland memory is DEMAND
+                    // PAGED: a buffer straight out of malloc() has a covering
+                    // VMA and no page table entry yet, and a fresh heap-growth
+                    // page in the 2-3GB user window is PRESENT-but-SUPERVISOR
+                    // until something faults it (the case-2 state documented in
+                    // mm_fault()). So this chokepoint was rejecting the single
+                    // most ordinary call in POSIX - read() into a buffer the app
+                    // just malloc'd - with EFAULT, before the handler (which
+                    // already prefaults, #510/#511) could run at all.
+                    //
+                    // MEASURED: the App Store's read-back of a 2.6MB package
+                    // returned -14 on the FIRST sys_read, with the on-disk file
+                    // byte-for-byte correct (sha256 verified from the host).
+                    // That is #607's "Read-back failed", and it was never an
+                    // ext2 bug. Every wa()/ra() descriptor had the same hole;
+                    // small reads only worked because their buffers happened to
+                    // land in already-touched pages.
+                    //
+                    // The fix is NOT to weaken the check. It is to resolve the
+                    // range through the process's OWN fault path first and then
+                    // ask again. mm_prefault_range -> mm_fault is strictly
+                    // VMA-gated and permission-gated: with no covering VMA, or
+                    // with a VMA that does not permit the access, it maps
+                    // nothing, so a genuinely bad pointer still fails the
+                    // re-validation exactly as before. Nothing is accepted that
+                    // Ring 3 could not have faulted in for itself.
+                    if (first == VALIDATE_UNMAPPED
+                        || first == VALIDATE_NO_WRITE
+                        || first == VALIDATE_NO_USER)
+                        && n <= PREFAULT_RETRY_MAX
+                    {
+                        let pr = unsafe { proc_current() };
+                        if pr.is_null() {
+                            first
+                        } else {
+                            let w = if a.kind == Kind::W { 1 } else { 0 };
+                            // Probe the first page alone, so a bogus pointer is
+                            // rejected in O(1) instead of walking a caller-
+                            // chosen length page by page.
+                            unsafe { mm_prefault_range(pr, p, 1, w) };
+                            let probe = unsafe {
+                                validate_user_ptr(p as *const u8, 1, access)
+                            };
+                            if probe != VALIDATE_OK {
+                                probe
+                            } else {
+                                unsafe { mm_prefault_range(pr, p, n, w) };
+                                unsafe {
+                                    validate_user_ptr(p as *const u8, n as usize, access)
+                                }
+                            }
+                        }
+                    } else {
+                        first
+                    }
+                }
             }
             Kind::None => VALIDATE_OK,
         };

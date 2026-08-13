@@ -1,11 +1,19 @@
-# MayteraOS Start menu - extra app groups (data-driven, #454).
+# MayteraOS Start menu - extra app groups and label overrides (data-driven, #454).
 # The built-in categories (Internet, Media, Accessories, Games, System) are
 # defined in the compositor. This file lets you add EXTRA collapsible groups of
-# native apps without recompiling: each `category:` line opens a new group and
-# each `item:` line adds an entry. New groups appear after the built-ins.
+# native apps, and RELABEL an existing entry (built-in or added here), without
+# recompiling: each `category:` line opens a new group, each `item:` line adds
+# an entry to the current group, each `rename:` line changes the display name
+# of whatever menu item already has that exec path.
 #
 #   category: My Tools
 #   item: Something | /APPS/SOMETHING | window
 #
+#   rename: /APPS/paint | Maytera Studio
+#
 # icon names: window (default), clock, calculator, image, network, cog, task, log
 # Lines starting with '#' and blank lines are ignored. Empty by default.
+#
+# Example (commented out): once the Maytera Studio app ships at /APPS/paint,
+# uncomment this one line to relabel the Start-menu entry with no rebuild.
+# rename: /APPS/paint | Maytera Studio

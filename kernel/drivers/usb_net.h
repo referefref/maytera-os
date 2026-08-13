@@ -45,9 +45,18 @@ typedef struct {
     // RX: one permanently outstanding bulk-IN into this DMA buffer.
     uint8_t *rx_buf;
     uint32_t rx_buf_len;    // bytes submitted per bulk-IN
-    // TX bounce buffer (frame + any vendor header)
+    // TX staging buffer: where usb_eth_send builds a frame + any vendor header
+    // before it is copied into the DMA ring below.
     uint8_t *tx_buf;
     uint32_t tx_buf_len;
+    // #549: TX DMA ring. usbnet_bulk_out is fire-and-forget (it runs under
+    // net_lock == interrupts off, and pre-scheduler during boot DHCP, so it
+    // cannot sleep and must not busy-poll). Each send rotates to the next slot
+    // so a frame's DMA buffer is not reused while its bulk-OUT TD may still be
+    // in flight; completions are reaped lazily off the shared event ring.
+    uint8_t *tx_ring;       // tx_ring_slots contiguous slots of tx_buf_len bytes
+    int      tx_ring_slots; // number of DMA slots in tx_ring
+    int      tx_ring_next;  // next slot to use (rotating)
 } usbnet_dev_t;
 
 extern usbnet_dev_t g_usbnet;
@@ -75,7 +84,11 @@ const char *usb_eth_name(void);                 // "CDC-ECM" / "AX88772" / "AX88
 int usbnet_alloc_buffers(usbnet_dev_t *d, uint32_t rx_len, uint32_t tx_len);
 int usbnet_config_bulk_eps(usbnet_dev_t *d, int ep_in, int in_mps,
                            int ep_out, int out_mps);
-// Blocking-with-short-timeout bulk OUT through the shared completion tables.
+// #549: ASYNCHRONOUS bulk OUT. Submits the frame's TD (plus a terminating ZLP
+// TD when send_zlp) onto the bulk-OUT ring and returns WITHOUT waiting for the
+// completion (this runs under net_lock == interrupts off and cannot sleep, and
+// a per-send busy-poll pegged a core on the iMac dongle). timeout_ms is kept
+// for call-site/ABI compatibility but is no longer a wait budget.
 int usbnet_bulk_out(usbnet_dev_t *d, const void *data, uint32_t len,
                     uint32_t timeout_ms, int send_zlp);
 void usbnet_fifo_push(const uint8_t *frame, uint32_t len);

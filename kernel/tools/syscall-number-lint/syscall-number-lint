@@ -1,0 +1,182 @@
+#!/bin/bash
+# syscall-number-lint - #745
+#
+# WHY THIS EXISTS. On 2026-08-10 two agent branches each allocated syscall 373:
+# one for SYS_WM_SET_WORK_AREA, one for SYS_SET_LOGIN_MODE. Both gap-scanned the
+# table honestly; they simply branched from different bases. git merged both with
+# NO conflict, because the two #defines sat at different line numbers. The result
+# COMPILED: two names for one number, and a dispatch table with two entries for
+# it. Whichever the compiler kept, the other feature would silently never run.
+#
+# It was caught by hand. Nothing in the build would have caught it. This is that
+# missing check.
+#
+# It enforces four things:
+#   1. no two SYS_* names share a number in the kernel header
+#   2. SYS_MAX is a SENTINEL, strictly greater than every real syscall. It has
+#      been wrong TWICE (it read 372, which was SYS_NET_PROBE's own number, then
+#      373, which was SYS_WM_SET_WORK_AREA's own number). It has zero callers,
+#      which is exactly why nobody noticed.
+#   3. the kernel header and userland/libc/syscall.h AGREE on every name they
+#      both define. A silent divergence there means userland calls one syscall
+#      believing it is another, which is worse than a build failure in every way.
+#   4. no duplicate numbers in the Rust argument table, which identifies
+#      syscalls by BARE NUMERIC LITERAL with the name only in a comment, so a
+#      name-anchored rename cannot see it and a stale entry points pointer
+#      validation at the wrong syscall.
+#   5. every APP-LOCAL copy of a syscall number agrees with the headers.
+#
+# Rule 5 exists because rules 1-4 were not enough. The 373 collision above was
+# resolved by renumbering SYS_SET_LOGIN_MODE/SYS_GET_LOGIN_MODE to 374/375. That
+# reached the kernel header, the libc header, the dispatch table and argtab.rs,
+# and the lint went green - but the first-boot wizard is a no_std Rust app that
+# CANNOT include the C header, so it holds a FIFTH copy in a private
+# `const SYS_*: i64 = N;` block. That copy still said 373/374. It compiled, and
+# every first-boot run reported "Sign-in preference could not be saved": 373 was
+# SYS_WM_SET_WORK_AREA (returns -1 to a non-compositor) and 374 was the SET the
+# app believed was a GET. Reproduced on build 1811 before this rule existed.
+#
+# The same shape exists in ~15 userland C apps that `#define SYS_FOO n` locally
+# rather than including the header. Rule 5 reads both forms. SYS_MAX is skipped:
+# it is a sentinel, it is rule 2's business, and a vendored old header under
+# userland/apps/python/port carries its own stale one.
+set -euo pipefail
+
+ROOT="."
+STRICT=0
+for a in "$@"; do
+    case "$a" in
+        --strict) STRICT=1 ;;
+        -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+        *) ROOT="$a" ;;
+    esac
+done
+KHDR="$ROOT/kernel/proc/syscall.h"
+UHDR="$ROOT/userland/libc/syscall.h"
+ARGTAB="$ROOT/kernel/rustkern/argtab.rs"
+
+fail=0
+say()  { printf '[syscall-number-lint] %s\n' "$*"; }
+bad()  { printf '[syscall-number-lint] FAIL: %s\n' "$*" >&2; fail=1; }
+# A rule that could not run. Under --strict this is a FAILURE, because a gate
+# that silently degrades to nothing is indistinguishable from a passing gate,
+# and this tree has been bitten by exactly that (#514 concurrency-lint, and
+# rule 3 here, which has never once run inside the golden kernel build).
+skipped() {
+    if [ "$STRICT" -eq 1 ]; then
+        bad "COULD NOT RUN: $*. Refused under --strict: a rule that does not run is not a rule."
+    else
+        say "SKIPPED (not strict): $*"
+    fi
+}
+
+[ -r "$KHDR" ] || { bad "cannot read $KHDR"; exit 1; }
+
+# Capture first, parse with awk: a grep that matches nothing exits 1, and under
+# `set -e` with pipefail that kills this script with no message at all.
+kdefs="$(sed -nE 's/^#define[[:space:]]+(SYS_[A-Z0-9_]+)[[:space:]]+([0-9]+).*/\1 \2/p' "$KHDR" || true)"
+[ -n "$kdefs" ] || { bad "no SYS_* defines found in $KHDR (parser broken?)"; exit 1; }
+
+# --- 1. duplicate numbers in the kernel header -----------------------------
+dupes="$(printf '%s\n' "$kdefs" | awk '$1 != "SYS_MAX" {n[$2] = n[$2] " " $1; c[$2]++}
+                                        END {for (k in c) if (c[k] > 1) print k ":" n[k]}')"
+if [ -n "$dupes" ]; then
+    while IFS= read -r line; do
+        bad "syscall number $line share one number. Two names for one syscall COMPILES; one of them then silently never runs."
+    done <<< "$dupes"
+fi
+
+# --- 2. SYS_MAX is a sentinel, not a syscall -------------------------------
+smax="$(printf '%s\n' "$kdefs" | awk '$1 == "SYS_MAX" {print $2; exit}')"
+hi="$(printf '%s\n' "$kdefs"  | awk '$1 != "SYS_MAX" {if ($2+0 > m) m = $2+0} END {print m+0}')"
+if [ -z "$smax" ]; then
+    say "note: no SYS_MAX defined, skipping the sentinel check"
+elif [ "$smax" -le "$hi" ]; then
+    owner="$(printf '%s\n' "$kdefs" | awk -v n="$smax" '$1 != "SYS_MAX" && $2 == n {print $1; exit}')"
+    bad "SYS_MAX is $smax but the highest syscall is $hi${owner:+ ($owner is also $smax)}. SYS_MAX must be ONE PAST the top; it has been wrong twice."
+fi
+
+# --- 3. kernel and libc must agree on shared names -------------------------
+if [ -r "$UHDR" ]; then
+    rule3_ran=1
+    udefs="$(sed -nE 's/^#define[[:space:]]+(SYS_[A-Z0-9_]+)[[:space:]]+([0-9]+).*/\1 \2/p' "$UHDR" || true)"
+    mism="$(awk 'NR==FNR {k[$1] = $2; next} ($1 in k) && k[$1] != $2 {print $1 " kernel=" k[$1] " libc=" $2}' \
+            <(printf '%s\n' "$kdefs") <(printf '%s\n' "$udefs") || true)"
+    if [ -n "$mism" ]; then
+        while IFS= read -r line; do
+            bad "kernel/libc disagree: $line. Userland would call one syscall believing it is another."
+        done <<< "$mism"
+    fi
+else
+    skipped "rule 3 (kernel/libc agreement): $UHDR is not readable"
+fi
+
+# --- 4. duplicate descriptors in the Rust argument table -------------------
+if [ -r "$ARGTAB" ]; then
+    anums="$(sed -nE 's/.*Desc[[:space:]]*\{[[:space:]]*num:[[:space:]]*([0-9]+).*/\1/p' "$ARGTAB" || true)"
+    if [ -n "$anums" ]; then
+        adup="$(printf '%s\n' "$anums" | sort -n | uniq -d || true)"
+        if [ -n "$adup" ]; then
+            while IFS= read -r n; do
+                bad "argtab.rs has more than one Desc for syscall $n."
+            done <<< "$adup"
+        fi
+    fi
+else
+    skipped "rule 4 (argtab descriptors): $ARGTAB is not readable"
+fi
+
+# --- 5. app-local copies of syscall numbers must match the headers ---------
+# Both spellings, because both exist in this tree:
+#   C   :  #define SYS_FOO 123
+#   Rust:  const SYS_FOO: i64 = 123;
+# Checked against the UNION of the two headers (an app may legitimately use a
+# kernel-only name that libc never re-exports, e.g. SYS_FIRSTBOOT_ADMIN), and a
+# name absent from both is left alone: an app is allowed to name a syscall the
+# headers do not, and flagging that would just train people to ignore this lint.
+APPDIR="$ROOT/userland/apps"
+if [ -d "$APPDIR" ]; then
+    rule5_ran=1
+    alldefs="$(cat "$KHDR" "$UHDR" 2>/dev/null \
+               | sed -nE 's@^#define[[:space:]]+(SYS_[A-Z0-9_]+)[[:space:]]+([0-9]+).*@\1 \2@p' \
+               | sort -u || true)"
+    appfiles="$(grep -rlE '^[[:space:]]*(#define[[:space:]]+SYS_[A-Z0-9_]+[[:space:]]+[0-9]+|const[[:space:]]+SYS_[A-Z0-9_]+:[[:space:]]*i64[[:space:]]*=[[:space:]]*[0-9]+)' \
+                "$APPDIR" 2>/dev/null | grep -v '/vendor/' || true)"
+    napp=0
+    for f in $appfiles; do
+        defs="$(sed -nE 's@^[[:space:]]*#define[[:space:]]+(SYS_[A-Z0-9_]+)[[:space:]]+([0-9]+).*@\1 \2@p;
+                         s@^[[:space:]]*const[[:space:]]+(SYS_[A-Z0-9_]+):[[:space:]]*i64[[:space:]]*=[[:space:]]*([0-9]+).*@\1 \2@p' \
+                "$f" | sort -u || true)"
+        [ -n "$defs" ] || continue
+        while read -r name num; do
+            [ -n "$name" ] || continue
+            [ "$name" = "SYS_MAX" ] && continue
+            hn="$(printf '%s\n' "$alldefs" | awk -v n="$name" '$1 == n {print $2}' | sort -u | tr '\n' ' ')"
+            hn="${hn% }"
+            [ -n "$hn" ] || continue          # app-only name: not our business
+            napp=$((napp + 1))
+            case " $hn " in
+                *" $num "*) ;;
+                *) bad "${f#$ROOT/}: $name = $num but the headers say $hn. An app that keeps its own copy of a number does not fail to build when the number moves; it silently calls a DIFFERENT syscall (#745)." ;;
+            esac
+        done <<< "$defs"
+    done
+    say "note: rule 5 checked $napp app-local syscall constant(s)"
+else
+    skipped "rule 5 (app-local syscall constants): $APPDIR does not exist"
+fi
+
+total="$(printf '%s\n' "$kdefs" | wc -l | tr -d ' ')"
+if [ "$fail" -ne 0 ]; then
+    say "FAILED"
+    exit 1
+fi
+skipped=""
+[ "${rule3_ran:-0}" = 1 ] || skipped="$skipped rule3(kernel/libc agreement)"
+[ "${rule5_ran:-0}" = 1 ] || skipped="$skipped rule5(app-local copies)"
+if [ -n "$skipped" ]; then
+    say "OK for the rules that RAN: $total syscall defines, all numbers unique, SYS_MAX past the top"
+    say "NOT CHECKED (no userland/ in this tree):$skipped. Run with --strict where the whole tree exists."
+else
+    say "OK: $total syscall defines, all numbers unique, SYS_MAX past the top, kernel and libc agree, app-local copies match"
+fi

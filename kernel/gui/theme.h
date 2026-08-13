@@ -437,7 +437,10 @@ uint32_t theme_darken(uint32_t color, int percent);
 // Theme Persistence and Runtime Switching (Added by P14 - Theme Specialist)
 // =============================================================================
 
-// Save current theme selection to /CONFIG/THEME.CFG
+// #711/#683b: NO-OP STUB. /CONFIG/THEME.CFG has exactly one writer, and it is
+// userland (libc/gui_theme.c, "active=<slug>"). This kernel-side writer used a
+// second, incompatible schema ("theme=/index=") on a second filesystem (the FAT
+// ESP rather than the ext2 root) and has been removed. Do not reinstate it.
 int theme_save_config(void);
 
 // Load theme selection from config file

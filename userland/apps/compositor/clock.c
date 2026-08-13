@@ -12,6 +12,7 @@
 
 #include "compositor.h"
 #include "../../libc/syscall.h"
+#include "../../libc/tz.h"   // #49: THE local-clock helper; never read the RTC here
 
 int g_show_digclock  = 0;     // visible (toggled from the widgets tray menu)
 int g_digclk_x       = -1;    // top-left x (-1 = default on first render)
@@ -51,13 +52,10 @@ static const char *mon3[]  = {"Jan","Feb","Mar","Apr","May","Jun",
 
 static void fmt_2(char *b, int v) { b[0] = '0' + (v / 10) % 10; b[1] = '0' + (v % 10); }
 
-// Zeller-ish day-of-week, 0=Sunday.
-static int digclk_dow(int d, int m, int y) {
-    static const int t[] = {0,3,2,5,0,3,5,1,4,6,2,4};
-    if (m < 3) y -= 1;
-    int w = (y + y/4 - y/100 + y/400 + t[(m-1) & 15] + d) % 7;
-    return (w < 0) ? w + 7 : w;
-}
+// #50: the private day-of-week routine that used to live here is gone; tz_wday()
+// in libc/tz.c is THE one, shared with widgets.c's calendar which had its own
+// separate Zeller copy. Two implementations of the same congruence is exactly
+// the pattern these tickets are about.
 
 // Large text with a soft drop shadow (no card). 2 TTF draws.
 static void halo(int x, int y, const char *s, int size, uint32_t fg) {
@@ -65,11 +63,13 @@ static void halo(int x, int y, const char *s, int size, uint32_t fg) {
     draw_text_ttf(x, y, s, size, fg);
 }
 
+// #49: LOCAL time, not the raw RTC. tz_local_hms() applies the user's chosen
+// zone (which the RTC does not carry: the RTC is UTC). Every clock this file
+// feeds - the digital desktop widget AND, via lock_clock_hms/_date below, the
+// lock screen and the login screen - therefore follows the setting.
 static void get_hms(int *hh, int *mm, int *ss, const char **ampm) {
-    long rtc = sys_get_rtc_time();
-    int h = (int)((rtc >> 16) & 0xFF);
-    int m = (int)((rtc >> 8) & 0xFF);
-    int s = (int)(rtc & 0xFF);
+    int h = 0, m = 0, s = 0;
+    tz_local_hms(&h, &m, &s);
     *ampm = "";
     if (g_digclk_12h) {
         *ampm = (h >= 12) ? "PM" : "AM";
@@ -111,7 +111,7 @@ __attribute__((unused)) static char *minsec_str(char *buf) {
 // "Mon DD" (no weekday) - the right-block bottom line for style 1.
 __attribute__((unused)) static char *monthday_str(char *buf) {
     int d = 19, m = 6, y = 2026;
-    get_rtc_date(&d, &m, &y);
+    tz_local_date(&d, &m, &y);
     if (m < 1) m = 1;
     if (m > 12) m = 12;
     int i = 0;
@@ -127,18 +127,18 @@ __attribute__((unused)) static char *monthday_str(char *buf) {
 // Full weekday name for the current date (style 1 middle line).
 __attribute__((unused)) static const char *weekday_full(void) {
     int d = 19, m = 6, y = 2026;
-    get_rtc_date(&d, &m, &y);
+    tz_local_date(&d, &m, &y);
     if (m < 1) m = 1;
     if (m > 12) m = 12;
-    return wdayfull[digclk_dow(d, m, y) & 7];
+    return wdayfull[tz_wday(d, m, y) & 7];
 }
 
 static char *date_str(char *buf) {
     int d = 19, m = 6, y = 2026;
-    get_rtc_date(&d, &m, &y);
+    tz_local_date(&d, &m, &y);
     if (m < 1) m = 1;
     if (m > 12) m = 12;
-    int w = digclk_dow(d, m, y);
+    int w = tz_wday(d, m, y);
     int i = 0;
     const char *wd = wday3[w & 7];
     for (int k = 0; wd[k]; k++) buf[i++] = wd[k];
@@ -257,3 +257,27 @@ void digclk_draw(int x, int y) {
 }
 
 void clock_render(void) { }   // legacy entry: the widget framework draws it now
+
+// #566: thin public wrappers around this file's own static RTC formatters, so
+// the lock screen's big live clock (lockscreen.c) reuses the exact same
+// time/date formatting instead of a second hand-rolled copy. Independent of
+// g_digclk_12h/g_digclk_secs (the lock screen always shows 24h + seconds, the
+// liveness indicator per docs/SECURE_LOGIN_DESIGN.md section 3.6/4.3).
+void lock_clock_hms(char *buf, int with_secs) {
+    // #49: goes STRAIGHT to tz_local_hms() rather than through get_hms(). The
+    // comment above has always said this readout is independent of
+    // g_digclk_12h, but routing it through get_hms() meant a user who set the
+    // desktop widget to 12-hour also got a 12-hour lock screen with no AM/PM
+    // marker (get_hms() returns the marker separately and this function
+    // dropped it), i.e. an ambiguous clock. Now the claim is true.
+    int hh = 0, mm = 0, ss = 0;
+    tz_local_hms(&hh, &mm, &ss);
+    int i = 0;
+    fmt_2(buf + i, hh); i += 2;
+    buf[i++] = ':'; fmt_2(buf + i, mm); i += 2;
+    if (with_secs) { buf[i++] = ':'; fmt_2(buf + i, ss); i += 2; }
+    buf[i] = '\0';
+}
+void lock_clock_date(char *buf) {
+    date_str(buf);
+}

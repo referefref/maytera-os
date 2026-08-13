@@ -1,3 +1,7 @@
+; SPDX-License-Identifier: MIT
+; Copyright (c) MayteraOS contributors.
+; Full license text: userland/libc/LICENSE (MIT License).
+;
 ; setjmp.asm - Non-local jump implementation for x86_64
 ; Implements setjmp/longjmp for exception handling support
 
@@ -66,3 +70,8 @@ longjmp:
 
     ; Jump to saved return address
     jmp [rdi + JB_RIP]
+
+; #640 leg 4: mark the stack NON-EXECUTABLE. ld marks PT_GNU_STACK RWE for
+; the WHOLE link if ANY input object lacks this note, so every hand-written
+; NASM object needs it, not just crt0. gcc emits it automatically for C.
+section .note.GNU-stack noalloc noexec nowrite progbits

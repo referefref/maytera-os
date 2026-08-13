@@ -972,7 +972,29 @@ fn recursive_hull_check(
     }
 
     // The far side of the crossing is solid: this plane is the impact plane.
-    st.normal = plane_normal(plane);
+    // THE ELEVATION/FLY-THROUGH BUG (#568): a clipnode's stored plane normal
+    // always points toward its children[0] ("front") side, regardless of
+    // which side the moving object actually approached from. The reference
+    // SV_RecursiveHullCheck negates the normal when side==1 (the segment
+    // started on the plane's NEGATIVE side, i.e. children[1]); this port used
+    // to return plane_normal(plane) unconditionally, which is only correct
+    // for side==0. A real compiled BSP's clipnode child order is an internal
+    // qbsp/hlbsp implementation detail with no relationship to "up/outside is
+    // children[0]" - it varies per node - so roughly HALF of all wall/floor/
+    // ceiling impacts across a large multi-elevation map (stairs, platforms,
+    // catwalks, tunnels) came back with a BACKWARDS normal. world.c's ground
+    // check (`best_n.z > FLOOR_NORMAL_Z`) and the residual-velocity clip
+    // (`dot(vel, best_n) < 0`) are both sign-SENSITIVE, so a flipped normal
+    // meant: floors at some elevations silently failed to register as ground
+    // (gravity never turned off, so the player kept re-falling into the same
+    // spot every other frame, or a ceiling hit was misread as landing on a
+    // floor), while the two SYNTHETIC test fixtures (hull_test's sealed room,
+    // dust2_test's single spawn point) happened to only ever exercise side==0
+    // impacts by construction, so neither caught it. See hull_test.c's new
+    // "side==1 ceiling-as-floor" fixture (gen_side1_fixture.py) for a minimal
+    // reproduction and world.c's step-up comment for the gameplay symptom.
+    let n = plane_normal(plane);
+    st.normal = if side == 0 { n } else { [-n[0], -n[1], -n[2]] };
 
     // Back off along the segment in 0.1-fraction steps (matching the
     // reference algorithm exactly) until a non-solid point is found. This is

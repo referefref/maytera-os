@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // stdio.h - Standard I/O for MayteraOS userland
 #ifndef LIBC_STDIO_H
 #define LIBC_STDIO_H
@@ -5,6 +9,12 @@
 #include <stddef.h>
 #include <stdarg.h>
 #include <stdint.h>
+
+#ifndef SEEK_SET
+#define SEEK_SET 0   // task #568: ANSI stdio.h must define these (was unistd.h-only)
+#define SEEK_CUR 1
+#define SEEK_END 2
+#endif
 
 // Output functions
 int putchar(int c);
@@ -38,6 +48,11 @@ extern FILE *stderr;
 FILE *fopen(const char *path, const char *mode);
 FILE *fdopen(int fd, const char *mode);
 int   fclose(FILE *f);
+// AssaultCube port phase 3 (docs/ASSAULTCUBE_PORT_PLAN.md): standard
+// <stdio.h> remove(), a genuinely missing generic primitive (was only
+// exposed as unlink()/rmdir() before). Tries unlink() first (files, the
+// common case), falls back to rmdir() for a directory path.
+int   remove(const char *path);
 size_t fread(void *buf, size_t sz, size_t n, FILE *f);
 size_t fwrite(const void *buf, size_t sz, size_t n, FILE *f);
 int   fseek(FILE *f, long off, int whence);
@@ -55,6 +70,7 @@ int   ungetc(int c, FILE *f);
 int   fprintf(FILE *f, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 int   vfprintf(FILE *f, const char *fmt, va_list ap);
 int   setvbuf(FILE *f, char *buf, int mode, size_t sz);
+void  setbuf(FILE *f, char *buf);
 
 // Formatted input
 int sscanf(const char *str, const char *fmt, ...) __attribute__((format(scanf, 2, 3)));

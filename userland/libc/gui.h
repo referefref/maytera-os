@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // gui.h - GUI library for MayteraOS user-space applications
 // Provides window protocol client and drawing helpers
 #ifndef _GUI_H

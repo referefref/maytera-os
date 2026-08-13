@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // stdio_file.c - FILE* stream implementation for MayteraOS userland
 #include "stdio.h"
 #include "stdlib.h"
@@ -65,6 +69,25 @@ static int parse_mode(const char *mode, int *o_flags, int *mode_bits) {
     return 0;
 }
 
+// task #582 (OpenArena port): rd_buf/wr_buf must both start out NULL, not
+// whatever garbage bytes a non-zeroed malloc(sizeof(FILE)) (see fdopen())
+// left at that offset. Previously this function only touched the buffer
+// pointer belonging to the mode actually in use (rd_buf for MODE_READ,
+// wr_buf for MODE_WRITE), so a write-only stream (fopen(path,"a"), no
+// '+') left rd_buf uninitialized. fclose()/setvbuf() then unconditionally
+// trusted rd_buf whenever owns_buf was set (fdopen() always sets it),
+// so EVERY close of a write-only file called free() on that garbage
+// pointer - a real, reproduced, measured heap-corruption bug: OpenArena's
+// Sys_Print() does fopen("OALOG.TXT","a") + fputs + fclose() on every
+// single console line, so this fired once per log line, live, right at
+// FS_Startup's search-path printout ("[malloc] heap corruption: free()
+// called with a pointer that does not resolve to a valid block", the
+// freed "pointer" decoding to literal ASCII bytes of a nearby string like
+// "q3config.cfg" - leftover heap content from a previous allocation of
+// the same freed/reused block, not a real FILE-owned buffer at all).
+// Zeroing both pointers here (and every size/pos field) up front, before
+// the mode-specific branches below populate only what applies, makes an
+// unused buffer pointer a defined NULL instead of undefined garbage.
 static void stream_init(FILE *s, int fd, int mode_bits, int buf_mode,
                         char *buf, size_t bufsz) {
     s->fd = fd;
@@ -72,23 +95,86 @@ static void stream_init(FILE *s, int fd, int mode_bits, int buf_mode,
     s->eof = 0;
     s->error = 0;
     s->ungot = -1;
+    s->rd_buf = NULL;
+    s->rd_size = 0;
+    s->rd_pos = 0;
+    s->rd_len = 0;
+    s->wr_buf = NULL;
+    s->wr_size = 0;
+    s->wr_pos = 0;
     if (mode_bits & MODE_READ) {
         s->rd_buf = buf;
         s->rd_size = bufsz;
-        s->rd_pos = 0;
-        s->rd_len = 0;
     }
     if (mode_bits & MODE_WRITE) {
         s->wr_buf = buf;
         s->wr_size = bufsz;
-        s->wr_pos = 0;
     }
     s->owns_buf = 0;
 }
 
+// task #582: fclose()/setvbuf() both need to free the ONE buffer fdopen()
+// actually malloc'd, without (a) trusting rd_buf when the stream is
+// write-only (see stream_init's comment above - that was the crash), and
+// without (b) double-freeing when a mode has both bits set (e.g. "r+"),
+// since stream_init() then points BOTH rd_buf and wr_buf at the SAME
+// single malloc'd buffer. Free whichever of the two is non-NULL, and
+// prefer rd_buf only because for the dual-mode case they are literally
+// the same pointer, so it does not matter which one is chosen - it must
+// just be freed exactly once.
+static void free_owned_buf(FILE *f) {
+    if (!f->owns_buf) return;
+    if (f->rd_buf) {
+        free(f->rd_buf);
+    } else if (f->wr_buf) {
+        free(f->wr_buf);
+    }
+    f->rd_buf = NULL;
+    f->wr_buf = NULL;
+    f->owns_buf = 0;
+}
+
+// #745 printf-shredding fix. Before this, printf()/putchar()/puts() never
+// touched this FILE layer at all: they called syscall1(SYS_PUTCHAR, c)
+// directly, one syscall per CHARACTER (see stdio.c). The kernel's /dev/console
+// backend (drivers/console.c) mirrors every write() under 256 bytes to the
+// syslog ring as ONE record, so a one-byte write() became a one-BYTE syslog
+// record: a diagnostic line assembled from N putchar() calls came out as N
+// shredded, unreadably interleaved entries instead of one line. The fix is
+// this buffering layer, already fully built and already correct for fopen()/
+// fwrite()/fprintf() - printf()/putchar()/puts() just never used it. See the
+// stdio.c end of this fix for the call-site side.
+//
+// stdout's buffering mode is chosen HERE, once, based on whether fd 1 is a
+// real interactive terminal:
+//   - isatty(1) FALSE (the common case: GUI apps like the compositor, and
+//     autorun/redirected tools) -> _IOLBF. A whole printf() line is now one
+//     write(2, buf, n) syscall, which is one syslog record and, incidentally,
+//     matches real libc's own "line-buffered unless truly non-interactive"
+//     default. Flushed on '\n', on a full 4096-byte buffer, or via fflush()/
+//     process exit (see exit() in stdlib.c and __libc_fini() in libc_init.c).
+//   - isatty(1) TRUE (an app launched from a real PTY-backed terminal, e.g.
+//     msh/vi/rogue/less run interactively) -> _IONBF, preserving EXACTLY
+//     today's per-character-immediate behavior. Those apps echo keystrokes
+//     and draw partial lines (shell prompts, cursor movement) with no
+//     trailing newline and no fflush() of their own; buffering that would
+//     make the terminal look frozen until Enter. This is the "something
+//     depends on the old behavior" case the fix must not silently regress,
+//     and it is why the split is by isatty(), not a blanket buffer-everything
+//     change. console_fops has no .ioctl (see drivers/console.c), so
+//     isatty(1) reliably reads 0 there and 1 on a real pts/N slave
+//     (drivers/pty.c / drivers/tty.c implement TIOCGPGRP) - verified by
+//     reading both .ioctl paths, not assumed.
+//
+// stderr stays _IONBF unconditionally, matching the codebase's own existing
+// crash-diagnostic convention: assert.c's __assert_fail() and stack_guard.c's
+// __stack_chk_fail() already write to fd 2 (raw or via fprintf(stderr,...))
+// expecting it to survive an abort()/_exit() with no flush. Nothing about
+// this fix touches that path.
 void __stdio_init(void) {
     stream_init(stdin, 0, MODE_READ, _IOLBF, 0, 0);
-    stream_init(stdout, 1, MODE_WRITE, _IOLBF, g_stdout_buf, sizeof(g_stdout_buf));
+    int stdout_buf_mode = isatty(1) ? _IONBF : _IOLBF;
+    stream_init(stdout, 1, MODE_WRITE, stdout_buf_mode, g_stdout_buf, sizeof(g_stdout_buf));
     stream_init(stderr, 2, MODE_WRITE, _IONBF, g_stderr_buf, sizeof(g_stderr_buf));
 }
 
@@ -127,6 +213,13 @@ static int flush_writes(FILE *f) {
     return 0;
 }
 
+// #695: fflush() IS NOT DURABILITY, and this is the layer where that gets
+// confused. flush_writes() above only drains the userland stdio buffer into
+// write(2); after it returns 0 the bytes are in the KERNEL, not on the medium.
+// For MayteraOS specifically, a write() to an ext2 or SMB/NFS fd only appends to
+// a kernel buffer that is committed at flush time, so fflush() can succeed on a
+// file that will never exist. To learn that the bytes are on the disk, call
+// fsync(fileno(f)) after fflush(f) and check IT.
 int fflush(FILE *f) {
     if (!f) {
         int rc = 0;
@@ -142,7 +235,7 @@ int fclose(FILE *f) {
     int rc = flush_writes(f);
     int cr = close(f->fd);
     if (cr < 0) rc = EOF;
-    if (f->owns_buf && f->rd_buf) free(f->rd_buf);
+    free_owned_buf(f);
     if (f != &g_stdin_s && f != &g_stdout_s && f != &g_stderr_s) free(f);
     return rc;
 }
@@ -275,7 +368,7 @@ void rewind(FILE *f) { fseek(f, 0, 0); f->error = 0; f->eof = 0; }
 
 int setvbuf(FILE *f, char *buf, int mode, size_t sz) {
     flush_writes(f);
-    if (f->owns_buf && f->rd_buf) free(f->rd_buf);
+    free_owned_buf(f);
     f->rd_buf = f->wr_buf = buf;
     f->rd_size = f->wr_size = sz;
     f->rd_pos = f->rd_len = 0;
@@ -283,6 +376,16 @@ int setvbuf(FILE *f, char *buf, int mode, size_t sz) {
     f->owns_buf = 0;
     f->flags = (f->flags & 0xF) | (mode << 4);
     return 0;
+}
+
+// setbuf: the traditional (pre-setvbuf) buffering call, added for the
+// Rogue port (userland/apps/rogue, task: verify+fix rogue). NULL means
+// "unbuffered"; a non-NULL buffer means "fully buffered, BUFSIZ bytes"
+// (glibc/BSD semantics). This is a real shared-libc primitive, not a
+// rogue-specific shim, so any future port that calls setbuf() gets it
+// for free instead of re-adding a private copy.
+void setbuf(FILE *f, char *buf) {
+    setvbuf(f, buf, buf ? _IOFBF : _IONBF, BUFSIZ);
 }
 
 // fprintf: reuse vsnprintf into a small chunked buffer then fwrite

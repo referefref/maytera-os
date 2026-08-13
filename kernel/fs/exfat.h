@@ -252,7 +252,7 @@ void exfat_close(exfat_file_t *file);
 int exfat_read(exfat_file_t *file, void *buffer, uint64_t size);
 
 // Write to file
-int exfat_write(exfat_file_t *file, const void *buffer, uint64_t size);
+MUST_CHECK int exfat_write(exfat_file_t *file, const void *buffer, uint64_t size);
 
 // Get file size
 uint64_t exfat_size(exfat_file_t *file);
@@ -288,7 +288,7 @@ int exfat_rename(exfat_fs_t *fs, const char *old_path, const char *new_path);
 void *exfat_read_file(exfat_fs_t *fs, const char *path, uint64_t *size_out);
 
 // Write entire file
-int exfat_write_file(exfat_fs_t *fs, const char *path, const void *data, uint64_t size);
+MUST_CHECK int exfat_write_file(exfat_fs_t *fs, const char *path, const void *data, uint64_t size);
 
 // Check if path exists
 int exfat_exists(exfat_fs_t *fs, const char *path);
@@ -306,7 +306,7 @@ void exfat_print_info(exfat_fs_t *fs);
 void exfat_list_dir(exfat_fs_t *fs, const char *path);
 
 // Sync (flush caches)
-int exfat_sync(exfat_fs_t *fs);
+MUST_CHECK int exfat_sync(exfat_fs_t *fs);
 
 // =============================================================================
 // Utility Functions

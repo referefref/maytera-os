@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // sys/wait.h
 #ifndef LIBC_SYS_WAIT_H
 #define LIBC_SYS_WAIT_H

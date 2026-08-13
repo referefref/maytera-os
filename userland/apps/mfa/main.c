@@ -407,7 +407,7 @@ static void draw_field(int x, int y, int w, const char *lbl, const char *val, in
     draw_text_sz(window_handle, x, y, lbl, 11, COL_TEXT2);
     int fy = y + 16;
     gui_fill_rounded_aa(window_handle, x, fy, w, 26, 4, COL_FIELD, COL_CARD);
-    gui_rounded_border(window_handle, x, fy, w, 26, 4, active ? COL_ACCENT : COL_FIELD_BORDER);
+    gui_rounded_border(window_handle, x, fy, w, 26, 4, active ? gui_pal()->focus : COL_FIELD_BORDER);  // #745
     draw_text_sz(window_handle, x + 6, fy + 5, val, 13, COL_TEXT);
     if (active) {
         int cx = x + 6 + (int)strlen(val) * 8;

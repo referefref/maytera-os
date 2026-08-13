@@ -35,7 +35,7 @@
 // if the config file is absent/empty. The manifest URL and the kernel URL are
 // both derived from this base (the kernel path comes from the signed manifest,
 // but its host is rebased onto the configured server so a relocated repo works).
-#define OTA_SERVER_DEFAULT "http://<UPDATE_SERVER>"
+#define OTA_SERVER_DEFAULT "http://updates.maytera.net"
 #define OTA_SERVER_CFG     "/CONFIG/OTA_SERVER.CFG"
 static char g_server_base[192] = OTA_SERVER_DEFAULT;
 

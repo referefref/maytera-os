@@ -54,6 +54,14 @@
 // Access Flags
 // ============================================================================
 
+// #616: THE hard ceiling validate_user_string() will accept as max_len. It is
+// not advisory: a longer bound is rejected outright as VALIDATE_ARRAY_TOO_LARGE,
+// so every strnlen_user()/strncpy_from_user() caller MUST stay at or under it.
+// It lives here, and validate.c uses it, so a caller can no longer pick a bound
+// out of the air that the validator silently refuses (#615's kstrdup_opt asked
+// for 4MB and therefore failed on EVERY call - see proc/syscall.c).
+#define USER_STRING_MAX         (1024u * 1024u)
+
 #define ACCESS_READ             (1 << 0)    // Read access
 #define ACCESS_WRITE            (1 << 1)    // Write access
 #define ACCESS_EXEC             (1 << 2)    // Execute access
@@ -91,10 +99,14 @@ typedef enum {
 // Pointer Validation API
 // ============================================================================
 
+// #646: validate_init() is DELETED (zero callers, and its "initialized" flag
+// was never read by anything). There is nothing to initialise.
+
 /**
- * Initialize the validation subsystem
+ * Number of pointer/string validations rejected since boot. Read by
+ * security_print_status().
  */
-void validate_init(void);
+uint64_t validate_failure_count(void);
 
 /**
  * Validate a user-space pointer
@@ -114,16 +126,6 @@ validate_error_t validate_user_ptr(const void *ptr, size_t size, uint32_t access
 validate_error_t validate_user_string(const char *str, size_t max_len);
 
 /**
- * Validate a user-space array
- * @param arr       array pointer
- * @param count     number of elements
- * @param elem_size size of each element
- * @param access    access flags
- * @return          VALIDATE_OK if valid, error code otherwise
- */
-validate_error_t validate_user_array(const void *arr, size_t count, size_t elem_size, uint32_t access);
-
-/**
  * Validate a kernel pointer (for internal checks)
  * @param ptr       pointer to validate
  * @param size      size of memory region
@@ -137,13 +139,6 @@ validate_error_t validate_kernel_ptr(const void *ptr, size_t size);
  * @return          true if in user space
  */
 bool is_user_address(uint64_t addr);
-
-/**
- * Check if an address is in kernel space
- * @param addr      address to check
- * @return          true if in kernel space
- */
-bool is_kernel_address(uint64_t addr);
 
 /**
  * Check if an address is canonical
@@ -207,29 +202,13 @@ ssize_t strnlen_user(const char *str, size_t max_len);
 int clear_user(void *dest, size_t size);
 
 // ============================================================================
-// Alignment Validation
-// ============================================================================
-
-/**
- * Check pointer alignment
- * @param ptr       pointer to check
- * @param alignment required alignment (must be power of 2)
- * @return          true if properly aligned
- */
-static inline bool is_aligned(const void *ptr, size_t alignment) {
-    return ((uint64_t)ptr & (alignment - 1)) == 0;
-}
-
-/**
- * Validate pointer alignment for specific type
- * @param ptr       pointer to check
- * @param type_size size of type (for alignment)
- * @return          VALIDATE_OK if aligned, VALIDATE_UNALIGNED otherwise
- */
-validate_error_t validate_alignment(const void *ptr, size_t type_size);
-
-// ============================================================================
 // Convenience Macros for Syscall Validation
+//
+// #646: all four have ZERO uses in the tree. They are kept because they are the
+// correct shape for a new syscall to adopt (validate, then -EFAULT), but do not
+// read their existence as evidence that syscalls are validated. What actually
+// validates today is proc/syscall.c's argtab dispatcher and the copy_*_user
+// family; see the note at the top of proc/procinfo.h.
 // ============================================================================
 
 // Validate read-only user pointer, return -EFAULT on failure

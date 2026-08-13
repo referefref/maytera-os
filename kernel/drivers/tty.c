@@ -9,6 +9,8 @@
 #include "tty.h"
 #include "../types.h"
 #include "../proc/signal.h"
+#include "../security/validate.h"  // #500: SYS_IOCTL Ring-3 arg validation
+#include "../security/uaccess_smap.h"  // #19/#645: AC bracket on the caller-buffer copy
 
 // From libc equivalents.
 extern void *memcpy(void *, const void *, size_t);
@@ -205,13 +207,18 @@ int64_t tty_read(tty_t *t, void *buf, size_t count, int nonblock) {
         if (rc == WAIT_EINTR) return -4;  // -EINTR
     }
 
-    while (got < count && t->input_ring.count > 0) {
-        uint8_t b;
-        ring_get(&t->input_ring, &b);
-        out[got++] = b;
-        // In canonical mode, stop at LF so read() doesn't cross lines.
-        if ((t->termios.c_lflag & ICANON) && b == '\n') break;
-    }
+    // #19/#645: `out` is the caller's buffer, Ring-3 on the sys_read path
+    // (kernel callers exist too, hence a bracket rather than copy_to_user).
+    // The wait_event above is deliberately OUTSIDE this window.
+    {   uaccess_ac_t __ac = uaccess_begin();
+        while (got < count && t->input_ring.count > 0) {
+            uint8_t b;
+            ring_get(&t->input_ring, &b);
+            out[got++] = b;
+            // In canonical mode, stop at LF so read() doesn't cross lines.
+            if ((t->termios.c_lflag & ICANON) && b == '\n') break;
+        }
+        uaccess_end(__ac); }
     return (int64_t)got;
 }
 
@@ -222,7 +229,13 @@ int64_t tty_write(tty_t *t, const void *buf, size_t count) {
     const uint8_t *in = (const uint8_t *)buf;
     size_t put = 0;
     while (put < count) {
-        uint8_t b = in[put];
+        // #19/#645: one load from the caller's (possibly Ring-3) buffer. The
+        // bracket is per byte because the loop body below can BLOCK waiting for
+        // ring space, and AC must not span that wait.
+        uint8_t b;
+        {   uaccess_ac_t __ac = uaccess_begin();
+            b = in[put];
+            uaccess_end(__ac); }
         int crlf = (t->termios.c_oflag & OPOST) && b == '\n' &&
                    (t->termios.c_oflag & ONLCR);
         int needed = crlf ? 2 : 1;
@@ -263,11 +276,15 @@ int64_t tty_write(tty_t *t, const void *buf, size_t count) {
 size_t tty_output_drain(tty_t *t, void *buf, size_t max) {
     uint8_t *out = (uint8_t *)buf;
     size_t got = 0;
-    while (got < max && t->output_ring.count > 0) {
-        uint8_t b;
-        ring_get(&t->output_ring, &b);
-        out[got++] = b;
-    }
+    // #19/#645: `out` is the caller's buffer; Ring-3 whenever a process holds
+    // the ptmx fd and reads it. Missing from the pre-existing ledger entirely.
+    {   uaccess_ac_t __ac = uaccess_begin();
+        while (got < max && t->output_ring.count > 0) {
+            uint8_t b;
+            ring_get(&t->output_ring, &b);
+            out[got++] = b;
+        }
+        uaccess_end(__ac); }
     // #442: wake any tty_write() blocked waiting for room -- without this,
     // draining the ring never told a blocked writer that space opened back
     // up, so the write()-side wait above would need a spurious wake to ever
@@ -322,6 +339,62 @@ int tty_ioctl(tty_t *t, unsigned cmd, void *arg) {
             return 0;  // stub
     }
     return -25;  // -ENOTTY
+}
+
+// #500 (MAYTERA-SEC-2026-0016): validate a USER ioctl arg for exactly the cmds
+// whose handlers dereference it. Called ONLY from the SYS_IOCTL syscall boundary
+// (proc/syscall.c), where arg is known to come from Ring 3. It is deliberately
+// NOT called from the kernel-internal file_ioctl callers (gui/terminal.c,
+// net/ssh/ssh2_server.c), which legitimately pass kernel pointers that must not
+// be U/S-validated. Returns 0 if arg is acceptable (or the cmd dereferences no
+// user memory - the switch default), or -14 (EFAULT) if the user pointer fails
+// the CR3 U/S walk (present + user, plus writable for the get/read-into-user
+// cmds). Sizes are compiler ground truth (sizeof), never hand-computed.
+// #509: describe the user<->kernel transfer for a tty ioctl cmd so the
+// SYS_IOCTL syscall boundary (proc/syscall.c) can bounce the arg through a
+// kernel buffer (TOCTOU-safe copy_*_user), leaving tty_ioctl()'s kernel-internal
+// callers (gui/terminal.c, net/ssh/ssh2_server.c, which pass KERNEL pointers)
+// untouched. Returns the arg size and sets from_user (kernel READS the user arg)
+// / to_user (kernel WRITES the user arg). Returns 0 if the cmd touches no user
+// memory. The cmd set mirrors tty_ioctl_validate_user_arg exactly.
+size_t tty_ioctl_user_desc(unsigned cmd, int *from_user, int *to_user) {
+    *from_user = 0; *to_user = 0;
+    switch (cmd) {
+        case TCGETS:       *to_user   = 1; return sizeof(struct termios);
+        case TCSETS: case TCSETSW: case TCSETSF:
+                           *from_user = 1; return sizeof(struct termios);
+        case TIOCGWINSZ:   *to_user   = 1; return sizeof(struct winsize);
+        case TIOCSWINSZ:   *from_user = 1; return sizeof(struct winsize);
+        case TIOCGPGRP:    *to_user   = 1; return sizeof(uint32_t);
+        case TIOCSPGRP:    *from_user = 1; return sizeof(uint32_t);
+        case FIONREAD:     *to_user   = 1; return sizeof(int);
+        case 0x80045430: /* TIOCGPTN: ptym_ioctl writes *(int *)arg */
+                           *to_user   = 1; return sizeof(int);
+        default:           return 0;
+    }
+}
+
+int tty_ioctl_validate_user_arg(unsigned cmd, void *arg) {
+    size_t sz;
+    uint32_t acc;
+    switch (cmd) {
+        case TCGETS:                          sz = sizeof(struct termios); acc = ACCESS_WRITE_USER; break;
+        case TCSETS: case TCSETSW: case TCSETSF:
+                                              sz = sizeof(struct termios); acc = ACCESS_READ_USER;  break;
+        case TIOCGWINSZ:                      sz = sizeof(struct winsize); acc = ACCESS_WRITE_USER; break;
+        case TIOCSWINSZ:                      sz = sizeof(struct winsize); acc = ACCESS_READ_USER;  break;
+        case TIOCGPGRP:                       sz = sizeof(uint32_t);       acc = ACCESS_WRITE_USER; break;
+        case TIOCSPGRP:                       sz = sizeof(uint32_t);       acc = ACCESS_READ_USER;  break;
+        case FIONREAD:                        sz = sizeof(int);            acc = ACCESS_WRITE_USER; break;
+        case 0x80045430: /* TIOCGPTN: ptym_ioctl writes *(int *)arg */
+                                              sz = sizeof(int);            acc = ACCESS_WRITE_USER; break;
+        default:
+            // Every other cmd returns -ENOTTY (or a stub) without touching arg,
+            // so there is nothing to validate. A NULL arg to a deref cmd is
+            // rejected here too (validate_user_ptr returns VALIDATE_NULL).
+            return 0;
+    }
+    return validate_user_ptr(arg, sz, acc) == VALIDATE_OK ? 0 : -14;
 }
 
 void tty_hangup(tty_t *t) {

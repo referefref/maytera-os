@@ -37,6 +37,7 @@ extern int g_clock_locked, g_cal_locked;             // widgets.c lock flags
 extern int g_digclk_x, g_digclk_y, g_digclk_locked, g_digclk_12h, g_digclk_secs, g_digclk_style; // clock.c
 extern int g_cursor_style, g_cursor_size;  // main.c (#116)
 extern int g_dock_style;                   // taskbar.c (#387 dock layout)
+extern int g_dock_opacity;                 // draw.c (#745 glass opacity, percent OPAQUE)
 
 // NOTE: the FAT driver is 8.3-only (no long/leading-dot names), so the profile
 // is stored as <home>/UIPROFIL.YML rather than the literal ~/.ui-profile.yaml.
@@ -54,6 +55,27 @@ static void prof_path(char *out) {
     out[i] = '\0';
 }
 
+// Current logged-in session username, e.g. for keying the Start menu's
+// per-user config directory (startmenu_model.rs's user layer, see startmenu.c
+// sm_user_fragment_dir()). Exposed here rather than open-coded in startmenu.c
+// because startmenu.c includes compositor.h, whose unguarded
+// `typedef int bool;` conflicts with libc/types.h's `typedef _Bool bool;`
+// pulled in by pwd.h/unistd.h (the same landmine documented at the top of
+// startmenu.c re: gui_scroll.h) - profile.c has no such conflict, so the
+// getpwuid() call belongs here, with just the resulting name string crossing
+// the file boundary. Writes an empty string (never a placeholder name) if the
+// session identity cannot be resolved, so callers see "no user identity" as
+// exactly that rather than a synthetic default.
+void profile_current_username(char *out, int outsz) {
+    if (outsz <= 0) return;
+    out[0] = '\0';
+    struct passwd *pw = getpwuid(getuid());
+    if (!pw || !pw->pw_name || !pw->pw_name[0]) return;
+    int i = 0;
+    while (pw->pw_name[i] && i < outsz - 1) { out[i] = pw->pw_name[i]; i++; }
+    out[i] = '\0';
+}
+
 static int prof_atoi(const char *s) {
     int v = 0, neg = 0; while (*s == ' ') s++;
     if (*s == '-') { neg = 1; s++; }
@@ -66,6 +88,34 @@ int  desktop_icon_count(void);
 void desktop_get_icon_pos(int idx, int *x, int *y);
 void desktop_set_icon_pos(int idx, int x, int y);
 int  desktop_positions_hash(void);
+int  desktop_builtin_count(void);                                  // (#745)
+int  desktop_icon_key(int idx, char *out, int cap);                // (#745)
+void desktop_set_icon_pos_by_key(const char *key, int axis, int v);// (#745)
+void desktop_place_unplaced(void);                                 // (#745)
+
+// (#745) HOW ICON POSITIONS ARE KEYED, AND HOW AN EXISTING DESKTOP MIGRATES.
+//
+// They used to be "ico<N>x"/"ico<N>y", keyed by the icon's INDEX. That is only
+// correct while the icon list is a fixed compiled-in array. Now that icons also
+// come from <home>/DESKTOP, adding or deleting ONE file renumbers every icon
+// after it, and every saved coordinate would be applied to the wrong icon. The
+// new form is "ic<key>x"/"ic<key>y", where <key> is the icon's stable identity
+// ('s'+app basename, or 'u'+file name+hash) and always begins 's' or 'u'.
+//
+// MIGRATION IS A READ-PATH RULE, not a conversion pass:
+//   READ  - both forms are accepted. A legacy "ico<N>" key is applied ONLY when
+//           N is below desktop_builtin_count(), i.e. only to the system icons
+//           those keys were actually written for. That is what preserves an
+//           existing user's arrangement of Computer / Recycle Bin / Terminal /
+//           Settings / Browser / App Store exactly as they left it.
+//   WRITE - always the new form. The first save after upgrade rewrites the file
+//           and the "ico<N>" lines simply stop being emitted.
+// So no arrangement is discarded, nothing needs a "have I migrated" flag that
+// could be wrong, and there is no half-completed one-shot copy to recover from.
+//
+// The bounded legacy read is also what stops a stale "ico6" (written when a
+// Start-menu "Add to Desktop" icon happened to sit at index 6 in some earlier
+// session) from being applied to whatever file now occupies index 6.
 
 // Parse keys of the form "ico<N>x" / "ico<N>y" into an icon index + axis.
 // Returns 1 on a match (sets *idx and *axis: 0=x, 1=y), 0 otherwise.
@@ -83,11 +133,26 @@ static int parse_icon_key(const char *k, int *idx, int *axis) {
 static void prof_apply(const char *k, int v) {
     int icoi, axis;
     if (parse_icon_key(k, &icoi, &axis)) {
+        // (#745) LEGACY form, bounded to the system icons it was written for.
+        if (icoi >= desktop_builtin_count()) return;
         int x = 0, y = 0;
         desktop_get_icon_pos(icoi, &x, &y);
         if (axis == 0) x = v; else y = v;
         desktop_set_icon_pos(icoi, x, y);
         return;
+    }
+    // (#745) Current form: "ic" + <key> + axis, where <key> starts 's' or 'u'.
+    // Disjoint from the legacy "ico<digit>" form by construction.
+    if (k[0] == 'i' && k[1] == 'c' && (k[2] == 's' || k[2] == 'u')) {
+        int L = 0; while (k[L]) L++;
+        char ax = (L >= 4) ? k[L - 1] : 0;
+        if (ax == 'x' || ax == 'y') {
+            char kk[24]; int m = 0;
+            for (int i = 2; i < L - 1 && m < (int)sizeof(kk) - 1; i++) kk[m++] = k[i];
+            kk[m] = '\0';
+            desktop_set_icon_pos_by_key(kk, (ax == 'x') ? 0 : 1, v);
+            return;
+        }
     }
     if      (!strcmp(k, "theme"))        set_theme(v);
     else if (!strcmp(k, "wallpaper"))    set_wallpaper(v);
@@ -165,7 +230,21 @@ static void prof_apply(const char *k, int v) {
     else if (!strcmp(k, "wtz2"))           g_wt_off[2] = v;
     else if (!strcmp(k, "show_stickies"))  g_show_stickies = v;
     else if (!strcmp(k, "show_aichat"))     g_aichat_enabled = v;
-    else if (!strcmp(k, "dock_style"))      g_dock_style = (v >= 0 && v < 4) ? v : 0;  // #387
+    else if (!strcmp(k, "dock_style"))      g_dock_style = (v >= 0 && v < 5) ? v : 0;  // #387 (#26: 5 = DOCK_COUNT in compositor.h, not included here)
+    // #745 glass opacity, percent OPAQUE. The floor is DERIVED, not chosen, and
+    // moved 60 -> 70 (dockgrey, 2026-08-12) in the same change that lightened
+    // CLR_GLASS_TINT's dark-branch derivation (main.c glass_theme_apply(), 58%
+    // -> 78%, so the marble dock/taskbar read as dark grey rather than black,
+    // per user report). A lighter tint at a low opacity lets more of a bright
+    // wallpaper wash through the glass, so the safe floor moved with it: a full
+    // black/white backdrop sweep against every glass-enabled shipped theme's
+    // OWN ink (readable_ink(taskbar_bg), see draw.c) puts the worst case
+    // (Ocean, white backdrop) at 4.62:1 for op=70 with the new tint, clearing
+    // WCAG AA's 4.5:1 text floor with a small margin - see
+    // /tmp/dockgrey_harness.py, do not hand-recompute this. A corrupt or
+    // out-of-range value falls back to the 75 default rather than to 0, which
+    // would render an invisible dock.
+    else if (!strcmp(k, "dock_opacity"))    g_dock_opacity = (v >= 70 && v <= 100) ? v : 75;
     // Mouse sensitivity (1-10): the kernel is the live authority (SYS_SET_MOUSE_SPEED,
     // applied to every PS/2 + USB delta). Seed it from the persisted profile on load.
     else if (!strcmp(k, "mouse_sens"))      set_mouse_speed((v >= 1 && v <= 10) ? v : 7);
@@ -176,7 +255,12 @@ void profile_load(void) {
     int fd = sys_open(path, 0);
     if (fd < 0) fd = sys_open("/UIPROFIL.YML", 0);
     if (fd < 0) return;
-    static char buf[2048];
+    // (#745) 5120, matching profile_save()'s buffer: the icon list is now
+    // dynamic (up to DESKTOP_ICON_MAX entries, two lines each), so a profile
+    // written by profile_save() must fit through the reader too. A short read
+    // here would silently drop the tail of the file, which is the last lines,
+    // which is exactly the icon positions.
+    static char buf[5120];
     long n = sys_read(fd, buf, sizeof(buf) - 1);
     sys_close(fd);
     if (n <= 0) return;
@@ -200,6 +284,11 @@ void profile_load(void) {
     }
     set_display_fx(g_brightness, g_nightlight);   // apply combined display fx
 }
+// (#745) NOTE: the second-pass icon placement is NOT called from in here. It is
+// called by the caller, immediately after profile_load() returns, because
+// profile_load() has three early returns (no file, empty file, unreadable) and
+// a placement pass that only runs on the success path would leave a first-boot
+// machine, the exact case with no profile at all, without one.
 
 static char *put_kv(char *p, const char *k, int v) {
     while (*k) *p++ = *k++;
@@ -214,20 +303,19 @@ static char *put_kv(char *p, const char *k, int v) {
     return p;
 }
 
-// Build an "ico<N><axis>" key into out (e.g. "ico12x"). out must hold >=8 bytes.
-static void icon_key(char *out, int idx, char axis) {
-    int i = 0;
-    out[i++] = 'i'; out[i++] = 'c'; out[i++] = 'o';
-    char t[6]; int n = 0;
-    if (idx == 0) t[n++] = '0';
-    while (idx) { t[n++] = '0' + idx % 10; idx /= 10; }
-    while (n) out[i++] = t[--n];
-    out[i++] = axis;
-    out[i] = '\0';
-}
+// (#745) The old icon_key() builder ("ico<N><axis>") is gone with the writer
+// that used it. parse_icon_key() above stays, because the READ path must still
+// understand a profile written by an older build.
 
 void profile_save(void) {
-    char buf[2048]; char *p = buf;
+    // (#745) static, and 5120 rather than 3072: this is ~75 fixed keys plus
+    // TWO lines per desktop icon, and it was a stack array sized with no
+    // margin. Adding a key to it as-is is how a stack smash starts. The icon
+    // lines are now name-keyed and the icon set is DYNAMIC up to
+    // DESKTOP_ICON_MAX (32), so the worst case is ~75*20 + 32*2*26 = ~3164
+    // bytes; 5120 keeps real headroom. profile_load()'s reader is sized to
+    // match, or the tail (the icon positions) would be silently truncated.
+    static char buf[5120]; char *p = buf;
     p = put_kv(p, "theme",        get_theme());
     p = put_kv(p, "wallpaper",    get_wallpaper());
     p = put_kv(p, "font_size",    get_font_size());
@@ -306,17 +394,25 @@ void profile_save(void) {
     p = put_kv(p, "show_stickies",  g_show_stickies);
     p = put_kv(p, "show_aichat",    g_aichat_enabled);
     p = put_kv(p, "dock_style",     g_dock_style);   // #387
+    p = put_kv(p, "dock_opacity",   g_dock_opacity); // #745
     p = put_kv(p, "mouse_sens",     get_mouse_speed());  // mouse feel (kernel sensitivity 1-10)
 
-    // Desktop icon positions (#: movable icons). One pair of keys per icon.
+    // Desktop icon positions. (#745) Keyed by the icon's STABLE IDENTITY, not
+    // by its index in the list: the list is dynamic now, and an index-keyed
+    // coordinate lands on a different icon the moment a file is added or
+    // removed ahead of it. See the migration note at the top of this file.
     {
         int ic = desktop_icon_count();
         for (int i = 0; i < ic; i++) {
             int x = 0, y = 0;
             desktop_get_icon_pos(i, &x, &y);
-            char k[8];
-            icon_key(k, i, 'x'); p = put_kv(p, k, x);
-            icon_key(k, i, 'y'); p = put_kv(p, k, y);
+            char kb[24];
+            if (desktop_icon_key(i, kb, sizeof(kb)) != 0) continue;
+            char k[28]; int m = 0;
+            k[m++] = 'i'; k[m++] = 'c';
+            for (int j = 0; kb[j] && m < 26; j++) k[m++] = kb[j];
+            k[m] = 'x'; k[m + 1] = '\0'; p = put_kv(p, k, x);
+            k[m] = 'y';                   p = put_kv(p, k, y);
         }
     }
 
@@ -359,7 +455,28 @@ void profile_tick(void) {
           + g_show_ha*331 + g_ha_x*337 + g_ha_y*347 + g_ha_locked*349
           + g_ha_mode*353 + g_ha_min*359 + g_ha_max*367   // #419
           + g_aichat_enabled*293   // #185
-          + g_dock_style*331       // #387 dock layout
+          + g_dock_style*379       // #387 dock layout (#745: this term used to
+                                   // carry the SAME prime as g_show_ha above. Two
+                                   // keys sharing a weight means a simultaneous
+                                   // +1/-1 leaves the hash unchanged, profile_save()
+                                   // is skipped, and BOTH changes are silently lost
+                                   // at the next reboot. Every term here must have
+                                   // its own prime.)
+          + g_dock_opacity*383     // #745 glass opacity. THIS TERM IS THE
+                                   // (#745 MERGE) 379 was taken by
+                                   // g_dock_style above, which moved
+                                   // there to stop sharing 331 with
+                                   // g_show_ha. Two keys on one prime
+                                   // is the bug that fix removed, so
+                                   // this takes the next free prime.
+                                   // WHOLE OF PART 3: profile_tick() only
+                                   // calls profile_save() when this hash
+                                   // changes, so a key present in put_kv
+                                   // but absent here applies live, survives
+                                   // until shutdown, and is gone on the next
+                                   // boot - which reads as "it did not save"
+                                   // and sends you looking at the file writer.
+                                   // 379 is the next free prime after 373.
           + get_mouse_speed()*373; // mouse feel: persist sensitivity changes
     if (last == -1) { last = h; return; }   // first sample: don't rewrite
     if (h != last) { last = h; profile_save(); }

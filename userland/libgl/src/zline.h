@@ -21,6 +21,21 @@
 		p1 = p2;
 		p2 = tmp;
 	}
+	// #560-followup: this Bresenham walk had NO bounds check against the
+	// buffer at all - a projected endpoint outside [0,xsize)x[0,ysize)
+	// (near-clip W close to zero, or a viewport-edge rounding case) made it
+	// walk pp/pz off the end of zb->pbuf/zb->zbuf for the whole line,
+	// corrupting adjacent heap/bss memory (measured: this wedged the
+	// GLTUNNEL screensaver, task #560 - the corrupted memory landed on the
+	// TinyGL context's matrix stack pointer, so the NEXT glBegin() call
+	// faulted on a garbage pointer many instructions after the real
+	// out-of-bounds write). Reject the whole line rather than walk off the
+	// buffer; this only rejects already-invalid geometry, never anything a
+	// correctly clipped scene would produce.
+	if (p1->x < 0 || p1->x >= zb->xsize || p1->y < 0 || p1->y >= zb->ysize ||
+	    p2->x < 0 || p2->x >= zb->xsize || p2->y < 0 || p2->y >= zb->ysize) {
+		return;
+	}
 	sx = zb->xsize;
 	pp = (PIXEL*)((GLbyte*)zb->pbuf + zb->linesize * p1->y + p1->x * PSZB);
 #ifdef INTERP_Z

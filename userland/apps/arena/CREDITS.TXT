@@ -1,9 +1,40 @@
 MAYTERA ARENA - ART ASSET CREDITS
 =================================================================
-The world/environment graphics overhaul uses freely-licensed art
-from OpenGameArt.org. Every asset below is CC0 (public domain).
-CC0 requires no attribution; credit is given here voluntarily and
-because this repository is public.
+This file covers two different asset sets under two different
+licenses; read each section's License line, not just this intro.
+
+The world/environment graphics overhaul (textures, sky, signage
+below) uses freely-licensed art from OpenGameArt.org. Every asset
+in THAT section is CC0 (public domain). CC0 requires no
+attribution; credit is given here voluntarily and because this
+repository is public.
+
+The character and weapon sprites (see "Freedoom Character and
+Weapon Sprites" below) are a SEPARATE set under the Freedoom
+project's BSD 3-clause license, which DOES require attribution -
+this section exists to satisfy that.
+
+-----------------------------------------------------------------
+Freedoom Character and Weapon Sprites
+  Project: Freedoom (https://github.com/freedoom/freedoom), v0.13.0
+  License: BSD 3-clause ("Copyright 2001-2024 Contributors to the
+           Freedoom project. All rights reserved."); full text in
+           FREEDOOM-COPYING.txt, which sits alongside both asset
+           directories it covers.
+  Source:  freedoom2.wad release, extracted and converted from Doom
+           picture format to BMP.
+  Used for: all enemy/character sprites (/ARENA/assets/spr/*.BMP -
+  zombie, shotgun zombie, serpentipede skins) and all weapon
+  viewmodel sprites (/ARENA/assets/wpn/*.BMP). See the source-file
+  header comments in characters.c and weapons_art.c for the exact
+  Freedoom lump prefixes each set was extracted from.
+  License file locations: userland/apps/arena/assets/spr/FREEDOOM-COPYING.txt,
+  userland/apps/arena/assets/wpn/FREEDOOM-COPYING.txt, and
+  userland/apps/arena/assets/FREEDOOM-COPYING.txt (the parent
+  directory covering both - added 2026-08-12, #745 task #57, because
+  a copy previously existed only next to wpn/ even though spr/ is
+  the larger Freedoom-derived set and this file never mentioned
+  Freedoom at all).
 
 -----------------------------------------------------------------
 Zortch World Textures

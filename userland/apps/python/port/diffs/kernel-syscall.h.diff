@@ -1,0 +1,18 @@
+--- /root/cpython-p2-backup/syscall.h.orig	2026-07-07 16:27:23.212844378 +0000
++++ <workspace>	2026-07-07 16:29:06.264900773 +0000
+@@ -255,6 +255,7 @@
+ #define SYS_DUP                        90
+ #define SYS_DUP2                       91
+ #define SYS_PIPE                       92
++#define SYS_FCNTL                      93  // #359: fcntl(fd,cmd,arg)
+ #define SYS_IOCTL                      94  // Device control (termios, winsize, ...)
+ #define SYS_WAITPID         98  // Wait for specific child process
+ #define SYS_GET_CPU_USAGE              193
+@@ -320,6 +321,7 @@
+ 
+ // File I/O
+ int64_t sys_open(const char *path, int flags);
++int64_t sys_fcntl(int fd, int cmd, long arg);  // #359
+ int64_t sys_play_wav(const char *path);
+ int64_t sys_close(int fd);
+ int64_t sys_read(int fd, void *buf, size_t count);

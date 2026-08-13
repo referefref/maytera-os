@@ -92,7 +92,14 @@ int main(int argc, char **argv) {
     int errors = 0;
     for (int i = 2; i < argc; i++) {
         if (chown(argv[i], new_uid, new_gid) != 0) {
-            printf("chown: cannot change ownership of '%s'\n", argv[i]);
+            // #554: chown is refused (not faked) on a genuine FAT path (the
+            // ESP: /boot, /EFI) - FAT has no owner to change. The kernel
+            // returns a plain -1 for both that case and a real permission
+            // denial, so this message covers both honestly rather than
+            // guessing which one happened.
+            printf("chown: cannot change ownership of '%s': permission denied,\n"
+                   "  or the filesystem has no ownership concept (FAT: /boot, /EFI)\n",
+                   argv[i]);
             errors++;
         }
     }

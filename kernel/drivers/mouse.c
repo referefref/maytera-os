@@ -342,6 +342,26 @@ void mouse_inject_button(int32_t x, int32_t y, int down) {
     __asm__ volatile("sti");
 }
 
+// (Win16 SkiFree idle-freeze repro, #200-follow-on) Test/automation hook: move
+// the synthetic cursor WITHOUT touching button state. mouse_inject_button()
+// always forces g_mouse.buttons = down?1:0, so it cannot express "the mouse is
+// hovering, no button involved" -- every call is a click edge. A real hardware
+// mouse move never changes button state, and this repeatedly-called-with-
+// unchanged-position path is exactly what a host cursor sitting over a window
+// generates (continuous WM_MOUSEMOVE with no button transitions), which is the
+// scenario needed to reproduce/verify the Win16 message-queue idle-starvation
+// bug (an app's PeekMessage-driven idle/animate branch never seeing an empty
+// queue while the cursor hovers). Touches the exact same globals
+// mouse_inject_button does, so every consumer (win16_pump_mouse included) sees
+// an identical move to real hardware; buttons are left exactly as they were.
+void mouse_inject_move(int32_t x, int32_t y) {
+    __asm__ volatile("cli");
+    g_mouse.x = x; g_mouse.y = y;
+    mouse_x = x; mouse_y = y;
+    g_mouse_synth_until = timer_ticks + 60;   /* ~240ms at 250Hz */
+    __asm__ volatile("sti");
+}
+
 // #307: inject a USB-HID boot mouse report (relative deltas + button bitmap +
 // wheel). Feeds the SAME g_mouse state that the PS/2 packet path updates, so the
 // compositor treats USB and PS/2 mice identically. HID Y is positive-down, the

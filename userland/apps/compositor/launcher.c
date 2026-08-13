@@ -4,7 +4,8 @@
 // next to the taskbar Start button. The user types a natural-language request
 // (or picks a seeded example with the arrow keys) and presses Enter; the prompt
 // is handed as a ONE-SHOT request to the existing AI backend by reusing the AI
-// Chat dock (/APPS/aichat) hand-off path: we write the prompt to
+// Chat dock (source dir/binary "aichat", deployed as /APPS/AICHAT, #371)
+// hand-off path: we write the prompt to
 // /CONFIG/AIASK.TXT and (re)enable the dock app, which consumes the file, pops
 // its panel open, and runs the prompt through the SAME ReAct tool loop
 // (aiclient_run_turn, #292/#327) that the chat input box uses. We do NOT add a
@@ -177,6 +178,10 @@ void launcher_render(void) {
     int ph = field_h + 14 + N_EXAMPLES * 34 + 20;
     int px = (g_fb_width - pw) / 2;
     int py = g_fb_height / 4;
+    // (local 81) ph grows with N_EXAMPLES, a compile-time array count, and this
+    // had no bottom clamp at all: one more example row and the panel ran off
+    // the screen. Shared work-area clamp, same one every other popup uses.
+    popup_clamp_to_work_area(pw, ph, &px, &py);
     if (py < 40) py = 40;
 
     s_panel_x = px; s_panel_y = py; s_panel_w = pw; s_panel_h = ph;

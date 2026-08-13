@@ -144,6 +144,399 @@ static void parse_perms_line(const char *line) {
     perms_set(path, uid, gid, mode);
 }
 
+// ============================================================================
+// #670 SYSTEM PERMS SEED
+// ============================================================================
+// perms_check() defaults a path with NO entry to root-owned 0755: world
+// READABLE, root-only writable (see its `if (!e)` branch below). That default
+// is how the kernel image itself (/KERNEL.ELF and its three sibling boot paths)
+// and every on-disk diagnostic became readable by any Ring-3 process. An
+// unstripped kernel.elf is a complete symbol map; a panic record is a live
+// fault address.
+//
+// The seed below gives those files REAL entries instead of leaning on the
+// default. Two properties matter:
+//
+//  1. It runs UNCONDITIONALLY, not only in perms_init()'s "no PERMS.DB found"
+//     branch. That branch does not execute on a shipped image, because the
+//     golden ships a /CONFIG/PERMS.DB. Adding entries there alone would have
+//     changed nothing on a real system while LOOKING like a fix, which is the
+//     exact prose-over-artifact trap blame.md keeps recording.
+//  2. It only fills a MISSING entry. An existing entry (an admin chmod, or a
+//     hand-authored PERMS.DB) always wins, so the seed can neither undo an
+//     operator decision nor silently re-tighten something root loosened.
+//
+// Every path here is written by Ring 0 only (panic.c, bootlog.c, devlog.c,
+// selfupdate.c, the installer) and read by nothing in userland: a tree-wide
+// grep of userland/ finds no open of any of them. perms_check() is consulted
+// only for p->privilege == PRIV_USER, so the in-kernel writers are unaffected
+// by 0600. Off-line post-mortem is also unaffected: PERMS.DB is a
+// MayteraOS-side sidecar and FAT/ext2 carry no such bits, so pulling the medium
+// and reading it on another machine works exactly as before.
+static const struct { const char *path; uint16_t mode; } perms_system_seed[] = {
+    // The kernel image on every boot path the deploy writes. normalize_path()
+    // uppercases, so "/boot/kernel.elf" and "/BOOT/KERNEL.ELF" are one key.
+    { "/KERNEL.ELF",           0600 },
+    { "/BOOT/KERNEL.ELF",      0600 },
+    { "/EFI/BOOT/KERNEL.ELF",  0600 },
+    { "/BOOT/KERNEL.ELF.BAK",  0600 },   // selfupdate.c's brick-safe backup
+    // Persistent diagnostics. The panic record carries a fault address; the
+    // device and boot logs describe the hardware and boot path in detail.
+    // Both the pre-#670 root paths and the ESP paths panic.c now uses.
+    { "/BOOT/PANIC.TXT",       0600 },
+    { "/BOOT/STAGE.TXT",       0600 },
+    { "/PANIC.TXT",            0600 },
+    { "/STAGE.TXT",            0600 },
+    { "/BOOTLOG.TXT",          0600 },
+    { "/DEVLOG.TXT",           0600 },
+    { "/USBLOG.TXT",           0600 },
+    { "/AUDIOLOG.TXT",         0600 },
+    { "/WIN16LOG.TXT",         0600 },
+    { "/SELFUPD.LOG",          0600 },
+
+    // ---------------------------------------------------------------------
+    // #674: the /CONFIG secrets. Before #674 perms_check() never traversed, so
+    // /CONFIG being 0700 protected NOTHING below it: each of these paths had no
+    // entry of its own and fell into the `if (!e)` default above, which is
+    // world-readable. Every one of them now carries its own mode, which is the
+    // Linux shape: the directory is traversable and the protection lives on the
+    // file (/etc is 0755, /etc/shadow is not).
+    //
+    // Reader ring was checked per path before choosing a mode (a grep of both
+    // kernel/ and userland/ for every name). Ring-0 readers are unaffected by
+    // 0600 because perms_check() is consulted only for p->privilege == PRIV_USER.
+    // ---------------------------------------------------------------------
+    // Kernel-only readers: 0600 costs nothing today.
+    //   SSH.CFG      -> gui/sshterm.c st_load_cfg()
+    //   SSHHOST.KEY  -> net/ssh/ssh2_server.c load_host_key()
+    //   AUTHKEYS     -> net/ssh/ssh2_server.c authkey_allowed()
+    //   KNOWN_HOSTS  -> net/ssh/ssh2.c ssh2_known_hosts()
+    //   PERMS.DB     -> this file (perms_init); no userland reader exists,
+    //                   chmod(1) goes through SYS_FS_PERM_INFO, not the file.
+    // #745: SHADOW WAS THE ONE SECRET THE CODE SEED DID NOT COVER.
+    //
+    // Its 0600 was set ONLY in perms_init()'s "no PERMS.DB found" branch,
+    // which by that branch's own admission does not execute on a shipped
+    // image, because the golden ships a /CONFIG/PERMS.DB. The password
+    // hashes were therefore protected purely by a LINE IN A DATA FILE
+    // ("/CONFIG/SHADOW:0:0:0600", verified present on golden 1742), with
+    // nothing in the kernel to restore it. Lose or regenerate that file and
+    // SHADOW silently falls back to perms_check()'s no-entry default, which
+    // is world-READABLE. That is exactly the failure mode property 1 of this
+    // seed was written to prevent, and the most important file in the system
+    // was the one file left outside it.
+    //
+    // The seed only fills a MISSING entry, so a PERMS.DB that already carries
+    // the line keeps it and an operator chmod still wins. This costs nothing
+    // on a healthy image and is the difference between "protected" and
+    // "protected as long as one data file is intact".
+    { "/CONFIG/SHADOW",        0600 },
+    { "/CONFIG/SSH.CFG",       0600 },
+    { "/CONFIG/SSHHOST.KEY",   0600 },
+    // #697: SSHD.CFG decides whether this machine answers on the network and
+    // which accounts may log in. Ring-3 write access to it is remote access,
+    // so it gets the same 0600 as the host key it gates.
+    { "/CONFIG/SSHD.CFG",      0600 },
+    { "/CONFIG/AUTHKEYS",      0600 },
+    { "/CONFIG/KNOWN_HOSTS",   0600 },
+    { "/CONFIG/KNOWN_HO",      0600 },   // the FAT 8.3 twin that is also on disk
+    { "/CONFIG/PERMS.DB",      0600 },
+    // #692: CRON.CFG names programs and, since #692, the uid each runs as.
+    // Write access to it is therefore write access to another account. It
+    // had no entry and fell into the world-readable, root-writable default;
+    // pinning it makes the "a line with no owner came from root" assumption
+    // in cron_parse_line() an enforced property rather than an incidental
+    // one. No userland reader exists (a tree-wide grep of userland/ finds
+    // only a comment in apps/updated/main.c); cron is read via SYS_CRON_LIST.
+    { "/CONFIG/CRON.CFG",      0600 },
+
+    // Ring-3 readers exist: 0600 is a REAL behaviour change for a non-root
+    // session, and is deliberate. Recorded here so nobody has to rediscover it:
+    //   KIMI.KEY   -> userland/libc/aiclient.c load_key(), plus independent
+    //                 copies in apps/paint/ai.c and apps/settings/main.c.
+    //                 A non-root session loses AI in aichat/terminal/msh/rss/
+    //                 paint and the Settings AI panel.
+    //   AISVC.CFG  -> userland/libc/aiclient.c load_aisvc(); it can carry a key
+    //                 that OVERRIDES KIMI.KEY, so locking one without the other
+    //                 would be theatre. Not present on the shipped image; the
+    //                 entry is harmless until Settings creates the file.
+    //   EXTSVC.CFG -> apps/haservice/main.c load_config() and the Settings
+    //                 external-services panel. It holds a Home Assistant token.
+    //                 The HA desktop widget itself does NOT read it (it reads
+    //                 the /HA*.TXT cache haservice writes), so the widget keeps
+    //                 rendering; it is the daemon that would be denied.
+    { "/CONFIG/KIMI.KEY",      0600 },
+    { "/CONFIG/AISVC.CFG",     0600 },
+    { "/CONFIG/EXTSVC.CFG",    0600 },
+
+    // #745: files that had NO entry and so sat on the world-readable
+    // no-entry default. Each was found by enumerating /CONFIG on golden 1742
+    // and subtracting the seed, which is the only way to see a gap of this
+    // shape: nothing points at a file that nobody remembered to protect.
+    //
+    //   MFA.DB      the TOTP shared secrets, written from Ring 3 by
+    //               apps/mfa (DB_PATH at apps/mfa/main.c:28). Its own UI
+    //               string says "stored obfuscated (not encrypted)", so the
+    //               file IS the second factor: anyone who reads it can
+    //               generate the codes. It is created at enrolment rather
+    //               than shipped, which is why it is absent from the golden
+    //               and absent from every previous audit of that directory.
+    //               Seeding it here means the entry exists BEFORE the file
+    //               does, so perms_on_create() (which never overwrites) finds
+    //               a policy already in place instead of stamping its 0644
+    //               default on a file full of secrets.
+    //   SERVICES.CFG each line names an executable AND the uid to run it as
+    //               (kernel/proc/services.c parses "name exec account uid
+    //               perms autostart enabled"). Write access to it is the
+    //               power to run code as any user at boot, which is the same
+    //               authority CRON.CFG got 0600 for in #692. It was left on
+    //               the default purely because nobody had enumerated it.
+    //   LOGIN.CFG   names the account the machine autologins as. Write access
+    //               is the power to choose who the desktop session runs as,
+    //               which is the entire subject of this change.
+    { "/CONFIG/MFA.DB",        0600 },
+    { "/CONFIG/SERVICES.CFG",  0600 },
+    { "/CONFIG/LOGIN.CFG",     0600 },
+
+    // DELIBERATELY NOT 0600, with reasons, because "lock everything" is how a
+    // permission model gets turned back off again:
+    //   PASSWD/GROUP: these are Linux's /etc/passwd and /etc/group, and they are
+    //     0644 there for a reason. They hold NO secrets (every hash lives in
+    //     SHADOW, which is 0600). userland/libc/pwd.c and grp.c open them from
+    //     Ring 3 for every uid->name lookup in the system: the Files properties
+    //     owner column, the msh prompt, whoami, id, su, login, chown, adduser,
+    //     passwd, and the COMPOSITOR'S OWN home-directory resolution
+    //     (apps/compositor/profile.c). 0600 would break all of that to hide a
+    //     username list. Explicit entries rather than the default so the intent
+    //     is recorded and survives any future change to that default.
+    //   CACERTS.PEM: public trust anchors, by definition not secret. Loaded by
+    //     net/tls/cert_store.c in Ring 0, so it could in fact be 0600 with no
+    //     functional cost today, but making public data root-only buys no
+    //     security and would break the first userland TLS client anyone writes.
+    { "/CONFIG/PASSWD",        0644 },
+    { "/CONFIG/GROUP",         0644 },
+    { "/CONFIG/CACERTS.PEM",   0644 },
+};
+
+// #674: /CONFIG shipped as mode 0700 (verified on golden build 1018, commit
+// 1f2ee02: /CONFIG/PERMS.DB carries the line "/CONFIG:0:0:0700"). That is
+// BACKWARDS relative to the model it is imitating. In Linux, /etc is 0755 and
+// the protection lives on the individual file. A directory mode of 0700 is how
+// you make a directory unusable to everyone but its owner, not how you protect
+// its contents, and before #674 it protected nothing whatsoever, because
+// perms_check() never looked at a parent directory.
+//
+// With #674's traversal live it stops being merely useless and becomes
+// actively harmful: 0700 root:root denies SEARCH on /CONFIG to every non-root
+// process, so nothing under /CONFIG resolves at all, including the entries
+// that are supposed to stay readable (PASSWD, GROUP). The secrets are protected
+// by their OWN 0600 entries seeded above; the directory must be traversable.
+//
+// #745: 0755 WAS ONE BIT TOO GENEROUS, AND THE MISSING BIT IS THE ENUMERATION.
+//
+// #674 argued, correctly, that the directory must be TRAVERSABLE and that
+// protection belongs on the individual file. It then reached for 0755, which
+// grants traversal (x) AND LISTING (r). Only the x is load-bearing: every
+// reader #674 lists by name (PASSWD, GROUP, CACERTS.PEM) is opened by its full
+// path, and a tree-wide grep of userland/ finds NO opendir("/CONFIG") at all,
+// so nothing legitimate enumerates this directory. The r bit was paid for
+// nothing.
+//
+// What it cost: with 0755 the protection model is an ENUMERATED ALLOWLIST, and
+// the attacker gets to read the list. Anything not in perms_system_seed[] falls
+// to perms_check()'s world-readable no-entry default, and an attacker can find
+// those files by listing the directory rather than having to guess names.
+// /CONFIG/MFA.DB is exactly such a file: created at enrolment (so it is absent
+// from the golden and from every audit of that directory), holding TOTP seeds
+// under a single fixed XOR byte, and world-readable the moment it exists.
+//
+// 0711 keeps every property #674 argues for and removes the enumeration.
+// MEASURED, not assumed: rustkern/permpath.rs requires only X_OK on each
+// intermediate component and applies the caller's requested access to the leaf
+// alone, and sys_open_k() asks for R_OK on the object being opened, so a
+// directory at 0711 can be traversed to a known child but cannot be opened for
+// readdir. perms_selftest() asserts that split on the live database every boot.
+//
+// HONEST LIMIT, so nobody mistakes this for more than it is: 0711 hides the
+// NAME LIST, not existence. SYS_STAT (proc/syscall.c sys_stat_path) performs no
+// permission check whatsoever, so a caller who GUESSES a name still learns
+// whether it exists and how big it is, and SYS_FS_PERM_INFO will still report
+// its mode. This change removes the easy enumeration; it does not close the
+// existence oracle. Those two syscalls are recorded in blame.md as the next
+// piece of work, and are deliberately NOT changed here because adding a
+// permission check to stat has a far wider blast radius than one directory mode
+// and deserves its own change and its own verification.
+//
+// KNOWN DIVERGENCE, measured from the code: sys_chdir() (proc/syscall.c)
+// validates by calling sys_open_k(path, 0), which asks for R_OK. POSIX chdir
+// requires only search permission, so a non-root process cannot cd into a 0711
+// directory on this system even though it can traverse it. That is a
+// pre-existing bug in chdir rather than in this mode choice, it affects every
+// 0711 directory and not just this one, and fixing it means changing a
+// validation path used by every chdir in the system. Left alone here on
+// purpose; recorded in blame.md.
+//
+// This is the one place the seed's "an operator chmod always wins" rule is
+// relaxed, so it is deliberately narrow: it rewrites /CONFIG ONLY when it is
+// EXACTLY the known-bad shipped value, root:root 0700. Any other owner, or any
+// other mode, is somebody's decision and is left untouched.
+static void perms_fix_config_dir(void) {
+    uint32_t uid = 0, gid = 0;
+    uint16_t mode = 0;
+    if (perms_get("/CONFIG", &uid, &gid, &mode) != 0) return;  // no entry: seed/default handles it
+    if (uid != 0 || gid != 0) return;                          // somebody else owns it: leave it
+    uint16_t cur = mode & 0777;
+    // 0700 is the known-bad SHIPPED value. 0755 is the value THIS FUNCTION
+    // itself wrote between #674 and #745, so migrating it is not overriding an
+    // operator decision, it is finishing our own. Any OTHER mode is somebody's
+    // choice and is left untouched, which keeps the seed's "an operator chmod
+    // always wins" rule intact.
+    if (cur != 0700 && cur != 0755) return;
+
+    perms_set("/CONFIG", 0, 0, 0711);
+    kprintf("[PERMS] #745: /CONFIG %04o -> 0711 (searchable, NOT listable); "
+            "secrets protected by their own 0600 entries\n", cur);
+}
+
+// ===========================================================================
+// #674 BOOT SELF-TEST
+// ===========================================================================
+// blame.md's most-repeated lesson is that in-tree prose lies: a control is only
+// real if you watched it fire. This runs on EVERY boot, against the LIVE
+// permission database (not a synthetic one), and it exercises perms_check()
+// itself rather than a re-implementation of it, so a bug in the walker cannot
+// hide behind a test that shares it.
+//
+// It asserts BOTH directions. A test that only checks denials passes trivially
+// if the checker denies everything, which would be a total outage dressed up as
+// a security win.
+//
+// It does not modify the database, and it uses uid 1000/1002 (admin/ref, the
+// accounts /CONFIG/PASSWD actually ships) rather than inventing users.
+extern int perms_canon_rs(const char *src, char *out, uint32_t cap);
+
+static int st_fail;
+
+static void st_canon(const char *in, const char *want) {
+    char got[256];
+    int n = perms_canon_rs(in, got, sizeof(got));
+    if (n < 0 || strcmp(got, want) != 0) {
+        kprintf("[PERMS-SELFTEST] FAIL canon(\"%s\") = \"%s\" (want \"%s\")\n",
+                in, n < 0 ? "<error>" : got, want);
+        st_fail++;
+    }
+}
+
+static void st_check(const char *path, uint32_t uid, uint32_t gid, int access,
+                     int want, const char *why) {
+    int got = perms_check(path, uid, gid, access);
+    // perms_check returns 0 (allow) or -1 (deny); compare on the sign only.
+    if ((got == 0) != (want == 0)) {
+        kprintf("[PERMS-SELFTEST] FAIL %s uid=%u access=%d -> %d (want %d) [%s]\n",
+                path, uid, access, got, want, why);
+        st_fail++;
+    }
+}
+
+void perms_selftest(void) {
+    st_fail = 0;
+
+    // --- canonicalization: the walker must see the object the FS will open ---
+    st_canon("/CONFIG/SHADOW",            "/CONFIG/SHADOW");
+    st_canon("/CONFIG/../CONFIG/SHADOW",  "/CONFIG/SHADOW");  // ".." popped
+    st_canon("/CONFIG/./SHADOW",          "/CONFIG/SHADOW");  // "." dropped
+    st_canon("//CONFIG//SHADOW",          "/CONFIG/SHADOW");  // "//" collapsed
+    st_canon("CONFIG/SHADOW",             "/CONFIG/SHADOW");  // made absolute
+    st_canon("/A/B/../../C",              "/C");
+    st_canon("/..",                       "/");               // never above root
+    st_canon("/../../..",                 "/");
+    st_canon("/",                         "/");
+    st_canon("/CONFIG/",                  "/CONFIG");         // trailing slash
+
+    // --- enforcement, on the live database --------------------------------
+    // Guard on the entries this test reasons about, so a hand-edited PERMS.DB
+    // produces a clear SKIP rather than a misleading FAIL.
+    uint32_t u = 0, g = 0; uint16_t m = 0;
+    if (perms_get("/CONFIG/KIMI.KEY", &u, &g, &m) == 0 && u == 0 && (m & 0777) == 0600) {
+        // The whole point of #674: three spellings of ONE object, all denied.
+        st_check("/CONFIG/KIMI.KEY",           1000, 1000, R_OK, -1, "0600 root, other has no r");
+        st_check("/CONFIG/../CONFIG/KIMI.KEY", 1000, 1000, R_OK, -1, "dotdot bypass closed");
+        st_check("/CONFIG/./KIMI.KEY",         1000, 1000, R_OK, -1, "dot bypass closed");
+        st_check("//CONFIG//KIMI.KEY",         1000, 1000, R_OK, -1, "double-slash bypass closed");
+        st_check("CONFIG/KIMI.KEY",            1000, 1000, R_OK, -1, "relative bypass closed");
+        // The uid-0 early-out must be EXACTLY as it was before #674.
+        st_check("/CONFIG/KIMI.KEY",              0,    0, R_OK,  0, "root bypass preserved");
+    } else {
+        kprintf("[PERMS-SELFTEST] SKIP secret vectors (/CONFIG/KIMI.KEY not root:0600)\n");
+    }
+
+    // The other direction: /CONFIG must stay TRAVERSABLE and its public files
+    // readable, or #674 is an outage rather than a fix.
+    if (perms_get("/CONFIG", &u, &g, &m) == 0 &&
+        ((m & 0777) == 0755 || (m & 0777) == 0711)) {
+        st_check("/CONFIG",        1000, 1000, X_OK, 0, "/CONFIG searchable (like /etc)");
+        st_check("/CONFIG/PASSWD", 1000, 1000, R_OK, 0, "uid->name lookup must keep working");
+    } else {
+        kprintf("[PERMS-SELFTEST] SKIP traversal-open vectors "
+                "(/CONFIG is neither 0755 nor 0711)\n");
+    }
+
+    // Traversal proper: a directory that denies search to others must protect a
+    // child that has NO entry of its own. This is precisely what the pre-#674
+    // exact-path lookup could not do.
+    if (perms_get("/HOME/ADMIN", &u, &g, &m) == 0 && u == 1000 && (m & 0777) == 0750 &&
+        perms_get("/HOME/ADMIN/NOSUCHFILE", &u, &g, &m) != 0) {
+        st_check("/HOME/ADMIN/NOSUCHFILE", 1002, 1002, R_OK, -1,
+                 "no x on 0750 parent for other: child inherits protection");
+        st_check("/HOME/ADMIN/NOSUCHFILE", 1000, 1000, R_OK,  0,
+                 "owner traverses its own 0750 home");
+    } else {
+        kprintf("[PERMS-SELFTEST] SKIP traversal vectors (/HOME/ADMIN not 1000:0750)\n");
+    }
+
+    // #676: the exact predicate the O_CREAT gate consults. Creating a NAME is a
+    // write to the PARENT DIRECTORY, so sys_open_k() (and open_redir_file())
+    // ask perms_check(parent, W_OK | X_OK). Asserted here in BOTH directions on
+    // the live database, because the allow direction alone is what a boot
+    // happens to exercise: the desktop creates files in its own home and never
+    // tries to create one in /CONFIG, so nothing in a normal boot log shows the
+    // gate REFUSING. HONEST SCOPE: this proves the decision function, not the
+    // syscall wiring; the wiring is evidenced separately by the fact that a
+    // uid-1000 session now creates /HOME/ADMIN/UIPROFIL.YML and still cannot
+    // write /CONFIG.
+    st_check("/CONFIG", 1000, 1000, W_OK | X_OK, -1,
+             "#676: create in /CONFIG refused (root-owned, no w for other)");
+    st_check("/",       1000, 1000, W_OK | X_OK, -1,
+             "#676: create in / refused (root-owned 0755)");
+    if (perms_get("/HOME/ADMIN", &u, &g, &m) == 0 && u == 1000 && (m & 0777) == 0750) {
+        st_check("/HOME/ADMIN", 1000, 1000, W_OK | X_OK, 0,
+                 "#676: create in OWN HOME permitted (this is what #679 unblocks)");
+        st_check("/HOME/ADMIN", 1002, 1002, W_OK | X_OK, -1,
+                 "#676: create in ANOTHER user's home refused");
+    }
+
+    if (st_fail == 0) {
+        kprintf("[PERMS-SELFTEST] #674 PASS: canonicalization + directory traversal enforced\n");
+    } else {
+        kprintf("[PERMS-SELFTEST] #674 *** %d FAILURE(S) *** permission model is NOT correct\n",
+                st_fail);
+    }
+}
+
+static void perms_seed_system(void) {
+    unsigned n = sizeof(perms_system_seed) / sizeof(perms_system_seed[0]);
+    unsigned added = 0;
+    for (unsigned i = 0; i < n; i++) {
+        if (perms_lookup(perms_system_seed[i].path)) continue;  // operator wins
+        perms_set(perms_system_seed[i].path, 0, 0, perms_system_seed[i].mode);
+        added++;
+    }
+    if (added) {
+        kprintf("[PERMS] #670: seeded %u system entries (kernel image + diagnostics)\n",
+                added);
+    }
+}
+
 void perms_init(void) {
     kprintf("[PERMS] Initializing permissions database...\n");
 
@@ -200,15 +593,65 @@ void perms_init(void) {
         perms_set("/CONFIG/SHADOW", 0, 0, 0600);
         perms_set("/HOME", 0, 0, 0755);
 
-        perms_sync();
+        if (perms_sync() != 0)
+            kprintf("[PERMS] sync failed (entries stay dirty and will be retried)\n");
     }
 
+    // #670: applies to BOTH branches above, so a PERMS.DB that predates this
+    // change gets the missing entries too. perms_sync() no-ops when nothing was
+    // added (it early-returns on !perms_dirty).
+    perms_seed_system();
+    perms_fix_config_dir();   // #674: must run AFTER the seed (it reads /CONFIG)
+    if (perms_sync() != 0)
+        kprintf("[PERMS] sync failed (entries stay dirty and will be retried)\n");
+
     perms_initialized = true;
+    perms_selftest();         // #674: proves the walker on the LIVE database
     kprintf("[PERMS] Permissions database ready\n");
 }
 
-void perms_sync(void) {
-    if (!perms_dirty || !g_fat_fs.mounted) return;
+// #679: WRITE-BACK OF RUNTIME OWNERSHIP.
+//
+// perms_sync() had exactly three callers, all of them one-shot: perms_init(),
+// chmod, and user administration. Nothing flushed the table during ordinary
+// operation. So create-time ownership recorded by perms_on_create() lived in
+// RAM ONLY and was lost at the next boot, at which point the file would fall
+// back to perms_check()'s root-owned no-entry default and its creator would no
+// longer be able to write it. MEASURED: after a uid-1000 boot the compositor
+// successfully created /HOME/ADMIN/UIPROFIL.YML, and /CONFIG/PERMS.DB still
+// held the same 34 entries it had at boot, with no entry for the new file.
+// The fix would have looked correct for exactly one boot and then regressed,
+// which is the failure shape blame.md keeps recording.
+//
+// COALESCED, not per-create. perms_sync() rewrites the WHOLE database as one
+// file, so calling it from the create path would turn a thousand-file App Store
+// install into a thousand full-database writes. Instead the existing heartbeat
+// worker (main.c heartbeat_worker, a real thread on a timer that already
+// performs file I/O) calls this, and perms_sync() early-returns when nothing is
+// dirty. No new thread, no new timer, and no poll loop for the concurrency lint
+// to object to.
+//
+// LOCKING, honestly: the perms table has no lock, and this adds a periodic
+// READER concurrent with syscall-context writers. That is safe for the reader
+// because perms_set() fully initializes an entry BEFORE linking it at the head
+// of its chain, and x86-64 store ordering (TSO) does not reorder those two
+// stores, so a walker sees either the old head or a fully-formed new entry. It
+// can miss an entry that appears mid-walk; that entry is still dirty and is
+// written by the next flush. What this does NOT fix is the pre-existing
+// writer/writer race in alloc_entry()'s non-atomic perm_pool_next++, which two
+// concurrent creates could tear. That is untouched by this change and is
+// recorded here rather than silently inherited.
+int perms_sync_if_dirty(void) {
+    return perms_sync();   // early-returns unless perms_dirty
+}
+
+// #693: returns 0 only if /CONFIG/PERMS.DB is on the medium. The important part
+// is NOT the return value, it is that perms_dirty is now cleared ONLY on
+// success. Clearing it after a failed write is the exact bug #695 documented:
+// the dirty flag is the only record that these entries still need writing, so
+// dropping it converts a retryable failure into permanent, silent loss.
+int perms_sync(void) {
+    if (!perms_dirty || !g_fat_fs.mounted) return 0;
 
     kprintf("[PERMS] Syncing permissions to disk...\n");
 
@@ -216,7 +659,7 @@ void perms_sync(void) {
     char *buf = kmalloc(64 * 1024);  // 64KB buffer
     if (!buf) {
         kprintf("[PERMS] Failed to allocate sync buffer\n");
-        return;
+        return -1;
     }
 
     int pos = 0;
@@ -275,23 +718,34 @@ void perms_sync(void) {
     }
 
     // Write to disk
-    fat_write_file(&g_fat_fs, "/CONFIG/PERMS.DB", buf, pos);
+    int rc = fat_write_file(&g_fat_fs, "/CONFIG/PERMS.DB", buf, pos);
     kfree(buf);
+    if (rc != 0) {
+        kprintf("[PERMS] FAILED to write /CONFIG/PERMS.DB (rc=%d); staying DIRTY "
+                "so the next sync retries\n", rc);
+        return rc;
+    }
     perms_dirty = false;
     kprintf("[PERMS] Synced %d entries to /CONFIG/PERMS.DB\n", count);
+    return 0;
 }
 
 // ============================================================================
 // Permission checking
 // ============================================================================
 
-int perms_check(const char *path, uint32_t proc_uid, uint32_t proc_gid, int access) {
-    // Root bypasses all checks
-    if (proc_uid == 0) return 0;
-
-    // Kernel processes (called before perms_init) always pass
-    if (!perms_initialized) return 0;
-
+// #674: the SINGLE-OBJECT decision. This is the verbatim pre-#674 body of
+// perms_check(), MINUS the early-outs. It is non-static so the Rust path walker
+// (rustkern/permpath.rs) can apply it to each component of a resolved path.
+//
+// It deliberately does NOT carry the uid-0 or !perms_initialized bypasses:
+// perms_check() applies those before it ever calls the walker, so this entry
+// point can never become a way around them.
+//
+// `path` must already be CANONICAL (absolute, no "." / ".." / "//"). The only
+// normalization applied is perms_lookup()'s uppercasing, which is what makes
+// "/boot/kernel.elf" and "/BOOT/KERNEL.ELF" a single key.
+int perms_check_leaf(const char *path, uint32_t proc_uid, uint32_t proc_gid, int access) {
     perm_entry_t *e = perms_lookup(path);
     if (!e) {
         // No entry means default permissions: owned by root, mode 0755
@@ -311,6 +765,85 @@ int perms_check(const char *path, uint32_t proc_uid, uint32_t proc_gid, int acce
     if ((access & W_OK) && !(bits & 2)) return -1;  // EACCES
     if ((access & X_OK) && !(bits & 1)) return -1;  // EACCES
     return 0;
+}
+
+// rustkern/permpath.rs. Canonicalizes `path` the way the filesystem resolves it
+// (absolute, "." dropped, ".." popped, "//" collapsed), then requires search
+// (x) on the root and on every intermediate directory component before applying
+// `access` to the object itself. Returns 0 allow / -1 deny / -2 too-long.
+extern int perms_path_check_rs(const char *path, uint32_t uid, uint32_t gid, int access);
+#define PERMS_ETOOLONG (-2)
+
+// Cap on [PERMS-DENY] console lines for the lifetime of the boot. See the
+// comment at the emit site for why this is a hard cap and not a time-based
+// rate limit.
+#define PERMS_DENY_LOG_MAX 200u
+
+int perms_check(const char *path, uint32_t proc_uid, uint32_t proc_gid, int access) {
+    // Root bypasses all checks
+    if (proc_uid == 0) return 0;
+
+    // Kernel processes (called before perms_init) always pass
+    if (!perms_initialized) return 0;
+
+    // #745 ELEVATION GRANT. The compositor drew a trusted prompt, the person at
+    // the keyboard proved they are the owner of this session, and the kernel
+    // issued this process a grant. It is as narrow as a privilege can be made
+    // here: ONE process (a field on process_t that Ring 3 has no syscall to
+    // write), ONE path prefix (a kernel constant, never anything the app said),
+    // and a bounded deadline. elev_path_covered_rs() fails CLOSED on any path
+    // that is not a plain absolute path under that prefix, so "/APPS/../CONFIG/
+    // SHADOW" is refused rather than normalised. See proc/elevate.h.
+    //
+    // Placed here and not in pkg_write_permit() because the App Store's package
+    // members are written with ordinary sys_open/sys_mkdir/chmod, not with
+    // SYS_PKG_WRITE; perms_check() is the one place all of them meet.
+    {
+        extern int elev_grant_permits(const char *path, uint32_t proc_uid);
+        if (elev_grant_permits(path, proc_uid)) return 0;
+    }
+
+    // #674: POSIX path resolution. Before this, perms_check() was an EXACT-PATH
+    // lookup of the one string it was handed: /CONFIG being 0700 did not protect
+    // /CONFIG/KIMI.KEY (no entry of its own -> the permissive default above),
+    // and neither "/CONFIG/../CONFIG/SHADOW" nor the bare "CONFIG/SHADOW" (which
+    // sys_open_k() makes absolute AFTER this check) matched the 0600 entry that
+    // was supposed to guard it.
+    int r = perms_path_check_rs(path, proc_uid, proc_gid, access);
+    if (r == PERMS_ETOOLONG) {
+        kprintf("[PERMS] #674: path exceeds %d bytes canonicalized, denying\n",
+                (int)sizeof(((perm_entry_t *)0)->path));
+        r = -1;
+    }
+    if (r != 0) {
+        // #674: say WHICH process was denied WHICH path. Without this a
+        // permission problem reaches userland as a bare EACCES from open() and
+        // surfaces as "the AI panel is blank", with nothing on the console
+        // connecting it to a mode. Naming the process and the path is the
+        // difference between a measurable policy and a mystery.
+        //
+        // Bounded, not rate-limited by time: a tight retry loop in one app must
+        // not be able to flood the serial console (which is the only debug
+        // channel on real hardware) or to push earlier, more informative lines
+        // out of a captured log. The cap is deliberately generous enough to
+        // cover a whole desktop session start.
+        static unsigned deny_logged = 0;
+        if (deny_logged < PERMS_DENY_LOG_MAX) {
+            deny_logged++;
+            extern const char *proc_current_name(void);
+            kprintf("[PERMS-DENY] proc=%s uid=%u gid=%u want=%c%c%c path=%s\n",
+                    proc_current_name(), proc_uid, proc_gid,
+                    (access & R_OK) ? 'r' : '-',
+                    (access & W_OK) ? 'w' : '-',
+                    (access & X_OK) ? 'x' : '-',
+                    path);
+            if (deny_logged == PERMS_DENY_LOG_MAX) {
+                kprintf("[PERMS-DENY] log cap (%u) reached; further denials silent\n",
+                        (unsigned)PERMS_DENY_LOG_MAX);
+            }
+        }
+    }
+    return r;
 }
 
 // ============================================================================
@@ -396,6 +929,21 @@ int perms_chmod(const char *path, uint32_t caller_uid, uint16_t mode) {
         return 0;
     }
 
+    // #745: an elevation grant covers chmod inside its prefix. It has to,
+    // because change 2 above makes the installed file ROOT-owned, so the
+    // ordinary "must own the file" test below would refuse the installer's own
+    // 0555 stamp on the binary it just wrote. Same narrow scope as every other
+    // use of the grant: one process, one prefix, one deadline.
+    {
+        extern int elev_grant_permits(const char *path, uint32_t proc_uid);
+        if (elev_grant_permits(path, caller_uid)) {
+            perm_entry_t *ge = perms_lookup(path);
+            if (ge) { ge->mode = mode; perms_dirty = true; }
+            else    { perms_set(path, 0, 0, mode); }
+            return 0;
+        }
+    }
+
     // Non-root: must own the file
     perm_entry_t *e = perms_lookup(path);
     if (!e) return -1;  // No entry, default root-owned
@@ -404,6 +952,74 @@ int perms_chmod(const char *path, uint32_t caller_uid, uint16_t mode) {
     e->mode = mode;
     perms_dirty = true;
     return 0;
+}
+
+// ===========================================================================
+// #679 prerequisite: CREATE-TIME OWNERSHIP
+// ===========================================================================
+// THE BUG THIS FIXES, measured under #674 on a uid-1000 session: the compositor
+// could not write /HOME/ADMIN/UIPROFIL.YML even though /HOME/ADMIN is
+// 1000:1000 0750, i.e. even though it owns that directory outright.
+//
+// The cause is perms_check()'s no-entry default. A path with no entry is
+// treated as ROOT-OWNED, and that branch denies W_OK to everyone who is not
+// root. Since nothing but mkdir ever created an entry, EVERY file created by
+// EVERY non-root process fell into it. The practical effect was that no
+// non-root user could write any file anywhere, including in their own home
+// directory, so no non-root session could persist any state at all. That is a
+// far bigger obstacle to running the desktop as a normal user than the missing
+// path traversal #674 fixed, and it is why enabling non-root would have broken
+// the desktop rather than secured it.
+//
+// Linux does not have this problem because a created inode carries its
+// CREATOR's uid/gid from the moment it exists. This does the same thing for the
+// perms.c sidecar: at every create point, record the creating process as the
+// owner, with the conventional default modes (0644 for a file, 0755 for a
+// directory).
+//
+// WHY IT REFUSES TO OVERWRITE AN EXISTING ENTRY. Several files in this system
+// are DELETED AND REWRITTEN in place by Ring 0 on every boot: /BOOTLOG.TXT,
+// /PANIC.TXT, /CONFIG/PERMS.DB itself. Those carry deliberate 0600 entries from
+// the #670 and #674 seeds, and an unconditional perms_set() here would silently
+// downgrade them to 0644 the first time their writer ran, quietly undoing the
+// hardening from one directory over. The same rule protects an operator chmod.
+// Ownership is therefore established ONCE, when the path first appears; a path
+// that already has a policy keeps it.
+//
+// This lives in C, not Rust, for the same reason perms_check_leaf() does: it is
+// three lines against the existing C hash table and its C-internal pool/chain
+// layout, and its callers are the existing C syscall handlers. Reimplementing
+// the lookup in Rust to add a setter would fork a shared primitive, which is
+// the thing CLAUDE.md forbids, to gain nothing.
+// IT CANONICALIZES, and that is not incidental. #674's whole finding was that a
+// permission key is only meaningful in the form the checker will look it up in:
+// perms_check() canonicalizes (absolute, "." dropped, ".." popped, "//"
+// collapsed) before it looks anything up, so a create that recorded the raw
+// caller-supplied spelling would file the entry under a key that is never
+// consulted, and the owner would silently not be the owner. The create points
+// see paths in several spellings (a bare name that sys_open_k() only makes
+// absolute LATER, an ext2-relative path, a "/ext2/..." prefixed path), which is
+// exactly the situation that produces such a mismatch.
+void perms_on_create(const char *path, uint32_t uid, uint32_t gid, int is_dir) {
+    if (!path || !path[0]) return;
+
+    extern int perms_canon_rs(const char *src, char *out, uint32_t cap);
+    char canon[256];
+    if (perms_canon_rs(path, canon, sizeof(canon)) < 0) return;  // unusable key
+
+    if (perms_lookup(canon)) return;  // seed, or operator chmod, or re-create: keep it
+
+    // #745: a file created under an ELEVATION GRANT belongs to ROOT, not to the
+    // person who authenticated. Without this the modal's own fine print would
+    // be false in both directions: "the installer runs as root" would be a
+    // sentence with nothing behind it, and "only an administrator can remove
+    // it" would be wrong, because the installing user would own every binary in
+    // /APPS and could rewrite it in place later with no prompt at all.
+    {
+        extern int elev_grant_permits(const char *path, uint32_t proc_uid);
+        if (elev_grant_permits(canon, uid)) { uid = 0; gid = 0; }
+    }
+    perms_set(canon, uid, gid, is_dir ? 0755 : 0644);
 }
 
 void perms_set_default(const char *path, uint32_t uid, uint32_t gid, int is_dir) {

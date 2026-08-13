@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: MIT
+// Copyright (c) MayteraOS contributors.
+// Full license text: userland/libc/LICENSE (MIT License).
+//
 // aio.h - User-space async I/O wrapper for MayteraOS
 // Task #42 - Provides convenient interface for io_uring-like operations
 #ifndef _LIBC_AIO_H

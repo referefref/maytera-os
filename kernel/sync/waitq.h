@@ -27,6 +27,7 @@
 
 #include "../types.h"
 #include "spinlock.h"
+#include "../cpu/mono.h"   // #483/#499: sched_now_ms(), the monotonic deadline clock
 
 // Forward decl
 struct process;
@@ -192,13 +193,22 @@ void wake_up_process(struct process *p);
 // years away at 250Hz, so the signed compare here is defensive, not a fix.
 static inline int wq_deadline_expired(uint64_t deadline) {
     if (deadline == WAIT_DEADLINE_NEVER) return 0;
-    return (int64_t)(timer_ticks - deadline) >= 0;
+    // #483/#499: deadlines are absolute mono_ms() values now, not timer_ticks,
+    // so a KVM tick burst cannot make a timed wait expire early.
+    return (int64_t)(sched_now_ms() - deadline) >= 0;
 }
 
 // Turn a relative tick count into an absolute deadline (pinned to "now").
+// #483/#499: the deadline is now an absolute mono_ms() value in MILLISECONDS.
+// Callers still pass a relative TICK count (the API is unchanged); we convert
+// it to ms against the real tick rate so a tick burst cannot shorten the wait.
+// The value stored is coherent with wq_deadline_expired() and with the
+// wake_sleeping_procs() sweep, which both read the same mono_ms() clock.
 static inline uint64_t wq_deadline_in(uint64_t ticks) {
     if (ticks == WAIT_DEADLINE_NEVER) return WAIT_DEADLINE_NEVER;
-    return timer_ticks + ticks;
+    uint32_t hz = g_timer_hz ? g_timer_hz : 250;
+    uint64_t ms = (ticks * 1000ULL) / hz;   // ticks -> ms (>=0)
+    return sched_now_ms() + ms;
 }
 
 // Milliseconds -> ticks against the ACTUAL tick rate. Rounds UP and clamps to
