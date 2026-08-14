@@ -68,7 +68,24 @@ run_make kernel "kernel"
 run_make boot/uefi "UEFI bootloader"
 
 # 4. DOOM (the headline userland app)
-run_make userland/apps/doom "DOOM"
+#
+# GUARDED ON PURPOSE. This step used to be an unconditional
+# `run_make userland/apps/doom`, and under `set -e` a missing directory made
+# `make -C` exit 2 and took the WHOLE build down at step 4, before a single app
+# was built. That is exactly what happened when a source sync dropped the port:
+# both `./build.sh` and `./build.sh --all-apps` stopped here and the README's
+# headline build command could not work.
+#
+# An optional port going missing must degrade to "skipped", never to "the build
+# is dead". Same shape as the libgl guard at step 1b. Apply this to any port
+# added below rather than adding another unconditional run_make.
+if [ -f userland/apps/doom/Makefile ]; then
+    run_make userland/apps/doom "DOOM"
+else
+    echo
+    echo "=== Skipping DOOM: userland/apps/doom/Makefile not present ==="
+    SKIPPED_PORTS="${SKIPPED_PORTS:-} doom"
+fi
 
 # 5. (optional) every other userland app with a Makefile
 # One optional app must not abort the whole build: some apps need extra
@@ -88,6 +105,9 @@ if [ $BUILD_ALL_APPS -eq 1 ]; then
 fi
 
 echo
+if [ -n "${SKIPPED_PORTS:-}" ]; then
+    echo "=== Optional ports skipped (not present in this tree):${SKIPPED_PORTS} ==="
+fi
 if [ -n "${FAILED_APPS:-}" ]; then
     echo "=== Build complete, WITH FAILURES ==="
     echo "  apps that did not build:${FAILED_APPS}"
@@ -97,6 +117,8 @@ else
 fi
 echo "  kernel:     kernel/kernel.elf"
 echo "  bootloader: boot/uefi/BOOTX64.EFI"
-echo "  DOOM:       userland/apps/doom/DOOM.ELF"
+if [ -f userland/apps/doom/DOOM.ELF ]; then
+    echo "  DOOM:       userland/apps/doom/DOOM.ELF"
+fi
 echo
 echo "Assemble a bootable FAT32 image with: ./stage-disk.sh"
