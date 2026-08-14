@@ -16,7 +16,6 @@ Excluded from the public source subset by
 
 | Component | Path in the internal tree | Why it is not published as source |
 |---|---|---|
-| DOOM (id Software) | `userland/apps/doom` | Distributed through the MayteraOS App Store rather than as repository source. The per-file id Software notices are intact in the source; the full upstream licence DOCUMENT is not yet tracked here, and it will be fetched from the authentic upstream release rather than retyped from memory. |
 | AssaultCube | `userland/apps/assaultcube` | App Store distribution. Its content licence forbids redistribution and its `vendor/` engine tree is excluded. |
 | OpenArena | `userland/apps/openarena` | App Store distribution. Its `vendor/` tree carries lcc, which is explicitly not free. |
 | GNU grep 2.5.4 | `userland/apps/grep-gnu` | GPLv3-or-later, and no GPLv3 licence document is tracked here yet. |
@@ -370,24 +369,24 @@ mechanically; see "How this table is kept honest" below.
 | MicroPython port glue | `userland/python/micropython/ports/maytera` | MIT (port glue only; upstream MicroPython is itself MIT) | upstream |
 | Duktape (JS engine core) | `userland/apps/browser/port/duktape` holds MayteraOS glue only; the engine is fetched, not tracked (see note below) | MIT (upstream) | not tracked |
 | NetSurf core libs (libwapcaplet, libparserutils, libhubbub, libcss, libdom) | `userland/apps/browser/port/netsurf` holds MayteraOS glue only; the libraries are fetched at pinned revisions, not tracked (see note below) | MIT (upstream NetSurf core libs) | not tracked |
-| DOOM (id Software) | `userland/apps/doom` | id Software DOOM Source Code License (NOT the GPL) | per-file headers only; **no licence document is in the tree, see the DOOM note below** |
+| DOOM (id Software) | `userland/apps/doom` | GPLv2 (id relicensed the DOOM source in 1999; the stale per-file headers still name the 1997 DOOM Source Code License) | `userland/apps/doom/LICENSE.TXT`, fetched verbatim from id's own upstream release, plus `userland/apps/doom/LICENSING.md` recording provenance and the header discrepancy |
 | Rogue 5.4.4 (Michael Toy, Ken Arnold, Glenn Wichman) | `userland/apps/rogue` | BSD 3-clause | `LICENSE.TXT` |
-| GNU grep (installs as `/APPS/GREP`, the only grep on the image since #745 local 98) | `userland/apps/grep-gnu/src` | GPLv3-or-later | none tracked |
-| GNU regex + gnulib, **copy 1 of 2** | `userland/apps/grep-gnu/lib` | LGPLv3-or-later | per-file headers |
-| busybox `vi.c` 1.36.1 | `userland/apps/vi/vendor/busybox` | GPLv2-or-later | none tracked; `userland/apps/vi/PROVENANCE.md` pins the upstream tarball and md5 |
-| GNU regex, **copy 2 of 2** | `userland/apps/vi/vendor/gnuregex` | LGPLv3-or-later | per-file headers |
-| CuraEngine | `userland/apps/curaslice/src` | AGPLv3 | `userland/apps/curaslice/LICENSE.curaengine`, which sits at the app root rather than beside the code it covers |
-| Clipper (Angus Johnson) | `userland/apps/curaslice/libs/clipper` | Boost Software License 1.0 | none tracked; the file header cites the Boost licence by URL |
+| GNU grep (installs as `/APPS/GREP`, the only grep on the image since #745 local 98) | `userland/apps/grep-gnu/src` | GPLv3-or-later | none tracked **NOT IN THIS REPOSITORY** |
+| GNU regex + gnulib, **copy 1 of 2** | `userland/apps/grep-gnu/lib` | LGPLv3-or-later | per-file headers **NOT IN THIS REPOSITORY** |
+| busybox `vi.c` 1.36.1 | `userland/apps/vi/vendor/busybox` | GPLv2-or-later | none tracked; `userland/apps/vi/PROVENANCE.md` pins the upstream tarball and md5 **NOT IN THIS REPOSITORY** |
+| GNU regex, **copy 2 of 2** | `userland/apps/vi/vendor/gnuregex` | LGPLv3-or-later | per-file headers **NOT IN THIS REPOSITORY** |
+| CuraEngine | `userland/apps/curaslice/src` | AGPLv3 | `userland/apps/curaslice/LICENSE.curaengine`, which sits at the app root rather than beside the code it covers **NOT IN THIS REPOSITORY** |
+| Clipper (Angus Johnson) | `userland/apps/curaslice/libs/clipper` | Boost Software License 1.0 | none tracked; the file header cites the Boost licence by URL **NOT IN THIS REPOSITORY** |
 | ClassiCube engine | `userland/apps/classicube/vendor/ClassiCube` | modified BSD 3-clause | `license.txt` |
 | FreeType, bundled *inside* ClassiCube | `userland/apps/classicube/vendor/ClassiCube/src/freetype` | FreeType Project License, or GPLv2, at your option | reproduced inside ClassiCube's own `license.txt` |
-| AssaultCube / Cube engine (Wouter van Oortmerssen and the AssaultCube team) | `userland/apps/assaultcube/vendor/AC` | zlib-like Cube licence (zlib plus an extra clause) | `source/README_CUBEENGINE.txt` |
-| ENet (Lee Salzman) | `userland/apps/assaultcube/vendor/AC/source/enet` | MIT | `LICENSE` beside the code, plus a second copy of the same text at `userland/apps/assaultcube/vendor/enet_LICENSE.txt` |
-| SDL2, zlib, libogg, libvorbis, OpenAL and GL headers bundled by AssaultCube | `userland/apps/assaultcube/vendor/AC/source/include` | zlib (SDL2, zlib) and BSD-style (Xiph) per file | per-file headers + `SDL_copying.h` + `README_jpeg.txt` |
-| OpenArena / ioquake3 engine | `userland/apps/openarena/vendor/OA` | GPLv2 | `source/COPYING.txt` |
-| libjpeg 8c (Independent JPEG Group) bundled by ioquake3 | `userland/apps/openarena/vendor/OA/source/code/jpeg-8c` | IJG licence | `README` |
-| lcc retargetable C compiler bundled by ioquake3 | `userland/apps/openarena/vendor/OA/source/code/tools/lcc` | **NOT free**: "you may not sell lcc or any product derived from it" | `COPYRIGHT` |
+| AssaultCube / Cube engine (Wouter van Oortmerssen and the AssaultCube team) | `userland/apps/assaultcube/vendor/AC` | zlib-like Cube licence (zlib plus an extra clause) | `source/README_CUBEENGINE.txt` **NOT IN THIS REPOSITORY** |
+| ENet (Lee Salzman) | `userland/apps/assaultcube/vendor/AC/source/enet` | MIT | `LICENSE` beside the code, plus a second copy of the same text at `userland/apps/assaultcube/vendor/enet_LICENSE.txt` **NOT IN THIS REPOSITORY** |
+| SDL2, zlib, libogg, libvorbis, OpenAL and GL headers bundled by AssaultCube | `userland/apps/assaultcube/vendor/AC/source/include` | zlib (SDL2, zlib) and BSD-style (Xiph) per file | per-file headers + `SDL_copying.h` + `README_jpeg.txt` **NOT IN THIS REPOSITORY** |
+| OpenArena / ioquake3 engine | `userland/apps/openarena/vendor/OA` | GPLv2 | `source/COPYING.txt` **NOT IN THIS REPOSITORY** |
+| libjpeg 8c (Independent JPEG Group) bundled by ioquake3 | `userland/apps/openarena/vendor/OA/source/code/jpeg-8c` | IJG licence | `README` **NOT IN THIS REPOSITORY** |
+| lcc retargetable C compiler bundled by ioquake3 | `userland/apps/openarena/vendor/OA/source/code/tools/lcc` | **NOT free**: "you may not sell lcc or any product derived from it" | `COPYRIGHT` **NOT IN THIS REPOSITORY** |
 | Freedoom-derived sprite and weapon art | `userland/apps/arena/assets` | BSD 3-clause | `FREEDOOM-COPYING.txt` (three copies, one per asset directory) |
-| Reproduced licence texts for the 14 shipped font families | `build/font-licenses` | OFL 1.1, Bitstream Vera, public domain, per family | the directory IS the licence text; ships on-image at `/FONT-LICENSES` |
+| Reproduced licence texts for the 14 shipped font families | `disk/FONT-LICENSES` (this repository; `build/font-licenses` in the internal tree) | OFL 1.1, Bitstream Vera, public domain, per family | the directory IS the licence text; ships on-image at `/FONT-LICENSES` |
 | zlib 1.3.1 (Jean-loup Gailly, Mark Adler) | `userland/ports/zlib` holds the mports recipe only; the upstream tarball is fetched at build time against a sha256 pin and is not tracked (see the mports note below) | zlib licence | not tracked; **full text reproduced in the mports note below**, which is the only place it exists in this repository |
 | PCRE2 10.45 (Philip Hazel; University of Cambridge) | `userland/ports/pcre2` holds the mports recipe and one patch only; the upstream tarball is fetched at build time against a sha256 pin and is not tracked (see the mports note below) | BSD 3-clause **with the PCRE2 binary-package exemption** | not tracked; **full text reproduced in the mports note below**, which is the only place it exists in this repository |
 
@@ -417,6 +416,16 @@ distributed binary that links the compiled engine. Found 2026-08-12 (#745,
 local queue item 57) while building the per-component license table; not fixed here,
 since moving ~750KB of vendored upstream source into git is a build-topology
 change outside this task's docs/license scope.
+
+> **Scope note (2026-08-14): the next two sections describe components that are
+> NOT in this repository.** `userland/apps/vi`, `userland/apps/grep-gnu` and
+> `userland/apps/curaslice` are absent from the public source subset (verified
+> with `find`; see the exclusion table at the top of this file). The analysis is
+> kept because it is the whole-project record and because the obligations are
+> real wherever those binaries are actually distributed. It is **not** a claim
+> that this repository ships `/APPS/VI`, `/APPS/GREP` or `/APPS/CURASLIC`, and
+> nothing you obtain from this repository carries the GPLv3 or AGPLv3
+> obligations described below.
 
 **The `VI` binary must be offered as GPLv3, not GPLv2. Stating it, not leaving
 it to be derived.** `/APPS/VI` links busybox `vi.c` (GPLv2-**or-later**) and
@@ -448,11 +457,30 @@ is `userland/apps/doom` (134 tracked files), it builds `DOOM.ELF`, and
 `build/build-golden.sh` installs it at `/GAMES/DOOM/DOOM.ELF`. Every one of
 those files carries id Software's own header ("This source is available for
 distribution and/or modification only under the terms of the DOOM Source Code
-License"), which is the retained-notice half of the obligation. **The full
-licence document is missing from the tree and this task did not write one**: a
-licence text must be reproduced from the authentic upstream document, never
-retyped from memory. **Owner action needed** before the next public push: drop
-the authentic `DOOMLICENSE` text into `userland/apps/doom/`.
+License"), which is the retained-notice half of the obligation.
+
+**That owner action is now discharged, and the licence conclusion above was
+wrong (2026-08-14).** The action item recorded here was to drop the authentic
+`DOOMLICENSE` text into `userland/apps/doom/`. Doing it revealed that the
+premise was mistaken. id Software's own upstream release
+(`github.com/id-Software/DOOM`) ships its licence document as `LICENSE.TXT`,
+and that document is the **GNU GPL v2**, not the 1997 DOOM Source Code License.
+id relicensed the DOOM source under GPLv2 in 1999 and never went back to
+rewrite the per-file banners, which is why the headers and the licence document
+disagree upstream. Reading the headers and not the document is what produced
+the earlier "NOT the GPL" entry.
+
+`userland/apps/doom/LICENSE.TXT` now holds that document, fetched verbatim and
+committed unmodified (git blob sha1 `d60c31a97a544b53039088d14fe9114583c0efc3`,
+sha256 `32b1062f7da84967e7019d01ab805935caa7ab7321a7ced0e30ebe75e5df1670`,
+17992 bytes). `userland/apps/doom/LICENSING.md` records the provenance, the
+verification command, and the header discrepancy so the next reader does not
+repeat the mistake. DOOM is therefore GPLv2, the same licence as MayteraOS
+itself, and no compatibility question arises.
+
+**No game data is tracked and none may be added.** The port is 63 `.c`, 70
+`.h`, one `Makefile`, `LICENSE.TXT` and `LICENSING.md`. Users supply their own
+WAD through `DOOM_WAD=` in `stage-disk.sh`.
 
 **The CA bundle's "in-file note" was checked and is not there (2026-08-13,
 local queue item 87).** This table and `docs/LICENSES.md` both recorded
@@ -698,7 +726,7 @@ That sentence covers the kernel and nothing else. **The ported userland
 applications are separate executables and each carries its own licence**, which
 is why the table above lists a licence per copy: `/APPS/VI` is GPLv3 (see
 above), `/APPS/GREP` is GPLv3-or-later, `/APPS/CURASLIC` is AGPLv3,
-`/GAMES/DOOM/DOOM.ELF` is under id's own licence, and `/APPS/CLASSICUBE` is
+`/GAMES/DOOM/DOOM.ELF` is GPLv2, and `/APPS/CLASSICUBE` is
 BSD 3-clause. Shipping them on one image is aggregation, not a combined work;
 none of them makes any other one copyleft, and none of them is covered by the
 kernel's blanket.
@@ -731,14 +759,20 @@ The in-house decoders (`jpeg.c`, `png.c`, `webp.c`, `wav.c`, `mpeg.c`) and the
 archiver (`userland/libarchive`) are original MayteraOS code.
 
 > **DOOM (id Software):** the DOOM engine source under `userland/apps/doom`
-> (the `d_*/i_*/r_*/p_*/w_*/z_*` files) is covered by id Software's own *DOOM
-> Source Code License*, carried in every source-file header. It is a **separate
-> license, not the GPL**, and permits non-commercial redistribution under id's
-> terms. It is carved out of this repository's blanket GPLv2-or-later;
-> MayteraOS's own code remains GPL. **The path in this paragraph used to read
-> `kernel/games/doom` and to cite a `DOOMLICENSE.md` that no longer exists
-> anywhere in the tree**; see the DOOM correction above for what happened and
-> what the owner still needs to do.
+> (the `d_*/i_*/r_*/p_*/w_*/z_*` files) is licensed under the **GNU GPL v2**,
+> the same licence as MayteraOS itself. The authoritative text is
+> `userland/apps/doom/LICENSE.TXT`, committed verbatim from id Software's own
+> upstream release.
+>
+> **Do not conclude otherwise from the per-file headers.** Every engine file
+> still carries a 1997 banner naming the *DOOM Source Code License*, because id
+> relicensed the source under GPLv2 in 1999 and never rewrote the banners. The
+> licence document, not the stale header, is controlling. An earlier revision of
+> this paragraph read those headers, called DOOM "a separate license, not the
+> GPL", and carved it out of this repository's blanket; that was wrong. See the
+> DOOM correction above, and `userland/apps/doom/LICENSING.md`.
+>
+> No DOOM game data is in this repository. The port needs a WAD you supply.
 
 ## Freedoom (Maytera Arena character and weapon sprites)
 
