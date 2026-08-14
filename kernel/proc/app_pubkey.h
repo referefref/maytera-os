@@ -7,7 +7,7 @@
 //     trusts ONLY the OTA key and NEVER this one, so an app-repo key compromise
 //     can sign apps but can NEVER sign a kernel.
 // PUBLIC key only; the matching PRIVATE key lives ONLY on the update server
-// (/root/ota-signing/app_priv.pem, chmod 600, never in any web root or image).
+// (held offline on the signing host, chmod 600, never in any web root or image).
 // Key-id (sha256(modulus)[:16]): c54e00c97d8af605
 #ifndef APP_PUBKEY_H
 #define APP_PUBKEY_H

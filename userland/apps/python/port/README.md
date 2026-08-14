@@ -15,7 +15,7 @@ upstream 3.11.9 and is not vendored here.
 
 ## Why this is here
 
-The port existed only under `/root/cpython-port-phase2-golden` on one build
+The port existed only under a `cpython-port-phase2-golden` directory on one build
 container. The 5.1 MB `PYTHON` binary shipped, but nothing that could rebuild
 it was under version control, so "we have a working Python 3" was true only for
 as long as that container survived. Same shape as the browser engine, fixed the
@@ -23,7 +23,7 @@ same way: commit what is ours, record how to fetch what is not.
 
 ## What is NOT here
 
-- **CPython 3.11.9 itself** (`/root/cpython-port`, 467 MB): upstream source
+- **CPython 3.11.9 itself** (a `cpython-port` working directory, 467 MB): upstream source
   plus its build tree, re-downloadable from python.org.
 - **`libpython3.11.a` and the four supplement archives** (`libpymath_supp.a`,
   `libwcharsupp.a`, `libmiscsupp.a`, `libcompatsupp.a`): build outputs.

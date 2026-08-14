@@ -10730,7 +10730,7 @@ static int win16_native_ctrl_proc(win16_window_t *win, uint16_t msg,
 // This section gives it real per-window item-list storage (g_combos[], see
 // its declaration near g_windows[]) plus the standard collapsed paint. The
 // collapsed chrome was matched in STRUCTURE (not a hand-guessed modern style)
-// against a real Win 3.1 render: the build host:/root/w6ref/bochs/render-final.png,
+// against a real Win 3.1 render: a local Bochs reference capture,
 // probed pixel-by-pixel with Python/PIL. MEASURED there: the text field is a
 // 1px sunken frame (top+left black, bottom+right white - the white matches
 // the field's own fill, so the far edge is genuinely invisible, exactly as in
@@ -10893,7 +10893,7 @@ static void win16_draw_combo(win16_window_t *win) {
 // (undocumented - this is not a public CB_* message) COMBOBOXCTLWNDPROC
 // extension, which our interpreter does not load or emulate as guest code.
 // Implementing it faithfully would mean disassembling that real binary (via
-// the Bochs reference rig, the build host:/root/w6ref or tools/word6/bochs) to learn
+// the Bochs reference rig) to learn
 // the real algorithm - genuinely deep, out of this pass's scope. Do NOT
 // hardcode the observed strings (not faithful emulation) and do NOT
 // resurrect the STRINGTABLE theory without new evidence; the gated

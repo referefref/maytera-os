@@ -58,7 +58,7 @@
 #   mports.sh --self-test               # prove the refusals actually refuse
 #
 # ENVIRONMENT
-#   MPORTS_CACHE    tarball cache            (default /root/mports-cache)
+#   MPORTS_CACHE    tarball cache            (default ./.mports-cache)
 #   MPORTS_OFFLINE  1 = never touch the network; a cache miss is fatal and
 #                   prints the exact wget command to run
 #
@@ -68,7 +68,7 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORTS_DIR="$SELF_DIR"
-: "${MPORTS_CACHE:=/root/mports-cache}"
+: "${MPORTS_CACHE:=$PWD/.mports-cache}"
 : "${MPORTS_OFFLINE:=0}"
 WORK="$PORTS_DIR/.work"
 OUT="$PORTS_DIR/out"

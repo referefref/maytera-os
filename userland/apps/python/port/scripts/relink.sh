@@ -1,11 +1,16 @@
 #!/bin/bash
 set -e
-L=<workspace>
-U=<workspace>
-SH=/root/cpython-port/shim
-GI=/usr/lib/gcc/x86_64-linux-gnu/12/include
-S=/root/cpython-port/Python-3.11.9
-CP=/root/cpython-port
+# Userland root and libc. Defaults are derived from this script's own location
+# (userland/apps/python/port/scripts -> userland), so a clean clone works with
+# no editing. Override either if your tree is laid out differently.
+U=${U:-$(cd "$(dirname "$0")/../../../.." && pwd)}
+L=${L:-$U/libc}
+SH=$CP/shim
+GI=${GCC_ISYSTEM:-$(gcc -print-file-name=include)}
+S=$CP/Python-3.11.9
+# Where the CPython port tree lives. Override for your own checkout:
+#   CPYTHON_PORT=/path/to/cpython-port ./relink.sh
+CP=${CPYTHON_PORT:-$PWD/cpython-port}
 cd $CP/build
 
 FLAGS="-ffreestanding -fno-stack-protector -fno-pic -mno-red-zone -mcmodel=large -nostdinc -fno-builtin -O2 -std=c11 -I$SH -I$L -isystem $GI -I. -I$S/Include -U__linux__ -D_Py_FORCE_UTF8_LOCALE -D_SYSCALL_H -Wno-implicit-function-declaration"

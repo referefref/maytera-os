@@ -34,8 +34,8 @@ Bluetooth is off.
 
 ## 2. Build serialization rule (the build container)
 
-All main-kernel builds happen in Proxmox the build container on the build server
-(<BUILD_SERVER>), tree `<BUILD_PATH>/active-code/source/kernel/`. The object
+All main-kernel builds happen in the build container on the build server,
+tree `<BUILD_PATH>/active-code/source/kernel/`. The object
 dir is shared, so only ONE `make` may run at a time.
 
 Before building:
@@ -55,7 +55,7 @@ rule (added this pass), so adding a new `bt/*.c` needs no Makefile edit.
 
 Edit locally, then copy each changed file into the container. From the build server:
 ```
-pct push 3007 /path/on/host/bt/hci.c \
+pct push <ct> /path/on/host/bt/hci.c \
   <BUILD_PATH>/active-code/source/kernel/bt/hci.c
 ```
 Never bulk-sync; push individual files to the exact `bt/` path.

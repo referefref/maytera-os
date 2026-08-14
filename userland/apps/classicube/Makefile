@@ -24,7 +24,7 @@ BUILD_DIR     = build
 # fetch-upstream.sh populates vendor/ClassiCube from the pinned commit and
 # its `verify` subcommand proves the vendored tree still equals that commit.
 CC_MK_DIR    := $(dir $(lastword $(MAKEFILE_LIST)))
-CC_VENDOR    ?= $(firstword $(wildcard $(CC_MK_DIR)vendor/ClassiCube/src) /root/cc-stage/ClassiCube/src)
+CC_VENDOR    ?= $(firstword $(wildcard $(CC_MK_DIR)vendor/ClassiCube/src) $(HOME)/cc-stage/ClassiCube/src)
 
 # The engine source is COMPILED FROM A STAGED COPY under $(BUILD_DIR)/src, not
 # from vendor/ in place. Core.h needs a MayteraOS platform branch, and patching

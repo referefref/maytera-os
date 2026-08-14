@@ -80,4 +80,4 @@ boot-time USB enumeration is a hard no-op when Bluetooth is off.
 ## Kernel artifact
 
   the build container: <BUILD_PATH>/active-code/source/kernel/kernel.elf (build 597)
-  Host copy used for boot test: the build server:/tmp/kernel-bt372.elf
+  Host copy used for boot test: a /tmp copy on the build server

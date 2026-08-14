@@ -13,7 +13,7 @@
 //     terminates the transfer. Every wait is BOUNDED (xhci_delay_ms, 1ms/iter)
 //     so a silent printer can never block on the full xHCI timeout.
 //
-// M3D Micro command reference (from the M33-Fio project, the build server:/root/m3d-ref):
+// M3D Micro command reference (from the M33-Fio project):
 //   Bootloader (single characters):  'S' = dump the 0x301-byte EEPROM (ends in
 //     '\r'); firmwareVersion is the little-endian u32 at offset 0x00, the
 //     serial number is ASCII near the end.  'Q' = leave the bootloader and run

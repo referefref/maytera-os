@@ -13,8 +13,8 @@
 // #670 (measured, NOT inferred): on the shipping two-partition ext2-root
 // golden these slots were NEVER ARMED, so /PANIC.TXT and /STAGE.TXT have not
 // been written at all since the #99 root cutover. Three real boot logs on the
-// build host - /root/boot1017.log (build 1017, today), /root/t649-ship.log and
-// /root/boot-canary-5.log - all show, immediately after
+// build host - three captured boot logs (build 1017, the t649 ship log and
+// boot canary 5) - all show, immediately after
 // "[MAIN] #99: ext2 is now the ROOT filesystem":
 //     [PANIC] WARNING: could not resolve /PANIC.TXT first cluster
 //     [PANIC] WARNING: could not resolve /STAGE.TXT first cluster

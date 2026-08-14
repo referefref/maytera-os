@@ -15,12 +15,12 @@
 # The kernel loader applies the resulting R_X86_64_RELATIVE entries at load, so
 # the image still relocates correctly; it just carries more of them.
 set -e
-U=${U:-<repo>-build/userland}
+U=${U:-$(cd "$(dirname "$0")/../../../.." && pwd)}
 L=$U/libc
-CP=/root/cpython-port
+CP=${CPYTHON_PORT:-$PWD/cpython-port}
 S=$CP/Python-3.11.9
 SH=$CP/shim
-GI=/usr/lib/gcc/x86_64-linux-gnu/12/include
+GI=${GCC_ISYSTEM:-$(gcc -print-file-name=include)}
 OUT=${OUT:-$CP/build/python-pie.elf}
 
 [ -f "$L/libc.a" ]  || { echo "FATAL: no $L/libc.a - build userland first"; exit 1; }
