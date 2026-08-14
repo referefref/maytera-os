@@ -392,7 +392,7 @@ static char subnet_mask[16] = "255.255.255.0";
 static char gateway[16] = "192.0.2.1";
 static char dns_primary[16] = "8.8.8.8";
 static char dns_secondary[16] = "8.8.4.4";
-static char mac_address[18] = "BC:24:11:80:C9:5B";
+static char mac_address[18] = "02:00:00:00:00:01";
 
 // (#382 pass2) Removed vpn_enabled / vpn_protocol: there is no VPN client stack,
 // so the Network panel marks VPN honestly as unavailable instead of a fake toggle.

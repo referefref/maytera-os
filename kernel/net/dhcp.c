@@ -571,8 +571,8 @@ int dhcp_discover(void) {
     // (RFC 2131 4.1: "chosen by the client"), not a bump of a constant seed.
     // dhcp_init() ran `dhcp_xid = timer_ticks ^ 0xDEADBEEF` BEFORE sti(), when
     // timer_ticks is always 0, so every MayteraOS box on earth started at
-    // 0xDEADBEEF and sent its first DISCOVER as 0xDEADBEF0. OBSERVED on the the build host
-    // LAN: two independent MayteraOS VMs (bc:24:11:5f:d9:25 and bc:24:11:a9:3b:1e)
+    // 0xDEADBEEF and sent its first DISCOVER as 0xDEADBEF0. OBSERVED on the build
+    // host LAN: two independent MayteraOS VMs, with distinct NIC MACs, both
     // broadcasting DISCOVERs with the IDENTICAL xid 0xdeadbef0 at the same time.
     // Two consequences, both real:
     //   1) CORRECTNESS: OFFERs are broadcast (we set flags=0x8000), so box A's
