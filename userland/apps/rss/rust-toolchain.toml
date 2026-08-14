@@ -8,7 +8,7 @@
 # Makefile additionally has a hard version gate that FAILS the build if the
 # active rustc is not this version, so drift can never pass silently.
 #
-# Pinned + reproduced on the build container (maytera-uibuild) 2026-07-16:
+# Pinned + reproduced on the build container 2026-07-16:
 #   rustc 1.97.0 (2d8144b78 2026-07-07)
 #   target x86_64-unknown-none (precompiled core + alloc from the 1.97.0 rust-std)
 #
