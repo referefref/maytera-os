@@ -34,7 +34,7 @@ here. See Releases below.
 | ![Widgets](screenshots/widgets.png) | ![Browser](screenshots/browser.png) |
 | Desktop widgets (clock, calendar, weather, monitors) | The web browser with a TLS 1.3 client |
 | ![DOOM](screenshots/doom.jpg) | ![Maytera Studio](screenshots/studio-filters.png) |
-| DOOM on the MayteraOS platform layer. Bring your own WAD | Maytera Studio: the Texturizer filter dialog |
+| DOOM, available from the App Store. Bring your own WAD | Maytera Studio: the Texturizer filter dialog |
 
 ## Highlights
 
@@ -263,14 +263,13 @@ those ports. Every row whose path is absent from this repository is marked
 **NOT IN THIS REPOSITORY**, so no row can be mistaken for an obligation on
 something you actually obtained here.
 
-The **DOOM** port is included, and it is GPLv2. That needs saying because the
-engine's per-file headers say otherwise: they carry a 1997 id Software banner
-naming the *DOOM Source Code License*, because id relicensed the source under
-the GPL v2 in 1999 and never rewrote the banners. The authoritative document is
-`userland/apps/doom/LICENSE.TXT`, committed verbatim from id's own upstream
-release; `userland/apps/doom/LICENSING.md` records its provenance, a checksum
-you can verify, and this discrepancy. **No DOOM game data is in this
-repository** and none will be added. Supply your own WAD.
+The **DOOM** port is distributed through the MayteraOS App Store rather than
+from this repository, along with its licence text. Worth recording here because
+the engine's per-file headers mislead: they carry a 1997 id Software banner
+naming the *DOOM Source Code License*, but id relicensed the source under the
+GPL v2 in 1999 and never rewrote those banners, so the headers describe a
+licence that no longer applies. **No DOOM game data is distributed by this
+project** and none will be. Supply your own WAD.
 
 Font licences ship with the fonts, under `disk/FONT-LICENSES`, as the SIL Open
 Font License requires.
