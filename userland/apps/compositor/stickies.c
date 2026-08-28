@@ -22,10 +22,11 @@
 #include "../../libc/notify.h"   // #742: notify_post (best effort, needs the disk)
 
 #define STICKY_MAX     24
-#define STICKY_W       150
-#define STICKY_H       120
-#define STICKY_TITLE_H 18
-#define STICKY_PAD     6
+// #uiscale: scaled at the definition.
+#define STICKY_W       ui_px(150)
+#define STICKY_H       ui_px(120)
+#define STICKY_TITLE_H ui_px(18)
+#define STICKY_PAD     ui_px(6)
 #define STICKY_TEXTMAX 240
 
 typedef struct {

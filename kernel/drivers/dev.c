@@ -11,8 +11,15 @@
 extern void *kmalloc(size_t);
 extern void kfree(void *);
 
-// Static table; small enough that linear scan is fine. Grows when we add pts/N.
-#define MAX_DEVICES 16
+// Static table; small enough that linear scan is fine.
+//
+// COUNTED, not guessed (2026-08-25): console, ttyACM0, null, zero, urandom,
+// random = 6, plus ptmx and pts/0..7 = 9, is FIFTEEN. Adding /dev/tty made it
+// sixteen, i.e. exactly the old cap, with zero headroom, and dev_register()
+// fails SILENTLY on overflow (it returns -1 and every caller but one drops it).
+// The next device anyone adds would have vanished with no diagnostic. Raised
+// so that is not the next bug.
+#define MAX_DEVICES 24
 
 typedef struct {
     const char  *name;   // static string or kmalloc'd; either way, never freed

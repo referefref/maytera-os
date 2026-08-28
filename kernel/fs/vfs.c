@@ -102,6 +102,14 @@ int64_t file_seek(file_t *f, int64_t offset, int whence) {
     return f->ops->seek(f, offset, whence);
 }
 
+// #120. -1 means "this kind does not know its size", NOT "size zero": the two
+// are different answers and a caller must be able to tell them apart. Callers
+// that get -1 must leave st_size alone rather than write 0 into it.
+int64_t file_size(file_t *f) {
+    if (!f || !f->ops || !f->ops->size) return -1;
+    return f->ops->size(f);
+}
+
 int file_ioctl(file_t *f, unsigned cmd, void *arg) {
     if (!f || !f->ops || !f->ops->ioctl) return -1;
     return f->ops->ioctl(f, cmd, arg);

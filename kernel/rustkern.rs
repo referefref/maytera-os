@@ -85,21 +85,48 @@ pub extern "C" fn rust_marker() -> u32 {
 // between subsystems is written down.
 // ===========================================================================
 #[path = "rustkern/aes.rs"] mod aes;
+#[path = "rustkern/amlhid.rs"] mod amlhid;   // #ASUSKBD: DSDT _HID presence scan
 #[path = "rustkern/argtab.rs"] mod argtab;
 #[path = "rustkern/common.rs"] mod common;
 #[path = "rustkern/arp.rs"] mod arp;
+#[path = "rustkern/bklsite.rs"] mod bklsite;   // #118: per-call-site BKL hold accounting
+#[path = "rustkern/scprof.rs"] mod scprof;   // #121: per-syscall time census + read-path phases
+#[path = "rustkern/rqlock.rs"] mod rqlock;   // #143: run-queue lock contention verdict
+#[path = "rustkern/bklstat.rs"] mod bklstat; // #166: BKL window deltas + invariants
+#[path = "rustkern/wakeloss.rs"] mod wakeloss;  // #167: block/wake race verdict
 #[path = "rustkern/bmp.rs"] mod bmp;
+#[path = "rustkern/blkstage.rs"] mod blkstage;   // #SB: single-owner claim over the block-write staging buffer
+
 #[path = "rustkern/cert_b64.rs"] mod cert_b64;
 #[path = "rustkern/certverify.rs"] mod certverify;
 #[path = "rustkern/certname.rs"] mod certname;   // #tls-certfix: X.509 name/usage/pathlen policy
 #[path = "rustkern/chacha20.rs"] mod chacha20;
 #[path = "rustkern/checksum.rs"] mod checksum;
+#[path = "rustkern/clickacct.rs"] mod clickacct; // #197: click delivery ledger
 #[path = "rustkern/clipboard.rs"] mod clipboard;
 #[path = "rustkern/conn.rs"] mod conn;
+#[path = "rustkern/cga.rs"] mod cga;   // #212: the CGA graphics presenter (modes 04h/05h/06h)
 #[path = "rustkern/conring.rs"] mod conring;   // #745 (task #70): async console ring + overflow policy
 #[path = "rustkern/dhcp.rs"] mod dhcp;
 #[path = "rustkern/dns.rs"] mod dns;
+#[path = "rustkern/dragsess.rs"] mod dragsess;   // cross-window drag session (Tier 5 docking)
+#[path = "rustkern/doscrtc.rs"] mod doscrtc;   // #740: what an INT 10h mode set leaves in the CRTC (stale-Offset trap)
+#[path = "rustkern/dosmem.rs"] mod dosmem;   // #745: XMS 3.0 + LIM EMS 4.0 for the DOS guest
+#[path = "rustkern/dosmcb.rs"] mod dosmcb;   // #172: conventional-memory free-space truth (INT 21h 48h BX) + AH=26h Create New PSP
+#[path = "rustkern/dospit.rs"] mod dospit;   // #172: the 8253/8254 channel state machine, shared by PIT channels 0 and 2
+#[path = "rustkern/opl2.rs"] mod opl2;   // #175: the OPL2/AdLib DETECTION protocol (no FM synthesis; see the module header)
+#[path = "rustkern/dossb.rs"] mod dossb;   // #181: Sound Blaster DSP protocol + 8237 DMA channel state (no FM synthesis; see the module header)
+#[path = "rustkern/fmq.rs"] mod fmq;     // #182: the DOS OPL2 register-write bridge to the Ring-3 FM synthesiser
+#[path = "rustkern/dosbus.rs"] mod dosbus;
+#[path = "rustkern/dosint15.rs"] mod dosint15;   // #252: INT 15h AH=86h, the BIOS WAIT a DOS AdLib probe times its 80us with   // #176: what a guest port access costs in emulated time (ISA bus cycle, not a CPU op)
+#[path = "rustkern/doswin.rs"] mod doswin;
+#[path = "rustkern/dosmick.rs"] mod dosmick;   // (#mickey) what a DOS guest is told the mouse did: unit-gain counters + clamp homing   // #745 (local 105): DOS host-window letterbox geometry
+#[path = "rustkern/dos4gw.rs"] mod dos4gw;   // #740: DOS/4GW guest bridge - INT frame marshalling, MISS census, DPMI memory
+#[path = "rustkern/dpmi.rs"] mod dpmi;   // #740: the DPMI host core (INT 31h) for DOS/4GW guests
+#[path = "rustkern/cfgread.rs"] mod cfgread;   // #192: is a config-file read outcome worth a log line?
+#[path = "rustkern/dpmi_rmcs.rs"] mod dpmi_rmcs;   // #740: DPMI 0300h simulate-real-mode-interrupt marshaller
 #[path = "rustkern/drvmap.rs"] mod drvmap;   // #739: drive-letter policy for mounted disk images
+#[path = "rustkern/dosovl.rs"] mod dosovl;   // #rawrite: per-user write overlay for a DOS game directory
 #[path = "rustkern/ed25519.rs"] mod ed25519;
 #[path = "rustkern/elf.rs"] mod elf;
 #[path = "rustkern/elevate.rs"] mod elevate;   // #745: system-wide install elevation policy
@@ -108,11 +135,22 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/ext2extent.rs"] mod ext2extent;
 #[path = "rustkern/ext2fsck.rs"] mod ext2fsck;
 #[path = "rustkern/fat.rs"] mod fat;
+#[path = "rustkern/firstrun.rs"] mod firstrun;   // #252: THE first-run (OOBE) state chokepoint
 #[path = "rustkern/fetchown.rs"] mod fetchown;   // #745 (task #36): async HTTP job slot ownership
 #[path = "rustkern/fbown.rs"] mod fbown;   // #745 (task #59): framebuffer claim ownership + lifetime
+#[path = "rustkern/fdown.rs"] mod fdown;   // #fdguard: legacy fd table cross-process ownership
+#[path = "rustkern/ptsown.rs"] mod ptsown;   // #fdguard: /dev/pts/N attach ownership
 #[path = "rustkern/fsperm.rs"] mod fsperm;
+#[path = "rustkern/fstatkind.rs"] mod fstatkind;   // #120: what KIND of object an fd refers to
 #[path = "rustkern/ghash.rs"] mod ghash;
+#[path = "rustkern/hdadma.rs"] mod hdadma;   // #71: HD Audio output-DMA liveness verdict (two-LPIB-read delta)
+#[path = "rustkern/pcmmix.rs"] mod pcmmix;
+#[path = "rustkern/sinkown.rs"] mod sinkown;   // #205: single-owner claim over the ONE hardware audio output stream   // #205: the fixed-point mix kernel behind the shared PCM sink
+#[path = "rustkern/pcmeq.rs"] mod pcmeq;   // #231r: the 5-band graphic EQ, fixed-point biquads, post-mix
+#[path = "rustkern/hdastarve.rs"] mod hdastarve;   // #189: what the HDA output ring must contain once the producer stops feeding it
+#[path = "rustkern/intelgpu.rs"] mod intelgpu;   // Intel iGPU identification (detection only, no MMIO)
 #[path = "rustkern/hidmap.rs"] mod hidmap;   // #763: HID usage -> PS/2 set-1, shared by USB and Bluetooth HID
+#[path = "rustkern/hidrepd.rs"] mod hidrepd; // #162: HID REPORT DESCRIPTOR parse -> consumer-page volume keys
 #[path = "rustkern/hmac.rs"] mod hmac;
 #[path = "rustkern/http.rs"] mod http;
 #[path = "rustkern/http2.rs"] mod http2;
@@ -124,46 +162,74 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/iso9660.rs"] mod iso9660;   // #196: ISO 9660 + Joliet parse (untrusted disc images)
 #[path = "rustkern/aiguard.rs"] mod aiguard;   // #745: LLM prompt-injection screen
 #[path = "rustkern/jpeg.rs"] mod jpeg;
+#[path = "rustkern/le.rs"] mod le;   // #740: LE (Linear Executable) parse + load for DOS/4GW
+#[path = "rustkern/go32.rs"] mod go32;   // #211: go32/DJGPP v2 i386 COFF parse + load + stubinfo
+#[path = "rustkern/ktime.rs"] mod ktime;
+#[path = "rustkern/ktz.rs"] mod ktz;   // #86: kernel-side TZ.CFG offset parser (login clock)   // #115 (local 120): the ONE calendar-time converter + wall clock
 #[path = "rustkern/md4.rs"] mod md4;
 #[path = "rustkern/md5.rs"] mod md5;
+#[path = "rustkern/modex.rs"] mod modex;   // #740: Mode X (unchained VGA) geometry + present scanline kernel
 #[path = "rustkern/mono.rs"] mod mono;
+#[path = "rustkern/mprotect.rs"] mod mprotect;   // #404: SYS_MPROTECT Ring-3 argument validation
 #[path = "rustkern/netstat.rs"] mod netstat;   // #745: structured net status + non-blocking probe
+#[path = "rustkern/fwfilter.rs"] mod fwfilter;   // #238: THE packet filter (rules, conntrack, config codec)
 #[path = "rustkern/mp4.rs"] mod mp4;
 #[path = "rustkern/parttbl.rs"] mod parttbl;
 #[path = "rustkern/instdisk.rs"] mod instdisk;
 #[path = "rustkern/pe.rs"] mod pe;
 #[path = "rustkern/pgrp.rs"] mod pgrp;   // #745 (local 82): POSIX process-group + session policy
+#[path = "rustkern/pipewr.rs"] mod pipewr;   // #111: pipe write-side decision machine (blocking write + SIGPIPE)
 #[path = "rustkern/pollsys.rs"] mod pollsys;   // #745 (local 82): poll(2) over the VFS fd layer
 #[path = "rustkern/png.rs"] mod png;
+#[path = "rustkern/winbuf.rs"] mod winbuf;   // #137: window content-buffer size policy
+#[path = "rustkern/winblit.rs"] mod winblit;  // #blitguard: sys_win_blit geometry contract
 #[path = "rustkern/pwpolicy.rs"] mod pwpolicy;   // password strength + breached-password policy
 #[path = "rustkern/permpath.rs"] mod permpath;   // #674: POSIX path resolution for perms_check()
+#[path = "rustkern/permhome.rs"] mod permhome;   // #PERMSKIP: "is this PERMS.DB key a user home?"
+#[path = "rustkern/selftestreg.rs"] mod selftestreg; // #PERMSKIP: the register of self-tests that DID NOT RUN
 #[path = "rustkern/ptwalk.rs"] mod ptwalk;   // #647: live page-table hierarchy walk
 #[path = "rustkern/proc_mem.rs"] mod proc_mem;
 #[path = "rustkern/procinfo.rs"] mod procinfo;
 #[path = "rustkern/procreap.rs"] mod procreap;   // #745 (task 37): which zombie process slots may be reclaimed
+#[path = "rustkern/rtcenc.rs"] mod rtcenc;   // #135: THE MC146818 RTC register codec, both directions (the 6h06m clock bug)
 #[path = "rustkern/sched_age.rs"] mod sched_age;
-#[path = "rustkern/schedwatch.rs"] mod schedwatch;   // #67: SMP livelock diagnostic + run-queue placement policy
+#[path = "rustkern/aptick.rs"] mod aptick;         // #169: per-core AP preemption decision
+#[path = "rustkern/schedwatch.rs"] mod schedwatch;
+#[path = "rustkern/cpuobs.rs"] mod cpuobs;   // #83: which core is a task on
+#[path = "rustkern/tickwatch.rs"] mod tickwatch;   // #745 (#62): periodic-tick health verdict + failover decision   // #67: SMP livelock diagnostic + run-queue placement policy
 #[path = "rustkern/seccore.rs"] mod seccore;
 #[path = "rustkern/sha256.rs"] mod sha256;
 #[path = "rustkern/loginmode.rs"] mod loginmode; // #745: LOGIN.CFG parse + compose
 #[path = "rustkern/sessionid.rs"] mod sessionid; // #745: session lock + account uid policy
+#[path = "rustkern/envblock.rs"] mod envblock;   // #112: initial user-stack layout + environment-entry policy
+#[path = "rustkern/sessend.rs"] mod sessend;  // #126: which processes belong to a session that just ended
 #[path = "rustkern/spawnid.rs"] mod spawnid;   // #692: spawn identity policy
 #[path = "rustkern/sntp.rs"] mod sntp;   // #797: SNTP reply validation + civil time
+#[path = "rustkern/sysvol.rs"] mod sysvol;   // #162: the ONE system master-volume/mute state machine
 #[path = "rustkern/sshdcfg.rs"] mod sshdcfg;   // #697: sshd listen + auth policy
 #[path = "rustkern/sha512.rs"] mod sha512;
 #[path = "rustkern/taskmgr.rs"] mod taskmgr;
+#[path = "rustkern/uiscale.rs"] mod uiscale;   // global UI scale factor: ONE definition, kernel + Ring 3
+#[path = "rustkern/battery.rs"] mod battery;   // #battmeter: control-method battery _BIF/_BST evaluation
 #[path = "rustkern/theme.rs"] mod theme;
 #[path = "rustkern/tls12.rs"] mod tls12;
 #[path = "rustkern/tlspool.rs"] mod tlspool;
 #[path = "rustkern/tls_parse.rs"] mod tls_parse;
 #[path = "rustkern/tls_suite.rs"] mod tls_suite;   // #tls-suitefix: the offered cipher suite list, shared by ClientHello and ServerHello
 #[path = "rustkern/userconf.rs"] mod userconf;   // #683: per-user config paths
+#[path = "rustkern/usbvol.rs"] mod usbvol;   // #740: data volumes in the boot device tail
+#[path = "rustkern/hotplug.rs"] mod hotplug; // #250: removable-volume list + mount-point path routing
 #[path = "rustkern/url.rs"] mod url;
 #[path = "rustkern/usb_desc.rs"] mod usb_desc;
+#[path = "rustkern/vbe.rs"] mod vbe;   // #740: VESA BIOS Extensions (VBE 1.2) for the DOS guest
 #[path = "rustkern/vfs_path.rs"] mod vfs_path;
 #[path = "rustkern/wav.rs"] mod wav;
+#[path = "rustkern/x86_32.rs"] mod x86_32;   // #740: 32-bit protected-mode guest execution core
+#[path = "rustkern/x87.rs"] mod x87;   // #211: the x87 execution unit for the 32-bit guest core (arithmetic from exec/softfpu.c)
 #[path = "rustkern/xattr.rs"] mod xattr;
 #[path = "rustkern/xdr.rs"] mod xdr;
+#[path = "rustkern/earlyfb.rs"] mod earlyfb;   // #ASUSDIAG: boot-stage tracker painted straight to the firmware framebuffer, live from the first instruction of kernel_main
+#[path = "rustkern/fltrec.rs"] mod fltrec;   // #ASUSDIAG: raw-block boot flight recorder (record layout, ring bookkeeping, CRC32)
 
 // ===========================================================================
 // #653: security-event record formatting. NEW kernel logic, so it is Rust per
@@ -208,6 +274,10 @@ pub extern "C" fn sec_event_severity(event: u32) -> u32 {
         // would train the user to ignore all of them.
         7 | 8 => 2,            // AUTH_SUCCESS, AUTH_FAIL
         12 => 2,               // #745 AI_INJECTION: a refused LLM request
+        // #fdguard: a cross-process file-descriptor or /dev/pts attach was
+        // REFUSED. WARNING: an app reaching for another process's I/O is a
+        // real attempted boundary crossing, worth surfacing like a denial.
+        13 => 2,               // #fdguard IO_BOUNDARY
         _ => 3,                // OVERFLOW, AUTH_PROBE and anything unknown
     }
 }
@@ -238,6 +308,9 @@ pub extern "C" fn sec_event_name(event: u32) -> *const u8 {
         // request is a thing the user asked for that did not happen, so it must
         // be visible rather than buried at INFO.
         12 => b"AI_INJECTION\0",
+        // #fdguard: appended per the append-only rule; a matching arm here
+        // and in sec_event_severity, or a new event logs as INFO UNKNOWN.
+        13 => b"IO_BOUNDARY\0",
         _ => b"UNKNOWN\0",
     };
     s.as_ptr()

@@ -44,6 +44,19 @@ const ST_ZOMBIE: u32 = 5;
 // flags bits, mirrored by PROC_REAP_F_* in kernel/proc/process.h.
 const F_SHARES_VM: u32 = 1 << 0; // a CLONE_THREAD thread (#430)
 const F_DETACHED: u32 = 1 << 1; // a kernel worker: nobody will ever wait() it
+// #161: the parent has SIGCHLD == SIG_IGN, the POSIX declaration that its
+// children must not become zombies. Computed on the C side (it needs the
+// parent's handler table); see reap_orphan_zombies() in kernel/proc/process.c.
+//
+// THE SECOND HALF OF THE SAME DEFECT. Task 37 above fixed the leak for KERNEL
+// workers, whose ppid was a lie. Ring 3 apps have the mirror-image problem with
+// a TRUE ppid: an app launched from the dock or the start menu really is a
+// child of the compositor, and the compositor really is alive - it just never
+// calls wait() and never exits, so `parent_alive` is permanently true and
+// "orphan" never becomes true. Every app the owner opened and closed left a
+// permanent zombie in a 64-entry table (#161, owner-reported: "it shows as
+// zombie"), and a zombie cannot be killed, which is why Kill did nothing.
+const F_NOCLDWAIT: u32 = 1 << 2;
 
 /// One process-table slot, flattened. Layout locked against the C side by a
 /// `_Static_assert` on `sizeof(proc_reap_ent_t)` in kernel/proc/process.c.
@@ -73,6 +86,7 @@ const MAX_SLOTS: usize = 64;
 ///       - ppid <= 1        (init/idle never call wait),
 ///       - F_SHARES_VM      (#430: a thread is joined via the futex),
 ///       - F_DETACHED       (task 37: a kernel worker),
+///       - F_NOCLDWAIT      (#161: the parent set SIGCHLD to SIG_IGN),
 ///       - no live parent   (a real orphan: the slot holding ppid is gone or
 ///                           is itself a zombie).
 fn scan(ents: &[ProcReapEnt], skip: i32) -> u64 {
@@ -86,7 +100,7 @@ fn scan(ents: &[ProcReapEnt], skip: i32) -> u64 {
             continue;
         }
         let unwaited = z.ppid <= 1
-            || (z.flags & (F_SHARES_VM | F_DETACHED)) != 0
+            || (z.flags & (F_SHARES_VM | F_DETACHED | F_NOCLDWAIT)) != 0
             || !parent_alive(ents, z.ppid);
         if unwaited {
             mask |= 1u64 << i;
@@ -185,6 +199,23 @@ pub extern "C" fn proc_reap_selftest_rs() -> u32 {
     let want = !0u64 << 2; // every slot from 2 upward
     if scan(&big, -1) != want {
         return 9;
+    }
+    // 10: #161 REGRESSION CASE - a Ring 3 app whose parent (the compositor) is
+    //     alive and has declared SIGCHLD == SIG_IGN -> REAP. If this ever goes
+    //     back to "keep", every app the user opens and closes leaks a slot
+    //     again and the 64-entry table fills after a few dozen launches.
+    let t10 = [base[0], base[1], e(11, 10, ST_ZOMBIE, F_NOCLDWAIT)];
+    if scan(&t10, -1) != (1u64 << 2) {
+        return 10;
+    }
+    // 11: THE CONTROL for case 10. Same shape with the flag CLEAR must still be
+    //     KEPT, or this rule has quietly become "reap every zombie" and msh
+    //     loses the exit status of every command it runs. Case 1 above covers
+    //     the same ground; this one states it as the paired negative so the two
+    //     cannot drift apart.
+    let t11 = [base[0], base[1], e(11, 10, ST_ZOMBIE, 0)];
+    if scan(&t11, -1) != 0 {
+        return 11;
     }
     0
 }

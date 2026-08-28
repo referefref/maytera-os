@@ -52,6 +52,12 @@ static const aicap_ent_t g_caps[] = {
     { "python.execute",      "app.python.execute",    AICAP_RISK_HIGH },
     { "taskmanager.kill",    "system.process.kill",   AICAP_RISK_HIGH },
     { "network.set",         "system.network.write",  AICAP_RISK_HIGH },
+    // #238: the packet filter. HIGH, and deliberately NOT folded into
+    // "system.network.write": granting an assistant permission to set an
+    // IP address is not the same decision as granting it permission to
+    // open or close ports, and a consent prompt that conflates the two
+    // asks the user a question they cannot answer accurately.
+    { "net.firewall",        "system.network.firewall", AICAP_RISK_HIGH },
     { "build.compile_app",   "app.build.compile",     AICAP_RISK_HIGH },
     { "build.deploy_app",    "app.build.deploy",      AICAP_RISK_HIGH },
 };

@@ -22,6 +22,7 @@
 #include "../../libc/devinfo.h"
 #include "../../libc/stdio.h"
 #include "../../libc/signal.h"
+#include "../../libc/proccpu.h"   /* #178: the ONE CPU ranking, shared with taskmgr and top */
 
 #define WIN_W  760
 #define WIN_H  560
@@ -49,11 +50,16 @@ static int win = -1, DW = WIN_W, DH = WIN_H;
 static devinfo_sysinfo_t g_sys;
 static int g_sys_ok = 0;
 
+/* #178: MAXPROC is now PROCCPU_MAX, the one bound, which is the kernel's
+   MAX_PROCESSES. This app used to pick its own; picking your own is how a row
+   ends up with no baseline slot. */
+_Static_assert(MAXPROC == PROCCPU_MAX, "sysmon's snapshot bound must be the shared one");
 static proc_info_t procs[MAXPROC];
 static int nproc = 0;
-static int cpu_pct[MAXPROC];
-static unsigned long long prev_ticks[256];      // keyed by pid
-static int prev_valid = 0;
+static unsigned int cpu_pct[MAXPROC];
+/* #178: the whole "diff two snapshots by pid" baseline, owned by libc. This
+   app no longer holds any CPU accounting state of its own to get wrong. */
+static proccpu_t cpu_state;
 
 static int cpu_total = 0;
 static unsigned long mem_total = 0, mem_used = 0;
@@ -126,6 +132,10 @@ static void set_status(const char *msg) {
 }
 
 // ---- sorting -----------------------------------------------------------------
+// #178: deliberately NOT proccpu_sort(). That helper is CPU-then-memory only,
+// and this table lets the user sort by memory, pid or name as well, so folding
+// it in would delete a feature. The RANKING is shared; the column choice is
+// this app's own and is not duplicated anywhere.
 static int proc_before(int a, int b) {
     switch (sort_mode) {
         case 1: return procs[a].mem_kb > procs[b].mem_kb;
@@ -141,7 +151,7 @@ static void sort_procs(void) {
         for (int b = 0; b < nproc - 1 - a; b++)
             if (!proc_before(b, b + 1) && proc_before(b + 1, b)) {
                 proc_info_t tp = procs[b]; procs[b] = procs[b + 1]; procs[b + 1] = tp;
-                int tc = cpu_pct[b]; cpu_pct[b] = cpu_pct[b + 1]; cpu_pct[b + 1] = tc;
+                unsigned int tc = cpu_pct[b]; cpu_pct[b] = cpu_pct[b + 1]; cpu_pct[b + 1] = tc;
             }
 }
 
@@ -161,21 +171,14 @@ static void push_hist(void) {
 static void sample(void) {
     unsigned long now = uptime_ms();
 
+    // #178: all three #145 invariants (idle in the denominator, idle out of the
+    // list, baselines matched BY PID) now live in libc/proccpu.c and nowhere
+    // else. This app previously carried its own copy, complete with its own
+    // bound; that copy and the Task Manager's disagreed on the bound, which is
+    // how one of the two defects survived a fix aimed at both.
     nproc = sys_proc_list(procs, MAXPROC);
     if (nproc < 0) nproc = 0;
-    unsigned long long d[MAXPROC], tot = 0;
-    for (int i = 0; i < nproc; i++) {
-        unsigned p = procs[i].pid;
-        unsigned long long pv = (p < 256) ? prev_ticks[p] : 0;
-        d[i] = (procs[i].cpu_ticks >= pv) ? (procs[i].cpu_ticks - pv) : 0;
-        tot += d[i];
-    }
-    for (int i = 0; i < nproc; i++)
-        cpu_pct[i] = (prev_valid && tot) ? (int)((d[i] * 100ULL) / tot) : 0;
-    for (int i = 0; i < 256; i++) prev_ticks[i] = 0;
-    for (int i = 0; i < nproc; i++)
-        if (procs[i].pid < 256) prev_ticks[procs[i].pid] = procs[i].cpu_ticks;
-    prev_valid = 1;
+    nproc = proccpu_rank(&cpu_state, procs, nproc, cpu_pct);
 
     cpu_total = sys_get_cpu_usage();
     sys_get_mem_info(&mem_total, &mem_used);
@@ -320,7 +323,7 @@ static void draw(void) {
         else snprintf(buf, sizeof(buf), "AP%d", procs[i].running_cpu);
         win_draw_text_ttf(win, cCore, ry + 3, buf, 11, td);
         win_draw_text_ttf(win, cState, ry + 3, state_name(procs[i].state), 11, td);
-        snprintf(buf, sizeof(buf), "%d%%", cpu_pct[i]);
+        snprintf(buf, sizeof(buf), "%u%%", cpu_pct[i]);
         win_draw_text_ttf(win, cCpu, ry + 3, buf, 12, tx);
         mem_str(procs[i].mem_kb, buf, sizeof(buf));
         win_draw_text_ttf(win, cMem, ry + 3, buf, 11, td);

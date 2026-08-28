@@ -42,11 +42,24 @@ extern fat_fs_t g_fat_fs;
 static uint8_t      g_win16_mem[WIN16_MEM_SIZE];
 static x86_16_cpu_t g_win16_cpu;
 
-// (#289 Phase1) When non-zero, the NEXT win16_run_file loads its NE under the
-// protected-mode selector/LDT model (see x86_16.c). Default 0 = real mode, so
-// every existing app path is unaffected. Set by the RC `win16pm` launcher (or a
-// future per-app policy). It is consumed (left as set by the caller) each run.
+// (#289 Phase1, #845 per-app mode) Resolved mode for the run IN PROGRESS: 0 =
+// real, 1 = protected. This is now purely an internal cache: win16_run_file_inner()
+// is the ONLY place that ever assigns it, computed fresh every run from
+// g_win16_mode_override plus the NE-header heuristic in win16_decide_pmode()
+// below, then re-applied after x86_16_init() (see #736) since that call
+// zeroes the cpu struct. Nothing outside ne.c writes this any more.
 int g_win16_want_pmode = 0;
+// (#845) Per-run mode REQUEST, set by whichever launch entry point in
+// syscall.c/win16api.c is about to proc_create() the guest: -1 = no override
+// (derive from the NE header, defaulting to real if that is inconclusive),
+// 0 = force real, 1 = force protected. This is the SINGLE channel both the
+// Start-menu launch (win16_launch(), an explicit mode argument from the
+// caller) and the /CONFIG/WIN16PM.RUN autolauncher (win16_launch_kernel(),
+// the trailing "pm" token) feed into win16_run_file_inner()'s one decision
+// point. Read exactly once per run and reset to -1 immediately after, so a
+// stale value from a previous launch can never leak into the next one (the
+// old g_win16_want_pmode was sticky across runs; this is not).
+int g_win16_mode_override = -1;
 char g_win16_cmdtail[128] = {0};   // (EP3) optional NE command tail (argv)
 // (#345) Win16 .SCR screensaver mode: set when the NE is launched with a "/s"
 // command tail (SCRNSAVE.LIB WinMain then runs the fullscreen saver). Gated so
@@ -1137,6 +1150,32 @@ static int win16_callfar_should_abort(void) {
 // It is a wrapper rather than an edit to syscall.c's win16_proc_entry() because
 // that file's line numbers are PINNED by the #645 smap-uaccess manifest, and
 // inserting one line there turns 48 unrelated entries into false failures.
+// (#845) Per-app real/protected mode decision, the single heuristic used when
+// no explicit override is given. Peeks the NE header bytes ALREADY IN HAND
+// (no extra file I/O) and reuses the exact "large/complex Win16 app" signature
+// already proven for Word6-class DGROUP/stack sizing at load_ne_module()
+// (SS==DS automatic data, a real declared heap, and a big segment table: see
+// the #278 Word6 pass20 comments there). Small real-mode-safe titles
+// (FreeCell, the Entertainment Pack, SkiFree) have far fewer segments and
+// stay in real mode unchanged. override: -1 = derive (this function
+// decides), 0 = force real, 1 = force protected.
+static int win16_decide_pmode(const uint8_t *f, uint32_t size, int override) {
+    if (override == 0 || override == 1) return override;
+    if (size < 0x40 || f[0] != 'M' || f[1] != 'Z') return 0;
+    uint32_t lfanew = (uint32_t)f[0x3C] | ((uint32_t)f[0x3D] << 8) |
+                      ((uint32_t)f[0x3E] << 16) | ((uint32_t)f[0x3F] << 24);
+    if (lfanew + 0x40 > size || f[lfanew] != 'N' || f[lfanew + 1] != 'E') return 0;
+    const uint8_t *ne = f + lfanew;
+    uint16_t segcount = (uint16_t)(ne[0x1C] | (ne[0x1D] << 8));
+    uint16_t autodata = (uint16_t)(ne[0x0E] | (ne[0x0F] << 8));
+    uint16_t ne_heap  = (uint16_t)(ne[0x10] | (ne[0x11] << 8));
+    uint32_t sssp = (uint32_t)ne[0x18] | ((uint32_t)ne[0x19] << 8) |
+                    ((uint32_t)ne[0x1A] << 16) | ((uint32_t)ne[0x1B] << 24);
+    uint16_t ss_idx = (uint16_t)(sssp >> 16);
+    if (autodata == ss_idx && ne_heap >= 0x1000 && segcount >= 100) return 1;
+    return 0;
+}
+
 static int win16_run_file_inner(const char *path);
 int win16_run_file(const char *path) {
     int rc = win16_run_file_inner(path);
@@ -1163,13 +1202,20 @@ static int win16_run_file_inner(const char *path) {
     }
     uint8_t *f = (uint8_t *)data;
 
-    // (#289 Phase1) Decide real-mode vs protected-mode for THIS run. Default is
-    // real mode (regression-safe). A caller sets g_win16_want_pmode=1 (e.g. the
-    // RC `win16pm` command) to load this NE under the selector/LDT model. We
-    // enable BEFORE x86_16_init / segment load so segbase[] gets selectors and
-    // every memory access this run routes through the LDT + arena.
-    extern int g_win16_want_pmode;
-    win16_pmode_enable(&g_win16_cpu, g_win16_want_pmode ? 1 : 0);   // resets LDT+arena when on
+    // (#289 Phase1, #845 per-app mode) Decide real-mode vs protected-mode for
+    // THIS run. ONE decision point for both launch paths (Start menu and the
+    // WIN16PM.RUN autolauncher): an explicit override from the caller wins,
+    // else derive from the NE header (win16_decide_pmode() above), else real
+    // mode (regression-safe default). We enable BEFORE x86_16_init / segment
+    // load so segbase[] gets selectors and every memory access this run
+    // routes through the LDT + arena.
+    extern int g_win16_mode_override;
+    int win16_mode_req = g_win16_mode_override;
+    g_win16_mode_override = -1;   // one-shot: never sticky into the next run
+    g_win16_want_pmode = win16_decide_pmode(f, size, win16_mode_req);
+    kprintf("[win16] %s: mode=%s (override=%d)\n", path,
+            g_win16_want_pmode ? "protected" : "real", win16_mode_req);
+    win16_pmode_enable(&g_win16_cpu, g_win16_want_pmode);   // resets LDT+arena when on
 
     // (#345) Screensaver mode. A "/s" (or "-s") command tail means run the NE as a
     // fullscreen screen saver. SCRNSAVE.LIB WinMain parses the tail: "/s"=run,

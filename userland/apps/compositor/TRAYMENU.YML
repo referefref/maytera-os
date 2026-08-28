@@ -6,10 +6,27 @@ sheep:
   - {type: slider, label: Count, bind: sheep_count, min: 1, max: 50}
   - {type: check, label: Sheepdog, bind: dog_show}
 sound:
+  # (#231r) The 5-band graphic EQ is BACK, and all FIVE bands are bound now.
+  #
+  # #231 removed the old three (Bass/Mid/Treble on eq0/eq2/eq4, with eq1 and
+  # eq3 bound to nothing at all) along with the decorative fader bank they
+  # drove, because g_eq[] in traymenu.c had no syscall or DSP behind it and
+  # was never persisted. Both halves of that are now false: eqN goes through
+  # SYS_AUDIO_EQ (413) to real per-band biquad filtering in the kernel's PCM
+  # mixer (kernel/rustkern/pcmeq.rs), and the positions are persisted by
+  # profile.c on the same path "volume" uses.
+  #
+  # The labels are the DSP's actual centre/corner frequencies. The sound
+  # panel's renderer still does not read this list (it is a hand-drawn
+  # hardware face, see tm_box()/snd_render() in traymenu.c, which derives its
+  # own labels from the kernel), but these bindings ARE live: anything that
+  # drives a binding by name reaches the same filter.
   - {type: slider, label: Volume, bind: volume, min: 0, max: 100}
-  - {type: slider, label: Bass, bind: eq0, min: 0, max: 100}
-  - {type: slider, label: Mid, bind: eq2, min: 0, max: 100}
-  - {type: slider, label: Treble, bind: eq4, min: 0, max: 100}
+  - {type: slider, label: 60 Hz, bind: eq0, min: 0, max: 100}
+  - {type: slider, label: 250 Hz, bind: eq1, min: 0, max: 100}
+  - {type: slider, label: 1 kHz, bind: eq2, min: 0, max: 100}
+  - {type: slider, label: 4 kHz, bind: eq3, min: 0, max: 100}
+  - {type: slider, label: 12 kHz, bind: eq4, min: 0, max: 100}
 widgets:
   - {type: check, label: Clock, bind: show_clock}
   - {type: check, label: Calendar, bind: show_calendar}

@@ -23,6 +23,7 @@ static const char *slot_name(uint32_t slot) {
     switch (slot) {
     case GUESTFS_SLOT_DOS:   return "dos";
     case GUESTFS_SLOT_WIN16: return "win16";
+    case GUESTFS_SLOT_DPMI:  return "dpmi";
     default:                 return "?";
     }
 }

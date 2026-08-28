@@ -5,6 +5,14 @@
 
 #include <stdint.h>
 #include "../../libc/tz.h"   // #49/#50: THE timezone list + local-clock helper
+// UI SCALE (task uiscale, compositor half): the compositor draws chrome
+// directly to the physical framebuffer, outside the kernel's per-window
+// coordinate transform, so it must scale its own geometry. ui_px()/ui_span()/
+// ui_unpx() and the cached g_ui_scale_pct/g_ui_scale_gen live here; see
+// uiscale.h for the full contract. Included at this single chokepoint so
+// every compositor .c file (all of which include compositor.h already) gets
+// the scaling primitives without a per-file include.
+#include "../../libc/uiscale.h"
 
 // ============================================================================
 // Forward declarations for libc (freestanding, no standard headers)
@@ -56,6 +64,14 @@ extern uint32_t CLR_GAUGE_BORDER;   // #110: theme-driven
 #define CLR_GAUGE_RAM       0xFF0088CC
 #define CLR_GAUGE_DSK       0xFFCC8800
 #define CLR_GAUGE_NET       0xFF8800CC
+
+// #battmeter: battery tray meter fill colour by charge band. Same house
+// style as the CLR_GAUGE_* constants immediately above (fixed semantic
+// accent, not a theme token - battery health colour is a universal
+// convention, not a look the theme should be able to recolour away).
+#define CLR_BATTERY_OK       0xFF2FBF4F   // > 30%: green
+#define CLR_BATTERY_LOW      0xFFCC8800   // 16-30%: amber (matches CLR_GAUGE_DSK)
+#define CLR_BATTERY_CRIT     0xFFCC3333   // <= 15%: red
 
 // Start menu
 extern uint32_t CLR_MENU_BG;
@@ -142,24 +158,37 @@ void compositor_apply_theme(int kernel_theme_id);
 // Layout constants
 // ============================================================================
 
+// #uiscale: every pixel dimension below is scaled AT THE DEFINITION via
+// ui_px(), so every consumer (draw side AND hit-test side alike) picks up
+// the scale factor automatically with no per-call-site edit, and draw/hit
+// can never drift apart the way a copy-pasted literal would. Verified none
+// of these are used as a compile-time array size, switch case, or #if
+// operand anywhere in the tree (grepped for "[NAME]" / "case NAME" / "#if
+// ... NAME" across every .c/.h here) before converting - a macro used in any
+// of those contexts would need a raw _BASE form plus a scaled accessor
+// instead, the way FONT_CHAR_W/H just above does. COUNTS/LIMITS (e.g.
+// START_MENU_MAX_ITEMS, DESKTOP_ICON_MAX, CTX_MENU_MAX_ITEMS, THUMB_COLS,
+// LOGIN_MAX_PASSWORD/USERS, MAX_WALLPAPERS) are left untouched: they are not
+// pixel measurements.
+
 // Taskbar
-#define TASKBAR_HEIGHT      36
-#define TASKBAR_PADDING     4
-#define TASKBAR_BTN_SIZE    28
-#define TASKBAR_ICON_SPACE  4
+#define TASKBAR_HEIGHT      ui_px(36)
+#define TASKBAR_PADDING     ui_px(4)
+#define TASKBAR_BTN_SIZE    ui_px(28)
+#define TASKBAR_ICON_SPACE  ui_px(4)
 
 // Gauges
-#define GAUGE_WIDTH         80
-#define GAUGE_HEIGHT        22
-#define GAUGE_SPACING       4
+#define GAUGE_WIDTH         ui_px(80)
+#define GAUGE_HEIGHT        ui_px(22)
+#define GAUGE_SPACING       ui_px(4)
 
 // Start menu
-#define START_MENU_WIDTH    300
-#define START_MENU_ITEM_H   26
-#define START_MENU_CAT_H    28
-#define START_MENU_PADDING  8
-#define START_MENU_SEP_H    12
-#define START_MENU_POWER_H  40
+#define START_MENU_WIDTH    ui_px(300)
+#define START_MENU_ITEM_H   ui_px(26)
+#define START_MENU_CAT_H    ui_px(28)
+#define START_MENU_PADDING  ui_px(8)
+#define START_MENU_SEP_H    ui_px(12)
+#define START_MENU_POWER_H  ui_px(40)
 // #<startmenu-rust> was 96 (fit the old hardcoded ~58-item default menu with
 // little headroom). Now that every entry (defaults, Win16 program groups, App
 // Store installs, user pins) is data merged at runtime, 96 is too tight to
@@ -171,8 +200,8 @@ void compositor_apply_theme(int kernel_theme_id);
 // the Favorites/Recent/category rows. Menu width/item icon size are now
 // runtime-configurable (Settings "Start Menu" panel); START_MENU_WIDTH above
 // stays as the compiled-in default.
-#define START_MENU_HEADER_H 40
-#define START_MENU_SEARCH_H 32
+#define START_MENU_HEADER_H ui_px(40)
+#define START_MENU_SEARCH_H ui_px(32)
 
 // Desktop icons
 extern int DESKTOP_ICON_SIZE;
@@ -185,9 +214,15 @@ void notif_tick(void);                       // poll spool + expire toasts (loop
 void notif_collect_damage(void);              // #585: per-toast damage rects (idle path, #379)
 void notif_render(void);                      // draw toasts + notification center
 int  notif_handle_mouse(int x, int y, int clicked);  // returns 1 if consumed
+int  notif_handle_key(int key);               // docs/NOTIFICATIONS_DESIGN.html sect;5: Esc/Tab/Enter, returns 1 if consumed
 int  notif_unread(void);                      // tray bell unread badge count
 void notif_toggle_center(void);               // bell click opens/closes center
 int  notif_center_open(void);
+// #127 verification-only: push a notification straight into history/toast
+// state via the exact same push_notification() the spool poller calls,
+// bypassing the file write. Used by testhook.c's NOTIFY verb ONLY (gated the
+// same as every other verb in that file); never called from shipping code.
+void notif_test_push(int sev, const char *title, const char *body);
 
 // Desktop widgets (#77): analog clock, calendar, sheep pet.
 void widgets_render(void);
@@ -274,56 +309,81 @@ void profile_save(void);
 void profile_tick(void);
 void profile_current_username(char *out, int outsz);
 int  text_width_ttf(const char *text, int size);
+
+// #204: word-wrap primitive shared with confirmdialog.c. Was private to
+// notif.c (#762 toast wrapping) until the confirm/notice card needed the
+// exact same greedy word-wrap + hard-break-a-too-wide-word + real-measured-
+// ellipsis behavior - every one of the confirm dialog's 7 call sites (Shut
+// Down/Restart/Log Out/Lock, Force Quit, Recycle Bin Delete/Empty, End Task/
+// Kill) was passing one whole unwrapped sentence and overflowing the card's
+// 328px body width (measured 474-727px, docs/CONFIRM_MODAL_DESIGN.html
+// section 8), so this got promoted rather than re-hand-rolled a second time
+// - the exact "several bespoke implementations, none shared" pattern this
+// project keeps re-finding. UI_WRAP_COL is the shared per-line buffer
+// stride; keep it equal to notif.c's NBODY and confirmdialog.h's
+// CONFIRM_LINE_MAX (confirmdialog.h defines CONFIRM_LINE_MAX as this macro
+// directly, so there is nothing to drift).
+#define UI_WRAP_COL 120
+int wrap_text_ttf(const char *body, int size, int max_w, int max_lines,
+                  char out[][UI_WRAP_COL]);
 extern int g_font_px;   // current UI label point size (#58)
-#define DESKTOP_ICON_MARGIN_X 20
-#define DESKTOP_ICON_MARGIN_Y 20
+// #uiscale TEMPORARY opt-out - see the declaration/rationale in main.c next
+// to g_ui_scale_native_text. push() before, pop() after (every return path,
+// or one guarded exit) drawing a surface whose own box geometry is not yet
+// scaled, so its text renders at native 1x to match.
+extern int g_ui_scale_native_text;
+void ui_scale_native_push(void);
+void ui_scale_native_pop(void);
+#define DESKTOP_ICON_MARGIN_X ui_px(20)
+#define DESKTOP_ICON_MARGIN_Y ui_px(20)
 extern int DESKTOP_ICON_SPACING_X;
 extern int DESKTOP_ICON_SPACING_Y;
 #define DESKTOP_ICON_MAX    32
 #define DESKTOP_ICON_NAME_LEN 32
 
 // Context menu
-#define CTX_MENU_WIDTH      160
-#define CTX_MENU_ITEM_H     24
-#define CTX_MENU_SEP_H      8
+#define CTX_MENU_WIDTH      ui_px(160)
+#define CTX_MENU_ITEM_H     ui_px(24)
+#define CTX_MENU_SEP_H      ui_px(8)
 #define CTX_MENU_MAX_ITEMS  16
 // Which surface opened the context menu (contextmenu.c): the desktop's fixed
 // action set, or a Start-menu item's Pin/Add-to-Desktop/Properties set.
 #define CTX_MODE_DESKTOP  0
 #define CTX_MODE_MENUITEM 1
 #define CTX_MODE_DOCK     2   // #44: dock item right-click (taskbar.c XFCE dock)
+#define CTX_MODE_VOLUME   3   // #250: removable-volume desktop icon right-click
 
 // Clock widget
-#define CLOCK_PADDING_X     12
-#define CLOCK_PADDING_Y     6
-#define CLOCK_MARGIN_RIGHT  16
-#define CLOCK_MARGIN_TOP    10
-#define CLOCK_CORNER_RADIUS 10
+#define CLOCK_PADDING_X     ui_px(12)
+#define CLOCK_PADDING_Y     ui_px(6)
+#define CLOCK_MARGIN_RIGHT  ui_px(16)
+#define CLOCK_MARGIN_TOP    ui_px(10)
+#define CLOCK_CORNER_RADIUS ui_px(10)
 
 // Login screen
 // #567: matches lockscreen.c's LOCK_PANEL_W/H (380x340) exactly so the login
 // and lock panels read as the same sibling shape, per the approved mockup.
-#define LOGIN_PANEL_W       380
-#define LOGIN_PANEL_H       340
-#define LOGIN_AVATAR_SIZE   64
-#define LOGIN_AVATAR_SPACE  20
-#define LOGIN_INPUT_W       280
-#define LOGIN_INPUT_H       32
-#define LOGIN_BUTTON_W      280
-#define LOGIN_BUTTON_H      36
+#define LOGIN_PANEL_W       ui_px(380)
+#define LOGIN_PANEL_H       ui_px(340)
+#define LOGIN_AVATAR_SIZE   ui_px(64)
+#define LOGIN_AVATAR_SPACE  ui_px(20)
+#define LOGIN_INPUT_W       ui_px(280)
+#define LOGIN_INPUT_H       ui_px(32)
+#define LOGIN_BUTTON_W      ui_px(280)
+#define LOGIN_BUTTON_H      ui_px(36)
 #define LOGIN_MAX_PASSWORD  64
 #define LOGIN_MAX_USERS     16
 
 // Wallpaper picker
-#define THUMB_WIDTH         64
-#define THUMB_HEIGHT        48
-#define THUMB_PADDING       8
-#define THUMB_COLS          5
+#define THUMB_WIDTH         ui_px(64)
+#define THUMB_HEIGHT        ui_px(48)
+#define THUMB_PADDING       ui_px(8)
+#define THUMB_COLS          5   // a COUNT, not a pixel size - not scaled
 #define THUMB_CELL_W        (THUMB_WIDTH + THUMB_PADDING)
-#define THUMB_CELL_H        (THUMB_HEIGHT + THUMB_PADDING + 16)
+#define THUMB_CELL_H        (THUMB_HEIGHT + THUMB_PADDING + ui_px(16))
 #define PICKER_WIDTH        (THUMB_COLS * THUMB_CELL_W + THUMB_PADDING * 2)
-#define PICKER_HEIGHT       400
-#define PICKER_TITLE_H      24
+#define PICKER_HEIGHT       ui_px(400)
+#define PICKER_TITLE_H      ui_px(24)
 #define MAX_WALLPAPERS      64
 
 // Screensaver
@@ -354,7 +414,7 @@ extern int DESKTOP_ICON_SPACING_Y;
 // black frame, and then does nothing further per tick until real input wakes
 // it (screensaver_on_input(), unchanged). This bounds the steady-state cost
 // of an unattended machine to ~0 instead of the ~14% of a core measured
-// (a test VM, golden 1016) for the GL/plasma savers running indefinitely at
+// (VM <vmid>, golden 1016) for the GL/plasma savers running indefinitely at
 // the #650 SS_FRAME_MIN_MS-throttled rate. 15 minutes here plus the
 // SS_DEFAULT_TIMEOUT idle wait above totals ~25 minutes idle before the
 // display goes fully quiet. See screensaver_active_since_ms() below.
@@ -372,8 +432,26 @@ extern int DESKTOP_ICON_SPACING_Y;
 #define SS_ACTIVATE_GRACE_MS 500
 
 // Font
-#define FONT_CHAR_W         8
-#define FONT_CHAR_H         16
+// #uiscale: FONT_CHAR_W/H have TWO different jobs in this tree, and only one
+// of them may scale.
+//   (1) THE RAW 8x16 BITMAP GLYPH DIMENSIONS - draw_char()/draw_text_bitmap()/
+//       draw_char_large() in draw.c index font_data[128][16] and advance the
+//       cursor by these values one-for-one against that fixed-size table.
+//       Scaling THAT use would read past the end of font_data. draw.c uses
+//       the _RAW forms below for exactly this reason.
+//   (2) A GENERAL "TEXT CELL" CONSTANT that ~55 call sites across
+//       iconpicker.c/startmenu.c/taskbar.c/wallpaper.c/widgets.c/stickies.c
+//       use to vertically center or lay out TTF-rendered text (draw_text()/
+//       draw_text_centered()) against an assumed row height - none of those
+//       sites touch the bitmap font at all. THIS is the meaning everywhere
+//       outside draw.c's own glyph rendering, and it must scale with the UI
+//       scale factor or every one of those labels drifts off-center as text
+//       grows. ui_px() independently on W and H is fine here: this is a
+//       single cell size, not two rects that must share an edge.
+#define FONT_CHAR_W_RAW     8
+#define FONT_CHAR_H_RAW     16
+#define FONT_CHAR_W         ui_px(FONT_CHAR_W_RAW)
+#define FONT_CHAR_H         ui_px(FONT_CHAR_H_RAW)
 
 // ============================================================================
 // Icon IDs (must match kernel gui/icons.h)
@@ -410,6 +488,9 @@ typedef enum {
     ICON_IRC,
     ICON_VIDEO,
     ICON_NETWORK,
+    ICON_WIFI_OFF,  // #159 sect 6b: wifi bars + slash, for the desktop-widget
+                     // offline component. NOT ICON_NETWORK - that id points at
+                     // icon_data_info_circle (icons.c), a mislabeled entry.
     ICON_SLIDERS,   // tray audio/quick-settings glyph (color-icon only)
     ICON_CHEVD,     // start-menu expanded indicator
     ICON_CHEVR,     // start-menu collapsed indicator
@@ -458,6 +539,14 @@ typedef enum {
     ICON_HA_BATTERY,      // sensor/binary_sensor battery
     ICON_HA_WARN,         // problem/smoke/gas/tamper/safety alert; unavailable
     ICON_HA_CHECK,        // problem-class clear; person/tracker home; connected
+    // #250: hot-plugged USB volume. APPENDED, never inserted: these values are
+    // persisted numerically (UIPROFIL.YML screensaver type, desktop icon keys),
+    // so inserting one renumbers what is already on disk.
+    ICON_USBDRIVE,
+    // #234i: a mounted disk image is a removable volume too, and a CD drawn as
+    // a USB stick is a lie the user has to click to discover.
+    ICON_CDROM,
+    ICON_FLOPPY,
     ICON_COUNT
 } icon_id_t;
 
@@ -474,6 +563,11 @@ typedef enum {
 #define DESK_KIND_DIR    1   // a directory in <home>/DESKTOP
 #define DESK_KIND_EXEC   2   // an executable file in <home>/DESKTOP
 #define DESK_KIND_FILE   3   // any other file in <home>/DESKTOP
+// #250: a hot-plugged removable volume. NOT a file and NOT a system shortcut:
+// it appears and disappears with the physical device, so it is rebuilt from
+// the kernel's volume list on every desktop rescan rather than persisted.
+// Opening it opens Files at its mount point; right-clicking it offers Eject.
+#define DESK_KIND_VOLUME 4
 
 // Desktop icon
 typedef struct {
@@ -515,6 +609,11 @@ typedef struct {
     bool is_separator;
     bool is_win16;        // launch via win16_run() instead of sys_spawn()
     int  launch_type;     // 0=native (sys_spawn), 1=win16, 2=dos (#208)
+    // (#845) Only meaningful when launch_type==LAUNCH_WIN16: -1=auto (derive
+    // from the NE header), 0=force real, 1=force protected. Set from the
+    // .MENU fragment's optional "mode=" field (startmenu_model.rs); items
+    // from other sources (the legacy /WIN16GRP.CFG loader) default to auto.
+    int  win16_mode;
 } menu_item_t;
 
 // #26 XFCE-style dock: a favorite/pinned app descriptor returned by
@@ -577,7 +676,19 @@ typedef enum {
        ss_is_gl_type() and the #560 GL crash-gate in screensaver_set_type()
        (which only checks SS_GLTUNNEL..SS_GLLAVA) correctly leave them alone. */
     SS_FLAME,          /* §4.1 Fractal Flame "Bloom Garden": IFS chaos-game histogram */
-    SS_STAINEDGLASS    /* §4.6 Stained-Glass Warp: Voronoi cells, hard ink edges */
+    SS_STAINEDGLASS,   /* §4.6 Stained-Glass Warp: Voronoi cells, hard ink edges */
+    /* #124: the ORIGINAL plasma (#282), restored ALONGSIDE Plasma Reborn
+       rather than instead of it. ff3ca5f replaced SS_PLASMA in place, so the
+       classic look (blocky step=4 blocks straight to the framebuffer, indexed
+       through the raw HSV wheel, no radial term, no bloom, no palette
+       cycling) had disappeared from the product entirely. Both now ship.
+       Same rule as the trio above: id >= 20 and OUTSIDE the contiguous
+       SS_GLTUNNEL..SS_GLLAVA block, because this is direct-pixel, not TinyGL,
+       so ss_is_gl_type() and the GL range checks correctly ignore it.
+       APPENDED, never inserted: these ids are persisted numerically as
+       screensaver:<n> in UIPROFIL.YML, so renumbering would silently change
+       what every existing profile selects. */
+    SS_PLASMACLASSIC   /* #282 original plasma: 4px blocks, raw HSV wheel */
 } screensaver_type_t;
 
 // Screensaver star
@@ -614,13 +725,8 @@ typedef struct {
     uint32_t color;
 } ss_bubble_t;
 
-// Login state
-typedef enum {
-    LOGIN_STATE_SELECT_USER = 0,
-    LOGIN_STATE_PASSWORD,
-    LOGIN_STATE_ERROR,
-    LOGIN_STATE_SUCCESS
-} login_state_t;
+// (#73) login_state_t deleted with login.c - it had no other user. The
+// kernel login gate has its own, unrelated, enum of the same name.
 
 // Wallpaper entry
 typedef struct {
@@ -691,6 +797,15 @@ extern uint64_t g_idle_ms;   // monotonic uptime_ms() of last user input
 // Redraw flag
 extern bool g_needs_redraw;
 
+// #162 volosd.c - the volume OSD. FEEDBACK ONLY: the media keys are a KERNEL
+// global hotkey (cpu/isr.c), so by the time this file hears anything the
+// volume has already changed. volosd_tick() is one SYS_VOL_STATE syscall per
+// loop; volosd_render() must be called from BOTH render paths, including the
+// exclusive lock-screen branch, because #162 covers the lock screen.
+void volosd_tick(void);
+void volosd_render(void);
+int  volosd_visible(void);
+
 // ============================================================================
 // Module APIs (each module exposes init/render/handle functions)
 // ============================================================================
@@ -753,6 +868,24 @@ uint32_t readable_ink_dim(uint32_t bg);
 // (#745) The same muted ink with an explicit mix percentage. 35 is the opaque
 // default kept by readable_ink_dim(); glass surfaces use GLASS_DIM_MIX (22).
 uint32_t readable_ink_dim_mix(uint32_t bg, int mix);
+// (readable_accent() is declared further below, next to its other chrome-
+// helper neighbors - kept legible as a small accent bar/icon/dot, NOT for use
+// as a filled button surface under fixed-color text; see
+// draw_popup_button_centered() below for that case.)
+
+// #127/#128: the ONE shared tray/system popup panel (rounded CLR_MENU_BG body,
+// soft drop shadow, CLR_MENU_BORDER hairline, 1px top highlight) - every popup
+// hung off the tray (notifications center, quick-control popups) must use
+// this instead of a bespoke rect+border combo. See draw.c for the full
+// rationale and docs/TRAY_POPUP_DESIGN_LANGUAGE.md for the spec this ports.
+void draw_popup_panel(int32_t x, int32_t y, int32_t w, int32_t h, int32_t radius);
+// A neutral (non-accent-colored) popup action button with centered TTF text,
+// contrast-safe on all 14 shipping themes by construction (both fill and ink
+// derive from CLR_MENU_BG). Use this for any "Clear all"/"Dismiss"/plain
+// action button in a tray popup - never a raw severity/accent color fill
+// under fixed white text (measured 3.68:1, fails WCAG AA on every theme).
+void draw_popup_button_centered(int32_t x, int32_t y, int32_t w, int32_t h,
+                                int32_t radius, const char *label, int ttf_size);
 
 // ============================================================================
 // (#745) GLASS chrome: translucent surfaces with a blurred backdrop.
@@ -761,7 +894,14 @@ uint32_t readable_ink_dim_mix(uint32_t bg, int mix);
 #define GLASS_SURF_PANEL   0     // default taskbar / XFCE top panel / Lumina bar
 #define GLASS_SURF_DOCK    1     // XFCE bottom dock
 #define GLASS_SURF_MENU    2     // start menu root panel
-#define GLASS_SURF_COUNT   3
+// (#glassmodal) 4th slot: the confirm/shutdown/log-off modal card AND the
+// CPU/RAM/DSK/NET perf pop-out both use this ONE slot. Safe to share because
+// the two are never open at the same time in practice (the confirm dialog is
+// a true modal - see confirmdialog.c) and glass_render()'s own cache stores
+// only ONE geometry/tint per slot, so two genuinely-simultaneous callers
+// would just alternate cold recomputes rather than corrupt anything.
+#define GLASS_SURF_MODAL   3     // confirm/shutdown modal card + perf pop-out
+#define GLASS_SURF_COUNT   4
 
 // Composite a glass surface: blurred backdrop, then `tint` at the user's
 // dock_opacity, into the given rect. Honours the clip, caches per surface.
@@ -771,6 +911,53 @@ void glass_bump_epoch(void);
 void glass_invalidate_all(void);
 int  glass_perf_get(int surf, uint32_t *cold_n, uint32_t *cold_ms,
                     uint32_t *cold_worst, uint32_t *hit_n, int *tier);
+
+// (#glassmodal) Shared glass/chrome helpers, promoted from taskbar.c
+// (previously static, ~lines 130-195 there) so confirmdialog.c and
+// draw_perf_popup() can reuse the SAME edge/highlight/opacity-floor logic
+// instead of each hand-rolling a third copy (CLAUDE.md: improve the shared
+// primitive, do not fork). Definitions live in draw.c, next to
+// glass_render(). No behavior change at any existing taskbar.c call site.
+int      flat_chrome_alpha(void);
+void     glass_or_flat(int32_t x, int32_t y, int32_t w, int32_t h, int surf);
+void     glass_edge_h(int32_t x, int32_t y, int32_t w, uint32_t c);
+void     glass_edge_v(int32_t x, int32_t y, int32_t h, uint32_t c);
+void     glass_highlight_h(int32_t x, int32_t y, int32_t w);
+
+// (#glassmodal) Generalized AA corner rounding for a FLOATING rect with an
+// arbitrary corner mask. The dock (taskbar.c: xfce_dock_paint_rounded() /
+// xfce_corner_coverage()) already proved this technique for a rect flush to
+// the screen edge, which only ever needs its top two corners rounded; a
+// floating modal or pop-out needs all four. Contract for callers:
+//   1. capture() BEFORE painting anything, so the captured pixels are the
+//      real backdrop (desktop, scrim, whatever is genuinely behind this
+//      panel), not something this panel already drew;
+//   2. paint the panel as a plain square rect (glass or flat);
+//   3. draw ALL interior content, including any footer/title band drawn
+//      after the main fill;
+//   4. restore() LAST, after every other draw call for this panel. Restoring
+//      last is what lets a footer band (painted after the main panel fill)
+//      still get correctly rounded corners at the panel's own outer radius,
+//      instead of being squared back off by a footer that was drawn UNDER an
+//      earlier restore.
+// corner_capture_t is cheap (4 * 24 * 24 * 4 bytes ~= 9KB) - use it as a
+// stack-local at each call site, not a global; it is transient per-render.
+#define CORNER_TL 1
+#define CORNER_TR 2
+#define CORNER_BL 4
+#define CORNER_BR 8
+#define CORNER_ALL (CORNER_TL|CORNER_TR|CORNER_BL|CORNER_BR)
+#define CORNER_CAP_MAXR 24
+
+typedef struct {
+    uint32_t px[4][CORNER_CAP_MAXR][CORNER_CAP_MAXR];
+    int32_t  x, y, w, h, r;
+    int      mask;
+} corner_capture_t;
+
+void draw_round_corners_capture(corner_capture_t *cap, int32_t x, int32_t y,
+                                 int32_t w, int32_t h, int32_t r, int mask);
+void draw_round_corners_restore(const corner_capture_t *cap);
 
 // The user preference, percent OPAQUE (60..100, default 90). ONE preference
 // covering the default taskbar, the XFCE panel and dock, the Lumina bar and
@@ -821,6 +1008,29 @@ void draw_putpixel(int32_t x, int32_t y, uint32_t color);
 void screenshot_poll(void);
 int  screenshot_capture(const char *path);
 
+// #148 (local 164, 2026-08-18): PrintScreen hotkey. ALWAYS a fire-and-forget
+// full-screen capture (owner clarification: drag/region-select is an in-app
+// Snapshot mode only, never reached from this hotkey). Full-resolution
+// capture to <home>/SCREENSHOTS, timestamped filename. Two paths after the
+// capture, both in screenshot.c:
+//   A. Native-fullscreen (#158) on top: STAYS fullscreen, shows the
+//      bottom-right thumbnail toast (screenshot_fs_toast_draw() below).
+//   B. Otherwise: opens Maytera Snap on the capture, bottom-left, without
+//      stealing focus (win_create_bg()).
+void screenshot_hotkey_fire(void);
+
+// #148 (local 164): the fullscreen-only capture toast. main.c's
+// native_fullscreen_try_render() calls screenshot_fs_toast_draw() (which
+// itself consults screenshot_fs_toast_active()) every tick it successfully
+// re-blits the app's frame, AFTER that blit and BEFORE cursor_render(); the
+// scheduling block folds screenshot_fs_toast_active() into its "force a full
+// render tick" predicate so the dwell always gets a real frame to end on even
+// against a perfectly static fullscreen app. See screenshot.c's toast module
+// comment for the full contract (why this cannot go through notif.c, and why
+// no separate erase/restore step is needed).
+int  screenshot_fs_toast_active(void);
+void screenshot_fs_toast_draw(void);
+
 // Live remote view + control over RFB/VNC (vnc.c, #440). vnc_poll() runs once
 // per frame (reverse-connects to a listening viewer per /CONFIG/VNC.CFG - see
 // the comment at the top of vnc.c for why the compositor is the RFB server but
@@ -864,15 +1074,16 @@ void icon_draw_scaled(icon_id_t id, int32_t x, int32_t y, int32_t size, uint32_t
 void icon_mico_basename(const char *exec_path, char *out, int cap);
 int  icon_import_and_apply(icon_id_t id, const char *src_path, const char *out_mico_path);
 
-// login.c - Login screen
-void login_init(void);
-int  login_run(void);  // Returns 0 on success, blocks until authenticated
-void login_render(void);
-void login_handle_key(int key);
-void login_handle_mouse(int32_t x, int32_t y, bool clicked);
-// Shared login/lock-screen drawing primitives (defined in login.c, reused by
-// lockscreen.c, #566 - "reuse, never reinvent" rather than a second copy of
-// avatar/password-field rendering).
+// (#73) login.c is DELETED. The compositor's own login screen was a superseded
+// duplicate of the kernel login gate (kernel/gui/login.c) that was never drawn
+// and never entered, but was still called on every keystroke and still built a
+// plaintext password buffer out of them. Its five entry points (login_init,
+// login_run, login_render, login_handle_key, login_handle_mouse) are gone.
+// Its still-used drawing primitives moved to draw.c.
+//
+// Shared login/lock-screen drawing primitives (now in draw.c, reused by
+// lockscreen.c and elevate.c, #566 - "reuse, never reinvent" rather than a
+// second copy of avatar/password-field rendering).
 void draw_bullet(int32_t cx, int32_t cy);
 
 // #745: the SHIPPED password-field primitive. It was static to lockscreen.c;
@@ -892,7 +1103,8 @@ void elevate_render(void);          // scrim + panel, drawn above everything
 int  elevate_modal_open(void);      // 1 while it owns the screen
 int  elevate_handle_key(int key);   // 1 if consumed (it consumes everything)
 int  elevate_handle_mouse(int32_t x, int32_t y, int clicked);
-void draw_password_field(int32_t x, int32_t y, int password_len, int cursor_blink);
+// (#73) draw_password_field() deleted: zero callers (both credential surfaces
+// use lock_draw_pill()) and it was the dead login layer's own password field.
 void draw_button(int32_t x, int32_t y, int32_t w, int32_t h, const char *label, uint32_t bg);
 // #745: state replaces the old bool "highlight" (AVATAR_ST_* above). uid
 // selects the decorative identity dot color (Settings' avatar_palette,
@@ -931,6 +1143,19 @@ void desktop_drag(int32_t x, int32_t y);         // mouse moved while button hel
 void desktop_release(int32_t x, int32_t y);      // left button released
 bool desktop_is_dragging(void);                  // a drag or rubber-band in progress
 void desktop_render_overlay(void);               // draw the rubber-band rectangle
+
+// --- cross-window drag ("docking"), dragghost.c ----------------------------
+// The drag ghost that follows the cursor between windows. Only the compositor
+// can draw it: the source app cannot put a pixel outside its own window, which
+// is the entire reason this lives here rather than in the terminal.
+//
+// INERT WHEN UNUSED: dragghost_poll() makes NO syscall unless a mouse button is
+// physically held, and dragghost_render()/dragghost_active() return on a static
+// int. There is no timer, no thread and no allocation behind any of these.
+int  dragghost_active(void);
+void dragghost_poll(int mx, int my, unsigned int buttons);
+void dragghost_release(int x, int y);
+void dragghost_render(void);
 // Right-click context-menu actions (wired from contextmenu.c).
 void desktop_auto_arrange(void);                 // re-flow all icons to default top grid
 void desktop_align_to_grid(void);                // snap current positions to the grid
@@ -954,12 +1179,30 @@ void desktop_new_file(void);
 // render path: it does file I/O (#426).
 void desktop_rescan_home(int force);
 void desktop_home_tick(void);                    // throttled caller of the above
+// #250 removable volumes. desktop_volumes_tick() is the polled entry point,
+// called once per compositor loop and throttled internally; it is ONE syscall
+// in the unchanged case and triggers a rescan only when the set of plugged-in
+// drives actually changes. Like desktop_home_tick() it runs from the input
+// tick and NEVER from a render path.
+void desktop_volumes_tick(void);
+// Volume behind desktop icon `idx`, or -1. Used by the context menu to offer
+// Eject on the right icon.
+int  desktop_icon_volume(int idx, int *out_kernel_index, int *out_readable);
+// Eject the volume behind desktop icon `idx`. Returns 1 on success.
+int  desktop_icon_eject(int idx);
+// Open the volume behind desktop icon `idx` in Files.
+void desktop_icon_open_volume(int idx);
+// Which desktop icon is at (x, y), or -1. Exposed so the right-click path can
+// offer an icon-specific menu instead of the desktop background one.
+int  desktop_icon_at(int32_t x, int32_t y);
 
 // Persistence hooks used by profile.c.
 int  desktop_icon_count(void);
 void desktop_get_icon_pos(int idx, int32_t *x, int32_t *y);
 void desktop_set_icon_pos(int idx, int32_t x, int32_t y);
-int  desktop_positions_hash(void);               // folded into the profile change hash
+// (#231) desktop_positions_hash() removed: profile_tick()'s change-detection
+// now hashes profile_build()'s actual serialized bytes (which already carry
+// every icon's key/kind/position) instead of a hand-maintained parallel hash.
 // (#745) Number of leading icons that are NOT sourced from <home>/DESKTOP.
 // profile.c uses it to bound the LEGACY index-keyed "ico<N>" restore to
 // exactly the set those keys were written for.
@@ -993,6 +1236,13 @@ bool taskbar_handle_mouse(int32_t x, int32_t y, bool clicked);
 bool taskbar_popup_active(void);                                    // #241
 bool taskbar_popup_handle_mouse(int32_t x, int32_t y, bool clicked); // #241
 int32_t taskbar_get_y(void);
+#ifdef MAYTERA_TESTHOOK
+// (#glassmodal) headless verification hook ONLY (see testhook.c). Opens the
+// CPU/RAM/DSK/NET perf pop-out for the given gauge index (0=CPU..3=NET),
+// calling the same code path a real gauge click uses - sidesteps the
+// gauge's mouse hit-test (#334/#440).
+void taskbar_test_open_perf_popup(int gauge);
+#endif
 
 // Per-app taskbar-tile right-click menu (Close). A right-click on a running
 // app's taskbar button was previously silently swallowed by
@@ -1009,7 +1259,40 @@ void taskbar_menu_render(void);
 // wm_window_info_t carries no pid, and does nothing if no match is found).
 void taskbar_close_window(int32_t win_id);
 void taskbar_force_quit_app_id(const char *app_id);
+// #745 (docs/CONFIRM_MODAL_DESIGN.html): Force Quit is now gated behind a
+// confirm dialog (see taskbar.c) instead of firing SIGKILL immediately.
+bool taskbar_force_quit_confirm_open(void);
+void taskbar_force_quit_confirm_render(void);
+int  taskbar_force_quit_confirm_handle_key(int key);
+bool taskbar_force_quit_confirm_handle_mouse(int32_t x, int32_t y, bool clicked);
 int  taskbar_dock_animating(void);   // #745: DOCK_XFCE hover ease in flight this frame?
+
+// #129: named indices into apps/settings/main.c's PANEL_* enum, so every
+// compositor call site that wants a specific Settings panel (tray icon deep
+// links, the desktop "Personalize" menu, the Start-menu gear, the digital
+// clock widget) names it instead of repeating a bare "case 14" a reader has
+// to cross-reference against settings/main.c by hand. MUST stay in sync with
+// that enum (settings/main.c has its own "keep in sync" comment at its one
+// pre-existing raw-number call site, startmenu.c's PANEL_STARTMENU).
+#define SETTINGS_PANEL_APPEARANCE  0
+#define SETTINGS_PANEL_DISPLAY     1
+#define SETTINGS_PANEL_NETWORK     3
+#define SETTINGS_PANEL_DATETIME    6
+#define SETTINGS_PANEL_BLUETOOTH   14
+#define SETTINGS_PANEL_WIFI        15
+#define SETTINGS_PANEL_STARTMENU   17
+// #129: THE one way to open Settings on a specific panel. Every previous call
+// site (contextmenu.c x2, traymenu.c, startmenu.c) did a blind
+// set_settings_tab()+sys_spawn(), which spawns a DUPLICATE Settings window
+// every time one is already open - sys_spawn() has no singleton check, and
+// nothing else provided one either. This focuses (and thereby un-minimizes)
+// an existing Settings window instead of spawning a second one; Settings
+// already polls get_settings_tab() on every event-loop pass while running
+// (see settings/main.c's "#74/#382: honour a live tab-switch request even
+// while already open" - the live-retarget path already existed, nothing
+// was driving it), so the ALREADY-OPEN case needs no new IPC, only the
+// missing "is one already open" check before deciding to spawn.
+void settings_open_panel(int tab);
 
 // #387 Dock / taskbar layout styles. Selectable live from Settings -> Appearance
 // and persisted in the UI profile (key "dock_style"). DEFAULT reproduces the
@@ -1021,6 +1304,25 @@ int  taskbar_dock_animating(void);   // #745: DOCK_XFCE hover ease in flight thi
 #define DOCK_XFCE        4   // #26 XFCE ("Marble" in Settings): glass top panel + glass flush bottom dock (pinned+running), icons ease a hover lift/grow (#745)
 #define DOCK_COUNT       5
 extern int g_dock_style;
+// (#123) Marble-dock geometry preferences. Owned by taskbar.c (the only
+// consumer of the geometry), persisted by profile.c into UIPROFIL.YML, and
+// live-applied from /CONFIG/DOCKHGT.CFG and /CONFIG/DOCKZOOM.CFG by main.c -
+// the same three-part arrangement g_dock_style and g_dock_opacity already use.
+// Both are CLAMPED at the point of use inside taskbar.c (xfce_dock_h() /
+// xfce_dock_zoom()), so no caller has to know the legal range.
+//   g_dock_height - total marble dock height in px (44..96, default 59)
+//   g_dock_zoom   - hover magnification, percent of the base icon size
+//                   (100..200, default 128; 100 = no zoom)
+// g_dock_height is a PREFERRED MAXIMUM. taskbar.c auto-scales the marble dock
+// BELOW it (never above) when the pinned+running item count would make the pane
+// wider than 75% of the current framebuffer width, and returns to the
+// preference by construction when the count drops. taskbar_bottom_inset()
+// reports the EFFECTIVE height; g_dock_height is only ever the ceiling.
+extern int g_dock_height;
+extern int g_dock_zoom;
+// (#123) Apply a work-area change caused by an auto-scale step. Returns 1 if a
+// change was pending. Called on main.c's poll cadence, never from the renderer.
+int taskbar_geom_settle(void);
 void taskbar_set_style(int s);               // apply a layout live
 int  taskbar_top_inset(void);                // px reserved at the TOP of screen
 int  taskbar_bottom_inset(void);             // px reserved at the BOTTOM of screen
@@ -1147,6 +1449,28 @@ bool startmenu_launch_item_by_name(const char *name);
 // for the MENUCTX/MENUPIN test verbs (open a context menu / toggle a
 // favorite by name without needing to hit-test a click).
 int  startmenu_find_item_by_name(const char *name);
+// #223 rd2: simulate the exact in-memory glitch under investigation
+// (g_fav_count zeroed with no legitimate write) so the sm_save_recents_only()
+// amplifier guard can be verified without needing to reproduce the real
+// trigger. Diagnostic-only, same gate as everything else in this block.
+void startmenu_debug_force_fav_zero(void);
+// #223 rd3: call sm_record_recent() directly with an arbitrary (possibly
+// >=128 byte) path, so the round-2 adjacency hypothesis (g_recent_paths
+// ends exactly where g_fav_count begins in .bss) can be tested with a real
+// long path instead of a scripted open/close repro. Diagnostic only, same
+// gate as everything else in this block.
+void startmenu_debug_record_recent(const char *path);
+// #223 rd3: runs the full >=128-byte-path stress sequence (fill all
+// MAX_RECENTS slots, force the already-full eviction branch, then a
+// found>0 promote of a mid-list long entry) in one call, so a single
+// one-shot TESTHOOK.CMD can exercise every shift/insert branch at once.
+void startmenu_debug_recent_stress(void);
+// #223 rd3b: forces a real nonzero g_fav_count baseline (via the same
+// sm_seed_default_favorites() a real first boot calls) FIRST, confirmed via
+// sm_favdebug_check, THEN runs startmenu_debug_recent_stress(). Needed
+// because a test whose subject starts at g_fav_count==0 cannot show a
+// nonzero-to-zero transition even if one exists.
+void startmenu_debug_seed_and_stress(void);
 // Sets the search query directly (bypasses key-by-key injection) so the live
 // type-to-filter logic can be verified deterministically.
 void startmenu_set_search(const char *q);
@@ -1156,6 +1480,11 @@ void startmenu_set_search(const char *q);
 // zero mouse dependency. Hit-test correctness is a separate concern (see the
 // #440 VNC guidance in testhook.c's file-top comment).
 void startmenu_open_category_by_name(const char *label);
+// (#glassmodal) Opens a power confirm dialog (1=Shut Down, 2=Restart,
+// 3=Log Out, 4=Lock) by action number, calling the same static
+// startmenu_power_confirm_show() the real power-grid icon click uses -
+// bypasses that icon's mouse hit-test the same way the verbs above do.
+void startmenu_test_power_confirm(int action);
 #endif
 
 // clock.c - Floating clock
@@ -1183,6 +1512,9 @@ void contextmenu_open_for_menuitem(int32_t x, int32_t y, int menu_item_idx);
 // not currently running): every window action is omitted. app_id/exec_path
 // empty means "identity unresolved": Force Quit (needs app_id to find a pid)
 // and Pin/Change Icon (need exec_path/icon_id) are independently omitted.
+// #250: menu for a removable-volume desktop icon. `icon_idx` is the desktop
+// icon index (desktop_icon_at()); `readable` says whether Open is offered.
+void contextmenu_open_for_volume(int32_t x, int32_t y, int icon_idx, int readable);
 void contextmenu_open_for_dock(int32_t x, int32_t y, int win_id, bool maximized,
                                const char *app_id, const char *exec_path,
                                icon_id_t icon_id, bool is_favorite);

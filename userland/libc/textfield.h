@@ -23,10 +23,14 @@
 // gui_event_t (see kernel cpu/isr.c + gui/desktop.c):
 //   Left  = keycode 0x82, Right = keycode 0x83  (key_char == 0)
 //   Up    = keycode 0x80, Down  = keycode 0x81  (key_char == 0)
-//   Home  = keycode 0x47, End   = keycode 0x4F  (extended; may not be emitted
+//   #243: Home/End/Delete are GUI_KEY_HOME/END/DEL from libc/keys.h, in the
+//   0x100 block. They used to be the raw make codes 0x47/0x4F/0x53, which are
+//   the ASCII letters G/O/S, so this helper could not tell Home from a typed
+//   capital G. Match the constants, never a literal.
+//   Home  = GUI_KEY_HOME, End = GUI_KEY_END  (extended; may not be emitted
 //           by the current kernel keyboard layer, handled here for forward
 //           compatibility and so apps do not have to special-case them)
-//   Delete= keycode 0x53 (extended, same caveat as Home/End)
+//   Delete= GUI_KEY_DEL (extended, same caveat as Home/End)
 //   Backspace = key_char 0x08 (also keycode 0x0E on some paths)
 //   Printable = key_char in 0x20..0x7E
 //   Ctrl+<letter> arrives as an ASCII control char in key_char (the PS/2 and
@@ -38,6 +42,8 @@
 // it with zero Makefile / libc.a changes.
 #ifndef _TEXTFIELD_H
 #define _TEXTFIELD_H
+
+#include "keys.h"   // #243: GUI_KEY_* is the ONLY declaration of these
 
 #include "types.h"
 #include "gui.h"
@@ -417,9 +423,9 @@ static inline int tf_handle_key(textfield_t *tf, const gui_event_t *ev) {
     switch (kc) {
         case 0x82: { int p = tf->cursor; int had = tf_sel_active(tf); tf_clear_sel(tf); tf_left(tf);  return had || tf->cursor != p; }  // Left
         case 0x83: { int p = tf->cursor; int had = tf_sel_active(tf); tf_clear_sel(tf); tf_right(tf); return had || tf->cursor != p; }  // Right
-        case 0x47: { int p = tf->cursor; int had = tf_sel_active(tf); tf_clear_sel(tf); tf_home(tf);  return had || tf->cursor != p; }  // Home
-        case 0x4F: { int p = tf->cursor; int had = tf_sel_active(tf); tf_clear_sel(tf); tf_end(tf);   return had || tf->cursor != p; }  // End
-        case 0x53:   // Delete
+        case GUI_KEY_HOME: { int p = tf->cursor; int had = tf_sel_active(tf); tf_clear_sel(tf); tf_home(tf);  return had || tf->cursor != p; }
+        case GUI_KEY_END:  { int p = tf->cursor; int had = tf_sel_active(tf); tf_clear_sel(tf); tf_end(tf);   return had || tf->cursor != p; }
+        case GUI_KEY_DEL:   // Delete
             if (tf_sel_active(tf)) { tf_delete_selection(tf); tf__commit(tf, TF_OP_DELETE); return 1; }
             if (tf_delete(tf)) { tf__commit(tf, TF_OP_DELETE); return 1; }
             return 0;

@@ -210,6 +210,11 @@ int rename(const char *oldpath, const char *newpath) {
     return (int)syscall2(SYS_RENAME, (long)oldpath, (long)newpath);
 }
 
+// #113: SECONDS SINCE THE UNIX EPOCH, UTC. SYS_TIME used to return seconds
+// since BOOT; the kernel now anchors the CMOS RTC against the TSC and returns
+// a real calendar second (kernel/cpu/wallclock.h). NOT timezone-adjusted, and
+// must never be: POSIX time() is UTC and the offset is applied by the
+// presentation layer (tz.c). Returns 0, not -1, if the kernel has no calendar.
 long time(long *t) {
     long val = syscall0(SYS_TIME);
     if (t) *t = val;

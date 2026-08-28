@@ -313,6 +313,11 @@ int thread_create(uint32_t flags, void *stack, uint32_t *parent_tid,
     // Set up kernel stack for initial context switch
     uint64_t stack_top = (uint64_t)thread->stack_base + THREAD_STACK_SIZE;
     stack_top &= ~0xF;  // 16-byte align
+    // #151: SysV requires a function to be ENTERED with RSP == 8 (mod 16), as if
+    // it were reached by a CALL from a 16-aligned RSP. context_switch reaches the
+    // entry fn via RET, so without this it starts at RSP == 0 (mod 16) and every
+    // 16-byte-aligned slot the compiler places on its frame is 8 bytes off.
+    stack_top -= 8;
 
     // Push return address (thread_wrapper)
     stack_top -= 8;
@@ -381,6 +386,11 @@ int thread_create_kernel(const char *name, void (*entry)(void *), void *arg,
     // Set up kernel stack for initial context switch
     uint64_t stack_top = (uint64_t)thread->stack_base + THREAD_STACK_SIZE;
     stack_top &= ~0xF;  // 16-byte align
+    // #151: SysV requires a function to be ENTERED with RSP == 8 (mod 16), as if
+    // it were reached by a CALL from a 16-aligned RSP. context_switch reaches the
+    // entry fn via RET, so without this it starts at RSP == 0 (mod 16) and every
+    // 16-byte-aligned slot the compiler places on its frame is 8 bytes off.
+    stack_top -= 8;
 
     // Push return address (thread_wrapper)
     stack_top -= 8;

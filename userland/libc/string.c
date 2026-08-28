@@ -17,6 +17,15 @@ void *memset(void *s, int c, size_t n) {
     return memset_fast(s, c, n);
 }
 
+// (#73) See string.h for why this is not memset(). The volatile pointer is the
+// whole mechanism: it must be volatile-qualified at the point of the STORE, so
+// the loop below is deliberately hand-written rather than a call to memset_fast.
+void secure_zero(void *p, size_t n) {
+    if (!p) return;
+    volatile unsigned char *q = (volatile unsigned char *)p;
+    while (n--) *q++ = 0;
+}
+
 void *memcpy(void *dest, const void *src, size_t n) {
     return memcpy_fast(dest, src, n);
 }
@@ -62,10 +71,39 @@ char *strcpy(char *dest, const char *src) {
     return dest;
 }
 
+// #231: strncpy() must write AT MOST n bytes, never n+1. The previous
+// implementation used the copy-then-decrement idiom
+// `while (n && (*d++ = *src++)) n--;` which copies the source's
+// terminating NUL as part of the loop body but then skips the n-- for that
+// same iteration, because the loop CONDITION (the just-copied byte) is
+// false and short-circuits before the decrement runs. n is left one too
+// high, and the follow-on padding loop `while (n--) *d++ = 0;` then
+// writes one byte beyond dest[n-1]. This fires on EVERY normal call where
+// src is a NUL-terminated string shorter than n (i.e. almost every real
+// caller of strncpy(dst, src, sizeof(dst))): a 128-byte payload is NOT
+// required, a 2-byte string is enough. See CHANGELOG.md #231 for the
+// original repro and blame.md for the #223 dock-favourites corruption this
+// caused in the wild.
+//
+// This rewrite counts the index explicitly instead of decrementing n on a
+// condition that can be starved, so every write, including the final NUL,
+// is accounted for and the total is always exactly n bytes:
+//   - source shorter than n (NUL found within the first n bytes): copy up
+//     to and including that NUL, then zero-pad the rest, for exactly n
+//     bytes total.
+//   - source n bytes or longer with no NUL in the first n bytes: copy
+//     exactly n bytes and do NOT append a terminator. This matches the C
+//     standard and is INTENTIONAL, not a second bug: callers that rely on
+//     strncpy's traditional no-guaranteed-termination and add their own
+//     dst[n-1] = 0 depend on this shape. Do not silently change it.
 char *strncpy(char *dest, const char *src, size_t n) {
-    char *d = dest;
-    while (n && (*d++ = *src++)) n--;
-    while (n--) *d++ = '\0';
+    size_t i = 0;
+    for (; i < n && src[i] != '\0'; i++) {
+        dest[i] = src[i];
+    }
+    for (; i < n; i++) {
+        dest[i] = '\0';
+    }
     return dest;
 }
 
@@ -85,6 +123,13 @@ int strcmp(const char *s1, const char *s2) {
         s2++;
     }
     return *(unsigned char *)s1 - *(unsigned char *)s2;
+}
+
+// strcoll(): see string.h. The C locale's collating sequence is the ordinary
+// byte sequence, so the correct implementation is exactly strcmp() - this is
+// not a stand-in for a real collation table, it is what the C locale means.
+int strcoll(const char *s1, const char *s2) {
+    return strcmp(s1, s2);
 }
 
 int strncmp(const char *s1, const char *s2, size_t n) {

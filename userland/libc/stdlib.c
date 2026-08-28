@@ -104,6 +104,50 @@ static uint64_t heap_end = HEAP_START;
 // a page boundary from an unaligned heap_end.
 static uint64_t heap_mapped = HEAP_START;
 
+// #COMPRESPAWN: SAY WHEN THE HEAP IS GROWING WITHOUT BOUND, WHILE IT STILL CAN.
+//
+// MEASURED 2026-08-25 on the owner's VM <vmid> (golden 2054): the compositor took
+// a page fault writing through an address 288 MB into this heap, after 8.8
+// hours. Reconstructing that number needed the CR2 from a kernel exception line
+// and arithmetic against HEAP_START. Nothing in the process had ever said "my
+// heap is 288 MB", so the leak was invisible right up to the moment it killed
+// the desktop, and the only evidence it left was the crash itself.
+//
+// heap_end never shrinks, so this watermark IS the leak indicator. Reported at
+// 32 MB granularity, so a healthy process (the compositor sits far below the
+// first threshold) never emits a line at all, and a leaking one emits at most 15
+// before it hits the 512 MB ceiling. That granularity is deliberate: the report
+// goes through a syscall that writes /BOOTLOG.TXT, which is real disk I/O, and
+// this is called with the heap lock held. Fifteen writes over the life of a
+// process that is already in trouble is a price worth paying; one per 4 KB
+// would not be. 32 rather than 64 because the compositor's measured growth rate
+// is ~33 MB/h, so 32 MB puts the first line inside the first hour and makes the
+// LINEARITY visible within one working session, which is what distinguishes a
+// leak from a one-off allocation.
+static uint64_t s_heap_hw_reported_mb = 0;
+
+static void heap_growth_milestone(void) {
+    uint64_t mb = (heap_mapped - HEAP_START) >> 20;
+    if (mb < s_heap_hw_reported_mb + 32) return;
+    s_heap_hw_reported_mb = mb - (mb % 32);
+
+    // No printf, no malloc: this runs inside the allocator, under its lock.
+    static const char pre[]  = "libc: heap high-water is now ";
+    static const char post[] = " MB of a 512 MB ceiling. heap_end never shrinks, "
+                               "so this is a LEAK INDICATOR, not normal growth.";
+    char msg[160];
+    unsigned k = 0;
+    for (unsigned i = 0; pre[i] && k < sizeof(msg) - 1; i++)  msg[k++] = pre[i];
+    char num[24]; int nd = 0;
+    uint64_t v = s_heap_hw_reported_mb;
+    if (v == 0) num[nd++] = '0';
+    while (v) { num[nd++] = (char)('0' + (v % 10)); v /= 10; }
+    while (nd > 0 && k < sizeof(msg) - 1) msg[k++] = num[--nd];
+    for (unsigned i = 0; post[i] && k < sizeof(msg) - 1; i++) msg[k++] = post[i];
+    msg[k] = 0;
+    sys_bootlog(msg);
+}
+
 // Ensure every byte in [HEAP_START, up_to) is backed by a writable page.
 // Maps only the page-aligned gap (heap_mapped .. roundup(up_to)).
 static int ensure_mapped(uint64_t up_to) {
@@ -117,6 +161,7 @@ static int ensure_mapped(uint64_t up_to) {
         return -1;
     }
     heap_mapped = need_end;
+    heap_growth_milestone();
     return 0;
 }
 
@@ -854,6 +899,17 @@ void exit(int status) {
 // _exit is defined in crt0.S - do not define it here
 
 void abort(void) {
+    // #307: abort() and __stack_chk_fail() both exit 127, and so does every
+    // Rust panic_handler in the tree (they all call this function). On a
+    // machine with no serial port that number was the ONLY evidence, which is
+    // how the owner's iMac produced two identical "COMPOSIT exiting, code 127"
+    // lines that could not be told apart. Stamp which one this was.
+    //
+    // Deliberately NOT a flush and NOT a printf: abort()'s contract in this
+    // tree is to write directly and go (see exit() above for why). This is one
+    // syscall over a string constant.
+    (void)sys_bootlog("libc: abort() called (assert failure or Rust panic); "
+                      "process terminating with exit 127");
     sys_exit(127);
     __builtin_unreachable();
 }
@@ -956,12 +1012,50 @@ int fsync(int fd) {
     return 0;
 }
 
+// #227: a negative kernel return here used to reach the caller UNCHANGED
+// (neither normalised to -1 nor translated into errno), unlike open()/fsync()
+// a few lines above, which already do the right thing. That silently broke
+// the POSIX EINTR-retry contract for every caller in the tree: a blocking
+// read() interrupted by a signal (drivers/tty.c's tty_read() returns -4, i.e.
+// -EINTR, straight out of wait_event_interruptible on WAIT_EINTR) came back
+// here as the raw value -4, with errno left at whatever it was before the
+// call. A well-behaved POSIX caller that checks `errno == EINTR` to decide
+// whether to retry never sees EINTR, because nothing ever wrote it, so an
+// ordinary interrupted read reads exactly like a hard I/O error.
+//
+// This is bug (a) of #227's two-bugs-stacked report, PROVEN by a headless
+// pty harness (userland/apps/winchprb): resizing the Terminal window while
+// `vi` runs raises SIGWINCH at vi's foreground process group (#220's fix,
+// completely correct and NOT touched here); vi has
+// ENABLE_FEATURE_VI_USE_SIGNALS=0 (compat/libbb.h) so it installs no signal
+// handler at all - the signal's only effect is that sig_raise() unblocks
+// vi's in-flight blocking read() on stdin via wake_up_process(), exactly as
+// #220 intended. vi's own readit() (vendor/busybox/vi.c:1122) already does
+// the correct thing for that: safe_read_key() retries on `errno == EINTR`.
+// But because read() below never set errno, retry never triggered: readit()
+// saw an unrecognised failure, called cookmode() and
+// bb_simple_error_msg_and_die("can't read user input") -> _exit(1). The
+// probe's kernel log confirms this precisely: vi's own zombie exit code was
+// 1 (a normal, voluntary _exit(1) from vi.c/libbb_compat.c), with NO
+// [EXCEPTION]/[#PF]/[CrashHandler] line anywhere near it - not a fault, not
+// an async-signal-unsafe handler (there is no handler to be unsafe), and not
+// a kernel signal-return-path bug. The kernel's SIGWINCH delivery is exactly
+// right; this libc function broke the contract underneath it.
+//
+// Every read()/write() caller in the tree (audited before this change) only
+// ever tests the return value's SIGN (<0, ==0, >0, != count), never a
+// specific negative magnitude, so normalising to -1 changes no caller's
+// control flow; it only makes errno finally carry real information.
 long read(int fd, void *buf, size_t count) {
-    return sys_read(fd, buf, count);
+    long r = sys_read(fd, buf, count);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return r;
 }
 
 long write(int fd, const void *buf, size_t count) {
-    return sys_write(fd, buf, count);
+    long r = sys_write(fd, buf, count);
+    if (r < 0) { errno = (int)-r; return -1; }
+    return r;
 }
 
 // Time functions
@@ -972,10 +1066,18 @@ long clock(void) {
 // ============================================================================
 // Environment
 // ============================================================================
-// crt0 does not pass envp, so the process starts with an empty environment.
-// getenv/setenv still round-trip within the process, which is what os.environ,
-// tzset(), and countless ports actually depend on. environ is a NULL-terminated
-// array of "NAME=VALUE" strings, grown on demand.
+// #112: THE ENVIRONMENT IS NOW INHERITED. This comment used to read "crt0 does
+// not pass envp, so the process starts with an empty environment", and that was
+// true of every process on the system: the kernel's setup_user_argv() wrote a
+// NULL where envp should be and crt0 never looked at it.
+//
+// crt0.S now computes envp from the initial stack and calls __libc_init_env()
+// below before main(). environ is a NULL-terminated array of "NAME=VALUE"
+// strings, grown on demand; setenv/putenv malloc their entries, while the
+// INHERITED entries are pointers into the initial stack, which is mapped for
+// the life of the process and never freed. Both kinds therefore stay valid for
+// as long as environ does, and neither is ever freed, which is why unsetenv()
+// only unlinks.
 
 char **environ = NULL;
 static int env_count = 0;
@@ -1042,6 +1144,64 @@ int unsetenv(const char *name) {
     for (int j = i; j < env_count; j++) environ[j] = environ[j + 1];
     env_count--;
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// #112: THE ONE PLACE THAT ATTACHES `environ` TO A SPAWN.
+//
+// sys_spawn_args() and sys_spawn_redir() in syscall.h are inline wrappers that
+// something like a hundred call sites across the tree use directly. Teaching
+// each of them to build an sc_spawn_req_t would be a hundred chances to get it
+// wrong and a hundred places to forget. Instead both inlines now route here,
+// so a child inherits its parent's environment WITHOUT its parent being
+// changed at all. That is what made msh's `export`, the terminal's PATH/HOME
+// and every ported tool's getenv() start working in one change.
+//
+// It lives in stdlib.c because that is where `environ` lives; putting it in
+// syscall.h would make a header depend on a symbol that only this file
+// defines.
+//
+// environ == NULL (nothing was ever inherited or set) sends envc = -1, which
+// the kernel answers with its default block rather than with an empty
+// environment. See sc_spawn_req_t in kernel/proc/syscall.h.
+int __spawn_with_env(const char *path, char **argv, int argc,
+                     const char *infile, const char *outfile, int append) {
+    sc_spawn_req_t req;
+    int n = -1;
+    if (environ) {
+        n = 0;
+        while (environ[n] && n < 64) n++;
+    }
+    req.path     = path;
+    req.argv     = argv;
+    req.argc     = argc;
+    req.envc     = n;
+    req.envp     = environ;
+    req.infile   = infile;
+    req.outfile  = outfile;
+    req.append   = append;
+    req.reserved = 0;
+    return sys_spawn_env(&req);
+}
+
+// Called by crt0.S with the envp vector the kernel left on the initial stack,
+// before main(). Stores the pointers as they are: the strings are on that
+// stack and outlive every use of them.
+//
+// A malformed entry is SKIPPED here rather than refused, and this is the one
+// place in the #112 chain that is permissive on purpose. The kernel already
+// refuses to build a block containing an entry with no '=' (see
+// rustkern/envblock.rs), so an entry that reaches this point without one came
+// from a kernel that predates that rule or from a hand-built stack; aborting a
+// process's startup over it would be a worse answer than ignoring it.
+void __libc_init_env(char **envp) {
+    if (!envp) return;
+    for (int i = 0; envp[i]; i++) {
+        if (!strchr(envp[i], '=')) continue;
+        if (env_grow() < 0) return;
+        environ[env_count++] = envp[i];
+        environ[env_count] = NULL;
+    }
 }
 
 int putenv(char *string) {

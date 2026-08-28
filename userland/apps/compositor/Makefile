@@ -14,10 +14,10 @@ CFLAGS = -fPIE -m64 -ffreestanding -fno-builtin -nostdinc -nostdlib \
 
 LDFLAGS = -pie --no-dynamic-linker -z notext -T ../../user-pie.ld -nostdlib -z max-page-size=0x1000
 
-SRCS = main.c draw.c icons.c login.c lockscreen.c desktop.c taskbar.c \
+SRCS = main.c draw.c icons.c lockscreen.c desktop.c taskbar.c \
        startmenu.c clock.c contextmenu.c screensaver.c screensaver_gfx.c wallpaper.c widgets.c traymenu.c profile.c \
        stickies.c notif.c bt_impl.c screenshot.c vnc.c launcher.c ha_format.c \
-       elevate.c iconpicker.c
+       elevate.c iconpicker.c confirmdialog.c perfframe.c volosd.c dragghost.c idleprof.c
 
 # #334 headless GUI verification hook (testhook.c). OFF by default - a plain
 # `make`/`make install` (what build/build-golden.sh always uses) builds
@@ -27,6 +27,14 @@ SRCS = main.c draw.c icons.c login.c lockscreen.c desktop.c taskbar.c \
 ifdef TESTHOOK
 CFLAGS += -DMAYTERA_TESTHOOK=1
 SRCS += testhook.c
+endif
+
+# #223 ROUND 2: throwaway canary/write-site instrumentation for g_fav_count
+# (startmenu.c). OFF by default, same idiom as TESTHOOK above - never in the
+# golden. `make FAVDEBUG=1` (usually combined with TESTHOOK=1 so the repro
+# can be driven by testhook verbs instead of mouse injection).
+ifdef FAVDEBUG
+CFLAGS += -DMAYTERA_FAVDEBUG=1
 endif
 
 OBJS = $(SRCS:.c=.o)

@@ -15,6 +15,13 @@
 //   /HA0.TXT..    per-slot cache: entity_id|friendly|state|unit|domain|device_class (#723)
 //   /HALIST.REQ   presence requests a full entity list refresh (for the picker)
 //   /HALIST.TXT   compact catalog: entity_id|friendly|state  (one per line)
+//   /HALIST.PRG   fetch-in-progress marker: non-empty (a running entity count)
+//                 while refresh_list()/refresh_list_states() is fetching the
+//                 catalog, truncated to 0 bytes the moment it returns. The
+//                 compositor's ha_prg_active() (apps/compositor/widgets.c)
+//                 reads this to drive the picker's "fetching" spinner - see
+//                 the (#231) note at its write site below for why this file
+//                 existed with NO writer for a time.
 //   /HACMD.TXT    pending control command: domain.service|entity_id  (widget writes)
 //
 // SAFETY (#414): a power-controlling switch (switch.* whose id/name contains
@@ -241,10 +248,19 @@ static void refresh_list_states(void){
 #define HA_CHUNK 100
 static char chunkbuf[24000];
 static int  itoa_app(char *d,int v){ char t[12]; int n=0; if(v==0)t[n++]='0'; while(v){t[n++]=(char)('0'+v%10);v/=10;} int i=0; while(n) d[i++]=t[--n]; return i; }
+// (#231) /HALIST.PRG's running-entity-count marker. Written once per chunk
+// while a catalog fetch is in flight, so the file is genuinely non-empty for
+// the whole span ha_prg_active() (widgets.c) is asking about, not just at the
+// start. remove_file() (truncate to 0 bytes) is what "not fetching" means, so
+// this never unlinks - only write_prg_count()/remove_file() touch this path.
+static void write_prg_count(int n){
+    char out[12]; int oi=itoa_app(out,n);
+    write_file("/HALIST.PRG",out,oi);
+}
 static void refresh_list(void){
     char url[256]; int u=0; for(int j=0;g_url[j];j++) url[u++]=g_url[j];
     const char *p="/api/template"; for(int j=0;p[j];j++) url[u++]=p[j]; url[u]=0;
-    int total=0; big[0]=0;
+    int total=0; big[0]=0; int prg_n=0;
     for(int off=0; off<5000; off+=HA_CHUNK){
         char body[320]; int bi=0;
         const char *a="{\"template\":\"{% for s in (states|list)[";
@@ -265,10 +281,14 @@ static void refresh_list(void){
         if(n<=0) break;                                   // 200 + empty => past the last entity
         chunkbuf[n]=0;
         if(!has(chunkbuf,"|")) break;                     // no entities in this page => end
-        for(int j=0;chunkbuf[j] && total<(int)sizeof(big)-2;j++) big[total++]=chunkbuf[j];
+        for(int j=0;chunkbuf[j] && total<(int)sizeof(big)-2;j++){
+            big[total++]=chunkbuf[j];
+            if(chunkbuf[j]=='\n') prg_n++;
+        }
         // HA strips the trailing newline of a rendered template, so ensure one
         // sits between pages or the last id of a page merges with the next.
-        if(total>0 && big[total-1]!='\n' && total<(int)sizeof(big)-1) big[total++]='\n';
+        if(total>0 && big[total-1]!='\n' && total<(int)sizeof(big)-1) { big[total++]='\n'; prg_n++; }
+        write_prg_count(prg_n);   // (#231) keep /HALIST.PRG live across a multi-page fetch
     }
     big[total]=0;
     if(total>0) write_file("/HALIST.TXT",big,total);
@@ -365,7 +385,19 @@ int main(int argc,char**argv){
         if(!sys_net_is_up()){ sys_sleep(5000); continue; }
 
         // Picker catalog on request (compositor drops /HALIST.REQ with content).
-        if(req_pending("/HALIST.REQ")){ remove_file("/HALIST.REQ"); refresh_list(); }
+        // (#231) /HALIST.PRG brackets the whole fetch: written non-empty BEFORE
+        // refresh_list() (which itself keeps it live per chunk, see
+        // write_prg_count()) so the "fetching" state is true from the first
+        // instant even if the first chunk is slow, and truncated HERE - the one
+        // call site - after refresh_list() returns by ANY of its paths
+        // (completed catalog, exhausted retries, or the refresh_list_states()
+        // fallback), so the marker can never be left stuck non-empty.
+        if(req_pending("/HALIST.REQ")){
+            remove_file("/HALIST.REQ");
+            write_file("/HALIST.PRG","1",1);
+            refresh_list();
+            remove_file("/HALIST.PRG");
+        }
 
         // Control commands (guarded).
         run_command();

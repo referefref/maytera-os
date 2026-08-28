@@ -92,6 +92,22 @@
 // Small DMA scratch for vendor control transfers (identity-mapped static).
 static uint8_t vbuf[64] __attribute__((aligned(64)));
 
+// #62: control-transfer budget for ASIX vendor register access.
+//
+// Bring-up runs ONCE and a cold chip legitimately takes a while, so it keeps the
+// generous enumeration budget. Everything AFTER attach is a PERIODIC POLL on the
+// background net worker (usb_asix_poll_link, once a second), and at the 5s
+// default a dongle that stops answering costs 5 SECONDS PER REGISTER: one link
+// poll is 2 MII reads of up to 3 vendor transfers each, so ~30s of blocking per
+// second of wall clock, forever. Measured on the owner's iMac14,4 as 13 x
+// "Transfer wait TIMEOUT slot 1 DCI 1 (5000ms budget; 5006ms real)" in one boot.
+// This is the same reasoning, and the same shape of fix, as the hub class-request
+// budget (#373, HUB_CTRL_TIMEOUT_MS). A healthy ASIX answers a vendor request in
+// well under a millisecond, so 250ms is a ~250x margin, not a tightened race.
+#define AX_INIT_CTRL_MS     5000
+#define AX_RUNTIME_CTRL_MS   250
+static uint32_t s_ax_ctrl_ms = AX_INIT_CTRL_MS;
+
 // Real wall-clock delay: the ASIX reset sequence needs true waits (up to
 // 150ms) with interrupts off, so use the PIT-calibrated xhci delay.
 static void asix_delay_ms(uint32_t ms) {
@@ -102,8 +118,9 @@ static int axw(usbnet_dev_t *d, uint8_t req, uint16_t value, uint16_t index,
                const void *data, uint16_t len) {
     if (len > sizeof(vbuf)) return -1;
     if (data && len) memcpy(vbuf, data, len);
-    int cc = xhci_control_transfer(d->xhc, d->slot_id, 0x40, req, value, index,
-                                   (data && len) ? vbuf : NULL, len);
+    int cc = xhci_control_transfer_to(d->xhc, d->slot_id, 0x40, req, value, index,
+                                      (data && len) ? vbuf : NULL, len,
+                                      s_ax_ctrl_ms);
     return (cc == CC_SUCCESS || cc == CC_SHORT_PACKET) ? 0 : -1;
 }
 
@@ -111,8 +128,8 @@ static int axr(usbnet_dev_t *d, uint8_t req, uint16_t value, uint16_t index,
                void *data, uint16_t len) {
     if (len > sizeof(vbuf)) return -1;
     memset(vbuf, 0, len);
-    int cc = xhci_control_transfer(d->xhc, d->slot_id, 0xC0, req, value, index,
-                                   vbuf, len);
+    int cc = xhci_control_transfer_to(d->xhc, d->slot_id, 0xC0, req, value, index,
+                                      vbuf, len, s_ax_ctrl_ms);
     if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) return -1;
     if (data && len) memcpy(data, vbuf, len);
     return 0;
@@ -312,6 +329,11 @@ static uint64_t s_link_tick = 0;
 static int      s_link_primed = 0;
 
 // One active PHY read (double-read BMSR to clear the latch), updates d->link.
+// #62: returns 0 if the PHY ANSWERED and -1 if the control transfer failed, so
+// the poller above can tell "link is down" (device answered, no carrier) apart
+// from "device is not answering at all". Previously it returned d->link, which
+// made those two indistinguishable and let the caller poll a dead device
+// forever at 5 seconds per register.
 static int usb_asix_read_link_now(usbnet_dev_t *d) {
     static uint32_t diag = 0;
     if (d->type == USBNET_TYPE_AX88772) {
@@ -321,15 +343,19 @@ static int usb_asix_read_link_now(usbnet_dev_t *d) {
             d->link = (bmsr & BMSR_LSTATUS) ? 1 : 0;
             if (diag < 8) { diag++;
                 bootlog_write("[AX88772] BMSR=0x%04x link=%d", bmsr, d->link); }
+            return 0;
         }
+        return -1;
     } else if (d->type == USBNET_TYPE_AX88179) {
         uint8_t pls = 0;
         axr(d, AX179_ACCESS_MAC, AX179_REG_PHYSICAL_LINK, 1, &pls, 1);  // discard
         if (axr(d, AX179_ACCESS_MAC, AX179_REG_PHYSICAL_LINK, 1, &pls, 1) == 0) {
             d->link = (pls & 0x07) ? 1 : 0;
+            return 0;
         }
+        return -1;
     }
-    return d->link;
+    return -1;
 }
 
 // Lazy link refresh (called from usb_eth_receive).
@@ -373,9 +399,46 @@ int usb_asix_link_up_cached(usbnet_dev_t *d) {
 // #381: active PHY link poll for the background net worker ONLY. Performs the
 // double-read BMSR/PHYSICAL_LINK control transfers off the UI/net_poll path and
 // updates d->link. The compositor + net_is_up() gate read the cached d->link.
+// #62: consecutive-failure backoff. Even with the short runtime budget above, a
+// dongle that has gone silent still costs ~0.5s of blocking per poll, once a
+// second, for as long as the machine is up. A timeout is the correct SEMANTICS
+// here (the wake source is a device that may never answer, CLAUDE.md rule 2) but
+// repeating it every second is not: after AX_LINK_FAIL_QUARANTINE consecutive
+// no-answer polls the driver stops asking and probes once per
+// AX_LINK_QUARANTINE_POLLS instead, so the device can still prove it recovered
+// (the #549 "NET_FAULTY must not be a one-way door" principle) without the
+// carrier poll being a standing cost. Total blocking on a permanently dead
+// dongle drops from ~30s per second to ~0.5s per 30s.
+#define AX_LINK_FAIL_QUARANTINE   3
+#define AX_LINK_QUARANTINE_POLLS 30
+static uint32_t s_link_fail        = 0;
+static uint32_t s_link_skip        = 0;
+static int      s_link_quarantined = 0;
+
 int usb_asix_poll_link(usbnet_dev_t *d) {
     extern volatile uint64_t timer_ticks;
-    usb_asix_read_link_now(d);
+    if (s_link_quarantined) {
+        if (++s_link_skip < AX_LINK_QUARANTINE_POLLS) return d->link;
+        s_link_skip = 0;                       // one probe per quarantine window
+    }
+    int answered = (usb_asix_read_link_now(d) == 0);
+    if (answered) {
+        if (s_link_quarantined)
+            bootlog_write("[AX88772] PHY answering again after %u quiet polls; "
+                          "link poll resumed (#62)", s_link_fail);
+        s_link_fail = 0;
+        s_link_quarantined = 0;
+        s_link_skip = 0;
+    } else {
+        s_link_fail++;
+        if (!s_link_quarantined && s_link_fail >= AX_LINK_FAIL_QUARANTINE) {
+            s_link_quarantined = 1;
+            s_link_skip = 0;
+            bootlog_write("[AX88772] PHY did not answer %u consecutive link "
+                          "polls; backing off to 1 probe per %u polls (#62)",
+                          s_link_fail, (unsigned)AX_LINK_QUARANTINE_POLLS);
+        }
+    }
     s_link_tick = timer_ticks;
     s_link_primed = 1;
     return d->link;
@@ -384,13 +447,94 @@ int usb_asix_poll_link(usbnet_dev_t *d) {
 // =============================================================================
 // RX de-framing
 // =============================================================================
+// #362: AX88772 RX carry-over state.
+//
+// MEASURED on the owner's AX88772B (0b95:7e2b) passed through to a VM: the chip
+// PACKS several Ethernet frames into ONE bulk-IN transfer and, when the transfer
+// buffer fills, SPLITS the last frame across the transfer boundary. The boot log
+// shows this directly ("rx off=0/234/298/532 ... tlen=2048": the 2048-byte
+// buffer came back COMPLETELY FULL, which is exactly the case where the chip has
+// more to give and cuts a frame in half). This is why the Linux asix driver
+// keeps rx->remaining across URBs.
+//
+// The de-framer below had NO carry-over, which cost two frames per fill, not
+// one: the split tail was dropped, AND the next transfer began mid-frame, so its
+// first four bytes parsed as a bogus header, failed the size == ~size check, and
+// `break` discarded the WHOLE next transfer. Measured effect: 45 RX frames/s
+// against an 85 Hz net pump (about every second transfer thrown away) and 31
+// KB/s of TCP throughput, against 7825 KB/s for e1000 on the identical image.
+//
+// State is file-static because there is exactly one g_usbnet device, matching
+// the existing style in this file. usb_asix_rx_reset() clears it, and MUST be
+// called whenever the bulk-IN pipe is restarted (start, or resubmit after an
+// endpoint error), or bytes from either side of a gap would be glued together
+// into one bogus frame.
+static uint8_t  s_rx_part[USBNET_FRAME_MAX];
+static uint32_t s_rx_have    = 0;   // bytes of the split frame already held
+static uint32_t s_rx_need    = 0;   // total size of the split frame (0 = none)
+static uint32_t s_rx_pad     = 0;   // pad bytes still to skip after it
+static uint8_t  s_rx_hdr[4];
+static uint32_t s_rx_hdrhave = 0;   // bytes held of a split 4-byte header
+
+// Diagnostics, read off-path (these run under net_lock with interrupts off, so
+// they are COUNTERS and never log lines; see the #745/#69 note in usb_ecm.c).
+uint64_t g_asix_rx_split_frames = 0;   // frames reassembled across a boundary
+uint64_t g_asix_rx_desync       = 0;   // transfers dropped on a bad header
+uint64_t g_asix_rx_max_xfer     = 0;   // largest bulk-IN the chip has handed us
+
+void usb_asix_rx_reset(void) {
+    s_rx_have = 0; s_rx_need = 0; s_rx_pad = 0; s_rx_hdrhave = 0;
+}
+
 void usb_asix_rx_fixup(usbnet_dev_t *d, uint8_t *buf, uint32_t len) {
+    if (len > g_asix_rx_max_xfer) g_asix_rx_max_xfer = len;
     if (d->type == USBNET_TYPE_AX88772) {
         // Stream of [u16 size | u16 ~size | frame...] records, each record
-        // padded to a 16-bit boundary (Linux asix_rx_fixup framing).
+        // padded to a 16-bit boundary (Linux asix_rx_fixup framing). Any of the
+        // three parts (header, body, pad byte) may be cut by the end of the
+        // transfer and continue at offset 0 of the next one.
         uint32_t off = 0;
         static uint32_t rxdiag = 0;
-        while (off + 4 <= len) {
+
+        // (a) Finish a 4-byte header that was cut by the previous boundary.
+        if (s_rx_hdrhave) {
+            while (s_rx_hdrhave < 4 && off < len) s_rx_hdr[s_rx_hdrhave++] = buf[off++];
+            if (s_rx_hdrhave < 4) return;             // still incomplete
+            uint32_t hdr = (uint32_t)s_rx_hdr[0] | ((uint32_t)s_rx_hdr[1] << 8) |
+                           ((uint32_t)s_rx_hdr[2] << 16) | ((uint32_t)s_rx_hdr[3] << 24);
+            uint32_t size = hdr & 0x7FF;
+            uint32_t chk  = (~hdr >> 16) & 0x7FF;
+            s_rx_hdrhave = 0;
+            if (size != chk || size == 0 || size > USBNET_FRAME_MAX) {
+                g_asix_rx_desync++; usb_asix_rx_reset(); return;
+            }
+            s_rx_need = size; s_rx_have = 0; s_rx_pad = (size & 1u);
+        }
+
+        // (b) Finish a frame body (and its pad byte) cut by the previous
+        //     boundary. This is the frame the old code silently dropped.
+        if (s_rx_need) {
+            uint32_t want = s_rx_need - s_rx_have;
+            uint32_t avail = len - off;
+            uint32_t take = (want < avail) ? want : avail;
+            memcpy(s_rx_part + s_rx_have, buf + off, take);
+            s_rx_have += take;
+            off += take;
+            if (s_rx_have < s_rx_need) return;        // still incomplete
+            usbnet_fifo_push(s_rx_part, s_rx_need);
+            g_asix_rx_split_frames++;
+            s_rx_need = 0; s_rx_have = 0;
+            while (s_rx_pad && off < len) { off++; s_rx_pad--; }
+            if (s_rx_pad) return;                     // pad byte lands next time
+        }
+
+        // (c) Normal in-transfer records.
+        while (off < len) {
+            if (off + 4 > len) {                      // header cut by the end
+                s_rx_hdrhave = 0;
+                while (off < len) s_rx_hdr[s_rx_hdrhave++] = buf[off++];
+                return;
+            }
             uint32_t hdr = (uint32_t)buf[off] | ((uint32_t)buf[off + 1] << 8) |
                            ((uint32_t)buf[off + 2] << 16) | ((uint32_t)buf[off + 3] << 24);
             uint32_t size = hdr & 0x7FF;
@@ -402,11 +546,24 @@ void usb_asix_rx_fixup(usbnet_dev_t *d, uint8_t *buf, uint32_t len) {
                 bootlog_write("[AX88772] rx off=%u hdr=0x%04x%04x size=%u chk=%u ok=%d tlen=%u",
                               off, (unsigned)(hdr >> 16), (unsigned)(hdr & 0xFFFF),
                               size, chk, (size == chk && size != 0), len); }
-            if (size != chk || size == 0) break;   // desynced: drop the rest
+            if (size != chk || size == 0 || size > USBNET_FRAME_MAX) {
+                // Genuinely desynced (not a boundary split): drop the rest and
+                // resynchronise on the next transfer.
+                g_asix_rx_desync++; usb_asix_rx_reset(); return;
+            }
             off += 4;
-            if (off + size > len) break;
+            if (off + size > len) {                   // body cut by the end
+                uint32_t avail = len - off;
+                memcpy(s_rx_part, buf + off, avail);
+                s_rx_have = avail; s_rx_need = size; s_rx_pad = (size & 1u);
+                return;
+            }
             usbnet_fifo_push(buf + off, size);
-            off += (size + 1) & ~1u;               // pad to 16-bit boundary
+            off += size;
+            if (size & 1u) {                          // pad to 16-bit boundary
+                if (off < len) off++;
+                else { s_rx_pad = 1; return; }
+            }
         }
     } else if (d->type == USBNET_TYPE_AX88179) {
         // Aggregated transfer: N packets (each 8-byte aligned), then N u32
@@ -479,10 +636,20 @@ int usb_asix_attach(xhci_controller_t *xhc, int slot_id, int speed,
     }
     // AX88179 aggregates many frames per bulk-IN; give it a large buffer.
     // (Kept to 12KB: matches the programmed 0x12 boundary conservatively.)
-    if (usbnet_alloc_buffers(d, is179 ? 12288 : 2048, 2048) != 0) return -1;
+    // #362: 16 KiB for the AX88772 (was 2048). The chip aggregates
+    // frames into one bulk-IN transfer, and exactly ONE full-size
+    // frame (1514 + 4 header) fits in 2048, so the old buffer filled
+    // and split a frame on essentially every transfer under load. A
+    // multiple of the 512-byte bulk max-packet size, and well inside
+    // the TRB transfer-length field (17 bits).
+    if (usbnet_alloc_buffers(d, is179 ? 12288 : 16384, 2048) != 0) return -1;
 
     int r = is179 ? ax88179_init(d) : ax88772_init(d);
     if (r != 0) return -1;
+
+    // #62: bring-up is over. Every control transfer from here on is a periodic
+    // poll, so drop to the runtime budget (see AX_RUNTIME_CTRL_MS above).
+    s_ax_ctrl_ms = AX_RUNTIME_CTRL_MS;
 
     d->active = 1;
     kprintf("[USB-ASIX] %s attached (%04x:%04x): MAC %02x:%02x:%02x:%02x:%02x:%02x\n",

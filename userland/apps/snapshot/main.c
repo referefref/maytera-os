@@ -32,6 +32,8 @@
 #include "../../libc/gui_theme.h"
 #include "../../libc/gui_style.h"
 #include "../../libc/fcntl.h"
+#include "../../libc/userconf.h"  // #148 (local 164): userhome_path() - THE home join
+#include "../../libc/tz.h"        // #148 (local 164): tz_local_stamp() - THE local-clock stamp
 
 // ---------------------------------------------------------------------------
 // Layout tokens
@@ -46,11 +48,30 @@
 #define TB_BTN_Y     7
 #define TB_BTN_H     30
 
-#define IMG_MAX_W    1024
-#define IMG_MAX_H    768
+// #148 (local 164, 2026-08-18): IMG_MAX_W/H were 1024x768, smaller than
+// FB_MAX_W/H (1280x800) just below - a "screen capture" whose own working
+// buffer cannot hold a screen-sized capture. That mismatch was latent until
+// today: bmp_parse() (below) REJECTS anything wider/taller than IMG_MAX,
+// so a full-resolution PrintScreen capture on this project's own common
+// 1280x800 desktop silently failed to load for the new bottom-left preview
+// (empirically found running this build - "No capture yet" with no error
+// visible, load_image_file() returning -1). Raised to match FB_MAX_W/H,
+// which already represents this file's own "the whole screen" ceiling (g_fb
+// below), so a screenshot can never exceed the buffer meant to hold one.
+#define IMG_MAX_W    1280
+#define IMG_MAX_H    800
 #define FB_MAX_W     1280
 #define FB_MAX_H     800
-#define FBUF_CAP     (2 * 1024 * 1024)
+// #148 (local 164, 2026-08-18): was 2MB, the SECOND buffer this same
+// full-resolution PrintScreen preview blew past (see the IMG_MAX_W/H
+// comment above). A 1280x800 24bpp uncompressed BMP is 54 + 1280*3*800 =
+// 3,072,054 bytes - read_file() below refused anything at or past FBUF_CAP,
+// so the file read itself failed silently before bmp_parse() ever ran,
+// which is why raising IMG_MAX_W/H alone did not fix the empty preview
+// (found by testing on a real VM, not by inspection - the first fix looked
+// complete and still produced "No capture yet"). 4MB clears a full
+// FB_MAX_W x FB_MAX_H 24bpp BMP with headroom for other formats.
+#define FBUF_CAP     (4 * 1024 * 1024)
 
 #define REQ_PATH     "/SCREENSHOT.REQ"
 #define CAP_PATH     "/SNAPWORK.BMP"
@@ -109,7 +130,9 @@ static int g_count_shown = -1;             // last countdown second drawn
 
 static int hover_x = -1, hover_y = -1;
 static char g_status[96] = "No capture yet";
-static char g_saved[32] = "";              // last saved path
+static char g_saved[256] = "";             // last saved path (#148 local 164:
+                                            // was char[32], too small for
+                                            // <home>/SCREENSHOTS/SHOT-<stamp>.BMP)
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -318,23 +341,61 @@ static int save_bmp24(const char *path) {
     return 0;
 }
 
-// Save to the first free /SNAPnnn.BMP slot. Returns 0 and fills g_saved.
+// #148 (local 164, 2026-08-18): the owner's save-location decision, applied
+// to Maytera Snap's own manual Save (was /SNAPnnn.BMP at the filesystem
+// root, scattering captures across /). ONE directory for every screenshot,
+// <home>/SCREENSHOTS, shared with the PrintScreen hotkey's own saves
+// (compositor/screenshot.c) so there is one place to look, not two.
+#define SAVE_SUB "SCREENSHOTS"
+
+// Pick the first unused <home>/<dirsub>/SNAP-<local-stamp>.BMP slot (dirsub
+// may be 0 for the bare <home>/SNAP-<stamp>.BMP fallback save_next() uses
+// below). Same shape as the compositor's PrintScreen hotkey path
+// (compositor/screenshot.c shot_hotkey_pick_name()), not a second design:
+// timestamped via tz_local_stamp() (LOCAL time - every visible clock in this
+// OS is local; see tz.h and the fuller rationale in screenshot.c), zero-
+// padded so a lexical filename sort is also a chronological sort (a counter
+// that reset to 1 on every boot never was), -2/-3 suffix on a same-second
+// collision rather than an overwrite. Returns 0 and fills `out` (>= 256
+// bytes) on success.
+static int pick_save_name(const char *dirsub, char *out, unsigned long cap) {
+    char stamp[TZ_STAMP_LEN];
+    tz_local_stamp(stamp, sizeof(stamp));
+    for (int suffix = 0; suffix <= 99; suffix++) {
+        char name[40];
+        if (suffix == 0) snprintf(name, sizeof(name), "SNAP-%s.BMP", stamp);
+        else             snprintf(name, sizeof(name), "SNAP-%s-%d.BMP", stamp, suffix + 1);
+        if (userhome_path(dirsub, name, out, cap) != 0) return -1;
+        int fd = sys_open(out, 0);
+        if (fd >= 0) { sys_close(fd); continue; }   // already taken this second
+        return 0;
+    }
+    return -1;   // 100 saves in the same second without a gap: give up honestly
+}
+
+// Save the annotated capture to <home>/SCREENSHOTS. mkdir is idempotent (the
+// same "create if missing, ignore if it's already there" idiom
+// userconf_open_write() uses for <home>/CONFIG). On a genuine write failure
+// (read-only media, full disk, a home tree mkdir could not actually create -
+// deliverable: must not lose the capture or fail silently) falls back to a
+// bare <home>/SNAP-<stamp>.BMP, no subdirectory required. Returns 0 and
+// fills g_saved with wherever it actually landed.
 static int save_next(void) {
-    for (int i = 1; i <= 999; i++) {
-        char name[24];
-        name[0] = '/'; name[1] = 'S'; name[2] = 'N'; name[3] = 'A'; name[4] = 'P';
-        name[5] = (char)('0' + i / 100);
-        name[6] = (char)('0' + (i / 10) % 10);
-        name[7] = (char)('0' + i % 10);
-        name[8] = '.'; name[9] = 'B'; name[10] = 'M'; name[11] = 'P';
-        name[12] = '\0';
-        int fd = sys_open(name, 0);
-        if (fd >= 0) { sys_close(fd); continue; }   // already exists
-        if (save_bmp24(name) == 0) {
-            strlcpy(g_saved, name, sizeof(g_saved));
-            return 0;
-        }
-        return -1;
+    char dir[256];
+    if (userhome_path(0, SAVE_SUB, dir, sizeof(dir)) == 0) {
+        sys_mkdir(dir, 0755);
+    }
+
+    char path[256];
+    if (pick_save_name(SAVE_SUB, path, sizeof(path)) == 0 &&
+        save_bmp24(path) == 0) {
+        strlcpy(g_saved, path, sizeof(g_saved));
+        return 0;
+    }
+    if (pick_save_name(0, path, sizeof(path)) == 0 &&
+        save_bmp24(path) == 0) {
+        strlcpy(g_saved, path, sizeof(g_saved));   // fallback location took it
+        return 0;
     }
     return -1;
 }
@@ -592,6 +653,7 @@ enum {
     BTN_SNAP = 0, BTN_D3, BTN_D10,
     BTN_PEN, BTN_LINE, BTN_BOX, BTN_ARROW, BTN_MARK, BTN_CROP,
     BTN_SIZE, BTN_UNDO, BTN_SAVE,
+    BTN_GALLERY,   // #148 (local 164): browse <home>/SCREENSHOTS in Gallery
     BTN_COUNT
 };
 
@@ -612,8 +674,9 @@ static rect_t toolbar_btn_rect(int id) {
         case BTN_CROP:  r.x = TB_PAD + 392;  r.w = 48; break;
         case BTN_SIZE:  r.x = TB_PAD + 588;  r.w = 34; break;
         case BTN_UNDO:  r.x = TB_PAD + 626;  r.w = 50; break;
-        case BTN_SAVE:  r.x = TB_PAD + 680;  r.w = 52; break;
-        default:        r.x = 0; r.w = 0; break;
+        case BTN_SAVE:    r.x = TB_PAD + 680;  r.w = 52; break;
+        case BTN_GALLERY: r.x = TB_PAD + 736;  r.w = 72; break;
+        default:          r.x = 0; r.w = 0; break;
     }
     return r;
 }
@@ -664,6 +727,7 @@ static void draw_toolbar(void) {
     draw_btn(BTN_SIZE, g_size_labels[g_size], 0);
     draw_btn(BTN_UNDO, "Undo", 0);
     draw_btn(BTN_SAVE, "Save", 0);
+    draw_btn(BTN_GALLERY, "Gallery", 0);
 }
 
 static void draw_statusbar(void) {
@@ -863,18 +927,41 @@ static int handle_toolbar_click(int x, int y) {
     if (point_in(toolbar_btn_rect(BTN_SAVE), x, y)) {
         if (g_iw > 0) {
             if (save_next() == 0) {
-                char msg[48];
-                int m = 0;
-                const char *t = "Saved ";
-                for (int k = 0; t[k]; k++) msg[m++] = t[k];
-                for (int k = 0; g_saved[k]; k++) msg[m++] = g_saved[k];
-                msg[m] = '\0';
+                // #148 (local 164): g_saved now holds a full <home>/SCREENSHOTS/...
+                // path (up to 255 bytes), not a 12-byte /SNAPnnn.BMP - the old
+                // manual, unbounded char-by-char copy into msg[48] was a real
+                // stack overflow waiting for a long home path. snprintf into a
+                // buffer sized for the worst case truncates safely instead.
+                char msg[300];
+                snprintf(msg, sizeof(msg), "Saved %s", g_saved);
                 set_status(msg);
             } else {
                 set_status("Save failed");
             }
             draw_statusbar();
             win_invalidate(win);
+        }
+        return 1;
+    }
+    // #148 (local 164): "Gallery" - the reuse decision for deliverable 3.
+    // Gallery already supports being launched pointed at an arbitrary
+    // directory (userland/apps/gallery/main.c: `if (argc > 1 && argv[1][0]
+    // == '/') strlcpy(g_path, argv[1], ...)`), so this is the SAME
+    // sys_spawn_args(path, av, 2) shape Files/desktop.c already use to open
+    // an app on a specific folder - not a second image-grid browser built
+    // inside Snapshot, which the ticket explicitly asked to avoid unless
+    // reuse were "genuinely unworkable" (it wasn't).
+    if (point_in(toolbar_btn_rect(BTN_GALLERY), x, y)) {
+        char dir[256];
+        if (userhome_path(0, SAVE_SUB, dir, sizeof(dir)) == 0) {
+            char *av[2];
+            av[0] = (char *)"/APPS/GALLERY";
+            av[1] = dir;
+            if (sys_spawn_args("/APPS/GALLERY", av, 2) < 0) {
+                set_status("Could not open Gallery");
+                draw_statusbar();
+                win_invalidate(win);
+            }
         }
         return 1;
     }
@@ -937,8 +1024,41 @@ static void stroke_end(void) {
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
+// #148 (local 164, 2026-08-18): the PrintScreen-on-a-normal-desktop path
+// (owner spec: "open the screenshot app with the preview showing... bottom
+// left of the screen... maintaining the current window focus"). A THIRD argv
+// slot, not a second meaning for argv[1] - argv[1] alone already means
+// "open this file for markup" (Files app's existing Open With path, unchanged
+// by this), so this needs its own opt-in marker or every "Open With Snapshot"
+// launch would also jump to the corner and refuse focus.
+#define PREVIEW_ARG "--preview"
+
+// No syscall today lets a userland app query the reserved taskbar/dock work
+// area (SYS_WM_SET_WORK_AREA in syscall.h is a compositor-only SETTER, no
+// GETTER exists) - a real, reported gap, not fudged here. PREVIEW_BOTTOM_GAP
+// is a conservative fixed margin (compositor.h's default-dock TASKBAR_HEIGHT
+// is 36px; this clears that plus room) that will not overlap the DEFAULT dock
+// style but is not guaranteed against every one of the 5 dock styles/heights.
+#define PREVIEW_LEFT_MARGIN  20
+#define PREVIEW_BOTTOM_GAP   60
+
 int main(int argc, char **argv) {
-    win = win_create(WIN_TITLE, 50, 24, WIN_W, WIN_H);
+    int preview_mode = (argc > 2 && strcmp(argv[2], PREVIEW_ARG) == 0);
+
+    if (preview_mode) {
+        int px = PREVIEW_LEFT_MARGIN, py = 24;
+        fb_info_t fi;
+        if (fb_info(&fi) == 0 && fi.height > 0) {
+            py = (int)fi.height - WIN_H - PREVIEW_BOTTOM_GAP;
+            if (py < 0) py = 0;
+        }
+        // win_create_bg(): does NOT take keyboard focus (kernel/proc/
+        // syscall.h SYS_WIN_CREATE_BG, #148 local 164) - whatever window the
+        // user was typing into keeps it.
+        win = win_create_bg(WIN_TITLE, px, py, WIN_W, WIN_H);
+    } else {
+        win = win_create(WIN_TITLE, 50, 24, WIN_W, WIN_H);
+    }
     if (win < 0) {
         printf("snapshot: failed to create window\n");
         return 1;
@@ -949,7 +1069,7 @@ int main(int argc, char **argv) {
     if (argc > 1 && argv[1][0] == '/') {
         if (load_image_file(argv[1]) == 0) {
             compute_fit();
-            set_status("Opened image for markup");
+            set_status(preview_mode ? "Screenshot saved - preview" : "Opened image for markup");
         } else {
             set_status("Could not open image");
         }

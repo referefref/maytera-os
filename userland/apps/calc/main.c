@@ -740,8 +740,172 @@ static void on_key(char c){
     }
 }
 
-int main(int argc, char **argv){
+// ---------------------------------------------------------------------------
+// Tool contract (#233) - PROJECTED FROM THE BUTTON TABLES, NOT WRITTEN OUT.
+//
+// This is the worked example of the completeness invariant in
+// libc/contract.h. Nothing below lists a calculator key. The action surface is
+// derived by walking std_btns[] and sci_btns[] - the SAME const tables that
+// draw_buttons() renders from and that hit_button()/btn_rect() hit-test
+// against - plus the five memory tokens the memory row dispatches.
+//
+// The consequence is the point: a key that is not in those tables cannot be
+// drawn, cannot be clicked, and cannot appear in the contract; a key that IS
+// there appears in all three automatically. Completeness is structural, so
+// there is no lint rule to forget and no second list to update. Adding a
+// scientific function to sci_btns[] gives it a contract action in the same
+// commit, with no edit here at all.
+//
+// COVERAGE, stated honestly (see docs/CONTRACT_API.md section 6): this covers
+// every token the UI can dispatch. on_key() (the keyboard path) is a strict
+// SUBSET of that token set - digits, . + - * / ( ) ^ %, Enter/=, Backspace and
+// Escape each map onto a token that is also a button - so the contract covers
+// the keyboard too. What is NOT covered, and is deliberately not: hover
+// highlighting and window chrome, neither of which is a feature of the app.
+// ---------------------------------------------------------------------------
+#include "../../libc/contract.h"
+
+#define CT_MAX_TOKS 96
+
+static const char *CT_MEM_TOKS[5] = { "MC", "MR", "M+", "M-", "MS" };
+
+static const char *g_ct_tok[CT_MAX_TOKS];       // distinct action tokens
+static const char *g_ct_face[CT_MAX_TOKS];      // the key face that produces it
+static char        g_ct_name[CT_MAX_TOKS][16];  // "key.<tok>", stable storage
+static int         g_ct_ntok = -1;
+
+// Build the distinct-token list by walking the app's own tables. Both the
+// normal token and the 2nd-function token of every button count, because both
+// are things the UI can do.
+static void ct_build_toks(void) {
+    if (g_ct_ntok >= 0) return;
+    g_ct_ntok = 0;
+    for (int pass = 0; pass < 3; pass++) {
+        const btn_t *bs; int n;
+        if      (pass == 0) { bs = std_btns; n = STD_N; }
+        else if (pass == 1) { bs = sci_btns; n = SCI_N; }
+        else                { bs = 0;        n = 5;     }
+        for (int i = 0; i < n; i++) {
+            const char *toks[2], *faces[2];
+            if (bs) {
+                toks[0] = bs[i].tok;  faces[0] = bs[i].face;
+                toks[1] = bs[i].tok2; faces[1] = bs[i].face2 ? bs[i].face2 : bs[i].face;
+            } else {
+                toks[0] = CT_MEM_TOKS[i]; faces[0] = CT_MEM_TOKS[i];
+                toks[1] = 0;              faces[1] = 0;
+            }
+            for (int k = 0; k < 2; k++) {
+                const char *t = toks[k];
+                if (!t || !t[0]) continue;
+                int dup = 0;
+                for (int j = 0; j < g_ct_ntok; j++)
+                    if (!__builtin_strcmp(g_ct_tok[j], t)) { dup = 1; break; }
+                if (dup || g_ct_ntok >= CT_MAX_TOKS) continue;
+                g_ct_tok[g_ct_ntok]  = t;
+                g_ct_face[g_ct_ntok] = faces[k];
+                // "key.<tok>". The token is used verbatim: a prettifying
+                // translation table would be one more thing to drift.
+                g_ct_name[g_ct_ntok][0] = 'k'; g_ct_name[g_ct_ntok][1] = 'e';
+                g_ct_name[g_ct_ntok][2] = 'y'; g_ct_name[g_ct_ntok][3] = '.';
+                int w = 4;
+                for (int q = 0; t[q] && w < 15; q++) g_ct_name[g_ct_ntok][w++] = t[q];
+                g_ct_name[g_ct_ntok][w] = '\0';
+                g_ct_ntok++;
+            }
+        }
+    }
+}
+
+// One action handler for every projected key. The token comes from it->ctx,
+// which the projection pointed at the app's own table entry, and it is passed
+// straight to do_token() - the SAME function the mouse and keyboard paths
+// call. A contract key press is therefore not a parallel implementation of
+// pressing the key; it IS pressing the key.
+static int ct_key_press(const ct_item_t *it, int argc, char **argv,
+                        char *out, int ocap) {
     (void)argc; (void)argv;
+    const char *tok = (const char *)it->ctx;
+    if (!tok) return -1;
+    do_token(tok);
+    // Mirror the mouse path's 2nd-auto-reset so the two cannot diverge.
+    if (second && __builtin_strcmp(tok, "2nd")) second = 0;
+    strlcpy(out, expr[0] ? expr : "0", (size_t)ocap);
+    return 0;
+}
+
+static int calc_project(int idx, ct_item_t *out) {
+    ct_build_toks();
+    if (idx < 0 || idx >= g_ct_ntok) return 0;
+    // The desc buffer is shared and is valid only until the next projection
+    // call. contract.c uses desc immediately (describe) and never retains it.
+    static char desc[96];
+    snprintf(desc, sizeof(desc), "Calculator key \"%s\" (token %s), via do_token()",
+             g_ct_face[idx] ? g_ct_face[idx] : g_ct_tok[idx], g_ct_tok[idx]);
+
+    ct_item_t it;
+    __builtin_memset(&it, 0, sizeof(it));
+    it.name   = g_ct_name[idx];
+    it.type   = CT_ACTION;
+    it.access = CT_WRITE;
+    it.risk   = CT_SAFE;      // a calculator key is reversible and touches nothing outside the app
+    it.actfn  = ct_key_press;
+    it.ctx    = g_ct_tok[idx];
+    it.desc   = desc;
+    *out = it;
+    return 1;
+}
+
+// ---- readable state and mode, backed by the app's own variables ----------
+static int ct_display_get(char *o, int n) { strlcpy(o, expr[0] ? expr : "0", (size_t)n); return 0; }
+static int ct_history_get(char *o, int n) { strlcpy(o, prevline, (size_t)n); return 0; }
+static int ct_memory_get(char *o, int n)  { char b[64]; fmt_double(memory, b); strlcpy(o, b, (size_t)n); return 0; }
+
+static const ct_item_t CALC_ITEMS[] = {
+    // `mode` is the variable the tab click handler assigns to, so this row and
+    // the tabs are the same store, not two.
+    { "mode", CT_ENUM, CT_RW, CT_SAFE, 0, 0, 1, "Standard|Scientific",
+      &mode, 0, 0, 0, 0, 0, 0,
+      "Keypad mode; the same variable the Standard/Scientific tabs set" },
+    { "display", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
+      0, 0, 0, 0, ct_display_get, 0, 0,
+      "The current expression/result shown in the display" },
+    { "history", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
+      0, 0, 0, 0, ct_history_get, 0, 0,
+      "The previous expression line shown above the display" },
+    { "memory", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
+      0, 0, 0, 0, ct_memory_get, 0, 0,
+      "Calculator memory register value (set through the MS/M+/M- keys)" },
+    { "memory_set", CT_BOOL, CT_READ, CT_SAFE, 0, 0, 1, 0,
+      &mem_set, 0, 0, 0, 0, 0, 0,
+      "Whether the memory register currently holds a value" },
+    { "second", CT_BOOL, CT_READ, CT_SAFE, 0, 0, 1, 0,
+      &second, 0, 0, 0, 0, 0, 0,
+      "Whether the 2nd modifier is active (set through the 2nd key)" },
+    { "degrees", CT_BOOL, CT_READ, CT_SAFE, 0, 0, 1, 0,
+      &deg, 0, 0, 0, 0, 0, 0,
+      "Trig angle unit: 1 degrees, 0 radians (set through the DEG key)" },
+    { "error", CT_BOOL, CT_READ, CT_SAFE, 0, 0, 1, 0,
+      &err, 0, 0, 0, 0, 0, 0,
+      "Whether the last evaluation raised an error (domain, divide by zero)" },
+};
+
+static const ct_contract_t CALC_CONTRACT = {
+    "calc", "Calculator",
+    "Key actions are PROJECTED from std_btns[]/sci_btns[], the same tables "
+    "draw_buttons() and hit_button() use, so the contract cannot omit a key "
+    "that exists or offer one that does not.",
+    CALC_ITEMS, (int)(sizeof(CALC_ITEMS) / sizeof(CALC_ITEMS[0])),
+    calc_project,
+    0,   // no persisted state to load
+    0    // nothing to commit: do_token() already mutated the live state
+};
+
+int main(int argc, char **argv){
+    // #233: a contract invocation must never open a window. Answering here,
+    // before win_create(), is what makes the API usable from a headless test
+    // harness and from the AI tool loop without a compositor.
+    if (contract_is_invocation(argc, argv))
+        return contract_cli(argc, argv, &CALC_CONTRACT);
 
     window_handle = win_create("Calculator", 280, 90, WIN_W, WIN_H);
     if (window_handle < 0){ printf("calc: failed to create window\n"); return 1; }

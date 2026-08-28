@@ -317,6 +317,9 @@ static void draw_items(void) {
         uint32_t sb_track, sb_thumb;
         gui_scroll_colors(0, THEME_BG_PRIMARY, &sb_track, &sb_thumb);
         win_draw_rect(win, WIN_W - 12, list_y, 12, sb_h, sb_track);
+        // (#117) was fill-only, no boundary; see gui_scroll_trough_border()'s
+        // comment in gui_scroll.h.
+        gui_scroll_trough_border(win, WIN_W - 12, list_y, 12, sb_h, sb_track, THEME_BG_PRIMARY);
         win_draw_rect(win, WIN_W - 12, thumb_y, 12, thumb_h, sb_thumb);
     }
 }

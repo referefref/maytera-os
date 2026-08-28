@@ -1287,7 +1287,7 @@ static void draw_explosion(Explosion *e) {
  * All three sets share this exact path (no per-set special-casing beyond the
  * palette tables themselves and set 1's existing circuit-grid overlay), so
  * the polish rolls out to every stage theme identically. Visually verified
- * on VM 2410 for all 3 sets as of this change (see CHANGELOG); stage 2/3
+ * on VM <vmid> for all 3 sets as of this change (see CHANGELOG); stage 2/3
  * were forced via a temporary g_stage override for the screendump, then
  * verified again with that override removed before commit. */
 #define PX_CELL 4

@@ -12,6 +12,10 @@
 // Resolve the app path that opens `filename` (by its extension). Writes into
 // out (size outsz) and returns out. Never returns NULL; falls back to a built-in
 // default table, and finally /APPS/editor for unknown types.
+// A /ASSOC.CFG entry is preferred over the built-in default ONLY if the app it
+// names exists (#<config-ref>). An entry pointing at a missing binary is ignored rather
+// than returned, so an uninstalled or misspelled handler degrades to a working
+// open instead of "Cannot open file".
 const char *assoc_app_for(const char *filename, char *out, int outsz);
 
 // Set/replace the default app for an extension (e.g. "txt", "/APPS/editor").

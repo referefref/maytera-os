@@ -113,6 +113,34 @@ rsvg-convert -w 64 -h 64 --background-color=none assets/icons/svg/NAME.svg -o g.
 #    assumption, do not re-derive it from prose alone)
 ```
 
+## Mirroring an existing icon (#123)
+
+When the ONLY change wanted is "the same icon, the other way round", do NOT
+re-rasterize. A horizontal mirror of a raster is a pure permutation of its
+pixels: every antialiased edge value is carried across unchanged, so the
+result has exactly the weight and coverage the shipped icon had.
+Re-rasterizing instead puts the glyph through whatever SVG renderer happens
+to be installed on the machine doing the work, which is NOT the renderer that
+produced the shipped set, and silently re-derives every edge. For a change
+whose entire content is a mirror, that is a needless risk.
+
+```
+tools/icons/mirror_icn.py <asset-base>/ICONS/NAME.ICN /tmp/NAME.mirrored.ICN
+```
+
+It self-checks that mirroring twice is the identity, so a format or indexing
+mistake fails loudly instead of shipping a subtly wrong icon nobody looks at
+closely.
+
+Mirror the SVG source in the SAME change so a future full regeneration lands
+in the same place: wrap the untouched path in a
+`<g transform="translate(W,0) scale(-1,1)">` (W = the viewBox width) rather
+than rewriting any coordinate, which keeps the "upstream path geometry
+unmodified" rule above intact. If the source is third-party, record the
+modification in `../../ATTRIBUTION.md`: CC BY 4.0 requires that changes be
+indicated. `APLAYER.svg` / `APLAYER.ICN` is the worked example (#123: the
+music note pointed the wrong way).
+
 ## Regenerating a bespoke (original-artwork) icon
 
 Pipeline (white glyph, transparent bg; the compositor adds the drop shadow):

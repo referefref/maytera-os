@@ -17,14 +17,36 @@ EFI_CRT = /usr/lib
 EFI_LDS = /usr/lib/elf_$(EFI_ARCH)_efi.lds
 
 # Compiler flags
+# #QUIETBOOT: TWO GATES THAT WOULD HAVE CAUGHT A BOOTLOADER THAT LINKED CLEANLY
+# AND CARRIED AN UNRESOLVED RELOCATION INTO THE FIRMWARE.
+#
+# MEASURED, not feared. Gating the loader console introduced a DPRINT() macro
+# used at bootloader.c:470 and defined at :1700. That compiled as an implicit
+# declaration of a function called DPRINT, which is only a WARNING, and
+# `ld -shared` does not require undefined symbols to resolve, so the link
+# SUCCEEDED and produced a 93918-byte BOOTX64.EFI. `nm -u` on it showed `U
+# DPRINT` and `objdump -R` showed a relocation naming it. The build said
+# "Build complete" and the artifact was broken.
+#
+# -Werror=implicit-function-declaration catches it at compile time. It is scoped
+# to that ONE diagnostic rather than a blanket -Werror, because this file is
+# gnu-efi code with pre-existing warnings and a blanket -Werror would fail the
+# build today for unrelated reasons, which is how a gate gets removed again.
 CFLAGS = -ffreestanding -fno-stack-protector -fpic \
          -fshort-wchar -mno-red-zone -I$(EFI_INC) \
          -I$(EFI_INC)/$(ARCH) -DEFI_FUNCTION_WRAPPER \
-         -Wall -Wextra
+         -Wall -Wextra -Werror=implicit-function-declaration
 
 # Linker flags
+# -z defs (a.k.a. --no-undefined) is the SECOND, independent gate: it makes the
+# link refuse an unresolved symbol instead of quietly recording a relocation.
+# Verified BOTH directions before being added: the real bootloader links clean
+# with it, and the deliberately-broken one fails with four `undefined reference
+# to DPRINT` errors and exit 1. Two gates rather than one because they fail at
+# different stages and neither subsumes the other: -Werror catches a missing
+# DECLARATION, -z defs catches a missing DEFINITION.
 LDFLAGS = -shared -Bsymbolic -L$(EFI_LIB) \
-          -T $(EFI_LDS) -nostdlib
+          -T $(EFI_LDS) -nostdlib -z defs
 
 # Build targets
 HELLO_TARGET = hello.efi

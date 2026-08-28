@@ -1,0 +1,68 @@
+--- a/src/regex/regexec.c
++++ b/src/regex/regexec.c
+@@ -992,8 +992,8 @@
+   Wrapper functions for POSIX compatible regexp matching.
+ */
+ 
+-int
+-regexec(const regex_t *restrict preg, const char *restrict string,
++static int
++tre_regexec_nulterm(const regex_t *restrict preg, const char *restrict string,
+ 	  size_t nmatch, regmatch_t pmatch[restrict], int eflags)
+ {
+   tre_tnfa_t *tnfa = (void *)preg->TRE_REGEX_T_FIELD;
+@@ -1026,3 +1026,54 @@
+     xfree(tags);
+   return status;
+ }
++
++/* MayteraOS (#745 local 97): REG_STARTEND, the 4.4BSD extension.
++ *
++ * Upstream's matchers walk the subject until a NUL, so a caller cannot say
++ * "match inside these bytes of a buffer that keeps going".  busybox vi's
++ * :substitute needs exactly that, and so does the GNU re_search()/re_match()
++ * adapter in gnu_compat.c, whose whole API takes a pointer and a length.
++ *
++ * This is done as a bounded COPY around the existing matcher rather than by
++ * threading a length through tre_tnfa_run_parallel/_backtrack and every
++ * GET_NEXT_WCHAR: the copy is one memcpy of the caller's own window and it
++ * cannot change how the engine matches, where an edit inside the matcher
++ * could.  Offsets are returned relative to STRING, which is what every
++ * REG_STARTEND caller expects.
++ */
++int
++regexec(const regex_t *restrict preg, const char *restrict string,
++	  size_t nmatch, regmatch_t pmatch[restrict], int eflags)
++{
++  regoff_t so, eo;
++  char *copy;
++  int ret;
++  size_t i;
++
++  if (!(eflags & REG_STARTEND) || nmatch == 0 || pmatch == NULL)
++    return tre_regexec_nulterm(preg, string, nmatch, pmatch,
++			       eflags & ~REG_STARTEND);
++
++  so = pmatch[0].rm_so;
++  eo = pmatch[0].rm_eo;
++  if (so < 0 || eo < so)
++    return REG_NOMATCH;
++
++  copy = xmalloc((size_t)(eo - so) + 1);
++  if (copy == NULL)
++    return REG_ESPACE;
++  memcpy(copy, string + so, (size_t)(eo - so));
++  copy[eo - so] = '\0';
++
++  ret = tre_regexec_nulterm(preg, copy, nmatch, pmatch,
++			    eflags & ~REG_STARTEND);
++  xfree(copy);
++  if (ret == REG_OK)
++    for (i = 0; i < nmatch; i++)
++      if (pmatch[i].rm_so >= 0)
++	{
++	  pmatch[i].rm_so += so;
++	  pmatch[i].rm_eo += so;
++	}
++  return ret;
++}

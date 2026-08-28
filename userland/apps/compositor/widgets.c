@@ -8,14 +8,100 @@
 extern int g_draw_blend;   // draw.c blend factor (255=opaque)
 extern int g_win_opacity;  // main.c global window opacity
 #include "../../libc/syscall.h"
+#include "../../libc/stdio.h"   // #213 snprintf() for the /RAILPOS.TXT verification dump
 #include "../../libc/theme.h"   // #723 theme_color()/THEME_COLOR_* for HA semantic tint
 #include "ha_format.h"          // #723 HA entity-state display formatter
+#include "../../libc/wifi_client.h"   // #159 sect 6a: wifi_tray_state() for the
+                                      // offline-component connectivity gate.
+                                      // WIFI_STUB_IMPL (honest stub, #237,
+                                      // was WIFI_MOCK_IMPL) already lives in
+                                      // bt_impl.c - do not redefine it here.
 
 // #102/#379 dirty-rect: when set, widgets_render() only DRAWS (no state advance:
 // no sheep/dog update, no sysmon/netinfo sampling). The idle compositor advances
 // state + collects damage once per frame via widgets_collect_damage(), then
 // draws each dirty rect with this flag set so per-rect redraws never double-tick.
 int g_widgets_draw_only = 0;
+
+// ===========================================================================
+// #159 sect 6: shared offline-state component for the four network-backed
+// desktop cards (Weather, Crypto, Stocks, Home Assistant). Detection reuses
+// the tray's own connectivity signal (taskbar.c tray_render_core, #384) -
+// no new syscall, per the ticket. Declared here (top of file, ahead of every
+// caller including ha_card_draw further down) so ordering never matters.
+// ===========================================================================
+static int widget_net_online(void) { return sys_net_is_up() || wifi_tray_state() == 2; }
+
+// Draws "No internet connection" into a card's data region
+// [content_top, content_bot) (absolute framebuffer y), replacing whatever the
+// live content would have shown there. THE CALLER MUST NOT HAVE READ ANY
+// CACHED NETWORK BUFFER (s_weather/s_crypto/s_stocks/s_ha_state/...) before
+// reaching this call - see each of the four callers below, which check
+// widget_net_online() and return before their own ha_refresh_cache()/
+// wsplit(s_weather,...)-equivalent read. That ordering is what makes "no
+// data" a structural guarantee instead of a rendering choice: there is no
+// code path where a stale cached value and this message can both be drawn.
+//
+// (#236) Generalized from the offline-only version: the SAME centered
+// icon+message block now also serves the "online, but this card has no data
+// yet" state that the fixed-footprint rule below needs (a card must fill its
+// reserved box with an explicit state, never collapse to fit what little it
+// has). `wrap1`/`wrap2` are the caller's own two-line split, used only when
+// the single line does not fit the card width - measuring a break point here
+// would need a word-wrap pass this file has no other use for.
+static void widget_draw_state(int x, int w, int content_top, int content_bot,
+                              int icon, const char *msg,
+                              const char *wrap1, const char *wrap2) {
+    // Undimmed readable_ink(), NOT readable_ink_dim(): the family's usual
+    // "unavailable"/"..." placeholder uses the dimmed ink, but that mix
+    // measures 4.16:1 on the classic theme - under the WCAG AA 4.5:1 small-
+    // text floor (docs/DESKTOP_WIDGET_FAMILY_159.html sect 2a). This state
+    // is meant to read as more prominent than a parse failure, and
+    // readable_ink()'s worst case (9.57:1) clears AA on every shipping theme.
+    uint32_t ink = readable_ink(CLR_MENU_BG);
+    int avail_h = content_bot - content_top;
+    if (avail_h < ui_px(50)) {
+        // Compact fallback (sect 6c): 18px icon + text inline, one row.
+        // Not triggered by any current card size - specified defensively,
+        // per the brief's question, for any future card under ~50px tall.
+        int isz = ui_px(18), rowh = ui_px(22);
+        int mw = text_width_ttf(msg, 15);
+        int totalw = isz + ui_px(8) + mw;
+        int rx = x + (w - totalw) / 2; if (rx < x + ui_px(12)) rx = x + ui_px(12);
+        int ry = content_top + (avail_h - rowh) / 2; if (ry < content_top) ry = content_top;
+        icon_draw_scaled(icon, rx, ry + (rowh - isz) / 2, isz, ink);
+        draw_text_ttf(rx + isz + ui_px(8), ry + (rowh - ui_px(15)) / 2, msg, 15, ink);
+        return;
+    }
+    int isz = ui_px(28), gap = ui_px(6), lineh = ui_px(18);
+    int mw = text_width_ttf(msg, 15);
+    int avail_w = w - ui_px(24);   // 12px inset each side, matching the family's row inset
+    // Re-measured at build time (sect 6d caption): "No internet connection" at
+    // TTF size 15 against the narrowest card (HA, 224-24=200px) - if it ever
+    // doesn't fit on one line, wrap to two rather than truncate a state message.
+    int lines = (mw <= avail_w) ? 1 : 2;
+    int blockh = isz + gap + lines * lineh;
+    int by = content_top + (avail_h - blockh) / 2; if (by < content_top) by = content_top;
+    icon_draw_scaled(icon, x + w / 2 - isz / 2, by, isz, ink);
+    int ty = by + isz + gap;
+    if (lines == 1) {
+        draw_text_ttf(x + w / 2 - mw / 2, ty, msg, 15, ink);
+    } else {
+        int w1 = text_width_ttf(wrap1, 15), w2 = text_width_ttf(wrap2, 15);
+        draw_text_ttf(x + w / 2 - w1 / 2, ty,         wrap1, 15, ink);
+        draw_text_ttf(x + w / 2 - w2 / 2, ty + lineh, wrap2, 15, ink);
+    }
+}
+// The two states every network-backed card can be in, both drawn INTO the
+// card's full reserved content region so neither one changes its footprint.
+static void widget_draw_offline(int x, int w, int content_top, int content_bot) {
+    widget_draw_state(x, w, content_top, content_bot, ICON_WIFI_OFF,
+                      "No internet connection", "No internet", "connection");
+}
+static void widget_draw_nodata(int x, int w, int content_top, int content_bot,
+                               const char *msg, const char *wrap1, const char *wrap2) {
+    widget_draw_state(x, w, content_top, content_bot, ICON_REFRESH, msg, wrap1, wrap2);
+}
 // Taskbar shares its sampled CPU% (and per-core array) so the sysmon widget and
 // the taskbar gauge read the identical source (#102 meter reconciliation).
 extern int taskbar_cpu_snapshot(unsigned int *cores, int *ncores);
@@ -116,7 +202,7 @@ static void widget_analog_clock(int cx, int cy, int r) {
     wdg_hand(cx, cy, hour_pos, r - 22, 2, CLR_MENU_TEXT);  // hour
     wdg_hand(cx, cy, m,        r - 12, 2, CLR_MENU_TEXT);  // minute
     wdg_hand(cx, cy, s,        r - 8,  1, 0x00FF5050);  // second
-    draw_circle_filled(cx, cy, 3, 0x00FFD040);          // hub
+    draw_circle_filled(cx, cy, ui_px(3), 0x00FFD040);   // hub
 }
 
 // --- Month calendar (#78) -------------------------------------------------
@@ -139,6 +225,20 @@ static int day_of_week(int d, int m, int y) { return tz_wday(d, m, y); }
 
 static void itoa2(char *b, int v) { b[0] = '0' + (v / 10) % 10; b[1] = '0' + v % 10; b[2] = '\0'; }
 
+// (#236) The calendar's height, in ONE place. widgets_render() used to carry
+// a hand-copied duplicate of this expression, which is the same
+// keep-two-formulas-in-sync arrangement that let the Weather card and its
+// reserved slot disagree. The 6 rows are unconditional on purpose: a month
+// that needs only 5 must still occupy the same box as one that needs 6, or
+// the widget below it would move between months.
+#define CAL_ROWS 6
+// #uiscale: FONT_CHAR_H is already ui_px()'d (compositor.h) - do NOT wrap it
+// in ui_px() again (see the sysmon_bar()/widget_timer() fix above for what
+// that bug looks like). Every OTHER literal here gets its own ui_px() call.
+static int calendar_card_h(void) {
+    return (FONT_CHAR_H + ui_px(10)) + (FONT_CHAR_H + ui_px(2)) + CAL_ROWS * (FONT_CHAR_H + ui_px(2)) + ui_px(6);
+}
+
 static void widget_calendar(int x, int y, int w) {
     int dd, mm, yy;
     tz_local_date(&dd, &mm, &yy);   // #49: "today" is a LOCAL date
@@ -146,13 +246,25 @@ static void widget_calendar(int x, int y, int w) {
     if (yy < 1970 || yy > 3000) yy = 2026;
 
     int cell = w / 7;
-    int header_h = FONT_CHAR_H + 6;
-    int dow_h = FONT_CHAR_H + 2;
-    int rows = 6;
-    int h = header_h + dow_h + rows * (FONT_CHAR_H + 2) + 6;
+    // #199: header_h was FONT_CHAR_H+6 (22px), too tight for the family's
+    // title baseline (every other data widget anchors its title at y+8, e.g.
+    // widget_uptime()/widget_timer()/widget_worldtime() above); +10 (26px)
+    // matches that same convention so this card's title no longer crowds the
+    // weekday row 2px below it.
+    int header_h = FONT_CHAR_H + ui_px(10);
+    int dow_h = FONT_CHAR_H + ui_px(2);
+    int h = calendar_card_h();
 
-    draw_rounded_rect(x, y, w, h, 8, CLR_MENU_BG);
+    draw_rounded_rect(x, y, w, h, ui_px(8), CLR_MENU_BG);
     draw_rect_outline(x, y, w, h, CLR_MENU_BORDER);
+    // #199: Calendar was the one card-shaped desktop widget #159 missed - every
+    // other data card (System Monitor/Timer/World Time/Uptime/Weather/Crypto/
+    // Stocks/Home Assistant) got a left accent bar + a left-aligned title in
+    // the accent color at x+12,y+8; Calendar kept its pre-#159 centered title
+    // and no accent bar, which is exactly the "doesn't match its neighbours"
+    // the owner is looking at. Same gold hue it already used for its title,
+    // now also the accent bar, so the diff is chrome-only, not a new color.
+    draw_rounded_rect(x, y, ui_px(4), h, ui_px(2), 0x00FFD040);   // left accent bar
 
     // Title: "Month Year"
     char title[32];
@@ -165,7 +277,7 @@ static void widget_calendar(int x, int y, int w) {
     title[ti++] = '0' + (yy / 10) % 10;
     title[ti++] = '0' + yy % 10;
     title[ti] = '\0';
-    draw_text_centered(x + w / 2, y + 4, title, readable_accent(0x00FFD040, CLR_MENU_BG));
+    draw_text(x + ui_px(12), y + ui_px(8), title, readable_accent(0x00FFD040, CLR_MENU_BG));
 
     // Weekday header
     static const char *wd[7] = {"Su","Mo","Tu","We","Th","Fr","Sa"};
@@ -178,7 +290,7 @@ static void widget_calendar(int x, int y, int w) {
     int first = day_of_week(1, mm, yy);
     int ndays = days_in_month(mm, yy);
     int gy0 = gy + dow_h;
-    int row_h = FONT_CHAR_H + 2;
+    int row_h = FONT_CHAR_H + ui_px(2);
     for (int day = 1; day <= ndays; day++) {
         int idx = first + day - 1;
         int col = idx % 7;
@@ -194,10 +306,10 @@ static void widget_calendar(int x, int y, int w) {
             // Circle the current day with a high-contrast AA ring (2px). The old
             // readable_accent(gold) rendered near-invisible on dark cards; use a
             // luminance-contrast ink so it stands out on ANY theme.
-            int rr = (row_h < cell ? row_h : cell) / 2 - 1; if (rr < 6) rr = 6;
+            int rr = (row_h < cell ? row_h : cell) / 2 - ui_px(1); if (rr < ui_px(6)) rr = ui_px(6);
             uint32_t ring = readable_ink(CLR_MENU_BG);
             wdg_ring(cx + cell / 2, cyy + FONT_CHAR_H / 2, rr,     ring);
-            wdg_ring(cx + cell / 2, cyy + FONT_CHAR_H / 2, rr - 1, ring);
+            wdg_ring(cx + cell / 2, cyy + FONT_CHAR_H / 2, rr - ui_px(1), ring);
         }
         draw_text(cx + (cell - text_width(nb)) / 2, cyy, nb, col_text);
     }
@@ -206,9 +318,12 @@ static void widget_calendar(int x, int y, int w) {
 // --- Sheep desktop pets (#80, multi): drag + gravity + speed/size/style ---
 #define MAX_SHEEP 50
 int g_sheep_enabled = 0;
-int g_show_clock     = 0;
+int g_show_clock     = 0;   // analog Clock stays OFF by default (owner's
+                             // 2026-08-18 list is Digital Clock, not this one)
 int g_aichat_enabled = 1;   // #185 AI Chat docked panel app (default ON; #453 busy-spin fixed in b740)
-int g_show_calendar  = 0;
+                             // also the 2026-08-18 owner default (setup/main.rs WIDX_AICHAT)
+int g_show_calendar  = 1;   // default ON, 2026-08-18 owner decision - see
+                             // setup/main.rs WIDX_CALENDAR / WIDGETS_DEFAULT_MASK
 int g_sheep_speed    = 3;   // 1..5
 int g_sheep_size     = 2;   // 1..3 (small/normal/large)
 int g_sheep_style    = 0;   // 0 classic, 1 spotted
@@ -218,8 +333,8 @@ int g_sheep_count    = 1;   // 1..50
 int g_dog_enabled = 0;   // sheepdog: enable via the sheep tray menu
 static int dog_x = -1, dog_y, dog_dir = 1, dog_dragging = 0, dog_gdx, dog_gdy;
 static unsigned dog_frame = 0;
-#define DOG_W 56
-#define DOG_H 30
+#define DOG_W ui_px(56)
+#define DOG_H ui_px(30)
 
 typedef struct {
     int x, y, vy, dir, state, land_t, blink_t, inited;
@@ -239,8 +354,13 @@ static int g_grabbed = -1;
 static int g_grab_dx = 0, g_grab_dy = 0;
 
 static int sheep_sc(void){ return (g_sheep_size<=1)?75 : (g_sheep_size>=3)?135 : 100; }
-static int sheep_w(void){ return 50 * sheep_sc() / 100; }
-static int sheep_h(void){ return 34 * sheep_sc() / 100; }
+// #uiscale: ui_px() on the base 1x dimension, sheep_sc()'s own percent size
+// setting applied on top - the two multipliers are independent (screen DPI
+// vs. the user's small/normal/large choice) and compose cleanly. sheep_hit()/
+// sheep_grab() below call these SAME functions, so the drag hit-box can never
+// drift from the drawn footprint.
+static int sheep_w(void){ return ui_px(50) * sheep_sc() / 100; }
+static int sheep_h(void){ return ui_px(34) * sheep_sc() / 100; }
 
 // (#40) The band a desktop pet lives in: the WIDGET AREA (taskbar_widget_
 // area()), not a hardcoded "screen minus 36". Under a bottom-taskbar style
@@ -648,7 +768,9 @@ static int sheep_frame_idx(const sheep_t *sp) {
 
 static void sheep_draw_sprite(const sheep_t *sp) {
     int sc = sheep_sc();
-    int dw = SHEEP_CELL * sc / 100, dh = dw;        // square frame, scaled to sheep size
+    // #uiscale: ui_px() on SHEEP_CELL so the sprite frame grows with screen
+    // DPI too, not just with the size-setting percent (sc).
+    int dw = ui_px(SHEEP_CELL) * sc / 100, dh = dw;  // square frame, scaled to sheep size
     int dx = sp->x + (sheep_w() - dw) / 2;          // centre over the logical box
     int dy = sp->y + sheep_h() - dh;                // feet on the box bottom (ground)
     int hflip = (sp->dir >= 0);                     // sheet faces LEFT; flip for right
@@ -660,9 +782,13 @@ static void sheep_one_draw(const sheep_t *sp) {
     int sc = sheep_sc();
     int bx = sp->x, by = sp->y;
     uint32_t wool = 0x00F0F0F0, woolsh = 0x00C8C8C8, face = 0x00303030;
-    #define PX(v) (bx + (v) * sc / 100)
-    #define PY(v) (by + (v) * sc / 100)
-    #define PR(v) (((v) * sc / 100) < 1 ? 1 : ((v) * sc / 100))
+    // #uiscale: ui_px() wraps the WHOLE (v)*sc/100 computation - the same
+    // "wrap the exact 1x value" rule as everywhere else in this file, just
+    // applied once here since every body-part call site already routes
+    // through one of these three macros.
+    #define PX(v) (bx + ui_px((v) * sc / 100))
+    #define PY(v) (by + ui_px((v) * sc / 100))
+    #define PR(v) (ui_px(((v) * sc / 100) < 1 ? 1 : ((v) * sc / 100)))
     int squash = (sp->state == 2) ? PR(4) : 0;
     int lie = (sp->state == 0 && sp->behavior == 1) ? PR(8) : 0;  // sleeping: lie down
 
@@ -673,8 +799,8 @@ static void sheep_one_draw(const sheep_t *sp) {
         int wallx = left ? 0 : g_fb_width;                       // the edge the feet grip
         // ly = distance perpendicular to the wall (feet at ly~34 grip the edge),
         // lx = position along the body (maps to vertical; head lx=40 is up).
-        #define TX(ly) (left ? (wallx + (34-(ly))*sc/100) : (wallx - (34-(ly))*sc/100))
-        #define TY(lx) (by + (50-(lx))*sc/100)
+        #define TX(ly) (left ? (wallx + ui_px((34-(ly))*sc/100)) : (wallx - ui_px((34-(ly))*sc/100)))
+        #define TY(lx) (by + ui_px((50-(lx))*sc/100))
         draw_circle_filled(TX(14), TY(18), PR(11), woolsh);
         draw_circle_filled(TX(13), TY(30), PR(11), woolsh);
         draw_circle_filled(TX(10), TY(24), PR(12), wool);
@@ -738,18 +864,18 @@ static void sheep_one_draw(const sheep_t *sp) {
     draw_circle_filled(hx, PY(14) + byo, PR(7), face);
     draw_circle_filled(hx, PY(9)  + byo, PR(6), wool);
     int eye = (sp->dir >= 0) ? hx + PR(2) : hx - PR(2);
-    if (sp->blink_t > 0) draw_fill_rect(eye - 1, PY(13) + byo, 3, 1, 0x00FFFFFF);
+    if (sp->blink_t > 0) draw_fill_rect(eye - ui_px(1), PY(13) + byo, ui_px(3), ui_px(1), 0x00FFFFFF);
     else draw_circle_filled(eye, PY(13) + byo, PR(1), 0x00FFFFFF);
     draw_fill_rect((sp->dir >= 0) ? hx - PR(4) : hx + PR(2), PY(12) + byo, PR(3), PR(4), woolsh);
     if (sp->state == 0 && sp->behavior == 1) {          // sleeping: closed eye + Zzz
-        draw_fill_rect(eye - 1, PY(13) + byo, 3, 1, face);
+        draw_fill_rect(eye - ui_px(1), PY(13) + byo, ui_px(3), ui_px(1), face);
         int zx = (sp->dir >= 0) ? PX(44) : PX(0);
-        draw_text(zx, by - 7, "z", CLR_MENU_TEXT);
-        draw_text(zx + 5, by - 14, "z", CLR_MENU_TEXT);
+        draw_text(zx, by - ui_px(7), "z", CLR_MENU_TEXT);
+        draw_text(zx + ui_px(5), by - ui_px(14), "z", CLR_MENU_TEXT);
     } else if (sp->state == 0 && sp->behavior == 3) {   // fart puff behind
         int px = (sp->dir >= 0) ? PX(2) : PX(46);
         draw_circle_filled(px, PY(21) + byo, PR(3), 0x0098C878);
-        draw_circle_filled(px + (sp->dir >= 0 ? -4 : 4), PY(18) + byo, PR(2), 0x00B8E0A0);
+        draw_circle_filled(px + (sp->dir >= 0 ? -ui_px(4) : ui_px(4)), PY(18) + byo, PR(2), 0x00B8E0A0);
     }
     #undef PX
     #undef PY
@@ -811,32 +937,39 @@ static void dog_draw(void) {
     uint32_t blk = 0x00282828, wht = 0x00F0F0F0;
     int fwd = (dog_dir >= 0);
     int walk = (dog_frame >> 2) & 1;
+    // #uiscale: DX/DY wrap the offset-from-origin in ui_px(), same idiom as
+    // sheep_one_draw()'s PX/PY above. Every rect/circle SIZE argument gets
+    // its own ui_px() call on the whole 1x expression (e.g. "9 - walk * 2").
+    #define DX(v) (bx + ui_px(v))
+    #define DY(v) (by + ui_px(v))
     // four thin legs
-    draw_fill_rect(bx + 13, by + 19, 3, 9 - walk * 2, blk);
-    draw_fill_rect(bx + 20, by + 19, 3, 7 + walk * 2, blk);
-    draw_fill_rect(bx + 33, by + 19, 3, 7 + walk * 2, blk);
-    draw_fill_rect(bx + 40, by + 19, 3, 9 - walk * 2, blk);
+    draw_fill_rect(DX(13), DY(19), ui_px(3), ui_px(9 - walk * 2), blk);
+    draw_fill_rect(DX(20), DY(19), ui_px(3), ui_px(7 + walk * 2), blk);
+    draw_fill_rect(DX(33), DY(19), ui_px(3), ui_px(7 + walk * 2), blk);
+    draw_fill_rect(DX(40), DY(19), ui_px(3), ui_px(9 - walk * 2), blk);
     // elongated body with rounded ends
-    draw_fill_rect(bx + 13, by + 9, 30, 11, blk);
-    draw_circle_filled(bx + 15, by + 14, 6, blk);
-    draw_circle_filled(bx + 41, by + 14, 6, blk);
-    draw_fill_rect(bx + 17, by + 16, 22, 4, wht);          // white underbelly
+    draw_fill_rect(DX(13), DY(9), ui_px(30), ui_px(11), blk);
+    draw_circle_filled(DX(15), DY(14), ui_px(6), blk);
+    draw_circle_filled(DX(41), DY(14), ui_px(6), blk);
+    draw_fill_rect(DX(17), DY(16), ui_px(22), ui_px(4), wht);          // white underbelly
     // raised tail at the rear
-    if (fwd) { draw_fill_rect(bx + 8, by + 5, 3, 9, blk); draw_fill_rect(bx + 6, by + 4, 4, 3, blk); }
-    else     { draw_fill_rect(bx + 45, by + 5, 3, 9, blk); draw_fill_rect(bx + 46, by + 4, 4, 3, blk); }
+    if (fwd) { draw_fill_rect(DX(8), DY(5), ui_px(3), ui_px(9), blk); draw_fill_rect(DX(6), DY(4), ui_px(4), ui_px(3), blk); }
+    else     { draw_fill_rect(DX(45), DY(5), ui_px(3), ui_px(9), blk); draw_fill_rect(DX(46), DY(4), ui_px(4), ui_px(3), blk); }
     // neck + head at the front
-    int hx = fwd ? bx + 46 : bx + 10;
-    draw_fill_rect(fwd ? bx + 40 : bx + 14, by + 7, 6, 9, blk);   // neck
-    draw_circle_filled(hx, by + 8, 6, blk);                       // head
+    int hx = fwd ? DX(46) : DX(10);
+    draw_fill_rect(fwd ? DX(40) : DX(14), DY(7), ui_px(6), ui_px(9), blk);   // neck
+    draw_circle_filled(hx, DY(8), ui_px(6), blk);                       // head
     // snout poking forward + nose
-    if (fwd) { draw_fill_rect(hx + 3, by + 9, 8, 4, blk); draw_fill_rect(hx + 10, by + 9, 2, 3, blk); }
-    else     { draw_fill_rect(hx - 11, by + 9, 8, 4, blk); draw_fill_rect(hx - 12, by + 9, 2, 3, blk); }
+    if (fwd) { draw_fill_rect(hx + ui_px(3), DY(9), ui_px(8), ui_px(4), blk); draw_fill_rect(hx + ui_px(10), DY(9), ui_px(2), ui_px(3), blk); }
+    else     { draw_fill_rect(hx - ui_px(11), DY(9), ui_px(8), ui_px(4), blk); draw_fill_rect(hx - ui_px(12), DY(9), ui_px(2), ui_px(3), blk); }
     // pointy ears
-    draw_fill_rect(hx - 4, by + 0, 3, 5, blk);
-    draw_fill_rect(hx + 1, by + 0, 3, 5, blk);
+    draw_fill_rect(hx - ui_px(4), DY(0), ui_px(3), ui_px(5), blk);
+    draw_fill_rect(hx + ui_px(1), DY(0), ui_px(3), ui_px(5), blk);
     // white face blaze + eye
-    draw_circle_filled(hx, by + 6, 2, wht);
-    draw_circle_filled(fwd ? hx + 2 : hx - 2, by + 6, 1, 0x00101010);
+    draw_circle_filled(hx, DY(6), ui_px(2), wht);
+    draw_circle_filled(fwd ? hx + ui_px(2) : hx - ui_px(2), DY(6), ui_px(1), 0x00101010);
+    #undef DX
+    #undef DY
 }
 
 // ===========================================================================
@@ -863,8 +996,8 @@ static char *w_itoa(char *b, int v) {
 // --- System Monitor mini (id 6): live CPU / RAM / Net bars + CPU sparkline ---
 int g_show_sysmon = 0;
 int g_sysmon_x = -1, g_sysmon_y = -1, g_sysmon_locked = 0;
-#define SYSMON_W   188
-#define SYSMON_H   162
+#define SYSMON_W   ui_px(188)
+#define SYSMON_H   ui_px(162)
 #define SPARK_N    48
 static unsigned char s_spark_cpu[SPARK_N];   // ring buffer of recent CPU %
 static int s_spark_head = 0, s_spark_filled = 0;
@@ -900,13 +1033,21 @@ static void sysmon_sample(void) {
 }
 
 // One labeled meter row: label, colored fill bar, value %.
+// #uiscale (report 2, "the widgets ... didn't scale yet"): SYSMON_W/H are
+// scaled (their #define, above); every offset/size literal below is now
+// ui_px()'d to match, so the card's CONTENT grows with its box instead of
+// staying pinned to its 1x layout inside a bigger box. Byte-identical at
+// 100% (ui_px is the identity there).
 static void sysmon_bar(int x, int y, int w, const char *label, int pct, uint32_t col) {
     draw_text(x, y, label, CLR_MENU_TEXT);
     char vb[8]; w_itoa(vb, pct);
     int vl = text_width(vb) + text_width("%");
     char vv[10]; int vi = 0; for (int k = 0; vb[k]; k++) vv[vi++] = vb[k]; vv[vi++]='%'; vv[vi]=0;
     draw_text(x + w - vl, y, vv, CLR_MENU_TEXT);
-    int by = y + FONT_CHAR_H + 1, bh = 7;
+    // #uiscale FIX: FONT_CHAR_H is already ui_px()'d (compositor.h) - wrapping
+    // it in ui_px() again double-scaled this offset above 100%. Found while
+    // converting the rest of this file's gadgets to the same convention.
+    int by = y + FONT_CHAR_H + ui_px(1), bh = ui_px(7);
     draw_fill_rect(x, by, w, bh, 0x00202830);
     draw_rect_outline(x, by, w, bh, CLR_MENU_BORDER);
     int fw = pct * (w - 2) / 100; if (fw < 0) fw = 0; if (fw > w - 2) fw = w - 2;
@@ -918,54 +1059,56 @@ static void widget_sysmon(int x, int y) {
     // idle path advances the sample once via sysmon_tick_sample().
     if (!g_widgets_draw_only && (s_sysmon_tick++ % 15 == 0)) sysmon_sample();
     int w = SYSMON_W, h = SYSMON_H;
-    draw_rounded_rect(x, y, w, h, 8, CLR_MENU_BG);
+    draw_rounded_rect(x, y, w, h, ui_px(8), CLR_MENU_BG);
     draw_rect_outline(x, y, w, h, CLR_MENU_BORDER);
-    draw_text(x + 10, y + 6, "System Monitor", readable_accent(0x0066C0FF, CLR_MENU_BG));
-    int ix = x + 10, iw = w - 20;
-    sysmon_bar(ix, y + 26, iw, "CPU", s_cpu_pct, 0x0050C050);
+    draw_rounded_rect(x, y, ui_px(4), h, ui_px(2), 0x0066C0FF);   // #159 sect 3: left accent bar
+    draw_text(x + ui_px(12), y + ui_px(8), "System Monitor", readable_accent(0x0066C0FF, CLR_MENU_BG));
+    int ix = x + ui_px(12), iw = w - ui_px(24);
+    sysmon_bar(ix, y + ui_px(26), iw, "CPU", s_cpu_pct, 0x0050C050);
     // Per-core strip (#279): one vertical bar per core, height = that core's %.
     {
-        int cy = y + 60, ch = 16;
+        int cy = y + ui_px(60), ch = ui_px(16);
         draw_text(ix, cy, "Cores", CLR_MENU_TEXT);
-        int bx0 = ix + text_width("Cores") + 6;
+        int bx0 = ix + text_width("Cores") + ui_px(6);
         int bw_avail = iw - (bx0 - ix);
         int nc = s_cpu_ncores; if (nc < 1) nc = 1;
-        int gap = (nc > 1) ? 1 : 0;
+        int gap = (nc > 1) ? ui_px(1) : 0;
         int cbw = (bw_avail - gap * (nc - 1)) / nc; if (cbw < 1) cbw = 1;
+        int cy0 = ui_px(2);
         for (int i = 0; i < nc; i++) {
             int pct = (int)s_cpu_cores[1 + i];
             if (pct < 0) pct = 0; if (pct > 100) pct = 100;
             int bx = bx0 + i * (cbw + gap);
-            draw_fill_rect(bx, cy - 2, cbw, ch, 0x00202830);
-            int fh = pct * (ch - 2) / 100; if (fh < 0) fh = 0;
+            draw_fill_rect(bx, cy - cy0, cbw, ch, 0x00202830);
+            int fh = pct * (ch - cy0) / 100; if (fh < 0) fh = 0;
             // green<60, amber<85, red otherwise
             uint32_t col = pct < 60 ? 0x0050C050 : pct < 85 ? 0x00E0C040 : 0x00E05050;
-            if (fh > 0) draw_fill_rect(bx, cy - 2 + (ch - 1 - fh), cbw, fh, col);
+            if (fh > 0) draw_fill_rect(bx, cy - cy0 + (ch - ui_px(1) - fh), cbw, fh, col);
         }
     }
-    sysmon_bar(ix, y + 82, iw, "RAM", s_ram_pct, 0x000088CC);
+    sysmon_bar(ix, y + ui_px(82), iw, "RAM", s_ram_pct, 0x000088CC);
     // CPU sparkline strip across the bottom.
-    int gx = ix, gy = y + 116, gw = iw, gh = 30;
+    int gx = ix, gy = y + ui_px(116), gw = iw, gh = ui_px(30);
     draw_fill_rect(gx, gy, gw, gh, 0x00161C22);
     draw_rect_outline(gx, gy, gw, gh, CLR_MENU_BORDER);
     int n = s_spark_filled;
     for (int i = 0; i < n; i++) {
         int idx = (s_spark_head - n + i + SPARK_N * 2) % SPARK_N;
         int v = s_spark_cpu[idx];
-        int bx = gx + 1 + i * (gw - 2) / SPARK_N;
-        int bh = v * (gh - 2) / 100; if (bh < 1) bh = 1;
-        draw_fill_rect(bx, gy + gh - 1 - bh, (gw - 2) / SPARK_N + 1, bh, 0x0040A0E0);
+        int bx = gx + ui_px(1) + i * (gw - ui_px(2)) / SPARK_N;
+        int bh = v * (gh - ui_px(2)) / 100; if (bh < 1) bh = 1;
+        draw_fill_rect(bx, gy + gh - ui_px(1) - bh, (gw - ui_px(2)) / SPARK_N + 1, bh, 0x0040A0E0);
     }
     // Net indicator dot (top-right) reflecting current throughput.
     uint32_t nd = s_net_pct > 50 ? 0x00FF8040 : s_net_pct > 5 ? 0x00FFD040 : 0x00608060;
-    draw_circle_filled(x + w - 14, y + 12, 4, nd);
+    draw_circle_filled(x + w - ui_px(14), y + ui_px(12), ui_px(4), nd);
 }
 
 // --- Timer / Stopwatch (id 7): stopwatch + countdown, uses uptime_ms() ------
 int g_show_timer = 0;
 int g_timer_x = -1, g_timer_y = -1, g_timer_locked = 0;
-#define TIMER_W  176
-#define TIMER_H  96
+#define TIMER_W  ui_px(176)
+#define TIMER_H  ui_px(96)
 // mode 0 = stopwatch (counts up), 1 = countdown timer.
 static int s_tmr_mode = 0;
 static int s_tmr_running = 0;
@@ -1002,25 +1145,27 @@ static void tmr_fmt(char *buf, unsigned long ms) {
     buf[i] = '\0';
 }
 
-// Button rects within the widget (computed from top-left x,y).
-// 3 buttons in a row near the bottom: [Start/Pause] [Reset] [Mode].
+// Button rects within the widget (computed from top-left x,y). Shared by
+// draw (widget_timer) and hit-test (timer_click) so the two cannot drift.
+// #uiscale: every literal here is now ui_px()'d, byte-identical at 100%.
 static void tmr_btn_rect(int x, int y, int i, int *bx, int *by, int *bw, int *bh) {
-    int n = 3, pad = 8, gap = 6;
+    int n = 3, pad = ui_px(8), gap = ui_px(6);
     int tw = (TIMER_W - pad * 2 - gap * (n - 1)) / n;
     *bx = x + pad + i * (tw + gap);
-    *by = y + TIMER_H - 30;
-    *bw = tw; *bh = 22;
+    *by = y + TIMER_H - ui_px(30);
+    *bw = tw; *bh = ui_px(22);
 }
 static void widget_timer(int x, int y) {
     int w = TIMER_W, h = TIMER_H;
-    draw_rounded_rect(x, y, w, h, 8, CLR_MENU_BG);
+    draw_rounded_rect(x, y, w, h, ui_px(8), CLR_MENU_BG);
     draw_rect_outline(x, y, w, h, CLR_MENU_BORDER);
+    draw_rounded_rect(x, y, ui_px(4), h, ui_px(2), 0x00FFC850);   // #159 sect 3: left accent bar
     const char *title = s_tmr_mode ? "Countdown" : "Stopwatch";
-    draw_text(x + 10, y + 6, title, readable_accent(0x00FFC850, CLR_MENU_BG));
+    draw_text(x + ui_px(12), y + ui_px(8), title, readable_accent(0x00FFC850, CLR_MENU_BG));
     unsigned long ms = s_tmr_mode ? tmr_remaining() : tmr_elapsed();
     char tb[16]; tmr_fmt(tb, ms);
     uint32_t tc = (s_tmr_mode && ms == 0) ? 0x00FF6060 : readable_ink(CLR_MENU_BG);
-    draw_text_centered(x + w / 2, y + 26, tb, tc);
+    draw_text_centered(x + w / 2, y + ui_px(26), tb, tc);
     static const char *lbl[3];
     lbl[0] = s_tmr_running ? "Pause" : "Start";
     lbl[1] = "Reset";
@@ -1029,6 +1174,8 @@ static void widget_timer(int x, int y) {
         int bx, by, bw, bh; tmr_btn_rect(x, y, i, &bx, &by, &bw, &bh);
         draw_fill_rect(bx, by, bw, bh, CLR_MENU_ITEM_HOVER);
         draw_rect_outline(bx, by, bw, bh, CLR_MENU_BORDER);
+        // #uiscale FIX: same double-scale as sysmon_bar() above - FONT_CHAR_H
+        // is already scaled.
         draw_text_centered(bx + bw / 2, by + (bh - FONT_CHAR_H) / 2, lbl[i], CLR_MENU_TEXT);
     }
 }
@@ -1050,8 +1197,8 @@ static int timer_click(int x, int y) {
 // --- World Time (id 8): three configurable timezone clocks -------------------
 int g_show_worldtime = 0;
 int g_worldtime_x = -1, g_worldtime_y = -1, g_worldtime_locked = 0;
-#define WT_W   188
-#define WT_H   96
+#define WT_W   ui_px(188)
+#define WT_H   ui_px(96)
 // WT_ZONES is defined in compositor.h (shared with profile.c).
 // Persisted: per-zone UTC offset in minutes and a 3-char label. The compositor
 // clock is treated as UTC reference; offsets shift it per zone. (No DST.)
@@ -1079,23 +1226,25 @@ static void wt_fmt(char *buf, int off_min) {
 }
 static void widget_worldtime(int x, int y) {
     int w = WT_W, h = WT_H;
-    draw_rounded_rect(x, y, w, h, 8, CLR_MENU_BG);
+    draw_rounded_rect(x, y, w, h, ui_px(8), CLR_MENU_BG);
     draw_rect_outline(x, y, w, h, CLR_MENU_BORDER);
-    draw_text(x + 10, y + 6, "World Time", readable_accent(0x0066FF99, CLR_MENU_BG));
-    int row0 = y + 26, rh = (h - 32) / WT_ZONES;
+    draw_rounded_rect(x, y, ui_px(4), h, ui_px(2), 0x0066FF99);   // #159 sect 3: left accent bar
+    draw_text(x + ui_px(12), y + ui_px(8), "World Time", readable_accent(0x0066FF99, CLR_MENU_BG));
+    int row0 = y + ui_px(26), rh = (h - ui_px(32)) / WT_ZONES;
     for (int z = 0; z < WT_ZONES; z++) {
         int ry = row0 + z * rh;
-        draw_text(x + 12, ry, s_wt_lbl[z], CLR_MENU_TEXT);
+        draw_text(x + ui_px(12), ry, s_wt_lbl[z], CLR_MENU_TEXT);
         char tb[8]; wt_fmt(tb, g_wt_off[z]);
-        draw_text(x + w - text_width(tb) - 12, ry, tb, readable_ink(CLR_MENU_BG));
+        draw_text(x + w - text_width(tb) - ui_px(12), ry, tb, readable_ink(CLR_MENU_BG));
     }
 }
 
 // (#282) Uptime widget (id 9): shows time since boot via uptime_ms().
-int g_show_uptime = 0;
+int g_show_uptime = 1;   // default ON, 2026-08-18 owner decision - see
+                          // setup/main.rs WIDX_UPTIME / WIDGETS_DEFAULT_MASK
 int g_uptime_x = -1, g_uptime_y = -1, g_uptime_locked = 0;
-#define UPT_W   188
-#define UPT_H   72
+#define UPT_W   ui_px(188)
+#define UPT_H   ui_px(72)
 static int upt_num(char *o, unsigned long v) {
     char t[12]; int n = 0;
     if (v == 0) { o[0] = '0'; return 1; }
@@ -1110,9 +1259,10 @@ static int upt_2d(char *o, unsigned long v) {
 }
 static void widget_uptime(int x, int y) {
     int w = UPT_W, h = UPT_H;
-    draw_rounded_rect(x, y, w, h, 8, CLR_MENU_BG);
+    draw_rounded_rect(x, y, w, h, ui_px(8), CLR_MENU_BG);
     draw_rect_outline(x, y, w, h, CLR_MENU_BORDER);
-    draw_text(x + 10, y + 6, "Uptime", readable_accent(0x00FFB060, CLR_MENU_BG));
+    draw_rounded_rect(x, y, ui_px(4), h, ui_px(2), 0x00FFB060);   // #159 sect 3: left accent bar
+    draw_text(x + ui_px(12), y + ui_px(8), "Uptime", readable_accent(0x00FFB060, CLR_MENU_BG));
     unsigned long sec = (unsigned long)(uptime_ms() / 1000UL);
     unsigned long d = sec / 86400UL; sec %= 86400UL;
     unsigned long hh = sec / 3600UL;  sec %= 3600UL;
@@ -1122,7 +1272,7 @@ static void widget_uptime(int x, int y) {
     i += upt_2d(buf + i, hh); buf[i++] = ':';
     i += upt_2d(buf + i, mm); buf[i++] = ':';
     i += upt_2d(buf + i, ss); buf[i] = 0;
-    draw_text(x + 14, y + 34, buf, readable_ink(CLR_MENU_BG));
+    draw_text(x + ui_px(12), y + ui_px(34), buf, readable_ink(CLR_MENU_BG));
 }
 
 // --- Public entry ---------------------------------------------------------
@@ -1133,7 +1283,12 @@ static void widget_uptime(int x, int y) {
 int g_clock_cx = -1, g_clock_cy = -1, g_cal_x = -1, g_cal_y = -1;
 int g_clock_locked = 0, g_cal_locked = 0;   // per-widget lock (persisted)
 // Digital clock widget (id 5) - state in clock.c, drawn by digclk_draw().
-extern int g_show_digclock, g_digclk_x, g_digclk_y, g_digclk_locked, g_digclk_12h, g_digclk_secs, g_digclk_style;
+// #235: g_digclk_12h is GONE. The 12/24-hour format is /CONFIG/SETTINGS.CFG key
+// 'h' (Settings' clock.use_24hour contract row), read by clock.c through the one
+// shared libc/settingscfg.c reader. This widget no longer keeps a private copy
+// and its menu no longer offers a private switch; the "Date & Time..." item
+// below deep-links to the one control, which the taskbar clock also follows.
+extern int g_show_digclock, g_digclk_x, g_digclk_y, g_digclk_locked, g_digclk_secs, g_digclk_style;
 void digclk_geom(int *w, int *h);
 void digclk_draw(int x, int y);
 static int s_digclk_w = 0, s_digclk_h = 0;
@@ -1141,8 +1296,7 @@ static int s_digclk_w = 0, s_digclk_h = 0;
 int g_weather_x = -1, g_weather_y = -1, g_crypto_x = -1, g_crypto_y = -1, g_stocks_x = -1, g_stocks_y = -1;
 int g_weather_locked = 0, g_crypto_locked = 0, g_stocks_locked = 0;
 static int s_clk_r = 44, s_cal_w = 196, s_cal_h = 0;
-#define CARD_W 248
-static int s_card_h[3] = { 64, 64, 64 };   // dynamic per-card height (auto-resize)
+#define CARD_W ui_px(248)
 // Verbosity per card: 1 = detailed (extra lines), 0 = compact. Persisted.
 int g_weather_verbose = 1, g_crypto_verbose = 1, g_stocks_verbose = 1;
 static int g_wdrag = -1, g_wdx = 0, g_wdy = 0;   // -1 none; 0..4 widget id
@@ -1154,10 +1308,80 @@ static int *s_card_lock[3] = { &g_weather_locked, &g_crypto_locked, &g_stocks_lo
 static int *s_card_vis[3]  = { &g_show_weather, &g_show_crypto, &g_show_stocks };
 static int *s_card_verbose[3] = { &g_weather_verbose, &g_crypto_verbose, &g_stocks_verbose };
 
+// ===========================================================================
+// (#236) A DESKTOP WIDGET'S FOOTPRINT IS A FUNCTION OF ITS SETTINGS, NEVER OF
+// WHETHER ITS DATA ARRIVED.
+//
+// MEASURED (golden 2054 = dev c537f63c, throwaway VM <vmid>, 1280x800, fresh
+// first boot through the OOBE wizard, positions read back out of the
+// /HOME/JAMES/UIPROFIL.YML that boot wrote): Calendar y=14 h=158, Weather
+// y=184, Uptime y=314, Home Assistant y=398. widgets_layout_rail_defaults()
+// had correctly reserved 118px for Weather, but draw_weather_card() sized
+// itself from the PARSED PAYLOAD
+//        h = (verbose && nf >= 9) ? 118 : 64
+// and /WEATHER.TXT did not exist yet, so the card PAINTED 64px tall. Result,
+// exactly as reported: the card looks glued to the Calendar 12px above it and
+// adrift from Uptime 66px below it, and every dimension the rest of this file
+// derives from s_card_h[0] (drag box, damage rect, the packing cursor for the
+// next widget in the column) is wrong for as long as the fetch has not landed.
+//
+// The shallow bug is the 64. The real one is that a widget whose SIZE depends
+// on a network fetch makes the whole desktop layout non-deterministic: two
+// boots of the same machine lay out differently depending on whether DHCP and
+// the netinfo fetch beat the first frame, and a position baked into
+// UIPROFIL.YML under one outcome is stale under the other. That is a
+// permanent supply of "it looked fine yesterday" reports, and it is also what
+// lets a stale-but-right-aligned stored y sit INSIDE the widget above it
+// (the overlap #213's rail_pos_trusted() cannot see - now closed too).
+//
+// THE RULE, for every card in this file:
+//
+//   ONE pure function per card computes its height from CONFIGURATION ONLY
+//   (verbosity, display mode, how many tickers the USER asked for). The draw
+//   path and the layout pass BOTH call that one function, so the reserved
+//   slot and the painted box cannot disagree. A card with no data draws an
+//   explicit empty state INSIDE its full footprint; it never collapses.
+//
+// This also deletes the s_card_h[]/s_ha_h "dynamic per-card height" trackers
+// outright. Those existed only to let the rest of the file find out what the
+// last draw happened to choose, which is precisely the coupling that made the
+// first frame (nothing drawn yet) and every no-data frame wrong.
+// ===========================================================================
+static int weather_card_h(void) { return g_weather_verbose ? 118 : 64; }
+
+// Crypto/Stocks: how many rows the user ASKED FOR, from the same
+// /CRYPTOID.TXT and /STOCKID.TXT this widget's own Settings dialog writes
+// (wcfg_path0()/wcfg_def0() below) and the netinfo service fetches from -
+// never how many the fetch came back with. Cached; refreshed on the netinfo
+// throttle, so the draw thread does no I/O it was not already doing (#426:
+// async-fetch-then-cache, a small flat-file read, never a poll or a wait).
+#define QUOTE_ROWS_MAX 8
+static int s_quote_rows[3] = { 1, 2, 2 };   // [0] unused (Weather), 1 crypto, 2 stocks
+static void quote_rows_refresh(void);       // fwd; defined with wcfg_path0()/wcfg_def0()
+static int quote_card_h(int rows) { return ui_px(30) + rows * ui_px(18) + ui_px(6); }
+
+// The one height accessor for info card `c` (0 weather, 1 crypto, 2 stocks).
+//
+// The lazy one-shot matters: s_quote_rows starts at the built-in {1,2,2}, and
+// the FIRST caller of this function is whichever of the rail-placement pass,
+// widget_box() or the damage collector happens to run first on frame 1 - which
+// may be before netinfo_refresh() has read /CRYPTOID.TXT. A user with four
+// coins configured would then have had 2 rows reserved for them exactly once,
+// at first placement, which is the same never-drawn-yet staleness this whole
+// change removes, reintroduced through the back door. Seeding it here makes
+// "the first read is the configured value" true for every caller regardless of
+// order. It is two small file reads, once per process, off the same flat-file
+// hand-off the cards already use - no wait, no poll (#426).
+static int s_quote_rows_ready = 0;
+static int card_h(int c) {
+    if (!s_quote_rows_ready) { s_quote_rows_ready = 1; quote_rows_refresh(); }
+    return c == 0 ? weather_card_h() : quote_card_h(s_quote_rows[c]);
+}
+
 // Per-widget right-click menu.
 static int g_wmenu = -1, g_wmenu_x = 0, g_wmenu_y = 0;
-#define WMENU_W 124
-#define WMENU_IH 22
+#define WMENU_W ui_px(124)
+#define WMENU_IH ui_px(22)
 
 void widget_settings_open(int id);   // forward decl (settings dialog, below)
 
@@ -1170,12 +1394,12 @@ void widget_settings_open(int id);   // forward decl (settings dialog, below)
 // picker (search + domain filter) over the /HALIST.TXT catalog.
 // ===========================================================================
 #define HA_ID 10
-#define HA_W  224
+#define HA_W  ui_px(224)
 int g_show_ha = 1;                 // flagship widget: shown by default
+                                    // also the 2026-08-18 owner default (setup/main.rs WIDX_HA)
 int g_ha_x = -1, g_ha_y = -1, g_ha_locked = 0;
 static char s_ha_entity[96]="", s_ha_friendly[96]="", s_ha_state[64]="", s_ha_unit[24]="", s_ha_domain[24]="";
 static char s_ha_dclass[24]="";    // #723 device_class (6th /HA0.TXT field)
-static int  s_ha_h = 74;
 static char s_ha_cat[200000];      // /HALIST.TXT catalog for the picker
 static int  s_ha_cat_len = 0;
 
@@ -1320,15 +1544,22 @@ static uint32_t ha_sem_color(ha_semantic_t sem){
 // character-count cut, so a long HA friendly name or humanized state never
 // overflows the card. `scale`=1 measures with text_width(); >1 uses the
 // draw_text_large metric (draw_text_large scale must match what's on screen).
-static void ha_fit_text(const char *src,int max_w,int scale,char *out,int cap){
+// `sz` <=1 means "measure with the default UI TTF size" (text_width());
+// otherwise `sz` is a literal draw_text_ttf() point size to measure AT (mode
+// 0/1 HA values pass 28/42 - the exact size they will be painted at). #159
+// sect 5a: this used to be a `scale` multiplier measured with
+// text_width_large() (the bitmap font's metric) while the paint call was
+// switched to draw_text_ttf() at a literal size - a fit computed against one
+// font and painted in another either clips early or overflows the card.
+static void ha_fit_text(const char *src,int max_w,int sz,char *out,int cap){
     int n=0; for(;src[n]&&n<cap-1;n++) out[n]=src[n]; out[n]=0;
-    int w = (scale<=1)? text_width(out) : text_width_large(out,scale);
+    int w = (sz<=1)? text_width(out) : text_width_ttf(out,sz);
     if (w<=max_w || max_w<=0) return;
     while (n>1){
         n--;
         char t[64]; int m=0; for(;m<n&&m<60;m++) t[m]=out[m];
         t[m++]='.'; t[m++]='.'; t[m++]='.'; t[m]=0;
-        int tw = (scale<=1)? text_width(t) : text_width_large(t,scale);
+        int tw = (sz<=1)? text_width(t) : text_width_ttf(t,sz);
         if (tw<=max_w || n<=1){ int i=0; for(;t[i]&&i<cap-1;i++) out[i]=t[i]; out[i]=0; return; }
     }
 }
@@ -1338,14 +1569,75 @@ static void ha_draw_spark(int x,int y,int w,int h){
     draw_fill_rect(x,y,w,h,0x00161E26);
     draw_rect_outline(x,y,w,h,0x00304556);
     int n=s_ha_spark_n, px=-1,py=-1;
+    int inset = ui_px(1), trim = ui_px(3);   // #uiscale: was a bare 1px/3px inset
     for(int i=0;i<n;i++){
-        int vx = x+1 + i*(w-3)/(n-1);
-        int vy = y+1 + (h-3) - s_ha_spark[i]*(h-3)/1000;
+        int vx = x+inset + i*(w-trim)/(n-1);
+        int vy = y+inset + (h-trim) - s_ha_spark[i]*(h-trim)/1000;
         if(px>=0) wdg_line(px,py,vx,vy,0x0041B0E0);
         px=vx; py=vy;
     }
 }
+// The single HA accent hue (#159 sect 1b/2b): used raw for the identity bar
+// fill and, theme-corrected via readable_accent(), for the title - folding
+// what used to be two literals (bar 0x0041B0E0, title 0x00CFE8F5) into one,
+// exactly like Weather/Crypto/Stocks each use one accent hue for both.
+#define HA_ACCENT 0x0041B0E0
+
+// (#236) The HA card's height, from the display MODE alone. The history row
+// used to be present iff s_ha_spark_n >= 2, i.e. iff /HASPARK.TXT had already
+// been written: the card grew 32px the moment a series landed and shrank
+// again whenever it did not. Home Assistant is currently LAST in the
+// canonical rail order, so that never displaced another widget on a default
+// desktop - it is the same fault as the Weather one with the blast radius
+// hidden by an ordering accident, which is exactly the kind of latent thing
+// that surfaces the day someone reorders the rail. The row is now RESERVED by
+// mode (every mode except Gauge, which has no history row at all) and drawn
+// as an explicit empty frame until there is a series to put in it.
+static int ha_card_h(void){
+    // #uiscale: FONT_CHAR_H is already ui_px()'d - every OTHER literal below
+    // is its own ui_px() call.
+    int top  = ui_px(10) + FONT_CHAR_H + ui_px(8);          // below the title
+    int valh = (g_ha_mode==1)? (FONT_CHAR_H*3+ui_px(6)) : (g_ha_mode==2)? ui_px(30) : (g_ha_mode==3)? ui_px(30) : (FONT_CHAR_H*2+ui_px(6));
+    int sparkh = (g_ha_mode!=3) ? ui_px(26) : 0;
+    return top + valh + (sparkh?sparkh+ui_px(6):0) + ui_px(8);
+}
+// Empty history frame: the same box ha_draw_spark() paints into, with the
+// reason it is empty, so the reserved row reads as deliberate rather than as
+// a rendering failure.
+static void ha_draw_spark_empty(int x,int y,int w,int h){
+    draw_fill_rect(x,y,w,h,0x00161E26);
+    draw_rect_outline(x,y,w,h,0x00304556);
+    const char *m = "No history yet";
+    int tw = text_width(m);
+    draw_text(x + (w - tw)/2, y + (h - FONT_CHAR_H)/2, m, readable_ink_dim(0x00161E26));
+}
+
 static void ha_card_draw(int x,int y){
+    // #159 sect 6a: offline gate FIRST, before ha_refresh_cache() touches the
+    // /HA0.TXT cache at all. This is what makes "no stale reading" structural
+    // rather than a rendering choice - there is no code path below this
+    // return that has read s_ha_state/s_ha_friendly/s_ha_entity/... yet.
+    if (!widget_net_online()) {
+        int W = HA_W;
+        int top = ui_px(10) + FONT_CHAR_H + ui_px(8);
+        // (#236) ha_card_h(), the SAME height this card has in every other
+        // state. This used to compute its own top+valh+8 (no history row),
+        // which made "offline" a THIRD distinct footprint on top of the
+        // have-spark / no-spark pair.
+        int H = ha_card_h();
+        draw_rounded_rect(x,y,W,H,ui_px(8),CLR_MENU_BG);
+        draw_rect_outline(x,y,W,H,CLR_MENU_BORDER);
+        draw_rounded_rect(x,y,ui_px(4),H,ui_px(2),HA_ACCENT);
+        // g_ha_label is a local Settings value (never populated by
+        // ha_refresh_cache()), so it is safe to read here; the HA friendly
+        // name / entity id are NOT (they come from the cache we are not
+        // reading), so this falls back to the generic title instead.
+        const char *title = g_ha_label[0] ? g_ha_label : "Home Assistant";
+        char tt[64]; ha_fit_text(title,W-ui_px(24),1,tt,sizeof(tt));
+        draw_text(x+ui_px(12),y+ui_px(10),tt,readable_accent(HA_ACCENT, CLR_MENU_BG));
+        widget_draw_offline(x,W,y+top,y+H-ui_px(8));
+        return;
+    }
     ha_refresh_cache();
     if((s_ha_io_tick++ % 24)==0){ ha_load_label(); ha_load_spark(); }
     // #723 domain/device_class -> humanized text + icon + semantic, once per
@@ -1354,54 +1646,73 @@ static void ha_card_draw(int x,int y){
     ha_display_t hd; ha_format_state(s_ha_domain,s_ha_dclass,s_ha_state,s_ha_unit,&hd);
     uint32_t semc = ha_sem_color(hd.sem);
     int W=HA_W;
-    int have_spark = (s_ha_spark_n>=2 && g_ha_mode!=3);
-    int top = 10 + FONT_CHAR_H + 8;                       // below the title
-    int valh = (g_ha_mode==1)? (FONT_CHAR_H*3+6) : (g_ha_mode==2)? 30 : (g_ha_mode==3)? 30 : (FONT_CHAR_H*2+6);
-    int sparkh = have_spark ? 26 : 0;
+    int spark_slot = (g_ha_mode!=3);                      // reserved by MODE (#236)
+    int have_spark = (s_ha_spark_n>=2 && spark_slot);     // ...filled only when there IS a series
+    int top = ui_px(10) + FONT_CHAR_H + ui_px(8);         // below the title
+    int valh = (g_ha_mode==1)? (FONT_CHAR_H*3+ui_px(6)) : (g_ha_mode==2)? ui_px(30) : (g_ha_mode==3)? ui_px(30) : (FONT_CHAR_H*2+ui_px(6));
     // No trailing entity-id row (#723: the raw id is noise on the always-
     // visible card - it stays available in the widget's Settings picker and,
     // for an already-bound widget, in the settings header caption below).
-    int H = top + valh + (sparkh?sparkh+6:0) + 8;  s_ha_h=H;
-    draw_fill_rect(x,y,W,H,0x00202832);
-    draw_rect_outline(x,y,W,H,0x00415A6E);
-    draw_fill_rect(x,y,W,4,0x0041B0E0);                   // HA accent
+    int H = ha_card_h();
+    // #159 sect 1b finding 1: was draw_fill_rect(...,0x00202832) / hardcoded
+    // border 0x00415A6E - theme-token fill/border, matching Weather/Crypto/
+    // Stocks (widgets.c draw_weather_card/draw_quote_card).
+    draw_rounded_rect(x,y,W,H,ui_px(8),CLR_MENU_BG);
+    draw_rect_outline(x,y,W,H,CLR_MENU_BORDER);
+    // #159 sect 1b finding 2: was a 4px TOP bar (draw_fill_rect(x,y,W,4,...));
+    // now the family's 4px LEFT bar, matching Weather/Crypto/Stocks/the four
+    // redesigned widgets - 8-of-8 consistent instead of 7-of-8.
+    draw_rounded_rect(x,y,ui_px(4),H,ui_px(2),HA_ACCENT);
     // Title: custom label overrides HA friendly name (#419 rename). The
     // entity_id fallback only fires before anything has ever loaded (#723:
     // it is not "the name", it is "nothing better to show yet").
     const char *title = g_ha_label[0]?g_ha_label:(s_ha_friendly[0]?s_ha_friendly:(s_ha_entity[0]?s_ha_entity:"Home Assistant"));
-    char tt[64]; ha_fit_text(title,W-24,1,tt,sizeof(tt));
-    draw_text(x+12,y+10,tt,0x00CFE8F5);
+    char tt[64]; ha_fit_text(title,W-ui_px(24),1,tt,sizeof(tt));
+    // #159 sect 1b finding 3: was a hardcoded 0x00CFE8F5 title color; now
+    // readable_accent() like every other reference widget's title.
+    draw_text(x+ui_px(12),y+ui_px(10),tt,readable_accent(HA_ACCENT, CLR_MENU_BG));
     int vy = y+top;
     long num; int is_num = ha_state_num(&num);
-    int isz = (g_ha_mode==1)?32:(g_ha_mode==2)?24:(g_ha_mode==3)?16:28;   // icon size per mode
+    int isz = (g_ha_mode==1)?ui_px(32):(g_ha_mode==2)?ui_px(24):(g_ha_mode==3)?ui_px(16):ui_px(28);   // icon size per mode
     if(g_ha_mode==2){                                     // ---- state badge ----
-        icon_draw_scaled(hd.icon, x+12, vy, isz, semc);
-        int bx = x+12+isz+8;
-        char bt[40]; ha_fit_text(hd.text, W-24-isz-8-24, 1, bt, sizeof(bt));
-        int bw = text_width(bt)+24; if(bw<64)bw=64; if(bw>W-24-isz-8)bw=W-24-isz-8;
-        draw_fill_rect(bx,vy,bw,24,semc);
-        draw_rect_outline(bx,vy,bw,24,readable_ink_dim(semc));
-        draw_text_centered(bx+bw/2,vy+4,bt,readable_ink(semc));   // #723 contrast-safe on any theme's semantic color
+        icon_draw_scaled(hd.icon, x+ui_px(12), vy, isz, semc);
+        int bx = x+ui_px(12)+isz+ui_px(8);
+        char bt[40]; ha_fit_text(hd.text, W-ui_px(24)-isz-ui_px(8)-ui_px(24), 1, bt, sizeof(bt));
+        int bw = text_width(bt)+ui_px(24); if(bw<ui_px(64))bw=ui_px(64); if(bw>W-ui_px(24)-isz-ui_px(8))bw=W-ui_px(24)-isz-ui_px(8);
+        draw_fill_rect(bx,vy,bw,ui_px(24),semc);
+        draw_rect_outline(bx,vy,bw,ui_px(24),readable_ink_dim(semc));
+        draw_text_centered(bx+bw/2,vy+ui_px(4),bt,readable_ink(semc));   // #723 contrast-safe on any theme's semantic color
     } else if(g_ha_mode==3){                              // ---- gauge / bar ----
         long v = is_num? num : 0;
         if(is_num && v/10 > g_ha_max){ g_ha_max = (int)(v/10); }   // auto-grow range
         long lo=(long)g_ha_min*10, hi=(long)g_ha_max*10; if(hi<=lo)hi=lo+10;
         long frac = (v-lo)*1000/(hi-lo); if(frac<0)frac=0; if(frac>1000)frac=1000;
-        int gw=W-24, gh=16;
-        draw_fill_rect(x+12,vy,gw,gh,0x00161E26);
-        draw_fill_rect(x+12,vy,(int)((long)gw*frac/1000),gh,0x0041B0E0);
-        draw_rect_outline(x+12,vy,gw,gh,0x00304556);
-        icon_draw_scaled(hd.icon, x+12, vy+gh+3, isz, semc);
-        char val[48]; ha_fit_text(hd.text, W-24-isz-6, 1, val, sizeof(val));
-        draw_text(x+12+isz+6,vy+gh+3,val,0x00CFE8F5);
+        int gw=W-ui_px(24), gh=ui_px(16);
+        draw_fill_rect(x+ui_px(12),vy,gw,gh,0x00161E26);
+        draw_fill_rect(x+ui_px(12),vy,(int)((long)gw*frac/1000),gh,0x0041B0E0);
+        draw_rect_outline(x+ui_px(12),vy,gw,gh,0x00304556);
+        icon_draw_scaled(hd.icon, x+ui_px(12), vy+gh+ui_px(3), isz, semc);
+        char val[48]; ha_fit_text(hd.text, W-ui_px(24)-isz-ui_px(6), 1, val, sizeof(val));
+        draw_text(x+ui_px(12)+isz+ui_px(6),vy+gh+ui_px(3),val,0x00CFE8F5);
     } else {                                              // ---- value / big ----
-        int scale = (g_ha_mode==1)?3:2;
-        icon_draw_scaled(hd.icon, x+12, vy+(valh-isz)/2, isz, semc);
-        int tx = x+12+isz+8;
-        char val[48]; ha_fit_text(hd.text, W-24-isz-8, scale, val, sizeof(val));
-        draw_text_large(tx,vy,val,0x00FFFFFF,scale);
+        // #159 sect 5: was draw_text_large()/text_width_large() - the sole
+        // bitmap-font call in the whole widget family (the "Unknown" bug).
+        // Mode 1 ("large number") -> size 42; mode 0 ("value+unit") -> 28,
+        // both literal draw_text_ttf() point sizes, not integer scales - they
+        // are NOT wrapped in ui_px() here because draw_text_ttf()/
+        // text_width_ttf() already scale their own `size` argument
+        // internally (main.c #uiscale chokepoint); wrapping here too would
+        // be the same double-scale bug fixed at the top of this file.
+        int ttf_size = (g_ha_mode==1) ? 42 : 28;
+        icon_draw_scaled(hd.icon, x+ui_px(12), vy+(valh-isz)/2, isz, semc);
+        int tx = x+ui_px(12)+isz+ui_px(8);
+        char val[48]; ha_fit_text(hd.text, W-ui_px(24)-isz-ui_px(8), ttf_size, val, sizeof(val));
+        draw_text_ttf(tx,vy,val,ttf_size,readable_ink(CLR_MENU_BG));
     }
-    if(have_spark) ha_draw_spark(x+12,vy+valh+6,W-24,20);
+    if(spark_slot){
+        if(have_spark) ha_draw_spark(x+ui_px(12),vy+valh+ui_px(6),W-ui_px(24),ui_px(20));
+        else           ha_draw_spark_empty(x+ui_px(12),vy+valh+ui_px(6),W-ui_px(24),ui_px(20));
+    }
 }
 
 // Bounding box of widget `id` (top-left). Returns 0 if hidden/unplaced.
@@ -1419,7 +1730,7 @@ static int widget_box(int id, int *bx, int *by, int *bw, int *bh) {
     if (id >= 2 && id <= 4) {
         int c = id - 2;
         if (!*s_card_vis[c] || *s_card_x[c] < 0) return 0;
-        *bx = *s_card_x[c]; *by = *s_card_y[c]; *bw = CARD_W; *bh = s_card_h[c]; return 1;
+        *bx = *s_card_x[c]; *by = *s_card_y[c]; *bw = CARD_W; *bh = card_h(c); return 1;
     }
     if (id == 5) {
         if (!g_show_digclock || g_digclk_x < 0) return 0;
@@ -1443,7 +1754,7 @@ static int widget_box(int id, int *bx, int *by, int *bw, int *bh) {
     }
     if (id == 10) {
         if (!g_show_ha || g_ha_x < 0) return 0;
-        *bx = g_ha_x; *by = g_ha_y; *bw = HA_W; *bh = s_ha_h; return 1;
+        *bx = g_ha_x; *by = g_ha_y; *bw = HA_W; *bh = ha_card_h(); return 1;
     }
     return 0;
 }
@@ -1562,14 +1873,30 @@ void widget_release(void) { g_wdrag = -1; }
 void widget_menu_open(int which, int x, int y) { g_wmenu = which; g_wmenu_x = x; g_wmenu_y = y; }
 int  widget_menu_is_open(void) { return g_wmenu >= 0; }
 static int widget_menu_nitems(void) {
-    if (g_wmenu == 5) return 5;          // digital clock: Hide, Lock, 12/24h, Seconds, Design
+    // #129: digital clock: Hide, Lock, Seconds, Design, Date & Time
+    // (the last item deep-links to Settings -> Date and Time - "clock" is one
+    // of the three tray/desktop clocks that ticket names; this is how the
+    // DESKTOP WIDGET form of the clock reaches it, since DOCK_DEFAULT has no
+    // bar-clock text to click - see taskbar.c's bar_clock_click()/g_bar_
+    // clock_* for the other 4 dock styles' bar-clock text).
+    // #235: the 12/24h item that used to sit at index 2 is GONE. It flipped a
+    // PRIVATE g_digclk_12h that the Settings control did not govern, so this
+    // menu and Settings could put the desktop clock and the taskbar clock into
+    // different formats at the same time. The one control is the "Date &
+    // Time..." item's destination; both clocks now follow it.
+    if (g_wmenu == 5) return 5;
     if (g_wmenu >= 2 && g_wmenu <= 4) return 3;  // info cards: Hide, Lock, Settings
     if (g_wmenu == 10) return 4;                 // #414/#419 HA: Hide, Lock, Display, Settings
     return 2;                            // all other widgets: Hide, Lock
 }
 
+// #uiscale: WMENU_W/WMENU_IH are now scaled (their #define, above); this
+// shared "+4" row-start inset is the same value the draw loop and the
+// hit-test loop both read, so it cannot drift the way the traymenu.c
+// checkbox/slider geometry did before this pass.
+#define WMENU_TOP_PAD ui_px(4)
 static void widget_menu_geom(int *mx, int *my, int *h) {
-    int hh = widget_menu_nitems() * WMENU_IH + 4;
+    int hh = widget_menu_nitems() * WMENU_IH + WMENU_TOP_PAD;
     int x = g_wmenu_x, y = g_wmenu_y;
     // (local 81) was clamped against the raw framebuffer with no x<0/y<0 floor,
     // so a menu wider/taller than the screen started off-screen and one opened
@@ -1579,19 +1906,23 @@ static void widget_menu_geom(int *mx, int *my, int *h) {
 }
 void widget_menu_render(void) {
     if (g_wmenu < 0) return;
+    // #uiscale FIXED: WMENU_W/WMENU_IH (this file) are now scaled, and every
+    // item offset below is ui_px()'d to match, so this menu no longer needs
+    // the native-text opt-out - it was one of the few widgets.c surfaces
+    // small and self-contained enough to convert in this pass.
     int x, y, h; widget_menu_geom(&x, &y, &h);
     int n = widget_menu_nitems();
     draw_fill_rect(x, y, WMENU_W, h, CLR_MENU_BG);
     draw_rect_outline(x, y, WMENU_W, h, CLR_MENU_BORDER);
     int *lk = widget_lock_ptr(g_wmenu);
     static const char *ha_mode_names[4] = { "Value", "Big", "Badge", "Gauge" };
-    const char *items[5];
+    const char *items[6];
     items[0] = "Hide";
     items[1] = (lk && *lk) ? "Unlock" : "Lock";
     if (g_wmenu == 5) {
-        items[2] = g_digclk_12h ? "24-hour" : "12-hour";
-        items[3] = g_digclk_secs ? "Hide seconds" : "Show seconds";
-        items[4] = "Next design";
+        items[2] = g_digclk_secs ? "Hide seconds" : "Show seconds";
+        items[3] = "Next design";
+        items[4] = "Date & Time...";   // #129/#235: deep-link to THE clock control
     } else if (g_wmenu == 10) {
         static char mbuf[24];
         const char *mn = ha_mode_names[g_ha_mode & 3];
@@ -1605,23 +1936,24 @@ void widget_menu_render(void) {
         items[2] = "Settings";
     }
     for (int i = 0; i < n; i++)
-        draw_text(x + 12, y + 4 + i * WMENU_IH + 5, items[i], CLR_MENU_TEXT);
+        draw_text(x + ui_px(12), y + WMENU_TOP_PAD + i * WMENU_IH + ui_px(5), items[i], CLR_MENU_TEXT);
 }
 int widget_menu_handle(int x, int y, int click) {
     if (g_wmenu < 0) return 0;
     if (!click) return 1;
     int mx, my, h; widget_menu_geom(&mx, &my, &h);
     int n = widget_menu_nitems();
-    if (x >= mx && x < mx + WMENU_W && y >= my + 4 && y < my + 4 + n * WMENU_IH) {
-        int idx = (y - (my + 4)) / WMENU_IH;
+    if (x >= mx && x < mx + WMENU_W && y >= my + WMENU_TOP_PAD && y < my + WMENU_TOP_PAD + n * WMENU_IH) {
+        int idx = (y - (my + WMENU_TOP_PAD)) / WMENU_IH;
         int *vis = widget_vis_ptr(g_wmenu);
         int *lk  = widget_lock_ptr(g_wmenu);
         int which = g_wmenu;
         if (idx == 0)      { if (vis) *vis = 0; }                 // Hide
         else if (idx == 1) { if (lk) *lk = !*lk; }               // Lock/Unlock
-        else if (which == 5 && idx == 2) { g_digclk_12h = !g_digclk_12h; }    // 12/24h
-        else if (which == 5 && idx == 3) { g_digclk_secs = !g_digclk_secs; }  // seconds
-        else if (which == 5 && idx == 4) { g_digclk_style = (g_digclk_style + 1) % 5; } // design
+        // #235: no 12/24h case here any more - see widget_menu_nitems().
+        else if (which == 5 && idx == 2) { g_digclk_secs = !g_digclk_secs; }  // seconds
+        else if (which == 5 && idx == 3) { g_digclk_style = (g_digclk_style + 1) % 5; } // design
+        else if (which == 5 && idx == 4) { g_wmenu = -1; settings_open_panel(SETTINGS_PANEL_DATETIME); return 1; } // #129
         else if (which == 10 && idx == 2) { g_ha_mode = (g_ha_mode + 1) & 3; }   // #419 cycle display mode
         else if (which == 10 && idx == 3) { g_wmenu = -1; widget_settings_open(10); return 1; }
         else if (idx == 2 && which >= 2 && which <= 4) { g_wmenu = -1; widget_settings_open(which); return 1; }
@@ -1638,7 +1970,11 @@ int  widget_is_dragging(void) { return g_wdrag >= 0; }
 // writes short result files. These widgets just read the cached files every
 // few seconds and draw a row of info cards along the top of the desktop.
 // ===========================================================================
-int g_show_weather = 0, g_show_crypto = 0, g_show_stocks = 0;
+// g_show_weather default ON, 2026-08-18 owner decision (see setup/main.rs
+// WIDX_WEATHER / WIDGETS_DEFAULT_MASK); Crypto and Stocks were NOT in the
+// owner's list and stay OFF, matching WIDGETS_UI indices 11/12 being absent
+// from WIDGETS_DEFAULT_MASK.
+int g_show_weather = 1, g_show_crypto = 0, g_show_stocks = 0;
 static char s_weather[256], s_crypto[256], s_stocks[256];
 static int  s_netinfo_tick = 0;
 
@@ -1685,6 +2021,7 @@ static void netinfo_refresh(void) {
     netinfo_read("/WEATHER.TXT", s_weather, sizeof(s_weather));
     netinfo_read("/CRYPTO.TXT",  s_crypto,  sizeof(s_crypto));
     netinfo_read("/STOCKS.TXT",  s_stocks,  sizeof(s_stocks));
+    quote_rows_refresh();   // (#236) the CONFIGURED row count, same throttle
 }
 
 // --- small drawing + parsing helpers --------------------------------------
@@ -1736,6 +2073,11 @@ static void wx_drop(int cx, int cy, int s, uint32_t c) {
         draw_fill_rect(cx - w / 2, cy - r - i, w, 1, c);
     }
 }
+// #uiscale: warrow() (the crypto/stocks change-% arrow, 9x5) is left at its
+// native pixel size deliberately, like the tray glyphs in tray_glyphs.h - a
+// fixed hand-built shape with no `s`/scale parameter of its own. Its POSITION
+// is computed from already-scaled coordinates at every call site, so it stays
+// correctly PLACED at any UI scale; only its own tiny shape does not grow.
 // One thick segment of a lightning bolt.
 static void wx_bolt_seg(int x0, int y0, int x1, int y1, int s, uint32_t c) {
     for (int t = 0; t < s; t++) wdg_line(x0 + t, y0, x1 + t, y1, c);
@@ -1800,74 +2142,141 @@ static const char *cursym(const char *cur) {
     return "";
 }
 
-static int draw_weather_card(int x, int y, int w) {
-    char f[9][48]; int nf = wsplit(s_weather, '|', f, 9, 48);
-    int verbose = g_weather_verbose;
-    int h = (verbose && nf >= 9) ? 118 : 64;
-    draw_rounded_rect(x, y, w, h, 8, CLR_MENU_BG);
+// Card chrome shared by every weather state, so the box, the border, the
+// accent bar and the title cannot drift between them.
+static void wx_chrome(int x, int y, int w, int h, const char *title) {
+    draw_rounded_rect(x, y, w, h, ui_px(8), CLR_MENU_BG);
     draw_rect_outline(x, y, w, h, CLR_MENU_BORDER);
-    draw_rounded_rect(x, y, 4, h, 2, 0x0066C0FF);
-    if (nf < 3) { draw_text(x + 12, y + 8, "WEATHER", readable_accent(0x0066C0FF, CLR_MENU_BG)); draw_text(x + 12, y + 32, "...", CLR_MENU_TEXT); return h; }
+    draw_rounded_rect(x, y, ui_px(4), h, ui_px(2), 0x0066C0FF);
+    draw_text(x + ui_px(12), y + ui_px(8), title, readable_accent(0x0066C0FF, CLR_MENU_BG));
+}
+
+static int draw_weather_card(int x, int y, int w) {
+    // (#236) ONE height, from the verbosity SETTING, in every data state:
+    // loaded, partial, failed, still loading, never configured, offline. See
+    // the card-footprint block comment above weather_card_h(). Deriving a
+    // height from the payload here is what this whole change exists to stop -
+    // do not reintroduce a local `h =` that reads nf.
+    int h = weather_card_h();
+    int verbose = g_weather_verbose;   // local widget setting, not cached data
+    // #159 sect 6a: offline gate FIRST, before wsplit(s_weather,...) reads the
+    // cached buffer at all - g_weather_verbose is a Settings toggle, not part
+    // of the network cache, so it is safe to read for sizing the fallback card.
+    if (!widget_net_online()) {
+        wx_chrome(x, y, w, h, "WEATHER");
+        widget_draw_offline(x, w, y + ui_px(30), y + h - ui_px(8));
+        return h;
+    }
+    char f[9][48]; int nf = wsplit(s_weather, '|', f, 9, 48);
+    if (nf < 3) {
+        // Online, but nothing usable cached: the netinfo service has not
+        // written /WEATHER.TXT yet (first boot / still loading), the fetch
+        // failed, or the payload was rejected by netinfo_payload_ok(). Same
+        // footprint, an explicit empty state inside it - the old code drew a
+        // bare "..." in a card it had already shrunk to 64px, which is both
+        // the layout bug and an unhelpful thing to look at.
+        wx_chrome(x, y, w, h, "WEATHER");
+        widget_draw_nodata(x, w, y + ui_px(30), y + h - ui_px(8),
+                           "No weather data yet", "No weather", "data yet");
+        return h;
+    }
     int icon = f[2][0] ? (f[2][0] - '0') : 2;
-    int isc = 2;                                                // 2x-size icon
+    // #uiscale: isc was a bare 2 (icon draw-scale, unrelated to sc/sheep-style
+    // percent multipliers) - wx_icon()'s whole geometry is parametrized by
+    // this one value, so scaling it here scales the icon with no other change.
+    int isc = ui_px(2);                                         // 2x-size icon
     // Drop the icon down so it lines up with the Min/Max row (verbose) instead
-    // of colliding with the location text on the top line.
-    int icy = (verbose && nf >= 9) ? y + 44 : y + 24;
-    wx_icon(x + w - 24*isc - 12, icy, icon, isc);
-    draw_text(x + 12, y + 8, f[0], readable_accent(0x0066C0FF, CLR_MENU_BG)); // location
+    // of colliding with the location text on the top line. Keyed off the
+    // verbosity SETTING now, not off nf: the card is 118px tall whenever
+    // verbose is on, so the icon belongs at the Min/Max row either way.
+    int icy = verbose ? y + ui_px(44) : y + ui_px(24);
+    wx_chrome(x, y, w, h, f[0]);                                // title = location
+    wx_icon(x + w - 24*isc - ui_px(12), icy, icon, isc);
     char l[64]; int li = 0;
     sb(l, &li, sizeof(l), f[1]); sb(l, &li, sizeof(l), "  ");
     sb(l, &li, sizeof(l), f[3]); sb(l, &li, sizeof(l), "\xB0" "C");    // condition + now temp
-    draw_text(x + 12, y + 30, l, CLR_MENU_TEXT);
+    draw_text(x + ui_px(12), y + ui_px(30), l, CLR_MENU_TEXT);
     if (verbose && nf >= 9) {
         li = 0; sb(l, &li, sizeof(l), "Min "); sb(l, &li, sizeof(l), f[4]); sb(l, &li, sizeof(l), "\xB0" "C   Max ");
         sb(l, &li, sizeof(l), f[5]); sb(l, &li, sizeof(l), "\xB0" "C");
-        draw_text(x + 12, y + 52, l, readable_ink_dim(CLR_MENU_BG));
+        draw_text(x + ui_px(12), y + ui_px(52), l, readable_ink_dim(CLR_MENU_BG));
         li = 0; sb(l, &li, sizeof(l), "Rain "); sb(l, &li, sizeof(l), f[7]); sb(l, &li, sizeof(l), "%  ");
         sb(l, &li, sizeof(l), f[8]); sb(l, &li, sizeof(l), "mm");
-        draw_text(x + 12, y + 72, l, readable_ink_dim(CLR_MENU_BG));
+        draw_text(x + ui_px(12), y + ui_px(72), l, readable_ink_dim(CLR_MENU_BG));
         li = 0; sb(l, &li, sizeof(l), "Humidity "); sb(l, &li, sizeof(l), f[6]); sb(l, &li, sizeof(l), "%");
-        draw_text(x + 12, y + 92, l, readable_ink_dim(CLR_MENU_BG));
+        draw_text(x + ui_px(12), y + ui_px(92), l, readable_ink_dim(CLR_MENU_BG));
+    } else if (verbose) {
+        // Verbose card, but the payload is short of the 9 fields the detail
+        // rows need (a truncated or older /WEATHER.TXT). The card keeps its
+        // 118px footprint; say why the detail is missing rather than leaving
+        // 60px of unexplained space.
+        draw_text(x + ui_px(12), y + ui_px(52), "Forecast detail unavailable", readable_ink_dim(CLR_MENU_BG));
     }
     return h;
 }
 
 // Shared renderer for crypto/stocks (per-item line: CODE  $price  ^chg%).
 static int draw_quote_card(int x, int y, int w, const char *raw, unsigned int accent,
-                           const char *title_base, const char *cur, int verbose) {
+                           const char *title_base, const char *cur, int verbose,
+                           int rows_cfg) {
+    // (#236) `rows_cfg` is how many tickers the USER configured (s_quote_rows,
+    // read from /CRYPTOID.TXT / /STOCKID.TXT). The row count used to come from
+    // the fetched payload - `rows = nq > 0 ? nq : 1` - so the card was 54px
+    // tall until data arrived and then jumped to 30+n*18+6, the same
+    // data-dependent footprint the Weather card had.
+    int rows = rows_cfg; if (rows < 1) rows = 1; if (rows > QUOTE_ROWS_MAX) rows = QUOTE_ROWS_MAX;
+    int h = quote_card_h(rows);
+    // #159 sect 6a: offline gate FIRST, before wsplit(raw,...) reads the
+    // cached s_crypto/s_stocks buffer at all. title_base ("CRYPTO"/"STOCKS")
+    // and cur ("USD"/NULL) are literal call-site constants from
+    // netinfo_render(), not cache reads, so they are safe to use; the
+    // currency-code suffix normally appended from f[0] IS cache-derived and
+    // is therefore dropped here rather than shown stale.
+    if (!widget_net_online()) {
+        draw_rounded_rect(x, y, w, h, ui_px(8), CLR_MENU_BG);
+        draw_rect_outline(x, y, w, h, CLR_MENU_BORDER);
+        draw_rounded_rect(x, y, ui_px(4), h, ui_px(2), accent);
+        draw_text(x + ui_px(12), y + ui_px(8), title_base, readable_accent(accent, CLR_MENU_BG));
+        widget_draw_offline(x, w, y + ui_px(30), y + h - ui_px(6));
+        return h;
+    }
     char f[12][48]; int nf = wsplit(raw, '|', f, 12, 48);
     int first = cur ? 1 : 0;                 // crypto: f[0] is the currency
     int nq = nf - first; if (nq < 0) nq = 0;
-    int rows = nq > 0 ? nq : 1;
-    int h = 30 + rows * 18 + 6;
-    draw_rounded_rect(x, y, w, h, 8, CLR_MENU_BG);
+    if (nq > rows) nq = rows;                // never paint past the reserved box
+    draw_rounded_rect(x, y, w, h, ui_px(8), CLR_MENU_BG);
     draw_rect_outline(x, y, w, h, CLR_MENU_BORDER);
-    draw_rounded_rect(x, y, 4, h, 2, accent);
+    draw_rounded_rect(x, y, ui_px(4), h, ui_px(2), accent);
     char title[40]; int ti = 0; sb(title, &ti, sizeof(title), title_base);
     if (cur && f[0][0]) { sb(title, &ti, sizeof(title), "  "); sb(title, &ti, sizeof(title), f[0]); }
-    draw_text(x + 12, y + 8, title, readable_accent(accent, CLR_MENU_BG));
-    if (nq == 0) { draw_text(x + 12, y + 30, "unavailable", readable_ink_dim(CLR_MENU_BG)); return h; }
+    draw_text(x + ui_px(12), y + ui_px(8), title, readable_accent(accent, CLR_MENU_BG));
+    if (nq == 0) {
+        widget_draw_nodata(x, w, y + ui_px(30), y + h - ui_px(6), "No data yet", "No data", "yet");
+        return h;
+    }
     const char *sym = cur ? cursym(f[0]) : "$";       // crypto: symbol from the file's currency
+    for (int i = nq; i < rows; i++)                   // configured but not (yet) returned
+        draw_text(x + ui_px(12), y + ui_px(30) + i * ui_px(18), "-", readable_ink_dim(CLR_MENU_BG));
     for (int i = 0; i < nq; i++) {
         char q[3][48]; int qn = wsplit(f[first + i], ',', q, 3, 48);   // code, price, chg
-        int yy = y + 30 + i * 18;
+        int yy = y + ui_px(30) + i * ui_px(18);
         // #303: only render a row that parsed into the expected code,price[,chg]
         // shape with a clean (space-free, short) ticker code; otherwise show a
         // placeholder rather than echoing whatever bytes ended up in the buffer.
         if (qn < 2 || !netinfo_payload_ok(q[0])) {
-            draw_text(x + 12, yy, "unavailable", readable_ink_dim(CLR_MENU_BG));
+            draw_text(x + ui_px(12), yy, "unavailable", readable_ink_dim(CLR_MENU_BG));
             continue;
         }
-        draw_text(x + 12, yy, q[0], CLR_MENU_TEXT);            // code
+        draw_text(x + ui_px(12), yy, q[0], CLR_MENU_TEXT);            // code
         char pr[40]; int pi = 0; sb(pr, &pi, sizeof(pr), sym); sb(pr, &pi, sizeof(pr), q[1]);
-        draw_text(x + 64, yy, pr, CLR_MENU_TEXT);              // $price
+        draw_text(x + ui_px(64), yy, pr, CLR_MENU_TEXT);              // $price
         if (verbose && q[2][0]) {                             // change arrow + %
             int up = (q[2][0] != '-');
             uint32_t col = up ? 0x0050E070 : 0x00FF6060;
-            warrow(x + w - 70, yy + 4, up, col);
+            warrow(x + w - ui_px(70), yy + ui_px(4), up, col);
             char cg[24]; int ci = 0;
             sb(cg, &ci, sizeof(cg), (q[2][0] == '-') ? q[2] + 1 : q[2]); sb(cg, &ci, sizeof(cg), "%");
-            draw_text(x + w - 60, yy, cg, col);
+            draw_text(x + w - ui_px(60), yy, cg, col);
         }
     }
     return h;
@@ -1876,21 +2285,25 @@ static int draw_quote_card(int x, int y, int w, const char *raw, unsigned int ac
 // Test-only: draw a labeled gallery of all weather icons (gated by /WXTEST.TXT)
 // so the icon set can be eyeballed without waiting on real conditions.
 static int g_wxtest = -1;
+// #uiscale: debug-only gallery (gated by /WXTEST.TXT, never shown on a
+// shipping desktop) - converted anyway for the same "every literal is its
+// own ui_px() call" consistency as everything else in this file, including
+// the icon draw-scale (was a bare 2, see draw_weather_card()'s isc).
 static void draw_icon_gallery(void) {
     static const char *names[7] = { "Clear", "Partly Cloudy", "Cloudy", "Fog", "Rain", "Snow", "Thunder" };
-    int x = 60, y = 80, w = 210, rowh = 56;
-    int h = 7 * rowh + 36;
-    draw_rounded_rect(x, y, w, h, 8, CLR_MENU_BG);
+    int x = ui_px(60), y = ui_px(80), w = ui_px(210), rowh = ui_px(56);
+    int h = 7 * rowh + ui_px(36);
+    draw_rounded_rect(x, y, w, h, ui_px(8), CLR_MENU_BG);
     draw_rect_outline(x, y, w, h, CLR_MENU_BORDER);
-    draw_text(x + 12, y + 8, "Weather Icons (test)", 0x0066C0FF);
+    draw_text(x + ui_px(12), y + ui_px(8), "Weather Icons (test)", 0x0066C0FF);
     for (int i = 0; i < 7; i++) {
-        int ry = y + 30 + i * rowh;
-        wx_icon(x + 18, ry, i, 2);
+        int ry = y + ui_px(30) + i * rowh;
+        wx_icon(x + ui_px(18), ry, i, ui_px(2));
         char lbl[24]; int li = 0;
         lbl[li++] = '0' + i; lbl[li++] = ':'; lbl[li++] = ' ';
         for (int j = 0; names[i][j] && li < 22; j++) lbl[li++] = names[i][j];
         lbl[li] = 0;
-        draw_text(x + 78, ry + 16, lbl, CLR_MENU_TEXT);
+        draw_text(x + ui_px(78), ry + ui_px(16), lbl, CLR_MENU_TEXT);
     }
 }
 
@@ -1898,15 +2311,23 @@ static void netinfo_render(void) {
     // Draw-only (idle per-rect) mode never advances the refresh tick; the idle
     // path refreshes + damages the cards once via netinfo_collect_damage().
     if (!g_widgets_draw_only && (s_netinfo_tick++ % 150 == 0)) netinfo_refresh();
-    int w = CARD_W, gap = 12;
-    int startx = (g_fb_width - (3 * w + 2 * gap)) / 2, dy = 14;
+    int w = CARD_W;
+    // (#199) Default first-render position for weather/crypto/stocks now
+    // comes from widgets_layout_rail_defaults() (called once per frame from
+    // widgets_render(), before this function), which puts them in the same
+    // right-hand rail as every other data widget. This used to compute its
+    // OWN independent default here - a centered top row - which is exactly
+    // one of the three uncoordinated placement groups the owner's "all over
+    // the place" report was describing; do not reintroduce a second default
+    // here.
     for (int i = 0; i < 3; i++) {
         if (!*s_card_vis[i]) continue;
-        if (*s_card_x[i] < 0) { *s_card_x[i] = startx + i * (w + gap); *s_card_y[i] = dy; }
         int hx = *s_card_x[i], hy = *s_card_y[i];
-        if (i == 0)      s_card_h[0] = draw_weather_card(hx, hy, w);
-        else if (i == 1) s_card_h[1] = draw_quote_card(hx, hy, w, s_crypto, 0x00FFC850, "CRYPTO", "USD", g_crypto_verbose);
-        else             s_card_h[2] = draw_quote_card(hx, hy, w, s_stocks, 0x0066FF99, "STOCKS", 0, g_stocks_verbose);
+        // (#236) No write-back of a "measured" height any more: card_h(c) is
+        // the one source of truth and every caller reads it directly.
+        if (i == 0)      draw_weather_card(hx, hy, w);
+        else if (i == 1) draw_quote_card(hx, hy, w, s_crypto, 0x00FFC850, "CRYPTO", "USD", g_crypto_verbose, s_quote_rows[1]);
+        else             draw_quote_card(hx, hy, w, s_stocks, 0x0066FF99, "STOCKS", 0, g_stocks_verbose, s_quote_rows[2]);
     }
 }
 
@@ -1962,6 +2383,38 @@ static const char *wcfg_path0(int id)  { return id==2 ? "/WXLOC.TXT" : id==3 ? "
 static const char *wcfg_def0(int id)   { return id==2 ? "London" : id==3 ? "BTC,ETH" : "AAPL,MSFT"; }
 static const char *wcfg_title(int id)  { return id==2 ? "Weather Settings" : id==3 ? "Crypto Settings" : "Stock Settings"; }
 static const char *wcfg_lbl0(int id)   { return id==2 ? "Location" : id==3 ? "Coins (short codes)" : "Tickers"; }
+// (#236) How many rows Crypto/Stocks reserve. Deliberately defined HERE, next
+// to wcfg_path0()/wcfg_def0(), so the count can never be read from a
+// different file (or a different default) than the Settings dialog writes.
+static int quote_rows_of(const char *csv) {
+    int n = 0, tok = 0;
+    for (int i = 0; csv[i]; i++) {
+        if (csv[i] == ',') { if (tok) { n++; tok = 0; } }
+        else if (csv[i] != ' ') tok = 1;
+    }
+    if (tok) n++;
+    if (n < 1) n = 1;
+    if (n > QUOTE_ROWS_MAX) n = QUOTE_ROWS_MAX;
+    return n;
+}
+static void quote_rows_one(int id, int slot) {
+    char b[128]; b[0] = '\0';
+    int fd = sys_open(wcfg_path0(id), 0);
+    if (fd >= 0) {
+        char raw[128];
+        long n = sys_read(fd, raw, sizeof(raw) - 1);
+        sys_close(fd);
+        if (n > 0) {
+            int i = 0;
+            for (; i < (int)sizeof(b) - 1 && i < n && raw[i] && raw[i] != '\n' && raw[i] != '\r'; i++) b[i] = raw[i];
+            while (i > 0 && b[i-1] == ' ') i--;
+            b[i] = '\0';
+        }
+    }
+    s_quote_rows[slot] = quote_rows_of(b[0] ? b : wcfg_def0(id));
+}
+static void quote_rows_refresh(void) { quote_rows_one(3, 1); quote_rows_one(4, 2); }
+
 static const char *wcfg_hint0(int id)  { return id==2 ? "City,Country  e.g. Perth,AU  or  London"
                                               : id==3 ? "e.g. BTC,ETH,USDT,SOL,XRP"
                                                       : "e.g. AAPL,MSFT,GOOG"; }
@@ -2377,43 +2830,452 @@ int widget_settings_handle_mouse(int x, int y, int click) {
     return 1;
 }
 
+// ===========================================================================
+// (#199) Right-hand widget rail: ONE default-placement pass.
+//
+// OWNER REPORT (first boot, Marble dock): "the widgets are all over the
+// place. i'd like ... the widgets [to] stack on the right hand side with an
+// even gap between them and the far right side of the screen ... starting
+// from the top of the screen ... and going downwards."
+//
+// ROOT CAUSE (measured, not assumed): the scattered look was NOT a stale
+// persisted profile and NOT a layout pass that failed to run - there simply
+// never was one. Three independent hardcoded default-position groups grew up
+// ticket-by-ticket, each unaware of the others:
+//   - #79/#78/#129: analog clock + calendar + digital clock, right edge,
+//     top of screen (calendar's own default Y was even derived from the
+//     analog clock's CURRENT g_clock_cy - which is populated whether or not
+//     the clock is shown, since #79 unconditionally computes the clock's
+//     default before checking g_show_clock - so calendar silently reserved a
+//     phantom clock-sized gap above itself even with the clock hidden).
+//   - #274: system monitor / timer / world time, LEFT edge, explicitly
+//     commented "so they don't collide with the right-side clock column" -
+//     i.e. the left-edge placement was a direct reaction to the right-edge
+//     group already being there, not a design.
+//   - #81-83: weather / crypto / stocks, centered in their OWN top row,
+//     inside netinfo_render(), oblivious to both of the above.
+// A 1990s-UNIX desktop with three uncoordinated corners is exactly "all over
+// the place". This replaces all three with one pass, reusing
+// taskbar_widget_area() (the same dock-style-aware bounds widget_clamp_pos(),
+// desktop icon placement and the kernel WM strut already use) so Marble's
+// floating overlay dock and a classic fenced bottom bar each get the correct
+// start Y and usable height with no dock-style special case written here.
+//
+// Only a widget whose stored position is still -1 (never dragged, nothing
+// persisted in UIPROFIL.YML) gets placed; anything the user has already
+// positioned - or that a PRIOR call to this same function already placed
+// this session - is left exactly where it is. Hidden widgets never reserve a
+// slot, so toggling one on/off does not leave a gap in the stack.
+//
+// Column packing: a simple top-to-bottom "shelf" pass in a fixed, stable
+// order (matching the widget tray menu's own order). When the next widget
+// would run past the bottom of the widget area, a new column starts
+// immediately to the left of the widest widget placed in the column so far,
+// so the rail overflows sideways instead of piling widgets on top of each
+// other or running off the bottom edge.
+// ===========================================================================
+// #uiscale: these three were bare 1x literals independent of the widgets
+// they space - at 200% every card in the rail doubled while the gaps
+// between them stayed fixed, which is a proportion drift even though it
+// never overlaps or clips anything. ui_px() keeps the rail's own spacing in
+// the same ratio to the widgets it lays out at any scale.
+#define RAIL_RIGHT_INSET ui_px(16)   // gap between the rail and the screen's right edge
+#define RAIL_TOP_GAP     ui_px(14)   // gap between the widget area's top and the first widget
+#define RAIL_V_GAP       ui_px(12)   // gap between consecutively stacked widgets
+
+// ===========================================================================
+// (#213) SELF-HEALING: a stored position is not automatically "placed
+// already" just because it fails the -1 sentinel check.
+//
+// MEASURED root cause (owner report on golden 2009, real iMac14,4): reading
+// the shipped out-of-git asset base's own UIPROFIL.YML (the file every
+// golden overlays onto, per build/build-golden.sh) showed exactly the four
+// defects reported, and NONE of them were unset (-1):
+//   upx: 16   upy: 460   (Uptime)          - #274's LEFT-EDGE default, baked
+//   hax: 16   hay: 544   (Home Assistant)  - in before #199 ever ran
+//   smx/tmx/wtx: 16      (sysmon/timer/worldtime, hidden but same stale left
+//                         value - would surface on the left the moment a
+//                         user enables one, so it needs the same healing)
+//   calx: 1068 caly: 150 (Calendar)  - a RAIL position, but baked at a
+//                         session where Clock was also shown above it; with
+//                         Clock now hidden, #199's own packing loop (see the
+//                         fix below) advanced its counter from RAIL_TOP_GAP
+//                         instead of Calendar's real y=150, so Weather (the
+//                         one position that WAS correctly reset to -1) got
+//                         placed at y=~186, inside Calendar's own 150-290
+//                         rect: an overlap, which reads as "no gap between
+//                         them".
+//   dcx: 1138 dcy: 8     (Digital Clock)  - a pre-#199 TOP-right default,
+//                         nowhere near the bottom-right corner #199 asked for
+// Every one of these is UNLOCKED (*lk: 0 for all of them in that file), so
+// the user never deliberately pinned any of them there - #199's own comment
+// ("anything already positioned ... is left exactly where it is") was
+// written assuming "already positioned" only ever meant "the user dragged
+// it", but a stale bake from an old scheme (or an old resolution, or a
+// session where a different widget was visible above it) satisfies the same
+// "not -1" test and is indistinguishable from a real placement by that test
+// alone.
+//
+// The fix: an UNLOCKED stored position is trusted only if it still looks
+// like a genuine rail slot ON THIS SCREEN, RIGHT NOW - right-aligned to the
+// rail's current edge. A locked widget is always trusted (the user pinned
+// it via the widget's own Lock menu item; that is an explicit, informed
+// decision this pass must never override, however odd the result looks).
+// Known limitation: this checks alignment against the PRIMARY column only,
+// so a widget legitimately overflowed into a second column on a very small
+// screen could be mis-judged "stale" and pulled back into column one on a
+// later boot at the same tiny resolution. Not a regression (#199 had no
+// second-column persistence story either) and not reachable at any
+// resolution this OS currently ships at.
+//
+// SECOND HEALING NEEDED (found verifying this same fix, real reproduction on
+// a 1280x800 Marble/XFCE screen): the first cut of this check trusted any
+// by >= ay - TOL, which is not tight enough. widgets_clamp_to_bounds() (#745)
+// runs every frame AND once at startup from taskbar_apply_work_area() -
+// BEFORE this function ever sees a widget's raw stored value on its very
+// first frame. A wildly-stale position (measured: clky baked at 6, i.e.
+// clock top = 6 - r = -38, off the top of the screen entirely) gets clamped
+// UP to exactly `ay` (the widget area's own top edge) by that startup clamp,
+// with NO RAIL_TOP_GAP margin - widget_clamp_pos() only enforces "not above
+// the area", it has no concept of the rail's own top gap. By the time this
+// function runs, the ORIGINAL -38 is gone; it only ever sees the LAUNDERED
+// by == ay (gap = 0), which the old `by >= ay - TOL` test wrongly called
+// trusted - reproducing "no gap between taskbar and calendar" (the clock in
+// this case) even with this fix applied, because the bad value never made it
+// here. A minimum-gap floor closes it: a trusted position must be at or past
+// where a FRESH placement would have put it (ay + RAIL_TOP_GAP), not merely
+// not-above-the-area. This costs nothing for a real fresh placement (which
+// always lands at exactly ay + RAIL_TOP_GAP or later) and nothing for a
+// widget stacked further down a column (whose y is always well past this
+// floor too) - it only rejects the narrow was-clamped-to-the-bare-top band
+// that used to slip through.
+// ===========================================================================
+#define RAIL_POS_TOL 4   // rounding-only slack; a different COLUMN never
+                          // lands within this of the current one
+
+// (#236) THIRD HEALING: a stored position that OVERLAPS the widget above it
+// in the same column is not a rail slot either, however well right-aligned it
+// is. #213's own block comment describes the fault it could not see - a
+// Weather y baked in a session where a different widget was above it lands
+// "inside Calendar's own 150-290 rect" - and then fixed only the CAUSE it had
+// measured, leaving the SHAPE undetected: the two tests above judge each
+// widget in isolation, so any stale y that happens to be right-aligned and
+// below the top gap is trusted no matter what it lands on top of. That is
+// exactly the owner's "weather widget positioned on top of the calendar
+// widget", and it survives the height fix because a position already written
+// to UIPROFIL.YML under the old data-dependent sizing does not heal itself.
+// `prev_bottom` is the bottom edge of the last widget placed or trusted in
+// this column (the column's own top edge for the first one), so this costs
+// nothing for a correct stack and rejects only a real collision.
+static int rail_pos_trusted(int locked, int bx, int by, int bw, int bh,
+                             int col_right, int ay, int area_bottom, int prev_bottom) {
+    (void)bh;
+    if (locked) return 1;
+    if (bx + bw < col_right - RAIL_POS_TOL || bx + bw > col_right + RAIL_POS_TOL) return 0;
+    if (by < ay + RAIL_TOP_GAP - RAIL_POS_TOL) return 0;
+    if (by > area_bottom) return 0;
+    if (by < prev_bottom) return 0;                 // sits on top of its neighbour
+    return 1;
+}
+
+static void widgets_layout_rail_defaults(void) {
+    int ax, ay, aw, ah;
+    taskbar_widget_area(&ax, &ay, &aw, &ah);
+    int area_bottom = ay + ah;
+    int col_right = ax + aw - RAIL_RIGHT_INSET;
+    int y = ay + RAIL_TOP_GAP;
+    int col_max_w = 0;
+
+    int prev_bottom = ay;   // bottom edge of the last widget in this column
+    // (#236) There is no "height estimate" here any more, for ANY card. This
+    // block used to mirror draw_weather_card()'s verbose->height mapping by
+    // hand (because s_card_h[0] was a stale tracker), and explained that
+    // Crypto/Stocks/HA kept reading the tracker since "their real height also
+    // depends on the user's configured ticker count, which cannot be known
+    // ahead of a first draw either way". It can: the ticker count is in
+    // /CRYPTOID.TXT and /STOCKID.TXT, which is what s_quote_rows caches. Every
+    // card now reports its height through the one pure function the draw path
+    // also uses (card_h()/ha_card_h()), so a reserved slot and a painted box
+    // are the same number BY CONSTRUCTION rather than by a mirrored formula
+    // that has to be kept in sync by hand.
+
+    // Canonical rail order. `unset` is the SAME field widget_box()/widget_
+    // set_pos() treat as that widget's "-1 = not yet placed" sentinel, so
+    // this never drifts from how the rest of the file already tests it.
+    // (#236) w/h are not an "estimate" any more: every card reports through
+    // card_h()/ha_card_h(), the same pure functions widget_box() uses for
+    // damage and drag and the draw path uses to paint. This comment used to
+    // say crypto/stocks/HA read "their own already-tracked s_card_h[]/s_ha_h"
+    // - those trackers are gone, and a comment describing a mechanism that no
+    // longer exists is worse than none.
+    struct { int id; int vis; int *unset; int *lock; int w, h; } r[10] = {
+        { 0,  g_show_clock,      &g_clock_cx,     &g_clock_locked,     2 * s_clk_r, 2 * s_clk_r },
+        { 1,  g_show_calendar,   &g_cal_x,        &g_cal_locked,       s_cal_w,     s_cal_h     },
+        { 2,  g_show_weather,    &g_weather_x,    &g_weather_locked,   CARD_W,      card_h(0)   },
+        { 3,  g_show_crypto,     &g_crypto_x,     &g_crypto_locked,    CARD_W,      card_h(1)   },
+        { 4,  g_show_stocks,     &g_stocks_x,     &g_stocks_locked,    CARD_W,      card_h(2)   },
+        { 6,  g_show_sysmon,     &g_sysmon_x,     &g_sysmon_locked,    SYSMON_W,    SYSMON_H    },
+        { 7,  g_show_timer,      &g_timer_x,      &g_timer_locked,     TIMER_W,     TIMER_H     },
+        { 8,  g_show_worldtime,  &g_worldtime_x,  &g_worldtime_locked, WT_W,        WT_H        },
+        { 9,  g_show_uptime,     &g_uptime_x,     &g_uptime_locked,    UPT_W,       UPT_H       },
+        { 10, g_show_ha,         &g_ha_x,         &g_ha_locked,        HA_W,        ha_card_h() },
+    };
+
+    for (int i = 0; i < 10; i++) {
+        if (!r[i].vis) continue;                    // hidden widgets reserve no slot
+        int w = r[i].w, h = r[i].h;
+        int need_place = (*r[i].unset < 0);
+        int bx = 0, by = 0, bw = 0, bh = 0, have_box = 0;
+        if (!need_place) {
+            // (#213) Already has a stored position - but "not -1" is not the
+            // same as "a real rail slot on this screen right now". See the
+            // rail_pos_trusted() block comment above for the measured bug
+            // this closes.
+            have_box = widget_box(r[i].id, &bx, &by, &bw, &bh);
+            if (have_box && !rail_pos_trusted(*r[i].lock, bx, by, bw, bh, col_right, ay, area_bottom, prev_bottom))
+                need_place = 1;
+        }
+        if (need_place) {
+            if (col_max_w > 0 && y + h > area_bottom) {
+                // Out of room in this column: start a new one immediately to
+                // its left (never off the bottom edge, never stacked on top
+                // of the previous widget).
+                col_right -= (col_max_w + RAIL_V_GAP);
+                y = ay + RAIL_TOP_GAP;
+                col_max_w = 0;
+                prev_bottom = ay;                        // new column, nothing above yet
+            }
+            widget_set_pos(r[i].id, col_right - w, y);   // reuse the ONE write-back
+            prev_bottom = y + h;
+            y += h + RAIL_V_GAP;
+            if (w > col_max_w) col_max_w = w;
+        } else if (have_box) {
+            // (#213) Trusted in-place widget: continue the packing cursor
+            // from where it REALLY is on screen, not from an accumulated
+            // counter that has no relationship to it. This is what stops a
+            // freshly-placed neighbour from overlapping a widget that kept
+            // its own (legitimately trusted) position.
+            y = by + bh + RAIL_V_GAP;
+            prev_bottom = by + bh;
+            if (bw > col_max_w) col_max_w = bw;
+        }
+    }
+}
+
+// (#199) The digital clock is deliberately NOT in the rail above: the owner
+// asked for it specifically underneath the version/build watermark in the
+// far bottom-right corner. `vy` mirrors desktop_render_version()'s own
+// formula (taskbar_get_y() - 20) so this never drifts from where that text
+// actually is - taskbar_get_y() is the one exported primitive both call.
+//
+// Whether "underneath" fits depends on the ACTIVE dock style, stated
+// explicitly rather than hardcoding Marble's geometry:
+//   - Overlay styles (Marble/XFCE): taskbar_widget_area() already extends to
+//     the true screen bottom (the floating dock does not fence off the
+//     desktop - #40), so there is real room below the watermark and the
+//     clock sits there, exactly as asked.
+//   - Fencing styles (Default/Classic UNIX/Lumina/Retro Bench): the widget
+//     area's bottom edge IS the watermark's own baseline, so there is no
+//     room below it at all. Falling through to the generic widget-area
+//     clamp here would have pulled the clock UP into the watermark's own
+//     text row (measured: clamped Y range 708-764 vs. watermark Y 744 on a
+//     1280x800 DOCK_DEFAULT screen - a real overlap, not just a reordering).
+//     Instead the clock explicitly falls back to sitting directly ABOVE the
+//     watermark, keeping the same bottom-right corner pairing without ever
+//     drawing on top of it.
+//
+// (#213) MEASURED on the exact 1280x800 Marble/XFCE reproduction this ticket
+// used: with GAP=8 the "below" arithmetic (version text row FONT_CHAR_H=16 +
+// GAP + clock height 56, all measured off taskbar_get_y()-20) needed 80px but
+// only 79px were available between the watermark and the true screen bottom
+// (area_bottom) - short by exactly 1px, so "below" was rejected every time
+// and the clock silently fell back to sitting ABOVE the watermark instead of
+// "underneath" it as specced, even though the underlying fix here (below)
+// otherwise worked. GAP=6 reclaims those 2px (1 of slack) with no visible
+// difference in the gap - it is still a clear, distinct gap, just not 8px -
+// and lets the intended "below" placement actually fire on this canonical
+// resolution instead of only in taller/looser configurations.
+#define DIGCLK_WATERMARK_GAP 6
+
+// (#213) Same "not -1 is not the same as still correct" healing as the rail
+// above: a bare "is it set" check let a pre-#199 TOP-right digital clock
+// default (measured: dcx=1138 dcy=8 in the shipped asset base, unlocked)
+// survive forever, because it is not -1 and nothing ever re-examined it.
+// Trusted only if right-aligned to the rail edge AND sitting in the bottom
+// quarter of the widget area - a clock parked at y=8 fails the second test
+// regardless of x, which is exactly the defect this closes.
+static int digclk_pos_trusted(int locked, int bx, int by, int bw,
+                               int ax, int aw, int ay, int area_bottom) {
+    if (locked) return 1;
+    int col_right = ax + aw - RAIL_RIGHT_INSET;
+    if (bx + bw < col_right - RAIL_POS_TOL || bx + bw > col_right + RAIL_POS_TOL) return 0;
+    int bottom_band_top = ay + (area_bottom - ay) * 3 / 4;
+    if (by < bottom_band_top) return 0;
+    return 1;
+}
+
+// KNOWN FOLLOW-UP (found verifying #213, not one of the four reported
+// defects and NOT fixed here): this function only checks its own position
+// against the version-text watermark and area_bottom. It does not know
+// where the rail column (widgets_layout_rail_defaults() above) ended up. On
+// a screen where every widget is enabled AND System Monitor (SYSMON_H=162,
+// unusually tall) lands last in the same right-hand column, System Monitor's
+// own box can run from y=596 to y=758 while the digital clock's default
+// (same 188px column width) lands at y=657-713 - fully inside it, a real
+// visual overlap. The owner's actual reported profile has System Monitor,
+// Timer and World Time all OFF, so this never fires for the four defects
+// this ticket fixes, but it is a real gap for whoever enables all 11
+// widgets at once: the two placement passes need to coordinate on the
+// occupied Y-range of shared columns, not just on the watermark.
+static void widgets_layout_digclock_default(void) {
+    int ax, ay, aw, ah;
+    taskbar_widget_area(&ax, &ay, &aw, &ah);
+    int area_bottom = ay + ah;
+    int need_place = (g_digclk_x < 0);
+    if (!need_place &&
+        !digclk_pos_trusted(g_digclk_locked, g_digclk_x, g_digclk_y, s_digclk_w, ax, aw, ay, area_bottom))
+        need_place = 1;
+    if (!need_place) return;
+
+    int vy = taskbar_get_y() - 20;             // same formula as desktop_render_version()
+    int below = vy + FONT_CHAR_H + DIGCLK_WATERMARK_GAP;
+    g_digclk_x = ax + aw - s_digclk_w - RAIL_RIGHT_INSET;
+    g_digclk_y = (below + s_digclk_h <= area_bottom) ? below
+                                                      : (vy - s_digclk_h - DIGCLK_WATERMARK_GAP);
+}
+
+// (#213 verification) Existence-gated position dump, same idiom as this
+// file's own g_wxtest/draw_icon_gallery gate just above and perfframe.c's
+// PF_GATE_PATH: armed only when /RAILDBG.TXT exists, so it costs nothing on
+// a normal boot and never blocks the draw thread (a throttled flat-file
+// write, not a poll/sleep - #426). Written to /RAILPOS.TXT so the exact
+// pixel positions the layout pass computed can be read back after boot
+// without eyeballing a screenshot.
+static int g_raildbg = -1;
+static void widgets_debug_dump_positions(void) {
+    if (g_raildbg < 0) {
+        int fd = sys_open("/RAILDBG.TXT", 0);
+        g_raildbg = (fd >= 0);
+        if (fd >= 0) sys_close(fd);
+    }
+    if (!g_raildbg) return;
+    static unsigned long last_ms = 0;
+    unsigned long now = uptime_ms();
+    if (now - last_ms < 1000) return;
+    last_ms = now;
+
+    int ax, ay, aw, ah; taskbar_widget_area(&ax, &ay, &aw, &ah);
+    char buf[900]; int n = 0;
+    n += snprintf(buf + n, sizeof(buf) - n,
+        "area ax=%d ay=%d aw=%d ah=%d taskbar_get_y=%d\n", ax, ay, aw, ah, taskbar_get_y());
+    n += snprintf(buf + n, sizeof(buf) - n, "clock vis=%d cx=%d cy=%d r=%d\n",
+        g_show_clock, g_clock_cx, g_clock_cy, s_clk_r);
+    n += snprintf(buf + n, sizeof(buf) - n, "calendar vis=%d x=%d y=%d w=%d h=%d\n",
+        g_show_calendar, g_cal_x, g_cal_y, s_cal_w, s_cal_h);
+    n += snprintf(buf + n, sizeof(buf) - n, "weather vis=%d x=%d y=%d\n",
+        g_show_weather, g_weather_x, g_weather_y);
+    n += snprintf(buf + n, sizeof(buf) - n, "crypto vis=%d x=%d y=%d\n",
+        g_show_crypto, g_crypto_x, g_crypto_y);
+    n += snprintf(buf + n, sizeof(buf) - n, "stocks vis=%d x=%d y=%d\n",
+        g_show_stocks, g_stocks_x, g_stocks_y);
+    n += snprintf(buf + n, sizeof(buf) - n, "sysmon vis=%d x=%d y=%d\n",
+        g_show_sysmon, g_sysmon_x, g_sysmon_y);
+    n += snprintf(buf + n, sizeof(buf) - n, "timer vis=%d x=%d y=%d\n",
+        g_show_timer, g_timer_x, g_timer_y);
+    n += snprintf(buf + n, sizeof(buf) - n, "worldtime vis=%d x=%d y=%d\n",
+        g_show_worldtime, g_worldtime_x, g_worldtime_y);
+    n += snprintf(buf + n, sizeof(buf) - n, "uptime vis=%d x=%d y=%d\n",
+        g_show_uptime, g_uptime_x, g_uptime_y);
+    n += snprintf(buf + n, sizeof(buf) - n, "ha vis=%d x=%d y=%d\n",
+        g_show_ha, g_ha_x, g_ha_y);
+    n += snprintf(buf + n, sizeof(buf) - n, "digclock vis=%d x=%d y=%d w=%d h=%d\n",
+        g_show_digclock, g_digclk_x, g_digclk_y, s_digclk_w, s_digclk_h);
+
+    sys_unlink("/RAILPOS.TXT");                 // clean truncate, matches profile_save()
+    int fd = sys_open("/RAILPOS.TXT", 0x41);    // O_WRONLY | O_CREAT
+    if (fd >= 0) { sys_write(fd, buf, (unsigned long)n); sys_close(fd); }
+}
+
 void widgets_render(void) {
+    // #uiscale (see main.c's g_ui_scale_native_text declaration for the full
+    // rationale): every desktop gadget in this file is now converted. The
+    // six done earlier (analog + digital clock, sysmon, timer, worldtime,
+    // uptime) are joined in this pass by the calendar, the weather/crypto/
+    // stocks cards, the Home Assistant card, the debug icon gallery and the
+    // sheep/sheepdog pets - see each one's own #uiscale comment for its box
+    // geometry. The only push/pop pair left below brackets digclk_geom()'s
+    // TEXT MEASUREMENT (it must run scaled, see its own comment); every
+    // other gadget draws with the opt-out OFF, which is also the state this
+    // function is entered in, so the net effect is still zero on every path.
+    //
+    // NOT covered by this pass: the per-widget Settings modal
+    // (widget_settings_render(), g_wsettings) draws OUTSIDE this function
+    // (see main.c's render loop) and is NOT gated by this opt-out at all -
+    // its own box literals (WSET_W=400 etc.) are still unscaled while its
+    // text already scales, which is the MIRROR of the bug this pass fixes
+    // (text growing inside a box that does not, not a box growing around
+    // text that does not). Tracked as a follow-up, not fixed here.
+    ui_scale_native_push();
     if (g_widgets_enabled) {
         g_draw_blend = g_win_opacity;   // desktop widgets honor the global transparency
-        int r = 44; s_clk_r = r;
-        if (g_clock_cx < 0) { g_clock_cx = g_fb_width - r - 18; g_clock_cy = 48 + r; }
-        if (g_show_clock) widget_analog_clock(g_clock_cx, g_clock_cy, r);
-        int calw = 196; s_cal_w = calw;
-        s_cal_h = (FONT_CHAR_H + 6) + (FONT_CHAR_H + 2) + 6 * (FONT_CHAR_H + 2) + 6;
-        if (g_cal_x < 0) { g_cal_x = g_fb_width - calw - 16; g_cal_y = g_clock_cy + r + 14; }
-        if (g_show_calendar) widget_calendar(g_cal_x, g_cal_y, calw);
-        // Digital clock (id 5): a normal draggable/lockable widget, not an overlay.
+        // #uiscale: r (the analog clock radius) is now scaled - see
+        // widget_analog_clock()'s own geometry, which is entirely DERIVED
+        // from r (ticks/hands/hub), so scaling this one value scales the
+        // whole clock face proportionally.
+        int r = ui_px(44); s_clk_r = r;
+        int calw = ui_px(196); s_cal_w = calw;
+        s_cal_h = calendar_card_h();
+        // #uiscale: digclk_geom() measures via text_width_ttf(), which
+        // honors the SAME native-text opt-out as draw_text_ttf() - it must
+        // run OUTSIDE that opt-out (like digclk_draw() below) or it would
+        // size the hit-box for 1x text while the glyphs it actually draws
+        // are scaled, reintroducing the exact overflow this opt-out exists
+        // to prevent, just inverted (box too SMALL for the drawn text).
+        ui_scale_native_pop();
         digclk_geom(&s_digclk_w, &s_digclk_h);
-        if (g_digclk_x < 0) { g_digclk_x = g_fb_width - s_digclk_w - 16; g_digclk_y = 8; }
-        if (g_show_digclock) digclk_draw(g_digclk_x, g_digclk_y);
-        // #274 new widgets (system monitor / timer / world time). Default to a
-        // left-edge stack so they don't collide with the right-side clock column.
-        if (g_sysmon_x < 0)    { g_sysmon_x = 16;    g_sysmon_y = 70; }
-        if (g_timer_x < 0)     { g_timer_x = 16;     g_timer_y = 70 + SYSMON_H + 12; }
-        if (g_worldtime_x < 0) { g_worldtime_x = 16; g_worldtime_y = 70 + SYSMON_H + 12 + TIMER_H + 12; }
+        ui_scale_native_push();
+        // (#199) One rail-placement pass for every still-unpositioned widget,
+        // replacing the three independent hardcoded default groups that used
+        // to live inline here (clock/calendar/digital-clock at the right edge,
+        // sysmon/timer/worldtime/uptime/HA at the LEFT edge specifically so
+        // they would not collide with that right-edge group, and weather/
+        // crypto/stocks centered in their own top row inside netinfo_render())
+        // - see widgets_layout_rail_defaults() below for why that was exactly
+        // the "all over the place" the owner reported on first boot.
+        widgets_layout_rail_defaults();
+        widgets_layout_digclock_default();
+        widgets_debug_dump_positions();   // #213 verification, no-op unless /RAILDBG.TXT exists
+
+        // #uiscale: pop once here and STAY popped for everything below - all
+        // eleven gadgets in this file (the six converted earlier plus
+        // calendar/HA/weather/crypto/stocks/icon-gallery/sheep/dog converted
+        // in this pass) now have scaled box geometry, so scaled text is
+        // correct for all of them and there is no later re-arm.
+        ui_scale_native_pop();
+        if (g_show_clock)     widget_analog_clock(g_clock_cx, g_clock_cy, r);
+        // Digital clock (id 5): a normal draggable/lockable widget, not an overlay.
+        if (g_show_digclock)  digclk_draw(g_digclk_x, g_digclk_y);
         if (g_show_sysmon)    widget_sysmon(g_sysmon_x, g_sysmon_y);
         if (g_show_timer)     widget_timer(g_timer_x, g_timer_y);
-        if (g_uptime_x < 0)    { g_uptime_x = 16;    g_uptime_y = 70 + SYSMON_H + 12 + TIMER_H + 12 + WT_H + 12; }
         if (g_show_worldtime) widget_worldtime(g_worldtime_x, g_worldtime_y);
         if (g_show_uptime)    widget_uptime(g_uptime_x, g_uptime_y);
-        if (g_ha_x < 0)       { g_ha_x = 16; g_ha_y = 70 + SYSMON_H + 12 + TIMER_H + 12 + WT_H + 12 + UPT_H + 12; }
+
+        if (g_show_calendar) widget_calendar(g_cal_x, g_cal_y, calw);
         if (g_show_ha)        ha_card_draw(g_ha_x, g_ha_y);
         netinfo_render();               // #81-83 weather/crypto/stock cards
         if (g_wxtest < 0) { int fd = sys_open("/WXTEST.TXT", 0); g_wxtest = (fd >= 0); if (fd >= 0) sys_close(fd); }
         if (g_wxtest) draw_icon_gallery();
-        // (#40) The THIRD placement path. Drag clamps (widget_drag_to) and a
-        // dock-style change clamps (taskbar_apply_work_area), but a widget
-        // whose stored position was still "unset" gets its DEFAULT placed a
-        // few lines above from raw screen geometry, which knows nothing about
-        // a top panel, and that happens the first time each widget is shown,
-        // not once at startup. Re-running THE one clamp here (not a second
-        // copy of the arithmetic) covers all three, costs a handful of global
-        // reads, and is a no-op once everything already sits inside the band.
+        // (#40/#199) The safety-net clamp. Drag clamps (widget_drag_to) and a
+        // dock-style change clamps (taskbar_apply_work_area); this is the
+        // third path, for the first frame a still-"unset" widget gets shown.
+        // widgets_layout_rail_defaults()/widgets_layout_digclock_default()
+        // above already compute their defaults FROM taskbar_widget_area(),
+        // so this is normally a no-op - it remains as the final guard for
+        // degenerate cases those two did not special-case (e.g. a screen too
+        // small to fit even one widget), so nothing can ever be placed
+        // fully off-screen. Re-running THE one clamp here (not a second copy
+        // of the arithmetic) is cheap and idempotent once everything already
+        // sits inside the band.
         if (!g_widgets_draw_only) widgets_clamp_to_bounds();
         g_draw_blend = 255;             // sheep + dog are never transparent
     }
@@ -2436,6 +3298,7 @@ void widgets_render(void) {
         for (int i = 0; i < g_sheep_count; i++) sheep_one_draw(&g_sheep[i]);
     }
     if (g_dog_enabled) { if (!g_widgets_draw_only) dog_update(); dog_draw(); }
+    ui_scale_native_pop();   // #uiscale: matches the push() at the top of this function
 }
 
 // ===========================================================================

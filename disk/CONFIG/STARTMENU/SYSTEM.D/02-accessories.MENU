@@ -13,4 +13,47 @@ item: Authenticator | /APPS/mfa | icon=auth
 item: Launcher | /APPS/LAUNCHER | icon=launcher
 item: Task Switcher | /APPS/WINSWTCH | icon=taskswitch
 item: Python | /APPS/PYTHON.ELF | icon=python
+# Maytera Code Studio. ~2,000 lines (userland/apps/ide/main.c 1,088 +
+# ide_pthread.c 879 + ide_clone.asm): tabbed multi-file editor, syntax
+# highlighting, project tree, and an integrated CPython console (/APPS/PYTHON.ELF)
+# running on a worker thread so the UI stays responsive. It has been MAINTAINED -
+# main.c:44-56 records the #243 fix that moved it onto the shared libc/keys.h
+# constants - and it has NEVER had a launcher. It shipped on every golden with no
+# menu entry, no desktop icon, no association and nothing in aiclient.c's launch
+# table, reachable only by typing its name in Terminal or finding it in the
+# Launcher's raw readdir of /APPS. icon=highlight is reused from Editor rather
+# than adding an id: icon files live outside the repo in the asset base, so a new
+# id would silently fall back to a vector glyph on the real image.
+item: Code Studio | /APPS/IDE | icon=highlight
 item: Help | /APPS/help | icon=help
+
+# (#845) Microsoft Word 6.0 (Win16/NE) - the headline case for per-app Win16
+# execution mode. This app previously had NO entry in any git-tracked .MENU
+# fragment; its only Start-menu presence was a "Microsoft Word 6.0" group in
+# the legacy runtime-written /WIN16GRP.CFG (see startmenu_load_win16_groups()
+# in startmenu.c), which launched it via win16_run() with no way to request
+# protected mode - so a menu click always ran it real-mode and it died with
+# "out of real-mode memory" (kernel/exec/ne.c's out-of-memory path), silently,
+# because win16_run() is non-blocking and returns 0 the instant the guest proc
+# is created, not when it finishes loading. It had only ever run via the
+# /CONFIG/WIN16PM.RUN boot autolauncher's explicit trailing "pm" token (see
+# docs/WORD6_DIVERGENCE_CATALOG.md).
+#
+# No mode= field here deliberately: WINWORD.EXE's NE header (235 segments,
+# SS==DS automatic data, a real declared heap) already matches the exact
+# "large/complex Win16 app" signature win16_decide_pmode() (kernel/exec/ne.c)
+# derives protected mode from - the SAME signature already proven at
+# load_ne_module()'s DGROUP/stack sizing for this exact binary (#278 Word6
+# pass20). Letting it derive, rather than hardcoding mode=pm, is the intended
+# "a newly added app works without anyone editing a list" behavior; add an
+# explicit mode=pm/mode=real here only if a future measurement shows the
+# heuristic getting this one wrong.
+#
+# This entry also DEDUPS against the legacy /WIN16GRP.CFG "Microsoft Word 6.0"
+# group: startmenu_load_win16_groups() skips any path sm_find_item_by_path()
+# already finds (the same mechanism that already dedups the 8 Entertainment
+# Pack titles against that file), so this fragment becomes the one source of
+# truth for this item's menu presence going forward, with the legacy file
+# still a safety net if this fragment line is ever lost.
+category: Office
+item: Microsoft Word 6.0 | /WIN16/WORD6/WINWORD.EXE | icon=win3x | type=win16

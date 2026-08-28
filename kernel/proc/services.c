@@ -206,11 +206,11 @@ static void svc_load_config(void) {
         char uidf[16], permsf[64], autof[8], enf[8];
         if (!svc_next_field(&cur, name, sizeof(name)))   continue;
         if (!svc_next_field(&cur, exec, sizeof(exec)))   continue;
-        if (!svc_next_field(&cur, account, sizeof(account))) strncpy(account, "service", sizeof(account));
-        if (!svc_next_field(&cur, uidf, sizeof(uidf)))   strncpy(uidf, "0", sizeof(uidf));
+        if (!svc_next_field(&cur, account, sizeof(account))) strncpy(account, "service", sizeof(account) - 1);
+        if (!svc_next_field(&cur, uidf, sizeof(uidf)))   strncpy(uidf, "0", sizeof(uidf) - 1);
         if (!svc_next_field(&cur, permsf, sizeof(permsf))) permsf[0] = '\0';
-        if (!svc_next_field(&cur, autof, sizeof(autof))) strncpy(autof, "0", sizeof(autof));
-        if (!svc_next_field(&cur, enf, sizeof(enf)))     strncpy(enf, "1", sizeof(enf));
+        if (!svc_next_field(&cur, autof, sizeof(autof))) strncpy(autof, "0", sizeof(autof) - 1);
+        if (!svc_next_field(&cur, enf, sizeof(enf)))     strncpy(enf, "1", sizeof(enf) - 1);
 
         svc_register(name, exec, account, svc_atou(uidf),
                      svc_parse_perms(permsf),

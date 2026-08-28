@@ -2,10 +2,10 @@
 // Full-screen login with user selection and password entry
 
 #include "login.h"
+#include "clock.h"   // #86: ktz_local_civil() - the login clock must show LOCAL time
 #include "themes.h"
 #include "image.h"
 #include "ttf.h"
-#include "window_decor.h"
 #include "desktop.h"        // #745: desktop_session_authenticated()
 #include "../types.h"
 #include "../string.h"
@@ -51,6 +51,44 @@ extern volatile uint64_t timer_ticks;
 
 // Forward declarations from font.h
 extern const uint8_t *font_get_glyph(char c);
+
+// #242: moved here from the now-deleted kernel/gui/window_decor.c. This was
+// the ONLY genuinely-called function out of window_decor.c's entire API
+// (verified by grepping every exported symbol in kernel/ and userland/ for
+// external callers before deletion): everything else in that file, including
+// the style-plugin registry and decor_draw_window_frame()/decor_draw_titlebar()
+// that a "window decoration" file sounds like it should be for, had ZERO
+// callers (blame.md #27, 2026-08-10). Real window frames are drawn by
+// window_draw() in window.c, which never included window_decor.h. Kept as a
+// plain 100%-or-0% (non-antialiased) rounded-rect fill: this is the login
+// selected-row highlight only, not a general-purpose primitive, so it is
+// static and local rather than reintroducing a shared file for one caller.
+static void decor_fill_rounded_rect(int32_t x, int32_t y, int32_t w, int32_t h,
+                                     int32_t radius, uint32_t color) {
+    if (radius <= 0) {
+        fb_fill_rect(x, y, w, h, color);
+        return;
+    }
+
+    if (radius > w / 2) radius = w / 2;
+    if (radius > h / 2) radius = h / 2;
+
+    fb_fill_rect(x + radius, y, w - 2 * radius, h, color);
+    fb_fill_rect(x, y + radius, radius, h - 2 * radius, color);
+    fb_fill_rect(x + w - radius, y + radius, radius, h - 2 * radius, color);
+
+    for (int32_t dy = 0; dy < radius; dy++) {
+        for (int32_t dx = 0; dx < radius; dx++) {
+            int32_t dist_sq = (radius - dx) * (radius - dx) + (radius - dy) * (radius - dy);
+            if (dist_sq <= radius * radius) {
+                fb_put_pixel(x + dx, y + dy, color);
+                fb_put_pixel(x + w - 1 - dx, y + dy, color);
+                fb_put_pixel(x + dx, y + h - 1 - dy, color);
+                fb_put_pixel(x + w - 1 - dx, y + h - 1 - dy, color);
+            }
+        }
+    }
+}
 
 // ============================================================================
 // Login gate palette (#569 redesign, per the user's direction seen on real
@@ -120,7 +158,11 @@ extern const uint8_t *font_get_glyph(char c);
 
 typedef enum {
     LOGIN_STATE_SELECT_USER,
-    LOGIN_STATE_CREATE_ACCOUNT,   // #568 first-boot: no accounts yet
+    // #OOBEAUTH (2026-08-23): LOGIN_STATE_CREATE_ACCOUNT is GONE. The
+    // kernel-drawn "Create your account" form it named is deleted; the
+    // userland OOBE wizard's PG_ACCOUNT page (userland/apps/setup/main.rs)
+    // is now the only account-creation screen. See login_run()'s handling of
+    // users_count_active() == 0 for the bootstrap handoff that replaced it.
     // #745: name + password, with NO account name anywhere on screen. This
     // is a whole state and not a flag on SELECT_USER because the two screens
     // share no control: one is a list you move a highlight down, the other is
@@ -160,18 +202,10 @@ static struct {
     // picker's index because in this mode there is no index - there is no list.
     char tu_user[LOGIN_MAX_USERNAME];
     int  tu_field;              // 0 = name, 1 = password
-    // #568 first-boot create-account flow
-    char cu_user[LOGIN_MAX_USERNAME];
-    char cu_pass[LOGIN_MAX_PASSWORD];
-    char cu_confirm[LOGIN_MAX_PASSWORD];
-    // #745: root gets its OWN password, so this screen collects two of them.
-    // Both are confirmed. A typo in root's password is not recoverable on this
-    // machine: there is no sudo and no elevation, so the only way to be root is
-    // to sign in as root, and a mistyped credential locks uid 0 forever.
-    char cu_root[LOGIN_MAX_PASSWORD];
-    char cu_rootconf[LOGIN_MAX_PASSWORD];
-    int  cu_field;              // 0=username 1=password 2=confirm 3=root 4=confirm-root
-    bool cu_submit_requested;   // set by the arrow button click
+    // #OOBEAUTH: the first-boot create-account fields (cu_user/cu_pass/
+    // cu_confirm/cu_root/cu_rootconf/cu_field/cu_submit_requested) that used
+    // to live here are GONE along with LOGIN_STATE_CREATE_ACCOUNT. Account
+    // creation is the userland wizard's PG_ACCOUNT page now.
 } login_ctx;
 
 // ============================================================================
@@ -370,11 +404,14 @@ static void draw_arrow_button(int x, int y, int s, bool hovered) {
     // against the live framebuffer, so the mark stays crisp with no new
     // machinery and no AA question of its own.
     //
-    // decor_fill_rounded_rect_aa() loses its LAST caller here and STAYS in
-    // window_decor.c on purpose. The 100-or-0 coverage defect in the plain
-    // decor_*_rounded_rect() pair is tree-wide, and the AA version is the fix
-    // for it; deleting it because this one caller went away would throw the
-    // primitive out with the caller.
+    // STALE AS OF #242 (2026-08-22): decor_fill_rounded_rect_aa() and the
+    // rest of kernel/gui/window_decor.c are DELETED. That file's entire API
+    // had zero real callers except decor_fill_rounded_rect() (the plain,
+    // 100%-or-0% coverage version), which is now a static helper directly
+    // above in this file. The antialiased variant this comment used to justify
+    // keeping is gone with it; if AA rounded rects are needed again, write
+    // them fresh rather than reviving the deleted file (see blame.md #27 and
+    // #242 for why that file existed but was never on the real draw path).
     int cx = x + s / 2, cy = y + s / 2;
 
     // SIZE. The glyph cache snaps every request to the closest of ten buckets
@@ -401,7 +438,9 @@ static void draw_arrow_button(int x, int y, int s, bool hovered) {
     //   INLINE (LOGIN_STATE_TYPED / LOGIN_STATE_PASSWORD): the arrow sits INSIDE
     //   the password pill, so its backdrop is the fixed LOGIN_INPUT_BG fill and
     //   NOT the wallpaper. 12.58:1 resting, 16.87:1 hovered.
-    //   STANDALONE (LOGIN_STATE_CREATE_ACCOUNT): here the backdrop IS the
+    //   STANDALONE (the old create-account screen, DELETED #OOBEAUTH
+    //   2026-08-23 - kept here as a historical measurement, no live caller
+    //   passes this geometry any more): here the backdrop IS the
     //   scrimmed wallpaper. Swept over all 256 wallpaper luminances the scrim
     //   (#060910 at alpha 145) can produce, i.e. backdrops #030509 through
     //   #717377: worst case 3.54:1 resting and 4.75:1 hovered, both at the
@@ -802,6 +841,43 @@ static void login_list_clamp(int total) {
     if (login_ctx.list_first < 0) login_ctx.list_first = 0;
 }
 
+// #218: map a uid to its row in the ACTIVE list and highlight it. Returns the
+// row index, or -1 if that uid is not an active account. The ONE place that
+// turns a uid into login_ctx.selected_user, shared by the lock screen (which
+// knows exactly whose session it is re-locking) and login_select_default().
+static int login_select_uid(uint32_t uid) {
+    int total = login_active(-1, NULL);
+    for (int i = 0; i < total; i++) {
+        user_entry_t *u = NULL;
+        (void)login_active(i, &u);
+        if (u && u->uid == uid) { login_ctx.selected_user = i; return i; }
+    }
+    return -1;
+}
+
+// #218: which row the picker highlights BEFORE the user has touched a key.
+// root (uid 0) is row 0 of every list, so a default of 0 meant a tired Enter
+// signed the owner in as root. The default is now the FIRST NON-ROOT account:
+// deterministic, needs no persisted \"last user\" state (which would itself be a
+// small disclosure and one more file to get wrong), and structurally cannot
+// land on uid 0. root stays one arrow-press UP and is reached deliberately.
+// If root is the ONLY account (a machine with no human user yet), row 0 is the
+// only choice and is used; there is no non-root identity to prefer.
+static void login_select_default(void) {
+    int total = login_active(-1, NULL);
+    for (int i = 0; i < total; i++) {
+        user_entry_t *u = NULL;
+        (void)login_active(i, &u);
+        if (u && u->uid != 0) {
+            login_ctx.selected_user = i;
+            login_list_clamp(total);   // scroll the chosen row into view
+            return;
+        }
+    }
+    login_ctx.selected_user = 0;   // root-only machine: the only choice
+    login_ctx.list_first = 0;
+}
+
 // Restart / Shut Down are plain shadowed TEXT now (no surrounds), so their hit
 // rects are derived from the measured text extents.
 static void login_power_rects(int *rx, int *rw, int *sx, int *sw_out,
@@ -822,13 +898,39 @@ static void login_power_rects(int *rx, int *rw, int *sx, int *sw_out,
 
 // Large live clock. Doubles as the liveness indicator (design 3.6): it visibly
 // ticks, so a wedged screen is distinguishable from a live one.
+// #86: THIS CLOCK USED TO SHOW UTC.
+//
+// It read the CMOS RTC directly and printed it. The RTC on this OS holds UTC
+// (net/sntp.c writes UTC into it), so a user in Adelaide saw a login clock
+// 9.5 hours out, while every clock in the DESKTOP was right, because those all
+// go through userland/libc/tz.c. It was a second clock that never read the
+// timezone setting the user had chosen in the first-run wizard.
+//
+// It now renders LOCAL time via ktz_local_civil() (gui/clock.h), which reads
+// the SAME /CONFIG/TZ.CFG that the wizard and Settings write. That function
+// shifts the EPOCH and re-derives the civil fields, so the DATE and WEEKDAY
+// below move with the clock: at +09:30, 23:00 UTC on Thursday is 08:30 on
+// FRIDAY, and printing "Thursday" under it would be a new bug of the same
+// family as the one being fixed.
+//
+// FALLBACK. If the RTC does not present a plausible date, ktz_local_civil()
+// refuses and we fall back to the raw RTC read exactly as before, rather than
+// drawing a fabricated time. A login screen with a wrong-but-confident clock is
+// worse than one showing whatever the hardware actually said.
 static void login_draw_clock(const login_geom_t *g) {
     extern void rtc_read_time(int *hour, int *minute, int *second);
     extern void rtc_read_date(int *day, int *month, int *year, int *weekday);
     int h=0,m=0,sec=0,d=1,mo=1,yr=2026,wd=0;
-    rtc_read_time(&h,&m,&sec);
-    rtc_read_date(&d,&mo,&yr,&wd);
+    int civ[7];
+    if (ktz_local_civil(civ) == 0) {
+        yr = civ[0]; mo = civ[1]; d = civ[2];
+        h  = civ[3]; m  = civ[4]; sec = civ[5]; wd = civ[6];
+    } else {
+        rtc_read_time(&h,&m,&sec);
+        rtc_read_date(&d,&mo,&yr,&wd);
+    }
     (void)yr;
+    (void)sec;
     char tbuf[8];
     snprintf(tbuf, sizeof(tbuf), "%02d:%02d", h, m);
     login_text_c(g->cx, g->clock_y, tbuf, g->clock_px, LOGIN_TEXT_COLOR);
@@ -855,88 +957,24 @@ static void login_draw_power(void) {
 }
 
 // ============================================================================
-// #568 first-boot create-account flow (same panel-free look)
+// #OOBEAUTH (2026-08-23): the first-boot create-account flow that used to live
+// here (login_cgeom_t, login_create_geom(), login_draw_create()) is DELETED.
+// It was a second implementation of the wizard's PG_ACCOUNT page, and it is
+// the screen the owner reported ("bare username/password dialog... when this
+// was previously in the wizard in a proper design") - the clock overprint and
+// the labels-behind-fields bugs on that screen are moot because the screen no
+// longer exists. See userland/apps/setup/main.rs's dk_draw_account() for the
+// surviving, single account-creation UI, and login_run() below for the
+// bootstrap handoff that makes it reachable on a virgin machine.
 // ============================================================================
 
-typedef struct {
-    int cx;
-    int title_y;
-    int ix, iw, ih;
-    int uy, py, cy, ry, qy;     // username, password, confirm, root, confirm-root
-    int ax, ay, asz;
-    int err_y;
-} login_cgeom_t;
-
-// #745: five fields now, not three. The row pitch drops from 78 to 62 and the
-// block starts higher so the whole form still fits above the arrow button on a
-// 600-line framebuffer (top=150, last row at 398, error at 458), not just on
-// 768. The field positions are computed from ONE pitch so drawing, hit-testing
-// and the caret can never disagree about where a row is.
-#define LOGIN_CREATE_ROWS   5
-#define LOGIN_CREATE_PITCH  62
-
-static void login_create_geom(login_cgeom_t *c) {
-    int sw = (int)login_ctx.screen_w;
-    int sh = (int)login_ctx.screen_h;
-    c->cx  = sw / 2;
-    c->iw  = LOGIN_FIELD_W;
-    c->ih  = LOGIN_FIELD_H;
-    c->asz = LOGIN_FIELD_H;
-    c->ix  = c->cx - (c->iw + 12 + c->asz) / 2;
-
-    int span  = (LOGIN_CREATE_ROWS - 1) * LOGIN_CREATE_PITCH + c->ih;
-    int top   = sh / 2 - span / 2 - 8;
-    if (top < 96) top = 96;                 // never collide with the title
-    c->title_y = top - 56;
-    c->uy      = top;
-    c->py      = top + 1 * LOGIN_CREATE_PITCH;
-    c->cy      = top + 2 * LOGIN_CREATE_PITCH;
-    c->ry      = top + 3 * LOGIN_CREATE_PITCH;
-    c->qy      = top + 4 * LOGIN_CREATE_PITCH;
-    c->ax      = c->ix + c->iw + 12;
-    c->ay      = c->qy;
-    c->err_y   = c->qy + c->ih + 14;
-}
-
-// Create-account view: same floating language as sign-in. One short prompt, no
-// panel, rounded fields, arrow button to submit.
-static void login_draw_create(void) {
-    login_cgeom_t c;
-    login_create_geom(&c);
-
-    login_text_c(c.cx, c.title_y, "Create your account", LOGIN_NAME_PX, LOGIN_TEXT_COLOR);
-
-    login_text(c.ix + 4, c.uy - 22, "Username", LOGIN_LABEL_PX, LOGIN_TEXT_FAINT);
-    draw_pill_field(c.ix, c.uy, c.iw, c.ih, login_ctx.cu_user, false,
-                    login_ctx.cu_field == 0, login_ctx.cursor_visible, "Username", 0, false);
-
-    login_text(c.ix + 4, c.py - 22, "Password", LOGIN_LABEL_PX, LOGIN_TEXT_FAINT);
-    draw_pill_field(c.ix, c.py, c.iw, c.ih, login_ctx.cu_pass, true,
-                    login_ctx.cu_field == 1, login_ctx.cursor_visible, "Password", 0, false);
-
-    login_text(c.ix + 4, c.cy - 22, "Confirm password", LOGIN_LABEL_PX, LOGIN_TEXT_FAINT);
-    draw_pill_field(c.ix, c.cy, c.iw, c.ih, login_ctx.cu_confirm, true,
-                    login_ctx.cu_field == 2, login_ctx.cursor_visible, "Confirm", 0, false);
-
-    // #745: root's own password. Labelled for what it is, because "root
-    // password" means nothing to someone who has never used a UNIX, and a
-    // field whose purpose is unclear gets the same string typed into it as the
-    // one above, which is the case this change exists to prevent.
-    login_text(c.ix + 4, c.ry - 22, "Root password (must differ)", LOGIN_LABEL_PX, LOGIN_TEXT_FAINT);
-    draw_pill_field(c.ix, c.ry, c.iw, c.ih, login_ctx.cu_root, true,
-                    login_ctx.cu_field == 3, login_ctx.cursor_visible, "Root password", 0, false);
-
-    login_text(c.ix + 4, c.qy - 22, "Confirm root password", LOGIN_LABEL_PX, LOGIN_TEXT_FAINT);
-    draw_pill_field(c.ix, c.qy, c.iw, c.ih, login_ctx.cu_rootconf, true,
-                    login_ctx.cu_field == 4, login_ctx.cursor_visible, "Confirm", 0, false);
-
-    draw_arrow_button(c.ax, c.ay, c.asz, login_ctx.hover_login_btn);
-
-    if (login_ctx.error_msg[0])
-        login_text_c(c.cx, c.err_y, login_ctx.error_msg, LOGIN_BODY_PX, LOGIN_ERROR_COLOR);
-}
-
 static void login_draw(void) {
+    // #157 (this is #569's release, moved here from login_init()): the login
+    // gate owns the display from its FIRST PAINTED FRAME, not from the moment
+    // login_init() ran. See the long comment at the old site in login_init().
+    // Idempotent, one predictable store, cheap enough to do every frame.
+    gfx_boot_release_display();
+
     // Darkened wallpaper (built once, then cheaply restored each frame).
     if (!g_backdrop_built) login_build_backdrop();
     login_restore_backdrop();
@@ -1033,8 +1071,6 @@ static void login_draw(void) {
             if (active_total > 1 && login_ctx.mode == LOGIN_MODE_LIST)
                 login_text_c(g.cx, g.back_y, "Switch User", LOGIN_BODY_PX, LOGIN_TEXT_DIM);
         }
-    } else if (login_ctx.state == LOGIN_STATE_CREATE_ACCOUNT) {
-        login_draw_create();
     }
 
     // Draw mouse cursor
@@ -1134,21 +1170,6 @@ static void login_handle_mouse_click(int32_t mx, int32_t my) {
                 login_ctx.error_msg[0] = '\0';
             }
         }
-    } else if (login_ctx.state == LOGIN_STATE_CREATE_ACCOUNT) {
-        login_cgeom_t c;
-        login_create_geom(&c);
-        if (mx >= c.ix && mx < c.ix + c.iw) {
-            if (my >= c.uy && my < c.uy + c.ih) { login_ctx.cu_field = 0; return; }
-            if (my >= c.py && my < c.py + c.ih) { login_ctx.cu_field = 1; return; }
-            if (my >= c.cy && my < c.cy + c.ih) { login_ctx.cu_field = 2; return; }
-            if (my >= c.ry && my < c.ry + c.ih) { login_ctx.cu_field = 3; return; }
-            if (my >= c.qy && my < c.qy + c.ih) { login_ctx.cu_field = 4; return; }
-        }
-        if (mx >= c.ax && mx < c.ax + c.asz &&
-            my >= c.ay && my < c.ay + c.asz) {
-            login_ctx.cu_submit_requested = true;
-            return;
-        }
     }
 }
 
@@ -1188,13 +1209,6 @@ static void login_handle_mouse_move(int32_t mx, int32_t my) {
                login_ctx.state == LOGIN_STATE_TYPED) {
         if (mx >= g.ax && mx < g.ax + g.asz &&
             my >= g.ay && my < g.ay + g.asz) {
-            login_ctx.hover_login_btn = true;
-        }
-    } else if (login_ctx.state == LOGIN_STATE_CREATE_ACCOUNT) {
-        login_cgeom_t c;
-        login_create_geom(&c);
-        if (mx >= c.ax && mx < c.ax + c.asz &&
-            my >= c.ay && my < c.ay + c.asz) {
             login_ctx.hover_login_btn = true;
         }
     }
@@ -1314,12 +1328,30 @@ void login_init(void) {
     login_ctx.cursor_blink_tick = timer_ticks;
     login_ctx.initialized = true;
 
-    // #569 repaint-artifact fix: from here on the login gate owns the display.
-    // Release the boot splash so late background logging (the periodic xHCI
-    // rescan worker calls gfx_boot_log() on every re-enumeration, and that used
-    // to paint the boot-log console into the back buffer AND swap it to the
-    // screen) can never flash over this screen again.
-    gfx_boot_release_display();
+    // #157: the #569 release USED TO HAPPEN HERE, and that is precisely why
+    // every failure from this line onward looked identical from the outside.
+    //
+    // The shipping golden is configured with autologin (/CONFIG/LOGIN.CFG says
+    // autologin=root), so login_run() returns from login_check_autologin()
+    // WITHOUT EVER DRAWING A FRAME. With the release done here, nothing ever
+    // repainted the screen again: the last thing the machine had painted was
+    // main.c's "[BOOT] Starting desktop services...", and that text stayed on
+    // the glass for the whole of provision_ai_key(), svc_init(), desktop_run(),
+    // the /APPS/COMPOSIT spawn, and the compositor's entire startup, right up
+    // until the compositor's first present.
+    //
+    // So "hangs at Starting desktop services..." was never a LOCATION. It was
+    // the signature of "nothing has put a pixel on the screen since
+    // login_init()", which spans hundreds of lines of kernel and a whole Ring-3
+    // address space. A user-visible symptom that cannot distinguish those is a
+    // diagnostic dead end, and it cost real debugging time.
+    //
+    // The release now happens in login_draw(), on the first frame the gate
+    // actually paints. That is the same instant #569 cared about (from the
+    // moment a real UI is on screen, late background gfx_boot_log() must never
+    // repaint over it) and not one line earlier. On the autologin path the boot
+    // console keeps the display, so desktop_run() can keep reporting progress
+    // all the way to the compositor's first frame.
 
     // #307 real-hardware bring-up: this is the kernel-side login screen
     // (main.c calls login_init()/login_run() before desktop_run()). Log the
@@ -1411,84 +1443,10 @@ int login_check_autologin(login_result_t *result) {
     return 0;
 }
 
-// #568: validate the create-account fields and, on success, create the first
-// administrator (uid 0) and fill the login result. Returns 0 on success (caller
-// proceeds to the desktop), -1 to stay on the create screen with error_msg set.
-static int login_create_submit(login_result_t *result) {
-    if (login_ctx.cu_user[0] == '\0') {
-        strncpy(login_ctx.error_msg, "Enter a username", sizeof(login_ctx.error_msg) - 1);
-        login_ctx.cu_field = 0;
-        return -1;
-    }
-    // The SAME check the kernel will run when it sets the passwords, so this
-    // screen cannot accept something the chokepoint then refuses. It used to
-    // be a local 6-character test that agreed with nothing else. #745: it is
-    // now the PAIR check, so it also covers root's password and the
-    // must-differ rule, and the band in the return code says which of the two
-    // fields to put the caret in.
-    {
-        int pc = users_check_first_boot_pair(login_ctx.cu_user,
-                                             login_ctx.cu_pass,
-                                             login_ctx.cu_root);
-        if (pc != 0) {
-            const char *m = "Could not create account";
-            if (PW_RC_IS_POLICY(pc))      { m = pw_policy_message(PW_RC_CODE(pc));      login_ctx.cu_field = 1; }
-            else if (PW_RC_ROOT_IS_POLICY(pc)) { m = pw_policy_message(PW_RC_ROOT_CODE(pc)); login_ctx.cu_field = 3; }
-            strncpy(login_ctx.error_msg, m, sizeof(login_ctx.error_msg) - 1);
-            login_ctx.error_msg[sizeof(login_ctx.error_msg) - 1] = '\0';
-            return -1;
-        }
-    }
-    if (strcmp(login_ctx.cu_pass, login_ctx.cu_confirm) != 0) {
-        strncpy(login_ctx.error_msg, "Passwords do not match", sizeof(login_ctx.error_msg) - 1);
-        login_ctx.cu_confirm[0] = '\0';
-        login_ctx.cu_field = 2;
-        return -1;
-    }
-    if (strcmp(login_ctx.cu_root, login_ctx.cu_rootconf) != 0) {
-        strncpy(login_ctx.error_msg, "Root passwords do not match", sizeof(login_ctx.error_msg) - 1);
-        login_ctx.cu_rootconf[0] = '\0';
-        login_ctx.cu_field = 4;
-        return -1;
-    }
-
-    int r = users_create_first_admin(login_ctx.cu_user, login_ctx.cu_pass,
-                                     login_ctx.cu_root);
-    if (r != 0) {
-        if (r == -2)
-            strncpy(login_ctx.error_msg, "Invalid username (no spaces, ':' or 'root')",
-                    sizeof(login_ctx.error_msg) - 1);
-        else if (PW_RC_IS_POLICY(r))
-            strncpy(login_ctx.error_msg, pw_policy_message(PW_RC_CODE(r)),
-                    sizeof(login_ctx.error_msg) - 1);
-        else if (PW_RC_ROOT_IS_POLICY(r))
-            strncpy(login_ctx.error_msg, pw_policy_message(PW_RC_ROOT_CODE(r)),
-                    sizeof(login_ctx.error_msg) - 1);
-        else
-            strncpy(login_ctx.error_msg, "Could not create account",
-                    sizeof(login_ctx.error_msg) - 1);
-        return -1;
-    }
-
-    user_entry_t *u = user_lookup_name(login_ctx.cu_user);
-    if (!u) {
-        strncpy(login_ctx.error_msg, "Could not create account",
-                sizeof(login_ctx.error_msg) - 1);
-        return -1;
-    }
-    result->uid = u->uid;
-    result->gid = u->gid;
-    strncpy(result->username, u->username, sizeof(result->username) - 1);
-    strncpy(result->home, u->home, sizeof(result->home) - 1);
-    // The password is hashed + persisted; scrub the plaintext from RAM.
-    memset(login_ctx.cu_pass, 0, sizeof(login_ctx.cu_pass));
-    memset(login_ctx.cu_confirm, 0, sizeof(login_ctx.cu_confirm));
-    memset(login_ctx.cu_root, 0, sizeof(login_ctx.cu_root));
-    memset(login_ctx.cu_rootconf, 0, sizeof(login_ctx.cu_rootconf));
-    kprintf("[LOGIN] First-boot account '%s' (uid=%u) created\n", u->username, u->uid);
-    bootlog_write("[LOGIN] first-boot account '%s' created; entering desktop (#568)", u->username);
-    return 0;
-}
+// #OOBEAUTH (2026-08-23): login_create_submit() is DELETED along with the
+// screen that called it. Account creation is the userland wizard's
+// PG_ACCOUNT page (SYS_FIRSTBOOT_ADMIN), reached via the bootstrap handoff
+// in login_run() below. See blame.md for the #226/#229/#OOBEAUTH history.
 
 int login_run(login_result_t *result) {
     if (!login_ctx.initialized) {
@@ -1500,20 +1458,57 @@ int login_run(login_result_t *result) {
         return 0;
     }
 
-    // #568 first-boot: no real accounts exist yet (fresh/public install with no
-    // shipped credentials). Force account creation instead of an empty user
-    // picker; the account created here becomes the administrator (uid 0).
+    // #OOBEAUTH (owner decision 2026-08-23): a virgin account database gets a
+    // HANDOFF here, not a kernel-drawn form. The form that used to be here
+    // was a second implementation of the userland OOBE wizard's PG_ACCOUNT
+    // page (userland/apps/setup/main.rs, dk_draw_account()), and it is the
+    // one the owner reported: a bare dialog appearing before the wizard,
+    // with the clock overprinting its title and labels drawn behind their
+    // fields. Deleting the duplicate and making the wizard's own page
+    // reachable again fixes both: the layout bugs go with the screen they
+    // were on.
+    //
+    // THERE IS NOTHING TO DRAW OR AUTHENTICATE HERE: the account table is
+    // empty, so this returns immediately with no pixel touched, straight into
+    // desktop_run() -> the compositor -> /APPS/SETUP.
+    //
+    // THE PRIVILEGE BOUNDARY, stated exactly (see also the longer comment on
+    // firstboot_bootstrap_ok_rs() in rustkern/firstrun.rs, which is the code
+    // that actually enforces it). This session's uid/gid/euid/egid are all
+    // FIRST_ADMIN_UID (1000, rustkern/sessionid.rs) - the fixed uid the first
+    // interactive account always gets - but NO account with that uid exists
+    // yet, so it is not tied to any real identity and every ordinary
+    // perms_check() treats it like any other unprivileged uid. It is NOT
+    // root and NOT a general elevated session. The one thing it can do that
+    // an ordinary uid-1000 session cannot - call SYS_FIRSTBOOT_ADMIN
+    // successfully - is granted not by this uid but by the kernel
+    // recognising this exact process as a DIRECT CHILD of the compositor
+    // (the same unforgeable framebuffer-owner identity proc/elevate.c's App
+    // Store elevation already trusts) while users_count_active() is still 0.
+    // The moment SYS_FIRSTBOOT_ADMIN succeeds, that count becomes 1 and the
+    // exception is gone for the rest of this boot and permanently thereafter:
+    // this branch, the only place that ever hands out a session with no
+    // account behind it, cannot be re-entered once the table is non-empty.
+    //
+    // HONEST COST: an attacker with physical access to a virgin machine now
+    // gets a full Ring-3 session (compositor + wizard, real code, real
+    // window handling) running before any account exists, rather than a
+    // small Ring-0-drawn form. That session runs at unprivileged uid 1000
+    // throughout and has exactly one elevated syscall reachable, gated as
+    // above - it cannot read SHADOW, cannot write /CONFIG directly, and
+    // cannot reach uid 0. It is a larger pre-auth code surface than before,
+    // bounded to that one exception; recorded here rather than glossed over.
     if (users_count_active() == 0) {
-        login_ctx.state = LOGIN_STATE_CREATE_ACCOUNT;
-        login_ctx.cu_user[0] = '\0';
-        login_ctx.cu_pass[0] = '\0';
-        login_ctx.cu_confirm[0] = '\0';
-        login_ctx.cu_root[0] = '\0';
-        login_ctx.cu_rootconf[0] = '\0';
-        login_ctx.cu_field = 0;
-        login_ctx.cu_submit_requested = false;
-        login_ctx.error_msg[0] = '\0';
-        bootlog_write("[LOGIN] first-boot: 0 accounts present; showing create-account flow (#568)");
+        extern uint32_t first_admin_uid_rs(void);
+        uint32_t buid = first_admin_uid_rs();
+        result->uid = buid;
+        result->gid = buid;
+        result->username[0] = '\0';
+        result->home[0] = '\0';
+        bootlog_write("[LOGIN] first-boot: 0 accounts present; handing off to the "
+                      "OOBE wizard's account page as a bootstrap session (uid=%u, #OOBEAUTH)",
+                      (unsigned)buid);
+        return 0;
     }
 
     // #745: which sign-in screen? Read the configured mode ONCE, here. The
@@ -1549,8 +1544,7 @@ int login_run(login_result_t *result) {
             login_ctx.password_pos = 0;
             login_ctx.state = LOGIN_STATE_PASSWORD;
         } else {
-            login_ctx.selected_user = 0;   // highlight the first row
-            login_ctx.list_first = 0;
+            login_select_default();   // #218: never default-highlight root (row 0)
         }
     }
 
@@ -1661,35 +1655,6 @@ int login_run(login_result_t *result) {
                 if (login_attempt(result) == 0) {
                     return 0;
                 }
-            } else if (login_ctx.state == LOGIN_STATE_CREATE_ACCOUNT) {
-                char *f; size_t fmax;
-                if (login_ctx.cu_field == 0)      { f = login_ctx.cu_user;     fmax = sizeof(login_ctx.cu_user); }
-                else if (login_ctx.cu_field == 1) { f = login_ctx.cu_pass;     fmax = sizeof(login_ctx.cu_pass); }
-                else if (login_ctx.cu_field == 2) { f = login_ctx.cu_confirm;  fmax = sizeof(login_ctx.cu_confirm); }
-                else if (login_ctx.cu_field == 3) { f = login_ctx.cu_root;     fmax = sizeof(login_ctx.cu_root); }
-                else                              { f = login_ctx.cu_rootconf; fmax = sizeof(login_ctx.cu_rootconf); }
-
-                if (key == '\n') {
-                    // Enter advances through the fields, then submits on the last.
-                    if (login_ctx.cu_field < LOGIN_CREATE_ROWS - 1) {
-                        login_ctx.cu_field++;
-                    } else if (login_create_submit(result) == 0) {
-                        return 0;
-                    }
-                } else if (key == '\t') {
-                    login_ctx.cu_field = (login_ctx.cu_field + 1) % LOGIN_CREATE_ROWS;
-                } else if (key == '\b') {
-                    size_t l = strlen(f);
-                    if (l > 0) f[l - 1] = '\0';
-                } else if (key == 27) {
-                    f[0] = '\0';                 // ESC clears the focused field
-                } else if (key >= ' ' && key < 127) {
-                    // Username field has no spaces or ':' (the PASSWD delimiter).
-                    if (!(login_ctx.cu_field == 0 && (key == ' ' || key == ':'))) {
-                        size_t l = strlen(f);
-                        if (l < fmax - 1) { f[l] = (char)key; f[l + 1] = '\0'; }
-                    }
-                }
             }
         }
 
@@ -1712,15 +1677,6 @@ int login_run(login_result_t *result) {
                         ? login_attempt_typed(result) : login_attempt(result);
                 if (r == 0) return 0;
             }
-
-            // #568 first-boot: Create Account button was clicked.
-            if (login_ctx.state == LOGIN_STATE_CREATE_ACCOUNT &&
-                login_ctx.cu_submit_requested) {
-                login_ctx.cu_submit_requested = false;
-                if (login_create_submit(result) == 0) {
-                    return 0;
-                }
-            }
         }
 
         // Cursor blink (every 500ms = 50 ticks at 100Hz)
@@ -1740,13 +1696,10 @@ int login_run(login_result_t *result) {
 int login_lock_screen(uint32_t uid) {
     login_init();
 
-    // Find the user index for this UID
-    int total = login_active(-1, NULL);
-    for (int i = 0; i < total; i++) {
-        user_entry_t *u = NULL;
-        (void)login_active(i, &u);
-        if (u && u->uid == uid) { login_ctx.selected_user = i; break; }
-    }
+    // #218: shared uid->row selector (was an inline loop here). On a uid that
+    // is not an active account it leaves the highlight where login_init() put
+    // it, exactly as the old loop did.
+    (void)login_select_uid(uid);
 
     // Go directly to password state
     login_ctx.state = LOGIN_STATE_PASSWORD;

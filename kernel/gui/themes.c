@@ -18,6 +18,7 @@
 // an uninitialized/black theme. Every other palette (the 11 other built-ins
 // plus anything the App Store installs) is data, not code.
 #include "themes.h"
+#include "uiscale.h"
 #include "font.h"
 #include "../serial.h"
 #include "../string.h"
@@ -43,6 +44,34 @@ static int g_theme_count = 0;
 // Maps an .mtheme file key (color field name) to its offset in theme_t so
 // the parser below can set fields generically instead of a 51-way switch.
 typedef struct { const char *key; unsigned long offset; } theme_field_t;
+
+// ---------------------------------------------------------------------------
+// The INT table's rows carry one extra bit: is this metric a COUNT OF PIXELS,
+// or is it an ENUM/BOOLEAN that merely happens to be stored as an int?
+//
+// This exists because of the global UI scale factor (rustkern/uiscale.rs).
+// theme_get_metric_by_id() below is the ONE function every integer metric read
+// in the kernel AND every SYS_THEME_METRIC from Ring 3 passes through, so it is
+// where the scale multiply belongs: every widget that was already theme-wired
+// scales for free, with no call-site edit anywhere. But `decor.style=gradient`
+// is the value 2 meaning GRADIENT, and `type.body_weight=bold` is the value 1
+// meaning BOLD. Multiplying either by 1.5 turns a gradient titlebar into
+// nothing and bold text into nothing, because 3 and 2 are not valid values of
+// those enums.
+//
+// THE FLAG LIVES IN THE ROW, NOT IN A PARALLEL ARRAY, DELIBERATELY. A parallel
+// bitmask or a second array is a second thing to keep in step with this one,
+// and this file already carries three separate warnings about what happens
+// when an index-linked structure drifts (see the _Static_assert below and the
+// DEF_C comment). A field in the row cannot drift from the row.
+//
+// A NEW ROW MUST CHOOSE. TM_PX is the common case and the safe default for a
+// geometry metric; TM_ENUM is for anything whose value is a NAME rather than a
+// LENGTH (that is exactly the set theme_int_parse() accepts words for).
+// ---------------------------------------------------------------------------
+#define TM_ENUM 0   // a name stored as an int: never scaled
+#define TM_PX   1   // a count of pixels: scaled by the global UI scale factor
+typedef struct { const char *key; unsigned long offset; unsigned char kind; } theme_int_field_t;
 static const theme_field_t g_theme_fields[] = {
     { "titlebar_active", offsetof(theme_t, titlebar_active) },
     { "titlebar_inactive", offsetof(theme_t, titlebar_inactive) },
@@ -178,46 +207,46 @@ static const theme_field_t g_theme_v2_color_fields[] = {
 // Integer fields. The array index IS the theme_metric_v2_t id, so
 // theme_get_metric_by_id() is a bounds check plus one load: no switch that
 // could drift out of step with the enum. The _Static_assert locks the count.
-static const theme_field_t g_theme_int_fields[] = {
-    /* TM_TITLEBAR_H              */ { "metric.titlebar_h", offsetof(theme_t, m_titlebar_h) },
-    /* TM_BORDER_W                */ { "metric.border_w", offsetof(theme_t, m_border_w) },
-    /* TM_BTN_H                   */ { "metric.btn_h", offsetof(theme_t, m_btn_h) },
-    /* TM_INPUT_H                 */ { "metric.input_h", offsetof(theme_t, m_input_h) },
-    /* TM_PAD                     */ { "metric.pad", offsetof(theme_t, m_pad) },
-    /* TM_GAP                     */ { "metric.gap", offsetof(theme_t, m_gap) },
-    /* TM_FOCUS_W                 */ { "metric.focus_w", offsetof(theme_t, m_focus_w) },
-    /* TM_WINMENU_ROWW            */ { "metric.winmenu_roww", offsetof(theme_t, m_winmenu_roww) },
-    /* TM_WINMENU_ROWH            */ { "metric.winmenu_rowh", offsetof(theme_t, m_winmenu_rowh) },
-    /* TM_WINMENU_HDR             */ { "metric.winmenu_hdr", offsetof(theme_t, m_winmenu_hdr) },
-    /* TM_TITLEBAR_BTN            */ { "metric.titlebar_btn", offsetof(theme_t, m_titlebar_btn) },
-    /* TM_TITLEBAR_BTN_GAP        */ { "metric.titlebar_btn_gap", offsetof(theme_t, m_titlebar_btn_gap) },
-    /* TM_GRIP                    */ { "metric.grip", offsetof(theme_t, m_grip) },
-    /* TM_SCROLLBAR_W             */ { "metric.scrollbar_w", offsetof(theme_t, m_scrollbar_w) },
-    /* TM_MENU_ROW_H              */ { "metric.menu_row_h", offsetof(theme_t, m_menu_row_h) },
-    /* TM_RADIUS_BTN              */ { "radius.btn", offsetof(theme_t, r_btn) },
-    /* TM_RADIUS_INPUT            */ { "radius.input", offsetof(theme_t, r_input) },
-    /* TM_RADIUS_MENU             */ { "radius.menu", offsetof(theme_t, r_menu) },
-    /* TM_RADIUS_CARD             */ { "radius.card", offsetof(theme_t, r_card) },
-    /* TM_DECOR_STYLE             */ { "decor.style", offsetof(theme_t, d_style) },
-    /* TM_DECOR_TITLEBAR_GRADIENT */ { "decor.titlebar_gradient", offsetof(theme_t, d_titlebar_gradient) },
-    /* TM_DECOR_GRIP              */ { "decor.grip", offsetof(theme_t, d_grip) },
-    /* TM_TYPE_CAPTION            */ { "type.caption", offsetof(theme_t, t_caption) },
-    /* TM_TYPE_CAPTION_LH         */ { "type.caption_lineheight", offsetof(theme_t, t_caption_lh) },
-    /* TM_TYPE_CAPTION_W          */ { "type.caption_weight", offsetof(theme_t, t_caption_w) },
-    /* TM_TYPE_BODY               */ { "type.body", offsetof(theme_t, t_body) },
-    /* TM_TYPE_BODY_LH            */ { "type.body_lineheight", offsetof(theme_t, t_body_lh) },
-    /* TM_TYPE_BODY_W             */ { "type.body_weight", offsetof(theme_t, t_body_w) },
-    /* TM_TYPE_TITLE              */ { "type.title", offsetof(theme_t, t_title) },
-    /* TM_TYPE_TITLE_LH           */ { "type.title_lineheight", offsetof(theme_t, t_title_lh) },
-    /* TM_TYPE_TITLE_W            */ { "type.title_weight", offsetof(theme_t, t_title_w) },
-    /* TM_TYPE_HEADING            */ { "type.heading", offsetof(theme_t, t_heading) },
-    /* TM_TYPE_HEADING_LH         */ { "type.heading_lineheight", offsetof(theme_t, t_heading_lh) },
-    /* TM_TYPE_HEADING_W          */ { "type.heading_weight", offsetof(theme_t, t_heading_w) },
-    /* TM_TYPE_DISPLAY            */ { "type.display", offsetof(theme_t, t_display) },
-    /* TM_TYPE_DISPLAY_LH         */ { "type.display_lineheight", offsetof(theme_t, t_display_lh) },
-    /* TM_TYPE_DISPLAY_W          */ { "type.display_weight", offsetof(theme_t, t_display_w) },
-    /* TM_TITLE_INSET             */ { "metric.title_inset", offsetof(theme_t, m_title_inset) },
-    /* TM_RADIUS_WINDOW           */ { "radius.window", offsetof(theme_t, r_window) },
+static const theme_int_field_t g_theme_int_fields[] = {
+    /* TM_TITLEBAR_H              */ { "metric.titlebar_h", offsetof(theme_t, m_titlebar_h), TM_PX },
+    /* TM_BORDER_W                */ { "metric.border_w", offsetof(theme_t, m_border_w), TM_PX },
+    /* TM_BTN_H                   */ { "metric.btn_h", offsetof(theme_t, m_btn_h), TM_PX },
+    /* TM_INPUT_H                 */ { "metric.input_h", offsetof(theme_t, m_input_h), TM_PX },
+    /* TM_PAD                     */ { "metric.pad", offsetof(theme_t, m_pad), TM_PX },
+    /* TM_GAP                     */ { "metric.gap", offsetof(theme_t, m_gap), TM_PX },
+    /* TM_FOCUS_W                 */ { "metric.focus_w", offsetof(theme_t, m_focus_w), TM_PX },
+    /* TM_WINMENU_ROWW            */ { "metric.winmenu_roww", offsetof(theme_t, m_winmenu_roww), TM_PX },
+    /* TM_WINMENU_ROWH            */ { "metric.winmenu_rowh", offsetof(theme_t, m_winmenu_rowh), TM_PX },
+    /* TM_WINMENU_HDR             */ { "metric.winmenu_hdr", offsetof(theme_t, m_winmenu_hdr), TM_PX },
+    /* TM_TITLEBAR_BTN            */ { "metric.titlebar_btn", offsetof(theme_t, m_titlebar_btn), TM_PX },
+    /* TM_TITLEBAR_BTN_GAP        */ { "metric.titlebar_btn_gap", offsetof(theme_t, m_titlebar_btn_gap), TM_PX },
+    /* TM_GRIP                    */ { "metric.grip", offsetof(theme_t, m_grip), TM_PX },
+    /* TM_SCROLLBAR_W             */ { "metric.scrollbar_w", offsetof(theme_t, m_scrollbar_w), TM_PX },
+    /* TM_MENU_ROW_H              */ { "metric.menu_row_h", offsetof(theme_t, m_menu_row_h), TM_PX },
+    /* TM_RADIUS_BTN              */ { "radius.btn", offsetof(theme_t, r_btn), TM_PX },
+    /* TM_RADIUS_INPUT            */ { "radius.input", offsetof(theme_t, r_input), TM_PX },
+    /* TM_RADIUS_MENU             */ { "radius.menu", offsetof(theme_t, r_menu), TM_PX },
+    /* TM_RADIUS_CARD             */ { "radius.card", offsetof(theme_t, r_card), TM_PX },
+    /* TM_DECOR_STYLE             */ { "decor.style", offsetof(theme_t, d_style), TM_ENUM },
+    /* TM_DECOR_TITLEBAR_GRADIENT */ { "decor.titlebar_gradient", offsetof(theme_t, d_titlebar_gradient), TM_ENUM },
+    /* TM_DECOR_GRIP              */ { "decor.grip", offsetof(theme_t, d_grip), TM_ENUM },
+    /* TM_TYPE_CAPTION            */ { "type.caption", offsetof(theme_t, t_caption), TM_PX },
+    /* TM_TYPE_CAPTION_LH         */ { "type.caption_lineheight", offsetof(theme_t, t_caption_lh), TM_PX },
+    /* TM_TYPE_CAPTION_W          */ { "type.caption_weight", offsetof(theme_t, t_caption_w), TM_ENUM },
+    /* TM_TYPE_BODY               */ { "type.body", offsetof(theme_t, t_body), TM_PX },
+    /* TM_TYPE_BODY_LH            */ { "type.body_lineheight", offsetof(theme_t, t_body_lh), TM_PX },
+    /* TM_TYPE_BODY_W             */ { "type.body_weight", offsetof(theme_t, t_body_w), TM_ENUM },
+    /* TM_TYPE_TITLE              */ { "type.title", offsetof(theme_t, t_title), TM_PX },
+    /* TM_TYPE_TITLE_LH           */ { "type.title_lineheight", offsetof(theme_t, t_title_lh), TM_PX },
+    /* TM_TYPE_TITLE_W            */ { "type.title_weight", offsetof(theme_t, t_title_w), TM_ENUM },
+    /* TM_TYPE_HEADING            */ { "type.heading", offsetof(theme_t, t_heading), TM_PX },
+    /* TM_TYPE_HEADING_LH         */ { "type.heading_lineheight", offsetof(theme_t, t_heading_lh), TM_PX },
+    /* TM_TYPE_HEADING_W          */ { "type.heading_weight", offsetof(theme_t, t_heading_w), TM_ENUM },
+    /* TM_TYPE_DISPLAY            */ { "type.display", offsetof(theme_t, t_display), TM_PX },
+    /* TM_TYPE_DISPLAY_LH         */ { "type.display_lineheight", offsetof(theme_t, t_display_lh), TM_PX },
+    /* TM_TYPE_DISPLAY_W          */ { "type.display_weight", offsetof(theme_t, t_display_w), TM_ENUM },
+    /* TM_TITLE_INSET             */ { "metric.title_inset", offsetof(theme_t, m_title_inset), TM_PX },
+    /* TM_RADIUS_WINDOW           */ { "radius.window", offsetof(theme_t, r_window), TM_PX },
 };
 #define THEME_INT_COUNT (sizeof(g_theme_int_fields) / sizeof(g_theme_int_fields[0]))
 _Static_assert(THEME_INT_COUNT == (size_t)TM_COUNT,
@@ -389,6 +418,33 @@ static void theme_fill_v2_defaults(theme_t *t, const uint8_t *seen_c, const uint
 // mtheme v2 integer read. Bounds-checked; an unknown id returns 0 so a newer
 // userland asking an older kernel degrades to its own default (see themes.h).
 int32_t theme_get_metric_by_id(int theme_id, int metric_id) {
+    int32_t raw = theme_get_metric_raw(theme_id, metric_id);
+    if (metric_id < 0 || metric_id >= (int)THEME_INT_COUNT) return 0;
+    if (g_theme_int_fields[metric_id].kind != TM_PX) return raw;
+    // THE GLOBAL UI SCALE FACTOR IS APPLIED HERE AND ONLY HERE, for the whole
+    // theme system, kernel and Ring 3 alike. See rustkern/uiscale.rs for why
+    // the theme file keeps its 1x design values and the multiply happens at
+    // read time (short version: a theme is per-LOOK, scale is per-DISPLAY, and
+    // build/assets/theme-scale-lint.sh enforces the 1x design scales that
+    // multiplying the stored values would break for all 14 shipped themes).
+    //
+    // A ZERO IS NEVER MANUFACTURED HERE. ui_px() never turns a nonzero into a
+    // zero, which matters more than it looks: this function's contract is that
+    // 0 means "this kernel does not know that id", and theme_metric_or() in
+    // Ring 3 substitutes the caller's own fallback on a 0. A scale that could
+    // round a 1px focus ring down to 0 would not draw a thinner ring, it would
+    // silently hand every caller its hardcoded default and un-theme the UI.
+    // A raw 0 (a legitimately zero radius, say) still returns 0, unchanged.
+    if (raw == 0) return 0;
+    return ui_px(raw);
+}
+
+// The UNSCALED value, for the handful of callers that genuinely want the
+// theme's own 1x design number rather than what to draw: the theme-preview
+// thumbnail in Settings (which draws a miniature window inside a fixed box and
+// would overflow it), and the scale lint's own reasoning about a theme file.
+// Everything that DRAWS wants theme_get_metric_by_id(), not this.
+int32_t theme_get_metric_raw(int theme_id, int metric_id) {
     const theme_t *t = (theme_id < 0) ? theme_get_current() : theme_get_by_id(theme_id);
     if (!t) t = theme_get_current();
     if (metric_id < 0 || metric_id >= (int)THEME_INT_COUNT) return 0;
@@ -785,7 +841,45 @@ void theme_init(void) {
             if (theme_load_from_file(path, &t) == 0) {
                 g_themes[g_theme_count++] = t;
             } else {
-                kprintf("[Themes] Warning: could not load %s, skipping\n", path);
+                // Terminal-theme pitfall (#241/termscroll, 2026-08-22): this used to
+                // just "continue" without incrementing g_theme_count. That SKIPS the
+                // slot instead of filling it, so every theme listed AFTER this one in
+                // INDEX.TXT shifts down by one kernel index. Userland's
+                // gui_theme_list() (userland/libc/gui_theme.c) always assigns an
+                // index by LISTING POSITION alone, regardless of whether the kernel
+                // could read that particular file - it has no way to know this
+                // happened. The next theme_color_of(index, ...) call for anything
+                // after the failed file then reads a DIFFERENT theme's colors out of
+                // this table: a transient read failure for ONE file (heap pressure,
+                // an ext2 hiccup, anything short of the file being entirely absent)
+                // silently desyncs every theme index after it for the rest of the
+                // boot, with no serial trace beyond one easy-to-miss warning line.
+                // This is exactly the shape of bug the terminal's independent theme
+                // (term_resolve_theme() in userland/apps/terminal/main.c) was
+                // reported to hit: a theme that "saved correctly" but did not
+                // visibly repaint, or repainted as some other theme.
+                //
+                // Fix the MECHANISM, not the instance: keep the SLOT. A fallback
+                // palette goes in this exact index so position in g_themes[] always
+                // matches position in INDEX.TXT, whether or not this one file loaded.
+                // A theme that fails to load still looks wrong (fallback colors, not
+                // its own), but every OTHER theme's index stays correct - the failure
+                // is now contained to the one slot instead of corrupting every index
+                // after it.
+                kprintf("[Themes] Warning: could not load %s; using the fallback "
+                        "palette for index %d so every later theme keeps its correct "
+                        "index\n", path, g_theme_count);
+                theme_t fb = g_fallback_theme;
+                fb.name[0] = 0;
+                strncpy(fb.name, fname, THEME_NAME_LEN - 1);
+                fb.name[THEME_NAME_LEN - 1] = 0;
+                {
+                    uint8_t zc[THEME_V2C_COUNT], zi[THEME_INT_COUNT];
+                    memset(zc, 0, sizeof(zc));
+                    memset(zi, 0, sizeof(zi));
+                    theme_fill_v2_defaults(&fb, zc, zi);
+                }
+                g_themes[g_theme_count++] = fb;
             }
         }
         kfree(idx);
@@ -943,6 +1037,27 @@ uint32_t theme_get_color_by_id(int theme_id, int color_id) {
         // APPEND ONLY; ids must match libc theme.h theme_color_id_t order.
         case 61: return t->c_titlebar_top;       // TITLEBAR_TOP
         case 62: return t->c_titlebar_bottom;    // TITLEBAR_BOTTOM
+        // (confirm-modal, docs/CONFIRM_MODAL_DESIGN.html) Seven more v2 token
+        // fields that have existed in theme_t (and been parsed from every
+        // .mtheme file's color.* keys, see the offset table above) since #711,
+        // with no reader here, so no userland caller could ever ask for them by
+        // name: surface_overlay/surface_raised/on_surface/on_accent/danger/
+        // on_danger/border_subtle. The confirm/notice modal is the first
+        // caller that needs a filled danger/accent SURFACE under fixed text
+        // rather than accent used as a boundary colour (see the design doc
+        // 5.1's WCAG table: 7 of 14 themes fail 4.5:1 on this exact pair,
+        // which is why the porting code floors these through
+        // gui_ensure_contrast() at draw time instead of trusting the raw
+        // value). Same one-arm-of-an-existing-C-switch justification as
+        // FOCUS_RING/TITLEBAR_TOP above for staying C. APPEND ONLY; ids must
+        // match userland libc theme.h theme_color_id_t enum order.
+        case 63: return t->c_surface_overlay;    // SURFACE_OVERLAY (color.surface_overlay)
+        case 64: return t->c_surface_raised;     // SURFACE_RAISED (color.surface_raised)
+        case 65: return t->c_on_surface;         // ON_SURFACE (color.on_surface)
+        case 66: return t->c_on_accent;          // ON_ACCENT (color.on_accent)
+        case 67: return t->c_danger;             // DANGER (color.danger)
+        case 68: return t->c_on_danger;          // ON_DANGER (color.on_danger)
+        case 69: return t->c_border_subtle;      // BORDER_SUBTLE (color.border_subtle)
         default: return t->window_bg;
     }
 }

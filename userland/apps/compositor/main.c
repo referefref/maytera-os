@@ -9,6 +9,7 @@
 #include "compositor.h"
 #include "../../libc/notify.h"
 #include "../../libc/syscall.h"
+#include "../../libc/keys.h"      // #243: GUI_KEY_* - THE keycode table
 #include "../../libc/theme.h"   // (#285) theme_color_of + color ids
 #include "../../libc/gui_theme.h" // (#565) file-based theme loader
 // #683: per-user preference paths. This was included only under
@@ -19,6 +20,10 @@
 // `typedef int bool` conflict.
 #include "../../libc/userconf.h"
 #include "../../libc/string.h"   // #745 P2: strcmp for widgets_cfg_poll() bind validation
+#include "../../libc/dock_opacity.h"  // #132: shared DOCK_OPACITY_MIN/MAX
+#include "../../libc/settingscfg.h"   // #230: settingscfg_dblclick_ms()
+#include "perfframe.h"
+#include "idleprof.h"   // #COMPIDLE: idle-CPU reason/cost profiler
 #ifdef MAYTERA_TESTHOOK
 #include "testhook.h"   // #334 headless verification hook - never in a normal build
 #endif
@@ -55,9 +60,12 @@ uint64_t g_idle_ms           = 0;
 
 bool g_needs_redraw = true;
 extern bool g_setup_pending;        // defined below; read by the input tick
+extern bool g_setup_handover_armed; // #203: defined below; read by the input tick
 void setup_pending_recheck(void);   // defined below; called from the input tick
 void dock_style_write_cfg(int v);   // #387 live channel, defined below
 void dock_opacity_write_cfg(int v); // #745 live channel, defined below
+void dock_height_write_cfg(int v);  // #123 live channel, defined below
+void dock_zoom_write_cfg(int v);    // #123 live channel, defined below
 
 // T0 #578: per-tick input classification, set by poll_input(), read by the
 // main loop to choose the cheap pointer-motion present path. g_tick_motion =
@@ -103,6 +111,22 @@ static inline void cursor_plot(int px, int py, uint32_t color)
     g_fb[py * g_fb_pitch + px] = color;
 }
 
+// #uiscale: the cursor already had a user-persisted size PREFERENCE
+// (g_cursor_size, 100..250 = 1.0x..2.5x, set via Settings -> set_cursor()).
+// The UI scale factor is a SEPARATE, independent multiplier that stacks on
+// top of it, not a replacement for it - a user who picked a big cursor at
+// 100% scale should still get a big cursor at 150% scale, just bigger again.
+// This is the SAME base-times-preference pattern taskbar.c's dock_zoom uses
+// on top of the dock's own scaled base (see taskbar.c #uiscale comment).
+// cursor_render() and cursor_bounds() both used to compute the exact same
+// "int scale = (g_cursor_size...) ? g_cursor_size : 100;" clamp independently
+// (a copy-paste-drift risk in its own right); both now call this one function.
+static inline int cursor_effective_scale(void)
+{
+    int base = (g_cursor_size >= 50 && g_cursor_size <= 250) ? g_cursor_size : 100;
+    return base * g_ui_scale_pct / 100;
+}
+
 void cursor_render(void)
 {
     // (#116) Pull the live cursor style/size from the kernel every frame so a
@@ -115,7 +139,7 @@ void cursor_render(void)
         g_cursor_size = (sz >= 50) ? sz : 100;
     }
 
-    int scale = (g_cursor_size >= 100 && g_cursor_size <= 250) ? g_cursor_size : 100;
+    int scale = cursor_effective_scale();
 
     if (g_cursor_style == 2) {
         // Glow: a pulsing accent disc with a thin white line on the inner AND
@@ -187,6 +211,18 @@ static void aichat_write_cfg(int enabled);
 
 static int compositor_init(void)
 {
+    // #uiscale: MUST be the very first thing this process does, before
+    // fb_info() below or anything else. This process is not yet registered
+    // as the framebuffer owner at this point (that only happens once it
+    // claims later on), so without this mark the kernel answers fb_info()
+    // the same way it answers every ordinary app: with the LOGICAL
+    // (unscaled) screen size, not the real physical one this file needs to
+    // draw chrome directly onto real pixels. See uiscale.h's own comment on
+    // ui_scale_mark_native() for the exact failure this order fixes
+    // (a 150% boot laid the whole desktop out for 1280x720 on a 1920x1080
+    // panel) - added here as soon as the kernel-side mark existed to fix it.
+    ui_scale_mark_native();
+
     fb_info_t fi;
     if (fb_info(&fi) < 0) {
         return -1;
@@ -214,6 +250,24 @@ static int compositor_init(void)
 
 
     // Subsystem initialisation (order matters: wallpaper before desktop)
+    // #uiscale BUGFIX (ui-ux screendump, real 2560x1600 @200%): seed the
+    // scale factor and the scale-derived desktop-icon globals BEFORE any
+    // layout math runs. ui_scale_refresh() (normally a per-frame main-loop
+    // call - see the main loop below) had never been called yet at this
+    // point, so g_ui_scale_pct still held its startup default of 100 and
+    // desktop_init() -> layout_default_top() -> grid_cell_pos() below baked
+    // every desktop icon's (px,py) into a grid spaced with the UNSCALED
+    // DESKTOP_ICON_SPACING_X/Y (compositor_apply_icon_size() had not run
+    // with the real factor yet either). The icon BITMAP and its LABEL TEXT
+    // both scale live every frame regardless (DESKTOP_ICON_SIZE is read at
+    // draw time, and draw_text_ttf()/text_width_ttf() apply ui_px() at call
+    // time), so the visible defect was exactly "things got bigger, the grid
+    // that holds them did not" - labels from adjacent icons overlapping.
+    // Calling both here, once, before desktop_init(), means the very first
+    // layout pass already uses the correct scaled spacing.
+    ui_scale_refresh();
+    compositor_apply_icon_size(get_icon_size());
+
     wallpaper_init();
     desktop_init();
     taskbar_init();
@@ -278,6 +332,21 @@ static int compositor_init(void)
     icon_load_color(ICON_SYSMON,        "/ICONS/MONITOR.ICN"); // existing, unwired
     icon_load_color(ICON_SERVICES,      "/ICONS/GEAR.ICN");    // existing, unwired
     icon_load_color(ICON_3DPRINT,       "/ICONS/PRINT3D.ICN");
+    // #deskicons: removable-volume icons (desktop.c desktop_append_volume_icons())
+    // had NO color art at all - ICON_CDROM/ICON_FLOPPY/ICON_USBDRIVE only ever
+    // existed as 24x24 1-bit mono glyphs in icons.c's icons[] fallback table, so
+    // icon_draw_color_if_present() always missed and icon_draw_scaled() fell back
+    // to that table's hand-rolled nearest-neighbour scaler with NO drop-shadow
+    // pass (only the color path draws one). Reported on a real 4K/200% panel as
+    // "looks like a CD but pixelated, no drop shadow" - both symptoms are this
+    // ONE missing asset registration, not two different draw paths: the shape
+    // (glyph) was already correct, the mono fallback path was just always ugly
+    // and became strikingly so once the desktop icon size started scaling past
+    // the 64x64 MICO source's native size. New 64x64 MICO art added to the asset
+    // base to match (see /ICONS/CDROM.ICN, FLOPPY.ICN, USBDRIVE.ICN).
+    icon_load_color(ICON_CDROM,         "/ICONS/CDROM.ICN");
+    icon_load_color(ICON_FLOPPY,        "/ICONS/FLOPPY.ICN");
+    icon_load_color(ICON_USBDRIVE,      "/ICONS/USBDRIVE.ICN");
     startmenu_init();
     contextmenu_init();
     traymenu_init();
@@ -320,9 +389,20 @@ static int compositor_init(void)
        restored ones. */
     taskbar_apply_work_area();
     dock_opacity_write_cfg(g_dock_opacity);  /* #745 same, for the glass opacity */
+    /* (#123) Same seeding contract for the two new marble-dock geometry
+       preferences: the compositor is the owner of UIPROFIL.YML, so it publishes
+       what it actually loaded into the CFG files Settings reads on open. Without
+       this, Settings would show its own compiled-in default the first time it
+       runs against a profile that has a different value, and the first drag of
+       the slider would jump the dock. */
+    dock_height_write_cfg(g_dock_height);
+    dock_zoom_write_cfg(g_dock_zoom);
     profile_save();   /* ensure the profile file exists */
     screensaver_init();
-    login_init();
+    // (#73) login_init() is GONE, with the rest of the compositor's own login
+    // screen. The real login gate is kernel/gui/login.c, which authenticates
+    // BEFORE this process is spawned; this one was a superseded duplicate that
+    // still armed a key sink. See the deletion note in CHANGELOG.md.
     lock_init();   // #566 secure session lock overlay
 
     return 0;
@@ -354,6 +434,12 @@ static bool s_dragging_settings = false;  // #419b settings-modal title-bar / sc
 // entering lock, so the brief flash is hidden rather than left open.
 static uint64_t s_super_press_ms = 0;
 #define SUPER_L_WINDOW_MS 600
+// #232: the SAME window now serves a SECOND chord, Super+Space, which opens the
+// AI command launcher (Spotlight). It is one timestamp and one window because
+// there is one Super press to hang both off; see the Super+Space branch in
+// process_events() for why the launcher had to move off its old bare-F1
+// binding, and GLOBALLY_CAPTURED_KEYS below for the full list of what this
+// compositor takes before an app can see it.
 // widgets.c drag API (relocatable desktop widgets)
 int  widget_hit(int x, int y);
 void widget_grab(int x, int y);
@@ -450,10 +536,21 @@ static const modal_grab_t g_modal_grabs[] = {
     { "ai-launcher",     launcher_is_open,        launcher_handle_key,                NULL,              MG_ALL,  0,  1 },
     { "power-confirm",   startmenu_power_confirm_open, startmenu_power_confirm_handle_key, NULL,          MG_ALL,  0,  1 },
     { "item-properties", startmenu_properties_open,    startmenu_properties_handle_key,    NULL,          MG_ALL,  0,  1 },
+    { "force-quit-confirm", taskbar_force_quit_confirm_open, taskbar_force_quit_confirm_handle_key, NULL,   MG_ALL,  0,  1 },
     { "icon-picker",     iconpicker_is_open,      iconpicker_handle_key,              NULL,              MG_ALL,  0,  1 },
     { "widget-settings", widget_settings_is_open, widget_settings_handle_key,         NULL,              MG_ALL,  0,  1 },
     { "sticky-editor",   stickies_editing,        stickies_handle_key,                NULL,              MG_ALL,  0,  1 },
     { "start-menu",      mg_startmenu_open,       startmenu_handle_key,               NULL,              MG_ALL,  0,  1 },
+    /* docs/NOTIFICATIONS_DESIGN.html sect;5: the notification centre is being
+       PROMOTED OUT of the ESC-ONLY tier below, not added to it - #334 makes
+       pointer clicks unreliable on the owner's hardware, and this surface's
+       whole job is to be read, so Esc/Tab/Enter are now its primary path.
+       notif_handle_key() owns its own Esc handling internally (matching
+       startmenu_handle_key()'s existing pattern) rather than routing through
+       the ESC-ONLY fallthrough block. notif_handle_mouse()'s existing
+       dispatch is untouched: mouse and keyboard are independent paths here,
+       exactly as they already are for the start menu. */
+    { "notif-center",    notif_center_open,       notif_handle_key,                   NULL,              MG_ALL,  0,  1 },
 
     /* --- ESC-ONLY tier: pointer-driven popups. They take no typing, so
        gating every key would only swallow input the user meant for the app.
@@ -461,8 +558,10 @@ static const modal_grab_t g_modal_grabs[] = {
        Esc that closes an overlay AND reaches the app is the exact symptom that
        exposed the elevation-modal leak, so Esc alone is claimed here. Popups
        that consume NO key at all (tray menu, per-widget menu, taskbar tile
-       menu, taskbar perf popup, notification centre) are deliberately absent:
-       they never take a keystroke the user believes is theirs. --- */
+       menu, taskbar perf popup) are deliberately absent: they never take a
+       keystroke the user believes is theirs. The notification centre used to
+       be named here too; it is now in the TYPING tier above (docs/
+       NOTIFICATIONS_DESIGN.html sect;5). --- */
     { "wallpaper-picker", mg_wallpaper_open,      NULL,                               NULL,              MG_ESC,  0,  0 },
     { "context-menu",     mg_ctxmenu_open,        NULL,                               NULL,              MG_ESC,  0,  0 },
 };
@@ -508,10 +607,68 @@ static const modal_grab_t *modal_grab_keyboard(void)
 }
 
 // Double-click tracking
-static uint64_t s_last_click_ticks = 0;
-#define DBL_CLICK_THRESHOLD 500   // ticks (approximately milliseconds)
+static uint64_t s_last_click_ms = 0;
+// #230 (docs/SETTINGS_CONTROL_AUDIT.md #224): was a hardcoded 500 with no
+// consumer of Settings' "Double-click Speed" slider anywhere in the tree, so
+// the control persisted a value nothing read. Now real:
+// settingscfg_dblclick_ms() (libc/settingscfg.c) reads SETTINGS.CFG's 'k' key
+// on a 2s throttle.
+//
+// #236 CORRECTION of the note that used to sit here. #230 wired a real
+// reader, but the reader's return value (real MILLISECONDS, 150-900) was
+// compared directly against a difference of sys_clock() TICKS a few lines
+// below - and sys_clock() returns the raw 250Hz PIT counter (4ms per tick,
+// same rate this function's own "suppressed" boot-window comment documents),
+// not milliseconds. Comparing a ms threshold against a tick delta scales the
+// EFFECTIVE threshold by the tick period: a 500ms setting behaved as 2000ms.
+// Measured on golden 2016: the double-click boundary sat at ~1.7-2.0s
+// regardless of the slider position, which is exactly what a threshold stuck
+// at the pre-#230 hardcoded 500 (interpreted as 500 ticks = 2.0s) looks like.
+// Fixed by switching the time source to uptime_ms() (SYS_UPTIME_MS), a real
+// monotonic-millisecond clock userland already has (used by settingscfg.c's
+// own poll throttle), so both sides of the compare are now the same unit.
+//
+// THIS WAS ALSO NOT THE ONLY DETECTOR. desktop.c's desktop_release() (the
+// path that actually fires for a desktop-icon click, since s_dbl_click below
+// only reaches desktop_handle_mouse() via a fallback branch the press/drag
+// path does not normally take) had its OWN independent hardcoded `500ULL`
+// tick comparison, and kernel gui/window.c's title-bar double-click had a
+// THIRD, kernel-side hardcoded ~0.5s. Three detectors, none of them reading
+// this setting. See desktop.c and window.c for the matching fixes, and
+// blame.md for why tools/pref-reader-lint could not have caught any of this.
+static int dbl_click_threshold(void) { return settingscfg_dblclick_ms(); }
+
+// Push the current threshold into the kernel (title-bar double-click/
+// maximize, gui/window.c) whenever it actually changes, same "only call the
+// syscall on a real change" discipline settings_autosave()'s contract_hash()
+// uses - dbl_click_threshold() itself is already throttled internally
+// (settingscfg_reload()'s 2s poll), so this comparison is nearly free every
+// frame and the syscall fires only when the user actually moves the slider
+// (or the kernel default is stale on the first frame after boot).
+static void dbl_click_threshold_push(void) {
+    static int s_last_pushed = -1;
+    int ms = dbl_click_threshold();
+    if (ms != s_last_pushed) {
+        sys_set_dblclick_ms(ms);
+        s_last_pushed = ms;
+    }
+}
 
 static bool fullscreen_app_on_top(void);   // (local 79) defined below
+
+// #158 NATIVE FULLSCREEN forward declarations - bodies defined near
+// render_frame() below (they call cursor_render/apply_display_effects/
+// fb_flip, which are declared/defined further down this file), but
+// native_fullscreen_watchdog_reset() is called from the F11 handler in
+// process_input(), which runs earlier in this file.
+static void native_fullscreen_watchdog_reset(void);
+static bool native_fullscreen_try_render(void);
+// apply_display_effects() is itself only forward-declared right before
+// render_frame() (its own definition is later still) - pulled forward here
+// too so native_fullscreen_try_render()'s call to it, defined ABOVE that
+// point, does not create an implicit (non-static) declaration that then
+// conflicts with the real static one.
+static void apply_display_effects(void);
 
 static void process_input(void)
 {
@@ -534,8 +691,26 @@ static void process_input(void)
     int my = abs_y - g_mouse_y;
 
     // Use the kernel-tracked position directly (already clamped).
+#ifdef MAYTERA_TESTHOOK
+    // (#123) A throwaway verification build can PIN the pointer. QEMU's
+    // relative-mouse injection does not land on this VM class (#334, and
+    // re-confirmed for this ticket: a mouse_move to a known dock slot moved
+    // nothing), so a hover-magnify screenshot is otherwise unobtainable.
+    // This suppresses only the position OVERWRITE - it does not fake a hover,
+    // it does not touch the magnify code, and it proves nothing about the
+    // mouse DRIVER, which this ticket does not change. Compiled out of every
+    // shipping binary along with the rest of the testhook.
+    extern int g_th_mouse_pinned;
+    if (!g_th_mouse_pinned) { g_mouse_x = abs_x; g_mouse_y = abs_y; }
+#else
     g_mouse_x = abs_x;
     g_mouse_y = abs_y;
+#endif
+
+    // #236: keep the kernel's title-bar double-click detector (gui/window.c)
+    // in sync with the live setting. Cheap most frames (see the function's
+    // own comment); only actually reaches the kernel on a real change.
+    dbl_click_threshold_push();
 
     // Derive button edge events
     uint32_t prev = g_mouse_prev_buttons;
@@ -551,12 +726,13 @@ static void process_input(void)
     if (!suppressed && (buttons & 1) && !(prev & 1)) {
         s_left_pressed = true;
 
-        // Double-click detection
-        uint64_t now = (uint64_t)sys_clock();
-        if ((now - s_last_click_ticks) < DBL_CLICK_THRESHOLD) {
+        // Double-click detection. #236: uptime_ms() (real monotonic ms), not
+        // sys_clock() (raw 250Hz ticks) - see dbl_click_threshold()'s comment.
+        uint64_t now = (uint64_t)uptime_ms();
+        if ((now - s_last_click_ms) < (uint64_t)dbl_click_threshold()) {
             s_dbl_click = true;
         }
-        s_last_click_ticks = now;
+        s_last_click_ms = now;
     }
     if (!(buttons & 1) && (prev & 1)) {
         s_left_released = true;
@@ -580,6 +756,7 @@ static void process_input(void)
     // below. A tick that is motion-only takes the cheap cursor-rect present.
     g_tick_motion    = (mx != 0 || my != 0);
     g_tick_nonmotion = (buttons != prev);
+    idleprof_motion(mx, my);   // #COMPIDLE: raw device chatter vs real input
     for (int i = 0; i < 8; i++) {
         int key = sys_get_keyboard();
         if (key < 0) {
@@ -611,7 +788,11 @@ static void process_input(void)
         //     saw only the release and Enter silently did nothing while letters
         //     and Esc worked.
         if (elevate_modal_open()) {
-            if (key >= 0 && key <= 0x8F) elevate_handle_key(key);
+            // #243: the nav/editing keys (GUI_KEY_HOME..GUI_KEY_DEL, 0x100-0x105)
+            // are included so Home/End/Delete work in the prompt's password
+            // field. They used to reach it as the letters G/O/S instead.
+            if ((key >= 0 && key <= 0x8F) ||
+                (key >= GUI_KEY_HOME && key <= GUI_KEY_DEL)) elevate_handle_key(key);
             continue;
         }
         // #745 (task #68) THE GATE. This single call replaced
@@ -631,12 +812,20 @@ static void process_input(void)
         // Special key presses: 0x80-0x8F (F1-F12, arrows, etc.).
         // Special key releases: 0x90-0x9F (special key + 0x10).
         // Regular key releases: char | 0x80 (>= 0xA0 for printable).
-        // We want to process 0x00-0x8F as key-down events, plus the one
-        // special-case press code that lives in the release range: 0x9B is
-        // KEY_SUPER (kernel cpu/isr.h, #552) -- the Super/GUI/Windows key.
-        // It could not fit in 0x80-0x8F because every byte there is already
-        // taken (several of them by more than one meaning; see isr.c).
-        if ((key >= 0 && key <= 0x8F) || key == 0x9B /* KEY_SUPER */) {
+        // We want to process 0x00-0x8F as key-down events, plus the two
+        // special-case press codes that live in the release range: 0x9B is
+        // KEY_SUPER (kernel cpu/isr.h, #552) -- the Super/GUI/Windows key --
+        // and 0x9D is KEY_PRINTSCREEN (#148). Neither could fit in 0x80-0x8F
+        // because every byte there is already taken (several of them by more
+        // than one meaning; see isr.c).
+        // #243: and the nav/editing block at 0x100-0x105, which is ABOVE every
+        // byte code listed above. process_events() dispatches s_last_key to
+        // whichever modal owns the keyboard (start-menu search, sticky notes,
+        // widget settings fields), and those are text fields that want Home/
+        // End/Delete. Before #243 they received G/O/S there.
+        if ((key >= 0 && key <= 0x8F) || key == 0x9B /* KEY_SUPER */
+            || key == 0x9D /* KEY_PRINTSCREEN */
+            || (key >= GUI_KEY_HOME && key <= GUI_KEY_DEL)) {
             s_last_key = key;
         }
     }
@@ -675,16 +864,23 @@ static void process_input(void)
     // Throttled because it opens a file. The helper early-outs on its own once
     // the flag is clear, so this costs nothing for the rest of the session; the
     // uptime check exists only to bound the cost WHILE setup is still pending.
-    if (g_setup_pending) {
+    // #203: EITHER flag keeps this poll alive. g_setup_pending ends at Apply,
+    // when SETUPDONE lands; g_setup_handover_armed ends at Finish, when the
+    // machine actually changes hands. Polling only while g_setup_pending was
+    // true is what made the handover watch unreachable.
+    if (g_setup_pending || g_setup_handover_armed) {
         static uint64_t s_last_setup_check;
         uint64_t now = uptime_ms();
         if (now - s_last_setup_check >= 500) {
             s_last_setup_check = now;
+            bool was_pending = g_setup_pending;
             setup_pending_recheck();
-            // Force a real repaint on the transition, rather than waiting for
-            // the next non-motion input: the whole point is that the desktop
-            // comes back by itself.
-            if (!g_setup_pending) g_needs_redraw = true;
+            // Force a real repaint on the TRANSITION (guarded by was_pending,
+            // or this would request a redraw every 500ms for the rest of the
+            // wizard's life now that the poll outlives g_setup_pending),
+            // rather than waiting for the next non-motion input: the whole
+            // point is that the desktop comes back by itself.
+            if (was_pending && !g_setup_pending) g_needs_redraw = true;
         }
     }
 }
@@ -829,15 +1025,16 @@ void dock_style_write_cfg(int v) {
     sys_close(fd);
 }
 // (#745) dock-opacity live channel, modelled exactly on the dock-style pair
-// above: Settings writes an ASCII integer (70..100, percent OPAQUE) to
-// DOCKOPAC.CFG, the compositor polls it and applies live, profile.c persists it
-// to UIPROFIL.YML, and the compositor seeds the file at boot so Settings opens
-// showing what is actually running.
+// above: Settings writes an ASCII integer (DOCK_OPACITY_MIN..MAX, percent
+// OPAQUE) to DOCKOPAC.CFG, the compositor polls it and applies live, profile.c
+// persists it to UIPROFIL.YML, and the compositor seeds the file at boot so
+// Settings opens showing what is actually running.
 void dock_opacity_write_cfg(int v) {
-    if (v < 70)  v = 70;   // #745 dockgrey (2026-08-12): floor 60 -> 70, see the
-                            // matching clamp in dock_opacity_poll() below and
-                            // glass_render()'s floor comment in draw.c
-    if (v > 100) v = 100;
+    // (#132) This clamp only guards against a garbage/out-of-range write; it
+    // is NOT the contrast floor any more (that was DOCK_OPACITY_WARN's 70/73
+    // predecessors, moved into a Settings-side warning - see dock_opacity.h).
+    if (v < DOCK_OPACITY_MIN) v = DOCK_OPACITY_MIN;
+    if (v > DOCK_OPACITY_MAX) v = DOCK_OPACITY_MAX;
     int fd = userconf_open_write("DOCKOPAC.CFG");
     if (fd < 0) return;
     char b[4];
@@ -847,6 +1044,25 @@ void dock_opacity_write_cfg(int v) {
     sys_write(fd, b, (unsigned long)n);
     sys_close(fd);
 }
+
+// (#123) The seed-writers for the two new channels. Deliberately clamped here
+// too, not only on read: this file is what SEEDS the CFG Settings opens with,
+// so writing an out-of-range value would show the user a number the compositor
+// would then refuse.
+static void dock_num_write_cfg(const char *name, int v, int lo, int hi) {
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    int fd = userconf_open_write(name);
+    if (fd < 0) return;
+    char b[8];
+    int n = 0;
+    if (v >= 100) { b[n++] = (char)('0' + v / 100); v %= 100; b[n++] = (char)('0' + v / 10); b[n++] = (char)('0' + v % 10); }
+    else          { b[n++] = (char)('0' + v / 10);  b[n++] = (char)('0' + v % 10); }
+    sys_write(fd, b, (unsigned long)n);
+    sys_close(fd);
+}
+void dock_height_write_cfg(int v) { dock_num_write_cfg("DOCKHGT.CFG",  v, 44,  96);  }
+void dock_zoom_write_cfg(int v)   { dock_num_write_cfg("DOCKZOOM.CFG", v, 100, 200); }
 
 static void dock_opacity_poll(void) {
     int fd = userconf_open_read("DOCKOPAC.CFG", "/DOCKOPAC.CFG");   // #683 fallback
@@ -859,13 +1075,59 @@ static void dock_opacity_poll(void) {
     int v = 0, any = 0;
     for (long i = 0; i < n && b[i] >= '0' && b[i] <= '9'; i++) { v = v * 10 + (b[i] - '0'); any = 1; }
     if (!any) return;
-    if (v < 70)  v = 70;      // the derived contrast floor; below it chrome
-    if (v > 100) v = 100;     // labels stop meeting 4.5:1 over a worst-case backdrop
+    // (#132) Was a hard 70/100 clamp ("the derived contrast floor"). That
+    // floor is real (see draw.c glass_render()/taskbar.c flat_chrome_alpha()
+    // for the measurements) but is now a Settings-side WARNING, not something
+    // this poll silently overrides - honour whatever the user actually set,
+    // down to DOCK_OPACITY_MIN.
+    if (v < DOCK_OPACITY_MIN) v = DOCK_OPACITY_MIN;
+    if (v > DOCK_OPACITY_MAX) v = DOCK_OPACITY_MAX;
     if (v != g_dock_opacity) {
         g_dock_opacity = v;
         glass_invalidate_all();   // alpha changed: every cached strip is stale
         g_needs_redraw = true;
     }
+}
+
+// (#123) Height + hover-zoom live channels. Same shape as the opacity pair
+// above (Settings writes an ASCII integer, the compositor polls and applies,
+// profile.c persists), with two differences that matter:
+//   - a HEIGHT change moves the desktop work area (taskbar_bottom_inset()
+//     follows g_dock_height), so it must push the new struts to the kernel WM
+//     and re-clamp icons/widgets. taskbar_apply_work_area() is the ONE function
+//     that does all of that; not calling it leaves maximized windows overlapping
+//     the dock, exactly as a live style switch would.
+//   - a height change also changes the glass surface's geometry, which
+//     invalidates the cached strip. glass_render() would notice on its own
+//     (geom_same compares w/h), but invalidating explicitly keeps this identical
+//     to the opacity path and costs one call on a change that happens at human
+//     speed.
+static void dock_num_poll(const char *name, const char *legacy, int lo, int hi, int *dst,
+                          int *changed) {
+    int fd = userconf_open_read(name, legacy);
+    if (fd < 0) return;
+    char b[8];
+    long n = sys_read(fd, b, sizeof(b) - 1);
+    sys_close(fd);
+    if (n <= 0) return;
+    b[n] = '\0';
+    int v = 0, any = 0;
+    for (long i = 0; i < n && b[i] >= '0' && b[i] <= '9'; i++) { v = v * 10 + (b[i] - '0'); any = 1; }
+    if (!any) return;
+    if (v < lo) v = lo;
+    if (v > hi) v = hi;
+    if (v != *dst) { *dst = v; *changed = 1; }
+}
+
+static void dock_geom_poll(void) {
+    int h_changed = 0, z_changed = 0;
+    dock_num_poll("DOCKHGT.CFG",  "/DOCKHGT.CFG",  44,  96,  &g_dock_height, &h_changed);
+    dock_num_poll("DOCKZOOM.CFG", "/DOCKZOOM.CFG", 100, 200, &g_dock_zoom,   &z_changed);
+    if (h_changed) {
+        glass_invalidate_all();     // the dock surface's geometry changed
+        taskbar_apply_work_area();  // struts + icon/widget re-clamp
+    }
+    if (h_changed || z_changed) g_needs_redraw = true;
 }
 
 static void dock_style_poll(void) {
@@ -968,16 +1230,114 @@ static void widgets_cfg_poll(void) {
 }
 
 // ============================================================================
+// GLOBALLY_CAPTURED_KEYS (#232) - THE COMPLETE LIST, IN ONE PLACE
+// ============================================================================
+//
+// This existed nowhere before, which is how a bare F1 came to be a system hotkey
+// without anyone weighing it against "F1 is Help in every application ever
+// written". A global key binding is a claim against EVERY app, EVERY game, the
+// DOS interpreter and the Win16 interpreter at once, and none of them can
+// negotiate. So the list has to be short, it has to be visible, and every entry
+// has to justify itself. Anything not on this list reaches the focused window.
+//
+// THE RULE: a system-global binding must be a CHORD (Super+x) or a key whose
+// ONLY meaning is the system action (PrintScreen, the media keys). A bare
+// letter or a bare F-key is never acceptable, for exactly the reason terminals
+// put their own shortcuts on Ctrl+Shift rather than on Ctrl.
+//
+//   KEY              WHERE                          APP ALSO SEES IT?   LIVE FULL-SCREEN?
+//   Vol Up/Dn/Mute   kernel cpu/isr.c (#162)        NO, never cooked    YES: never ours
+//   Caps Lock        kernel cpu/isr.c               NO, never cooked    YES: never ours
+//   PrintScreen      this file, screenshot_hotkey   yes (0x9D is inert) YES: deliberate
+//   F11              this file + kernel gui/window  yes                 YES: THE ESCAPE HATCH
+//   Super            this file, startmenu_toggle    yes                 no (#232)
+//   Super + L        this file, lock_enter (#566)   yes ('l' is sent)   no (#232)
+//   Super + Space    this file, launcher_toggle     yes (' ' is sent)   no (#232)
+//   Esc              this file, close-an-overlay    yes, unless a modal no overlay can be
+//                                                   claims it              open under one
+//
+// The last column is #232's second half: a FULL-SCREEN APP OWNS THE KEYBOARD.
+// See the long note at the top of process_events() for the rule, what counts as
+// full screen, and why F11 is the one binding that stays live.
+//
+// F11 IS THE ONE BARE KEY LEFT, and it is kept deliberately, not by oversight:
+// leave-fullscreen is the one action that must work when the fullscreen app
+// itself is wedged and never presents again, F11 is the near-universal
+// convention for exactly that, and it is what #158 was specified against. It is
+// still a bare-key global and therefore still a claim against every app; if a
+// title turns up that genuinely needs F11, that is the ticket to reopen, not
+// this comment.
+//
+// THE "APP ALSO SEES IT" COLUMN IS NOT A MISTAKE. process_input() calls
+// sys_inject_key() for every key that no modal claims, and it runs BEFORE this
+// function, so a global shortcut here is normally an ADDITION to delivery, not
+// a replacement for it. That is why removing the F1 binding was the whole fix
+// and no new suppression was needed: the app was already getting F1.
+//
+// NOT COVERED HERE, AND KNOWN: a DOS guest reads the raw scancode tap in
+// cpu/isr.c, which is armed on kernel WM focus only (#156) and is NOT informed
+// when a compositor OVERLAY (this file's launcher, start-menu search, a sticky
+// note) takes the keyboard. So text typed into one of those overlays still
+// reaches a focused DOS guest. That is the same "two consumers, one keystroke"
+// shape #156 fixed for the unfocused case and it wants the same treatment: the
+// compositor telling the kernel that a modal owns the keyboard. Filed, not
+// fixed here.
+// ============================================================================
+
+// ============================================================================
 // process_events: dispatch input to the correct UI layer
 // ============================================================================
 
 static void process_events(void)
 {
+    // #232 A FULL-SCREEN APP OWNS THE KEYBOARD.
+    //
+    // THE PRINCIPLE, and it is the same one that took the AI launcher off F1: a
+    // global hotkey is a claim against every application at once. On a desktop,
+    // with a taskbar and other windows visible, "Super opens the start menu" is
+    // a fair claim. Over a full-screen game it is not: the key is one the game
+    // may want, and firing the binding YANKS THE USER OUT of what they were
+    // doing with no warning. So while a full-screen app is on top, the
+    // compositor's own bindings stand down and the app gets the keyboard.
+    //
+    // WHAT COUNTS AS FULL SCREEN. Both mechanisms, because both produce the
+    // same situation for the user:
+    //   * fullscreen_app_on_top() - the BOUNDS heuristic (#596): a visible,
+    //     non-minimised window covering the entire framebuffer. A MAXIMISED
+    //     window does not trip this, because maximise leaves the taskbar strip
+    //     visible, so its height is short of g_fb_height.
+    //   * sys_wm_fullscreen_status() >= 0 - #158 NATIVE fullscreen, the
+    //     explicit kernel-tracked state a titlebar button enters.
+    //
+    // THE ESCAPE HATCH IS F11, and it is deliberately the ONE binding that
+    // stays live (see its branch below). It is the near-universal convention
+    // for leaving full screen, #158 already specified it as the way out that
+    // must work even when the app itself is wedged, and it is handled here in
+    // the compositor's own process, above the app. Leaving full screen restores
+    // every other binding at once, so the whole rule is "one key gets you out,
+    // everything else belongs to the app".
+    //
+    // ALSO STILL LIVE, and why: PrintScreen (screenshotting a game is a primary
+    // use of a screenshot key, the key is never typed into anything, and
+    // screenshot_hotkey_fire() already has a dedicated stays-fullscreen path
+    // for exactly this case), and the kernel's volume/mute keys, which never
+    // enter the cooked ring at all (cpu/isr.c, #162) and so were never the
+    // compositor's to stand down from.
+    //
+    // SUPER IS PRESS-ONLY. cpu/isr.h emits KEY_SUPER (0x9B) on the press and
+    // NO release code, ever - measured, and stated in libc/gui_mods.h. So this
+    // suppression is written per-PRESS and never waits for a release; code that
+    // waited for one would wait forever. It also declines to ARM the chord
+    // window, so a Super pressed under a full-screen app cannot combine with an
+    // 'l' or a space typed a moment later.
+    const bool fs_owns_kbd = fullscreen_app_on_top() ||
+                             (sys_wm_fullscreen_status() >= 0);
+
     // #566: record a Super press timestamp regardless of which branch below
     // ends up consuming it, so the Super+L chord check further down always
     // sees an up-to-date window even if the start menu (or another modal)
     // intercepts the key first.
-    if (s_last_key == 0x9B /* KEY_SUPER */) {
+    if (s_last_key == 0x9B /* KEY_SUPER */ && !fs_owns_kbd) {
         s_super_press_ms = uptime_ms();
     }
 
@@ -1016,7 +1376,8 @@ static void process_events(void)
     // #566 Super+L: highest priority after the lock gate itself, so it fires
     // even if the start menu (opened by the Super press moments earlier) or
     // another overlay would otherwise capture 'l'/'L' first.
-    if (s_last_key >= 0 && (s_last_key == 'l' || s_last_key == 'L') &&
+    if (s_last_key >= 0 && !fs_owns_kbd &&
+        (s_last_key == 'l' || s_last_key == 'L') &&
         s_super_press_ms != 0 &&
         (uptime_ms() - s_super_press_ms) < SUPER_L_WINDOW_MS) {
         s_super_press_ms = 0;
@@ -1025,9 +1386,73 @@ static void process_events(void)
         return;
     }
 
+    // #232 Super+Space: open/close the AI command launcher (Spotlight). Same
+    // priority and same mechanism as Super+L directly above, and deliberately
+    // ABOVE the g_modal_grabs[] typing tier, so the space is not typed into the
+    // start-menu search field that the Super press moments earlier opened.
+    //
+    // WHY A CHORD AND NOT A BARE KEY. The launcher used to be on bare F1 (see
+    // the long note at its old site further down this function). A single
+    // unmodified key cannot be a system-global hotkey on a desktop that runs
+    // full-screen games, a DOS interpreter and a Win16 interpreter: every one
+    // of those has its own meaning for the F-keys and no way to negotiate.
+    // Super is the one key nothing in an app's key map claims, which is why
+    // the start menu, the lock chord and now this all hang off it.
+    //
+    // The Super press ITSELF still toggles the start menu (that is Super's
+    // documented job, #552), so this closes the menu that press opened before
+    // showing the launcher, the same way lock_enter() force-closes it.
+    if (s_last_key == ' ' && !fs_owns_kbd && s_super_press_ms != 0 &&
+        (uptime_ms() - s_super_press_ms) < SUPER_L_WINDOW_MS) {
+        s_super_press_ms = 0;
+        s_last_key = -1;
+        if (g_start_menu_open) startmenu_toggle();
+        launcher_toggle();
+        return;
+    }
+
     // While the screensaver is active, suppress all UI events
     if (screensaver_check_timeout()) {
         return;
+    }
+
+    // #148: PrintScreen takes an immediate screenshot, UNCONDITIONALLY,
+    // regardless of which (if any) modal owns the keyboard - checked here,
+    // before the g_modal_grabs[] typing-tier walk below, the same
+    // "outranks every overlay" priority Super+L uses above. A held text
+    // field (start-menu search, a sticky note, the AI launcher, ...) cannot
+    // mistake byte 0x9D for a printable character, so there is nothing
+    // PrintScreen could corrupt by not being swallowed; making "does my
+    // screenshot key work" depend on unrelated UI state would be a worse
+    // bug than the one this fixes. It IS still gated by the lock-screen
+    // (exclusive tier, returns above this function) and the screensaver
+    // check immediately above, matching every other shortcut - neither of
+    // those is something a keystroke should be able to capture through.
+    // Deliberately NOT added to g_modal_grabs[]: that table decides who
+    // receives TYPED input, and this key is never typed anywhere. Capturing
+    // with a menu or dropdown open is also a useful #141 cross-check (stale
+    // dropdown pixels left on the framebuffer after a menu switch): the shot
+    // should show what is really composited, stuck pixels included.
+    if (s_last_key == 0x9D /* KEY_PRINTSCREEN, kernel cpu/isr.h */) {
+        // #148 (local 164, 2026-08-18) OWNER'S FULL SPEC: PrintScreen is
+        // ALWAYS a fire-and-forget full-screen capture (no drag/region UI is
+        // ever reached from this hotkey - that stays an in-app Snapshot mode,
+        // entered only via its own "New" + rectangle tool). What happens
+        // AFTER the capture depends on fullscreen (#158) state, and
+        // screenshot_hotkey_fire() (screenshot.c) makes that call itself:
+        //   A. Native-fullscreen on top: STAYS fullscreen, shows the
+        //      bottom-right thumbnail toast (see native_fullscreen_try_render()
+        //      below for where that toast actually gets drawn).
+        //   B. Otherwise: opens Maytera Snap on the capture, bottom-left,
+        //      without stealing focus.
+        // ORDER-SENSITIVE regardless of which path: screenshot_hotkey_fire()
+        // captures BEFORE reading fullscreen status, so the shot always shows
+        // whatever #158's own SYS_WM_FULLSCREEN_RENDER most recently wrote
+        // into g_fb (the app's real content), never a desktop recomposite -
+        // and path A never calls anything that changes fullscreen state, so
+        // there is nothing later in this same key handler that could race it.
+        screenshot_hotkey_fire();
+        s_last_key = -1;
     }
 
     // Keyboard: global shortcuts
@@ -1035,14 +1460,21 @@ static void process_events(void)
         int key = s_last_key;
         const modal_grab_t *mg_kbd = modal_grab_keyboard();
 
-        // F1 toggles the command launcher (Spotlight) - a keyboard equivalent of
-        // the taskbar Maytera-logo button, so the launcher is reachable without
-        // the pointer. Handled before the modal key-capture below so it can also
-        // close the launcher.
-        if (key == 0x88 /* F1 */) {
-            launcher_toggle();
-            s_last_key = -1;
-        } else
+        // #232: THE AI LAUNCHER IS NO LONGER ON F1. It used to be, right here,
+        // as `if (key == 0x88 /* F1 */) { launcher_toggle(); }` - an
+        // UNCONDITIONAL global capture, ahead of the modal walk and ahead of
+        // every app. F1 is not a spare key: it is Help in essentially every
+        // application ever written (libhelp's own HELP_UI_KEY_F1 is F1), and it
+        // is a plain game key - DOS Joust prints "F1: START GAME" on its title
+        // screen and reaches its start-a-game routine ONLY through its INT 9
+        // hook on scancode 0x3B. Pressing it opened the AI prompt panel over
+        // the top of the game every single time. The binding moved to
+        // Super+Space, the same shape as macOS Spotlight's Cmd+Space and
+        // Windows' Win+S, and for the same reason terminals put their shortcuts
+        // on Ctrl+Shift: a global consumer must use a chord an ordinary
+        // application will never send. The taskbar Maytera-logo button is
+        // unchanged and is still the pointer route to the same launcher_toggle().
+        //
         // #745 (task #68) THE DISPATCH WALK. This one branch replaced a
         // seven-deep else-if chain (launcher, power-confirm, item-properties,
         // icon picker, widget settings, sticky editor, start menu) that had to
@@ -1062,9 +1494,26 @@ static void process_events(void)
         // apps. (F5 settings launcher removed too for consistency.)
 
 
-        // F11: toggle maximize/restore of the focused app window.
+        // F11 (#158). CHECKED before landing this ticket: F11 was already
+        // bound to sys_wm_maximize_focused() (below) - this is not a fresh
+        // binding, it is an ADDITIONAL branch ahead of it. The owner's own
+        // wording ("F11 to move back to windowed mode") only specifies the
+        // EXIT direction, so that pre-existing maximize toggle is left
+        // running unchanged for the non-fullscreen case: there is a reason
+        // not to make this a full symmetric toggle (an existing, working
+        // binding), so ENTER stays button-only (kernel titlebar chrome).
+        // Handled HERE, above any per-app routing, in the compositor's own
+        // input loop - a SEPARATE Ring-3 process from whatever app is
+        // fullscreen, so this keeps working even if that app is wedged and
+        // never presents again (the ticket's hard requirement: F11 must be
+        // handled ABOVE the app).
         if (key == 0x85) {
-            sys_wm_maximize_focused();
+            if (sys_wm_fullscreen_status() >= 0) {
+                sys_wm_fullscreen_exit();
+                native_fullscreen_watchdog_reset();
+            } else {
+                sys_wm_maximize_focused();
+            }
             s_last_key = -1;
         }
 
@@ -1072,7 +1521,12 @@ static void process_events(void)
         // Same action, same function as the taskbar start button and the
         // old ESC-closes-it path below: startmenu_toggle() is the single
         // code path, so this is not a second parallel start-menu mechanism.
-        if (key == 0x9B /* KEY_SUPER, kernel cpu/isr.h */) {
+        // #232: NOT while a full-screen app owns the keyboard. This is the
+        // binding the owner named ("disable the windows key when we have any
+        // full screen app open") and it is the clearest case: opening the start
+        // menu over a game covers it, takes the keyboard for the search field,
+        // and is almost never what the person pressing it meant.
+        if (key == 0x9B /* KEY_SUPER, kernel cpu/isr.h */ && !fs_owns_kbd) {
             startmenu_toggle();
             s_last_key = -1;
         }
@@ -1089,8 +1543,22 @@ static void process_events(void)
             }
         }
 
-        // Forward key to the login layer if it wants it (post-login this is a no-op)
-        login_handle_key(key);
+        // (#73) THE DEAD KEY SINK WAS HERE, and the comment above it was wrong in
+        // the way that matters: "post-login this is a no-op" was the reason nobody
+        // looked. It was NOT a no-op. login_handle_key() ran for every key that
+        // reached this fallthrough, and the compositor's own login state machine
+        // was left armed in LOGIN_STATE_SELECT_USER by login_init(), so a single
+        // '1'..'9' (there are 3 accounts on the golden) moved it to
+        // LOGIN_STATE_PASSWORD and every printable key after that was appended to
+        // a plaintext g_password[] belonging to a screen that is never drawn and
+        // whose only reset path, login_run()'s loop, was commented out. Enter then
+        // called sys_authenticate() for real.
+        //
+        // The fix is DELETION, not a guard: a guard on dead code is two things to
+        // maintain and one of them is a lie. There is nothing left to forward to.
+        // If a compositor-owned surface ever needs keys again it joins
+        // g_modal_grabs[] above (the #68 registry), which is the ONE definition of
+        // who owns a keystroke - it does not get a second, ungated call site here.
         }   // end else (widget Settings dialog not open)
     }
 
@@ -1127,7 +1595,10 @@ static void process_events(void)
     // Same rule and same reasoning as the #745 setup-pending gate directly
     // above, and it reads the SAME predicate the renderer uses rather than a
     // second copy, so "drawn" and "clickable" cannot disagree again.
-    const bool bar_live = chrome_live && !fullscreen_app_on_top();
+    // #232: reuses the fs_owns_kbd computation from the top of this function
+    // rather than asking again. Two queries a frame that must agree is how
+    // "drawn" and "clickable" drifted apart in the first place.
+    const bool bar_live = chrome_live && !fs_owns_kbd;
 
     // Desktop pet: once grabbed, keep dragging until the button is released,
     // then let it fall under gravity onto the taskbar.
@@ -1174,6 +1645,9 @@ static void process_events(void)
     }
     if (!consumed && startmenu_properties_open()) {
         consumed = startmenu_properties_handle_mouse(g_mouse_x, g_mouse_y, s_left_pressed);
+    }
+    if (!consumed && taskbar_force_quit_confirm_open()) {
+        consumed = taskbar_force_quit_confirm_handle_mouse(g_mouse_x, g_mouse_y, s_left_pressed);
     }
     // #44 "Change Icon" file picker: also a true modal, same priority.
     if (!consumed && iconpicker_is_open()) {
@@ -1280,6 +1754,14 @@ static void process_events(void)
         static int s_prev_mx = -1;
         static int s_prev_my = -1;
 
+        // Cross-window drag: refresh the ghost from the kernel session. This
+        // is the ONLY per-frame cost the docking protocol adds to the
+        // compositor, and it self-gates on the button mask BEFORE making any
+        // syscall, so an idle desktop pays one integer test. It reads the same
+        // g_mouse_x/g_mouse_y about to be injected below, so the ghost cannot
+        // lag the pointer by a frame.
+        dragghost_poll(g_mouse_x, g_mouse_y, (unsigned int)g_mouse_buttons);
+
         if (g_mouse_x != s_prev_mx || g_mouse_y != s_prev_my) {
             sys_inject_mouse(g_mouse_x, g_mouse_y, MOUSE_EVENT_MOVE, 0);
             s_prev_mx = g_mouse_x;
@@ -1304,6 +1786,15 @@ static void process_events(void)
 
         if (s_left_released) {
             sys_inject_mouse(g_mouse_x, g_mouse_y, MOUSE_EVENT_UP, 1);
+            // Cross-window drag: the release is what commits a drop. Deliberately
+            // AFTER the injection above, so a target window receives the ordinary
+            // EVENT_MOUSE_UP it would have got anyway BEFORE it is told a payload
+            // is waiting. No-op when no drag is in flight.
+            //
+            // The kernel resolves the drop target itself from this point; the
+            // compositor cannot name one. That is what keeps a drop from being
+            // redirected to a window that is not really under the cursor.
+            dragghost_release(g_mouse_x, g_mouse_y);
         }
 
         // Right-button press: route to the window under the cursor so the app
@@ -1418,12 +1909,128 @@ static bool fullscreen_in_list(const wm_window_info_t *wins, int n) {
 // suppression chokepoint rather than adding a second mechanism.
 bool g_setup_pending = false;
 
+// #203: ARMED WHEN THE FIRST-BOOT WIZARD IS SPAWNED, AND DELIBERATELY NOT THE
+// SAME FLAG AS g_setup_pending.
+//
+// g_setup_pending means "hide the chrome, this machine is unconfigured", and it
+// is cleared the moment /CONFIG/SETUPDONE appears. The wizard writes SETUPDONE
+// at the end of apply(), which runs when Continue is pressed on the LAST page -
+// one page BEFORE Finish. The first version of this handover watched for the
+// Finish marker from inside setup_pending_recheck(), which the input tick only
+// calls while g_setup_pending is true, so the watch stopped existing before the
+// event it was watching for could happen. It never fired once, on a machine
+// where every other part of the change worked.
+//
+// "The machine is unconfigured" and "the first-run wizard is still on screen"
+// are two facts that end at two different moments. One flag cannot carry both.
+bool g_setup_handover_armed = false;
+
 // Re-read the marker cheaply; the wizard writes it as its LAST action, so this
 // is how the desktop comes back without a reboot. Throttled by the caller.
+//
+// #136 (owner ticket, userland/apps/setup/main.rs's "Skip to Desktop" corner
+// control): SETUPDONE means "genuinely configured, never show the wizard
+// again". SETUPSKIP is deliberately a SEPARATE, weaker marker meaning "let
+// the chrome through for the rest of THIS boot only" - the wizard writes it
+// instead of SETUPDONE precisely so the next boot still finds SETUPDONE
+// absent and respawns /APPS/SETUP. See the boot-time spawn site below
+// (search g_setup_pending = true) for the other half of this contract: it
+// deletes any stale SETUPSKIP before arming g_setup_pending, so a marker
+// left behind by a skipped session can never be mistaken for consent to
+// skip a LATER boot's wizard.
 void setup_pending_recheck(void) {
+    // THE HANDOVER WATCH, checked FIRST and gated on its OWN flag so that
+    // clearing g_setup_pending (which happens one page early, at Apply) cannot
+    // switch it off. See g_setup_handover_armed above.
+    if (g_setup_handover_armed) {
+    // =======================================================================
+    // #203 (owner report) / #126 Part A: A LOGIN IS A SESSION BOUNDARY, AND
+    // FINISHING THE FIRST-RUN WIZARD IS A LOGIN.
+    //
+    // OWNER REPORT, verbatim: "in the first run wizard we created a user
+    // (james) and then it logged us in as root?" Reproduced on golden 2007:
+    // every write the wizard makes SUCCEEDS and PERSISTS - the account is
+    // created, LOGIN.CFG is written, the next boot honours it - and the
+    // machine is STILL root's, because the wizard runs INSIDE the session that
+    // shipped autologin=root and Finish only exits the SETUP process. The
+    // compositor beneath it never went anywhere, so every app the owner opens
+    // in the minutes after setup runs as uid 0.
+    //
+    // THE HANDOVER IS THE ONE THE MACHINE ALREADY HAS. Log Out is a plain
+    // sys_exit(0) (startmenu.c case 3); gui/desktop.c notices the pid is gone
+    // and returns; main.c's #566 login-gate loop re-runs login_init() +
+    // login_run(), which RE-EVALUATES login_check_autologin() within the same
+    // boot. Measured on the #203 reproduction machine:
+    //
+    //     compositor: Log Out -> clean exit for login re-entry
+    //     [Desktop] Compositor (pid 21) exited; returning to login gate
+    //     [LOGIN] Auto-login as james (uid=1001)
+    //
+    // No reboot and no new syscall.
+    //
+    // WHY /CONFIG/SETUPNEW AND NOT /CONFIG/SETUPDONE. SETUPDONE is written at
+    // the END OF the wizard's apply(), which runs when Continue is pressed on
+    // the last page - BEFORE the Done page is drawn. Keying this exit off
+    // SETUPDONE takes the desktop away about half a second after Apply and the
+    // person never sees the Done page or presses Finish. SETUPNEW is written
+    // as the LAST thing Finish does, and only in the first-boot flow, so it
+    // means exactly "the machine just changed hands". UNLINKED BEFORE THE
+    // EXIT: a marker that survives is a marker that logs somebody out on a
+    // later boot for no reason (the #136 stale-SETUPSKIP failure, one file
+    // over).
+    //
+    // WHY THIS BELONGS ON TOP OF #126 PART A AND NOT ON ITS OWN. Exiting here
+    // without Part A's session teardown would hand the incoming user the
+    // OUTGOING user's live, focusable, ROOT-OWNED windows - the
+    // privilege-escalation path #126 measured (a standard user driving a
+    // root-owned Settings process into Users & Accounts). Part A stamps the
+    // compositor as session leader and SIGKILLs the departing session at the
+    // gate, which is what makes this exit safe rather than merely convenient.
+    // That is why #203's standalone five-line version was not taken and this
+    // branch was landed instead.
+    // =======================================================================
+    //
+    // #229 UPDATE: THE MARKER IS NO LONGER A FILE, AND THE PARAGRAPH ABOVE IS
+    // WHY IT SHOULD NEVER HAVE BEEN ONE.
+    //
+    // Read it again: SETUPNEW means "for this boot only", and the note about
+    // unlinking it before the exit is a stale-marker cleanup bolted onto a
+    // per-boot signal that was being stored on persistent media. The same
+    // paragraph one file over describes #136, the identical bug with
+    // SETUPSKIP. Worse, both the marker and its cleanup are writes to /CONFIG,
+    // which is root-owned 0711 - so on a non-root session (every session since
+    // #226 removed autologin=root) the wizard could not raise the signal AND
+    // this could not clear it.
+    //
+    // SYS_FIRSTRUN(FR_HANDOVER_TAKE) is a CONSUMING read of one bit of kernel
+    // state that starts clear at every boot because .bss starts clear at every
+    // boot. There is no marker to leave behind, so there is no cleanup to get
+    // right and no permission for it to fail on. See kernel/rustkern/
+    // firstrun.rs.
+        if (sys_firstrun(FR_HANDOVER_TAKE) == 1) {
+            g_setup_pending = false;
+            g_setup_handover_armed = false;
+            sys_bootlog("compositor: first-run wizard finished -> clean exit to hand the session over (#203/#126)");
+            sys_exit(0);
+            return;   // not reached
+        }
+    }
     if (!g_setup_pending) return;
+    // No handover marker: the wizard is done (or was skipped) but this session
+    // is not changing hands, so only un-suppress the desktop. This is the
+    // pre-#203 behaviour and it stays the behaviour on every path that is not
+    // a first-boot Finish - a crashed wizard, a Skip to Desktop, or the #126
+    // reduced personalisation flow.
     int fd = sys_open("/CONFIG/SETUPDONE", 0);
-    if (fd >= 0) { sys_close(fd); g_setup_pending = false; }
+    if (fd >= 0) { sys_close(fd); g_setup_pending = false; return; }
+    // #229: the escape hatch, now a kernel flag rather than /CONFIG/SETUPSKIP.
+    // A uid-1000 wizard could not create that file, so "Skip to Desktop" told
+    // the person "Could not reach the desktop; try again." and meant it
+    // permanently: the one control that exists for when a step fails had the
+    // same failure mode as the step. FR_SKIP_GET is a plain read of a bit and
+    // cannot refuse. SETUPDONE is still a file because it is a DURABLE machine
+    // fact; the difference is the whole point of the split.
+    if (sys_firstrun(FR_SKIP_GET) == 1) { g_setup_pending = false; }
 }
 
 static bool fullscreen_app_on_top(void) {
@@ -1436,6 +2043,133 @@ static bool fullscreen_app_on_top(void) {
     int n = wm_get_windows(wins, 16);
     return fullscreen_in_list(wins, n);
 }
+
+// ============================================================================
+// #158 NATIVE FULLSCREEN.
+//
+// Distinct from fullscreen_app_on_top() above (#596): that predicate is a
+// BOUNDS heuristic (any window covering the whole fb hides desktop chrome)
+// and still runs the full compositor_render_windows() kernel composite every
+// frame. This is an EXPLICIT, kernel-tracked, user-invoked state (the
+// titlebar button or F11) for exactly ONE window at a time, and it replaces
+// the WHOLE render_frame_body() layer stack - wallpaper, icons, widgets, and
+// the per-window chrome/corner/widget draw loop SYS_COMPOSITOR_RENDER_WINDOWS
+// runs - with one direct kernel blit (SYS_WM_FULLSCREEN_RENDER). That redraw
+// cost, MEASURED at 256-272 blits/s and 424-474 MB/s with two windows open
+// (#153 instrumentation), is what this feature exists to cut to ~zero.
+//
+// THE WAY BACK lives mostly in the KERNEL (kernel/gui/window.c: focus loss,
+// window close/crash, session lock, screensaver latch - see the #158 block
+// there), because #157 proved a display handed away must be reclaimable even
+// if the process that asked for it is wedged. This file adds the two paths
+// that can only live in userland: F11 (compositor's own input loop, ABOVE
+// whatever app is fullscreen) and the watchdog below (a live liveness signal
+// the kernel has no reason to police on its own clock).
+// ============================================================================
+
+// #158 WATCHDOG. Same shape as #157's g_fb_flip_count-vs-elapsed-time
+// discriminator: compare a monotonic "the app did real work" counter
+// (SYS_WM_FULLSCREEN_STATUS's packed window-id+commit-sequence) against
+// wall-clock time. An advancing counter is a live app; a stalled one is
+// recovered from. Much shorter than #157's 45s boot grace - this is a LIVE
+// desktop being taken over, not a one-shot boot handoff, so a wedged app
+// should be recovered from quickly rather than leaving the user staring at a
+// dead frame with no visible way out other than knowing to press F11 (which,
+// per the ticket, must ALSO keep working - this is the belt to that brace).
+#define NATIVE_FS_WATCHDOG_MS 8000
+static int64_t  s_fs_watch_key       = -1;   // last (id<<32|commit_seq) observed
+static uint64_t s_fs_watch_change_ms = 0;    // uptime_ms() it last changed
+
+static void native_fullscreen_watchdog_reset(void) {
+    s_fs_watch_key = -1;
+    s_fs_watch_change_ms = 0;
+}
+
+// true = watchdog fired and already called sys_wm_fullscreen_exit().
+static bool native_fullscreen_watchdog_tick(int64_t status) {
+    uint64_t now = uptime_ms();
+    if (status != s_fs_watch_key) {
+        s_fs_watch_key = status;
+        s_fs_watch_change_ms = now;
+        return false;
+    }
+    if (s_fs_watch_change_ms == 0) { s_fs_watch_change_ms = now; return false; }
+    if (now - s_fs_watch_change_ms >= NATIVE_FS_WATCHDOG_MS) {
+        notify_post("Fullscreen App Not Responding",
+                    "The app stopped presenting frames; the desktop was restored.",
+                    NOTIFY_WARNING);
+        sys_bootlog("compositor: #158 fullscreen watchdog fired (no content "
+                    "commit for NATIVE_FS_WATCHDOG_MS) - restoring the desktop");
+        sys_wm_fullscreen_exit();
+        native_fullscreen_watchdog_reset();
+        return true;
+    }
+    return false;
+}
+
+// Gate: the fast path only runs when NOTHING ELSE needs the screen. Reuses
+// g_modal_grabs[] (the #745 "THE DISPATCH WALK" table, main.c above) rather
+// than re-deriving "is anything open" a second way, plus the two overlay
+// flags that table deliberately excludes (setup wizard - see the NOTE on
+// fullscreen_app_on_top(); tray menu - consumes no keystroke, so the table
+// never listed it).
+static bool any_modal_or_overlay_open(void) {
+    extern bool g_setup_pending;
+    if (g_setup_pending || g_tray_menu_open) return true;
+    for (int i = 0; i < MG_COUNT; i++) {
+        if (g_modal_grabs[i].is_open && g_modal_grabs[i].is_open()) return true;
+    }
+    return false;
+}
+
+// The fast path. Returns true if it painted and presented a frame (caller
+// does nothing else this tick); false if the caller must run a normal
+// composite instead - which is what visibly restores the desktop, whether
+// because nothing is fullscreen, something else needs the screen, or the
+// kernel already self-healed the claim away.
+static bool native_fullscreen_try_render(void) {
+    int64_t status = sys_wm_fullscreen_status();
+    if (status < 0) { native_fullscreen_watchdog_reset(); return false; }
+
+    if (any_modal_or_overlay_open()) {
+        // #158: anything else that needs the screen reclaims it outright
+        // (Super key, launcher, wallpaper picker, ...) rather than racing an
+        // ambiguous "fullscreen app behind a menu" frame. The requested
+        // overlay then renders on the normal (now windowed) desktop.
+        sys_wm_fullscreen_exit();
+        native_fullscreen_watchdog_reset();
+        return false;
+    }
+
+    if (native_fullscreen_watchdog_tick(status)) return false;
+
+    if (sys_wm_fullscreen_render() != 0) {
+        // Kernel declined: self-healed away this frame (focus lost, window
+        // closed, owner died). Fall through to the normal composite, which
+        // repaints the real desktop.
+        native_fullscreen_watchdog_reset();
+        return false;
+    }
+
+    // #148 (local 164): the PrintScreen fullscreen toast. Drawn AFTER the
+    // app's own fresh frame just landed in g_fb and BEFORE the cursor, so it
+    // sits on top of real current content and under the pointer, every tick
+    // it is active. screenshot_fs_toast_draw() no-ops instantly when the
+    // toast is not armed (screenshot_fs_toast_active() check inside it), so
+    // this costs nothing on every other frame. See screenshot.c's toast
+    // module comment for why this must NOT go through notif.c/a resumed
+    // composite, and why no separate erase step is needed - the row-blit
+    // above already overwrites this exact region from scratch every time
+    // native_fullscreen_try_render() succeeds.
+    screenshot_fs_toast_draw();
+
+    cursor_render();
+    apply_display_effects();
+    idleprof_flip();   // #COMPIDLE: timed present
+    perfframe_mark("fullscreen");   // perf62: #158 native-fullscreen fast path
+    return true;
+}
+
 
 // #596: last uptime_ms() at which a TRUE-FULLSCREEN app window presented a
 // frame. screensaver.c reads this: a game/GL app that is actively rendering is
@@ -1858,6 +2592,10 @@ static void render_frame_body(bool draw_windows)
         startmenu_power_confirm_render(); // 7c. Power/session confirm dialog (modal)
     }
 
+    if (taskbar_force_quit_confirm_open()) {
+        taskbar_force_quit_confirm_render(); // 7d. #745 Force Quit confirm dialog (modal)
+    }
+
     if (iconpicker_is_open()) {
         iconpicker_render();          // 7d. #44 "Change Icon" file picker (modal)
     }
@@ -1876,6 +2614,12 @@ static void render_frame_body(bool draw_windows)
     if (!fs && !g_setup_pending) widget_settings_render();// 9c. Per-widget Settings dialog
     if (!fs) launcher_render();      // 9c2. Command launcher (Spotlight) overlay
     notif_render();                  // 9d. Notification toasts + center (#168)
+    volosd_render();                 // 9d2. #162 volume OSD (self-gating)
+    dragghost_render();              // 9d3. cross-window drag ghost. Above the
+                                     //     windows AND the taskbar, because a
+                                     //     tab can be dragged over both, but
+                                     //     below the elevation modal, which
+                                     //     must stay over everything.
     elevate_render();                // 9e. #745 elevation modal: scrim + panel
                                      //     over EVERYTHING, drawn last before
                                      //     the cursor so nothing can cover it.
@@ -1883,11 +2627,45 @@ static void render_frame_body(bool draw_windows)
     apply_display_effects();         // 10b. Brightness / night-light
 }
 
+// perf62: render_frame()'s own full-composite present (below) is reached from
+// several main-loop callers whose REASON for wanting a full frame differs -
+// #62's premise is that a windowed-app redraw and a plain desktop interaction
+// are different paths, so they must not collapse into one bucket. The caller
+// sets this immediately before calling render_frame(); it defaults to
+// "interactive" so a stray call (there is exactly one other call site, the
+// redundant screensaver-active call in the main loop, which never reaches
+// the fb_flip() this tags - see the g_screensaver_active early-return above)
+// never mis-tags anything.
+static const char *s_pf_full_reason = "interactive";
+
 static void render_frame(void)
 {
     // #102/#379: a full frame always composites the whole screen; reset any clip
     // left over from an idle dirty-rect present.
     draw_clear_clip();
+
+    // #151: tell the kernel to stop blitting user windows straight to the FB
+    // whenever ANYTHING owns the whole display that a punch-through could leak
+    // through - the screensaver AND the lock screen alike. This used to be
+    // checked only below, AFTER the g_session_locked early-return a few lines
+    // down, so it never fired for lock at all: the kernel kept compositing the
+    // last-focused window's own redraws (a blinking text-field cursor, a live
+    // value, any win_invalidate()) straight onto hardware on ITS OWN cadence,
+    // independent of this compositor's fb_flip() of the lock overlay. Whatever
+    // was on screen at lock time (e.g. an open Settings window) could then
+    // still repaint ON TOP of the lock screen after every one of its own
+    // redraws - reported as "I can see the window of the settings app behind
+    // the clock" - on every dock style and theme, since the missing call has
+    // nothing to do with rendering/CSS. Moved here (same set_win_blank()
+    // primitive the screensaver already used - see below), and its condition
+    // widened to cover both exclusive-display states, so it fires no matter
+    // which branch below is taken this frame.
+    static bool s_blank_prev = false;
+    bool want_blank = g_screensaver_active || g_session_locked;
+    if (want_blank != s_blank_prev) {
+        set_win_blank(want_blank ? 1 : 0);
+        s_blank_prev = want_blank;
+    }
 
     // #566: the lock overlay is exclusive - while locked, render ONLY it.
     // Checked before even the screensaver branch below, so the screensaver
@@ -1897,19 +2675,21 @@ static void render_frame(void)
     // active at a time instead of two competing ones.
     if (g_session_locked) {
         lock_render();
+        // #162: the lock screen is one of the places the ticket explicitly
+        // names, and this branch returns before the normal overlay tail, so
+        // the OSD has to be drawn here too or the volume keys would work with
+        // no feedback exactly where the user can see least.
+        volosd_render();
         cursor_render();
         apply_display_effects();
-        fb_flip();
+        idleprof_flip();   // #COMPIDLE: timed present
+        perfframe_mark("lock");   // perf62: lock-screen present, not a scored path
+        // #62: the lock screen exclusively owns the display this tick, so
+        // chrome/windowed/interactive/cursor/fullscreen are all structurally
+        // unreachable below - note it so a long lock session is not later
+        // read as a stall on whichever of THOSE paths presents next.
+        perfframe_note_quiescent();
         return;
-    }
-
-    // Tell the kernel to stop blitting user windows straight to the FB while the
-    // screensaver owns the display (otherwise e.g. the terminal's cursor-blink
-    // redraws punch through the screensaver). Only fires on state transitions.
-    static bool s_ss_blank_prev = false;
-    if (g_screensaver_active != s_ss_blank_prev) {
-        set_win_blank(g_screensaver_active ? 1 : 0);
-        s_ss_blank_prev = g_screensaver_active;
     }
 
     // Screensaver takes over the full display
@@ -1917,7 +2697,7 @@ static void render_frame(void)
         // #652 BLANK-AFTER STAGE. Even at the #650 SS_FRAME_MIN_MS-throttled
         // rate (~15fps), a GL/plasma screensaver left running for hours (a
         // machine idle overnight) burns CPU forever - MEASURED ~14% of a
-        // core on a test VM / golden 1016 (11.6 flips/sec, top idle:85
+        // core on VM <vmid> / golden 1016 (11.6 flips/sec, top idle:85
         // COMPOSIT:14), not the 34% an earlier report claimed, but not zero
         // either, and zero is achievable because nobody is looking by then.
         // Once the screensaver has been running CONTINUOUSLY (real on-screen
@@ -1938,9 +2718,20 @@ static void render_frame(void)
         if (since_active >= SS_BLANK_AFTER_MS) {
             if (!s_ss_blanked) {
                 draw_fill_rect(0, 0, g_fb_width, g_fb_height, 0xFF000000);
-                fb_flip();
+                idleprof_flip();   // #COMPIDLE: timed present
+                perfframe_mark("screensaver");   // perf62: one-shot blank transition
                 s_ss_blanked = true;
             }
+            // #62: this is the actual mechanism behind the 1,476-second
+            // "chrome" outlier the 2026-08-20 real-iMac capture reported -
+            // confirmed by the screensaver's own active window matching that
+            // gap exactly. The blank-after steady state can run for as long
+            // as the machine sits unattended, presenting NOTHING every tick
+            // (by design, #652) - note it every such tick so whichever path
+            // presents next (on real input) is timed from when the display
+            // became presentable again, not from its own last mark before
+            // the screensaver ever activated.
+            perfframe_note_quiescent();
             return;   // steady state: nothing to compute, nothing to present
         }
         s_ss_blanked = false;   // re-armed for the next activation
@@ -1969,7 +2760,22 @@ static void render_frame(void)
         screensaver_render();
         cursor_render();
         apply_display_effects();
-        fb_flip();
+        idleprof_flip();   // #COMPIDLE: timed present
+        perfframe_mark("screensaver");   // perf62: animating screensaver present
+        // #62: the screensaver exclusively owns the display for as long as
+        // it stays active (blank-after or animating alike) - see the
+        // blank-after call site above for the full rationale.
+        perfframe_note_quiescent();
+        return;
+    }
+
+    // #158 NATIVE FULLSCREEN fast path. Checked AFTER lock/screensaver (both
+    // above already returned if active - the ordering itself is the "lock and
+    // screensaver can always take the screen back" guarantee: this can never
+    // run while either owns the display) and BEFORE the normal composite
+    // below, which it replaces entirely on a hit. See the #158 block above
+    // fullscreen_app_on_top() for the full contract.
+    if (native_fullscreen_try_render()) {
         return;
     }
 
@@ -1988,7 +2794,8 @@ static void render_frame(void)
     g_glass_live = 1;
     render_frame_body(true);         // full desktop stack, all windows
     g_glass_live = 0;
-    fb_flip();                       // 11. Present
+    idleprof_flip();   // #COMPIDLE: timed present                       // 11. Present
+    perfframe_mark(s_pf_full_reason);   // perf62: caller-tagged (see above)
 }
 
 // ============================================================================
@@ -2009,7 +2816,7 @@ static void render_frame(void)
 // the 250% cap. Returned in screen coords, NOT yet clamped.
 static void cursor_bounds(int mx, int my, int *x0, int *y0, int *x1, int *y1)
 {
-    int scale = (g_cursor_size >= 50 && g_cursor_size <= 250) ? g_cursor_size : 100;
+    int scale = cursor_effective_scale();   // #uiscale: same formula cursor_render() draws with
     int reach = 12 * scale / 100 + 6;   // arrow max extent + glow radius margin
     *x0 = mx - reach; *y0 = my - reach;
     *x1 = mx + reach; *y1 = my + reach;
@@ -2067,7 +2874,8 @@ static void render_frame_cursor(int old_x, int old_y,
     render_frame_body(need_windows);
     draw_clear_clip();
     g_widgets_draw_only = 0;
-    fb_flip();
+    idleprof_flip();   // #COMPIDLE: timed present
+    perfframe_mark("cursor");   // perf62: T0(a)/#578 pointer-motion-only partial present
     vnc_mark_rect_dirty(x0, y0, rw, rh);   // #440 parity: same rect to VNC
 }
 
@@ -2113,7 +2921,8 @@ static void render_frame_idle(void)
     }
     draw_clear_clip();
     g_widgets_draw_only = 0;
-    fb_flip();                       // 11. single present (kernel copies back->front)
+    idleprof_flip();   // #COMPIDLE: timed present                       // 11. single present (kernel copies back->front)
+    perfframe_mark("idle");   // perf62: pure-idle dirty-rect present
 }
 
 // ============================================================================
@@ -2170,7 +2979,8 @@ static void render_frame_chrome(const wm_window_info_t *wins, int nwins)
     }
     draw_clear_clip();
     g_widgets_draw_only = 0;
-    fb_flip();                       // single present
+    idleprof_flip();   // #COMPIDLE: timed present                       // single present
+    perfframe_mark("chrome");   // perf62: windows-open-but-static chrome-only present
 }
 
 // ============================================================================
@@ -2179,7 +2989,48 @@ static void render_frame_chrome(const wm_window_info_t *wins, int nwins)
 
 // --- Scalable UI text via the kernel TTF engine (#58) ---
 int g_font_px = 16;   // Medium default
+
+// #uiscale TEMPORARY opt-out (ui-ux screendump bug 3, desktop gadgets).
+// widgets.c's own box literals (calendar cells, weather/HA cards, etc - 781
+// of them) are NOT scaled (documented, out of scope for this pass), but
+// draw_text_ttf()/text_width_ttf() below scale UNCONDITIONALLY, so gadget
+// text started rendering at the full UI-scale factor inside boxes that
+// stayed 1x - strictly worse than doing nothing (Calendar overlapping its
+// own date columns, Weather/HA cards overflowing their frames). This depth
+// counter lets a caller say "the box under me is not scaled, so my text
+// must not be either" for the duration of one draw call.
+//
+// REMOVING THIS requires scaling widgets.c's own box geometry (ui_px()/
+// ui_span() on its layout literals) FIRST, then deleting every push/pop
+// site below and this counter itself. Until then it is the only thing
+// stopping gadget text from outgrowing gadget boxes.
+int g_ui_scale_native_text = 0;
+void ui_scale_native_push(void) { g_ui_scale_native_text++; }
+void ui_scale_native_pop(void)  { if (g_ui_scale_native_text > 0) g_ui_scale_native_text--; }
+// UI SCALE CHOKEPOINT (task uiscale). Every text call in this compositor -
+// draw_text()/draw_text_centered() via UI_TTF_SIZE (draw.c), and the ~80-odd
+// direct draw_text_ttf()/text_width_ttf() call sites across clock.c, notif.c,
+// taskbar.c, traymenu.c, widgets.c, elevate.c, lockscreen.c, confirmdialog.c,
+// dragghost.c, screenshot.c, volosd.c and contextmenu.c that pass their own
+// literal point size - ALL route through these two functions and no other
+// path reaches ttf_text()/ttf_measure() (the raw kernel syscalls). Scaling
+// `size` here, once, is what makes every one of those call sites scale
+// without being touched individually, and keeps draw_text_ttf() and
+// text_width_ttf() applying the SAME transform to the SAME logical size, so
+// a caller's own "tw = text_width_ttf(s, sz); draw_text_ttf(x, y, s, sz, c)"
+// pairing (there are many) never sees its measured width disagree with what
+// gets drawn.
+//
+// font_metrics() (libc/syscall.h, off-limits to this task) is a SEPARATE
+// direct-to-kernel call with its own `size` argument at a handful of sites
+// (draw.c, dragghost.c, taskbar.c, volosd.c); those sites scale their own
+// `size` argument to font_metrics() individually so the ascent/descent they
+// get back stays proportional to what draw_text_ttf() actually drew.
 void draw_text_ttf(int32_t x, int32_t y, const char *text, int size, uint32_t color) {
+    // #uiscale: g_ui_scale_native_text (see its declaration above) is a
+    // TEMPORARY opt-out for callers whose own box geometry is not scaled -
+    // see the sweep in widgets.c/notif.c/traymenu.c/stickies.c/startmenu.c.
+    size = g_ui_scale_native_text ? size : ui_px(size);
     // #102/#379 dirty-rect: text is rasterized in the KERNEL (SYS_DRAW_TTF) and
     // cannot honor the userland clip per-pixel, so cull the whole syscall when
     // the text's (generous) bounding box lies entirely outside the active clip.
@@ -2193,7 +3044,8 @@ void draw_text_ttf(int32_t x, int32_t y, const char *text, int size, uint32_t co
     ttf_text(x, y, text, size, color);
 }
 int text_width_ttf(const char *text, int size) {
-    return ttf_measure(text, size);
+    int eff = g_ui_scale_native_text ? size : ui_px(size);   // #uiscale: see draw_text_ttf() above
+    return ttf_measure(text, eff);
 }
 
 // --- Display post-effects: brightness dim + night-light warm tint (#57) ---
@@ -2231,6 +3083,11 @@ static void apply_display_effects(void)
 }
 
 // --- Live desktop icon sizing (driven by get_icon_size(), see #63) ---
+// #uiscale: these are plain globals (not macros), re-derived here from a
+// logical 32/48/64 ladder and the UI scale factor together, exactly the
+// "re-derive on the edge-triggered ui_scale_refresh() poll" shape the theme
+// poll uses. main()'s loop calls this again (with the last-applied icon-size
+// preference) whenever ui_scale_refresh() reports a change - see the loop.
 int DESKTOP_ICON_SIZE = 48;
 int DESKTOP_ICON_SPACING_X = 100;
 int DESKTOP_ICON_SPACING_Y = 90;
@@ -2238,9 +3095,9 @@ int DESKTOP_ICON_SPACING_Y = 90;
 void compositor_apply_icon_size(int sz)
 {
     switch (sz) {
-    case 0: DESKTOP_ICON_SIZE=32; DESKTOP_ICON_SPACING_X=72;  DESKTOP_ICON_SPACING_Y=66;  break;
-    case 2: DESKTOP_ICON_SIZE=64; DESKTOP_ICON_SPACING_X=128; DESKTOP_ICON_SPACING_Y=116; break;
-    default: DESKTOP_ICON_SIZE=48; DESKTOP_ICON_SPACING_X=100; DESKTOP_ICON_SPACING_Y=90; break;
+    case 0: DESKTOP_ICON_SIZE=ui_px(32); DESKTOP_ICON_SPACING_X=ui_px(72);  DESKTOP_ICON_SPACING_Y=ui_px(66);  break;
+    case 2: DESKTOP_ICON_SIZE=ui_px(64); DESKTOP_ICON_SPACING_X=ui_px(128); DESKTOP_ICON_SPACING_Y=ui_px(116); break;
+    default: DESKTOP_ICON_SIZE=ui_px(48); DESKTOP_ICON_SPACING_X=ui_px(100); DESKTOP_ICON_SPACING_Y=ui_px(90); break;
     }
 }
 
@@ -2524,6 +3381,20 @@ void compositor_apply_theme(int kernel_theme_id)
     glass_theme_apply();
 }
 
+// #161: signal()/SIGCHLD/SIG_IGN declared locally instead of including
+// <../../libc/signal.h>. That header pulls libc/types.h, whose
+// `typedef _Bool bool` collides head-on with compositor.h's own
+// `typedef int bool` - a pre-existing divergence in this app that is not
+// this ticket's to resolve, and resolving it here would touch every file in
+// the compositor. `signal` is a real symbol in libc.a (libc/signal.c:59) and
+// this prototype is its exact signature, so the call is checked by the linker
+// as usual. The two constants are pinned by their libc/signal.h values.
+typedef void (*tb_sighandler_t)(int);
+extern tb_sighandler_t signal(int signum, tb_sighandler_t handler);
+#define tb_signal   signal
+#define TB_SIGCHLD  17                          /* libc/signal.h SIGCHLD */
+#define TB_SIG_IGN  ((tb_sighandler_t)1)        /* libc/signal.h SIG_IGN */
+
 int main(int argc, char **argv)
 {
     (void)argc;
@@ -2532,9 +3403,60 @@ int main(int argc, char **argv)
     // NOTE: No sys_putchar() calls here. They write to a PTY with no reader
     // and will block the compositor indefinitely.
 
+    // #161: DECLARE THAT WE WILL NEVER wait() FOR A CHILD.
+    //
+    // Every app the user launches - dock, start menu, desktop icon, launcher -
+    // is spawned by this process, so its ppid is ours. Nothing in this file has
+    // ever called wait()/waitpid(), and this process does not exit, so on exit
+    // each of those apps became a ZOMBIE that the kernel's reap policy was
+    // required to keep forever (it reclaims a zombie only when nobody can still
+    // wait for it, and a live parent means somebody can). MAX_PROCESSES is 64:
+    // open and close apps for long enough and the table fills, "[PROC] No free
+    // process slots" follows, and nothing more can be launched. It is the same
+    // slow denial of service #745 task 37 fixed for kernel fetch workers,
+    // reached by ordinary desktop use. The owner saw the first symptom of it:
+    // a killed app that "shows as zombie" and will not go away.
+    //
+    // SIGCHLD == SIG_IGN is the POSIX way to say this, and it is a DECLARATION
+    // rather than a heuristic: the kernel side (rustkern/procreap.rs,
+    // F_NOCLDWAIT) reaps our children the moment they exit, and any process
+    // that does still wait() - msh - is untouched because it says nothing.
+    // Placed before compositor_init(), so the very first app we can possibly
+    // spawn is already covered.
+    tb_signal(TB_SIGCHLD, TB_SIG_IGN);
+
     // Initialise the framebuffer and all subsystems
     if (compositor_init() < 0) {
         sys_exit(1);
+    }
+
+    // #uiscale: verify the userland copy of the scale formula (uiscale.h's
+    // ui_px()/ui_span()/ui_unpx(), duplicated there ONLY because the
+    // compositor cannot afford a syscall per coordinate - see that header's
+    // own rationale) agrees with the kernel's, once, at startup, over a wide
+    // probe range including the round-trip and shared-edge properties. This
+    // is the ONE place in the tree that logs with the same bare printf()
+    // convention startmenu.c already uses unconditionally in the shipping
+    // compositor (e.g. its "[StartMenu] rebuild:" line) - printf() here goes
+    // through fputc()/stdout, NOT the sys_putchar() this file's own top-of-file
+    // warning bans (that ban is about the raw PTY-fd1 syscall specifically).
+    {
+        extern int printf(const char *fmt, ...);
+        int mismatches = ui_scale_selfcheck();
+        if (mismatches != 0) {
+            // LOUD: the two copies of the formula disagree. This should never
+            // happen outside active development on uiscale.c/uiscale.rs; if it
+            // ever fires on a shipped build, compositor chrome and the kernel's
+            // own window-boundary transform can disagree about where a pixel
+            // is, which is exactly the class of bug this selfcheck exists to
+            // catch before it reaches a screenshot.
+            printf("[UISCALE] SELFCHECK FAILED: %d mismatch(es) between the "
+                   "compositor's ui_px/ui_span/ui_unpx and the kernel's - see "
+                   "the MISMATCH/EDGE BROKEN lines above for the exact values.\n",
+                   mismatches);
+        } else {
+            printf("[UISCALE] selfcheck OK: 0 mismatches (pct=%d)\n", ui_scale_pct());
+        }
     }
 
     // (#565) Restore the persisted active theme from /CONFIG/THEME.CFG at
@@ -2553,9 +3475,10 @@ int main(int argc, char **argv)
         }
     }
 
-    // TODO: Re-enable login once desktop is fully working.
-    // login_run() plays /SOUNDS/STARTUP.WAV on success internally.
-    // login_run();
+    // (#73) The "TODO: re-enable login" that used to sit here is gone with the
+    // code it referred to. It was never going to be re-enabled: kernel/gui/login.c
+    // is the login gate and it runs BEFORE this process exists. Leaving the TODO
+    // and login_init() in place is what kept the dead layer's key sink armed.
     //
     // #745 THE SHOWSTOPPER FOR THE NON-ROOT FLIP WAS HERE. These three lines
     // used to read:
@@ -2606,27 +3529,140 @@ int main(int argc, char **argv)
     // reachable caller before this).
     {
         int sfd = sys_open("/CONFIG/SETUPDONE", 0);
-        if (sfd >= 0) { sys_close(sfd); }
-        else          { g_setup_pending = true; sys_spawn("/APPS/SETUP"); }
+        if (sfd < 0) {
+            // FIRST BOOT. The full wizard, and g_setup_pending gates the
+            // taskbar / desktop icons / start menu off until it finishes,
+            // because until then the machine has no owner and no password.
+            //
+            // #136: delete any /CONFIG/SETUPSKIP left by a PREVIOUS boot's
+            // "Skip to Desktop" before g_setup_pending is armed. Without
+            // this, a stale skip marker from last boot would be sitting on
+            // disk the instant setup_pending_recheck() first polls (see
+            // its own comment), clearing g_setup_pending within ~330ms and
+            // hiding the wizard we are about to spawn - exactly the
+            // "reappear every boot until actually completed" requirement
+            // failing silently. Result ignored: absent is the common case.
+            //
+            // #229: BOTH UNLINKS ARE GONE, AND SO IS THE CLASS OF BUG THEY
+            // WERE ADDED FOR.
+            //
+            // They were writes to /CONFIG, which is root-owned 0711, so on a
+            // non-root session (every session since #226 removed
+            // autologin=root) the cleanup for the stale-marker bug had exactly
+            // the same permission hole as the bug. Both signals are now bits of
+            // kernel state (SYS_FIRSTRUN, kernel/rustkern/firstrun.rs) that
+            // start clear at every boot because .bss starts clear at every
+            // boot. A per-boot signal on persistent media needs a cleanup; a
+            // per-boot signal in per-boot storage does not.
+            //
+            // FR_SKIP_CLEAR is still called, and it is NOT the old unlink under
+            // a new name: it covers the second case, a LOG OUT AND BACK IN
+            // within one boot on a machine that is still unconfigured. The
+            // kernel bit survives that (it is per-boot, not per-session), so
+            // the incoming compositor clears it as it arms a fresh first run,
+            // exactly as it used to delete the file. It cannot fail.
+            sys_firstrun(FR_SKIP_CLEAR);
+            g_setup_pending = true;
+            // #203: arm the handover watch HERE, at the one site that knows
+            // this is the FIRST-BOOT wizard rather than the #126 reduced
+            // personalisation flow. It stays armed for the life of this
+            // compositor: the cost is one sys_open() every 500ms in a session
+            // that begins with the first-run wizard, which happens once per
+            // machine, and the alternative is a disarm condition that has to
+            // guess when the wizard gave up.
+            g_setup_handover_armed = true;
+            sys_spawn("/APPS/SETUP");
+        } else {
+            sys_close(sfd);
+            // #126: THE MACHINE IS SET UP, BUT IS THIS USER?
+            //
+            // /CONFIG/SETUPDONE is a single absolute path, so the FIRST person
+            // to finish the wizard permanently suppressed it for everyone who
+            // ever signed in afterwards. That is the reported defect: a second
+            // user got a desktop configured by, and for, somebody else.
+            //
+            // The per-user answer lives beside the per-user profile that
+            // already works: <home>/CONFIG/SETUPUSR, resolved by the same
+            // passwd-table join userconf_path() performs for THEME.CFG,
+            // DOCKSTYL.CFG and the rest. No parallel config system, one more
+            // name in the namespace that exists. Root's home is "/", so root's
+            // marker is /CONFIG/SETUPUSR: beside SETUPDONE, and not it.
+            //
+            // NO LEGACY FALLBACK. userconf_open_read()'s fallback exists so an
+            // upgrade keeps a setting the user already had; there is no
+            // pre-#126 location for this marker, and falling back to a shared
+            // path would make one user's marker answer for everybody, which is
+            // the bug.
+            //
+            // g_setup_pending is deliberately NOT set here. It gates the shell
+            // off for an UNCONFIGURED MACHINE; this machine is configured and
+            // the person is signed in, so the desktop stays usable and the
+            // personalisation wizard is a window on top of it. (It could not
+            // work anyway: setup_pending_recheck() clears the flag from
+            // /CONFIG/SETUPDONE, which is already present.)
+            char upath[256];
+            int have_user_marker = 0;
+            if (userconf_path("SETUPUSR", upath, sizeof(upath)) == 0) {
+                int ufd = sys_open(upath, 0);
+                if (ufd >= 0) { sys_close(ufd); have_user_marker = 1; }
+            } else {
+                // The path did not fit, so we do not know. Treat that as
+                // "already personalised" rather than launching a wizard whose
+                // completion marker cannot be written: it would reappear at
+                // every single login and there would be no way to stop it.
+                have_user_marker = 1;
+            }
+            if (!have_user_marker) sys_spawn("/APPS/SETUP");
+        }
     }
 
     while (1) {
 
+        idleprof_tick_begin();    // #COMPIDLE: see idleprof.h
+
         int loop_sleep_ms = 33;   // #102/#379 adaptive idle poll interval
+
+        // #uiscale: ONE cheap syscall every frame (real work only when the
+        // kernel's generation counter moved - see ui_scale_refresh()'s own
+        // comment in uiscale.c). Must run before anything else in this frame
+        // touches ui_px()/ui_span() or any of the FONT_CHAR_*/TASKBAR_*/
+        // START_MENU_*/etc macros that read the g_ui_scale_pct this call
+        // maintains, so the whole frame draws at one consistent factor.
+        //
+        // Unlike the ~2s throttled theme-file poll below (gui_theme_poll_reload,
+        // which has to actually read a file off disk), this is NOT throttled:
+        // the syscall itself is already gen-counter-gated, so calling it every
+        // iteration costs nothing extra on the common no-change path and never
+        // leaves the compositor mid-frame on a stale factor for up to 2s.
+        if (ui_scale_refresh()) {
+            // The factor changed (Settings' scale control, a laptop-DPI
+            // auto-pick, or SYS_UI_SCALE from another process). Force a full
+            // recomposite so already-drawn pixels - open app windows
+            // included, same reasoning as a theme switch just below - are
+            // redrawn at the new factor, and re-derive the handful of
+            // compositor globals that are cached values rather than plain
+            // macros (a macro re-evaluates ui_px() on every use for free;
+            // these do not).
+            wm_force_redraw_all();
+            g_needs_redraw = true;
+            compositor_apply_icon_size(get_icon_size());   // #63 desktop icon grid
+        }
 
         taskbar_update();     // Refresh gauge samples (CPU, RAM, disk)
         lock_poll();          // #566 refresh the kernel-authoritative lock state + idle-timeout check
         elevate_poll();       // #745: mirror the kernel's elevation request and
                               //       run its watchdog, BEFORE input is routed
         process_input();      // Poll mouse and keyboard
-        { static int s_dp = 0; if (++s_dp >= 10) { s_dp = 0; dock_style_poll(); dock_opacity_poll(); widgets_cfg_poll(); } }  // #387 live dock style, #745 live dock opacity + widget live-apply channel
+        { static int s_dp = 0; if (++s_dp >= 10) { s_dp = 0; dock_style_poll(); dock_opacity_poll(); dock_geom_poll(); taskbar_geom_settle(); widgets_cfg_poll(); perfframe_poll(); } }  // #387 live dock style, #745 live dock opacity, #123 live dock height/zoom, + widget live-apply channel, perf62 frame-interval gate/dump
         { static int s_sp = 0; if (++s_sp >= 10) { s_sp = 0; setup_pending_recheck(); } }  // #745 fix: this was dead code with zero callers, so g_setup_pending never
                                                                                             // cleared after the OOBE wizard wrote SETUPDONE - taskbar/icons/start menu
                                                                                             // stayed gated off forever. Same ~330ms cadence as the dock-style poll above.
         desktop_home_tick();        // #745 throttled (2s) <home>/DESKTOP rescan; no-op when unchanged
+    desktop_volumes_tick();     // #250 throttled (1s) removable-volume list; ONE syscall when unchanged
         startmenu_prefs_poll();     // throttled internally; live-applies Settings "Start Menu" prefs
         startmenu_favs_poll();      // #745 P1: throttled internally; live-applies the first-boot wizard's FAVCH.CFG
         startmenu_rust_poll();      // throttled internally; live-applies system/user menu config + installs
+        volosd_tick();        // #162 notice a volume/mute change (1 syscall)
         profile_tick();       // #92 persist UI settings on change
         stickies_tick();      // #270 persist sticky notes when changed
         // #566: pause notification aging while locked, so a toast's timer does
@@ -2843,15 +3879,114 @@ int main(int argc, char **argv)
                         // proximity-magnify has the identical latent bug and
                         // was NOT fixed here (out of scope for #745's marble
                         // dock ask) - see blame.md.
-                        taskbar_dock_animating();
-            bool interactive = recent_input || g_screensaver_active || other_interactive;
+                        taskbar_dock_animating() ||
+                        // Cross-window drag ghost in flight. SAME shape as
+                        // taskbar_dock_animating() directly above: the ghost
+                        // is a card that moves with the pointer and is far
+                        // larger than the cursor-rect clip the cheap path
+                        // uses, so without this it would be clipped away and
+                        // leave a trail. Bounded by construction: the flag is
+                        // false again the moment the button comes up.
+                        dragghost_active() ||
+                        // #148 (local 164): the PrintScreen fullscreen toast's
+                        // 2s dwell. SAME shape as taskbar_dock_animating()
+                        // just above - force the full path (which is what
+                        // reaches native_fullscreen_try_render(), the only
+                        // place this toast is ever drawn or erased) for
+                        // exactly as long as the toast is armed, so a
+                        // perfectly STATIC fullscreen app (no input, nothing
+                        // else forcing a tick) still gets a frame to draw the
+                        // toast on AND a frame afterward to erase it by
+                        // simply not drawing it. Without this fold-in, a
+                        // static fullscreen app could leave the toast on
+                        // screen indefinitely past its 2s budget (frozen,
+                        // not ghosted - see screenshot.c) until something
+                        // UNRELATED forced the next tick.
+                        screenshot_fs_toast_active();
+            // #COMPIDLE: A TICK IN WHICH NOTHING HAPPENED HAS NOTHING TO DRAW.
+            //
+            // `recent_input` stays true for 500ms after the last pointer or
+            // key event, and while it is true loop_sleep_ms drops to 8ms. So a
+            // single click used to buy roughly SIXTY consecutive full-screen
+            // composites-and-presents, of which the first one drew the change
+            // and the other fifty-nine reproduced it byte for byte. At
+            // 1280x800 in a VM that is invisible. At 1920x1080 on the owner's
+            // laptop it is 2.07 million pixels composited from scratch, sixty
+            // times, per click - and if anything keeps `recent_input` pinned
+            // (a touchpad that reports a one-pixel delta with a hand resting
+            // near it is the obvious candidate on a laptop and cannot happen
+            // in a VM) it stops being a burst and becomes the steady state.
+            //
+            // A tick qualifies as QUIET only if EVERY input to the frame is
+            // unchanged: no pointer motion, no button/key, nothing in the
+            // other_interactive set (menus, drags, animations, the lock, an
+            // app window invalidating itself), and no explicit redraw request.
+            // Under those conditions the composite is provably identical to
+            // the one already on screen, so it is skipped and the tick falls
+            // through to the idle path, which still services widget, taskbar
+            // and toast damage exactly as it does at true idle.
+            //
+            // LATENCY IS NOT TRADED AWAY: the 8ms poll interval is still
+            // applied below whenever recent_input holds, so the very next tick
+            // that DOES carry an event is serviced just as fast as before.
+            //
+            // #158's carve-out is honoured: while a window is fullscreen,
+            // render_frame()'s fast path (and the watchdog/modal-reclaim
+            // checks inside it) must run every tick, so a fullscreen window
+            // disqualifies the whole optimisation exactly as it disqualifies
+            // cursor_only below.
+            bool quiet_tick = recent_input && !g_tick_motion && !g_tick_nonmotion &&
+                              !other_interactive && !g_needs_redraw &&
+                              !g_screensaver_active && !fullscreen_in_list(_w, _n);
+            if (quiet_tick) idleprof_reason(IP_R_QUIET);
+            bool interactive = (recent_input && !quiet_tick) ||
+                               g_screensaver_active || other_interactive;
+
+            // #COMPIDLE: record WHY, from the same booleans, before any of
+            // them is consumed. This is the whole diagnostic: on the owner's
+            // laptop one of these counters will be pinned near the tick rate
+            // and on every VM measured here they are all near zero.
+            {
+                unsigned _r = 0;
+                if (recent_input)             _r |= IP_R_INPUT;
+                if (apps_dirty)               _r |= IP_R_APPSDIRTY;
+                if (g_screensaver_active)     _r |= IP_R_SCRSAVER;
+                if (s_dragging_sheep || s_dragging_dog || s_dragging_widget ||
+                    s_dragging_sticky || s_dragging_desktop || dragghost_active())
+                                              _r |= IP_R_DRAG;
+                if (widget_menu_is_open() || g_start_menu_open ||
+                    g_context_menu_open || g_wallpaper_picker_open ||
+                    g_tray_menu_open || g_launcher_open ||
+                    startmenu_power_confirm_open() || startmenu_properties_open() ||
+                    widget_settings_is_open() || taskbar_popup_active() ||
+                    stickies_editing())       _r |= IP_R_MENU;
+                if (g_session_locked)         _r |= IP_R_LOCKED;
+                if (taskbar_dock_animating() || screenshot_fs_toast_active())
+                                              _r |= IP_R_DOCKANIM;
+                if (g_needs_redraw)           _r |= IP_R_REDRAW;
+                idleprof_reason(_r);
+            }
             // Cursor-move-only: the pointer moved this tick and nothing else of
             // consequence is happening. Repaint just the old+new cursor rects.
+            // #158: a partial cursor-rect present only ever repaints a small
+            // box around the pointer, so any OTHER pixel left over from
+            // before native fullscreen was entered (most visibly the
+            // taskbar) would linger on screen indefinitely - the fast path
+            // in render_frame() (and the watchdog/modal-reclaim checks
+            // inside it) must run EVERY tick a window is fullscreen, not
+            // just on ticks with non-motion activity. Reuses
+            // fullscreen_in_list() (already computed above for
+            // g_fs_present_ms): window_fullscreen_enter() sets bounds to the
+            // exact full screen, so that bounds check also catches native
+            // fullscreen with no separate predicate to keep in sync.
             bool cursor_only = g_tick_motion && !g_tick_nonmotion &&
-                               !other_interactive && !g_needs_redraw;
+                               !other_interactive && !g_needs_redraw &&
+                               !fullscreen_in_list(_w, _n);
             static int s_drawn_cursor_x = 0, s_drawn_cursor_y = 0;
 
             if (g_screensaver_active) {
+                idleprof_path(IP_P_SCRSAVER);           // #COMPIDLE
+                idleprof_damage_px((unsigned long)g_fb_width * (unsigned long)g_fb_height);
                 render_frame();           // screensaver owns the whole display
                 g_needs_redraw = false;
                 vnc_mark_full_dirty();    // #440: whole screen changed
@@ -2869,8 +4004,18 @@ int main(int argc, char **argv)
                     // T0 #578: only the pointer moved. Recomposite + present just
                     // the old+new cursor rects (render_frame_cursor feeds VNC the
                     // exact rect itself, so do NOT mark the whole screen dirty).
+                    idleprof_path(IP_P_CURSOR);         // #COMPIDLE
                     render_frame_cursor(s_drawn_cursor_x, s_drawn_cursor_y, _w, _n);
                 } else {
+                    // perf62: tag the upcoming present by WHY it's happening -
+                    // an app's own content changing ("windowed") versus plain
+                    // desktop interaction (menu/drag/typing, "interactive") -
+                    // #62's premise is that these differ, so they must not
+                    // share one bucket. apps_dirty is exactly the signal
+                    // computed above for this same tick.
+                    s_pf_full_reason = apps_dirty ? "windowed" : "interactive";
+                    idleprof_path(IP_P_FULL);           // #COMPIDLE
+                    idleprof_damage_px((unsigned long)g_fb_width * (unsigned long)g_fb_height);
                     render_frame();       // full-screen composite + present
                     if (vnc_changed) vnc_mark_full_dirty();
                 }
@@ -2880,7 +4025,6 @@ int main(int argc, char **argv)
                 // with low latency instead of the 33ms (30Hz) desktop cadence.
                 // The cursor is re-composited every frame here (render_frame draws
                 // it last), so it is never gated by the idle partial-present path.
-                if (recent_input) loop_sleep_ms = 8;
             } else {
                 // Not interactive this tick. render_frame_idle()'s partial
                 // widget/desktop redraw does NOT recomposite app-window
@@ -2918,6 +4062,8 @@ int main(int argc, char **argv)
                     if (!fullscreen_app_on_top()) taskbar_collect_damage();
                     notif_collect_damage();
                     if (damage_count() > 0) {
+                        idleprof_path(IP_P_CHROME);     // #COMPIDLE
+                        idleprof_reason(IP_R_TASKBAR);
                         render_frame_chrome(_w, _n);
                         quiet = 0;
                         loop_sleep_ms = 50;
@@ -2925,8 +4071,10 @@ int main(int argc, char **argv)
                         int dn = damage_count();
                         for (int di = 0; di < dn; di++) {
                             int dx, dy, dw, dh;
-                            if (damage_get(di, &dx, &dy, &dw, &dh))
+                            if (damage_get(di, &dx, &dy, &dw, &dh)) {
                                 vnc_mark_rect_dirty(dx, dy, dw, dh);
+                                idleprof_damage_px((unsigned long)dw * (unsigned long)dh);
+                            }
                         }
                     } else {
                         if (quiet < 60) quiet++;
@@ -2942,6 +4090,8 @@ int main(int argc, char **argv)
                 taskbar_collect_damage();
                 notif_collect_damage();   // #585: toast slide/settle rects only, never full-screen
                 if (damage_count() > 0) {
+                    idleprof_path(IP_P_IDLE);           // #COMPIDLE
+                    idleprof_reason(IP_R_WIDGET);
                     render_frame_idle();
                     quiet = 0;
                     loop_sleep_ms = 50;    // animating idle: ~20Hz poll is plenty
@@ -2951,8 +4101,10 @@ int main(int argc, char **argv)
                     int n = damage_count();
                     for (int di = 0; di < n; di++) {
                         int dx, dy, dw, dh;
-                        if (damage_get(di, &dx, &dy, &dw, &dh))
+                        if (damage_get(di, &dx, &dy, &dw, &dh)) {
                             vnc_mark_rect_dirty(dx, dy, dw, dh);
+                            idleprof_damage_px((unsigned long)dw * (unsigned long)dh);
+                        }
                     }
                 } else {
                     if (quiet < 60) quiet++;
@@ -2964,6 +4116,16 @@ int main(int argc, char **argv)
                 }
                 }
             }
+            // Mouse feel: while the user is actively moving the pointer /
+            // typing, poll + present at ~120Hz so the cursor tracks the hand
+            // with low latency instead of the 33ms (30Hz) desktop cadence.
+            // #COMPIDLE moved this out of the interactive branch: a quiet tick
+            // now takes the idle path (which would otherwise back the interval
+            // off to 50/120ms), and backing off the POLL rate inside the
+            // post-input window is precisely the latency regression this must
+            // not cause. Applied last so it overrides whichever branch ran.
+            if (recent_input) loop_sleep_ms = 8;
+
             // T0 #578: remember where the cursor was last drawn so the next
             // cursor-only tick can damage the vacated rect. Every present path
             // above draws the cursor at the current g_mouse position.
@@ -2987,6 +4149,7 @@ int main(int argc, char **argv)
         testhook_poll();
 #endif
 
+        idleprof_tick_end();        // #COMPIDLE: closes this tick's timing
         sys_sleep(loop_sleep_ms);   // adaptive: 33ms active, up to 120ms idle
     }
 

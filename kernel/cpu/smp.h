@@ -12,13 +12,15 @@
 
 #include "../types.h"
 #include "../sync/spinlock.h"
+#include "cpumax.h"
 
 // ============================================================================
 // Configuration
 // ============================================================================
 
-// Maximum number of CPUs supported
-#define SMP_MAX_CPUS        256
+// Maximum number of CPUs supported. ONE definition, in cpu/cpumax.h (#143).
+// This used to be a second, independent 256 that disagreed with the scheduler
+// cap of 8 and with the Rust observer cap of 32.
 
 // Per-CPU stack size (16KB per CPU)
 #define SMP_STACK_SIZE      (16 * 1024)
@@ -147,14 +149,12 @@ void smp_halt_all(void);
 // Synchronization Helpers
 // ============================================================================
 
-// Global kernel lock (big kernel lock for coarse-grained synchronization)
-extern spinlock_t kernel_lock;
-
-// Acquire kernel lock
-void kernel_lock_acquire(void);
-
-// Release kernel lock
-void kernel_lock_release(void);
+//
+// 2026-08-23: kernel_lock / kernel_lock_acquire() / kernel_lock_release()
+// were declared here and are GONE. They had zero callers and this comment
+// called them "the big kernel lock", which they were not. THE Big Kernel
+// Lock is bkl_acquire()/bkl_release()/bkl_release_all()/bkl_reacquire(),
+// declared further down this file.
 
 // #279 3b-1.5: per-CPU GS-base data + ring-0 stack setter.
 void smp_cpu_local_init(uint32_t cpu);
@@ -164,7 +164,66 @@ void cpu_set_kernel_stack(uint64_t top);
 void bkl_acquire(void);
 void bkl_release(void);
 uint32_t bkl_release_all(void);
+// #745 (#75) forensics: this core's BKL depth (0 if not owner) plus the return
+// address of the call that took each level. via 1 = bkl_acquire, 2 = bkl_reacquire.
+uint32_t bkl_self_forensics(void **ra_out, uint8_t *via_out, uint32_t max);
 void bkl_reacquire(uint32_t depth);
+
+// ===========================================================================
+// #166: THE per-CPU BKL counter snapshot.
+//
+// WHY THE CALLER NO LONGER PASSES A CPU COUNT.
+//
+// sched_smp_report() used to sum these counters itself, with the loop bound
+// `i < sched_rq_ncpu()` - a number derived from MAYTERA_MAX_CPUS - over arrays
+// sized by cpu/smp.c's own BKL_STAT_CPUS. The two constants disagreed (32 vs 8)
+// and the reader walked off the end of six arrays and zeroed part of a seventh.
+// Equalising the constants fixes today's instance. Removing the PARAMETER is
+// what stops the next one: a caller that cannot say "how many" cannot say a
+// number that is wrong. The bound now comes from sizeof() of the array itself,
+// evaluated in the translation unit that declares it.
+//
+// Fields are per-window CUMULATIVE totals across all cores. The caller turns
+// them into deltas (rustkern/bklstat.rs), which is where the monotonicity
+// invariants are checked. max_us is a PER-WINDOW maximum and is RESET by this
+// call, exactly as the old loop did.
+typedef struct {
+    uint64_t acquires;      // takes that reached the compare-and-swap
+    uint64_t contended;     // of those, the ones that had to wait. <= acquires.
+    uint64_t recursive;     // re-entrant takes (cannot contend; not acquires)
+    uint64_t spins;         // pause() iterations burned waiting
+    uint64_t held_us;       // total microseconds held, summed over cores
+    uint64_t long_holds;    // holds over 1 ms
+    uint64_t max_us;        // longest single hold this window (then reset)
+    uint32_t ncpu;          // the arrays' REAL extent, from sizeof
+    uint32_t max_cpu;       // core that recorded max_us
+    uint32_t max_reason;    // 0x1NN vector / 0x2NN syscall / 0x300 other
+    uint32_t max_from_switch; // that hold began in bkl_reacquire()
+} bkl_totals_t;
+
+void bkl_stat_totals(bkl_totals_t *out);
+
+// One reporting window's DELTAS plus the verdict. Mirrors BklWindow in
+// rustkern/bklstat.rs. See that file for what each flag means and, more
+// importantly, for why none of these numbers is ever clamped.
+typedef struct {
+    uint64_t acquires, contended, recursive, spins, held_us, long_holds, max_us;
+    uint32_t flags, ncpu, max_cpu, max_reason, max_from_switch, _pad;
+} bkl_window_t;
+
+// The FFI sizeof locks this tree uses at every Rust seam. A struct that drifts
+// on one side of an FFI does not fail to build, it silently reads the wrong
+// field - and this ticket is about an instrument reading the wrong memory.
+_Static_assert(sizeof(bkl_totals_t) == 72, "#166: bkl_totals_t FFI layout");
+_Static_assert(sizeof(bkl_window_t) == 80, "#166: bkl_window_t FFI layout");
+
+// Compute one window from a snapshot. Returns the flag word (0 = every
+// invariant held); also written to out->flags. `window_us` 0 means "unknown",
+// and the duration-based checks are then withheld rather than guessed.
+uint32_t bkl_window_rs(const bkl_totals_t *cur, uint64_t window_us,
+                       uint32_t ncpu_online, int32_t armed, bkl_window_t *out);
+uint64_t bkl_window_bad_rs(void);
+uint32_t bkl_stat_selftest_rs(void);
 
 // #279 3b-3 per-CPU current process
 extern volatile int g_smp_current_ready;

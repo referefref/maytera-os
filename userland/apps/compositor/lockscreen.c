@@ -29,6 +29,7 @@
 // surrounds. No notification count is shown at all.
 
 #include "compositor.h"
+#include "../../libc/string.h"   // #73 secure_zero
 #include "../../libc/notify.h"   // #745: NOTIFY_WARNING for a declined lock
 #include "../../libc/syscall.h"
 #include "../../libc/stdio.h"
@@ -125,7 +126,7 @@ void lock_init(void)
     // kernel flag is authoritative, so read it rather than assume).
     g_session_locked     = (sys_session_is_locked() == 1);
     g_lock_password_len  = 0;
-    g_lock_password[0]   = '\0';
+    secure_zero(g_lock_password, sizeof(g_lock_password));   /* #73 */
     g_lock_name_len      = 0;
     g_lock_name[0]       = '\0';
     g_lock_error[0]      = '\0';
@@ -201,7 +202,7 @@ void lock_enter_reason(int reason)
         return;
     }
     g_lock_password_len = 0;
-    g_lock_password[0]  = '\0';
+    secure_zero(g_lock_password, sizeof(g_lock_password));   /* #73 */
     g_lock_name_len     = 0;
     g_lock_name[0]      = '\0';
     g_lock_error[0]     = '\0';
@@ -245,7 +246,7 @@ static void do_unlock(void)
     int typed = (s_login_mode == LOGIN_MODE_TYPED);
     int rc = sys_session_unlock(typed ? g_lock_name : "", g_lock_password);
     g_lock_password_len = 0;
-    g_lock_password[0]  = '\0';
+    secure_zero(g_lock_password, sizeof(g_lock_password));   /* #73 */
 
     if (rc == 0) {
         g_lock_error[0] = '\0';
@@ -310,14 +311,14 @@ void lock_poll(void)
 #define LOCK_SHADOW      0xFF000000
 #define LOCK_SCRIM       0xFF060910
 #define LOCK_SCRIM_A     145          // DARKEN ONLY - never pixelate
-#define LOCK_FIELD_W     300
-#define LOCK_FIELD_H     42
+#define LOCK_FIELD_W     ui_px(300)
+#define LOCK_FIELD_H     ui_px(42)
 // User request: a smaller submit arrow. It was LOCK_FIELD_H, i.e. exactly as
 // tall as the password field, which read as a second button rather than an
 // affordance on the end of the field. #745 finishes the move: 28 -> 20, and
 // it now sits INSIDE the field's right-hand end instead of floating 12px
 // outside it, so the field is centred on the screen on its own.
-#define LOCK_ARROW_SZ    20
+#define LOCK_ARROW_SZ    ui_px(20)
 // LOCK_AVATAR_R IS GONE. It had been defined-but-unused since the avatar disc
 // was removed; #745 removes the constant too rather than leave a name that
 // invites the disc back.
@@ -657,7 +658,7 @@ int lock_handle_key(int key)
         g_lock_field ^= 1;
     } else if (key == 27 && typed) {
         g_lock_name_len = 0; g_lock_name[0] = '\0';
-        g_lock_password_len = 0; g_lock_password[0] = '\0';
+        g_lock_password_len = 0; secure_zero(g_lock_password, sizeof(g_lock_password));   /* #73 */
         g_lock_error[0] = '\0';
         g_lock_field = 0;
     } else if (key == 8 || key == 127) {
@@ -665,6 +666,7 @@ int lock_handle_key(int key)
             if (g_lock_name_len > 0) g_lock_name[--g_lock_name_len] = '\0';
         } else if (g_lock_password_len > 0) {
             g_lock_password[--g_lock_password_len] = '\0';
+            /* #73: the dropped byte is erased, not just un-terminated. */
         }
         g_lock_error[0] = '\0';   // clears the held error border
     } else if (key >= 32 && key <= 126) {

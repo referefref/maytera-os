@@ -5,6 +5,25 @@
 # reproducible by a build. One unified submenu: native games (sys_spawn), the
 # Win16 Entertainment Pack titles + SkiFree (win16_run, type=win16), and the
 # DOS games (dos_run, type=dos). See #208.
+#
+# 2026-08-26 (dw2menu): THIS FILE'S COMMENTS ONCE DELETED FOUR OF ITS ITEMS, and
+# the fix was to the READER, so do not "tidy" the comments believing they are
+# the hazard. The compositor used to slurp each .MENU into a static char[8192]
+# with one sys_read(); this file crossed 8191 bytes on 2026-08-23 and its last
+# four items - Rogue, Rogue (DOS), Discworld II and Pyro! (floppy) - were never
+# parsed. Nothing said so: the item-level "dropped" reporting could not see
+# lines the parser never received, and the Start menu cheerfully announced
+# "74 item(s) shown, 0 dropped" while these fragments declared 78. The owner
+# reported Discworld II missing from a machine where the CD volume was mounted
+# correctly on E: and DWB.EXE was readable.
+#
+# sm_feed_file() in userland/apps/compositor/startmenu.c now STREAMS the file
+# and feeds startmenu_model.rs one LINE at a time, so no whole-file size limit
+# exists to outgrow. The only remaining bound is a single LINE at SM_FRAG_LINE
+# (1024 bytes), which build/invariant-gate.sh check 18b enforces against every
+# shipped fragment, reading the limit out of startmenu.c rather than restating
+# it. Write as much explanation here as the next person needs.
+#
 category: Games
 item: Maytera Arena | /APPS/ARENA | icon=game_arena
 item: Maytera Chess | /APPS/CHESS | icon=game_chess
@@ -40,3 +59,330 @@ item: Commander Keen 6 | /GAMES/KEEN6/K6DEMO.EXE | icon=dosapp | type=dos
 # re-checking the live golden, build 1743, rather than trusting the ticket's
 # older snapshot of that file).
 item: Mutant Space Bats of Doom | /GAMES/BATS/BATS.EXE | icon=dosapp | type=dos
+# 2026-08-23 (#<config-ref>): the FOURTH /GAMES.CFG entry. The migration off that file
+# moved three of its four lines here and left this one behind, and because
+# /GAMES.CFG's reader was deleted in the same change (startmenu.c's
+# startmenu_load_games_cfg(), see the note at that call site) the game went from
+# launchable to unreachable by ANY means: the Start menu is the only launcher
+# for a DOS binary in the shipping system. /GAMES/PRINCE/4D_PRIN.EXE and its
+# 36 .DAT files were on the image the whole time. Verified present on golden
+# 2019 before adding this line, not assumed from the old file's contents.
+item: 4D Prince of Persia | /GAMES/PRINCE/4D_PRIN.EXE | icon=dosapp | type=dos
+
+# 2026-08-18: the eight DOS games added to the asset base the same day. They were
+# installed under /DOS but NOT given menu entries, and the Start menu is the ONLY
+# launcher for a DOS binary in the shipping system - the terminal spawns ELF via
+# sys_spawn_args and has no DOS path at all, so without these lines the games are
+# present on disk and unreachable by any means. Entry points were read off the
+# built image, not guessed: STUNTS ships LOAD.EXE (there is no STUNTS.EXE, only a
+# STUNTS.COM loader stub), and it needs ARGUMENTS. MCGA selects the mode-13h
+# driver; launched bare,
+# LOAD.EXE relocates itself high, finds no driver name among ega/cga/tdy/mcga,
+# prints "Invalid file name." and exits 1 (#172, MEASURED). The kernel splits
+# a launch line on the first space in dos_launch_common(); before #172 only
+# the DOSRUN.CFG path did, so no menu entry could pass an argument.
+#
+# THE `/ssb` FROM SETUP.DAT IS DELIBERATELY NOT PASSED, and this is the one
+# line here that is a judgement rather than a transcription. Stunts' own
+# SETUP.EXE wrote `load.exe /u MCGA  /ssb ` into /DOS/STUNTS/SETUP.DAT on
+# this image, so /ssb is what the game was configured for. MEASURED, same
+# kernel and same image, one run each, only the argument differing:
+#   /u MCGA /ssb  -> loads, sets mode 13h, then spins in the OPL2 detection
+#                    (`in al,0x218` -> 0xFF, `and al,0xE0 / cmp al,0xC0`,
+#                    266 retries at 422a:0821), gives up and exit(1) at
+#                    7,966,841 instructions with a black screen.
+#   /u MCGA       -> TITLE SCREEN, then the attract-mode 3D drive, still
+#                    running at the timeout with 58.8% frame motion.
+# CORRECTED 2026-08-26 (#252). The sentence that used to be here said
+# "MayteraOS emulates no AdLib/OPL2 and no Sound Blaster, so asking for one
+# is asking for hardware that is not there". THAT HAS BEEN FALSE SINCE #181
+# AND #182, and it was still being read as current three tickets later: an
+# OPL2 answers at 0x388/0x389 and is synthesised for real in Ring 3
+# (/APPS/FMSYNTH, userland/lib/opl2), and a Sound Blaster DSP with 8237 DMA
+# answers at 0x220. Monkey Island's music was MEASURED coming out of the
+# audio sink on 2026-08-26.
+#
+# THE #172 FAILURE ABOVE NO LONGER REPRODUCES. MEASURED 2026-08-26, golden
+# 2215, /u MCGA /ssb, /CONFIG/DOSIO.CFG=2, one run: LOAD.EXE loads, runs, and
+# is PASS/live at 42.3% frame motion at the timeout, with 23.2 s of audio at
+# the sink. It does NOT exit 1 and it does NOT show a black screen.
+#
+# AND THE PORT IN THE #172 NOTE IS NOT THE PORT IT USES ANY MORE. The IOTRACE
+# census for that run is 0x388 x114 and 0x389 x57, and NOT ONE access anywhere
+# in 0x2xx. #172 saw `in al,0x218` because 0x388 answered 0xFF then, so Stunts
+# fell through to hunting a Sound Blaster; now that #182 makes 0x388 answer,
+# it stays on the AdLib path and never goes looking. Re-measure before quoting
+# a port from an old trace: the port a guest uses is a CONSEQUENCE of what
+# answered it last time.
+#
+# /ssb IS STILL NOT PASSED HERE, and this is now a QUALITY judgement rather
+# than a "does it run" one. Under /ssb, Stunts writes FM registers far faster
+# than the Ring-3 synthesiser drains them: MEASURED 799,836 pushed with
+# 125,576 DROPPED and the ring pinned at 1024/1024 for the whole run. Its
+# music therefore plays, badly. That is a #187-class ring problem at a write
+# rate an order of magnitude above anything #187 measured, and it wants its
+# own ticket and its own measurement.
+#
+# NOTE FOR WHOEVER TAKES THAT TICKET: none of this is caused by #252. The
+# control arm was run - same image, same arguments, STOCK kernel - and it
+# behaves the same (150,696 pushed, 120,160 dropped), which is what `i15w=0`
+# on the [FMQ] line already said. Stunts was fixed by #182 and nobody had
+# re-measured it since. Flip this entry to /ssb once the drop rate is fixed.
+# STUNTS.COM loader stub), and KEEN7 is a Keen 4 MOD whose binary really is
+# KEEN4E.EXE, which is why its label says so.
+item: Aladdin | /DOS/ALADDIN/ALADDIN.EXE | icon=dosapp | type=dos
+item: SkyRoads | /DOS/SKYROADS/SKYROADS.EXE | icon=dosapp | type=dos
+item: The Secret of Monkey Island | /DOS/MONKEY/MONKEY.EXE | icon=dosapp | type=dos
+item: Stunts | /DOS/STUNTS/LOAD.EXE /u MCGA | icon=dosapp | type=dos
+item: Joust | /DOS/JOUST/JOUST.COM | icon=dosapp | type=dos
+item: Commander Keen 7 (Keen 4 mod) | /DOS/KEEN7/KEEN4E.EXE | icon=dosapp | type=dos
+item: NetHack | /DOS/NETHACK/NETHACK.EXE | icon=dosapp | type=dos
+
+# 2026-08-25 (#234f): SIMCITY CLASSIC. A plain 16-bit real-mode MZ, so it takes
+# the x86_16 interpreter path and IS subject to the #232 CPU cap (the cap is
+# forced off only for DOS/4GW guests, dosexec.c:8425). Entry point read off the
+# staged tree, not guessed: SIMCITY.EXE is the game, SETTINGS.EXE is its video
+# and sound configurator, and PICK.BAT is a DOS menu wrapper that needs
+# CHOICE.EXE and a command interpreter, neither of which a MayteraOS DOS guest
+# has. Launch the game directly.
+#
+# The window and taskbar title is DERIVED FROM THE DIRECTORY, not from this
+# label: dos_guest_title() (dosexec.c:5943) takes seg[nseg-2] of the path and
+# appends " (DOS)", so this shows as "SIMCITY (DOS)". Renaming the label here
+# would not change it.
+# THE /d2 IS LOAD-BEARING AND WAS MEASURED, NOT CHOSEN. It selects the game's
+# MCGA/VGA 320x200x256 mode, INT 10h 0x13. The alternative, the vendor default
+# EGA/VGA 640x480x16 (mode 0x12), renders every widget correctly and every GLYPH
+# as a scatter of a few pixels, so the game is unreadable in it. The letters in
+# the game's own usage string, SIMCITY [/d{EeCTHMm2}], are documented nowhere;
+# all four of these were established by running it and reading which directory it
+# opened and which mode it set: /dE -> CEGA/ + mode 0x12, /dC -> CGA/ (not
+# shipped), /dM and /dm (case is folded) -> MONO/, /d2 -> MCGA/ + mode 0x13.
+#
+# The command tail reaches the guest through the #172 split in
+# dos_launch_common(), the same mechanism the Stunts entry above uses.
+item: SimCity Classic | /DOS/SIMCITY/SIMCITY.EXE /d2 | icon=dosapp | type=dos
+# TWO ROGUES SHIP AND ONLY THE EMULATED ONE HAD AN ENTRY. userland/apps/rogue is
+# the complete native BSD Rogue port: 15,004 lines across 38 .c files, built PIE
+# against user-pie.ld, opening a real window via _win_create (curses.c:174) with
+# its own cell renderer over SYS_WIN_DRAW_RECT/TEXT. It has been played and fixed
+# at least once (curses.c:20-31 carries the SYS_WIN_CREATE outer-size note that
+# cost Rogue its status row). Nothing launched it; the menu's "Rogue" was the DOS
+# binary under the emulator.
+#
+# The native build is now the one called "Rogue": it is ours, it is a Ring-3 PIE,
+# it gets a real window, and it pays no emulation cost. The DOS binary keeps an
+# entry under a name that says what it is, because /DOS/ROGUE also earns its place
+# as x86-16 test corpus (tools/x86-16-oracle uses it as a length-decoder oracle)
+# and the two are not the same experience.
+#
+# Both are existence-checked by startmenu_model.rs::sm_model_finish(), so a
+# missing path renders nothing rather than a launcher for nothing (#537).
+item: Rogue | /APPS/rogue | icon=game
+item: Rogue (DOS) | /DOS/ROGUE/ROGUE.EXE | icon=dosapp | type=dos
+
+# 2026-08-21 (#207): DISCWORLD II. The owner asked "how do i start discworld
+# from the imac i dont see it in the start menu OR in the file system?", and
+# both halves of that were correct observations of one fact: Discworld II is
+# not a file anywhere. It is a raw ISO 9660 volume in the UNPARTITIONED TAIL
+# of the boot stick (#740), mounted at boot by usbvol_probe_and_mount() onto a
+# DOS drive letter. Nothing that browses a filesystem can show it, and
+# /APPS/DISKIMG cannot either: its scan looks for .iso/.img FILES inside
+# DIRECTORIES, and a raw device volume is neither. The Start menu is the only
+# launcher for a DOS binary in the shipping system, so with no line here the
+# game was present on the medium and unreachable by any means.
+#
+# THE PATH IS THE CD's ROOT, NOT ITS DW2 SUBDIRECTORY. On a real Discworld II
+# disc, DWB.EXE is at the root and \DW2 holds the game data plus VOLUME, the
+# disc identity file. The game hardcodes that shape: it probes drives with INT
+# 21h AX=4409h for one that answers "remote", chdirs it to \DW2 and opens
+# VOLUME. MEASURED both ways on build 2008 (#207): from /WINDIR/DRIVE_E/DWB.EXE
+# it sets VESA mode 0x101 and reaches the DISCWORLD II main menu; from a volume
+# whose DW2 is the hard-disk INSTALL directory instead, the same binary gets
+# `3Dh open FAIL '/WINDIR/DRIVE_E/DW2/VOLUME'`, prints "Discworld cannot locate
+# the Discworld CD." and exits 15 after 92,970 instructions. The tail must hold
+# the DISC images, not a DOSBox-style installed tree.
+#
+# WHY E: IS DERIVED AND NOT ASSUMED. usbvol mounts with DISKIMG_LETTER_AUTO,
+# which is rustkern/drvmap.rs's lowest free letter of DRV_CLASS_CDROM; that
+# file maps A:/B: to floppy, C: to fixed, D: reserved, E:..Z: to CD. At the
+# point usbvol runs (kernel/main.c, right after diskimg_boot_harness()) no
+# image is mounted on a normal boot, so the FIRST volume in the tail chain is
+# always E: and the second is always F:. Write disc 1 first:
+#   tools/usbvol/mkusbvol.sh --target <stick> --device --serial <serial> \
+#       disc1.iso disc2.iso
+# MEASURED: E: = disc 1 (label 20070601_14), F: = disc 2 (20070601_15); the
+# game runs E:\DWB.EXE and takes its data from F:\DW2, which is why BOTH discs
+# belong in the chain rather than only the one being launched.
+#
+# 2026-08-26 (no ticket, discentry) AMENDMENT, AND IT DECIDES WHETHER ANY VOLUME AFTER
+# THIS ONE EXISTS AT ALL. The chain has no index: each volume's length is read
+# from its OWN ISO 9660 primary volume descriptor, and usbvol_next_off_rs()
+# probes align_up(offset + THAT declared length). mkusbvol.sh used to lay the
+# next volume out at align_up(offset + the FILE's size), which differs the
+# moment an ISO carries lead-out padding, as every ripped disc here does. Five
+# volumes written, three mounted, no error anywhere: the kernel probed 1 MiB
+# short of where volume 4 had been written, found no CD001 and stopped. Both
+# sides now use the declared length and mkusbvol.sh re-walks the finished chain
+# the way the kernel does before it reports success. Re-verified: the two
+# Discworld discs still come up E: and F: with three more volumes behind them.
+#
+# AND IF THE STICK HAS NO DISCWORLD VOLUME THIS LINE COSTS NOTHING: the
+# existence check in startmenu_model.rs::sm_model_finish() calls access() on
+# the path, access() is stat(), and stat() has consulted the mounted image
+# since #193. No volume means no E:, means no such path, means the item is
+# silently dropped rather than rendered as a launcher for nothing (#537).
+item: Discworld II | /WINDIR/DRIVE_E/DWB.EXE | icon=dosapp | type=dos
+
+# 2026-08-25 (#234g): PYRO! 2.01, ON A MOUNTED 3.5" 720 KB FLOPPY IMAGE.
+#
+# This is the Discworld II shape one class down: the program is not a file on
+# this filesystem at all, it is a file inside a disk image that /APPS/DISKIMG
+# mounts on A:. /IMAGES/PYRO.IMG ships on the asset base; mounting it makes
+# /WINDIR/DRIVE_A/INSTALL.EXE resolve, and this line then renders.
+#
+# AND IF NOTHING IS MOUNTED THIS LINE COSTS NOTHING, by the same mechanism the
+# Discworld line relies on: sm_model_finish() in startmenu_model.rs calls
+# access() on the path, fat_open() only takes its image branch when
+# diskimg_is_mounted('A') is true (fs/fat.c:372), so with A: empty the path does
+# not exist and the item is silently dropped rather than rendered as a launcher
+# for nothing (#537). The model rebuilds about once a second, so the entry
+# appears within a second of mounting and disappears on eject.
+#
+# WHY INSTALL.EXE AND NOT PYRO.EXE. There is no PYRO.EXE on this disk. The
+# 720 KB image holds exactly three files, MEASURED by mounting it:
+# INSTALL.EXE (38,112), PYROCOMP.EXE (288,105) and READ.ME (5,343). PYROCOMP.EXE
+# is the compressed payload, and INSTALL.EXE is what unpacks it. Pointing this
+# at a PYRO.EXE that does not exist would be the FONTBOOK phantom again.
+#
+# HONEST LIMIT, stated because it is a property of the medium and not a bug: a
+# mounted image is READ-ONLY (DISKIMG_F_READONLY, diskimg.c:975) and INT 21h
+# AH=36h reports zero bytes free on it, so the installer can read the disk and
+# can write to C:, but nothing can write back to A:.
+item: Pyro! (floppy) | /WINDIR/DRIVE_A/INSTALL.EXE | icon=dosapp | type=dos
+
+# 2026-08-26 (no ticket, discentry): THE DIG AND RED ALERT WERE MEASURED AND DELIBERATELY
+# HAVE NO LINE HERE. Both were written into the stick's tail chain alongside the
+# two Discworld II discs, both load, both run real instructions, and NEITHER
+# reaches a playable state. A line for either would be a launcher for a black
+# window, which is worse than no line: the existence check in
+# startmenu_model.rs::sm_model_finish() cannot save us here, because the paths
+# DO exist. This block records what each one actually does so the next person
+# does not spend a day re-deriving it.
+#
+# THE VOLUME ORDER THIS ALL ASSUMES, and the reason it is worth writing down:
+# usbvol walks the tail chain in ascending offset order and assigns the lowest
+# free CD letter, so chain position IS the drive letter. Written disc1, disc2,
+# DIG, RA-Allies, RA-Soviet, the mapping MEASURED on build 2214 is
+#   E: Discworld II disc 1   F: Discworld II disc 2   G: THEDIG
+#   H: RA CD1 (Allies)       I: RA CD2 (Soviet)
+# and "[USBVOL] 5 data volume(s) mounted from the boot device tail". Adding
+# three volumes after Discworld II does NOT shift E: or F:, and the Discworld II
+# line below was re-verified to its main menu with all five present.
+#
+# THE DIG (/WINDIR/DRIVE_G/DIG/DIG.EXE). It is a bound DOS/4GW binary: MZ at
+# file offset 0, LE at 0x2c90, so le_find_rs() takes it and dosexec runs the LE
+# directly rather than its 16-bit extender stub. DO NOT point an entry at
+# DOS4GW.EXE the way DIG.BAT does; that file is the extender itself, a plain
+# real-mode MZ with no LE in it, and running it would be running the loader
+# instead of the game. DIG95.EXE is the Win95 build and there is no Win32
+# subsystem (#288).
+#   MEASURED: the LE loads, the arena is 32,572 KiB, and the guest dies at
+#   77,379 instructions with "Not enough memory to allocate file structures"
+#   and INT 21h AH=4Ch exit code 1, having presented 3 frames of nothing.
+#   The cause is NOT the CD and NOT the arena size. Watcom's 32-bit runtime
+#   grows its heap with INT 21h AH=4Ah on its own flat data segment, and the
+#   DOS/4GW bridge routes 4Ah to the REAL-MODE MCB allocator (int21_class() in
+#   rustkern/dos4gw.rs classes 0x48/0x49/0x4A as A_REGS, and dosexec.c:1959
+#   answers them out of conventional memory). With /CONFIG/DOSDIAG.CFG on, the
+#   one line that says it all is
+#     [dos] 4Ah resize es=0000 req=cf86 maxpara=a000 top=2000 ss=0000
+#   i.e. the guest asked to set its data segment to 0xCF86 paragraphs (850,016
+#   bytes) and was refused against a 640 KB ceiling, inside a 32 MB arena.
+#   Discworld II survives only because its initial break is already big enough:
+#   DWB.EXE contains the identical `mov ah,0xED / int 21h` heap-grow and simply
+#   never calls it.
+#   THE FIX IS A BRIDGE FEATURE, NOT A MENU LINE: 4Ah under a 32-bit guest means
+#   "set the flat data segment's limit", and needs a break region reserved
+#   between the top of the loaded image and DOS4GW_HEAP_SLACK's DPMI pool. That
+#   is dos4gw work; when it lands, this entry becomes one line and a re-test.
+#
+# 2026-08-27 (no ticket, rafault) RED ALERT NOW PLAYS, AND THIS FILE FINALLY GETS
+# ITS ITEM LINE. Everything from here to the "RED ALERT (/WINDIR/DRIVE_H/..."
+# block below is the history of four blockers, all now resolved; the block below
+# is still true about the DISCS and is kept for that reason alone.
+#
+#   RESOLVED, install (rawrite): /DOS/RA ships GAME.DAT, REDALERT.MIX and
+#   REDALERT.INI on the asset base, root:root 0644 under a 0755 directory, with
+#   RA.EXE deliberately absent because it is the 1,656-byte stub, not the game.
+#   Guest writes go to a per-user overlay at <home>/GAMES/RA, which is the only
+#   design that can work here: the DOS/4G swap file's name is EIGHT RANDOM
+#   CHARACTERS chosen per run, so there is no filename a permission row could
+#   name.
+#   RESOLVED, memory (ra4gw): INT 21h AH=4Ah on the guest's own flat selector is
+#   answered from the DPMI arena, not the 640 KB MCB allocator.
+#   RESOLVED, mouse (raplay): DPMI 0200h no longer answers an IRET byte for
+#   vector 33h, so the driver-detect test succeeds, and the INT 33h 0Ch event
+#   handler installed through a DPMI 0300h reflection is now actually called.
+#   RESOLVED, the derail (rafault): the guest was not drawing black frames on
+#   purpose and it was not stuck. A successful INT 21h AH=4Eh copied 128 bytes
+#   (the SIZE of the bridge's DTA mirror) back into the guest's DTA when a find
+#   result is 43 bytes, so the volume-label find that finds the disc wrote 85
+#   bytes of nothing over Red Alert's own stack - its saved registers at DTA+0x30,
+#   its saved EBP at DTA+0x3c and ITS RETURN ADDRESS at DTA+0x40. It then
+#   returned to guest linear 0 with every GPR zero. rustkern/dos4gw.rs now copies
+#   DTA_FIND_LEN = 43, and the 4GW boot self-test has a poison check that goes
+#   RED if that is ever widened again.
+#
+# MEASURED on golden 2239 (this build's own kernel, no diagnostic overrides),
+# with the Allies disc mounted on H: as an ISO 9660 image: Red Alert plays its
+# full VQA intro - "Trinity, New Mexico", the laboratory, the Westwood Studios
+# logo, the Red Alert title - and reaches Allied mission 1 in game, with the
+# sidebar, the objective line, map scroll, a moving cursor and unit tooltips.
+# Consecutive free-running frames differ by 64-75%. Zero MISS lines.
+#
+# AND MEASURED WITH NO DISC AT ALL, which is what decides the item line: Red
+# Alert draws its OWN dialog, "PLEASE INSERT A RED ALERT CD INTO THE CD-ROM
+# DRIVE", with working OK/CANCEL buttons and a live mouse cursor. That is a
+# legible message from the game about what is missing, not the black window this
+# file exists to prevent, so the entry is honest on a machine with no disc.
+#
+# WHAT THE USER STILL HAS TO PROVIDE: the disc. Put CD1 (or CD2) in the boot
+# medium's tail with tools/usbvol/mkusbvol.sh and it is mounted on a CD drive
+# letter at boot; Red Alert finds it by VOLUME LABEL ("CD1"/"CD2"), not by drive
+# letter, so any letter will do. There is no requires= attribute in this grammar,
+# so the item cannot be hidden when no disc is present - hence the paragraph
+# above being a measurement rather than an assumption.
+item: Red Alert | /DOS/RA/GAME.DAT | icon=dosapp | type=dos
+#
+# RED ALERT (/WINDIR/DRIVE_H/... and /WINDIR/DRIVE_I/...). It refuses to run
+# from a CD BY ITS OWN DESIGN, and it refuses twice, so there is no launch line
+# on either disc that can work.
+#   /INSTALL/RA.EXE is a 1,656-byte real-mode MZ launcher, not the game. At
+#   offset 0x37 of its image it does `xor dl,dl / mov ah,36h / int 21h`, i.e.
+#   free space on the DEFAULT drive, and a mounted disc correctly reports zero
+#   free (int21svc.c:1049 returns BX=0 for a read-only image, which is the truth
+#   and not a placeholder). MEASURED: "Error - insufficient disk space to run
+#   Red Alert. Red Alert requires 8,388,608 bytes of disk space." and it sits on
+#   "Press a key to continue."
+#   /INSTALL/GAME.DAT is the actual game, a Rational DOS/4G LE (inner MZ at file
+#   offset 233,508, LE at 244,900). Launching it directly skips the stub and
+#   hits the game's OWN copy of the same check: "Insufficient Disk Space to run
+#   Red Alert. You must have 8 megabytes of free disk space."
+#   The Allies and Soviet discs are byte-identical in layout, so this is one
+#   game with two data discs, not two games: whichever way it eventually runs it
+#   wants ONE entry, not two.
+#   HOW FAR IT GETS WHEN THAT CHECK PASSES, measured by copying GAME.DAT +
+#   REDALERT.MIX + REDALERT.INI to a writable C: (which reports 268 MB free) and
+#   launching /DOS/RA/GAME.DAT: the disk check passes, it chdirs, reads
+#   REDALERT.INI, hooks INT 08h, sets mode 13h, and then loops forever on
+#     [GUESTFS-DENY] ... op=INT21/3Ch create ... path=/DOS/RA/./REDALERT.INI
+#   because /DOS/<GAME> falls into perms_check()'s root-owned 0755 no-entry
+#   default and the guest runs as the uid-1000 desktop session. That is the same
+#   wall NetHack and SimCity hit, and fs/perms.c:333-405 already records the
+#   answer: an explicit entry for the file the game writes, not a writable game
+#   directory. Beyond that it still needs MAIN.MIX from the disc and it will
+#   reach the same AH=4Ah heap-grow gap The Dig found.
+#   So Red Alert needs an INSTALLED tree plus a perms entry plus the bridge fix.
+#   None of those is a Start-menu change, and until all three exist there is
+#   nothing here to launch.

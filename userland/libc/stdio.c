@@ -10,6 +10,7 @@
 #include "syscall.h"
 #include "string.h"
 #include "unistd.h"
+#include "termios.h"   // #745 (local 99): getchar() probes fd 0 for a termios
 #include <stdint.h>
 
 // AssaultCube port phase 3: standard remove(), see stdio.h.
@@ -40,7 +41,43 @@ int puts(const char *s) {
     return 0;
 }
 
+// #745 (local 99): getchar() reads STDIN, not the raw kernel keyboard.
+//
+// This was `return syscall0(SYS_GETCHAR);`, which reads the kernel's GLOBAL
+// keyboard buffer and has nothing to do with fd 0. For anything the Terminal
+// spawns that is doubly wrong: the keystrokes meant for the child are written
+// to the pty master and arrive on its fd 0 through the tty line discipline,
+// while SYS_GETCHAR reads a buffer the COMPOSITOR drains eight keys per frame
+// in its own input loop. So the child raced the compositor for bytes it should
+// never have been reading, and lost nearly every time. MEASURED on golden
+// build 1872: in `less`, neither SPACE nor `q` did anything at all, and the
+// whole line discipline (raw mode, ^D, VMIN/VTIME, ICANON editing) was bypassed
+// for every getchar() caller in the tree.
+//
+// WHY THE GATE, rather than just reading fd 0: a process whose fd 0 is
+// /dev/console (anything launched detached, from AUTORUN.CFG, or as a GUI app)
+// gets 0 = EOF from console_read() forever (kernel/drivers/console.c), so an
+// unconditional read(0) would turn every one of those callers into an instant
+// EOF. console_fops.ioctl is NULL, so tcgetattr() FAILS there and succeeds on a
+// pty slave, which separates the two cases exactly. Existing non-pty callers
+// (doom, rogue, assaultcube) keep the old code path byte for byte.
+//
+// The answer is cached because otherwise every character costs an extra
+// syscall. An app that dup2()s a different fd onto 0 after its first getchar()
+// would keep the stale answer; nothing in the tree does that, and the honest
+// fix if one ever does is to re-probe on dup2, not to pay a syscall per byte.
 int getchar(void) {
+    static int stdin_is_tty = -1;
+    if (stdin_is_tty < 0) {
+        struct termios t;
+        stdin_is_tty = (tcgetattr(0, &t) == 0) ? 1 : 0;
+    }
+    if (stdin_is_tty) {
+        unsigned char c;
+        long n = read(0, &c, 1);
+        if (n == 1) return (int)c;
+        return EOF;          // 0 = ^D / master closed; <0 = error
+    }
     return syscall0(SYS_GETCHAR);
 }
 

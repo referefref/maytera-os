@@ -146,10 +146,27 @@ static int   g_dragtest = 0;
 // #342 multi-window WinAmp rig: the EQ, PLAYLIST and ALBUM ART sections each
 // live in their OWN borderless (nochrome) window so they can be shown/hidden and
 // dragged independently, just like classic WinAmp. The MilkDrop visualizer
-// (viz.c) is already a separate window. The EQ and PL windows simply BLIT the
-// matching sub-region of the shared offscreen framebuffer g_fb (compose() /
-// compose_skin() still render the full stacked rack into g_fb unchanged); the
-// ART window renders the decoded cover into its own small buffer.
+// (viz.c) is already a separate window. The EQ and PL windows BLIT the matching
+// sub-region of the shared offscreen framebuffer g_fb (compose() / compose_skin()
+// still render the full stacked rack into g_fb unchanged); the ART window
+// renders the decoded cover into its own small buffer, and (#160) album art is
+// drawn NOWHERE else - compose()/compose_skin() used to also bake an inline
+// thumbnail into the MAIN module (leftover from before this split), which is
+// exactly the "album cover glued to the main module" defect; removed.
+//
+// #160: MAIN and EQ are hardcoded to W(400) x MOD_MAIN_H/MOD_EQ_H(150/128),
+// sized for the procedural palette skins (compose()), which really do use the
+// full width/height. A classic bitmap .wsz skin (compose_skin()) draws a
+// 275x116 rack image regardless, so those windows were ALWAYS oversized by
+// 125px wide / 34px (MAIN) or 12px (EQ) tall in bitmap-skin mode - the reported
+// "dead space beside the EQ" and "black/weird area under the main player and
+// EQ". cur_main_w()/cur_main_h()/cur_eq_w()/cur_eq_h() (below render()) return
+// the skin-appropriate size; window CREATION (main(), panel_open_eq/pl/art())
+// uses them once, and render()'s blit uses them every frame so a mid-session
+// skin-family switch ([S] button) at least stops squishing the image (MayteraOS
+// has no win_resize() syscall, so the WINDOW's own on-screen bounds - set once
+// at creation - cannot live-resize; a switch after open can still leave the
+// old window bounds around the new content, same as before this fix, not worse).
 static int   eq_win  = -1;   // EQ window handle (>=0 = open)
 static int   pl_win  = -1;   // playlist window handle
 static int   art_win = -1;   // album-art window handle
@@ -157,6 +174,17 @@ static int   lib_win = -1;   // music-library browser window handle (g_view==1)
 // which window is currently being dragged (>=0), plus grab offset. Replaces the
 // single-window g_dragging flag so every window is independently draggable (#334).
 static int   g_drag_win = -1;
+
+// #160: classic bitmap .wsz skins are a fixed 275x116 per module (MAIN/EQ);
+// see the #342 comment above for why this matters. Defined near render()
+// (needs g_bitmap_active), declared here so window-creation code earlier in
+// the file (main(), panel_open_eq/pl/art()) can call them too.
+#define SKIN_RACK_W 275
+#define SKIN_RACK_H 116
+static int cur_main_w(void);
+static int cur_main_h(void);
+static int cur_eq_w(void);
+static int cur_eq_h(void);
 
 // album-art window geometry (its own framebuffer, scaled from g_art)
 #define ART_WIN_W   232
@@ -217,7 +245,6 @@ static uint32_t g_fb[W * H];
 static void parse_metadata(const char *path, track_t *t);
 static void track_label(const track_t *t, char *out, int outsz);
 static void load_art_for(const char *path);
-static void mp_draw_art(int bx, int by, int box);
 static void mp_cpy(char *d, const char *s, int cap);
 static void mp_zero(void *p, int n);
 static void lib_open(void);    // #342 music-library browser window
@@ -484,6 +511,14 @@ static void compose(void) {
     // WORKING min/close buttons, and move our own [V]/[T]/[S] buttons LEFT of the
     // kernel button band (window-x < 328) where the kernel does not intercept, and
     // exclude that strip from the drag zone so they fire on click, not drag.
+    // #160 UPDATE (verified against kernel/gui/window.c, current tree): this
+    // premise no longer holds. wm_handle_mouse_move()/wm_handle_mouse_down() now
+    // both gate the ENTIRE cog/min/max/close hit-test block on
+    // `!(win->flags & WINDOW_FLAG_NOCHROME)` - a NOCHROME window's titlebar-button
+    // zone is explicitly documented there as "phantom zones... fall through to
+    // the app". The x<328 constraint below is therefore stale as a safety
+    // requirement (harmless to leave as-is - it still fits - but do not copy this
+    // pattern into new nochrome UI on the assumption the kernel band is live).
     // ALL five controls live LEFT of the kernel title-button band (window-x < 328)
     // and are excluded from the drag zone, so EVERY click reaches on_click and the
     // kernel never intercepts them. This matters for close too: under the exclusive
@@ -530,12 +565,16 @@ static void compose(void) {
             fb_hline(bx, sy + sh - 1 - pk, bw - 1, 0xC8D6E6);
     }
 
-    // album art thumbnail (inside the right edge of the LCD panel)
-    mp_draw_art(W - 64, MOD_MAIN_Y + 24, 56);   // #335 larger cover thumbnail
+    // #160: album art is ONLY the detachable art_win (compose_art()) now - the
+    // #335 inline thumbnail that used to live here was a leftover from before
+    // the #342 window split and is exactly the "album cover stuck to the main
+    // module" the ticket reports. Removed; the marquee strip below reclaims the
+    // freed width (was narrowed to 316px "to leave room for album art"; now
+    // matches the W-16 width the LCD panel above it already uses).
 
-    // title marquee strip (narrowed on the right to leave room for album art)
-    fb_rect(8, MOD_MAIN_Y + 70, 316, 14, SK.lcd_bg);
-    fb_bevel(8, MOD_MAIN_Y + 70, 316, 14, 0);
+    // title marquee strip
+    fb_rect(8, MOD_MAIN_Y + 70, W - 16, 14, SK.lcd_bg);
+    fb_bevel(8, MOD_MAIN_Y + 70, W - 16, 14, 0);
 
     // info strip (state + toggles) drawn as small bevel chips
     draw_button_face(8,  MOD_MAIN_Y + 88, 56, 12, g_shuffle ? 1 : 0);
@@ -1645,33 +1684,10 @@ static void online_art_poll(void) {
     }
 }
 
-// draw the album-art thumbnail (or a placeholder note) into g_fb
-static void mp_draw_art(int bx, int by, int box) {
-    fb_rect(bx - 1, by - 1, box + 2, box + 2, 0x000000);
-    if (g_art_have && g_art_w > 0 && g_art_h > 0) {
-        // #335: scale the decoded cover to fill `box`, preserving aspect ratio.
-        int dw = box, dh = box;
-        if (g_art_w >= g_art_h) dh = box * g_art_h / g_art_w;
-        else                    dw = box * g_art_w / g_art_h;
-        if (dw < 1) dw = 1; if (dh < 1) dh = 1;
-        int ox = bx + (box - dw) / 2, oy = by + (box - dh) / 2;
-        for (int y = 0; y < dh; y++) {
-            int sy = y * g_art_h / dh; if (sy >= g_art_h) sy = g_art_h - 1;
-            for (int x = 0; x < dw; x++) {
-                int sx = x * g_art_w / dw; if (sx >= g_art_w) sx = g_art_w - 1;
-                px(ox + x, oy + y, 0xFF000000u | (g_art[sy * g_art_w + sx] & 0xFFFFFF));
-            }
-        }
-    } else {
-        fb_rect(bx, by, box, box, 0x2A3038);
-        fb_bevel(bx, by, box, box, 1);
-        uint32_t c = 0x90A0B0;            // musical-note placeholder
-        int nw = box / 16; if (nw < 2) nw = 2;
-        fb_rect(bx + box / 2 + box / 8, by + box / 6, nw, box * 2 / 3, c);
-        fb_rect(bx + box / 2 - box / 5, by + box - box / 4, box / 3, box / 8 < 2 ? 2 : box / 8, c);
-        fb_rect(bx + box / 2 + box / 8, by + box / 6, box / 5, nw, c);
-    }
-}
+// #160: mp_draw_art() (the inline album-art thumbnail drawer) removed here -
+// its only two callers were the leftover pre-#342 inline draws in compose()
+// and compose_skin(), both deleted. Album art now renders exclusively in the
+// detachable art_win via compose_art()/artfb_fill() (unrelated code, kept).
 
 // ============================================================================
 // Music library (recursive scan, persisted index, browse-by-artist/album view)
@@ -2153,7 +2169,10 @@ static void start_drag(int handle) {
 static void panel_open_eq(void) {
     if (eq_win >= 0) return;
     int mx = 0, my = 0; win_get_pos(win, &mx, &my);
-    eq_win = win_create("HiFi Equalizer", mx, my + MOD_MAIN_H, W, MOD_EQ_H);
+    // #160: stack below the MAIN window's ACTUAL height (cur_main_h()), not
+    // the procedural-skin constant MOD_MAIN_H - a bitmap .wsz skin's main
+    // window is only 116px tall, not 150.
+    eq_win = win_create("HiFi Equalizer", mx, my + cur_main_h(), cur_eq_w(), cur_eq_h());
     if (eq_win >= 0) win_set_nochrome(eq_win);
 }
 static void panel_close_eq(void) {
@@ -2162,7 +2181,12 @@ static void panel_close_eq(void) {
 static void panel_open_pl(void) {
     if (pl_win >= 0) return;
     int mx = 0, my = 0; win_get_pos(win, &mx, &my);
-    int py = my + MOD_MAIN_H + (eq_win >= 0 ? MOD_EQ_H : 0);
+    // #160: same reasoning as panel_open_eq() - stack below whichever of
+    // MAIN/EQ is actually showing, at its real height. The playlist window
+    // itself stays W wide in every skin: pledit.bmp is a tiling texture with
+    // no native width (unlike MAIN/EQ's fixed 275x116 bitmap), so W=400 is a
+    // real, deliberate size here, not a leftover mismatch.
+    int py = my + cur_main_h() + (eq_win >= 0 ? cur_eq_h() : 0);
     pl_win = win_create("HiFi Playlist", mx, py, W, MOD_PL_H);
     if (pl_win >= 0) win_set_nochrome(pl_win);
 }
@@ -2172,7 +2196,10 @@ static void panel_close_pl(void) {
 static void panel_open_art(void) {
     if (art_win >= 0) return;
     int mx = 0, my = 0; win_get_pos(win, &mx, &my);
-    art_win = win_create("Album Art", mx + W + 8, my, ART_WIN_W, ART_WIN_H);
+    // #160: hug the MAIN window's actual right edge (cur_main_w()) instead of
+    // always assuming 400px - otherwise a bitmap-skin MAIN window (275 wide)
+    // leaves a ~125px gap before the art window starts.
+    art_win = win_create("Album Art", mx + cur_main_w() + 8, my, ART_WIN_W, ART_WIN_H);
     if (art_win >= 0) win_set_nochrome(art_win);
 }
 static void panel_close_art(void) {
@@ -2475,8 +2502,11 @@ static void compose_skin(void) {
             if (idx == g_sel) fb_rect(SK_PLX + 3, ry, W - 6, SK_PLROW, g_bskin.pl_selectbg);
         }
     }
-    // album art thumbnail (top-right of the playlist area)
-    mp_draw_art(284, SK_MY + 18, 100);   // #335 album art fills the space right of the 275px main module
+    // #160: no inline album art here either (see the #342 comment up near
+    // eq_win/art_win) - it lived at x=284 (just right of the 275px skin) and
+    // was the other half of the "album cover glued to the main module" defect.
+    // The MAIN window is also no longer 400px wide in bitmap-skin mode (see
+    // cur_main_w()), so this offset would not even land in-window any more.
 
     draw_panel_toggles_fb();   // #342 [EQ][PL][VIS][ART] chips overlaid on the skin title bar
 }
@@ -2586,11 +2616,40 @@ static void on_click_skin(int mx, int my) {
 // ----------------------------------------------------------------------------
 // Frame
 // ----------------------------------------------------------------------------
-// #342: blit a sub-region of the shared g_fb (rows [y0, y0+h)) into a window.
-static void blit_region(int handle, int y0, int h) {
+// #160: MAIN/EQ native content size depends on the active skin family - a
+// classic bitmap .wsz skin is a fixed SKIN_RACK_W x SKIN_RACK_H (275x116);
+// the procedural palette skins (compose(), g_bitmap_active==0) really do fill
+// the full W x MOD_MAIN_H/MOD_EQ_H rack. Mirrors the EXACT condition render()
+// already uses to pick compose() vs compose_skin(), so a loaded-but-failed
+// bitmap skin (g_bskin.loaded==0, falls back to compose()) sizes the same way
+// it renders.
+static int cur_main_w(void) { return (g_bitmap_active && g_bskin.loaded) ? SKIN_RACK_W : W; }
+static int cur_main_h(void) { return (g_bitmap_active && g_bskin.loaded) ? SKIN_RACK_H : MOD_MAIN_H; }
+static int cur_eq_w(void)   { return (g_bitmap_active && g_bskin.loaded) ? SKIN_RACK_W : W; }
+static int cur_eq_h(void)   { return (g_bitmap_active && g_bskin.loaded) ? SKIN_RACK_H : MOD_EQ_H; }
+
+// #342: blit a sub-region of the shared g_fb (rows [y0, y0+h), width w) into a
+// window. #160: `w` can now be narrower than g_fb's own W-wide row stride (a
+// bitmap-skin MAIN/EQ window is only SKIN_RACK_W wide). SYS_WIN_BLIT has no
+// separate "stride vs width" concept - it reads `w` pixels per row, back to
+// back - so a narrower w cannot be blitted straight out of g_fb: that would
+// read row N+1 starting (W-w) pixels too early, scrambling the image.
+// g_blit_scratch repacks the sub-rectangle into a tightly-strided buffer first
+// when w < W; the common case (w == W: PLAYLIST always, MAIN/EQ in a
+// procedural skin) skips the copy entirely.
+static uint32_t g_blit_scratch[W * MOD_MAIN_H];   // MOD_MAIN_H(150) is the tallest module
+static void blit_region(int handle, int y0, int w, int h) {
     if (handle < 0) return;
-    syscall5(SYS_WIN_BLIT, handle, 0, 0, (W & 0xFFFF) | ((h & 0xFFFF) << 16),
-             (long)(g_fb + (size_t)y0 * W));
+    const uint32_t *src = g_fb + (size_t)y0 * W;
+    if (w >= W) {
+        syscall5(SYS_WIN_BLIT, handle, 0, 0, (W & 0xFFFF) | ((h & 0xFFFF) << 16), (long)src);
+    } else {
+        if (h > MOD_MAIN_H) h = MOD_MAIN_H;   // defensive clamp: fits g_blit_scratch
+        for (int y = 0; y < h; y++)
+            for (int x = 0; x < w; x++)
+                g_blit_scratch[y * w + x] = src[y * W + x];
+        syscall5(SYS_WIN_BLIT, handle, 0, 0, (w & 0xFFFF) | ((h & 0xFFFF) << 16), (long)g_blit_scratch);
+    }
     win_invalidate(handle);
 }
 static void render(void) {
@@ -2605,12 +2664,29 @@ static void render(void) {
     if (g_bitmap_active && g_bskin.loaded) compose_skin();
     else compose();
     // main window = the top MAIN region; EQ / PL sub-windows blit their own g_fb
-    // region only when open (#342).
-    blit_region(win, MOD_MAIN_Y, MOD_MAIN_H);
-    blit_region(eq_win, MOD_EQ_Y, MOD_EQ_H);
-    blit_region(pl_win, MOD_PL_Y, MOD_PL_H);
+    // region only when open (#342). #160: MAIN/EQ use the skin-appropriate size
+    // (cur_main_*()/cur_eq_*()) so a bitmap skin's 275x116 rack is blitted 1:1,
+    // not squished into (or leaving dead space in) a 400x150/128 window.
+    blit_region(win, MOD_MAIN_Y, cur_main_w(), cur_main_h());
+    blit_region(eq_win, MOD_EQ_Y, cur_eq_w(), cur_eq_h());
+    blit_region(pl_win, MOD_PL_Y, W, MOD_PL_H);
     if (g_bitmap_active && g_bskin.loaded) overlay_skin();
     else overlay();
+    // #160: the overlay pass just above draws TEXT via win_draw_text_ttf(), a
+    // "plain draw syscall" that - per sys_win_invalidate()'s own contract
+    // comment in kernel/proc/syscall.c - never commits content_buffer to the
+    // compositor's content_presented snapshot on its own; only win_invalidate()
+    // (or a self-invalidating blit/image syscall) does. blit_region() above
+    // already called win_invalidate() for win/eq_win/pl_win, but that happened
+    // BEFORE this overlay text was drawn, so every frame's text sat in
+    // content_buffer and was never republished - this is why playlist track
+    // names (and, in the procedural skins, every OT()/OSM() caption) stopped
+    // rendering. The g_view==1 library branch above already gets this right
+    // (win_invalidate(lib_win) AFTER overlay_library()); this brings the rack
+    // view in line with it.
+    win_invalidate(win);
+    if (eq_win >= 0) win_invalidate(eq_win);
+    if (pl_win >= 0) win_invalidate(pl_win);
     // album-art window (its own buffer + a title caption)
     if (art_win >= 0) {
         compose_art();
@@ -2903,9 +2979,21 @@ int main(int argc, char **argv) {
     for (int i = 0; i < NUM_EQ; i++) g_eq[i] = 32;
     g_repeat = 1;   // #335 repeat-all so playback loops continuously
 
+    // #160: discover .wsz skins and restore the last chosen skin BEFORE
+    // creating any window (moved up from below win_create() - neither
+    // function touches `win`/g_dir/anything set up between the old and new
+    // call sites, so this is a pure reorder). g_bitmap_active must be known
+    // before win_create() so the MAIN window can be sized to cur_main_w()/
+    // cur_main_h() - the skin-appropriate size - instead of always the wider
+    // procedural W x MOD_MAIN_H, which left dead space / a black band under a
+    // classic bitmap skin's smaller 275x116 rack (see the #342 comment near
+    // eq_win/art_win).
+    scan_skins();
+    load_skin_cfg();
+
     // #342: the main window now holds ONLY the MAIN module; EQ / PLAYLIST / ART
     // are separate toggleable windows.
-    win = win_create("Maytera HiFi", 170, 46, W, MOD_MAIN_H);
+    win = win_create("Maytera HiFi", 170, 46, cur_main_w(), cur_main_h());
     if (win < 0) return 1;
     win_set_nochrome(win);
     { int _fd = sys_open("/CONFIG/MPDRAGTEST.CFG", 0);
@@ -2913,10 +3001,6 @@ int main(int argc, char **argv) {
 
     scan_dir(g_dir);
     if (g_ntracks == 0) { strcpy(g_dir, "/"); scan_dir(g_dir); }
-
-    // Discover .wsz skins and restore the last chosen skin (built-in or .wsz).
-    scan_skins();
-    load_skin_cfg();
 
     // Build the music library: load the persisted index if present, else do a
     // recursive scan of the configured music dirs (/CONFIG/MPLIB.CFG or the

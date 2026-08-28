@@ -642,8 +642,24 @@ void Platform_Init(void) {
 
 void Platform_Free(void) { }
 
+/* Defined in Http_Maytera.c. The real per-code sentences live in that file's
+ * (upstream-mandated static) HttpBackend_DescribeError, which _HttpBase.h
+ * already calls for the LOG line; MaytHttp_DescribeError is the small public
+ * wrapper added alongside it so the ON-SCREEN error text (the launcher's
+ * "&cError %e when ..." label, which resolves %e through this function) gets
+ * the same sentence instead of falling through to a raw hex code (#800,
+ * 2026-08-17: this is what "&cError 4D48D0O3 when downloading resources"
+ * on screen actually was). */
+cc_bool MaytHttp_DescribeError(cc_result res, cc_string* dst);
+
 cc_bool Platform_DescribeError(cc_result res, cc_string* dst) {
 	const char* err;
+
+	/* Our own MHTTP_ERR_* range (0x4D480001-0x4D480006, see Http_Maytera.c)
+	   first: it is what a resource-download failure actually returns, and it
+	   has real sentences ("Networking is temporarily disabled after repeated
+	   failures") rather than strerror()'s generic text. */
+	if (MaytHttp_DescribeError(res, dst)) return true;
 
 	/* ClassiCube's own error codes start at 0xCCDED000 and are described by
 	   Logger.c, not here. Anything under 1000 is an errno from userland/libc. */

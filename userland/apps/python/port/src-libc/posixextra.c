@@ -3,6 +3,8 @@
 // implementations over the existing MayteraOS syscalls; where the kernel has no
 // backing primitive the function is a clearly-commented best-effort stub.
 #include "unistd.h"
+#include "fcntl.h"
+#include "stdlib.h"
 #include "time.h"
 #include "sys/time.h"
 #include "sys/stat.h"
@@ -19,11 +21,25 @@ int access(const char *path, int mode) {
     return 0;
 }
 
-// ftruncate()/truncate(): the kernel FAT/ext2 fd layer has no truncate primitive
-// (files are rewritten whole on close). Best-effort no-op so callers that only
-// pre-size or shrink temp files keep working; returns success.
-int ftruncate(int fd, long length) { (void)fd; (void)length; return 0; }
-int truncate(const char *path, long length) { (void)path; (void)length; return 0; }
+// ftruncate()/truncate(). SECOND COPY of the shared libc's file, kept because
+// the CPython port carries its own private libc; it was ALSO a no-op returning
+// success (#745 local 109). Corrected identically here. If the two ever have to
+// diverge, that is the moment to delete this copy rather than edit it twice
+// again.
+int ftruncate(int fd, long length) {
+    if (fd < 0 || length < 0) { errno = EINVAL; return -1; }
+    if (syscall2(SYS_FTRUNCATE, (long)fd, length) != 0) { errno = EINVAL; return -1; }
+    return 0;
+}
+
+int truncate(const char *path, long length) {
+    if (!path || length < 0) { errno = EINVAL; return -1; }
+    int fd = open(path, O_WRONLY, 0);
+    if (fd < 0) { errno = ENOENT; return -1; }
+    int rc = ftruncate(fd, length);
+    close(fd);
+    return rc;
+}
 
 int getpagesize(void) { return 4096; }
 

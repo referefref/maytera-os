@@ -6,6 +6,11 @@
 #include "../serial.h"
 #include "../string.h"
 #include "../mm/heap.h"
+#include "../cpu/mono.h"   // #115: bound the RTC update-in-progress waits
+#include "../cpu/wallclock.h" // #86: wallclock_now_unix + ktime_unix_to_civil_rs
+#include "../fs/fat.h"        // #86: read /CONFIG/TZ.CFG (the SAME file userland writes)
+#include "../fs/bootlog.h"    // #192: the absent-TZ note belongs in the persistent log too
+#include "../fs/cfgread.h"    // #192: is this read outcome worth a log line?
 #include "../video/framebuffer.h"
 #include "../video/font.h"
 #include "../video/graphics.h"
@@ -14,20 +19,15 @@
 // External timer ticks
 extern volatile uint64_t timer_ticks;
 
-// RTC I/O ports
-#define RTC_INDEX_PORT  0x70
-#define RTC_DATA_PORT   0x71
-
-// RTC registers
-#define RTC_SECONDS     0x00
-#define RTC_MINUTES     0x02
-#define RTC_HOURS       0x04
-#define RTC_WEEKDAY     0x06
-#define RTC_DAY         0x07
-#define RTC_MONTH       0x08
-#define RTC_YEAR        0x09
-#define RTC_STATUS_A    0x0A
-#define RTC_STATUS_B    0x0B
+// RTC ACCESS MOVED TO drivers/rtc.c (#135).
+//
+// This widget used to host the port I/O for the whole kernel: rtc_read_time()
+// and rtc_read_date() were defined here and called by syscalls 142/143,
+// rustkern/ktime.rs's wall clock, gui/login.c and, through those, every
+// userland clock. The write half lived in proc/syscall.c and encoded
+// registers DIFFERENTLY, which is what shipped the 6h06m clock error.
+// Both halves now share one codec (rustkern/rtcenc.rs) behind one driver.
+// The declarations still come from clock.h, so callers are unchanged.
 
 // Sine lookup table (scaled by 1000, 60 entries for 6-degree increments)
 // sin(i * 6 degrees) * 1000, starting from 0 degrees
@@ -50,78 +50,6 @@ static int isin(int angle) {
 // Get cosine value (angle in 6-degree units, 0-59)
 static int icos(int angle) {
     return isin(angle + 15);  // cos(x) = sin(x + 90), 90/6 = 15
-}
-
-// BCD to binary conversion
-static int bcd_to_bin(uint8_t bcd) {
-    return ((bcd >> 4) * 10) + (bcd & 0x0F);
-}
-
-// Read RTC register
-static uint8_t rtc_read(uint8_t reg) {
-    outb(RTC_INDEX_PORT, reg);
-    return inb(RTC_DATA_PORT);
-}
-
-// Check if RTC update in progress
-static bool rtc_update_in_progress(void) {
-    outb(RTC_INDEX_PORT, RTC_STATUS_A);
-    return (inb(RTC_DATA_PORT) & 0x80) != 0;
-}
-
-// Read time from RTC
-void rtc_read_time(int *hour, int *minute, int *second) {
-    // Wait for update to finish
-    while (rtc_update_in_progress());
-
-    uint8_t sec = rtc_read(RTC_SECONDS);
-    uint8_t min = rtc_read(RTC_MINUTES);
-    uint8_t hr = rtc_read(RTC_HOURS);
-
-    // Check if BCD mode (bit 2 of status B = 0 means BCD)
-    uint8_t status_b = rtc_read(RTC_STATUS_B);
-    bool is_bcd = !(status_b & 0x04);
-    bool is_24hr = (status_b & 0x02);
-
-    if (is_bcd) {
-        *second = bcd_to_bin(sec);
-        *minute = bcd_to_bin(min);
-        *hour = bcd_to_bin(hr & 0x7F);
-    } else {
-        *second = sec;
-        *minute = min;
-        *hour = hr & 0x7F;
-    }
-
-    // Handle 12-hour mode
-    if (!is_24hr && (hr & 0x80)) {
-        *hour = (*hour % 12) + 12;  // PM
-    }
-}
-
-// Read date from RTC
-void rtc_read_date(int *day, int *month, int *year, int *weekday) {
-    while (rtc_update_in_progress());
-
-    uint8_t d = rtc_read(RTC_DAY);
-    uint8_t m = rtc_read(RTC_MONTH);
-    uint8_t y = rtc_read(RTC_YEAR);
-    uint8_t w = rtc_read(RTC_WEEKDAY);
-
-    uint8_t status_b = rtc_read(RTC_STATUS_B);
-    bool is_bcd = !(status_b & 0x04);
-
-    if (is_bcd) {
-        *day = bcd_to_bin(d);
-        *month = bcd_to_bin(m);
-        *year = bcd_to_bin(y) + 2000;  // Assume 20xx
-        *weekday = bcd_to_bin(w);
-    } else {
-        *day = d;
-        *month = m;
-        *year = y + 2000;
-        *weekday = w;
-    }
 }
 
 // Day names
@@ -572,4 +500,125 @@ void clock_launch(void) {
                     (app_destroy_handler_t)clock_destroy);
 
     kprintf("[Clock] Widget launched\n");
+}
+
+// ===========================================================================
+// #86: the kernel-side reader for the configured timezone. See clock.h for why
+// this exists and why it is a parser rather than a second zone list.
+// ===========================================================================
+
+// Same throttle as userland/libc/tz.c's TZ_REFRESH_MS, deliberately: a user who
+// changes the zone in Settings should see the login clock agree within the same
+// couple of seconds, not on a different schedule.
+#define KTZ_REFRESH_MS 2000ULL
+
+static int      g_ktz_off_min  = 0;
+static int      g_ktz_from_file = 0;
+static uint64_t g_ktz_last_ms  = 0;
+static int      g_ktz_loaded   = 0;
+
+// #192: named ONCE, so the existence probe, the read and the cfgread policy key
+// cannot drift apart. The SAME path the first-run wizard and Settings write
+// (root's home is "/", so userconf resolves TZ.CFG to exactly this for a root
+// session, and the login screen is pre-session so the global file is right).
+#define KTZ_CFG_PATH "/CONFIG/TZ.CFG"
+
+static void ktz_reload(void) {
+    extern fat_fs_t g_fat_fs;
+    extern int32_t ktz_parse_offset_rs(const uint8_t *buf, int32_t len, int32_t *out_min);
+
+    // #192: THIS FUNCTION IS THE LOOP THAT FLOODED THE BOOT LOG. It runs every
+    // KTZ_REFRESH_MS for as long as the login clock is on screen, which is
+    // forever on a machine sitting at the sign-in screen. It called
+    // fat_read_file_retry(), the #307 bounded-retry reader built for a file
+    // that IS present on flaky USB media. On a fresh image TZ.CFG is ABSENT,
+    // the normal state before anyone picks a timezone, so every two seconds it
+    // produced three "read FAILED/empty ... giving up" lines and burned about
+    // 900,000 io_wait() iterations of pointless backoff. "Giving up" printed,
+    // and then the whole cycle started again.
+    //
+    // Two changes. First, ASK WHETHER THE FILE IS THERE before reading it:
+    // fat_exists() is routing-correct (ext2 root first, then the FAT ESP, the
+    // same order fat_read_file() uses), allocates nothing and prints nothing.
+    // Second, use the PLAIN reader, not the retry reader: a poll that comes
+    // round again in two seconds has no use for a spin backoff, and a transient
+    // miss costs one refresh interval instead of stalling the caller.
+    //
+    // THE POLL ITSELF STAYS. Settings and the first-run wizard write TZ.CFG
+    // while this clock is on screen, and the clock must follow within a couple
+    // of seconds without a reboot (clock.h states that contract). What is
+    // removed is the noise and the spin, not the liveness.
+    // #192: STORAGE MUST BE UP BEFORE "absent" MEANS "not configured".
+    // main.c runs the [KTZ] boot self-test BEFORE the ext2 root is mounted (the
+    // mount is ~60 lines later in the serial log), and /CONFIG lives on that
+    // root. Without this guard the very first refresh reported "no timezone
+    // configured yet" on a machine that HAD one, which is the same class of
+    // dishonest line #192 exists to remove, just quieter. Asking whether the
+    // /CONFIG DIRECTORY is there uses the same routing-correct primitive and
+    // needs no new mount-state plumbing: no /CONFIG, no verdict, no line.
+    if (fat_exists(&g_fat_fs, "/CONFIG") != 1) {
+        return;
+    }
+    if (fat_exists(&g_fat_fs, KTZ_CFG_PATH) != 1) {
+        if (cfgread_report_rs(KTZ_CFG_PATH, -1, CFG_OUTCOME_ABSENT) == CFG_LOG_NOTE) {
+            kprintf("[KTZ] no timezone configured yet (%s absent); clock shows UTC\n",
+                    KTZ_CFG_PATH);
+            bootlog_write("[KTZ] no timezone configured yet (%s absent); clock shows UTC",
+                          KTZ_CFG_PATH);
+        }
+        return;
+    }
+
+    uint32_t size = 0;
+    void *data = fat_read_file(&g_fat_fs, KTZ_CFG_PATH, &size);
+    if (!data || size == 0) {
+        // Present a moment ago and unreadable now. That IS a fault, so it stays
+        // loud; cfgread.rs rate-limits it rather than silencing it.
+        int act = cfgread_report_rs(KTZ_CFG_PATH, -1, CFG_OUTCOME_IOERR);
+        if (act == CFG_LOG_WARN) {
+            kprintf("[KTZ] %s present but read FAILED; keeping previous offset\n",
+                    KTZ_CFG_PATH);
+            bootlog_write("[KTZ] %s present but read FAILED; keeping previous offset",
+                          KTZ_CFG_PATH);
+        } else if (act == CFG_LOG_SUPPRESSED) {
+            bootlog_write("[KTZ] %s: further read failures will not be logged "
+                          "until it reads successfully again", KTZ_CFG_PATH);
+        }
+        // UTC stays the honest answer until a read succeeds, and it is NOT
+        // recorded as "configured", so a later successful read still wins.
+        if (data) kfree(data);
+        return;
+    }
+    if (cfgread_report_rs(KTZ_CFG_PATH, -1, CFG_OUTCOME_OK) == CFG_LOG_NOTE) {
+        kprintf("[KTZ] timezone read from %s (%u bytes)\n", KTZ_CFG_PATH, size);
+        bootlog_write("[KTZ] timezone read from %s (%u bytes)", KTZ_CFG_PATH, size);
+    }
+    int32_t off = 0;
+    if (ktz_parse_offset_rs((const uint8_t *)data, (int32_t)size, &off) == 0) {
+        g_ktz_off_min   = (int)off;
+        g_ktz_from_file = 1;
+    }
+    // A parse failure deliberately leaves the previous value alone: a torn or
+    // truncated read must not snap the clock to UTC for one frame.
+    kfree(data);
+}
+
+static void ktz_refresh(void) {
+    uint64_t now = mono_ms();
+    if (!g_ktz_loaded || (now - g_ktz_last_ms) >= KTZ_REFRESH_MS) {
+        g_ktz_last_ms = now;
+        g_ktz_loaded  = 1;
+        ktz_reload();
+    }
+}
+
+int ktz_offset_minutes(void) { ktz_refresh(); return g_ktz_off_min; }
+int ktz_is_set(void)         { ktz_refresh(); return g_ktz_from_file; }
+
+int ktz_local_civil(int *out) {
+    if (!out) return -1;
+    int64_t utc = wallclock_now_unix();     // epoch seconds, 0 = RTC not sane
+    if (utc <= 0) return -1;
+    int64_t local = utc + (int64_t)ktz_offset_minutes() * 60;
+    return (int)ktime_unix_to_civil_rs(local, out);
 }

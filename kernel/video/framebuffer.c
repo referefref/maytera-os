@@ -6,16 +6,70 @@
 #include "../mm/vmm.h"      // #642: PAT / write-combining front buffer
 #include "../cpu/dlprof.h"    // #642: dp_tsc() - the shared rdtsc helper
 #include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
+#include "../drivers/pci.h" // ASUS bring-up: positively identify a VIRTUAL display
+                            // adapter before touching the Bochs DISPI I/O ports
 
 // Framebuffer state
 static uint32_t *fb_front = NULL;      // Front buffer (actual display)
 static uint32_t *fb_back = NULL;       // Back buffer (drawing target)
 static uint32_t *fb_addr = NULL;       // Current drawing target
-static uint32_t fb_width = 0;
-static uint32_t fb_height = 0;
-static uint32_t fb_pitch = 0;          // Bytes per line
+static uint32_t fb_width = 0;          // LOGICAL width  (post-rotation)
+static uint32_t fb_height = 0;         // LOGICAL height (post-rotation)
+static uint32_t fb_pitch = 0;          // LOGICAL bytes per line (fb_back's row stride)
 static uint32_t fb_bpp = 0;            // Bits per pixel
 static int fb_is_bgr = 0;
+
+// ===========================================================================
+// #745 (local 102): display rotation (GPD MicroPC - the panel is physically
+// mounted rotated, so its native GOP scanout is portrait; Linux users on the
+// same hardware fix this with an fbcon/xrandr transform, and we need the
+// software equivalent since firmware cannot change how the panel is glued in).
+//
+// DECISION: rotate at the PRESENT chokepoint, not per-primitive. fb_width/
+// fb_height/fb_pitch above (and every fb_* draw call in this file) are the
+// LOGICAL screen: the console, gfx_boot_splash(), and the compositor's mapped
+// back buffer all draw into fb_back as an ordinary unrotated landscape screen
+// and never know rotation exists. fb_phys_* below is the raw GOP layout that
+// only fb_swap_buffers()/fb_swap_dirty_rects() (video/framebuffer.c) ever
+// touch, rotating each row (or each damage rect - #379/b740) as it copies
+// back->front. This was chosen over transforming every draw primitive because
+// the compositor already funnels 100% of its output through exactly that one
+// copy (confirmed: fb_put_pixel/fb_fill_rect/fb_draw_rect/fb_blit/etc. write
+// ONLY fb_addr==fb_back; nothing in this tree writes fb_front outside these
+// two functions), so rotating there is free of per-primitive overhead and
+// naturally covers every caller, including ones this file's own author will
+// never know about (DOOM's fullscreen path, the Win16 layer, TinyGL) instead
+// of requiring each of them to opt in.
+//
+// MEASURED COST (see the block above fb_present_rotated_copy() below): a 90/
+// 270 present is a cache-hostile transpose (each written pixel lands on a new
+// destination cache line - there is no reuse to exploit without block tiling,
+// which is not implemented here), unlike the straight-line memcpy the NONE/
+// 180 paths keep. This is real, on-hardware-relevant cost with no GPU to hide
+// it behind, which is why it stays C rather than moving to Rust: it is
+// entangled with the existing cli/CR3-switch/damage-lock present chokepoint
+// (sys_fb_flip() in gui/fb_syscall.c) that is already hand-tuned C with its
+// own TSC-cycle instrumentation (#632/#642), and reusing dp_tsc() here rather
+// than introducing an FFI boundary mid-cli-region keeps that entanglement in
+// one language. rotation==NONE (every machine that is not this one) takes the
+// UNCHANGED pre-#102 fb_swap_buffers()/fb_swap_dirty_rects() code path with
+// byte-identical behaviour - see the early-out in both functions below.
+static fb_rotation_t fb_rotation   = FB_ROTATE_NONE;
+static uint32_t fb_phys_width      = 0;   // native GOP width (firmware-reported)
+static uint32_t fb_phys_height     = 0;   // native GOP height
+static uint32_t fb_phys_pitch      = 0;   // native GOP row stride (bytes), fb_front
+
+fb_rotation_t fb_get_rotation(void)  { return fb_rotation; }
+uint32_t fb_get_phys_width(void)     { return fb_phys_width; }
+uint32_t fb_get_phys_height(void)    { return fb_phys_height; }
+
+// Rotation-copy cycle counters, read by the [FLIPPROF]-style boot log line so
+// the cost is a measured number, not an assertion (mirrors #632's g_flip_*
+// counters one file over). Cumulative + max, cheap enough to keep unconditional.
+volatile uint64_t g_fb_rot_copy_tot_cyc = 0;
+volatile uint64_t g_fb_rot_copy_max_cyc = 0;
+volatile uint64_t g_fb_rot_copy_calls   = 0;
+volatile uint64_t g_fb_rot_copy_px_tot  = 0;   // total pixels copied, for cyc/px
 
 // Global variables for external access (fb_syscall.c)
 uint64_t g_fb_phys_addr = 0;
@@ -36,6 +90,21 @@ static bool fb_double_buffered = false;
 #define VBE_DISPI_INDEX_VIRT_HEIGHT 0x07
 #define VBE_DISPI_INDEX_X_OFFSET    0x08
 #define VBE_DISPI_INDEX_Y_OFFSET    0x09
+// ASUS bring-up: the DISPI interface IDENTIFIES ITSELF through index 0. Real
+// Bochs/QEMU/VirtualBox report 0xB0C0..0xB0C5 (the interface revision); a
+// machine that does not decode these ports at all floats the bus and reads
+// 0xFFFF. This is the POSITIVE identification the gate below needs.
+#define VBE_DISPI_INDEX_ID          0x00
+#define VBE_DISPI_ID0               0xB0C0
+#define VBE_DISPI_ID5               0xB0C5
+
+// Display-class PCI vendors that are virtual adapters known to implement the
+// Bochs DISPI register interface. This list is a WHITELIST, deliberately: any
+// machine not on it never has a byte written to ports 0x1CE/0x1CF.
+#define FB_VDPY_VENDOR_QEMU     0x1234  // QEMU / Bochs stdvga (1234:1111)
+#define FB_VDPY_VENDOR_QXL      0x1B36  // Red Hat QXL
+#define FB_VDPY_VENDOR_VIRTIO   0x1AF4  // virtio-vga / virtio-gpu
+#define FB_VDPY_VENDOR_VBOX     0x80EE  // VirtualBox VBoxVGA
 
 static uint16_t bochs_vbe_read(uint16_t index) {
     outw(VBE_DISPI_IOPORT_INDEX, index);
@@ -47,9 +116,85 @@ static void bochs_vbe_write(uint16_t index, uint16_t value) {
     outw(VBE_DISPI_IOPORT_DATA, value);
 }
 
+// ASUS bring-up: is there a VIRTUAL display adapter on the PCI bus?
+//
+// fb_init() is reached from console_init(), which main.c runs BEFORE pci_init(),
+// so the pci.c device table does not exist yet and pci_find_vendor_class() would
+// answer "no" on every machine. pci_read8/16() are pure 0xCF8/0xCFC
+// configuration cycles with no initialisation of their own, so this walks bus 0
+// directly. Bus 0 is sufficient and deliberate: every emulator in the whitelist
+// puts its display adapter on bus 0, and widening the walk would only add ways
+// to mis-identify a real GPU behind a bridge as virtual.
+//
+// This is a POSITIVE test. "The read was not 0xFFFF" is NOT one, and is exactly
+// the reasoning that made the old unconditional fixup dangerous.
+static int fb_virtual_display_present(uint16_t *out_vendor, uint16_t *out_device) {
+    for (uint8_t slot = 0; slot < 32; slot++) {
+        if (pci_read16(0, slot, 0, PCI_VENDOR_ID) == 0xFFFF) continue;
+        uint8_t hdr = pci_read8(0, slot, 0, PCI_HEADER_TYPE);
+        uint8_t nfunc = (hdr & 0x80) ? 8 : 1;
+        for (uint8_t func = 0; func < nfunc; func++) {
+            uint16_t vid = pci_read16(0, slot, func, PCI_VENDOR_ID);
+            if (vid == 0xFFFF) continue;
+            if (pci_read8(0, slot, func, PCI_CLASS) != PCI_CLASS_DISPLAY) continue;
+            if (vid == FB_VDPY_VENDOR_QEMU || vid == FB_VDPY_VENDOR_QXL ||
+                vid == FB_VDPY_VENDOR_VIRTIO || vid == FB_VDPY_VENDOR_VBOX) {
+                if (out_vendor) *out_vendor = vid;
+                if (out_device) *out_device = pci_read16(0, slot, func, PCI_DEVICE_ID);
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
 // Read and fix Bochs VGA display alignment after fb_init
 static void fb_dump_vga_crtc(void);
 static void fb_fix_bochs_alignment(void) {
+    // ASUS bring-up GATE. This function used to run UNCONDITIONALLY from
+    // fb_init(), on every machine, and it does raw I/O to the Bochs VBE DISPI
+    // ports 0x1CE/0x1CF plus (via fb_dump_vga_crtc) the legacy VGA CRTC and
+    // attribute-controller ports. On a machine that does not decode those
+    // ports the reads float to 0xFFFF, `virt_w != fb_phys_width` is then
+    // trivially true, and the code WRITES 0xFFFF-derived values back to I/O
+    // ports it does not own. fb_dump_vga_crtc() is the same story and is NOT a
+    // read-only dump despite its name: it writes the attribute controller
+    // (0x3C0) and CRTC start-address (0x3D4/0x3D5) whenever its own floated
+    // reads come back non-zero, which on unclaimed ports they always do.
+    //
+    // Two POSITIVE conditions, both required, before a single byte is written:
+    //   1. a display-class PCI function from a known virtual-adapter vendor;
+    //   2. the DISPI interface identifying itself through index 0 with a
+    //      version in 0xB0C0..0xB0C5.
+    // Order matters: (1) is pure PCI config space and is safe everywhere, so a
+    // machine that fails it never has the index register at 0x1CE written at
+    // all, not even for the probe.
+    uint16_t vdpy_vendor = 0, vdpy_device = 0;
+    if (!fb_virtual_display_present(&vdpy_vendor, &vdpy_device)) {
+        kprintf("[FB] Bochs VBE: NOT detected (no virtual display adapter on PCI "
+                "bus 0) - DISPI + VGA CRTC fixup SKIPPED, no I/O to 0x1CE/0x1CF\n");
+        bootlog_write("[FB] Bochs VBE NOT detected (no virtual display adapter) "
+                      "- DISPI/VGA-CRTC fixup SKIPPED");
+        return;
+    }
+
+    uint16_t dispi_id = bochs_vbe_read(VBE_DISPI_INDEX_ID);
+    if (dispi_id < VBE_DISPI_ID0 || dispi_id > VBE_DISPI_ID5) {
+        kprintf("[FB] Bochs VBE: adapter %04x:%04x present but DISPI id 0x%x is "
+                "out of range - fixup SKIPPED\n",
+                vdpy_vendor, vdpy_device, dispi_id);
+        bootlog_write("[FB] Bochs VBE NOT confirmed (adapter %04x:%04x, DISPI id "
+                      "0x%x) - DISPI/VGA-CRTC fixup SKIPPED",
+                      vdpy_vendor, vdpy_device, dispi_id);
+        return;
+    }
+
+    kprintf("[FB] Bochs VBE detected (adapter %04x:%04x, DISPI id 0x%x) - "
+            "alignment fixup WILL run\n", vdpy_vendor, vdpy_device, dispi_id);
+    bootlog_write("[FB] Bochs VBE detected (adapter %04x:%04x, DISPI id 0x%x) "
+                  "- DISPI/VGA-CRTC fixup RUNNING",
+                  vdpy_vendor, vdpy_device, dispi_id);
+
     uint16_t xres = bochs_vbe_read(VBE_DISPI_INDEX_XRES);
     uint16_t yres = bochs_vbe_read(VBE_DISPI_INDEX_YRES);
     uint16_t bpp = bochs_vbe_read(VBE_DISPI_INDEX_BPP);
@@ -64,11 +209,17 @@ static void fb_fix_bochs_alignment(void) {
     kprintf("[FB] Bochs VBE: virt_w=%u virt_h=%u x_off=%u y_off=%u\n",
             virt_w, virt_h, x_off, y_off);
 
-    // Fix: ensure virtual width matches actual width and offsets are zero
+    // Fix: ensure virtual width matches actual width and offsets are zero.
+    // #745 (local 102): this is a Bochs/QEMU-std-vga HARDWARE register - it
+    // describes the real scanout memory layout, so it must be compared/set
+    // against fb_phys_width (the true GOP width), never fb_width (which is
+    // the LOGICAL, possibly-rotated width and would drive this register to
+    // the wrong value on a 90/270 rotated boot, corrupting the actual display
+    // this function exists to fix).
     int fixed = 0;
-    if (virt_w != fb_width) {
-        kprintf("[FB] Fixing virt_width: %u -> %u\n", virt_w, (unsigned)fb_width);
-        bochs_vbe_write(VBE_DISPI_INDEX_VIRT_WIDTH, (uint16_t)fb_width);
+    if (virt_w != fb_phys_width) {
+        kprintf("[FB] Fixing virt_width: %u -> %u\n", virt_w, (unsigned)fb_phys_width);
+        bochs_vbe_write(VBE_DISPI_INDEX_VIRT_WIDTH, (uint16_t)fb_phys_width);
         fixed = 1;
     }
     if (x_off != 0) {
@@ -121,6 +272,32 @@ static void fb_fix_bochs_alignment(void) {
 // PTEs carry the right bits, and nothing regresses. It cannot prove the win.
 // The number that matters is the one this prints on the real iMac.
 // ===========================================================================
+// ---------------------------------------------------------------------------
+// #COMPIDLE: HOW MANY PIXELS ACTUALLY REACH THE DISPLAY, AND HOW OFTEN.
+//
+// The owner's report is "the compositor uses 70% of the CPU at idle" on real
+// hardware, and the recorded prior failure on this exact question was that a
+// VM measured ~0% and the VM number was believed. A VM cannot settle it,
+// because the front buffer there is ordinary host RAM. What CAN be settled
+// from any machine, including his, is the WORKLOAD: how many presents per
+// second, how many of them are whole-screen, and how many bytes per second
+// are written across the (on real hardware) MMIO aperture. Those three
+// numbers are hardware-independent statements about what the compositor
+// ASKED for, and they are what turn "70%" into a diagnosis instead of an
+// impression.
+//
+// Counted here rather than in sys_fb_flip because this is the only place that
+// knows the real byte count: sys_fb_flip sees rectangles, this sees the
+// memcpy lengths, and after clamping the two are not the same number.
+//
+// Cost is one add per copy, on a path that already does a multi-KB memcpy.
+// ---------------------------------------------------------------------------
+uint64_t g_fb_front_bytes   = 0;   // bytes written back->front, lifetime
+uint64_t g_fb_full_presents = 0;   // whole-screen presents
+uint64_t g_fb_part_presents = 0;   // damage-rect presents
+uint64_t g_fb_wc_bytes      = 0;   // front-buffer bytes actually re-typed WC
+uint64_t g_fb_wc_span       = 0;   // front-buffer bytes in total
+
 static int      fb_wc_active     = 0;
 uint64_t        g_fb_wc_pre_cyc  = 0;   // cycles for one full present, before
 uint64_t        g_fb_wc_pre2_cyc = 0;   // CONTROL: a second present, still before
@@ -133,6 +310,17 @@ int fb_wc_is_active(void) { return fb_wc_active; }
 // black over black: measurable, and invisible on screen. Interrupts are masked
 // so a timer tick cannot land inside the sample.
 static uint64_t fb_time_one_present(void) {
+    // #745 (local 102): LOGICAL size, deliberately - fb_back is allocated to
+    // exactly fb_height*fb_pitch bytes (see fb_init()). Using fb_phys_height*
+    // fb_phys_pitch here instead would read past the end of fb_back on a
+    // 90/270 rotated boot (logical byte count is always <= physical: proof in
+    // fb_init()'s comment on fb_pitch). Both buffers are freshly zeroed at
+    // this point in fb_init (see caller), so this straight-line copy is a
+    // faithful "N bytes, one linear memcpy" timing sample either way; on a
+    // rotated boot N is the logical (smaller-or-equal) byte count, which is a
+    // legitimate lower bound on the real rotated present's cost, not the
+    // exact number - the real present is a transpose, strictly more
+    // expensive per byte than this straight memcpy measures.
     uint64_t sz = (uint64_t)fb_height * fb_pitch;
     uint64_t rflags;
     __asm__ volatile("pushfq; pop %0" : "=r"(rflags));
@@ -150,6 +338,13 @@ static void fb_enable_write_combining(void) {
 
     uint64_t sz = (uint64_t)fb_height * fb_pitch;
     sz = (sz + 0xFFF) & ~0xFFFULL;
+    // #745 (local 102): the PAT re-type below must cover the PHYSICAL front
+    // buffer (the real GOP MMIO BAR) - fb_sz below, not the LOGICAL `sz`
+    // above (which fb_time_one_present() needs unchanged; see its comment).
+    // On rotation NONE/180 these are numerically identical, so this is a
+    // no-op change for every machine that is not rotated.
+    uint64_t fb_sz = (uint64_t)fb_phys_height * fb_phys_pitch;
+    fb_sz = (fb_sz + 0xFFF) & ~0xFFFULL;
 
     // TWO "before" samples, not one. The first present of a boot is cold in
     // every sense (source not in cache, TLB unwarmed), so a naive
@@ -171,7 +366,7 @@ static void fb_enable_write_combining(void) {
     extern uint64_t g_kernel_cr3;
     uint64_t cr3 = g_kernel_cr3 ? g_kernel_cr3 : (read_cr3() & VMM_ADDR_MASK);
 
-    int64_t wc_bytes = vmm_set_memtype_range(cr3, (uint64_t)fb_front, sz,
+    int64_t wc_bytes = vmm_set_memtype_range(cr3, (uint64_t)fb_front, fb_sz,
                                              VMM_PAT_IDX_WC);
     if (wc_bytes <= 0) {
         kprintf("[FB] #642: WC re-type covered nothing (%ld), front buffer unchanged\n",
@@ -179,12 +374,14 @@ static void fb_enable_write_combining(void) {
         return;
     }
     fb_wc_active = 1;
+    g_fb_wc_bytes = (uint64_t)wc_bytes;   // #COMPIDLE: reportable at runtime
+    g_fb_wc_span  = fb_sz;
     // Coverage is NOT assumed to be 100%. vmm_set_memtype_range only re-types
     // whole 2MB/1GB granules, so a framebuffer whose size is not a multiple of
     // the granule keeps its tail at the firmware type. Report the real figure,
     // because a speedup measured over a partially-converted buffer is a
     // partially-converted speedup and saying otherwise would overstate it.
-    uint64_t pct = (uint64_t)wc_bytes * 100 / sz;
+    uint64_t pct = (uint64_t)wc_bytes * 100 / fb_sz;
 
     if (fb_back) g_fb_wc_post_cyc = fb_time_one_present();
 
@@ -199,8 +396,8 @@ static void fb_enable_write_combining(void) {
     uint64_t warm_x100   = g_fb_wc_pre2_cyc ? (g_fb_wc_pre_cyc  * 100) / g_fb_wc_pre2_cyc : 0;
 
     kprintf("[FB] #642 WC ACTIVE on 0x%lx..0x%lx: %lu of %lu KB re-typed (%lu%%)\n",
-            (uint64_t)fb_front, (uint64_t)fb_front + sz,
-            (uint64_t)wc_bytes / 1024, sz / 1024, pct);
+            (uint64_t)fb_front, (uint64_t)fb_front + fb_sz,
+            (uint64_t)wc_bytes / 1024, fb_sz / 1024, pct);
     kprintf("[FB] #642 present: cold=%lu  CONTROL=%lu cyc (%lu.%03lu cyc/byte)  "
             "wc=%lu cyc (%lu.%03lu cyc/byte)\n",
             g_fb_wc_pre_cyc, g_fb_wc_pre2_cyc, pre2_mcpb / 1000, pre2_mcpb % 1000,
@@ -213,7 +410,7 @@ static void fb_enable_write_combining(void) {
     // report, and serial is silent in GUI mode.
     bootlog_write("[FB] #642 WC: base=0x%lx size=%lu covered=%lu (%lu%%) "
                   "cold=%lu control=%lu wc=%lu cyc speedup=%lu.%02lux warmup=%lu.%02lux",
-                  (uint64_t)fb_front, sz, (uint64_t)wc_bytes, pct,
+                  (uint64_t)fb_front, fb_sz, (uint64_t)wc_bytes, pct,
                   g_fb_wc_pre_cyc, g_fb_wc_pre2_cyc, g_fb_wc_post_cyc,
                   ratio_x100 / 100, ratio_x100 % 100, warm_x100 / 100, warm_x100 % 100);
 }
@@ -226,20 +423,48 @@ void fb_init(framebuffer_info_t *info) {
     }
 
     fb_front = (uint32_t *)info->address;
-    fb_width = info->width;
-    fb_height = info->height;
-    fb_pitch = info->pitch;
+    fb_phys_width = info->width;
+    fb_phys_height = info->height;
+    fb_phys_pitch = info->pitch;
     fb_bpp = info->bpp;
     fb_is_bgr = (info->pixel_format == PIXEL_FORMAT_BGR);
 
-    // Set global variables for external access
+    // #745 (local 102): rotation is decided HERE, once, for the whole boot
+    // session (reboot-to-apply - see docs/UI_STYLE_GUIDE.md-following hint in
+    // the Settings Display panel). g_boot_info was filled by the UEFI
+    // bootloader from \ROTATE.TXT before ExitBootServices (uefi/bootloader.c),
+    // so it is already valid at this, the very first framebuffer call of boot -
+    // gfx_boot_splash() and everything else draws rotated from its first pixel.
+    // Any value other than the four real rotations (a NULL g_boot_info on a
+    // boot path that never set one, a stale/corrupt marker) degrades to
+    // FB_ROTATE_NONE, never to an out-of-range enum.
+    extern boot_info_t *g_boot_info;
+    fb_rotation = FB_ROTATE_NONE;
+    if (g_boot_info && g_boot_info->display_rotation <= FB_ROTATE_270) {
+        fb_rotation = (fb_rotation_t)g_boot_info->display_rotation;
+    }
+    bool fb_swapped_dims = (fb_rotation == FB_ROTATE_90 || fb_rotation == FB_ROTATE_270);
+
+    fb_width  = fb_swapped_dims ? fb_phys_height : fb_phys_width;
+    fb_height = fb_swapped_dims ? fb_phys_width  : fb_phys_height;
+    // NONE/180 keep the exact physical pitch (dims did not swap, so this is
+    // the pre-#102 value, unchanged). 90/270 need a back buffer whose rows are
+    // as wide as the new LOGICAL width, which fb_phys_pitch cannot express (it
+    // was sized for the OTHER axis), so it is tightly repacked. Every GOP mode
+    // this kernel has ever booted is 32bpp (fb_bpp asserted at 32 in the
+    // rotated-copy path below), so width*4 is exact, not an approximation.
+    fb_pitch = fb_swapped_dims ? (fb_width * 4) : fb_phys_pitch;
+
+    // Set global variables for external access - LOGICAL, same contract as
+    // pre-#102 (sys_fb_info() and every other reader never knew there was a
+    // physical layout to begin with, and still doesn't need to).
     g_fb_phys_addr = info->address;
     g_fb_width = fb_width;
     g_fb_height = fb_height;
     g_fb_pitch = fb_pitch;
     g_fb_bpp = fb_bpp;
 
-    // Allocate back buffer for double buffering
+    // Allocate back buffer for double buffering (LOGICAL size)
     uint32_t buffer_size = fb_height * fb_pitch;
     fb_back = (uint32_t *)kmalloc_aligned(buffer_size, 4096);  // page-align so sys_fb_map mapping matches exactly (#72)
 
@@ -250,16 +475,22 @@ void fb_init(framebuffer_info_t *info) {
         fb_addr = fb_back;  // Draw to back buffer
         kprintf("[FB] Double buffering enabled (%u KB back buffer)\n", buffer_size / 1024);
 
-        // Also clear the front buffer (hardware framebuffer) to remove UEFI graphics
-        memset(fb_front, 0, buffer_size);
+        // Also clear the front buffer (hardware framebuffer) to remove UEFI
+        // graphics. PHYSICAL size: for FB_ROTATE_90/270 this now differs from
+        // the back buffer's (logical) size, and clearing the wrong number of
+        // bytes here would either under-clear the real GOP buffer (leftover
+        // firmware garbage at the tail) or overrun it.
+        memset(fb_front, 0, (size_t)fb_phys_height * fb_phys_pitch);
     } else {
         fb_double_buffered = false;
         fb_addr = fb_front;  // Fall back to single buffer
         kprintf("[FB] Warning: Could not allocate back buffer, using single buffer\n");
     }
 
-    kprintf("[FB] Framebuffer initialized: %ux%u pitch=%u ppsl=%u @ 0x%lx\n",
-            fb_width, fb_height, fb_pitch, fb_pitch/4, (uint64_t)fb_front);
+    kprintf("[FB] Framebuffer initialized: logical %ux%u pitch=%u  physical %ux%u pitch=%u  "
+            "rotation=%u @ 0x%lx\n",
+            fb_width, fb_height, fb_pitch, fb_phys_width, fb_phys_height, fb_phys_pitch,
+            (unsigned)fb_rotation, (uint64_t)fb_front);
 
     // #642: re-type the front buffer as write-combining. Must run AFTER
     // fb_front/fb_back/fb_pitch are set (it sizes and times a real present) and
@@ -443,14 +674,118 @@ void fb_blit(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint32_t *dat
 }
 
 // Swap back buffer to front buffer (present frame)
+// ===========================================================================
+// #745 (local 102): rotated present helpers. Entered ONLY when fb_rotation !=
+// FB_ROTATE_NONE - fb_swap_buffers()/fb_swap_dirty_rects() below keep their
+// exact pre-#102 memcpy code path otherwise, so an unrotated machine's present
+// is byte-identical to before this ticket (proof: grep for FB_ROTATE_NONE in
+// both functions - the old lines are reached with zero new code in between).
+//
+// A logical rect rotated by a multiple of 90 degrees DOES land on a single
+// axis-aligned rectangle in physical space (rotating a rectangle by 90/180/
+// 270 never produces a non-rectangular result) - so this is not "rotate the
+// bounding box, then memcpy the block". For 90/270 the ACCESS PATTERN into
+// that physical rectangle is a transpose: one source row (contiguous reads)
+// fills one destination COLUMN (fb_phys_pitch-strided writes), which is why
+// this is a per-pixel copy rather than a row-oriented memcpy, and why it is
+// measurably slower than the straight-line memcpy the NONE/180 paths keep -
+// see g_fb_rot_copy_* below, read by the [FLIPPROF]-style boot log line.
+// ===========================================================================
+
+// Copy one rectangle from the LOGICAL back buffer into the PHYSICAL front
+// buffer, applying fb_rotation. lx,ly,lw,lh are already clamped to the
+// logical screen by both call sites before this is reached.
+static void fb_present_rect_rotated(int32_t lx, int32_t ly, int32_t lw, int32_t lh) {
+    if (lw <= 0 || lh <= 0) return;
+
+    uint64_t t0 = dp_tsc();
+
+    if (fb_rotation == FB_ROTATE_180) {
+        // Same dimensions as the logical screen: logical (x,y) -> physical
+        // (phys_w-1-x, phys_h-1-y). Source read is row-contiguous; the
+        // destination row is the mirror row, filled back-to-front.
+        for (int32_t row = 0; row < lh; row++) {
+            const uint32_t *src = (const uint32_t *)((const uint8_t *)fb_back +
+                                    (uint32_t)(ly + row) * fb_pitch) + lx;
+            uint32_t py = fb_phys_height - 1 - (uint32_t)(ly + row);
+            uint32_t *dstrow = (uint32_t *)((uint8_t *)fb_front + (uint32_t)py * fb_phys_pitch);
+            for (int32_t col = 0; col < lw; col++) {
+                dstrow[fb_phys_width - 1 - (uint32_t)(lx + col)] = src[col];
+            }
+        }
+    } else {
+        // FB_ROTATE_90 / FB_ROTATE_270: transpose. fb_width/fb_height are the
+        // LOGICAL (already-swapped-by-fb_init) dims; fb_height == the
+        // physical width and fb_width == the physical height (fb_init()
+        // swapped them for exactly this reason). Derivation: rotating a WxH
+        // image 90 deg clockwise produces an HxW image where
+        // dst(H-1-y, x) = src(x, y); 270 (90 CCW) is dst(y, W-1-x) = src(x, y).
+        int rot90 = (fb_rotation == FB_ROTATE_90);
+        for (int32_t row = 0; row < lh; row++) {
+            int32_t srcy = ly + row;
+            const uint32_t *src = (const uint32_t *)((const uint8_t *)fb_back +
+                                    (uint32_t)srcy * fb_pitch) + lx;
+            for (int32_t col = 0; col < lw; col++) {
+                int32_t srcx = lx + col;
+                uint32_t px, py;
+                if (rot90) {
+                    px = fb_height - 1 - (uint32_t)srcy;   // fb_height == phys width
+                    py = (uint32_t)srcx;
+                } else {
+                    px = (uint32_t)srcy;
+                    py = fb_width - 1 - (uint32_t)srcx;    // fb_width == phys height
+                }
+                *(uint32_t *)((uint8_t *)fb_front + py * fb_phys_pitch + px * 4) = src[col];
+            }
+        }
+    }
+
+    uint64_t d = dp_tsc() - t0;
+    g_fb_rot_copy_tot_cyc += d;
+    g_fb_rot_copy_calls++;
+    g_fb_rot_copy_px_tot  += (uint64_t)lw * (uint64_t)lh;
+    g_fb_front_bytes      += (uint64_t)lw * (uint64_t)lh * 4ULL;   // #COMPIDLE
+    if (d > g_fb_rot_copy_max_cyc) g_fb_rot_copy_max_cyc = d;
+}
+
+// Full-screen rotated present: the first frame, a whole-screen damage rect,
+// and any caller that passes full_redraw all fall back to this, exactly like
+// the pre-#102 full memcpy() they replace.
+static void fb_present_full_rotated(void) {
+    fb_present_rect_rotated(0, 0, (int32_t)fb_width, (int32_t)fb_height);
+}
+
+// Read by main.c's boot-log heartbeat, alongside [FLIPPROF] (#632) - the same
+// "measured, not asserted" posture. Cheap (a handful of divides) and called
+// at heartbeat cadence, not per-frame.
+void fb_rotate_profile_get(uint64_t *tot_cyc, uint64_t *max_cyc,
+                            uint64_t *calls, uint64_t *px_tot) {
+    if (tot_cyc) *tot_cyc = g_fb_rot_copy_tot_cyc;
+    if (max_cyc) *max_cyc = g_fb_rot_copy_max_cyc;
+    if (calls)   *calls   = g_fb_rot_copy_calls;
+    if (px_tot)  *px_tot  = g_fb_rot_copy_px_tot;
+}
+
 void fb_swap_buffers(void) {
     if (!fb_double_buffered || !fb_back || !fb_front) {
         return;  // Nothing to swap in single buffer mode
     }
 
+    // #745 (local 102): rotated present. Everything below this block is the
+    // UNCHANGED pre-#102 code, reached exactly as before when fb_rotation is
+    // FB_ROTATE_NONE (every machine that is not this one).
+    if (fb_rotation != FB_ROTATE_NONE) {
+        fb_present_full_rotated();
+        g_fb_full_presents++;                 // #COMPIDLE (bytes counted in
+        __asm__ volatile("sfence" ::: "memory");   // fb_present_rect_rotated)
+        return;
+    }
+
     // Copy back buffer to front buffer
     uint32_t buffer_size = fb_height * fb_pitch;
     memcpy(fb_front, fb_back, buffer_size);
+    g_fb_front_bytes += buffer_size;      // #COMPIDLE
+    g_fb_full_presents++;
     // #642: WC stores are weakly ordered and sit in the write-combining buffers
     // until a line fills or a fence drains them. Without this the last partial
     // line of a present can still be in a buffer when the caller assumes the
@@ -467,12 +802,22 @@ void fb_swap_dirty_rects(const void *dirty_rects, uint32_t count, bool full_redr
     
     // If full redraw requested or no dirty rects, do full swap
     if (full_redraw || count == 0 || dirty_rects == NULL) {
+        if (fb_rotation != FB_ROTATE_NONE) {          // #745 (local 102)
+            fb_present_full_rotated();
+            g_fb_full_presents++;                     // #COMPIDLE
+            __asm__ volatile("sfence" ::: "memory");
+            return;
+        }
         uint32_t buffer_size = fb_height * fb_pitch;
         memcpy(fb_front, fb_back, buffer_size);
+        g_fb_front_bytes += buffer_size;      // #COMPIDLE
+        g_fb_full_presents++;
         __asm__ volatile("sfence" ::: "memory");   // #642, see fb_swap_buffers
         return;
     }
     
+    g_fb_part_presents++;   // #COMPIDLE: one damage-rect present (N rects)
+
     // Cast to rect structure (x, y, width, height as int32_t)
     typedef struct { int32_t x, y, width, height; } rect_t;
     const rect_t *rects = (const rect_t *)dirty_rects;
@@ -492,13 +837,26 @@ void fb_swap_dirty_rects(const void *dirty_rects, uint32_t count, bool full_redr
         
         // Skip invalid rectangles
         if (w <= 0 || h <= 0) continue;
-        
+
+        // #745 (local 102): the damage rect is in LOGICAL space - the
+        // compositor that reported it never learns rotation exists (see the
+        // block comment above fb_rotation) - so it is rotated pixel-by-pixel
+        // alongside the copy here rather than as a separate "rotate the rect,
+        // then memcpy" step. See the block comment above
+        // fb_present_rect_rotated() for why a straight memcpy is not
+        // available even though the rotated rect IS a physical rectangle.
+        if (fb_rotation != FB_ROTATE_NONE) {
+            fb_present_rect_rotated(x, y, w, h);
+            continue;
+        }
+
         // Copy each row of the dirty rectangle
         uint32_t bytes_per_row = w * 4;  // 4 bytes per pixel (BGRA)
         for (int32_t row = 0; row < h; row++) {
             uint32_t offset = ((y + row) * fb_pitch) + (x * 4);
             memcpy((uint8_t*)fb_front + offset, (uint8_t*)fb_back + offset, bytes_per_row);
         }
+        g_fb_front_bytes += (uint64_t)bytes_per_row * (uint64_t)h;   // #COMPIDLE
     }
     // #642: drain the write-combining buffers once for the whole partial
     // present. This path matters MORE than the full-copy one: a damage rect is
@@ -609,7 +967,14 @@ void fb_fill_rect_alpha(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t
 }
 
 
-// Debug: read and log VGA CRTC registers that affect display width
+// Debug: read and log VGA CRTC registers that affect display width.
+// NOT read-only despite the name: it WRITES the attribute controller (0x3C0)
+// and the CRTC start-address registers (0x3D4/0x3D5) when its reads come back
+// non-zero, which on a machine that does not decode these legacy ports they
+// always do (floating bus -> 0xFF). Its only caller is fb_fix_bochs_alignment()
+// and it is reached ONLY after that function's positive Bochs identification,
+// so it is gated by construction; do not call it from anywhere else without
+// repeating that gate.
 static void fb_dump_vga_crtc(void) {
     // Read CRTC Offset register (index 0x13) - logical line width
     outb(0x3D4, 0x13);

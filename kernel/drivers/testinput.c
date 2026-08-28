@@ -63,6 +63,95 @@ static wait_queue_head_t ti_wq;             // bounded-wait queue for the worker
 static volatile int      ti_enabled = 0;
 static int32_t           ti_last_x = 0, ti_last_y = 0;   // last injected pointer
 
+// ---- #197: click delivery ledger + latched click --------------------------
+//
+// THE BUG THIS REPLACES. CLICK used to be: set the physical button level, sleep
+// a FIXED 40ms, clear it. That is not an event, it is a PULSE, and the
+// compositor does not receive it - it SAMPLES the level once per frame in
+// process_input() and computes the edge itself. If no frame boundary falls
+// inside the pulse the compositor sees 0 before and 0 after, no edge exists,
+// and the click is gone. Nothing detected that: the "OK CLICK x y" ACK was
+// emitted unconditionally, so it described the PARSER, not delivery. A frame
+// exceeding 40ms is not exotic, it is an ordinary full-screen repaint, which is
+// why the loss rate tracked compositor load and read as "flaky".
+//
+// THE FIX. Hold the level until the ledger says the compositor sampled the
+// edge, then move to the next edge. The wait is #426 BEST tier, not a timeout
+// workaround: there are TWO independent wake sources, so no wake can be lost.
+// sys_get_mouse() calls testinput_click_edge() on every observed edge, AND
+// wait_event_timeout re-checks the counter on its own cadence; the CONDITION is
+// a monotonic counter, so a missed wake costs one quantum and can never hang.
+// The bound exists only so a dead compositor reports a failure instead of
+// parking the channel forever - and that failure is exactly what the harness
+// needs to be able to go RED.
+//
+// WHY NOT ROUTE THROUGH sys_inject_mouse() LIKE THE VNC PATH (#188/#440/#443).
+// Because that path has a KNOWN DOUBLE-DELIVERY SHAPE. vnc_inject_pointer()
+// (userland/apps/compositor/vnc.c) calls sys_inject_mouse(DOWN) AND pokes the
+// physical level via set_mouse_buttons(); the compositor then samples that same
+// level on its next frame and relays a SECOND DOWN. An app under the cursor
+// gets two EVENT_MOUSE_DOWNs for one click, which is why #188 needed a
+// workaround. Injecting the physical level ONLY - what this channel already did
+// and still does - is the shape a real PS/2 or USB mouse has, and it delivers
+// exactly once. The layer was right; the TIMING was wrong.
+extern void     clickacct_note_inject_rs(int down);
+extern uint64_t clickacct_get_rs(uint32_t which);
+#define CA_INJ_DOWN 0u
+#define CA_INJ_UP   1u
+#define CA_SMP_DOWN 2u
+#define CA_SMP_UP   3u
+#define CA_ROUTED   4u
+#define CA_HIT      5u
+#define CA_POLLS    6u
+
+static wait_queue_head_t ti_click_wq;         // woken on every sampled edge
+static volatile int      ti_click_wq_ready = 0;
+static int               ti_click_mode = 1;   // 1 = latched (#197), 0 = legacy pulse
+static uint32_t          ti_click_ms   = 1500;// bound on one edge, ms
+
+void testinput_click_edge(int edge) {
+    (void)edge;
+    if (!ti_click_wq_ready) return;
+    wake_up_all(&ti_click_wq);
+}
+
+// Drive ONE button edge and return 1 if the compositor sampled it, 0 if it did
+// not within the bound. In legacy pulse mode (ti_click_mode == 0) the edge is
+// injected and the caller does the historical fixed sleep; the return is then
+// the ledger's after-the-fact verdict, not a synchronisation.
+static int ti_click_edge(int32_t x, int32_t y, int down) {
+    uint32_t which  = down ? CA_SMP_DOWN : CA_SMP_UP;
+    uint64_t before = clickacct_get_rs(which);
+    mouse_inject_button(x, y, down);
+    if (!ti_click_mode) return -1;            // pulse mode: no latch
+    int rc = wait_event_timeout(&ti_click_wq,
+                                clickacct_get_rs(which) != before,
+                                wq_ms_to_ticks(ti_click_ms));
+    return (rc == WAIT_OK) ? 1 : 0;
+}
+
+// One complete click. Returns a 2-bit mask: bit0 = press edge observed,
+// bit1 = release edge observed. 3 means the compositor saw a whole click.
+static int ti_click_once(int32_t x, int32_t y) {
+    int m = 0;
+    if (ti_click_mode) {
+        if (ti_click_edge(x, y, 1) == 1) m |= 1;
+        if (ti_click_edge(x, y, 0) == 1) m |= 2;
+    } else {
+        // LEGACY (RED) ARM, preserved verbatim so the old behaviour can be
+        // reproduced back-to-back against the fix under identical load.
+        uint64_t d0 = clickacct_get_rs(CA_SMP_DOWN);
+        uint64_t u0 = clickacct_get_rs(CA_SMP_UP);
+        mouse_inject_button(x, y, 1);
+        proc_sleep(40);                       // >=1 compositor frame between edges
+        mouse_inject_button(x, y, 0);
+        proc_sleep(40);                       // settle, so the ledger read is fair
+        if (clickacct_get_rs(CA_SMP_DOWN) != d0) m |= 1;
+        if (clickacct_get_rs(CA_SMP_UP)   != u0) m |= 2;
+    }
+    return m;
+}
+
 // ---- reply helpers ---------------------------------------------------------
 // Emit an ACK line ATOMICALLY. Serial output kernel-wide is unlocked, so the
 // per-2s [HB] heartbeat (and other kprintf) can otherwise interleave at
@@ -230,7 +319,11 @@ static int ti_getkv(const char *path, const char *key, char *out, int cap) {
 
 // ---- command dispatch ------------------------------------------------------
 static void ti_process_line(const char *line) {
-    char buf[128];
+    // #197: 256, not 128. The CLICKS ledger reply is 58 bytes of fixed text
+    // plus SEVEN unsigned 64-bit counters. snprintf truncates safely, but a
+    // truncated ACK loses its trailing newline and jams the host line parser -
+    // which is exactly the silent-failure class this ticket exists to remove.
+    char buf[256];
     const char *p = skip_ws(line);
     if (*p == 0) return;
 
@@ -242,6 +335,24 @@ static void ti_process_line(const char *line) {
         snprintf(buf, sizeof(buf), "OK KBQ depth=%d consumed=%lu irq=%lu\n",
                  keyboard_buffer_depth(), (unsigned long)g_kbd_consumed,
                  (unsigned long)g_kbd_irq_scancodes);
+        ti_reply(buf);
+        return;
+    }
+    // #162: read back the AUTHORITATIVE volume state, so a test can assert the
+    // exact level and mute flag rather than inferring them from pixels. Same
+    // packed word SYS_VOL_STATE returns (rustkern/sysvol.rs), so this reports
+    // what the compositor and the tray slider see, not a second opinion.
+    // Debug-gated with the rest of this file: no /TESTINPUT.TXT, no worker, no
+    // command surface at all on a shipping golden.
+    if (!strncmp(p, "VOL", 3)) {
+        extern int sysvol_get_rs(void);
+        extern int sysvol_muted_rs(void);
+        extern uint64_t sysvol_state_rs(void);
+        uint64_t st = sysvol_state_rs();
+        snprintf(buf, sizeof(buf),
+                 "OK VOL level=%d muted=%d seq=%u keyseq=%u\n",
+                 sysvol_get_rs(), sysvol_muted_rs(),
+                 (unsigned)((st >> 16) & 0xFFFF), (unsigned)((st >> 32) & 0xFFFF));
         ti_reply(buf);
         return;
     }
@@ -268,15 +379,80 @@ static void ti_process_line(const char *line) {
         ti_reply(buf);
         return;
     }
+    // #197: CLICKS - read the whole click ledger. The ONLY honest answer to
+    // "did that click land"; the OK line below is a parser receipt, these are
+    // kernel-side monotonic counters that HAVE to advance (blame.md's rule from
+    // the wedged-guest false alarm, where an absent ACK was mistaken for a dead
+    // guest while the guest was consuming every event).
+    if (!strncmp(p, "CLICKS", 6)) {
+        snprintf(buf, sizeof(buf),
+                 "OK CLICKS inj_d=%lu inj_u=%lu smp_d=%lu smp_u=%lu routed=%lu hit=%lu polls=%lu\n",
+                 (unsigned long)clickacct_get_rs(CA_INJ_DOWN),
+                 (unsigned long)clickacct_get_rs(CA_INJ_UP),
+                 (unsigned long)clickacct_get_rs(CA_SMP_DOWN),
+                 (unsigned long)clickacct_get_rs(CA_SMP_UP),
+                 (unsigned long)clickacct_get_rs(CA_ROUTED),
+                 (unsigned long)clickacct_get_rs(CA_HIT),
+                 (unsigned long)clickacct_get_rs(CA_POLLS));
+        ti_reply(buf);
+        return;
+    }
+    // CLICKMODE <0|1> [ms] - 1 = latched (#197 default), 0 = the pre-#197 fixed
+    // 40ms pulse. Kept so the broken arm can be re-run on the SAME binary under
+    // the SAME load as the fix, which is a stronger comparison than two builds.
+    if (!strncmp(p, "CLICKMODE", 9)) {
+        p += 9; int m = parse_dec(&p); int ms = parse_dec(&p);
+        if (m == 0 || m == 1) ti_click_mode = m;
+        if (ms > 0 && ms <= 30000) ti_click_ms = (uint32_t)ms;
+        snprintf(buf, sizeof(buf), "OK CLICKMODE %s ms=%u\n",
+                 ti_click_mode ? "latch" : "pulse", (unsigned)ti_click_ms);
+        ti_reply(buf);
+        return;
+    }
+    // CLICKN <n> <x> <y> [gapms] - the RELIABILITY SELF-TEST. Sends n clicks at
+    // one point and reports how many the compositor actually SAMPLED, straight
+    // from the ledger. It can fail: on the pulse arm it under-counts, and the
+    // host asserts sampled == n.
+    if (!strncmp(p, "CLICKN", 6)) {
+        p += 6; int n = parse_dec(&p); int x = parse_dec(&p); int y = parse_dec(&p);
+        int gap = parse_dec(&p);
+        if (n <= 0 || n > 500 || x <= -1000000 || y <= -1000000) {
+            ti_reply("ERR CLICKN badarg\n"); return;
+        }
+        if (gap <= -1000000 || gap < 0) gap = 0;
+        if (gap > 2000) gap = 2000;
+        uint64_t d0 = clickacct_get_rs(CA_SMP_DOWN);
+        uint64_t u0 = clickacct_get_rs(CA_SMP_UP);
+        uint64_t r0 = clickacct_get_rs(CA_ROUTED);
+        uint64_t h0 = clickacct_get_rs(CA_HIT);
+        ti_last_x = x; ti_last_y = y;
+        int full = 0;
+        for (int i = 0; i < n; i++) {
+            if (ti_click_once(x, y) == 3) full++;
+            if (gap) proc_sleep((uint32_t)gap);
+        }
+        snprintf(buf, sizeof(buf),
+                 "OK CLICKN n=%d mode=%s full=%d smp_d=%lu smp_u=%lu routed=%lu hit=%lu\n",
+                 n, ti_click_mode ? "latch" : "pulse", full,
+                 (unsigned long)(clickacct_get_rs(CA_SMP_DOWN) - d0),
+                 (unsigned long)(clickacct_get_rs(CA_SMP_UP)   - u0),
+                 (unsigned long)(clickacct_get_rs(CA_ROUTED)   - r0),
+                 (unsigned long)(clickacct_get_rs(CA_HIT)      - h0));
+        ti_reply(buf);
+        return;
+    }
     if (!strncmp(p, "CLICK", 5)) {               // CLICK <x> <y>  (down+up)
         p += 5; int x = parse_dec(&p); int y = parse_dec(&p);
         if (x <= -1000000 || y <= -1000000) { ti_reply("ERR CLICK badarg\n"); return; }
+        uint64_t r0 = clickacct_get_rs(CA_ROUTED), h0 = clickacct_get_rs(CA_HIT);
         ti_last_x = x; ti_last_y = y;
-        mouse_inject_button(x, y, 1);
-        proc_sleep(40);                          // >=1 compositor frame between edges
-        mouse_inject_button(x, y, 0);
-        snprintf(buf, sizeof(buf), "OK CLICK %d %d polls=%lu\n",
-                 x, y, (unsigned long)g_mouse_poll_count);
+        int m = ti_click_once(x, y);
+        snprintf(buf, sizeof(buf),
+                 "OK CLICK %d %d mode=%s down=%d up=%d routed=%lu hit=%lu polls=%lu\n",
+                 x, y, ti_click_mode ? "latch" : "pulse", (m & 1) ? 1 : 0, (m & 2) ? 1 : 0,
+                 (unsigned long)(clickacct_get_rs(CA_ROUTED) - r0),
+                 (unsigned long)(clickacct_get_rs(CA_HIT) - h0),
+                 (unsigned long)g_mouse_poll_count);
         ti_reply(buf);
         return;
     }
@@ -342,6 +518,43 @@ static void ti_process_line(const char *line) {
         ti_reply(buf);
         return;
     }
+    if (!strncmp(p, "AUTOSCALE ", 10)) {   // AUTOSCALE <w> <h> <laptop>
+        // Ask the SHIPPED KERNEL what auto-detection would decide for a given
+        // framebuffer geometry. This exists because the display the answer
+        // matters most for - the owner's 3840x2160 laptop panel - cannot be
+        // reproduced in QEMU at all: OVMF's mode table tops out at 2560x1600,
+        // so -device VGA,xres=3840 silently falls back. Without this, the 4K
+        // answer could only be shown by a host-compiled copy of the same source,
+        // which is evidence about the SOURCE, not about the binary that ships.
+        p += 10;
+        int w = parse_dec(&p); while (*p == ' ') p++;
+        int h = parse_dec(&p); while (*p == ' ') p++;
+        int lap = 0;
+        if (*p == '-') { p++; lap = -parse_dec(&p); } else { lap = parse_dec(&p); }
+        extern int32_t uiscale_auto_pct_rs(int32_t, int32_t, int32_t);
+        extern int32_t uiscale_max_pct_rs(int32_t, int32_t);
+        snprintf(buf, sizeof(buf), "OK AUTOSCALE %dx%d laptop=%d auto=%d max=%d\n",
+                 w, h, lap, (int)uiscale_auto_pct_rs(w, h, lap),
+                 (int)uiscale_max_pct_rs(w, h));
+        ti_reply(buf);
+        return;
+    }
+    if (!strncmp(p, "UISCALE", 7)) {        // UISCALE  -> the LIVE state
+        extern int32_t uiscale_pct_rs(void);
+        extern int32_t uiscale_src_rs(void);
+        extern int32_t uiscale_auto_pct(void);
+        extern int32_t uiscale_max_pct(void);
+        extern int32_t uiscale_is_laptop(void);
+        extern uint32_t fb_get_width(void);
+        extern uint32_t fb_get_height(void);
+        snprintf(buf, sizeof(buf),
+                 "OK UISCALE pct=%d src=%d auto=%d max=%d laptop=%d fb=%ux%u\n",
+                 (int)uiscale_pct_rs(), (int)uiscale_src_rs(),
+                 (int)uiscale_auto_pct(), (int)uiscale_max_pct(),
+                 (int)uiscale_is_laptop(), fb_get_width(), fb_get_height());
+        ti_reply(buf);
+        return;
+    }
     ti_reply("ERR unknown\n");
 }
 
@@ -369,6 +582,14 @@ static void ti_worker(void *arg) {
 
 // ---- arm (only when /TESTINPUT.TXT present on the ESP) ---------------------
 void testinput_init(void) {
+    // #197: the click wait queue is armed UNCONDITIONALLY, before the marker
+    // gate. sys_get_mouse() calls testinput_click_edge() on every sampled edge
+    // and must never touch an uninitialised queue; with no marker there is no
+    // worker and nothing ever waits, so this costs one zeroed struct and adds
+    // no command surface to a shipping golden.
+    wait_queue_head_init(&ti_click_wq);
+    ti_click_wq_ready = 1;
+
     if (!g_fat_fs.mounted || !fat_exists(&g_fat_fs, "/TESTINPUT.TXT")) {
         // Default OFF: a shipping golden has no marker, so no worker exists and
         // COM1 RX is not consumed. Zero added surface.

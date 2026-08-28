@@ -3,7 +3,7 @@
 # ClassiCube upstream tree.
 #
 # The buildable engine source is ALSO vendored in-repo under
-# vendor/ClassiCube/ (so a git archive of maytera-src can rebuild ClassiCube
+# vendor/ClassiCube/ (so a git archive of the internal source repo can rebuild ClassiCube
 # with no network). This script exists to (a) record the exact upstream
 # provenance as CODE rather than only as prose, and (b) PROVE the vendored copy
 # still equals upstream at the pinned commit. Same convention as

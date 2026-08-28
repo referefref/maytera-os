@@ -53,6 +53,13 @@ int   fclose(FILE *f);
 // exposed as unlink()/rmdir() before). Tries unlink() first (files, the
 // common case), falls back to rmdir() for a directory path.
 int   remove(const char *path);
+
+// rename(): ISO C puts this in <stdio.h> alongside remove(). This libc declared
+// it ONLY in <unistd.h>, so a translation unit that included <stdio.h> and
+// called rename() - which is what the C standard tells it to do - got an
+// implicit declaration. Lua 5.4's loslib.c (os.rename) is exactly that TU. Same
+// signature and same definition as the <unistd.h> declaration; nothing moved.
+int   rename(const char *oldpath, const char *newpath);
 size_t fread(void *buf, size_t sz, size_t n, FILE *f);
 size_t fwrite(const void *buf, size_t sz, size_t n, FILE *f);
 int   fseek(FILE *f, long off, int whence);
@@ -67,6 +74,25 @@ int   fputs(const char *s, FILE *f);
 int   fgetc(FILE *f);
 char *fgets(char *s, int n, FILE *f);
 int   ungetc(int c, FILE *f);
+
+// getc()/clearerr() have been DEFINED in posixextra.c for a long time and were
+// never declared anywhere, so every caller got an implicit declaration (getc
+// returns int, so it happened to work; that is luck, not a contract). Declared
+// here for the Lua 5.4 port (local queue 91), which calls both.
+int   getc(FILE *f);
+void  clearerr(FILE *f);
+
+// freopen(): reopen an existing stream on a new path/mode. Lua's
+// luaL_loadfilex() uses it to switch a text-mode script stream to binary when
+// the file turns out to be a precompiled chunk.
+FILE *freopen(const char *path, const char *mode, FILE *f);
+
+// tmpfile()/tmpnam(): ISO C temporary files. See stdio_file.c for what
+// "temporary" can and cannot mean on this OS.
+FILE *tmpfile(void);
+char *tmpnam(char *s);
+#define L_tmpnam 32
+#define TMP_MAX  256
 int   fprintf(FILE *f, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 int   vfprintf(FILE *f, const char *fmt, va_list ap);
 int   setvbuf(FILE *f, char *buf, int mode, size_t sz);

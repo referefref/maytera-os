@@ -5,9 +5,9 @@ MayteraOS Full Test Suite Runner
 Runs all available test suites and generates comprehensive reports.
 
 Usage:
-    ./run_all_tests.py --vm 1002
-    ./run_all_tests.py --vm 1002 --suite syscall
-    ./run_all_tests.py --vm 1002 --html-report
+    ./run_all_tests.py --vm <vmid>
+    ./run_all_tests.py --vm <vmid> --suite syscall
+    ./run_all_tests.py --vm <vmid> --html-report
 """
 
 import argparse

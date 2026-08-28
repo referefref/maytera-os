@@ -189,7 +189,7 @@ static void serial_write_locked(uint16_t port, char c) {
     // BOUNDED wait for the UART transmit-holding register to empty. An unbounded
     // poll here hangs the ENTIRE kernel when TX can't drain: e.g. QEMU's serial
     // chardev buffer fills because nothing is reading the serial socket, so the
-    // THRE bit never sets. That deterministically wedged a test VM's toram boot at
+    // THRE bit never sets. That deterministically wedged VM <vmid>'s toram boot at
     // "Starting desktop services..." (trapped RIP inside this loop, RDX=0x3F8 /
     // RBP=0x3FD). #426 no-unbounded-busy-wait discipline: cap the spin and drop
     // the char rather than freezing the machine. When TX is healthy the very

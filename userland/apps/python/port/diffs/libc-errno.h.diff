@@ -1,5 +1,5 @@
---- a/errno.h
-+++ b/errno.h
+--- <workspace>	2026-07-07 16:27:23.216605773 +0000
++++ <workspace>	2026-07-07 16:31:17.096127727 +0000
 @@ -38,6 +38,25 @@
  #define ENOSYS          38
  #define ENOTEMPTY       39

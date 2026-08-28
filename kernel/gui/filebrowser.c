@@ -17,6 +17,17 @@
 #include "../fs/xattr.h"
 #include "thumbnailer.h"
 
+
+// #243: the two-namespaces guard. drivers/keyboard.h defines KEY_HOME as the
+// PS/2 SCANCODE 0x47 (== ASCII 'G'); cpu/isr.h defines it as the COOKED code
+// 0x100 that keyboard_get_char() actually delivers. Whichever header wins the
+// include order decides what the name means in this file, and getting it wrong
+// silently reinstates the exact bug #243 fixed. gui/login.c carries the same
+// assert for KEY_UP (#745) after the same hazard.
+_Static_assert(KEY_HOME == 0x100 && KEY_END == 0x101 && KEY_PGUP == 0x102 &&
+               KEY_PGDN == 0x103 && KEY_INS == 0x104 && KEY_DEL == 0x105,
+               "#243: this file is seeing drivers/keyboard.h's SCANCODE "
+               "KEY_HOME (0x47 = 'G'), not cpu/isr.h's cooked 0x100");
 // Global FAT filesystem (from main kernel)
 extern fat_fs_t g_fat_fs;
 
@@ -981,9 +992,9 @@ bool fb_handle_keyboard(filebrowser_t *fb, uint32_t keycode, char c) {
         return true;
     }
 
-    // Home - Go to root
-    // Home key often sends different codes, check common ones
-    if (keycode == 0x47) {  // Home scancode
+    // Home - Go to root. #243: KEY_HOME (cpu/isr.h), not the raw 0x47 make
+    // code this used to match, which was also ASCII 'G'.
+    if (keycode == KEY_HOME) {
         filebrowser_navigate(fb, "/");
         return true;
     }

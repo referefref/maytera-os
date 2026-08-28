@@ -80,6 +80,15 @@ static int64_t e2v_seek(file_t *f, int64_t offset, int whence) {
     return np;
 }
 
+// #120: THE LIVE SIZE. v->size is grown by e2v_write() and only reaches the
+// inode at flush/release, so between a write and a close the on-disk i_size is
+// stale and a path stat would report the old value. This is the current one.
+static int64_t e2v_size(file_t *f) {
+    ext2_vfile_t *v = (ext2_vfile_t *)f->priv;
+    if (!v) return -1;
+    return (int64_t)v->size;
+}
+
 // #695 Phase 1: THE ext2 flush. There is exactly one, and release() is defined
 // as flush() + teardown below, so an fsync and a close cannot report different
 // things about the same buffer.
@@ -117,6 +126,7 @@ static const file_ops_t ext2_vfs_ops = {
     .read    = e2v_read,
     .write   = e2v_write,
     .seek    = e2v_seek,
+    .size    = e2v_size,
     .ioctl   = NULL,
     .flush   = e2v_flush,
     .release = e2v_release,

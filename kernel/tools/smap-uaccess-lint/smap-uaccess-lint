@@ -378,7 +378,16 @@ def rule_b2(root, watch, manifest, rep):
                 open_at = None
 
 
-FUNC_RE = re.compile(r'^[A-Za-z_][\w \t*]*\b(\w+)\s*\(([^;{)]*)\)\s*\{', re.M)
+# #blitguard: the parameter class MUST allow balanced parens.
+# It used to be `[^;{)]*`, which cannot contain a ')', so ANY function whose
+# parameter list carries an attribute was never matched and therefore never
+# analysed by any B rule. MEASURED on proc/syscall.c: widening this made
+# EXACTLY ONE function newly visible, and it was sys_win_blit() - the one
+# holding a live Ring-0 read of a Ring-3 pointer. Nothing else changed, in
+# either direction. A parser that silently skips a function is worse than one
+# that fails, because the skip reads as a clean result.
+FUNC_RE = re.compile(r'^[A-Za-z_][\w \t*]*\b(\w+)\s*'
+                     r'\(((?:[^;{()]|\((?:[^;{()]|\([^;{()]*\))*\))*)\)\s*\{', re.M)
 
 def split_functions(text):
     """Crude but adequate brace matcher: returns [(name, params, start_line, body)]."""
@@ -422,12 +431,35 @@ def rule_b3(root, watch, manifest, rep):
             for v in VALIDATORS:
                 for m in re.finditer(r"\b%s\s*\(\s*\(?[^,()]*?\)?\s*([A-Za-z_]\w*)" % v, body):
                     users.add(m.group(1))
-            for m in re.finditer(r"\bcopy_from_user\s*\([^,]+,\s*\(?[^,()]*\)?\s*([A-Za-z_]\w*)", body):
-                users.add(m.group(1))
-            for m in re.finditer(r"\b(?:copy_to_user|clear_user)\s*\(\s*\(?[^,()]*\)?\s*([A-Za-z_]\w*)", body):
-                users.add(m.group(1))
-            for m in re.finditer(r"\b(?:strncpy_from_user)\s*\([^,]+,\s*\(?[^,()]*\)?\s*([A-Za-z_]\w*)", body):
-                users.add(m.group(1))
+            # #120: NAME THE ARGUMENT, do not capture a fragment of it.
+            #
+            # These three seeds used to read `\(?[^,()]*\)?\s*([A-Za-z_]\w*)`.
+            # `[^,()]*` is GREEDY, so on `copy_to_user(ubuf, ...)` it consumed
+            # "ubu" and the capture group took what was left: the single letter
+            # `f`. MEASURED, not theorised - `copy_from_user(&kbuf, uptr, n)`
+            # seeded `r`. So the B3 scan has never tracked a copy_*_user buffer
+            # BY NAME anywhere in this kernel: it tracked trailing letters, and
+            # a later deref of the real pointer went unseen. It also invented
+            # names, which is how it fired on #120's `file_t *f` - a kernel
+            # pointer that merely shares its spelling with the phantom.
+            #
+            # Making it LAZY (which is what the VALIDATORS seed above already
+            # does, correctly) fixes the bare case and breaks the CAST case:
+            # `copy_to_user((void *)arg2, ...)` then captures `void`. Neither
+            # form is right, so neither is used. The argument text is captured
+            # whole and the LAST identifier in it is taken, which is the name in
+            # every shape that occurs: `ubuf`, `&st` -> st, `(void *)arg2` ->
+            # arg2, `(char *)f->buf` -> buf.
+            def _seed_arg(argtext):
+                ids = re.findall(r"[A-Za-z_]\w*", argtext or "")
+                if ids:
+                    users.add(ids[-1])
+            for m in re.finditer(r"\bcopy_from_user\s*\([^,]+,([^,]*)", body):
+                _seed_arg(m.group(1))
+            for m in re.finditer(r"\b(?:copy_to_user|clear_user)\s*\(([^,]*)", body):
+                _seed_arg(m.group(1))
+            for m in re.finditer(r"\b(?:strncpy_from_user)\s*\([^,]+,([^,]*)", body):
+                _seed_arg(m.group(1))
             if not users:
                 continue
             # simple aliases: T *v = (T*)u;
@@ -459,6 +491,16 @@ def rule_b3(root, watch, manifest, rep):
             for arel, abase, abody in analysis:
                 if BRACKET.search(abody):
                     continue
+                # #120: an `extern` DECLARATION is not a dereference. `const
+                # char *body,` in a prototype matches the same `\*\s*name`
+                # shape as a real deref, and this tree declares its externs
+                # INSIDE the function that uses them, so the prototypes sit in
+                # the scanned body. Blanked (newlines kept, so line numbers stay
+                # exact) rather than special-cased at the match, because the
+                # declaration can span lines and the continuation line carries
+                # no `extern` keyword of its own to test for.
+                abody = re.sub(r"\bextern\b[^;{}]*;",
+                               lambda m: re.sub(r"[^\n]", " ", m.group(0)), abody)
                 for off, ln in enumerate(abody.split("\n")):
                     hit = None
                     for u in users:
@@ -478,6 +520,170 @@ def rule_b3(root, watch, manifest, rep):
                     rep.bad("B3", "%s:%d: Ring-0 deref of user pointer `%s` outside "
                                   "copy_*_user and outside an AC bracket:\n        %s"
                                   % (arel, lineno, hit, ln.strip()[:110]))
+
+
+# ---------------------------------------------------------------------------
+# RULE B4 - A DECLARED USER BUFFER, DEREFERENCED WITHOUT A COPY PRIMITIVE
+# ---------------------------------------------------------------------------
+# WHY THIS RULE EXISTS, AND WHY B3 COULD NOT HAVE FOUND IT (#blitguard)
+#
+# B3 decides what a "user pointer" is by watching where the SAFETY PRIMITIVES
+# are used: a name seeds its tainted set only by being handed to a validator or
+# to a copy_*_user wrapper. That makes B3 a lint on the DISCIPLINE OF CODE THAT
+# ALREADY USES A PRIMITIVE. It is structurally incapable of seeing a handler
+# that uses no primitive at all, because such a handler seeds nothing, and B3's
+# very first act is `if not users: continue`.
+#
+# That is not a hypothetical hole. sys_win_blit() read a Ring-3 pointer with a
+# raw per-pixel dereference for its entire life, called no validator and no copy
+# wrapper, and was therefore invisible to B3 while every lint reported green.
+# It was ALSO invisible to tools/syscall-ptr-lint, which asks a different
+# question ("does this syscall have an argtab descriptor?") and correctly
+# answered yes. Three green lints, one live arbitrary-kernel-read.
+#
+# The fix is to seed from something that does not depend on the handler behaving:
+# rustkern/argtab.rs ALREADY declares, per syscall number and per argument index,
+# exactly which arguments are Ring-3 pointers and how many bytes each covers.
+# That table is maintained, machine-readable, and true whether or not the handler
+# is correct. So B4 asks the one question the others do not:
+#
+#     For every argument the argtab DECLARES to be a user buffer, does the
+#     handler reach it through a copy primitive - or does it just index it?
+#
+# SCOPE, deliberately narrow, because a noisy lint gets disabled:
+#   * BUFFERS only (Kind::R / Kind::W). Kind::Str is excluded: Ring-3 strings
+#     handed raw to the filesystem are ALREADY the single KNOWN_GAP entry on
+#     smap-uaccess.manifest, and re-reporting that class here would duplicate a
+#     ledger rather than find anything.
+#   * INDEXING only (`p[i]`). A bare `*p` also matches a pointer DECLARATION
+#     (`const uint32_t *urow = ...`), and reporting the declaration you just
+#     read is how a rule earns its reputation for noise.
+#   * `extern ...;` statements are stripped from the body first, for the same
+#     reason: a local prototype's `void *out` is a parameter star, not a deref.
+#   * A copy primitive naming ANY ALIAS of the parameter counts as safe, not
+#     just the parameter itself: computing a row pointer and copying THAT is
+#     exactly the correct shape.
+#
+# MEASURED against this tree when it was written: 1 finding on the pre-fix tree
+# (SYS_WIN_BLIT, param src_buffer, via src_row, at the line that page-faulted in
+# the live repro), 0 findings after the fix, and 0 false positives across all 99
+# argtab-declared buffer syscalls.
+
+B4_SAFE = (r"copy_from_user|copy_to_user|clear_user|strncpy_from_user"
+           r"|strnlen_user|sc_bounce_str|sc_path_from_user")
+
+
+def _split_top(s):
+    """Split a comma list at paren depth 0."""
+    out, d, cur = [], 0, ""
+    for ch in s:
+        if ch in "([{":
+            d += 1
+        elif ch in ")]}":
+            d -= 1
+        if ch == "," and d == 0:
+            out.append(cur.strip()); cur = ""
+        else:
+            cur += ch
+    if cur.strip():
+        out.append(cur.strip())
+    return out
+
+
+def rule_b4(root, manifest, rep):
+    ap = os.path.join(root, "rustkern", "argtab.rs")
+    hp = os.path.join(root, "proc", "syscall.h")
+    cp = os.path.join(root, "proc", "syscall.c")
+    if not (os.path.isfile(ap) and os.path.isfile(hp) and os.path.isfile(cp)):
+        return   # not a full kernel tree (the synthetic self-test fixture)
+
+    # 1. argtab: which (syscall number, 1-based arg index) is a user BUFFER.
+    declared = {}
+    for m in re.finditer(r"Desc\s*\{\s*num:\s*(\d+)\s*,\s*args:\s*\[(.*?)\]\s*,?\s*\}",
+                         strip_comments(read(ap)), re.S):
+        idxs = set()
+        for i, it in enumerate(_split_top(m.group(2))):
+            t = it.strip()
+            if t == "NONE":
+                continue
+            core = t[3:-1].strip() if (t.startswith("sx(") and t.endswith(")")) else t
+            if core.startswith("s("):
+                continue          # Kind::Str: the ledgered class, see above
+            idxs.add(i + 1)
+        if idxs:
+            declared[int(m.group(1))] = idxs
+
+    # 2. syscall number -> SYS_* name
+    name_of = {}
+    for m in re.finditer(r"^#define\s+(SYS_[A-Z0-9_]+)\s+(\d+)", read(hp), re.M):
+        name_of.setdefault(int(m.group(2)), m.group(1))
+
+    # 3. dispatcher: SYS_* -> handler, and which parameter receives argN
+    sc = strip_comments(read(cp))
+    funcs = {f[0]: f for f in split_functions(sc)}
+
+    for num, idxs in sorted(declared.items()):
+        sysname = name_of.get(num)
+        if not sysname:
+            continue
+        cm = re.search(r"case\s+%s\s*:(.{0,900}?)(?=\n\s*case\s+SYS_|\n\s*default\s*:)"
+                       % sysname, sc, re.S)
+        if not cm:
+            continue
+        call = re.search(r"\b(sys_\w+)\s*\(([^;]*)\)\s*;", cm.group(1))
+        if not call or call.group(1) not in funcs:
+            continue
+        handler = call.group(1)
+        callargs = _split_top(call.group(2))
+        _n, params, startline, body = funcs[handler]
+        body = re.sub(r"\bextern\b[^;]*;", "", body)
+        pnames = []
+        for p in _split_top(params):
+            ids = re.findall(r"[A-Za-z_]\w*", p)
+            pnames.append(ids[-1] if ids else None)
+
+        for ai in idxs:
+            pos = None
+            for k, ca in enumerate(callargs):
+                if re.search(r"\barg%d\b" % ai, ca):
+                    pos = k; break
+            if pos is None or pos >= len(pnames) or not pnames[pos]:
+                continue
+            pn = pnames[pos]
+            alias = {pn}
+            for _ in range(2):
+                for am in re.finditer(r"\b([A-Za-z_]\w*)\s*=\s*([^;=][^;]*);", body):
+                    rhs = am.group(2)
+                    bare = rhs
+                    for cast in ("(void", "(char", "(uint32_t", "(uint8_t", "(const"):
+                        bare = bare.replace(cast, "")
+                    if "(" in rhs and re.search(r"[A-Za-z_]\w*\s*\(", bare):
+                        continue   # RHS calls something: that is a kernel bounce
+                    if any(re.search(r"\b%s\b" % re.escape(a), rhs) for a in alias):
+                        alias.add(am.group(1))
+            safe = any(re.search(r"\b(?:%s)\s*\([^;]*\b%s\b" % (B4_SAFE, re.escape(a)), body)
+                       for a in alias)
+            if safe:
+                continue
+            for a in sorted(alias):
+                dm = re.search(r"\b%s\s*\[" % re.escape(a), body)
+                if not dm:
+                    continue
+                lineno = startline + body[:dm.start()].count("\n")
+                frag = body[dm.start():].split("\n")[0].strip()
+                if manifest.covers("proc/syscall.c", lineno, frag):
+                    break
+                rep.bad("B4",
+                        "proc/syscall.c:%d %s(): rustkern/argtab.rs declares "
+                        "%s arg%d (`%s`) a USER BUFFER, and the handler indexes "
+                        "it directly as `%s[...]` with no copy_*_user. That is a "
+                        "Ring-0 dereference of a Ring-3-controlled address: a "
+                        "#PF under SMAP, and before SMAP an unbounded read of "
+                        "whatever Ring 3 named. Bounce it with copy_from_user() "
+                        "one chunk at a time; sys_win_draw_image() in this "
+                        "file is the reference shape."
+                        % (lineno, handler, sysname, ai, pn, a))
+                break
 
 
 # ---------------------------------------------------------------------------
@@ -654,6 +860,7 @@ def run_all(root, manifest):
     watch = derive_watch_set(root)
     rule_b2(root, watch, manifest, rep)
     rule_b3(root, watch, manifest, rep)
+    rule_b4(root, manifest, rep)
     return rep, watch
 
 def self_test():
@@ -696,6 +903,37 @@ int handler(void *ubuf, unsigned n) {
     # point: it proves the CR3-window rule works on its own, rather than being
     # masked by the validated-then-dereffed rule that happens to cover the same
     # line in the real tree.
+    # #120 REGRESSION. Both B3 cases above seed the user set through
+    # validate_user_ptr, whose regex was always correct. NOTHING exercised the
+    # copy_from_user / copy_to_user / strncpy_from_user seeds, and all three
+    # were broken: a greedy `[^,()]*` swallowed the identifier and the capture
+    # group took the letters left over, so `copy_to_user(ubuf, ...)` seeded the
+    # name `f` and `copy_from_user(&k, uptr, n)` seeded `r`. The scan then
+    # watched names that do not exist and never watched the real buffer. This
+    # fixture is seeded ONLY by copy_to_user, so it was GREEN (a silent miss)
+    # before the fix and is RED after it.
+    case("B3 copy_to_user-seeded deref (#120 seed-regex regression)", "B3",
+         watched="""
+int handler(void *ubuf, unsigned n) {
+    char k[64];
+    k[0] = 1;
+    if (copy_to_user(ubuf, k, n) != 0) return -1;
+    return ubuf[0];
+}
+""")
+    # #120: and the mirror - a PROTOTYPE naming a watched pointer must not be
+    # read as a deref of it. This was GREEN only because the seed never named a
+    # real pointer; with the seed fixed it goes RED unless declarations are
+    # excluded.
+    case("B3 extern prototype is not a deref (#120)", None,
+         watched="""
+int handler(void *ubuf, unsigned n) {
+    extern int helper_fn(const char *ubuf, unsigned n);
+    char k[64];
+    if (copy_from_user(k, ubuf, n) != 0) return -1;
+    return k[0];
+}
+""")
     case("B2 unbracketed access inside a foreign-CR3 window", "B2",
          watched="""
 int loader(unsigned long pml4, char *dst, const char *src, unsigned n, void *other) {

@@ -12,6 +12,7 @@
 #include "win16api.h"
 #include "ne.h"
 #include "../serial.h"
+#include "../cpu/isr.h"   // #243: KEY_HOME..KEY_DEL, the cooked-code table
 #include "../string.h"
 #include "../video/framebuffer.h"
 #include "../video/font.h"
@@ -19,6 +20,17 @@
 #include "../fs/fat.h"
 #include "../fs/perms.h"     // #708: R_OK/W_OK/X_OK
 #include "../fs/guestfs.h"   // #708: the DOS/Win16 guest filesystem gate
+
+// #243: the two-namespaces guard. drivers/keyboard.h defines KEY_HOME as the
+// PS/2 SCANCODE 0x47 (== ASCII 'G'); cpu/isr.h defines it as the COOKED code
+// 0x100 that keyboard_get_char() actually delivers. Whichever header wins the
+// include order decides what the name means in this file, and getting it wrong
+// silently reinstates the exact bug #243 fixed. gui/login.c carries the same
+// assert for KEY_UP (#745) after the same hazard.
+_Static_assert(KEY_HOME == 0x100 && KEY_END == 0x101 && KEY_PGUP == 0x102 &&
+               KEY_PGDN == 0x103 && KEY_INS == 0x104 && KEY_DEL == 0x105,
+               "#243: this file is seeing drivers/keyboard.h's SCANCODE "
+               "KEY_HOME (0x47 = 'G'), not cpu/isr.h's cooked 0x100");
 extern uint32_t fb_get_pixel(uint32_t x, uint32_t y);
 extern fat_fs_t g_fat_fs;
 // (#257) shared drive-letter FS layer (dos/dospath.c).
@@ -816,7 +828,7 @@ static void win16_menu_strip_maintain(void) {
         if (!g_menu_snap) return;
     }
     // Discriminate "menu present" from "menu blanked" by counting ink (dark) pixels in
-    // the MENU-TEXT band ONLY. Empirically (per-row dark-pixel dump on a test VM), Word's
+    // the MENU-TEXT band ONLY. Empirically (per-row dark-pixel dump on VM <vmid>), Word's
     // 16px menu strip is: row 2 = a full-width separator line, rows 11-15 = the toolbar's
     // top edge/bevel, and BOTH of those are dark in either state. The menu glyphs of
     // "File Edit View ... Help" live in rows 3-10 (x in [8,470)): ~1000 dark pixels when
@@ -2303,7 +2315,7 @@ static void u_getfreesystemresources(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx
 // ordinal that lacks one (see find_stub / g_stub_table dispatch). For most
 // boolean-style stubs AX=1 means "success"; for LocalCompact it instead means
 // "the largest contiguous free block in the local heap is 1 byte". MEASURED
-// (win16_trace on a test VM, #278 Word6 continuation pass): every keystroke drove
+// (win16_trace on VM <vmid>, #278 Word6 continuation pass): every keystroke drove
 // Word's own R_reformat -> PAGINATE-engine path into two MessageBoxes, "Word has
 // insufficient memory. You will not be able to undo this action once it is
 // completed. Do you want to continue?" and "There are too many edits in the
@@ -3199,7 +3211,7 @@ static uint32_t win16_call_wndproc(uint16_t pseg, uint16_t poff, uint16_t hwnd,
                 pseg, poff, msg, wParam, (unsigned)lParam);
     // (#278 P41) trace messages delivered to Word's MDI document windows
     // (frame 0040, MDI client 004d, doc child 004e, edit pane 004f, ruler 0050).
-    // (#278 DIAG typed-char-bail pass) kprintf is dropped on a test VM in GUI mode
+    // (#278 DIAG typed-char-bail pass) kprintf is dropped on VM <vmid> in GUI mode
     // (serial silent); route via win16_trace -> /WIN16LOG.TXT instead, per the
     // established rig learning (blame.md). Also: reset the trace ring the first
     // time ANY WM_CHAR/WM_KEYDOWN reaches ANY window, so the whole 256KB budget
@@ -3820,7 +3832,7 @@ static void u_setwindowpos(x86_16_cpu_t *c, uint16_t *ax, uint16_t *dx,
         // fixed for, with its own comment explaining why (Tetris's GameGrid
         // derives its per-cell pixel size from WM_SIZE's lParam; without a
         // fresh WM_SIZE after a resize it keeps a stale 1x1 cell size). This
-        // handler never got the matching fix. MEASURED (a test VM, #word6-scroll
+        // handler never got the matching fix. MEASURED (VM <vmid>, #word6-scroll
         // pass): Word 6's document body (OpusWwd, hwnd 004f) is laid out via
         // SetWindowPos, not MoveWindow, as part of finalizing the MDI child's
         // geometry once the toolbar dock/ruler/status bar all have their final
@@ -4458,7 +4470,7 @@ void win16_host_rebind_canvas(int slot, uint32_t *new_buf, int new_w, int new_h)
             win16_draw_frame(mw);   // recompute cx/cy/cw/ch for the new canvas
             uint32_t lp = ((uint32_t)(uint16_t)mw->ch << 16) | (uint16_t)mw->cw;
             msgq_post(mw->hwnd, WM_SIZE, 0, lp);
-            // (#word6-maximize) MEASURED (a test VM, FreeCell maximize): WM_SIZE
+            // (#word6-maximize) MEASURED (VM <vmid>, FreeCell maximize): WM_SIZE
             // alone reflows anchored chrome (menu bar, a right-anchored "Cards
             // Left" label) but is NOT sufficient to bring back the play-field
             // content -- real Win16 apps that redraw only in WM_PAINT (rather
@@ -4612,7 +4624,7 @@ static uint16_t kernel_key_to_vk(int code, int *is_release, char *ch) {
         // as code=0x84 and this switch (correctly, for real F5) mapped it to
         // VK_F5, so holding Ctrl alone made Word 6 receive WM_KEYDOWN(VK_F5)
         // and open its real "Go To" dialog (RegisterClass/CreateWindow 'Go To'
-        // confirmed via a gated g_w6life trace on a test VM), which our interpreter
+        // confirmed via a gated g_w6life trace on VM <vmid>), which our interpreter
         // creates but never shows (shown=0) and which then loops creating child
         // controls forever: the wedge. isr.h now emits 0x99 for Ctrl press
         // (0x84 is unambiguously F5 again); map it here to the real VK_CONTROL
@@ -4630,17 +4642,18 @@ static uint16_t kernel_key_to_vk(int code, int *is_release, char *ch) {
         // inline WM_KEYDOWN(VK_HOME) handler runs and decides "start of line"
         // vs "start of document" itself via GetKeyState(VK_CONTROL) above,
         // faithful to real Win16, not a forced caret jump.
-        // NOTE (known, NOT fixed here): 0x47 is genuinely ambiguous at the
-        // keyboard_get_char() layer: cpu/isr.c also pushes the SAME byte for
-        // Shift+G (scancode_to_ascii_shift['g']=='G'==0x47), and this exact
-        // ambiguity already exists system-wide (see proc/syscall.c
-        // SYS_INJECT_KEY and userland/libc/textfield.h, which also key off
-        // 0x47 for Home unconditionally). This fix matches that existing
-        // convention rather than inventing a new one; a real fix needs a
-        // richer per-event structure (scancode + extended flag) threaded
-        // through instead of one overloaded byte. Out of scope for this
-        // task (see blame.md).
-        case 0x47: return 0x24;  // KEY_HOME -> VK_HOME
+        // #243 RESOLVED. This block used to carry a note saying 0x47 was
+        // "genuinely ambiguous at the keyboard_get_char() layer" because
+        // cpu/isr.c pushed the SAME byte for Shift+G, that the ambiguity
+        // existed system-wide, and that a real fix "needs a richer per-event
+        // structure (scancode + extended flag) threaded through instead of one
+        // overloaded byte. Out of scope for this task". The diagnosis was
+        // exactly right, and the fix is now done: cpu/isr.c's cooked ring is
+        // 16 bits wide and these six keys have codes in the 0x100 block, so
+        // Home and Shift+G are no longer the same value. Word 6 keeps its
+        // navigation keys AND can type a capital G, which it could not do for
+        // as long as this switch had to choose between them.
+        case KEY_HOME: return 0x24;  // -> VK_HOME
         // (#word6-scroll) PageUp/PageDown/End had the EXACT same gap as Home
         // above, just never fixed: cpu/isr.c forwards these extended keys as
         // their raw PS/2 make-code byte (Home=0x47, End=0x4F, PgUp=0x49,
@@ -4660,14 +4673,19 @@ static uint16_t kernel_key_to_vk(int code, int *is_release, char *ch) {
         // so PRIOR=0x21/NEXT=0x22/END=0x23 slot into the same known-correct
         // range, not a guess. Delete (0x53 -> VK_DELETE=0x2E) is the same
         // class of gap; fixed alongside since it is a one-line, well-defined
-        // mapping and shares the identical bug shape. Same ambiguity caveat
-        // as Home above (0x49/'I', 0x51/'Q', 0x4F/'O', 0x53/'S' collide with
-        // real letters at this cooked-code layer); out of scope to fix the
-        // deeper ambiguity here, same as Home.
-        case 0x49: return 0x21;  // KEY_PAGEUP   -> VK_PRIOR
-        case 0x51: return 0x22;  // KEY_PAGEDOWN -> VK_NEXT
-        case 0x4F: return 0x23;  // KEY_END      -> VK_END
-        case 0x53: return 0x2E;  // KEY_DELETE   -> VK_DELETE
+        // mapping and shares the identical bug shape. The ambiguity these once
+        // carried (0x49/'I', 0x51/'Q', 0x4F/'O', 0x53/'S' colliding with real
+        // letters at the cooked-code layer) is GONE as of #243; see the
+        // KEY_HOME note above.
+        case KEY_PGUP: return 0x21;  // -> VK_PRIOR
+        case KEY_PGDN: return 0x22;  // -> VK_NEXT
+        case KEY_END:  return 0x23;  // -> VK_END
+        case KEY_DEL:  return 0x2E;  // -> VK_DELETE
+        // #243: Insert had NO mapping at all here, so it arrived as 0x52 ==
+        // ASCII 'R' and was typed into the document as the letter R. Same
+        // contiguous VK block as the five above: VK_INSERT 0x2D, VK_DELETE
+        // 0x2E.
+        case KEY_INS:  return 0x2D;  // -> VK_INSERT
         // (Word6 divergence catalog #2, Alt-menu) KEY_ALT/KEY_ALT_UP are new
         // cooked codes (cpu/isr.c previously never produced any for the real
         // Alt key at all, see isr.c/isr.h); map to real VK_MENU (0x12) so
@@ -10730,7 +10748,7 @@ static int win16_native_ctrl_proc(win16_window_t *win, uint16_t msg,
 // This section gives it real per-window item-list storage (g_combos[], see
 // its declaration near g_windows[]) plus the standard collapsed paint. The
 // collapsed chrome was matched in STRUCTURE (not a hand-guessed modern style)
-// against a real Win 3.1 render: a local Bochs reference capture,
+// against a real Win 3.1 render: the build host:<workspace>,
 // probed pixel-by-pixel with Python/PIL. MEASURED there: the text field is a
 // 1px sunken frame (top+left black, bottom+right white - the white matches
 // the field's own fill, so the far edge is genuinely invisible, exactly as in
@@ -10893,7 +10911,7 @@ static void win16_draw_combo(win16_window_t *win) {
 // (undocumented - this is not a public CB_* message) COMBOBOXCTLWNDPROC
 // extension, which our interpreter does not load or emulate as guest code.
 // Implementing it faithfully would mean disassembling that real binary (via
-// the Bochs reference rig) to learn
+// the Bochs reference rig, the build host:<workspace> or tools/word6/bochs) to learn
 // the real algorithm - genuinely deep, out of this pass's scope. Do NOT
 // hardcode the observed strings (not faithful emulation) and do NOT
 // resurrect the STRINGTABLE theory without new evidence; the gated
@@ -14825,7 +14843,6 @@ int win16_api_dispatch(x86_16_cpu_t *c, uint16_t off) {
 /* --- #278 Word6/OLE2 merge: WIN16PM.RUN boot auto-launcher (ported from ole2c) --- */
 extern void *proc_create(const char *name, void (*fn)(void *), void *arg, int prio);
 extern void  proc_sleep(unsigned ms);
-extern int   g_win16_want_pmode;
 // #dosverify: was win16_launch() (the syscall-facing wrapper, proc/syscall.c),
 // which bounces `path` through strncpy_from_user() on the assumption it is a
 // USER pointer. This thread is kernel code passing its own kernel-stack
@@ -14835,7 +14852,7 @@ extern int   g_win16_want_pmode;
 // found while verifying #dosverify did not regress Word6/Win16 games.
 // win16_launch_kernel() is the same launch, for a caller that already owns a
 // kernel string.
-extern int win16_launch_kernel(const char *path);
+extern int win16_launch_kernel(const char *path, int mode);
 extern char  g_win16_cmdtail[128];
 static void win16_autolaunch_thread(void *arg) {
     (void)arg;
@@ -14856,9 +14873,16 @@ static void win16_autolaunch_thread(void *arg) {
       if (m+1<sz && (p[m]==0x70||p[m]==0x50) && (p[m+1]==0x6d||p[m+1]==0x4d)) want_pm=1; }
     kfree(d);
     if (!path[0]) return;
-    kprintf("[WIN16AUTO] launching %s (%s)\n", path, want_pm?"pmode":"realmode");
+    // (#845) A trailing "pm" token FORCES protected mode (explicit override,
+    // wins over the derived default - what VM <vmid>'s WORD6/WINWORD.EXE pm has
+    // always relied on). No token means no override: the mode is left to
+    // ne.c's win16_decide_pmode() to derive from the NE header, same as an
+    // ordinary Start-menu launch of the same binary would get. This is one of
+    // the two entry points that feed the single decision point in
+    // win16_run_file_inner(); the other is win16_launch() (Start menu),
+    // reached via SYS_WIN16_RUN.
+    kprintf("[WIN16AUTO] launching %s (%s)\n", path, want_pm ? "forced pmode" : "auto");
     g_win16_cmdtail[0] = 0;
-    g_win16_want_pmode = want_pm;
-    win16_launch_kernel(path);
+    win16_launch_kernel(path, want_pm ? 1 : -1);
 }
 void win16_autolaunch_init(void) { proc_create("win16auto", win16_autolaunch_thread, 0, 2); }

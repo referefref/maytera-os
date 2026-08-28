@@ -9,10 +9,26 @@
 #include "../mm/pmm.h"
 #include "../mm/vmm.h"
 #include "../fs/bootlog.h"
+#include "../fs/fat.h"      // #156: fat_exists() for the /XHCIMSI.* ESP gate
 #include "../proc/process.h"
 #include "../cpu/mono.h"    // #507/#525: THE shared clock + busy-delay (no private PIT loop here)
+#include "../cpu/idt.h"     // #139: idt_register_handler / interrupt_frame_t for the MSI handler
+#include "../cpu/apic.h"    // #139: lapic_eoi / lapic_get_id
 #include "../sync/waitq.h"
+#include "usb_hid.h"            // #134: HID slot teardown on disconnect
 #include "../sync/noblock.h"   // #614: g_xhci_evt_wq, the event-ring wait queue   // #433: proc_create/PRIO_* for the re-scan worker
+
+// #62: budget for the endpoint-recovery COMMANDS issued after a failed
+// transfer. These are host-controller commands (Stop/Reset Endpoint, Set TR
+// Dequeue), not device transactions: on a working controller they retire in
+// microseconds even when the DEVICE is silent, which is exactly the case they
+// exist for. A short budget guarantees recovery can never cost more than the
+// fault it repairs.
+#define XHCI_RECOVER_CMD_MS 100
+
+// Defined near the endpoint-recovery block at the bottom of this file; called
+// from xhci_control_transfer_to() far above it.
+int xhci_recover_control_endpoint(xhci_controller_t *xhc, int slot_id, int wait_rc);
 
 // =============================================================================
 // Global State
@@ -38,8 +54,77 @@ volatile int xhci_xfer_log = 0;   // gated by /CONFIG/USBDEBUG.CFG (see main.c)
 // transfer-event completion code and residual for each (slot, DCI) so a
 // polling worker can tell whether an outstanding interrupt-IN TD has completed
 // without blocking. Indexed [slot_id-1][dci]. cc==0 means "no completion yet".
+// #134: ROOT port each enabled slot hangs off, stored ONE-BASED so that the
+// plain zero initialisation of this array already means "unknown", with no
+// init hook to forget to call.
+static int16_t g_slot_root_port[XHCI_MAX_SLOTS];
 static volatile uint8_t  g_xfer_cc[XHCI_MAX_SLOTS][XHCI_MAX_ENDPOINTS];
 static volatile uint32_t g_xfer_residual[XHCI_MAX_SLOTS][XHCI_MAX_ENDPOINTS];
+
+// #139 MEASUREMENT. The microsecond (mono_us, truncated to 32 bits so this
+// table costs 32 KB rather than 64 KB; unsigned subtraction still yields the
+// correct delta across the ~71-minute wrap) at which a drainer OBSERVED the
+// transfer event for this (slot, DCI). usb_hid.c differences it against its own
+// submit and inject stamps, which is what separates the three delays that add
+// up to mouse latency instead of guessing which one dominates:
+//   submit  -> observe : the controller's own periodic schedule (the xHCI
+//                        endpoint-context Interval field) plus event-ring
+//                        drain delay;
+//   observe -> inject  : the HID poll worker's wake cadence, i.e. precisely
+//                        what #139 event-driven completion removes.
+static volatile uint32_t g_xfer_done_us[XHCI_MAX_SLOTS][XHCI_MAX_ENDPOINTS];
+
+// #155: OPTIONAL per-transfer-event OBSERVER, for a driver that keeps MORE THAN
+// ONE TD in flight on a single endpoint.
+//
+// g_xfer_cc[][] is ONE cell per (slot, DCI). That is correct and sufficient for
+// every existing user (HID, MSC, CDC-ACM, Bluetooth), because each of them keeps
+// exactly one TD outstanding and reaps it before submitting the next. It is
+// structurally unusable for a QUEUED endpoint: the second completion overwrites
+// the first, and with it the residual, so both the byte count and the fact that
+// a transfer happened at all are lost. That single-TD-per-endpoint shape is the
+// measured ~3 Mbit/s ceiling on the USB-Ethernet dongle (#155).
+//
+// Growing g_xfer_cc/g_xfer_residual by a queue depth would cost
+// XHCI_MAX_SLOTS(256) * XHCI_MAX_ENDPOINTS(32) * depth for every slot on the
+// machine to serve ONE singleton device. Instead the one driver that needs
+// depth registers an observer and keeps its own completion ring, sized by that
+// driver, freed by that driver, and invisible to every other endpoint.
+//
+// CONTRACT, and it is strict, because this is called from the event drainer:
+//   - runs with the event-ring lock held, and MAY run with interrupts off and
+//     inside an MSI handler's drain;
+//   - MUST NOT block, sleep, log, allocate, or take any lock that another
+//     context can hold across a sleep. A ring store and nothing else.
+// NULL by default: for every build that has no USB NIC this is one
+// branch-not-taken per transfer event.
+void (*xhci_xfer_observer)(uint32_t slot, uint32_t dci,
+                           uint8_t cc, uint32_t residual) = 0;
+
+// #133: the completion code of the LAST FAILING transfer on each (slot, DCI).
+// g_xfer_cc is cleared the instant a poller consumes it, so by the time a
+// recovery path runs, the reason the transfer failed is already gone - and the
+// reason is what decides the recovery. A Stall means the DEVICE has halted the
+// endpoint and only a CLEAR_FEATURE(ENDPOINT_HALT) on the control endpoint
+// un-halts it; a USB Transaction Error means the link dropped and a Reset
+// Endpoint is the whole cure. Doing the second when the first was needed is a
+// recovery that reports success and changes nothing, which is exactly how a
+// wireless mouse ends up permanently dead beside a keyboard that is fine.
+static volatile uint8_t g_xfer_last_err[XHCI_MAX_SLOTS][XHCI_MAX_ENDPOINTS];
+
+// #133: why did the last transfer on this endpoint fail? 0 = no failure seen.
+uint8_t xhci_xfer_last_error(int slot_id, int dci) {
+    if (slot_id < 1 || slot_id > XHCI_MAX_SLOTS) return 0;
+    if (dci < 0 || dci >= XHCI_MAX_ENDPOINTS) return 0;
+    return g_xfer_last_err[slot_id - 1][dci];
+}
+
+// #139: read the observe stamp for one endpoint. 0 means "never observed".
+uint32_t xhci_xfer_done_us(int slot_id, int dci) {
+    if (slot_id < 1 || slot_id > XHCI_MAX_SLOTS) return 0;
+    if (dci < 0 || dci >= XHCI_MAX_ENDPOINTS) return 0;
+    return g_xfer_done_us[slot_id - 1][dci];
+}
 
 // #307: the event ring is shared by control/bulk (blocking, via
 // xhci_wait_for_event) and by the HID / UAC pollers (non-blocking, via
@@ -51,6 +136,68 @@ static volatile uint32_t g_xfer_residual[XHCI_MAX_SLOTS][XHCI_MAX_ENDPOINTS];
 // #614: event-ring wait queue. See xhci_evt_worker() below for why blocking
 // here is safe on hardware that never raises an interrupt.
 static wait_queue_head_t g_xhci_evt_wq = { .head = NULL, .lock = SPINLOCK_INIT };
+
+// =============================================================================
+// #139: the xHCI interrupt this driver never had
+// =============================================================================
+// Until now the event ring was drained ONLY by timer-driven workers, so every
+// completion waited for the next poll pass. USBCMD.INTE and Interrupter 0's
+// IMAN.IE were both already set at init; the missing piece was the PCI-level
+// delivery (MSI), so the controller had no way to tell anyone anything and the
+// "hardware that never interrupts" in the #614 comment was a property of THIS
+// DRIVER, not of the hardware.
+//
+// WHAT THE HANDLER DELIBERATELY DOES NOT DO: drain. xhci_process_event() calls
+// kprintf() on the port-status-change and unknown-event paths, and kprintf
+// takes g_console_lock. An ISR that took a lock the interrupted thread on the
+// SAME cpu already holds deadlocks that cpu outright - which is exactly the
+// four-cpu wedge blame.md records at #134, reached from the other direction.
+// So the handler does the two register acknowledgements the spec requires and
+// then WAKES, and the drain happens in the woken thread's context where
+// kprintf and everything else is legal. The interrupt buys latency; it does
+// not move any work into interrupt context.
+static volatile uint64_t g_xhci_msi_seq = 0;    // bumped once per interrupt
+static volatile uint64_t g_xhci_msi_hits = 0;   // total, for the boot log
+static int g_xhci_msi_armed = 0;
+
+// #156: THE MSI ARMING GATE. Default OFF.
+//
+// #139 armed an xHCI MSI for the first time in this kernel's life. It could
+// never run on the test rig: QEMU's qemu-xhci exposes MSI-X (0x11) and not MSI
+// (0x05), so pci_enable_msi() declined and xhci_msi_isr() shipped having
+// EXECUTED ZERO TIMES on any machine anyone had watched. The one machine that
+// can execute it is the owner's iMac14,4 (Intel xHCI at 00:14.0), and build
+// 1921 is the first build in which it would have. That build hangs at boot on
+// that machine and 1910 did not.
+//
+// So the arming is opt-in until it has been observed working on real hardware.
+// OFF is EXACTLY the pre-#139 state: the event ring is drained by the two
+// always-armed timer-driven workers (usb_hid_poll_worker and xhci_evt_worker),
+// which is how every shipping build up to and including 1910 ran. #139's real
+// win, the Endpoint Context Interval encoder fix that was making every
+// full-speed interrupt endpoint 8x slower, is in a completely different
+// function (xhci_configure_endpoint_ep) and is NOT affected by this gate.
+//
+// Resolved once, in xhci_setup_interrupt(), from:
+//   compile-time default  XHCI_MSI_DEFAULT_ON (0; `make XHCIMSI=1` makes it 1)
+//   /XHCIMSI.TXT on the FAT ESP  -> force ON
+//   /XHCIMSI.OFF on the FAT ESP  -> force OFF (wins, so a kernel built ON can
+//                                   still be recovered without a rebuild)
+// Same shape as /SMPSCHED.TXT and /TORAMOFF.TXT, per the project rule about
+// reusing the existing mechanism. READ ONLY: nothing in the kernel writes it,
+// so blame.md's "a runtime-WRITABLE ESP marker needs /boot/" (fat_write_file's
+// ext2 redirect) does not apply.
+#ifndef XHCI_MSI_DEFAULT_ON
+#define XHCI_MSI_DEFAULT_ON 0
+#endif
+static int g_xhci_msi_gate = 0;          // resolved in xhci_setup_interrupt()
+int xhci_msi_gate(void) { return g_xhci_msi_gate; }
+
+uint64_t xhci_msi_seq(void)   { return g_xhci_msi_seq; }
+uint64_t xhci_msi_count(void) { return g_xhci_msi_hits; }
+int      xhci_msi_armed(void) { return g_xhci_msi_armed; }
+
+struct wait_queue_head *xhci_event_waitq(void) { return &g_xhci_evt_wq; }
 
 static volatile int g_evt_busy = 0;
 static inline int xhci_evt_trylock(void) { return __sync_lock_test_and_set(&g_evt_busy, 1) == 0; }
@@ -85,6 +232,21 @@ static volatile int g_xhci_last_cmd_timeout = 0;  // 1 = no completion event see
 // "enumeration: N device(s)" summary is accurate regardless of which pass ran.
 static uint8_t g_port_enumerated[MAX_XHCI_CONTROLLERS][256];
 static int     g_enum_dev_found[MAX_XHCI_CONTROLLERS];
+
+// #135 (root port 4 flaps on the owner's iMac14,4, re-enumerating a keyboard
+// that was never unplugged). State for the PORTSC transition log, the connect
+// debounce, the flap governor and same-device recognition. Indexed exactly like
+// g_port_enumerated[] above (controller index, then root-port number - 1).
+static uint32_t g_portsc_prev[MAX_XHCI_CONTROLLERS][256];
+static uint8_t  g_portsc_prev_valid[MAX_XHCI_CONTROLLERS][256];
+static uint16_t g_port_flaps[MAX_XHCI_CONTROLLERS][256];      // confirmed disconnects
+static uint16_t g_port_cooldown[MAX_XHCI_CONTROLLERS][256];   // re-scans to skip
+static uint16_t g_port_stable[MAX_XHCI_CONTROLLERS][256];     // consecutive good scans
+static uint16_t g_port_orphan[MAX_XHCI_CONTROLLERS][256];     // #134: consecutive scans
+                                                              // flagged enumerated with no slot
+static uint32_t g_port_last_devid[MAX_XHCI_CONTROLLERS][256]; // (vid<<16)|pid
+static uint32_t g_legsup_off[MAX_XHCI_CONTROLLERS];           // MMIO byte offset, 0=none
+static uint32_t g_portsc_log_lines = 0;
 
 static inline int xhci_ctrl_index(xhci_controller_t *xhc) {
     int idx = (int)(xhc - xhci_controllers);
@@ -214,6 +376,231 @@ static inline void xhci_portsc_write(xhci_controller_t *xhc, int port, uint32_t 
 // Doorbell access
 static inline void xhci_doorbell_write(xhci_controller_t *xhc, uint32_t slot, uint32_t value) {
     xhc->doorbells[slot] = value;
+}
+
+// =============================================================================
+// #135: root-port flap diagnosis (PORTSC decode, controller context, debounce)
+// =============================================================================
+//
+// THE FAULT. On the owner's real iMac14,4 the 3-second re-scan alternates
+// "port 4 disconnected" and "port 4 connected but not enumerated" forever,
+// re-enumerating the still-physically-plugged Apple keyboard 05ac:024f into a
+// fresh device slot and fresh hid_devices[] entries every cycle. The re-scan
+// decided this on ONE bit: xhci_port_is_connected() is a bare PORTSC & CCS read.
+// Nothing has ever dumped the rest of the register across the transition, so
+// WHY CCS reads 0 on an attached device is, at the time of writing, unknown.
+//
+// These helpers exist to answer that from the owner's next boot, and they write
+// to bootlog_write(), NEVER kprintf(): the iMac runs in GUI mode with no serial
+// console, so a kprintf diagnostic on that machine does not exist. (That trap is
+// why the USBLEGSUP hand-off below reported its result to nobody for months.)
+//
+// THE FIELD THAT DECIDES IT is CSC. The change bits are RW1C and the re-scan
+// never clears them, so:
+//   CCS=0 with CSC=1  -> the controller LATCHED a connect-status change; the
+//                        device really did go electrically absent (cable, VBUS,
+//                        or an agent that reset/depowered the port).
+//   CCS=0 with CSC=0  -> the bit moved with no latched transition. That is not a
+//                        cable event. Suspect the port being routed away from
+//                        the xHCI, or firmware operating it behind us.
+// PLS, PP, OCA and PR separate the sub-cases: PP=0 means something depowered the
+// port, OCA=1 means over-current shut it down, PLS tells you whether the link is
+// in Polling / RxDetect / Inactive / Compliance / Resume rather than U0.
+static const char *xhci_pls_name(uint32_t pls) {
+    switch (pls) {
+        case 0:  return "U0";        case 1:  return "U1";
+        case 2:  return "U2";        case 3:  return "U3-susp";
+        case 4:  return "Disabled";  case 5:  return "RxDetect";
+        case 6:  return "Inactive";  case 7:  return "Polling";
+        case 8:  return "Recovery";  case 9:  return "HotReset";
+        case 10: return "Compliance"; case 11: return "TestMode";
+        case 15: return "Resume";    default: return "rsvd";
+    }
+}
+
+// The persistent log is a 96 KB RAM buffer and everything past it is serial-only
+// (i.e. invisible on this machine), so the transition log is HARD CAPPED. It
+// only ever fires on a CHANGE, so a healthy machine spends one line per port.
+#define XHCI_PORTSC_LOG_MAX 200
+
+static void xhci_portsc_log(xhci_controller_t *xhc, uint32_t port, uint32_t v,
+                            const char *why) {
+    (void)xhc;
+    if (g_portsc_log_lines > XHCI_PORTSC_LOG_MAX) return;
+    g_portsc_log_lines++;
+    if (g_portsc_log_lines > XHCI_PORTSC_LOG_MAX) {
+        bootlog_write("[PORTSC] transition-log cap %d reached; further PORTSC "
+                      "changes are serial-only", XHCI_PORTSC_LOG_MAX);
+        return;
+    }
+    bootlog_write("[PORTSC] p%u %s raw=%08x CCS=%u PED=%u OCA=%u PR=%u "
+                  "PLS=%u(%s) PP=%u spd=%u | CSC=%u PEC=%u WRC=%u OCC=%u "
+                  "PRC=%u PLC=%u CEC=%u",
+                  port + 1, why, v,
+                  (v & XHCI_PORTSC_CCS) ? 1 : 0,
+                  (v & XHCI_PORTSC_PED) ? 1 : 0,
+                  (v & XHCI_PORTSC_OCA) ? 1 : 0,
+                  (v & XHCI_PORTSC_PR)  ? 1 : 0,
+                  (v >> 5) & 0xf, xhci_pls_name((v >> 5) & 0xf),
+                  (v & XHCI_PORTSC_PP)  ? 1 : 0,
+                  (v >> 10) & 0xf,
+                  (v & XHCI_PORTSC_CSC) ? 1 : 0,
+                  (v & XHCI_PORTSC_PEC) ? 1 : 0,
+                  (v & XHCI_PORTSC_WRC) ? 1 : 0,
+                  (v & XHCI_PORTSC_OCC) ? 1 : 0,
+                  (v & XHCI_PORTSC_PRC) ? 1 : 0,
+                  (v & XHCI_PORTSC_PLC) ? 1 : 0,
+                  (v & XHCI_PORTSC_CEC) ? 1 : 0);
+}
+
+// USBLEGSUP / USBLEGCTLSTS bit definitions (xHCI 1.1 sections 7.1.1 / 7.1.2).
+#define XHCI_LEGSUP_BIOS_OWNED  (1u << 16)
+#define XHCI_LEGSUP_OS_OWNED    (1u << 24)
+// SMI ENABLES live at bits 0 (USB SMI), 4 (Host System Error), 13 (OS
+// Ownership), 14 (PCI Command), 15 (BAR). Bits 29-31 are RW1C SMI status.
+#define XHCI_LEGCTL_SMI_ENABLES ((1u<<0)|(1u<<4)|(1u<<13)|(1u<<14)|(1u<<15))
+#define XHCI_LEGCTL_SMI_STATUS  ((1u<<29)|(1u<<30)|(1u<<31))
+
+// Everything OUTSIDE PORTSC that can make a still-plugged device read CCS=0.
+// Two named suspects, both one register read and neither ever logged before:
+//   - the Intel USB2/USB3 port-routing registers (#366). If firmware hands a
+//     switchable USB2 port back to the EHCI companion, that port's xHCI PORTSC
+//     reads CCS=0 with nothing having been unplugged. Root port 4 is the LAST
+//     switchable USB2 port on this chipset (XUSB2PR read back 0x0000000f), which
+//     makes this hypothesis specific and testable rather than decorative.
+//   - USBLEGSUP. If HC BIOS Owned has gone high again, firmware has re-taken the
+//     controller and is operating the ports behind us, which is exactly what
+//     legacy USB keyboard emulation does, and it is the KEYBOARD port flapping.
+static void xhci_portctx_log(xhci_controller_t *xhc, const char *why) {
+    int idx = xhci_ctrl_index(xhc);
+    uint32_t legsup = 0, legctl = 0;
+    if (g_legsup_off[idx] && xhc->mmio_base) {
+        volatile uint32_t *cap =
+            (volatile uint32_t *)(xhc->mmio_base + g_legsup_off[idx]);
+        legsup = cap[0];
+        legctl = cap[1];
+    }
+    uint32_t pssen = 0, xusb2pr = 0;
+    if (xhc->pci && xhc->pci->vendor_id == 0x8086) {
+        pssen   = pci_read32(xhc->pci->bus, xhc->pci->slot, xhc->pci->func, 0xD0);
+        xusb2pr = pci_read32(xhc->pci->bus, xhc->pci->slot, xhc->pci->func, 0xD8);
+    }
+    bootlog_write("[PORTCTX] %s USBSTS=%08x LEGSUP=%08x(BIOS_OWNED=%u) "
+                  "LEGCTLSTS=%08x XUSB2PR=%08x PSSEN=%08x", why,
+                  xhci_op_read32(xhc, XHCI_OP_USBSTS), legsup,
+                  (legsup & XHCI_LEGSUP_BIOS_OWNED) ? 1 : 0, legctl,
+                  xusb2pr, pssen);
+}
+
+// DEBOUNCE. USB 2.0 section 7.1.7.3 requires software to see a connect or
+// disconnect stable for at least 100 ms before acting on it. The re-scan took
+// exactly ONE CCS sample every 3 seconds and tore the port down on it, so a
+// transient of any duration - including one caused by another agent touching the
+// port between our samples - was indistinguishable from an unplug. Sample across
+// >100 ms and believe a disconnect only when EVERY sample agrees. A disagreement
+// is logged, because a "glitch" line is itself the evidence the single-sample
+// code destroyed. Returns 1 when the disconnect is confirmed, 0 when it is not.
+//
+// Cost: this runs ONLY in the re-scan worker thread, and only on the scan where
+// a port we believe is enumerated first reads CCS=0, so the steady state is
+// unchanged. xhci_delay() is this file's calibrated real-time delay (see its
+// definition above); it is a delay, not a condition poll.
+#define XHCI_DEBOUNCE_SAMPLES 6
+#define XHCI_DEBOUNCE_MS      20
+static int xhci_port_disconnect_confirmed(xhci_controller_t *xhc, uint32_t port) {
+    int ones = 0;
+    uint32_t last = 0;
+    for (int i = 0; i < XHCI_DEBOUNCE_SAMPLES; i++) {
+        xhci_delay(XHCI_DEBOUNCE_MS);
+        last = xhci_portsc_read(xhc, port);
+        if (last & XHCI_PORTSC_CCS) ones++;
+    }
+    if (ones) {
+        xhci_portsc_log(xhc, port, last, "DEBOUNCE-GLITCH");
+        bootlog_write("[PORTSC] p%u: CCS=0 was a GLITCH - %d of %d debounce samples "
+                      "over %dms read CCS=1; port NOT torn down",
+                      port + 1, ones, XHCI_DEBOUNCE_SAMPLES,
+                      XHCI_DEBOUNCE_SAMPLES * XHCI_DEBOUNCE_MS);
+        return 0;
+    }
+    return 1;
+}
+
+// =============================================================================
+// #135: xHCI USBLEGSUP BIOS->OS ownership hand-off
+// =============================================================================
+//
+// THIS WAS BROKEN FOR AS LONG AS THE FILE HAS EXISTED IN GIT, and it failed
+// silently. The hand-off block used to sit near the top of xhci_init(), THIRTY-SIX
+// LINES BEFORE `xhc->mmio_base` is assigned from BAR0. xhci_cap_read32() and the
+// extended-capability walk therefore dereferenced (NULL + offset): the code read
+// HCCPARAMS1 from physical address 0x10, walked a fabricated capability list
+// through low RAM (identity-mapped, so no fault), and - had a stray byte there
+// read as capability id 1 - would have WRITTEN the OS-owned bit and the SMI mask
+// into low memory. It never addressed the controller once.
+//
+// So on real hardware the controller may still be BIOS-OWNED, and firmware SMM
+// legacy-USB code keeps operating the root ports behind us. That is a first-class
+// suspect for #135: only the KEYBOARD port flaps, on a machine whose firmware
+// emulates a legacy keyboard from exactly that port.
+//
+// Nothing pointed at any of this because the outcome was reported with kprintf()
+// ONLY, and the iMac has no serial console.
+//
+// The SMI mask was wrong too. USBLEGCTLSTS bit 0 is USB SMI Enable, and the old
+// `*ctlsts = *ctlsts & 0x7` KEPT it, so even a successful hand-off would have
+// left the controller raising an SMI on every USB event. Clear every SMI enable
+// and write 1 to the RW1C status bits to ack anything already pending, as Linux
+// does in quirks.c:usb_disable_xhci_ports/xhci_bios_handoff.
+static void xhci_bios_handoff(xhci_controller_t *xhc) {
+    int idx = xhci_ctrl_index(xhc);
+    g_legsup_off[idx] = 0;
+    uint32_t hcc = xhci_cap_read32(xhc, XHCI_CAP_HCCPARAMS1);
+    uint32_t xecp = (hcc >> 16) & 0xffff;   // offset in 32-bit dwords
+    if (!xecp) {
+        bootlog_write("[xHCI] BIOS hand-off: controller has NO extended "
+                      "capabilities (HCCPARAMS1=0x%08x)", hcc);
+        return;
+    }
+    uint32_t guard = 0;
+    while (xecp && guard++ < 64) {
+        volatile uint32_t *cap =
+            (volatile uint32_t *)(xhc->mmio_base + (xecp * 4));
+        uint32_t capval = *cap;
+        uint8_t capid = capval & 0xff;
+        if (capid == 1) {                       // USB Legacy Support Capability
+            g_legsup_off[idx] = xecp * 4;
+            uint32_t before = capval;
+            int waited = 0;
+            if (capval & XHCI_LEGSUP_BIOS_OWNED) {
+                *cap = capval | XHCI_LEGSUP_OS_OWNED;   // request OS ownership
+                for (int i = 0; i < 1000; i++) {        // spec allows up to 1s
+                    if (!((*cap) & XHCI_LEGSUP_BIOS_OWNED)) break;
+                    xhci_delay(1);
+                    waited++;
+                }
+            }
+            uint32_t after = *cap;
+            volatile uint32_t *ctlsts = cap + 1;
+            uint32_t ctl_before = *ctlsts;
+            *ctlsts = (ctl_before & ~XHCI_LEGCTL_SMI_ENABLES) | XHCI_LEGCTL_SMI_STATUS;
+            uint32_t ctl_after = *ctlsts;
+            bootlog_write("[xHCI] BIOS->OS hand-off @+0x%x: LEGSUP %08x -> %08x "
+                          "(BIOS_OWNED %u -> %u after %dms), LEGCTLSTS %08x -> %08x%s",
+                          g_legsup_off[idx], before, after,
+                          (before & XHCI_LEGSUP_BIOS_OWNED) ? 1 : 0,
+                          (after  & XHCI_LEGSUP_BIOS_OWNED) ? 1 : 0, waited,
+                          ctl_before, ctl_after,
+                          (after & XHCI_LEGSUP_BIOS_OWNED)
+                              ? "  *** FIRMWARE STILL OWNS THIS CONTROLLER ***" : "");
+            return;
+        }
+        uint32_t next = (capval >> 8) & 0xff;   // next pointer, in dwords
+        if (!next) break;
+        xecp += next;
+    }
+    bootlog_write("[xHCI] BIOS hand-off: no USB Legacy Support capability in %u "
+                  "extended-capability entries (xECP=0x%x)", guard, (hcc >> 16) & 0xffff);
 }
 
 // =============================================================================
@@ -413,10 +800,156 @@ static int xhci_command_ring_init(xhci_controller_t *xhc) {
     return 0;
 }
 
-// Send a command and wait for completion
-static int xhci_send_command(xhci_controller_t *xhc, xhci_trb_t *cmd) {
+// ===========================================================================
+// #134: THE COMMAND RING IS A SINGLE SHARED RESOURCE AND IT HAD NO LOCK.
+// ===========================================================================
+// xhci_send_command_to() does four things that are only correct if exactly one
+// thread is inside at a time, and nothing enforced that:
+//
+//   1. xhci_ring_enqueue(&xhc->cmd_ring) is a read-modify-write of
+//      enqueue_idx plus, on the wrap, of cycle_bit. Two threads can be handed
+//      the SAME TRB and each write a different command into it, or lose the
+//      cycle toggle at the link TRB - the precise failure #307 already
+//      documents at that function ("the controller saw a cycle mismatch and
+//      silently stopped executing the ring").
+//   2. g_cmd_cc is ONE byte for the WHOLE controller. Clearing it before
+//      ringing the doorbell erases a completion another thread was waiting for.
+//   3. g_cmd_slot is ONE byte too, and xhci_enable_slot() reads the slot id out
+//      of it. A stolen completion therefore does not merely fail: it hands back
+//      SOMEBODY ELSE'S SLOT NUMBER, and the caller then programs DCBAA and a
+//      device context for a slot that is live - on this hardware, possibly the
+//      USB mass-storage device the root filesystem is mounted from.
+//   4. g_xhci_last_cmd_cc / _timeout are shared diagnostics.
+//
+// WHY THIS ONLY BECAME REACHABLE RECENTLY, and why the ticket is an unplug.
+// Until #62/#133/#134 (aa68a1a, 40f51ce - both AFTER build 1902) the only
+// commands issued once the scheduler was live came from the port re-scan
+// worker, one thread, serialised by being one thread. Those commits added TWO
+// more issuers on other threads, and both of them fire on a DISCONNECT:
+//   - usb_hid_poll() -> xhci_recover_endpoint() -> Reset Endpoint + Set TR
+//     Dequeue, from the HID poll worker, when the in-flight interrupt-IN TD of
+//     the device being unplugged completes with a transaction error; and
+//   - xhci_recover_control_endpoint() -> Stop/Reset Endpoint + Set TR Dequeue,
+//     from whatever thread was doing a control transfer (on the owner's iMac
+//     the ASIX USB-Ethernet link poller, which #62 measured burning 5 s
+//     budgets on slot 1 DCI 1 thirteen times in one boot).
+// while the re-scan worker is in xhci_teardown_port_slots() -> Disable Slot and
+// then re-enumerating. Build 1902 lost input on an unplug and kept running;
+// 1907+ freezes. This is the concurrency the difference introduced.
+//
+// THE LOCK IS THE MSC COMMAND LOCK'S SHAPE, DELIBERATELY. usb_msc.c already
+// solved exactly this problem for the SCSI command lock (#617/#745): an
+// uncontended atomic acquire, a wait-queue block with the re-check AFTER
+// queueing (the lost-wake close), and a no-block fallback for the pre-scheduler
+// phase where the lock is uncontended by construction. Copying that shape
+// rather than inventing a third one is the project rule, and it means this
+// lock behaves under IF=0 and pre-proc_init exactly like the one that has
+// already been proven on the boot path.
+//
+// CONTENTION IS COUNTED, NOT ASSERTED. g_xhci_cmd_contended is the measurement
+// that says whether two threads really do issue commands at once on a given
+// machine; the first one also names the waiting caller's return address for
+// addr2line. On a machine where it stays zero, this lock costs one atomic per
+// command.
+#define XHCI_CMD_BLOCK_MS 10
+static wait_queue_head_t g_xhci_cmd_wq = { .head = NULL, .lock = SPINLOCK_INIT };
+static volatile int      g_xhci_cmd_busy = 0;
+uint64_t g_xhci_cmd_contended     = 0;   // times a caller had to wait
+uint64_t g_xhci_cmd_noblock_refused = 0; // contention from a context that cannot park
+uint64_t g_xhci_cmd_contend_ra    = 0;   // first waiter's return address
+
+// A CONTENDED ACQUIRE FROM A CONTEXT THAT CANNOT PARK FAILS, IT DOES NOT SPIN.
+// usb_msc.c's equivalent fallback is a `while (test_and_set)` justified by
+// "unreachable by construction, because the pre-scheduler USB stack is
+// single-threaded". That justification is sound for the uncontended case and
+// worthless for this one: the whole point here is that OTHER threads issue
+// commands, and #745 already documents what an unbounded wait entered with
+// IF=0 costs (the machine stops, because the scheduler cannot run to let the
+// holder finish). Returning -1 is honest and safe: every caller already treats
+// a negative return as "the command failed", the recovery paths simply retry on
+// their next pass, and the boot path never reaches it because it is
+// single-threaded and therefore always takes the uncontended acquire above.
+// Counted, so "this never happens" stays a measurement rather than a claim.
+static int xhci_cmd_lock(void) {
+    // #134 (2026-08-18): THE COMMAND CRITICAL SECTION MUST NOT ENTER THE
+    // STORAGE STACK. This lock is NOT recursive and its contended path is an
+    // unbounded for(;;), so anything that re-enters it from INSIDE the critical
+    // section wedges the calling thread for ever. There is exactly such a path
+    // today: xhci_wait_for_event() calls bootlog_write() on its TIMEOUT branch
+    // while this lock is still held; bootlog_write() flushes /BOOTLOG.TXT; and
+    // on a USB-rooted machine that flush goes fat/ext2 -> blk_write ->
+    // usb_msc_transport, whose error recovery issues Reset Endpoint / Set TR
+    // Dequeue COMMANDS. That is a self-deadlock in one thread, and an ABBA
+    // against the MSC command lock in the other direction (a thread holding
+    // msc_cmd_lock that needs a controller command, while we hold the command
+    // lock and need msc_cmd_lock). Both loops are unbounded, so both are
+    // permanent, and the thread that dies quietly is the port re-scan worker:
+    // exactly the "no further re-scan output, machine otherwise usable" shape.
+    //
+    // Fix the mechanism, not the one call site: open the logger's OWN defer
+    // window (fs/bootlog.c g_bl_defer, the same primitive usb_msc_transport()
+    // already uses for this identical hazard) for the whole hold. Lines issued
+    // inside still reach the RAM buffer and serial and are persisted by the
+    // next safe context, so no diagnostic is lost; no present or future caller
+    // can reach the medium from in here.
+    if (__sync_lock_test_and_set(&g_xhci_cmd_busy, 1) == 0) { bootlog_defer_begin(); return 0; }
+
+    if (g_xhci_cmd_contended++ == 0) {
+        g_xhci_cmd_contend_ra = (uint64_t)__builtin_return_address(0);
+        bootlog_write("[xHCI] #134: TWO THREADS issued controller commands at once "
+                      "(waiter ra=%p). The command ring, g_cmd_cc and g_cmd_slot "
+                      "are single-instance and were unserialised until now; this "
+                      "is the window that could hand a caller another slot's "
+                      "completion. Serialised from here.",
+                      (void *)g_xhci_cmd_contend_ra);
+    }
+
+    for (;;) {
+        if (!wq_may_block()) {
+            g_xhci_cmd_noblock_refused++;
+            return -1;
+        }
+        wait_queue_entry_t wqe;
+        __wait_prepare(&g_xhci_cmd_wq, &wqe, 0);
+        // Re-check AFTER queueing: the lost-wake close (usb_msc.c's shape).
+        if (g_xhci_cmd_busy)
+            (void)__wait_event_wait_deadline(&wqe, sched_now_ms() + XHCI_CMD_BLOCK_MS);
+        __wait_finish(&g_xhci_cmd_wq, &wqe);
+        if (__sync_lock_test_and_set(&g_xhci_cmd_busy, 1) == 0) { bootlog_defer_begin(); return 0; }
+    }
+}
+
+static void xhci_cmd_unlock(void) {
+    bootlog_defer_end();          // #134: see xhci_cmd_lock()
+    __sync_lock_release(&g_xhci_cmd_busy);
+    // Unconditional, like the event-drain wake above: wake_up_all() is safe from
+    // IRQ context and a no-op on an empty queue.
+    wake_up_all(&g_xhci_cmd_wq);
+}
+
+// Send a command and wait for completion, with an EXPLICIT budget.
+//
+// #62: the recovery path added below issues commands from inside an ALREADY
+// FAILED transfer. Giving those commands the same 5s budget as enumeration
+// would let a single quiet device turn one 5s stall into three, i.e. the
+// recovery would be worse than the fault it repairs. Recovery therefore uses
+// XHCI_RECOVER_CMD_MS. Every pre-existing caller keeps 5000ms via the
+// xhci_send_command() wrapper below, so no existing behaviour changes.
+static int xhci_send_command_to(xhci_controller_t *xhc, xhci_trb_t *cmd,
+                                uint32_t timeout_ms) {
+    // #134: everything from the ring enqueue to consuming g_cmd_cc is ONE
+    // critical section. See the block comment above.
+    if (xhci_cmd_lock() < 0) {
+        kprintf("[xHCI] command declined: ring busy and this context cannot wait\n");
+        return -1;
+    }
+
     xhci_trb_t *trb = xhci_ring_enqueue(&xhc->cmd_ring);
-    if (!trb) { kprintf("[xHCI] command ring enqueue failed\n"); return -1; }
+    if (!trb) {
+        kprintf("[xHCI] command ring enqueue failed\n");
+        xhci_cmd_unlock();
+        return -1;
+    }
 
     // Copy command TRB
     trb->parameter = cmd->parameter;
@@ -436,7 +969,7 @@ static int xhci_send_command(xhci_controller_t *xhc, xhci_trb_t *cmd) {
     // Wait for command completion event. Record the outcome for the on-screen
     // diagnostics: xhci_wait_for_event returns -1 uniquely on TIMEOUT (no
     // completion event ever seen), -cc on a real command error, or CC_SUCCESS.
-    int r = xhci_wait_for_event(xhc, TRB_COMMAND_COMPLETION, 5000);
+    int r = xhci_wait_for_event(xhc, TRB_COMMAND_COMPLETION, timeout_ms);
     if (r == -1) {
         g_xhci_last_cmd_timeout = 1;
         g_xhci_last_cmd_cc = 0;
@@ -447,7 +980,12 @@ static int xhci_send_command(xhci_controller_t *xhc, xhci_trb_t *cmd) {
         g_xhci_last_cmd_timeout = 0;
         g_xhci_last_cmd_cc = r;
     }
+    xhci_cmd_unlock();
     return r;
+}
+
+static int xhci_send_command(xhci_controller_t *xhc, xhci_trb_t *cmd) {
+    return xhci_send_command_to(xhc, cmd, 5000);
 }
 
 // =============================================================================
@@ -753,40 +1291,6 @@ int xhci_init(pci_device_t *pci) {
         }
     }
 
-    // #307: xHCI USBLEGSUP BIOS->OS ownership hand-off, BEFORE the reset.
-    // Extended capability list starts at (HCCPARAMS1 xECP)*4 from MMIO base.
-    // Cap id 1 = USB Legacy Support: set HC OS Owned (bit24), wait for HC BIOS
-    // Owned (bit16) to clear, then quiesce SMIs in USBLEGCTLSTS (next dword).
-    {
-        uint32_t hcc = xhci_cap_read32(xhc, XHCI_CAP_HCCPARAMS1);
-        uint32_t xecp = (hcc >> 16) & 0xffff;   // offset in 32-bit dwords
-        uint32_t guard = 0;
-        while (xecp && guard++ < 64) {
-            volatile uint32_t *cap = (volatile uint32_t *)(xhc->mmio_base + (xecp * 4));
-            uint32_t capval = *cap;
-            uint8_t capid = capval & 0xff;
-            if (capid == 1) { // USB Legacy Support Capability
-                if (capval & (1u << 16)) { // HC BIOS Owned Semaphore set
-                    *cap = capval | (1u << 24); // request HC OS Owned
-                    for (int i = 0; i < 100; i++) { // up to ~100ms
-                        if (!((*cap) & (1u << 16))) break;
-                        xhci_delay(1);
-                    }
-                    kprintf("[xHCI] BIOS->OS hand-off: LEGSUP now 0x%08x\n", *cap);
-                } else {
-                    kprintf("[xHCI] BIOS->OS hand-off: not BIOS-owned (LEGSUP 0x%08x)\n", capval);
-                }
-                // Disable all legacy SMIs, ack RW1C bits in USBLEGCTLSTS.
-                volatile uint32_t *ctlsts = cap + 1;
-                *ctlsts = (*ctlsts) & 0x7;  // clear SMI enables; keep low bits
-                break;
-            }
-            uint32_t next = (capval >> 8) & 0xff; // next ptr in dwords
-            if (!next) break;
-            xecp += next;
-        }
-    }
-
     // Get MMIO base address from BAR0
     uint64_t mmio_base = pci_get_bar_address(pci, 0);
     if (mmio_base == 0) {
@@ -833,6 +1337,11 @@ int xhci_init(pci_device_t *pci) {
 
     kprintf("[xHCI] 64-bit: %s, Context size: %u bytes\n",
             xhc->has_64bit ? "yes" : "no", xhc->context_size);
+
+    // #135: USBLEGSUP BIOS->OS hand-off. It MUST run here and not earlier: it
+    // needs xhc->mmio_base, which is only assigned from BAR0 above. It must also
+    // run BEFORE xhci_reset(), so the controller is ours before we reset it.
+    xhci_bios_handoff(xhc);
 
     // Reset controller
     if (xhci_reset(xhc) < 0) {
@@ -1202,8 +1711,17 @@ int xhci_process_event(xhci_controller_t *xhc, xhci_trb_t *event) {
             // the ring first can no longer steal a completion out from under it.
             if (slot >= 1 && slot <= XHCI_MAX_SLOTS && ep < XHCI_MAX_ENDPOINTS) {
                 g_xfer_residual[slot - 1][ep] = event->status & 0xFFFFFF;
+                // #139: stamp BEFORE publishing the completion code, so a HID
+                // poller that observes cc != 0 always reads a stamp belonging
+                // to THAT completion and never to the previous one.
+                g_xfer_done_us[slot - 1][ep] = (uint32_t)mono_us();
                 g_xfer_cc[slot - 1][ep] = cc ? cc : CC_SUCCESS;
             }
+            // #155: hand the SAME completion to a queued-depth driver, which
+            // cannot use the single cell above. See xhci_xfer_observer.
+            if (xhci_xfer_observer)
+                xhci_xfer_observer(slot, ep, (uint8_t)(cc ? cc : CC_SUCCESS),
+                                   event->status & 0xFFFFFF);
             xhci_iso_xfer_events++;   // #323: flow-control counter
             if (xhci_xfer_log) {
                 kprintf("[xHCI] Transfer event: slot %u, EP %u, CC=%s (%u)\n",
@@ -1247,12 +1765,50 @@ int xhci_process_event(xhci_controller_t *xhc, xhci_trb_t *event) {
 // on, into the shared g_xfer_cc / g_cmd_cc tables). This is the core of the
 // HID+MSC coexistence fix: completions are recorded per (slot,DCI) and per
 // command regardless of WHICH thread observes the event, so nothing is stolen.
+// #426 (ASUS unknown-silicon bring-up): the drain loop below used to have NO
+// iteration cap and NO deadline. Termination depended ENTIRELY on the
+// controller's cycle-bit discipline being correct: a controller that leaves
+// stale TRBs whose cycle bit matches across the whole segment, or a cycle_bit
+// this driver mis-tracked after an error, spins here forever. The loop is
+// reached from the MSI handler, from BOTH blocking waiters and from the
+// periodic drain worker, so on unfamiliar xHCI silicon it is the single
+// strongest hang candidate on the boot path, and this project's standing rule
+// (#426) is that every device poll is bounded.
+//
+// The cap is expressed in terms of the ring itself, so it cannot silently
+// become wrong if XHCI_RING_SIZE (or a future per-controller ring size)
+// changes, with a generous floor for the degenerate size==0 case. It is
+// UNREACHABLE in healthy operation: ERDP is advanced only AFTER the loop, so
+// within ONE call the controller may legitimately produce at most one full
+// segment of events (xhc->event_ring.size). Anything past 2x that means the
+// controller is re-using entries this driver has not released yet, which is
+// already an error, not a busy bus.
+#define XHCI_DRAIN_CAP_MULT   2u
+#define XHCI_DRAIN_CAP_FLOOR  512u
+// How many cap trips get the full loud treatment. A wedged controller can trip
+// on every single drain pass, and /USBLOG.TXT is written through the USB stack
+// itself, so an unbounded report would be its own denial of service.
+#define XHCI_DRAIN_CAP_REPORTS 8u
+
+static uint32_t g_xhci_drain_cap_hits = 0;   // total trips, all controllers
+static uint32_t g_xhci_drain_cap_reported = 0;
+// Snapshot of the most recent trip, published for the deferred (blocking-safe)
+// /USBLOG.TXT write below. Written under the event-ring lock, read after it.
+static uint32_t g_xhci_drain_cap_pending = 0;
+static int      g_xhci_drain_cap_ctrl = 0;
+static uint32_t g_xhci_drain_cap_deq = 0;
+static uint32_t g_xhci_drain_cap_cyc = 0;
+static uint32_t g_xhci_drain_cap_cnt = 0;
+
 static void xhci_drain_events(xhci_controller_t *xhc) {
     if (!xhci_evt_trylock()) return;
 
     uint32_t ir_offset = XHCI_RT_IR0;
     xhci_trb_t *event = &xhc->event_ring.trbs[xhc->event_ring.dequeue_idx];
     int processed = 0;
+    uint32_t drained = 0;
+    uint32_t drain_cap = xhc->event_ring.size * XHCI_DRAIN_CAP_MULT;
+    if (drain_cap < XHCI_DRAIN_CAP_FLOOR) drain_cap = XHCI_DRAIN_CAP_FLOOR;
 
     while ((event->control & TRB_CYCLE) == xhc->event_ring.cycle_bit) {
         xhci_process_event(xhc, event);
@@ -1265,6 +1821,28 @@ static void xhci_drain_events(xhci_controller_t *xhc) {
             xhc->event_ring.cycle_bit ^= 1;
         }
         event = &xhc->event_ring.trbs[xhc->event_ring.dequeue_idx];
+
+        if (++drained >= drain_cap) {
+            // Do NOT return silently: a silent bail here would turn a broken
+            // controller into an unexplained "USB is slow / no storage found".
+            // kprintf only at this point - we may be inside the MSI handler AND
+            // we still hold the event-ring lock, and usblog_write() flushes
+            // through the FAT/block layer, which on a USB-root box means
+            // issuing xHCI transfers. Doing that from here would re-enter the
+            // drainer with its lock held and hang. The on-disk line is written
+            // after the unlock, and only from a context that may block.
+            g_xhci_drain_cap_hits++;
+            g_xhci_drain_cap_ctrl = (int)(xhc - xhci_controllers);
+            g_xhci_drain_cap_deq  = xhc->event_ring.dequeue_idx;
+            g_xhci_drain_cap_cyc  = xhc->event_ring.cycle_bit;
+            g_xhci_drain_cap_cnt  = drained;
+            g_xhci_drain_cap_pending = 1;
+            kprintf("[xHCI] BUG: event drain hit cap %u (ctrl=%d deq=%u cycle=%u) "
+                    "- possible stale cycle bit\n",
+                    drained, g_xhci_drain_cap_ctrl,
+                    xhc->event_ring.dequeue_idx, xhc->event_ring.cycle_bit);
+            break;
+        }
     }
 
     if (processed) {
@@ -1276,6 +1854,26 @@ static void xhci_drain_events(xhci_controller_t *xhc) {
     }
 
     xhci_evt_unlock();
+
+    // #426: the durable half of the cap report. The lock is released, so
+    // usblog_write() may re-enter the drainer through the block layer, and
+    // wq_may_block() (sync/noblock.h - the ONE canonical definition of "may
+    // this context sleep", which xhci_may_block() below is an alias of) keeps
+    // us out of ISR / pre-scheduler / interrupts-off contexts entirely. On a
+    // stick-booted machine with no serial port, /USBLOG.TXT is the only place
+    // this evidence can survive, which is exactly what made the iMac's USB
+    // failure readable.
+    if (g_xhci_drain_cap_pending && wq_may_block()) {
+        g_xhci_drain_cap_pending = 0;
+        if (g_xhci_drain_cap_reported < XHCI_DRAIN_CAP_REPORTS) {
+            g_xhci_drain_cap_reported++;
+            usblog_write("[xHCI] BUG: event drain hit cap %u (ctrl=%d deq=%u "
+                         "cycle=%u) - possible stale cycle bit; trips=%u",
+                         g_xhci_drain_cap_cnt, g_xhci_drain_cap_ctrl,
+                         g_xhci_drain_cap_deq, g_xhci_drain_cap_cyc,
+                         g_xhci_drain_cap_hits);
+        }
+    }
 
     // #614: wake anybody blocked waiting for a completion. Unconditional (not
     // only when `processed`), exactly as hda_service_stream() wakes
@@ -1619,6 +2217,41 @@ int xhci_enable_slot(xhci_controller_t *xhc) {
 }
 
 int xhci_disable_slot(xhci_controller_t *xhc, int slot_id) {
+    // #134: A DISABLED SLOT NUMBER IS IMMEDIATELY REUSABLE, AND THE HID TABLE
+    // IS KEYED ON SLOT NUMBER. Before 40f51ce nothing in this kernel ever
+    // disabled a slot at runtime, so slot ids only ever climbed (the 1902
+    // hardware capture shows exactly that: 1,4,5,6,7,8,9 across replugs) and a
+    // stale hid_devices[] entry could only ever be inert. Adding a teardown
+    // created slot REUSE, and with it a new failure mode: an entry still
+    // holding a recycled slot id makes the HID poll worker submit a Normal TRB
+    // onto - and clear the completion byte of - whatever device now owns that
+    // slot. A boot keyboard's interrupt-IN is DCI 3 and a USB mass-storage
+    // device's bulk-IN is usually DCI 3 as well, and on this machine that MSC
+    // device is the root filesystem.
+    //
+    // xhci_teardown_port_slots() does call usb_hid_detach_slot() first, but it
+    // is keyed on g_slot_root_port[], which is written at exactly one site: any
+    // HID slot that never passed through it is never released, and blame.md
+    // records a real capture with no teardown line at all. A guard at one
+    // caller is not an invariant. Releasing here, at the ONE place a slot is
+    // freed, makes "no HID entry ever names a freed slot" true by construction
+    // for every present and future caller. It is a no-op for a slot with no HID
+    // entries, which is every non-HID caller of this function.
+    usb_hid_detach_slot(xhc, slot_id);
+
+    // #134 (2026-08-18): and the SAME argument applies to g_slot_root_port[].
+    // It is the only record of which root port a slot hangs off, it is written
+    // at exactly one site (xhci_address_device_ex) and it was cleared at
+    // exactly one site (xhci_teardown_port_slots). Every OTHER disable - the
+    // three enumeration-failure paths and the hub path - left the entry naming
+    // a port for a slot that no longer exists. That stale entry is now
+    // load-bearing: xhci_port_has_live_slot() uses this table to decide whether
+    // a port marked "enumerated" really has a device, so a lie here would
+    // become a port that can never be re-enumerated. Clear it at the ONE place
+    // a slot is freed and it holds for every present and future caller.
+    if (slot_id >= 1 && slot_id <= XHCI_MAX_SLOTS)
+        g_slot_root_port[slot_id - 1] = 0;
+
     xhci_trb_t cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.control = XHCI_TRB_TYPE(TRB_DISABLE_SLOT) | ((slot_id & 0xFF) << 24);
@@ -1710,6 +2343,12 @@ static int xhci_address_device_ex(xhci_controller_t *xhc, int slot_id,
     slot_ctx->speed = speed;
     slot_ctx->context_entries = 1;  // Only EP0 for now
     slot_ctx->root_hub_port = root_hub_port + 1;
+    // #134: remember which ROOT port this slot hangs off. The re-scan worker
+    // needs it to know WHICH slots died when a port goes empty; without it the
+    // driver had no way to associate a disconnect with the resources it had to
+    // release, which is why nothing was ever released.
+    if (slot_id >= 1 && slot_id <= XHCI_MAX_SLOTS)
+        g_slot_root_port[slot_id - 1] = (int16_t)(root_hub_port + 1);
     // #373: TT fields for a Low/Full-Speed device behind a High-Speed hub.
     if (tt_hub_slot > 0) {
         slot_ctx->tt_hub_slot = tt_hub_slot & 0xFF;
@@ -1867,7 +2506,14 @@ int xhci_control_transfer_to(xhci_controller_t *xhc, int slot_id,
     xhci_ring_doorbell(xhc, slot_id, 1);  // EP0 = doorbell target 1
 
     // Wait for completion (race-free, keyed by slot + DCI 1), bounded timeout.
-    return xhci_wait_transfer(xhc, slot_id, 1, timeout_ms);
+    // #62: a FAILED control transfer must not be left behind. See
+    // xhci_recover_control_endpoint() for why returning here without cleaning
+    // up made one quiet device cost 5 seconds PER SUBSEQUENT REQUEST forever.
+    int cc = xhci_wait_transfer(xhc, slot_id, 1, timeout_ms);
+#ifndef XHCI_EPTEST_NORECOVER
+    if (cc < 0) xhci_recover_control_endpoint(xhc, slot_id, cc);
+#endif
+    return cc;
 }
 
 // Public control transfer: standard device enumeration, generous 5s timeout.
@@ -1998,7 +2644,7 @@ int xhci_root_port_info(xhci_controller_t *xhc, int port,
 // handled separately by uac_probe (it manages its own config + iso EP).
 extern int usb_hid_attach(xhci_controller_t *xhc, int slot_id, int iface_num,
                           int ep_in, int ep_in_mps, int b_interval, int speed,
-                          uint8_t subclass, uint8_t protocol);
+                          uint8_t subclass, uint8_t protocol, int rd_len);
 extern int usb_msc_enumerate(xhci_controller_t *xhc, int slot_id, int interface_num,
                              int bulk_in_ep, int bulk_out_ep,
                              int max_packet_in, int max_packet_out);
@@ -2069,7 +2715,13 @@ void xhci_usblog_device(int slot_id, int speed, uint16_t vid, uint16_t pid,
                          eaddr, (eaddr & 0x80) ? "IN " : "OUT",
                          usblog_ep_type(eattr), emps, eintv);
         } else if (btype == 0x21) {                // HID descriptor
-            usblog_write("    (HID class descriptor, %d bytes)", blen);
+            // #162: report the wDescriptorLength too. "HID class descriptor,
+            // 9 bytes" said nothing useful; the interesting number is how big
+            // the REPORT descriptor is, because that is the one we fetch.
+            int rl = (blen >= 9 && cfg[i + 6] == 0x22)
+                         ? (cfg[i + 7] | (cfg[i + 8] << 8)) : 0;
+            usblog_write("    (HID class descriptor, %d bytes; report descriptor "
+                         "%d bytes)", blen, rl);
         }
         i += blen;
     }
@@ -2111,12 +2763,28 @@ static void xhci_attach_class_drivers(xhci_controller_t *xhc, int slot_id,
             int ep_int_in = -1, ep_int_in_mps = 0, ep_int_interval = 0;
             int ep_bulk_in = -1, ep_bulk_in_mps = 0;
             int ep_bulk_out = -1, ep_bulk_out_mps = 0;
+            // #162: wDescriptorLength of this interface's REPORT descriptor,
+            // taken from its HID class descriptor (bDescriptorType 0x21). This
+            // walk already SAW that descriptor and logged only its length in
+            // bytes; the field inside it is what lets us ask the device for the
+            // report descriptor, which is the only trustworthy statement of
+            // what an interface actually sends. 0 = no HID class descriptor.
+            int hid_rd_len = 0;
             int j = i + blen;
             while (j + 2 <= total) {
                 int elen = cfg[j];
                 int etype = cfg[j + 1];
                 if (elen < 2 || j + elen > total) break;
                 if (etype == 0x04) break;              // next interface
+                if (etype == 0x21 && elen >= 9) {      // #162: HID class descriptor
+                    // bLength, bDescriptorType(0x21), bcdHID(2), bCountryCode,
+                    // bNumDescriptors, bDescriptorType, wDescriptorLength(2).
+                    // Only the FIRST subordinate descriptor is read, and only
+                    // when it is type 0x22 (Report); an optional Physical
+                    // descriptor is not something we ask for.
+                    if (cfg[j + 6] == 0x22)
+                        hid_rd_len = cfg[j + 7] | (cfg[j + 8] << 8);
+                }
                 if (etype == 0x05 && elen >= 7) {      // ENDPOINT
                     int eaddr = cfg[j + 2];
                     int eattr = cfg[j + 3] & 0x03;
@@ -2180,9 +2848,24 @@ static void xhci_attach_class_drivers(xhci_controller_t *xhc, int slot_id,
                                  slot_id, iface_num, ep_int_in,
                                  cfg_dci >= 0 ? "OK" : "FAILED", cfg_dci);
                     if (cfg_dci >= 0) {
-                        usb_hid_attach(xhc, slot_id, iface_num, ep_int_in,
+                        // #135: CHECK THE RETURN. This call ignored it, so every
+                        // reason usb_hid_attach() can refuse a bind was invisible
+                        // at the call site; the owner's capture shows slot 9
+                        // logging CONFIG_EP OK for both interfaces and then simply
+                        // nothing, with input dead and no diagnostic. A refusal is
+                        // now stated here as well, on the PERSISTENT log, whatever
+                        // the reason inside the HID layer turns out to be.
+                        int hid_rc = usb_hid_attach(xhc, slot_id, iface_num, ep_int_in,
                                        ep_int_in_mps, ep_int_interval, speed,
-                                       (uint8_t)isub, (uint8_t)iproto);
+                                       (uint8_t)isub, (uint8_t)iproto, hid_rd_len);
+                        if (hid_rc < 0) {
+                            kprintf("[xHCI]   slot %d HID iface %d: usb_hid_attach "
+                                    "REFUSED (rc=%d)\n", slot_id, iface_num, hid_rc);
+                            bootlog_write("[xHCI] *** slot %d HID iface %d: "
+                                          "usb_hid_attach REFUSED the bind (rc=%d) - "
+                                          "THIS INPUT DEVICE WILL NOT WORK ***",
+                                          slot_id, iface_num, hid_rc);
+                        }
                     } else {
                         kprintf("[xHCI]   slot %d HID iface %d: interrupt-IN EP config "
                                 "FAILED after retries; NOT attaching dead endpoint\n",
@@ -2425,6 +3108,27 @@ static void xhci_probe_device(xhci_controller_t *xhc, int slot_id, int speed,
     bootlog_write("[xHCI] %s slot %d: %04x:%04x class 0x%02x sub 0x%02x proto 0x%02x speed %s mps0 %u",
                   label, slot_id, vid, pid, desc[4], desc[5], desc[6],
                   xhci_speed_name(speed), mps0);
+
+    // #135: SAME-DEVICE RECOGNITION across a root-port flap. The captured iMac
+    // log re-enumerated one keyboard into slots 3, 7, 8 and 9 and never once said
+    // it was the same physical device; you had to notice the repeated 05ac:024f
+    // by eye. Say it, and say what it cost.
+    {
+        int rp = (slot_id >= 1 && slot_id <= XHCI_MAX_SLOTS)
+                     ? (int)g_slot_root_port[slot_id - 1] : 0;
+        if (rp >= 1 && rp <= 256) {
+            int ci = xhci_ctrl_index(xhc);
+            uint32_t id = ((uint32_t)vid << 16) | (uint32_t)pid;
+            if (g_port_flaps[ci][rp - 1] &&
+                g_port_last_devid[ci][rp - 1] == id) {
+                bootlog_write("[PORTFLAP] port %d: the SAME device %04x:%04x is back "
+                              "after flap #%u - it was never unplugged; slot %d and a "
+                              "fresh set of HID entries have been spent on it",
+                              rp, vid, pid, g_port_flaps[ci][rp - 1], slot_id);
+            }
+            g_port_last_devid[ci][rp - 1] = id;
+        }
+    }
 
     // Read the configuration descriptor: 9 bytes for wTotalLength, then full.
     static uint8_t cfg[512] __attribute__((aligned(64)));
@@ -3263,17 +3967,58 @@ int xhci_configure_endpoint_ep(xhci_controller_t *xhc, int slot_id,
             // High/Super speed: xHCI Interval = bInterval - 1 (1..16 -> 0..15).
             xiv = b_interval - 1;
         } else {
-            // Full/Low speed: bInterval is in 1ms frames; convert to the
-            // 125us-based log2 interval (1ms == 8 microframes -> Interval 3).
+            // #139 ROOT CAUSE OF THE MOUSE LAG. Full/Low speed: bInterval is in
+            // 1 ms frames, and the xHCI Endpoint Context Interval field is an
+            // EXPONENT of 125 us microframes, so the encoding (xHCI 1.2 table
+            // 6-12, and Linux xhci_parse_frame_interval) is
+            //     Interval = floor(log2(bInterval * 8))
+            // which for bInterval = 1 ms is 3, exactly as the comment here has
+            // always said. The loop below already computes that value. The
+            // `xiv += 3` that used to follow it applied the "+3" A SECOND TIME,
+            // so every full-speed and low-speed interrupt endpoint in the
+            // kernel was programmed with an interval EIGHT TIMES the period the
+            // device asked for, and the controller polled it eight times too
+            // slowly. Nothing failed: the endpoint worked perfectly, just at
+            // 1/8 the rate, which is why this survived so long.
+            //
+            // MEASURED on a VM with TWO otherwise identical QEMU USB mice on
+            // the SAME xHCI, one forced Full-Speed (bInterval 10, this branch)
+            // and one High-Speed (bInterval 7, the branch above), driven with
+            // continuous motion (see the [HIDLAT] lines in /BOOTLOG.TXT):
+            //     full-speed, before this fix : reports every 63.9 ms  (15.6/s)
+            //     high-speed, same boot       : reports every  8.2 ms  ( 122/s)
+            //     full-speed, after this fix  : reports every  8.3 ms  ( 121/s)
+            // The owner's iMac14,4 keyboard AND mouse both enumerate FULL-SPEED
+            // (blame.md, #62/#135 captures: "P4 slot 7: 05ac:024f ...
+            // Full-Speed (12 Mbps)"), and the Apple mouse reports bInterval=10,
+            // so this branch is the one his hardware takes. It also explains the
+            // #133 asymmetry: at ~15 Hz a KEYBOARD still feels perfect, because
+            // keystrokes are discrete events tens of milliseconds apart, while
+            // a pointer sampled 15 times a second is exactly "laggy and
+            // jittery". Same controller, same driver, different perception of
+            // the same defect.
             int frames = b_interval > 0 ? b_interval : 1;
             int microframes = frames * 8;
             xiv = 0;
             while ((1 << (xiv + 1)) <= microframes && xiv < 15) xiv++;
-            xiv += 3;
+            // xHCI 1.2 6.2.3.6 restricts LS/FS interrupt endpoints to 3..10
+            // (1 ms .. 128 ms). The formula above already lands in that range
+            // for every legal bInterval (1..255 frames); clamp so a malformed
+            // descriptor cannot program something the controller will reject.
+            if (xiv < 3) xiv = 3;
+            if (xiv > 10) xiv = 10;
         }
         if (xiv < 0) xiv = 0;
         if (xiv > 15) xiv = 15;
         ep->interval = xiv;
+        // #139: record what was actually programmed. The interval is invisible
+        // in every existing log, so an eight-fold error in it presented only as
+        // "the mouse feels laggy" and could not be checked from a capture. The
+        // owner's machine has no serial console, so this has to reach the
+        // persistent log to be worth anything (blame.md #135).
+        bootlog_write("[xHCI] slot %d DCI %d: interrupt EP 0x%02x bInterval %d "
+                      "speed %d -> xHCI Interval %d (%d us period)",
+                      slot_id, dci, ep_addr, b_interval, speed, xiv, 125 << xiv);
         ep->max_esit_lo = max_packet & 0xFFFF;
         ep->max_esit_hi = 0;
     }
@@ -3378,6 +4123,189 @@ int xhci_int_in_submit(xhci_controller_t *xhc, int slot_id, int dci,
     return 0;
 }
 
+// =============================================================================
+// #133/#134: xHCI endpoint HALT recovery
+// =============================================================================
+// Per xHCI 4.10.2.1 an endpoint whose transfer completes with Stall, USB
+// Transaction Error, Babble Detected or Data Buffer Error is left in the HALTED
+// state, where it executes nothing and ignores every doorbell. Recovering it is
+// a two-command sequence. Until now this driver issued NEITHER: TRB_RESET_EP and
+// TRB_SET_TR_DEQUEUE were #defined in xhci.h and had ZERO callers anywhere in
+// the kernel, so the FIRST transfer error on any endpoint killed it until the
+// next reboot. That is the mechanism behind a USB mouse that works and then
+// stops while the keyboard (a different endpoint) carries on.
+
+// EP0's transfer ring is stored at transfer_rings[slot-1][0] while its DCI is 1
+// (xhci_control_transfer_to and xhci_address_device both index [0]). Every other
+// endpoint is stored at its own DCI. Getting this wrong is silent: DCI 1 is
+// never populated, so a recovery keyed on [1] would find NULL, do nothing, and
+// report success-shaped failure. #62.
+static xhci_ring_t *xhci_ring_for_dci(xhci_controller_t *xhc, int slot_id, int dci) {
+    if (!xhc || slot_id < 1 || slot_id > (int)xhc->max_slots) return 0;
+    if (dci < 1 || dci >= XHCI_MAX_ENDPOINTS) return 0;
+    return xhc->transfer_rings[slot_id - 1][dci == 1 ? 0 : dci];
+}
+
+// Running/Stopped -> Stopped. Per xHCI 4.6.9 this is the command that aborts a
+// TD that is still pending, which is the state a TIMED-OUT transfer leaves the
+// endpoint in. Reset Endpoint (below) is only legal from Halted and answers
+// Context State Error otherwise, so the two are not interchangeable.
+int xhci_stop_endpoint(xhci_controller_t *xhc, int slot_id, int dci) {
+    if (!xhc || slot_id < 1 || slot_id > (int)xhc->max_slots) return -1;
+    if (dci < 1 || dci >= XHCI_MAX_ENDPOINTS) return -1;
+    xhci_trb_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.control = XHCI_TRB_TYPE(TRB_STOP_EP) |
+                  ((uint32_t)(slot_id & 0xFF) << 24) |
+                  ((uint32_t)(dci & 0x1F) << 16);
+    return xhci_send_command_to(xhc, &cmd, XHCI_RECOVER_CMD_MS);
+}
+
+// Halted -> Stopped.
+int xhci_reset_endpoint(xhci_controller_t *xhc, int slot_id, int dci) {
+    if (!xhc || slot_id < 1 || slot_id > (int)xhc->max_slots) return -1;
+    if (dci < 1 || dci >= XHCI_MAX_ENDPOINTS) return -1;
+    xhci_trb_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    cmd.control = XHCI_TRB_TYPE(TRB_RESET_EP) |
+                  ((uint32_t)(slot_id & 0xFF) << 24) |
+                  ((uint32_t)(dci & 0x1F) << 16);
+    return xhci_send_command_to(xhc, &cmd, XHCI_RECOVER_CMD_MS);
+}
+
+// Discard the aborted TD and restart the transfer ring from a known-clean state.
+// The ring is rewound to index 0 with cycle 1 (exactly what xhci_ring_init would
+// leave), and the controller's dequeue pointer is set to match, so producer and
+// consumer agree again. Doing only the Reset Endpoint would leave the controller
+// pointing mid-TD at the transfer that failed.
+int xhci_set_tr_dequeue(xhci_controller_t *xhc, int slot_id, int dci) {
+    if (!xhc || slot_id < 1 || slot_id > (int)xhc->max_slots) return -1;
+    if (dci < 1 || dci >= XHCI_MAX_ENDPOINTS) return -1;
+    xhci_ring_t *ring = xhci_ring_for_dci(xhc, slot_id, dci);
+    if (!ring || ring->size == 0) return -1;
+    if (ring->phys_addr < 0x1000ULL || ring->phys_addr >= 0x80000000ULL) return -1;
+
+    ring->trbs = (xhci_trb_t *)ring->phys_addr;
+    ring->enqueue_idx = 0;
+    ring->dequeue_idx = 0;
+    ring->cycle_bit   = 1;
+    memset(ring->trbs, 0, ring->size * sizeof(xhci_trb_t));
+    xhci_trb_t *link = &ring->trbs[ring->size - 1];
+    link->parameter = ring->phys_addr;
+    link->status    = 0;
+    link->control   = XHCI_TRB_TYPE(TRB_LINK) | TRB_CYCLE | (1 << 1);  // toggle
+    __asm__ volatile("mfence" ::: "memory");
+
+    xhci_trb_t cmd;
+    memset(&cmd, 0, sizeof(cmd));
+    // Dequeue Cycle State must match the ring's producer cycle bit (1 above).
+    cmd.parameter = (ring->phys_addr & ~0xFULL) | 1ULL;
+    cmd.control = XHCI_TRB_TYPE(TRB_SET_TR_DEQUEUE) |
+                  ((uint32_t)(slot_id & 0xFF) << 24) |
+                  ((uint32_t)(dci & 0x1F) << 16);
+    return xhci_send_command_to(xhc, &cmd, XHCI_RECOVER_CMD_MS);
+}
+
+// #133: clear a DEVICE-side endpoint halt (USB 2.0 9.4.1
+// CLEAR_FEATURE(ENDPOINT_HALT), bmRequestType 0x02 to the endpoint). Identical
+// in shape to usb_msc_clear_stall(), which has done exactly this for bulk
+// endpoints since the MSC driver was written; the interrupt-IN path never had
+// it, so a STALLED HID endpoint could be Reset Endpoint'ed on the HOST side for
+// ever while the DEVICE kept its halt feature set and stalled the very next
+// transaction. BLOCKS (a control transfer), so this belongs on the re-scan
+// worker, never on the HID poll worker where it would freeze all input for the
+// duration of the request.
+int xhci_clear_endpoint_halt(xhci_controller_t *xhc, int slot_id, int ep_addr) {
+    if (!xhc || slot_id < 1) return -1;
+    return xhci_control_transfer_to(xhc, slot_id,
+        0x02,           // bmRequestType: Host->Device, Standard, Endpoint
+        0x01,           // bRequest: CLEAR_FEATURE
+        0x00,           // wValue: ENDPOINT_HALT
+        ep_addr,        // wIndex: endpoint address, direction bit included
+        NULL, 0, 250);
+}
+
+// #62: recover the CONTROL endpoint (DCI 1) after a control transfer that
+// failed, so the failure costs one budget instead of every budget from now on.
+//
+// MEASURED on the owner's iMac14,4 (build 1904, /BOOTLOG.TXT): 17 "Transfer
+// wait TIMEOUT ... 5000ms budget; 5006ms real" lines in ONE boot, 13 of them on
+// slot 1 DCI 1 - the AX88772 USB-Ethernet dongle's control endpoint - which is
+// ~85 SECONDS of blocking. That is not 13 independent faults. xhci_wait_transfer
+// returned -1 and NOTHING cleaned up: the aborted TD stayed on the EP0 ring, the
+// endpoint was left Stopped or Halted (xHCI 4.10.2.1: an endpoint that halts
+// executes nothing and ignores every doorbell), and every later request queued
+// TRBs behind it that could never run. So request #2 onward were GUARANTEED to
+// burn their full budget. One quiet device poisoned its own control endpoint for
+// the rest of the boot, and the ASIX link poller re-triggered it every second.
+//
+// xhci_recover_endpoint() already existed for exactly this (#133/#134) but had
+// ONE caller, the HID interrupt-IN poll path (usb_hid.c). The control path -
+// every enumeration request, every hub class request, every vendor register
+// access - had none.
+//
+// wait_rc is xhci_wait_transfer's return value, whose contract is: -1 uniquely
+// means TIMEOUT (no completion event at all, TD still pending, endpoint Running
+// or Stopped), any other negative value is -cc for a real error completion
+// (Stall / Transaction Error / Babble / Data Buffer Error), which per spec
+// leaves the endpoint HALTED. The two states need different commands and Reset
+// Endpoint answers Context State Error from a non-halted endpoint, so we try the
+// state-appropriate command first and fall back to the other rather than
+// guessing. Either way the ring is then rewound with Set TR Dequeue.
+int xhci_recover_control_endpoint(xhci_controller_t *xhc, int slot_id, int wait_rc) {
+    if (!xhci_ring_for_dci(xhc, slot_id, 1)) return -1;
+    int timed_out = (wait_rc == -1);
+    int ok;
+    if (timed_out) {
+        ok = (xhci_stop_endpoint(xhc, slot_id, 1) >= 0) ||
+             (xhci_reset_endpoint(xhc, slot_id, 1) >= 0);
+    } else {
+        ok = (xhci_reset_endpoint(xhc, slot_id, 1) >= 0) ||
+             (xhci_stop_endpoint(xhc, slot_id, 1) >= 0);
+    }
+    int deq = xhci_set_tr_dequeue(xhc, slot_id, 1);
+    g_xfer_cc[slot_id - 1][1] = 0;
+    g_xfer_residual[slot_id - 1][1] = 0;
+    // Rate-limited: the whole point is that this stops repeating, so a line per
+    // event is affordable for the first few and pure noise after that.
+    static uint32_t diag = 0;
+    if (diag < 12) {
+        diag++;
+        bootlog_write("[xHCI] slot %d DCI 1 (control): %s recovery %s/%s (#62)",
+                      slot_id, timed_out ? "timeout" : "error",
+                      ok ? "ep-ok" : "ep-FAIL", (deq >= 0) ? "deq-ok" : "deq-FAIL");
+    }
+    return (ok && deq >= 0) ? 0 : -1;
+}
+
+// Full recovery: reset, restart the ring, and drop any stale completion so the
+// caller's next poll cannot consume the error a second time. The caller re-arms.
+int xhci_recover_endpoint(xhci_controller_t *xhc, int slot_id, int dci) {
+    if (xhci_reset_endpoint(xhc, slot_id, dci) < 0) {
+        bootlog_write("[xHCI] slot %d DCI %d: Reset Endpoint FAILED", slot_id, dci);
+        return -1;
+    }
+    if (xhci_set_tr_dequeue(xhc, slot_id, dci) < 0) {
+        bootlog_write("[xHCI] slot %d DCI %d: Set TR Dequeue FAILED", slot_id, dci);
+        return -1;
+    }
+    g_xfer_cc[slot_id - 1][dci] = 0;
+    g_xfer_residual[slot_id - 1][dci] = 0;
+    bootlog_write("[xHCI] slot %d DCI %d: endpoint halt recovered "
+                  "(Reset Endpoint + Set TR Dequeue)", slot_id, dci);
+    return 0;
+}
+
+// #139: has a drainer already recorded an unconsumed completion for this
+// endpoint? A pure read of the completion byte: no drain, no lock, no side
+// effect, so it is legal as a wait-queue condition (which is evaluated with
+// interrupts off inside the wait macro, where draining would not be).
+int xhci_xfer_pending(int slot_id, int dci) {
+    if (slot_id < 1 || slot_id > XHCI_MAX_SLOTS) return 0;
+    if (dci < 0 || dci >= XHCI_MAX_ENDPOINTS) return 0;
+    return g_xfer_cc[slot_id - 1][dci] != 0;
+}
+
 // Returns 1 and sets *out_len (bytes actually transferred) if the outstanding
 // interrupt-IN TD completed, 0 if still pending, -1 on error/stall.
 int xhci_int_in_poll(xhci_controller_t *xhc, int slot_id, int dci, uint32_t *out_len,
@@ -3388,7 +4316,11 @@ int xhci_int_in_poll(xhci_controller_t *xhc, int slot_id, int dci, uint32_t *out
     uint8_t cc = g_xfer_cc[slot_id - 1][dci];
     if (cc == 0) return 0;                 // nothing yet
     g_xfer_cc[slot_id - 1][dci] = 0;       // consume
-    if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) return -1;
+    if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) {
+        g_xfer_last_err[slot_id - 1][dci] = cc;   // #133: keep the REASON
+        return -1;
+    }
+    g_xfer_last_err[slot_id - 1][dci] = 0;
     if (out_len) {
         uint32_t resid = g_xfer_residual[slot_id - 1][dci];
         *out_len = (resid <= submitted_len) ? (submitted_len - resid) : submitted_len;
@@ -3426,21 +4358,417 @@ int xhci_get_controller_count(void) {
 // Returns the number of newly enumerated devices. This is called ONLY from the
 // dedicated re-scan worker thread below, never from a hot path / IRQ / the
 // compositor draw thread.
+// #134: release the resources of every HID slot that hung off a now-empty root
+// port. Before this, a disconnect cleared ONLY the "enumerated" flag: the xHCI
+// slot stayed enabled, its transfer rings stayed allocated, and above all the
+// hid_devices[] entries were never released. Since that table is capped and was
+// append-only, two replug cycles of a composite keyboard exhausted it and every
+// further HID attach was silently refused - a total, unrecoverable input lockout
+// on a machine with no serial and sshd=0 (the reported #134).
+//
+// DELIBERATELY LIMITED TO HID SLOTS. A disconnected MSC or network slot keeps
+// exactly its previous behaviour, so the USB-boot path cannot regress: the
+// golden boots its root filesystem off a USB mass-storage device on this very
+// controller, and that is not a thing to experiment with blind.
+//
+// The transfer-ring PAGES are intentionally not freed, only unlinked. The HID
+// poll worker runs concurrently at ~250 Hz and takes no lock, so freeing memory
+// it might be walking would trade a bounded, once-per-replug leak for a
+// use-after-free. Unlinking is enough to make the scarce resource (the
+// controller's device slots, 32 on this iMac) recyclable.
+//
+// #250 (2026-08-23): MASS STORAGE IS NOW TORN DOWN TOO, WITH THE BOOT DEVICE
+// EXPLICITLY EXCLUDED.
+//
+// The paragraph above is still the rule for the ROOT device and is now
+// enforced as a check rather than as a blanket exclusion. Leaving ALL MSC
+// slots alone had a consequence that only became visible once removable
+// volumes reached the UI: nothing ever called usb_msc_device_removed(), so
+// pulling a stick fired no REMOVED event, the hotplug manager never tore the
+// mount down, and the drive stayed in the Files sidebar and on the desktop
+// forever, pointing at a filesystem that is no longer there.
+//
+// THE BOOT MEDIUM IS SKIPPED BY IDENTITY, not by hoping it never disconnects:
+// blk_root_usb_index() names the exact USB MSC device the root filesystem is
+// served from, and that device's slot is left completely untouched. A spurious
+// disconnect on the boot port therefore behaves exactly as it did before this
+// change. Every other mass-storage slot is a data volume the user plugged in,
+// and the honest response to it going away is to say so.
+static int xhci_teardown_port_slots(xhci_controller_t *xhc, uint32_t port) {
+    int torn = 0;
+    for (int slot = 1; slot <= (int)xhc->max_slots && slot <= XHCI_MAX_SLOTS; slot++) {
+        if (g_slot_root_port[slot - 1] != (int16_t)(port + 1)) continue;
+
+        // #250: mass storage. Checked BEFORE the HID test because a slot is
+        // one or the other, and the MSC branch must not fall through to the
+        // HID one.
+        {
+            extern int usb_msc_find_device_by_slot(int slot_id);
+            extern void usb_msc_device_removed(int slot_id);
+            extern int blk_root_is_usb(void);
+            extern int blk_root_usb_index(void);
+            int mi = usb_msc_find_device_by_slot(slot);
+            if (mi >= 0) {
+                if (blk_root_is_usb() && mi == blk_root_usb_index()) {
+                    bootlog_write("[xHCI] re-scan: port %u disconnect: slot %d is the "
+                                  "BOOT medium (usb msc %d); NOT torn down",
+                                  port + 1, slot, mi);
+                    continue;
+                }
+                // Fires USB_MSC_EVENT_REMOVED, which is what makes
+                // drivers/hotplug.c unmount the volume, invalidate every open
+                // handle on it (mount generation) and drop it from the UI.
+                usb_msc_device_removed(slot);
+                for (int dci = 1; dci < XHCI_MAX_ENDPOINTS; dci++)
+                    xhc->transfer_rings[slot - 1][dci] = 0;   // unlink, do not free
+                xhci_disable_slot(xhc, slot);
+                g_slot_root_port[slot - 1] = 0;
+                torn++;
+                bootlog_write("[xHCI] re-scan: port %u disconnect: slot %d torn down "
+                              "(USB MSC device %d removed, slot disabled)",
+                              port + 1, slot, mi);
+                continue;
+            }
+        }
+
+        if (!usb_hid_slot_has_device(xhc, slot)) continue;   // HID slots only
+        usb_hid_detach_slot(xhc, slot);
+        for (int dci = 1; dci < XHCI_MAX_ENDPOINTS; dci++)
+            xhc->transfer_rings[slot - 1][dci] = 0;          // unlink, do not free
+        xhci_disable_slot(xhc, slot);
+        g_slot_root_port[slot - 1] = 0;   // unknown again
+        torn++;
+        bootlog_write("[xHCI] re-scan: port %u disconnect: slot %d torn down "
+                      "(HID entries released, slot disabled)", port + 1, slot);
+    }
+    return torn;
+}
+
+// #134 (2026-08-18): RE-ARM A ROOT PORT AFTER A CONFIRMED DISCONNECT.
+//
+// WHAT WAS ACTUALLY MISSING. The disconnect path cleared a SOFTWARE flag
+// (g_port_enumerated) and told the log it had "cleared for re-enum on replug".
+// It never touched the PORT. In particular it never acknowledged PORTSC's seven
+// RW1C change bits, which this file's own #135 comment states plainly: "The
+// change bits are RW1C and the re-scan never clears them". So after the first
+// disconnect CSC is stuck at 1 for the life of the boot, and per xHCI 1.1
+// 4.19.2 a change bit generates a Port Status Change Event only on a 0->1
+// TRANSITION. A port whose CSC is already 1 therefore reports NOTHING to the
+// event ring when a device is plugged back in. Today we poll CCS so we survive
+// that; the moment anyone wires hotplug to the event ring - which is the
+// obvious next step and how every other xHCI driver does it - the replug
+// becomes invisible, silently. It also destroys the diagnostic: every [PORTSC]
+// line after the first disconnect prints CSC=1 whether or not anything latched.
+//
+// THREE THINGS, in the order the spec requires:
+//   1. ACK every RW1C change bit, RW1C-safely (never write 1 to PED, which
+//      DISABLES the port, and never to PR/WPR/LWS). This is what makes the next
+//      attach a real 0->1 transition again.
+//   2. PORT POWER. A port with PP=0 cannot detect a connect at all, ever. The
+//      owner's capture had PP=1, so this is not what bit him, but "power was
+//      still on" was an OBSERVATION about one log, not an invariant, and the
+//      check costs one register read.
+//   3. LINK STATE. Inactive(6) and Compliance(10) are the two states a port can
+//      be parked in where the link is dead and a fresh attach is NOT reported
+//      until software recovers it. The recovery is a WARM port reset (WPR),
+//      which this driver has never issued. RxDetect(5) - what the owner's port
+//      was in - is the correct, connect-detecting idle state, so this branch
+//      does NOT fire for his capture and is not claimed as the fix for it.
+//
+// NOT A RESET ON EVERY DISCONNECT. A hot (PR) reset is NOT needed to OBSERVE a
+// connect on a USB2 root port: the USB2 root-hub port state machine (xHCI 1.1
+// 4.19.1.1) moves Disconnected -> Disabled in hardware on attach, setting CCS
+// and latching CSC. A reset is needed to get Disabled -> Enabled before any
+// transfer can run, and xhci_rescan_ports() already issues one immediately
+// before enumerating. That half was never missing.
+static void xhci_port_rearm_for_connect(xhci_controller_t *xhc, uint32_t port) {
+    const uint32_t clear_mask = XHCI_PORTSC_CHANGE_BITS | XHCI_PORTSC_PED |
+                                XHCI_PORTSC_PR | XHCI_PORTSC_WPR |
+                                XHCI_PORTSC_LWS;
+    uint32_t before = xhci_portsc_read(xhc, port);
+
+    // 1. Acknowledge every latched change bit.
+    xhci_portsc_write(xhc, port, (before & ~clear_mask) | XHCI_PORTSC_CHANGE_BITS);
+
+    uint32_t v = xhci_portsc_read(xhc, port);
+
+    // 2. Port power.
+    int repowered = 0;
+    if (!(v & XHCI_PORTSC_PP)) {
+        xhci_portsc_write(xhc, port, (v & ~clear_mask) | XHCI_PORTSC_PP);
+        for (int i = 0; i < 100; i++) xhci_delay(1);   // power-good + USB2 debounce
+        v = xhci_portsc_read(xhc, port);
+        repowered = 1;
+    }
+
+    // 3. Dead link states: warm reset.
+    int warm = 0;
+    uint32_t pls = (v & XHCI_PORTSC_PLS_MASK) >> 5;
+    if (pls == 6 || pls == 10) {
+        xhci_portsc_write(xhc, port, (v & ~clear_mask) | XHCI_PORTSC_WPR);
+        int t = 200;                                  // bounded, ~200 ms
+        while (t-- > 0) {
+            xhci_delay(1);
+            v = xhci_portsc_read(xhc, port);
+            if (v & XHCI_PORTSC_WRC) break;
+        }
+        v = xhci_portsc_read(xhc, port);
+        xhci_portsc_write(xhc, port, (v & ~clear_mask) | XHCI_PORTSC_CHANGE_BITS);
+        v = xhci_portsc_read(xhc, port);
+        warm = 1;
+    }
+
+    // The witness. Uncapped (once per confirmed disconnect, not per transition)
+    // and it prints the register BEFORE and AFTER, because "cleared for re-enum"
+    // was a sentence about an intention and this is a measurement.
+    bootlog_write("[xHCI] re-scan: port %u re-armed for connect: PORTSC %08x -> "
+                  "%08x; change bits ACKed%s%s; PP=%u PLS=%u(%s) CSC=%u. A new "
+                  "attach can now latch CSC 0->1.",
+                  port + 1, before, v,
+                  repowered ? "; port power RE-ASSERTED (was PP=0)" : "",
+                  warm ? "; WARM RESET issued (link was Inactive/Compliance)" : "",
+                  (v & XHCI_PORTSC_PP) ? 1 : 0,
+                  (v & XHCI_PORTSC_PLS_MASK) >> 5,
+                  xhci_pls_name((v & XHCI_PORTSC_PLS_MASK) >> 5),
+                  (v & XHCI_PORTSC_CSC) ? 1 : 0);
+
+    // Our own write is not a spontaneous transition: re-baseline the transition
+    // log so the NEXT [PORTSC] line is genuinely about the hardware.
+    {
+        int idx = xhci_ctrl_index(xhc);
+        g_portsc_prev[idx][port] = v;
+        g_portsc_prev_valid[idx][port] = 1;
+    }
+}
+
+// #134: does ANY device slot still claim this root port? This is the hardware-
+// backed answer to "is this port really enumerated", as opposed to the software
+// flag g_port_enumerated, which is only a belief. See the stale-flag self-heal
+// in xhci_rescan_ports().
+static int xhci_port_has_live_slot(xhci_controller_t *xhc, uint32_t port) {
+    for (int s = 1; s <= (int)xhc->max_slots && s <= XHCI_MAX_SLOTS; s++)
+        if (g_slot_root_port[s - 1] == (int16_t)(port + 1)) return 1;
+    return 0;
+}
+
+// #135: a port that has been confirmed-disconnected this many times is not
+// being replugged by a human; it is FLAPPING. Re-enumerating it every 3s burns a
+// controller device slot plus (for a composite keyboard) two hid_devices[]
+// entries per cycle and hammers the bus for a device that will drop again. After
+// the threshold, back off for a cooling period and SAY SO, so the failure is
+// diagnosable instead of merely expensive. A port that then stays up decays its
+// flap count back to zero, so a genuinely flaky cable that settles is forgiven.
+#define XHCI_FLAP_THRESHOLD       8
+#define XHCI_FLAP_COOLDOWN_SCANS 10   // ~30s at the 3000ms re-scan interval
+#define XHCI_FLAP_STABLE_SCANS   20   // ~60s connected+enumerated clears the count
+
+// #134: consecutive scans a CONNECTED port may read "enumerated" with no device
+// slot naming it before the flag is treated as stale. 3 scans ~ 9s.
+#define XHCI_ORPHAN_SCANS         3
+
+// =============================================================================
+// #134 (2026-08-18): THE RE-SCAN WORKER'S SILENCE MUST NEVER BE AMBIGUOUS AGAIN
+// =============================================================================
+//
+// THE DIAGNOSTIC GAP THAT COST THIS TICKET THREE SESSIONS. Every line this
+// worker emits is conditional on something having CHANGED. On the owner's
+// iMac14,4 capture (golden 1923) the last thing it ever said was
+// "port 4 disconnect: slot 3 torn down", after which the file runs another 110
+// lines from other subsystems and this worker says nothing at all - through a
+// physical replug. Two completely different faults produce that byte-for-byte:
+//
+//   (a) the worker is ALIVE and the hardware genuinely never reported a
+//       connect (a port/link/routing problem), or
+//   (b) the worker is STOPPED - wedged on a lock, or its CPU halted by a kernel
+//       fault, which on an SMP box leaves the machine perfectly usable (see
+//       blame.md, "A kernel PANIC can present as a HANG").
+//
+// Those need opposite fixes and nothing in the artifact separates them. So:
+// emit a line that is NOT conditional on anything. It carries a monotonically
+// increasing scan counter (so a stopped worker is visible as a counter that
+// stops), the monotonic clock, the RAW PORTSC of every root port (so the
+// hardware's own answer to "is anything plugged in" is in the artifact even
+// when nothing changed and even after the capped [PORTSC] transition log has
+// given up), the driver's enumerated-flag for each port, and the command-lock
+// contention counters.
+//
+// BUDGET, because #134 also had to fix a diagnostic that burned the log down:
+// one line per controller per XHCI_HB_SCANS scans, plus one FORCED line after
+// any teardown or stale-flag clear. At 20 scans that is one ~200-byte line per
+// minute, i.e. ~12 KB/hour, against a RAM buffer that now compacts what it has
+// already persisted. The per-event flap diagnostics stay capped as they are;
+// this one is deliberately periodic rather than per-event, which is what makes
+// it bounded no matter how badly a port misbehaves.
+#define XHCI_HB_SCANS 20              // ~60s at the 3000ms re-scan interval
+static uint64_t g_rescan_scans    = 0;
+static int      g_rescan_hb_force = 0;
+
+static void xhci_rescan_heartbeat(void) {
+    for (int i = 0; i < xhci_controller_count; i++) {
+        xhci_controller_t *xhc = &xhci_controllers[i];
+        if (!xhc->initialized) continue;
+        int idx = xhci_ctrl_index(xhc);
+        uint32_t n = xhc->max_ports;
+        if (n > 16) n = 16;            // keep the line bounded; count is printed
+        char ports[288];
+        int o = 0;
+        ports[0] = 0;
+        for (uint32_t p = 0; p < n; p++) {
+            if (o > (int)sizeof(ports) - 20) break;
+            uint32_t v = xhci_portsc_read(xhc, p);
+            int w = snprintf(ports + o, sizeof(ports) - (size_t)o, "%sp%u=%08x%c",
+                             o ? " " : "", p + 1, v,
+                             g_port_enumerated[idx][p] ? 'E' : '-');
+            if (w <= 0) break;
+            o += w;
+            if (o >= (int)sizeof(ports)) { o = (int)sizeof(ports) - 1; break; }
+        }
+        bootlog_write("[xHCI-HB] ctrl%d ALIVE scan#%lu t=%lums ports=%u "
+                      "cmd(contend=%lu,noblk=%lu) %s",
+                      i, (unsigned long)g_rescan_scans,
+                      (unsigned long)(mono_ready() ? mono_ms() : 0),
+                      xhc->max_ports,
+                      (unsigned long)g_xhci_cmd_contended,
+                      (unsigned long)g_xhci_cmd_noblock_refused,
+                      ports);
+    }
+}
+
 int xhci_rescan_ports(xhci_controller_t *xhc) {
     if (!xhc || !xhc->initialized) return 0;
     int idx = xhci_ctrl_index(xhc);
     int newly = 0;
-    for (uint32_t port = 0; port < xhc->max_ports; port++) {
-        int connected = xhci_port_is_connected(xhc, port);
+    uint32_t nports = xhc->max_ports;
+    if (nports > 256) nports = 256;
+    for (uint32_t port = 0; port < nports; port++) {
+        // #135: read PORTSC ONCE per port per scan and log it whenever it moves.
+        // This is the readout that has never existed: the re-scan previously
+        // consumed a single bit (CCS) of this register and threw the rest away,
+        // so the reason a still-plugged keyboard reads disconnected was not
+        // merely unknown, it was unrecorded.
+        uint32_t v = xhci_portsc_read(xhc, port);
+        int first = !g_portsc_prev_valid[idx][port];
+        if (first || v != g_portsc_prev[idx][port]) {
+            if (!first && ((v ^ g_portsc_prev[idx][port]) & XHCI_PORTSC_CCS)) {
+                xhci_portsc_log(xhc, port, g_portsc_prev[idx][port], "was");
+                xhci_portsc_log(xhc, port, v, "now CCS-CHANGED");
+                xhci_portctx_log(xhc, "on-CCS-change");
+            } else {
+                xhci_portsc_log(xhc, port, v, first ? "first-scan" : "changed");
+            }
+            g_portsc_prev[idx][port] = v;
+            g_portsc_prev_valid[idx][port] = 1;
+        }
+
+        int connected = (v & XHCI_PORTSC_CCS) ? 1 : 0;
         if (!connected) {
             if (g_port_enumerated[idx][port]) {
+                // #135: DEBOUNCE before believing it. One sample every 3 seconds
+                // is not a disconnect detector.
+                if (!xhci_port_disconnect_confirmed(xhc, port)) continue;
                 g_port_enumerated[idx][port] = 0;   // allow replug re-enumeration
-                bootlog_write("[xHCI] re-scan: port %u disconnected; cleared for "
-                              "re-enum on replug", port + 1);
+                g_port_stable[idx][port] = 0;
+                if (g_port_flaps[idx][port] < 0xffff) g_port_flaps[idx][port]++;
+                bootlog_write("[xHCI] re-scan: port %u disconnected (debounced over "
+                              "%dms, flap #%u); cleared for re-enum on replug",
+                              port + 1, XHCI_DEBOUNCE_SAMPLES * XHCI_DEBOUNCE_MS,
+                              g_port_flaps[idx][port]);
+                xhci_teardown_port_slots(xhc, port);   // #134: and RELEASE it
+                // #134: and RE-ARM THE PORT ITSELF, not just our idea of it.
+                xhci_port_rearm_for_connect(xhc, port);
+                // #134: prove the worker is still alive on the very next scan.
+                // Three sessions of this ticket stalled on being unable to tell
+                // "alive, nothing changed" from "stopped right here".
+                g_rescan_hb_force = 1;
+                if (g_port_flaps[idx][port] >= XHCI_FLAP_THRESHOLD) {
+                    g_port_cooldown[idx][port] = XHCI_FLAP_COOLDOWN_SCANS;
+                    bootlog_write("[xHCI] *** port %u is FLAPPING (%u confirmed "
+                                  "disconnects of a device nobody unplugged). "
+                                  "Backing off re-enumeration for %d re-scans "
+                                  "(~%ds) so it stops burning a device slot and "
+                                  "HID entries every cycle. See the [PORTSC] "
+                                  "lines above for why CCS reads 0. ***",
+                                  port + 1, g_port_flaps[idx][port],
+                                  XHCI_FLAP_COOLDOWN_SCANS,
+                                  (XHCI_FLAP_COOLDOWN_SCANS * 3));
+                }
             }
             continue;
         }
-        if (g_port_enumerated[idx][port]) continue;   // already enumerated
+        if (g_port_enumerated[idx][port]) {
+            // #134 (2026-08-18): SELF-HEAL A STALE "ENUMERATED" FLAG.
+            //
+            // g_port_enumerated is the ONE thing standing between a connected
+            // port and a re-enumeration, and it is a byte of driver belief. If
+            // any path ever leaves it set on a port that has no device slot,
+            // that port is dead until reboot and NOTHING SAYS SO: the re-scan
+            // worker logs only on change, so it goes quiet and looks exactly
+            // like a healthy idle port. That failure mode was reachable, because
+            // until this commit xhci_disable_slot() did not clear
+            // g_slot_root_port[] and the two records could disagree with nothing
+            // ever comparing them.
+            //
+            // Cross-check the belief against the slot table every scan and clear
+            // it if they disagree for XHCI_ORPHAN_SCANS in a row (hysteresis, so
+            // a device mid-enumeration is never clobbered; enumeration is
+            // synchronous on this thread, so the margin is generous). This turns
+            // "the state we clear is the state we consult" into something the
+            // running system checks, instead of something a comment asserts.
+            if (!xhci_port_has_live_slot(xhc, port)) {
+                if (++g_port_orphan[idx][port] >= XHCI_ORPHAN_SCANS) {
+                    bootlog_write("[xHCI] re-scan: port %u reads CONNECTED and is "
+                                  "flagged enumerated, but NO device slot names "
+                                  "it after %d scans. The flag is STALE: clearing "
+                                  "it so this port is enumerated again.",
+                                  port + 1, XHCI_ORPHAN_SCANS);
+                    g_port_enumerated[idx][port] = 0;
+                    g_port_orphan[idx][port] = 0;
+                    g_rescan_hb_force = 1;
+                    continue;   // next scan resets + enumerates it
+                }
+            } else if (g_port_orphan[idx][port]) {
+                g_port_orphan[idx][port] = 0;
+            }
+            // Connected and working. Decay the flap count so a port that settles
+            // is not penalised forever by an old burst.
+            if (g_port_flaps[idx][port]) {
+                if (++g_port_stable[idx][port] >= XHCI_FLAP_STABLE_SCANS) {
+                    bootlog_write("[xHCI] port %u stable for %d re-scans; clearing "
+                                  "flap count (%u)", port + 1,
+                                  XHCI_FLAP_STABLE_SCANS, g_port_flaps[idx][port]);
+                    g_port_flaps[idx][port] = 0;
+                    g_port_stable[idx][port] = 0;
+                }
+            }
+            continue;   // already enumerated
+        }
+        if (g_port_cooldown[idx][port]) {
+            // #134 (2026-08-18): SAY SO. This branch is the one place in the
+            // driver where a port that is PHYSICALLY CONNECTED is deliberately
+            // not enumerated, and it was completely silent for the whole 30s
+            // cooldown. From the artifact that is indistinguishable from the
+            // fault this ticket is about - a connected device that never comes
+            // up and nothing explaining why - which is the exact ambiguity the
+            // rest of this change exists to remove. Measured on VM <vmid>: an
+            // unplug/replug arm at ~13s intervals trips XHCI_FLAP_THRESHOLD on
+            // a port within 8 cycles and then produces three "connected but
+            // never enumerated" cycles with no explanation anywhere.
+            // Once per cooldown, not once per scan, so it stays bounded.
+            if (g_port_cooldown[idx][port] == XHCI_FLAP_COOLDOWN_SCANS) {
+                bootlog_write("[xHCI] re-scan: port %u IS CONNECTED but "
+                              "re-enumeration is SUPPRESSED for the next %d "
+                              "scans (~%ds) by the flap governor (%u confirmed "
+                              "disconnects). This is deliberate back-off, not a "
+                              "failure to detect the device. It clears itself; "
+                              "%d consecutive good scans also clear the count.",
+                              port + 1, XHCI_FLAP_COOLDOWN_SCANS,
+                              XHCI_FLAP_COOLDOWN_SCANS * 3,
+                              g_port_flaps[idx][port], XHCI_FLAP_STABLE_SCANS);
+                g_rescan_hb_force = 1;
+            }
+            g_port_cooldown[idx][port]--;
+            continue;   // flap governor: not this scan
+        }
         // Connected but not yet enumerated: reset then bounded-retry enumerate.
         bootlog_write("[xHCI] re-scan: port %u connected but not enumerated; "
                       "resetting + enumerating", port + 1);
@@ -3451,6 +4779,62 @@ int xhci_rescan_ports(xhci_controller_t *xhc) {
     }
     return newly;
 }
+
+#ifdef XHCI_EPTEST
+// =============================================================================
+// #62: DESTRUCTIVE self-test for control-endpoint recovery.
+// =============================================================================
+// Built only with `make XHCIEPTEST=1` (GREEN, recovery compiled in) or
+// `make XHCIEPTEST=2` (RED, -DXHCI_EPTEST_NORECOVER removes the recovery call
+// and restores the pre-fix behaviour). Never in a golden.
+//
+// It does NOT simulate the fault. It causes a REAL one: a GET_DESCRIPTOR for
+// descriptor type 0xFF, which every USB device answers with a STALL, which per
+// xHCI 4.10.2.1 leaves the control endpoint HALTED - the exact state the owner's
+// iMac log shows slot 1 stuck in. It then issues a PERFECTLY VALID
+// GET_DESCRIPTOR(DEVICE) on the same endpoint and reports whether it worked.
+//
+//   GREEN arm: stall observed, recovery runs, the follow-up request SUCCEEDS.
+//   RED arm:   stall observed, no recovery, the follow-up request cannot be
+//              executed by a halted endpoint and burns its whole budget.
+//
+// If both arms pass, the test is worthless and the result must be discarded.
+static void xhci_ep0_recovery_selftest(void) {
+    for (int i = 0; i < xhci_controller_count; i++) {
+        xhci_controller_t *xhc = &xhci_controllers[i];
+        if (!xhc->initialized) continue;
+        // Highest slot with an EP0 ring: on the test VM the boot MSC device
+        // enumerates first, so the highest slot is a throwaway peripheral and a
+        // RED arm cannot take the root filesystem down with it.
+        int slot = -1;
+        for (int s = 1; s <= (int)xhc->max_slots && s <= XHCI_MAX_SLOTS; s++)
+            if (xhc->transfer_rings[s - 1][0]) slot = s;
+        if (slot < 0) continue;
+
+        static uint8_t dbuf[64] __attribute__((aligned(64)));
+        bootlog_write("[EPTEST] ctrl %d slot %d: arming (recovery %s)", i, slot,
+#ifdef XHCI_EPTEST_NORECOVER
+                      "DISABLED (RED arm)");
+#else
+                      "ENABLED (GREEN arm)");
+#endif
+        // 1. Provoke a genuine STALL: descriptor type 0xFF does not exist.
+        memset(dbuf, 0, sizeof(dbuf));
+        int r1 = xhci_control_transfer_to(xhc, slot, 0x80, 0x06, 0xFF00, 0,
+                                          dbuf, 18, 1000);
+        bootlog_write("[EPTEST] step1 provoke-stall rc=%d (want <0)", r1);
+
+        // 2. A request that MUST work on a healthy endpoint.
+        memset(dbuf, 0, sizeof(dbuf));
+        int r2 = xhci_control_transfer_to(xhc, slot, 0x80, 0x06, 0x0100, 0,
+                                          dbuf, 18, 1000);
+        int ok = (r2 == CC_SUCCESS || r2 == CC_SHORT_PACKET) && dbuf[1] == 0x01;
+        bootlog_write("[EPTEST] step2 recover-and-reuse rc=%d bDescType=0x%02x "
+                      "=> %s", r2, dbuf[1], ok ? "PASS" : "FAIL");
+        bootlog_write("[EPTEST] VERDICT slot %d: %s", slot, ok ? "PASS" : "FAIL");
+    }
+}
+#endif  // XHCI_EPTEST
 
 // The re-scan worker. It sleeps XHCI_RESCAN_INTERVAL_MS between scans on the
 // scheduler's timer-sleep queue (proc_sleep, the SAME shared primitive the HID
@@ -3463,11 +4847,33 @@ static void xhci_rescan_worker(void *arg) {
     (void)arg;
     bootlog_write("[xHCI] port re-scan worker started (~%dms interval)",
                   XHCI_RESCAN_INTERVAL_MS);
+#ifdef XHCI_EPTEST
+    proc_sleep(4000);              // let every device finish enumerating
+    xhci_ep0_recovery_selftest();  // #62 destructive proof; test builds only
+#endif
+    g_rescan_hb_force = 1;             // #134: one heartbeat on the first scan,
+                                       // so "the worker never started" and "the
+                                       // worker started and stopped later" are
+                                       // distinguishable from the artifact.
     for (;;) {
         proc_sleep(XHCI_RESCAN_INTERVAL_MS);
+        g_rescan_scans++;
+        // #133: give a parked HID device another chance. This thread, not the
+        // HID poll worker, because the recovery may need a CLEAR_FEATURE
+        // control transfer and blocking the poll worker freezes ALL input.
+#ifndef HID_PARKTEST_NOREVIVE
+        usb_hid_retry_failed();
+#endif
         int total_new = 0;
         for (int i = 0; i < xhci_controller_count; i++) {
             total_new += xhci_rescan_ports(&xhci_controllers[i]);
+        }
+        // #134: unconditional liveness + raw port state. AFTER the scan, so the
+        // PORTSC values printed are the post-scan truth, and so a scan that
+        // wedges produces no heartbeat rather than a stale-but-reassuring one.
+        if (g_rescan_hb_force || (g_rescan_scans % XHCI_HB_SCANS) == 0) {
+            g_rescan_hb_force = 0;
+            xhci_rescan_heartbeat();
         }
         if (total_new > 0) {
             bootlog_write("[xHCI] re-scan enumerated %d new device(s)", total_new);
@@ -3504,13 +4910,233 @@ static void xhci_evt_worker(void *arg) {
     (void)arg;
     bootlog_write("[xHCI] event-ring drain worker started (%d controller(s))",
                   xhci_controller_count);
+    // #139: PROVE the interrupt fires, on a machine with no serial console.
+    // "MSI armed" is a statement about a register write; this is a statement
+    // about the handler having RUN. blame.md's zero-callers family (the USBLEGSUP
+    // hand-off, validate_user_ptr, sse_save) is entirely made of code that was
+    // believed live because it existed. Reported a handful of times early and
+    // then never again, so it cannot burn the log down.
+    uint32_t reports = 0;
+    uint64_t next_report_ms = 0;
     for (;;) {
         for (int i = 0; i < xhci_controller_count; i++) {
             if (xhci_controllers[i].initialized)
                 xhci_drain_events(&xhci_controllers[i]);
         }
+        if (reports < 6 && sched_now_ms() >= next_report_ms) {
+            next_report_ms = sched_now_ms() + (reports ? 30000 : 5000);
+            reports++;
+            bootlog_write("[xHCI] #139: MSI armed=%d, handler has run %llu time(s) "
+                          "at %llu ms uptime", xhci_msi_armed(),
+                          (unsigned long long)xhci_msi_count(),
+                          (unsigned long long)sched_now_ms());
+        }
         proc_sleep(1);   // one tick; a real timer sleep, never a busy spin (#426)
     }
+}
+
+// =============================================================================
+// #139: MSI handler and arming
+// =============================================================================
+
+// Acknowledge and wake. Nothing else. See the note at g_xhci_msi_seq above for
+// why this must not drain the ring.
+//
+// The two acknowledgements are both REQUIRED and both RW1C ("write 1 to
+// clear"), so each is a read followed by writing the SAME bit back, never a
+// blanket write:
+//   USBSTS.EINT  (xHCI 5.4.2) - set whenever an interrupter asserts; the
+//                controller will not assert again until it is cleared.
+//   IMAN.IP      (xHCI 5.5.2.1) - per-interrupter pending flag; with MSI this
+//                is cleared by the handler, and leaving it set wedges that
+//                interrupter permanently after exactly one interrupt.
+// Getting either wrong produces a driver that interrupts ONCE and then looks
+// exactly like hardware that does not interrupt at all, which is the failure
+// this whole change exists to end, so both are written explicitly.
+static void xhci_msi_isr(interrupt_frame_t *frame) {
+    (void)frame;
+    for (int i = 0; i < xhci_controller_count; i++) {
+        xhci_controller_t *xhc = &xhci_controllers[i];
+        if (!xhc->initialized) continue;
+        uint32_t sts = xhci_op_read32(xhc, XHCI_OP_USBSTS);
+        if (sts & XHCI_STS_EINT)
+            xhci_op_write32(xhc, XHCI_OP_USBSTS, XHCI_STS_EINT);
+        uint32_t iman = xhci_rt_read32(xhc, XHCI_RT_IR0 + XHCI_IR_IMAN);
+        if (iman & XHCI_IMAN_IP)
+            xhci_rt_write32(xhc, XHCI_RT_IR0 + XHCI_IR_IMAN, iman | XHCI_IMAN_IP);
+    }
+    g_xhci_msi_hits++;
+    g_xhci_msi_seq++;
+    // wake_up_all takes the queue lock with spinlock_acquire_irqsave, so any
+    // thread holding it runs with IF=0 and this interrupt cannot preempt it on
+    // the same cpu. Checked in sync/waitq.c, not assumed (the HDA MSI handler
+    // relies on the identical property).
+    wake_up_all(&g_xhci_evt_wq);
+    lapic_eoi();
+}
+
+// RECORD THE CAPABILITY LIST, NOT JUST THE VERDICT. blame.md #135: a driver
+// that decides a hardware state on one bit should log the whole register, or
+// the reason it decided that way is not merely unknown, it is unrecorded.
+// "No MSI capability" and "has MSI-X but no MSI" are completely different
+// situations with completely different fixes, and the owner's iMac14,4 xHCI
+// (PCI 00:14.0) has never had its capability list dumped by anything.
+// Bounded walk: a corrupt list must not spin.
+//
+// #156: this now runs WHETHER OR NOT MSI is armed. It is the single piece of
+// evidence that says whether that machine's controller has MSI at all, which
+// is the question the #139 boot regression turns on, and it must not be
+// gated behind the very thing it is meant to justify.
+static void xhci_log_pci_caps(xhci_controller_t *xhc) {
+    char caps[96];
+    int n = 0;
+    caps[0] = 0;
+    uint8_t off = pci_read8(xhc->pci->bus, xhc->pci->slot, xhc->pci->func, 0x34);
+    for (int guard = 0; guard < 48 && off >= 0x40; guard++) {
+        uint8_t id   = pci_read8(xhc->pci->bus, xhc->pci->slot, xhc->pci->func, off);
+        uint8_t next = pci_read8(xhc->pci->bus, xhc->pci->slot, xhc->pci->func, off + 1);
+        if (n < (int)sizeof(caps) - 8) {
+            const char *hex = "0123456789abcdef";
+            if (n) caps[n++] = ',';
+            caps[n++] = '0'; caps[n++] = 'x';
+            caps[n++] = hex[(id >> 4) & 0xF];
+            caps[n++] = hex[id & 0xF];
+            caps[n] = 0;
+        }
+        if (next == off || next < 0x40) break;
+        off = next;
+    }
+    bootlog_write("[xHCI] #139: %04x:%04x at %02x:%02x.%x PCI capabilities [%s]"
+                  " (MSI 0x05 present=%d, MSI-X 0x11 present=%d)",
+                  xhc->pci->vendor_id, xhc->pci->device_id,
+                  xhc->pci->bus, xhc->pci->slot, xhc->pci->func, caps,
+                  pci_find_capability(xhc->pci, PCI_CAP_ID_MSI) ? 1 : 0,
+                  pci_find_capability(xhc->pci, PCI_CAP_ID_MSIX) ? 1 : 0);
+}
+
+// #156: resolve the gate ONCE. Runs from xhci_setup_interrupt(), which main.c
+// calls long after the FAT ESP is mounted (the same ordering /SMPSCHED.TXT
+// relies on), so fat_exists() is safe here.
+//
+// THE BUILD ARM MUST BE READABLE OUT OF THE ARTIFACT. blame.md's recurring
+// defect is a build believed to have a feature compiled out on the strength of
+// the filename or the make line (the COMPOSIT-*-testhook staging with no
+// TESTHOOK symbol in it). #if, not a ternary, so exactly ONE of these strings
+// is linked and `strings kernel.elf | grep '#156 BUILD-ARM'` answers which
+// kernel you are holding without booting it.
+#if XHCI_MSI_DEFAULT_ON
+static const char XHCI_MSI_BUILD_ARM[] = "[xHCI] #156 BUILD-ARM: MSI DEFAULT ON";
+#else
+static const char XHCI_MSI_BUILD_ARM[] = "[xHCI] #156 BUILD-ARM: MSI DEFAULT OFF";
+#endif
+const char *xhci_msi_build_arm(void) { return XHCI_MSI_BUILD_ARM; }
+
+static void xhci_msi_gate_resolve(void) {
+#if XHCI_MSI_DEFAULT_ON
+    const char *why = "compiled-in default ON (make XHCIMSI=1)";
+#else
+    const char *why = "compiled-in default OFF (#156)";
+#endif
+    g_xhci_msi_gate = XHCI_MSI_DEFAULT_ON;
+    bootlog_write("%s", XHCI_MSI_BUILD_ARM);
+
+    extern fat_fs_t g_fat_fs;
+    if (g_fat_fs.mounted) {
+        if (fat_exists(&g_fat_fs, "/XHCIMSI.TXT")) {
+            g_xhci_msi_gate = 1;
+            why = "/XHCIMSI.TXT present on the FAT ESP";
+        }
+        // OFF wins over ON: a kernel built or gated ON must always be
+        // recoverable by dropping one file on the ESP, with no rebuild.
+        if (fat_exists(&g_fat_fs, "/XHCIMSI.OFF")) {
+            g_xhci_msi_gate = 0;
+            why = "/XHCIMSI.OFF present on the FAT ESP (overrides)";
+        }
+    } else {
+        why = "FAT ESP not mounted, no gate file read; compiled-in default kept";
+    }
+
+    bootlog_write("[xHCI] #156: MSI gate = %s (%s)",
+                  g_xhci_msi_gate ? "ON" : "OFF", why);
+    kprintf("[xHCI] #156: MSI gate = %s (%s)\n",
+            g_xhci_msi_gate ? "ON" : "OFF", why);
+}
+
+void xhci_setup_interrupt(void) {
+    if (xhci_controller_count <= 0) return;
+
+    xhci_msi_gate_resolve();
+
+    int armed = 0, no_cap = 0, gated = 0;
+    for (int i = 0; i < xhci_controller_count; i++) {
+        xhci_controller_t *xhc = &xhci_controllers[i];
+        if (!xhc->initialized || !xhc->pci) continue;
+
+        // Unconditional: this is the evidence, not the feature (see above).
+        xhci_log_pci_caps(xhc);
+
+        // #156: register the C handler EVEN WHEN THE GATE IS OFF. Nothing can
+        // raise vector 0x51 with MSI disabled, so this changes no behaviour;
+        // but cpu/idt.c installs the 0x51 IDT GATE unconditionally, and
+        // isr_handler_impl() answers an unregistered vector with a kprintf and
+        // NO EOI. That would leave the LAPIC's in-service bit for 0x51 set for
+        // ever, permanently masking every lower-priority vector on that cpu -
+        // including the timer at 32. A stray interrupt must be acknowledged.
+        idt_register_handler(XHCI_MSI_VECTOR, xhci_msi_isr);
+
+        if (!g_xhci_msi_gate) {
+            gated++;
+            bootlog_write("[xHCI] #156: MSI NOT armed on %04x:%04x at %02x:%02x.%x "
+                          "(gate OFF). Completions come from the two always-armed "
+                          "timer-driven drain workers, which is exactly how every "
+                          "build up to 1910 ran. IMOD/IMAN untouched, INTx left "
+                          "alone, pci_enable_msi() not called.",
+                          xhc->pci->vendor_id, xhc->pci->device_id,
+                          xhc->pci->bus, xhc->pci->slot, xhc->pci->func);
+            continue;
+        }
+
+        // Interrupter moderation. IMODI is in 250 ns units and is the interval
+        // the controller waits before asserting again, so it is the storm
+        // guard: 4000 == 1 ms == at most 1000 interrupts/second per
+        // controller, which is the value the spec leaves in place after a
+        // reset. It is programmed EXPLICITLY rather than inherited, because
+        // firmware may have left anything here and an inherited 0 means "no
+        // moderation at all" - an unbounded interrupt rate on a bus that also
+        // carries this machine's root filesystem. 1 ms of added worst-case
+        // latency against a mouse whose fastest endpoint period is 1 ms is a
+        // trade worth making in that direction.
+        xhci_rt_write32(xhc, XHCI_RT_IR0 + XHCI_IR_IMOD, 4000);
+
+        // Re-assert IMAN.IE: xhci_event_ring_init set it, but a controller
+        // reset between then and now would have cleared it, and it costs one
+        // MMIO write to not depend on that.
+        uint32_t iman = xhci_rt_read32(xhc, XHCI_RT_IR0 + XHCI_IR_IMAN);
+        xhci_rt_write32(xhc, XHCI_RT_IR0 + XHCI_IR_IMAN, iman | XHCI_IMAN_IE);
+
+        if (pci_enable_msi(xhc->pci, XHCI_MSI_VECTOR, lapic_get_id())) {
+            armed++;
+            g_xhci_msi_armed = 1;
+            bootlog_write("[xHCI] #139: MSI armed on vector 0x%02x -> LAPIC %u "
+                          "(controller %04x:%04x at %02x:%02x.%x, IMOD=4000 "
+                          "= 1ms max rate)", XHCI_MSI_VECTOR, lapic_get_id(),
+                          xhc->pci->vendor_id, xhc->pci->device_id,
+                          xhc->pci->bus, xhc->pci->slot, xhc->pci->func);
+        } else {
+            no_cap++;
+            bootlog_write("[xHCI] #139: controller %04x:%04x at %02x:%02x.%x has "
+                          "NO MSI capability (see the capability list above; if it "
+                          "shows 0x11 the controller has MSI-X, which this kernel "
+                          "cannot yet program); completions stay on the timer-driven "
+                          "drain workers only - the pre-#139 behaviour, not a "
+                          "regression", xhc->pci->vendor_id, xhc->pci->device_id,
+                          xhc->pci->bus, xhc->pci->slot, xhc->pci->func);
+        }
+    }
+    kprintf("[xHCI] #139/#156: MSI armed on %d controller(s), %d without "
+            "capability, %d held off by the #156 gate\n", armed, no_cap, gated);
+    bootlog_write("[xHCI] #139/#156: MSI armed on %d controller(s), %d without "
+                  "capability, %d held off by the #156 gate", armed, no_cap, gated);
 }
 
 void xhci_start_rescan_thread(void) {

@@ -918,9 +918,54 @@ static void create_panel(int thick) {
         x = g_screen_w - g_win_w; if (x < 0) x = 0;
         y = PANEL_TOP;                      // glued to the right
     }
-    g_window = win_create(APP_TITLE, x, y, g_win_w, g_win_h);
-    if (g_window >= 0)
-        win_set_nochrome(g_window);   // borderless panel (kernel also focuses it)
+    // #194: this is the docked, non-popped panel at the state `create_panel()`
+    // was just told to build. When that state is DOCK_COLLAPSED the result is
+    // the SLIVER_W (12px) edge handle: a borderless strip with no text field
+    // and nothing useful to type into. Every OTHER state reaching this line
+    // (DOCK_OPEN, DOCK_PEEK) is a real content surface the user just asked to
+    // see, so it keeps the normal focus-on-create behaviour those states have
+    // always had.
+    //
+    // Root cause of #194 (owner-reported on real hardware, build 2001): this
+    // call used to be plain win_create() unconditionally, so EVERY recreation
+    // of the panel - including the auto-launch of the collapsed sliver at
+    // compositor boot (main.c: g_aichat_enabled defaults ON) - stole keyboard
+    // focus via the kernel's unconditional wm_focus_window() in
+    // sys_win_create_impl(focus=1). On a fresh boot the aichat process's own
+    // init (aiclient_init/fb_info/load_cfg) can finish AFTER the user has
+    // already opened a DOS window and started typing, so this 12px handle
+    // nobody asked to interact with would silently steal focus back off the
+    // DOS guest - matching #177's "OK KEY 1c depth=1" log line that never
+    // reached the guest, and a compositor-driven repro here on this same
+    // build: a Terminal window with visible keyboard focus (title bar lit,
+    // caret blinking, keystrokes echoing) went inert - title bar dimmed, next
+    // three keystrokes produced no echo - the instant a freshly spawned
+    // Maytera AI panel completed create_panel(DOCK_COLLAPSED).
+    //
+    // Fix reuses the existing #148 (local 164) primitive built for exactly
+    // this shape of problem (PrintScreen's Snapshot preview must appear
+    // without disturbing what the user is typing into): win_create_bg() is
+    // the same call with focus=0, so the sliver still appears and still
+    // paints, it just does not touch whatever currently holds keyboard focus.
+    // See kernel/proc/syscall.c sys_win_create_impl's shared `focus` gate.
+    if (g_dock == DOCK_COLLAPSED)
+        g_window = win_create_bg(APP_TITLE, x, y, g_win_w, g_win_h);
+    else
+        g_window = win_create(APP_TITLE, x, y, g_win_w, g_win_h);
+    if (g_window >= 0) {
+        // #216: mirror the win_create/win_create_bg choice just above. The
+        // OLD code called the focus-grabbing win_set_nochrome() here
+        // unconditionally, which silently undid that choice for the
+        // DOCK_COLLAPSED sliver the instant it appeared - the kernel's
+        // nochrome path had its own, unconditional focus grab, so #194's
+        // fix (win_create_bg for the collapsed sliver) was defeated one
+        // line later by a second, uncoordinated focus decision in the same
+        // function. Route through the same gate instead of adding a third.
+        if (g_dock == DOCK_COLLAPSED)
+            win_set_nochrome_bg(g_window);
+        else
+            win_set_nochrome(g_window);   // borderless panel that IS the surface the user asked to see
+    }
 }
 
 // Transition to a dock state, recreating the window at the matching width.

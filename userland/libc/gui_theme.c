@@ -369,11 +369,20 @@ static unsigned int gtp_mix(unsigned int a, unsigned int b, int t, int n) {
     unsigned int bl = ((a & 0xFF) * (n - t) + (b & 0xFF) * t) / (unsigned)n;
     return (r << 16) | (g << 8) | bl;
 }
-// theme_metric_of() returns 0 for "this kernel does not know that id"; the
-// kernel decorator's own win_metric_or() treats any non-positive value as
+// theme_metric_raw_of() returns 0 for "this kernel does not know that id";
+// the kernel decorator's own win_metric_or() treats any non-positive value as
 // "use the fallback", so this does too and the two cannot disagree.
+//
+// (#wizflash) Deliberately theme_metric_raw_of(), NOT theme_metric_of(). This
+// preview draws through the CALLER's own window (a scale_on window: Settings
+// and the first-boot wizard both are), and every win_draw_rect()/win_draw_
+// pixel() call below is scaled ONCE at that window's syscall boundary. The
+// scaled getter, theme_metric_of(), ALSO multiplies by the current UI scale,
+// which would apply the factor twice - measured at 200%: a 20px title bar
+// came out 80px instead of 40, overflowing the fixed-size crop this function
+// draws into. See SYS_THEME_METRIC_RAW's comment in kernel/proc/syscall.h.
 static int gtp_metric(int ti, theme_metric_id_t id, int fallback) {
-    int v = theme_metric_of(ti, id);
+    int v = theme_metric_raw_of(ti, id);
     return (v > 0) ? v : fallback;
 }
 
@@ -390,9 +399,16 @@ void gui_theme_win_preview(int handle, int x, int y, int w, int h,
     int tbh  = gtp_metric(theme_index, THEME_METRIC_TITLEBAR_H,     20);
     int btn  = gtp_metric(theme_index, THEME_METRIC_TITLEBAR_BTN,   16);
     int gap  = gtp_metric(theme_index, THEME_METRIC_TITLEBAR_BTN_GAP, 2);
+    // An enum/boolean metric, not a pixel count: never scaled by either
+    // getter (theme_get_metric_by_id() only multiplies TM_PX ids), so there
+    // is no double-scale risk here and no reason to prefer one getter over
+    // the other. Left on the plain (scaled-getter) call for that reason.
     int grad = theme_metric_of(theme_index, THEME_METRIC_DECOR_TITLEBAR_GRADIENT);
-    // radius 0 is a LEGAL value (square corners), so this one is read raw.
-    int bev  = theme_metric_of(theme_index, THEME_METRIC_RADIUS_WINDOW);
+    // radius 0 is a LEGAL value (square corners), so this one is read
+    // UNFILTERED (not through gtp_metric's positive-fallback), but it is
+    // still a TM_PX metric and so still needs the UNSCALED getter for the
+    // same double-scale reason as bw/tbh/btn/gap above.
+    int bev  = theme_metric_raw_of(theme_index, THEME_METRIC_RADIUS_WINDOW);
     if (bev > 6) bev = 6;            // kernel WIN_BEVEL_MAX
     if (bev < 0) bev = 0;
 

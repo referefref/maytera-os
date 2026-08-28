@@ -187,7 +187,7 @@ the body is fixed:
   case-insensitive to the source DIRECTORY name, else it creates the entry
   using the binary name. This app is new: the shipped image's `/APPS` has 164
   entries and **none matches `classicube` or `CLASSICUBE` in any case**
-  (checked with `debugfs -R "ls /APPS"` against `maytera-imac-b738.img` p2;
+  (checked with `debugfs -R "ls /APPS"` against `the golden image` p2;
   `GLCUBE` exists and does not collide). So the fall-through applies and the
   entry is created as the Makefile's `TARGET`, which is `CLASSICUBE`. Changing
   `TARGET` changes the shipped path, and anything that launches the app must
@@ -298,7 +298,7 @@ responsive. Proof, all four required:
    list.
 
 ### Standing constraints on whoever verifies
-* Throwaway VMs only, destroyed with their LVs. Never a test VM or 2281.
+* Throwaway VMs only, destroyed with their LVs. Never VM <vmid> or 2281.
 * Never test new userland on an old base image.
 * Prove claims against the artifact: `nm`, `objdump`, `readelf`, `md5sum`.
   Never `grep` a binary.

@@ -69,7 +69,9 @@ static struct {
     // Desktop running flag
     bool running;
 
-    // Title-bar double-click tracking (toggles maximize/restore)
+    // Title-bar double-click tracking (toggles maximize/restore). #236: this
+    // field NOW HOLDS MILLISECONDS, not raw ticks - see wm_set_dblclick_ms()
+    // and its call site in wm_handle_mouse_down() below for why.
     uint64_t last_tb_click_tick;
     window_t *last_tb_click_win;
 
@@ -79,12 +81,32 @@ static struct {
     window_t *tb_hover_win;
 } wm_state;
 
+// #236: the ONE governed double-click threshold for the title-bar
+// maximize/restore toggle below, in real milliseconds. Was a hardcoded
+// `freq/2` (~0.5s) with zero connection to the userland "Double-click Speed"
+// setting; see syscall.h's SYS_SET_DBLCLICK_MS block comment for the full
+// story (three independent hardcoded detectors found on golden 2016, this
+// was the kernel-side one). Default matches the old hardcoded value so a
+// machine that boots before the compositor's first push (or an app that
+// creates a window before any compositor exists at all) behaves exactly as
+// it always did.
+static uint32_t g_dblclick_ms = 500;
+
+// Clamped in the syscall handler (sys_set_dblclick_ms), not here: this
+// function has no way to report a rejected value back to the caller, and a
+// silently-clamped setter that ALSO clamps make two places to keep in sync.
+void wm_set_dblclick_ms(uint32_t ms) {
+    g_dblclick_ms = ms;
+}
+
 // (local 79) The probe below is COMPILED OUT by default. It is an instrument,
 // not a feature: leaving it armed would put a few hundred lines of [FOCDIAG]
 // into every golden's console for a question that is already answered, and
 // deleting it outright would make the next pass rebuild it from scratch (the
 // OpenArena report is NOT fully explained, see the CHANGELOG entry). Re-arm it
-// with `make CFLAGS_EXTRA=-DFOCUSDIAG_ENABLED=1` or by editing the 0 below.
+// with `make FOCUSDIAG=1` (kernel/Makefile; the previous `CFLAGS_EXTRA=...`
+// form here was never read by the Makefile and silently armed nothing) or by
+// editing the 0 below.
 #ifndef FOCUSDIAG_ENABLED
 #define FOCUSDIAG_ENABLED 0
 #endif
@@ -544,6 +566,17 @@ window_t *window_create(const char *title, int32_t x, int32_t y, int32_t width, 
 void window_destroy(window_t *win) {
     if (!win) return;
 
+    // #158: a fullscreen window about to be freed MUST NOT leave
+    // g_fullscreen_win dangling - every later wm_fullscreen_active() call
+    // would dereference freed memory. No restore is needed (the window is
+    // gone), just drop the claim and force the desktop back onto screen.
+    // This is the "app crash / window close while fullscreen" way back.
+    extern window_t *g_fullscreen_win;
+    if (g_fullscreen_win == win) {
+        g_fullscreen_win = NULL;
+        wm_invalidate_all();
+    }
+
     // Destroy all widgets first
     widgets_destroy_all(win);
 
@@ -731,6 +764,129 @@ void window_restore(window_t *win) {
 
         kprintf("Restored maximized window '%s'\n", win->title);
     }
+}
+
+// ============================================================================
+// #158 NATIVE FULLSCREEN.
+//
+// AT MOST ONE window may hold this at a time - g_fullscreen_win is the single
+// source of truth, mirrored onto the window's own WINDOW_FLAG_FULLSCREEN bit
+// so per-window code (window_destroy, window_set_focus) can check locally
+// without a global lookup. Entering fullscreen fills the WHOLE screen (not
+// the work area maximize uses), suppresses ALL kernel-drawn chrome for EVERY
+// window (wm_draw_all/wm_draw_apps/wm_draw_winmenu below all check
+// wm_fullscreen_active() first), and is the compositor's cue (via
+// SYS_WM_FULLSCREEN_RENDER) to skip its own wallpaper/taskbar/icon layers and
+// the SYS_COMPOSITOR_RENDER_WINDOWS composite entirely - one direct content
+// blit instead of the whole per-window chrome/corner/widget draw loop. That
+// redraw cost, not the pixels, is what #158 exists to cut.
+//
+// THE WAY BACK. Five independent triggers restore the desktop, because #157
+// (frozen boot splash) proved that a display handed away and never taken back
+// is worse than the feature it was for:
+//   1. F11 (compositor main.c) - handled ABOVE the app, always works even if
+//      the app never presents again.
+//   2. window_set_focus() - losing focus force-exits (see below).
+//   3. window_destroy() - the window going away force-clears g_fullscreen_win
+//      BEFORE it is freed (see top of window_destroy).
+//   4. wm_force_exit_fullscreen() - called from sys_session_lock() and the
+//      SYS_SET_WIN_BLANK handler (kernel/proc/syscall.c), so the lock screen
+//      and the screensaver can never be bypassed by a fullscreen app sitting
+//      on top of them (#151/#158).
+//   5. The compositor's own watchdog (main.c): if the window's content commit
+//      sequence stops advancing for NATIVE_FS_WATCHDOG_MS, it calls
+//      SYS_WM_FULLSCREEN_EXIT itself - same shape as #157's g_fb_flip_count-
+//      vs-elapsed-time discriminator, applied to a live app instead of boot.
+// ============================================================================
+window_t *g_fullscreen_win = NULL;
+
+void window_fullscreen_enter(window_t *win) {
+    if (!win) return;
+    if (win->flags & WINDOW_FLAG_FULLSCREEN) return;   // already fullscreen: no-op
+
+    // Only one window may hold this. If another window somehow still claims
+    // it (should be unreachable - every entry point below keeps this true),
+    // restore that one first rather than leaking two "fullscreen" windows.
+    if (g_fullscreen_win && g_fullscreen_win != win) {
+        window_fullscreen_exit(g_fullscreen_win);
+    }
+
+    win->fs_stored_bounds = win->bounds;
+    win->fs_was_maximized = (win->flags & WINDOW_FLAG_MAXIMIZED) ? 1 : 0;
+
+    win->bounds.x = 0;
+    win->bounds.y = 0;
+    win->bounds.width  = (int32_t)fb_get_width();
+    win->bounds.height = (int32_t)fb_get_height();
+
+    win->flags |= WINDOW_FLAG_FULLSCREEN;
+    win->flags &= ~WINDOW_FLAG_MAXIMIZED;   // fullscreen supersedes; exit restores it
+    g_fullscreen_win = win;
+
+    // The app must reflow to the new (screen-filling) size, exactly like
+    // maximize does - a fullscreen game needs to know its real render target.
+    user_window_handle_resize(win);
+
+    kprintf("Fullscreen: window '%s' entered native fullscreen (%dx%d)\n",
+            win->title, (int)win->bounds.width, (int)win->bounds.height);
+    wm_invalidate_all();
+}
+
+void window_fullscreen_exit(window_t *win) {
+    if (!win) return;
+    if (!(win->flags & WINDOW_FLAG_FULLSCREEN)) return;   // not fullscreen: no-op
+
+    win->bounds = win->fs_stored_bounds;
+    win->flags &= ~WINDOW_FLAG_FULLSCREEN;
+    if (win->fs_was_maximized) win->flags |= WINDOW_FLAG_MAXIMIZED;
+    win->fs_was_maximized = 0;
+
+    if (g_fullscreen_win == win) g_fullscreen_win = NULL;
+
+    // (#745) the dock style / work area may have changed while fullscreen;
+    // clamp back on screen exactly like the maximize/minimize restores do.
+    {
+        int32_t rx = win->bounds.x, ry = win->bounds.y;
+        wm_clamp_to_work_area(win, &rx, &ry);
+        win->bounds.x = rx;
+        win->bounds.y = ry;
+    }
+
+    user_window_handle_resize(win);
+
+    kprintf("Fullscreen: window '%s' exited native fullscreen\n", win->title);
+    wm_invalidate_all();
+}
+
+// Self-healing getter: see the contract in window.h. Called on every
+// composite (wm_draw_all/wm_draw_apps/wm_draw_winmenu) and every fast-path
+// render, so a stale claim can never survive more than one frame.
+window_t *wm_fullscreen_active(void) {
+    if (!g_fullscreen_win) return NULL;
+    window_t *w = g_fullscreen_win;
+
+    bool ok = (w->flags & WINDOW_FLAG_FULLSCREEN) &&
+              (w->flags & WINDOW_FLAG_VISIBLE) &&
+              (w == wm_state.focused_window);
+    if (ok) {
+        // Same stale-owner backstop shape as fbown_owner_rs()'s liveness check
+        // (kernel/gui/fb_syscall.c is_compositor()) - a dead owning process
+        // must not be able to hold the screen hostage.
+        process_t *owner = proc_get(w->owner_pid);
+        ok = owner && owner->state != PROC_STATE_ZOMBIE &&
+                      owner->state != PROC_STATE_UNUSED;
+    }
+    if (!ok) {
+        w->flags &= ~WINDOW_FLAG_FULLSCREEN;
+        g_fullscreen_win = NULL;
+        wm_invalidate_all();
+        return NULL;
+    }
+    return w;
+}
+
+void wm_force_exit_fullscreen(void) {
+    if (g_fullscreen_win) window_fullscreen_exit(g_fullscreen_win);
 }
 
 // Move a window
@@ -940,6 +1096,18 @@ void window_set_focus(window_t *win) {
     if (wm_state.focused_window == win) return;
     fdg_change(wm_state.focused_window, win, __builtin_return_address(0));
 
+    // #158: REVOKE ON FOCUS CHANGE. Only the focused window may hold native
+    // fullscreen (ticket security requirement); this is the single chokepoint
+    // every focus change passes through (click another window, alt-tab,
+    // taskbar switch, a new window stealing focus on create), so it is the
+    // one place this needs to be checked. window_fullscreen_exit() is a
+    // proper restore (bounds + maximize state), not just a flag clear, since
+    // the window itself is still alive here - only losing focus, not closing.
+    extern window_t *g_fullscreen_win;
+    if (g_fullscreen_win && g_fullscreen_win == wm_state.focused_window) {
+        window_fullscreen_exit(g_fullscreen_win);
+    }
+
     // Remove focus from old window
     if (wm_state.focused_window) {
         wm_state.focused_window->flags &= ~WINDOW_FLAG_FOCUSED;
@@ -1021,7 +1189,7 @@ static bool is_in_titlebar(window_t *win, int32_t x, int32_t y) {
 
 // Check if point is on close button
 static bool is_on_close_button(window_t *win, int32_t x, int32_t y) {
-    int32_t btn_x = win->bounds.x + win->bounds.width - CLOSE_BUTTON_SIZE - 2;
+    int32_t btn_x = titlebar_btn_x(win->bounds.x, win->bounds.width, TITLEBAR_SLOT_CLOSE);
     int32_t btn_y = win->bounds.y + TITLEBAR_BUTTON_Y_OFFSET;
     return (x >= btn_x && x < btn_x + CLOSE_BUTTON_SIZE &&
             y >= btn_y && y < btn_y + CLOSE_BUTTON_SIZE);
@@ -1031,7 +1199,19 @@ uint8_t g_default_window_opacity = 255;
 
 // Settings cog button: 4th button, left of [minimize][maximize][close].
 static bool is_on_cog_button(window_t *win, int32_t x, int32_t y) {
-    int32_t btn_x = win->bounds.x + win->bounds.width - 4 * CLOSE_BUTTON_SIZE - 2 - 3 * TITLEBAR_BUTTON_SPACING;
+    int32_t btn_x = titlebar_btn_x(win->bounds.x, win->bounds.width, TITLEBAR_SLOT_COG);
+    int32_t btn_y = win->bounds.y + TITLEBAR_BUTTON_Y_OFFSET;
+    return (x >= btn_x && x < btn_x + CLOSE_BUTTON_SIZE &&
+            y >= btn_y && y < btn_y + CLOSE_BUTTON_SIZE);
+}
+
+// #158: native fullscreen button, 5th button, LEFTMOST of the group (left of
+// the cog). Added as a new leftmost slot rather than renumbering any existing
+// button, so cog/minimize/maximize/close keep their exact offsets and hover
+// numbers unchanged - only visible/hit-testable on chromed, non-fullscreen
+// windows (fullscreen windows draw no chrome at all - see wm_draw_all()).
+static bool is_on_fullscreen_button(window_t *win, int32_t x, int32_t y) {
+    int32_t btn_x = titlebar_btn_x(win->bounds.x, win->bounds.width, TITLEBAR_SLOT_FULLSCREEN);
     int32_t btn_y = win->bounds.y + TITLEBAR_BUTTON_Y_OFFSET;
     return (x >= btn_x && x < btn_x + CLOSE_BUTTON_SIZE &&
             y >= btn_y && y < btn_y + CLOSE_BUTTON_SIZE);
@@ -1102,7 +1282,7 @@ static bool is_on_minimize_button(window_t *win, int32_t x, int32_t y) {
     // Close is at: width - CLOSE_BUTTON_SIZE - 2
     // Maximize is at: width - 2*CLOSE_BUTTON_SIZE - 2 - TITLEBAR_BUTTON_SPACING
     // Minimize is at: width - 3*CLOSE_BUTTON_SIZE - 2 - 2*TITLEBAR_BUTTON_SPACING
-    int32_t btn_x = win->bounds.x + win->bounds.width - 3 * CLOSE_BUTTON_SIZE - 2 - 2 * TITLEBAR_BUTTON_SPACING;
+    int32_t btn_x = titlebar_btn_x(win->bounds.x, win->bounds.width, TITLEBAR_SLOT_MINIMIZE);
     int32_t btn_y = win->bounds.y + TITLEBAR_BUTTON_Y_OFFSET;
     return (x >= btn_x && x < btn_x + CLOSE_BUTTON_SIZE &&
             y >= btn_y && y < btn_y + CLOSE_BUTTON_SIZE);
@@ -1111,7 +1291,7 @@ static bool is_on_minimize_button(window_t *win, int32_t x, int32_t y) {
 // Check if point is on maximize button (middle of the three buttons)
 static bool is_on_maximize_button(window_t *win, int32_t x, int32_t y) {
     // Maximize is at: width - 2*CLOSE_BUTTON_SIZE - 2 - TITLEBAR_BUTTON_SPACING
-    int32_t btn_x = win->bounds.x + win->bounds.width - 2 * CLOSE_BUTTON_SIZE - 2 - TITLEBAR_BUTTON_SPACING;
+    int32_t btn_x = titlebar_btn_x(win->bounds.x, win->bounds.width, TITLEBAR_SLOT_MAXIMIZE);
     int32_t btn_y = win->bounds.y + TITLEBAR_BUTTON_Y_OFFSET;
     return (x >= btn_x && x < btn_x + CLOSE_BUTTON_SIZE &&
             y >= btn_y && y < btn_y + CLOSE_BUTTON_SIZE);
@@ -1227,6 +1407,7 @@ void wm_handle_mouse_move(int32_t x, int32_t y) {
         else if (is_on_minimize_button(win, x, y)) new_hover = 2;
         else if (is_on_maximize_button(win, x, y)) new_hover = 3;
         else if ((win->flags & WINDOW_FLAG_CLOSABLE) && is_on_close_button(win, x, y)) new_hover = 4;
+        else if (is_on_fullscreen_button(win, x, y)) new_hover = 5;   // #158
         if (win->tb_hover_btn != new_hover) {
             win->tb_hover_btn = new_hover;
             rect_t tb_rect = { win->bounds.x, win->bounds.y, win->bounds.width, TITLEBAR_HEIGHT };
@@ -1316,10 +1497,20 @@ void wm_handle_mouse_down(int32_t x, int32_t y, uint32_t button) {
     // app (its on_click) instead of triggering kernel maximise/minimize/close.
     // Chromed windows (no NOCHROME flag) keep their button hit-tests unchanged.
     if (!(win->flags & WINDOW_FLAG_NOCHROME)) {
+        // #158: native fullscreen button. window_set_focus(win) already ran
+        // above, so win is guaranteed to be the FOCUSED window here - the
+        // security requirement ("only the focused window may hold it") is
+        // satisfied by construction, not by a separate check.
+        if (is_on_fullscreen_button(win, x, y)) {
+            window_fullscreen_enter(win);
+            wm_invalidate_all();
+            return;
+        }
+
         // #165: transparency (Filter) button -> open the window context menu under
         // it (Lock/Unlock + Opacity). Toggle if already open for this window.
         if (is_on_cog_button(win, x, y)) {
-            int32_t bx = win->bounds.x + win->bounds.width - 4 * CLOSE_BUTTON_SIZE - 2 - 3 * TITLEBAR_BUTTON_SPACING;
+            int32_t bx = titlebar_btn_x(win->bounds.x, win->bounds.width, TITLEBAR_SLOT_COG);
             if (g_winmenu.open && g_winmenu.win == win) {
                 g_winmenu.open = 0;
             } else {
@@ -1392,11 +1583,21 @@ void wm_handle_mouse_down(int32_t x, int32_t y, uint32_t button) {
         // Double-click on the title bar toggles maximize/restore. This gives a
         // large, safe target for un-maximizing a window, instead of the tiny
         // restore button that sits right next to close in the screen corner.
-        uint64_t now = timer_ticks;
-        uint32_t freq = pit_get_frequency();
-        uint64_t dbl_window = freq ? (uint64_t)(freq / 2) : 125;  // ~0.5s
+        //
+        // #236: was `timer_ticks` compared against `freq/2` (a fixed ~0.5s,
+        // ticks-native but STILL a hardcoded constant with zero connection to
+        // the userland "Double-click Speed" setting - one of three
+        // independent hardcoded double-click detectors found on golden 2016).
+        // Converted to real milliseconds (same `ticks * 1000 / hz` formula
+        // SYS_UPTIME_MS uses, so this and userland's uptime_ms() agree on what
+        // a millisecond is) and compared against g_dblclick_ms, which
+        // userland/apps/compositor/main.c keeps in sync via
+        // SYS_SET_DBLCLICK_MS whenever the setting actually changes.
+        extern uint32_t g_timer_hz;
+        uint32_t hz = g_timer_hz ? g_timer_hz : (pit_get_frequency() ? pit_get_frequency() : 250);
+        uint64_t now = (uint64_t)timer_ticks * 1000ULL / hz;
         if (win == wm_state.last_tb_click_win &&
-            (now - wm_state.last_tb_click_tick) < dbl_window) {
+            (now - wm_state.last_tb_click_tick) < (uint64_t)g_dblclick_ms) {
             if (win->flags & WINDOW_FLAG_MAXIMIZED) {
                 window_restore(win);
             } else {
@@ -1505,13 +1706,20 @@ void wm_handle_mouse_up(int32_t x, int32_t y, uint32_t button) {
 void wm_handle_key_down(uint32_t keycode, char key_char) {
     window_t *win = wm_state.focused_window;
 
-    // F11: toggle maximize/restore of the focused window (global WM hotkey).
-    // Goes through window_maximize/window_restore, which call
-    // user_window_handle_resize() so the owning app reflows to the new size.
-    // Intercepted here so F11 is not also acted on by the app.
+    // F11: exit native fullscreen if the focused window holds it (#158 - the
+    // explicit escape hatch, handled here so it works even in the kernel
+    // fallback desktop); otherwise toggle maximize/restore, unchanged.
+    // Goes through window_maximize/window_restore/window_fullscreen_exit,
+    // which call user_window_handle_resize() so the owning app reflows to
+    // the new size. Intercepted here so F11 is not also acted on by the app.
     if (keycode == 0x85 && win) {  // 0x85 = F11 (translated special-key code)
-        if (win->flags & WINDOW_FLAG_MAXIMIZED) window_restore(win);
-        else window_maximize(win);
+        if (win->flags & WINDOW_FLAG_FULLSCREEN) {
+            window_fullscreen_exit(win);
+        } else if (win->flags & WINDOW_FLAG_MAXIMIZED) {
+            window_restore(win);
+        } else {
+            window_maximize(win);
+        }
         return;
     }
 
@@ -1625,8 +1833,28 @@ static int win_ci_has(const char *h, const char *n) {
 static int win_modern_style(void) {
     return theme_get_metric_by_id(-1, TM_DECOR_TITLEBAR_GRADIENT) ? 1 : 0;
 }
-// #136: map a window title to a titlebar icon (windows carry no icon id).
-static icon_id_t window_title_icon(const char *t) {
+// #136: map a window to a titlebar icon (windows carry no icon id of their
+// own). #223: identity first, title second. A DOS host process ("dos"/
+// "dosrun", kernel/dos/dosexec.c proc_create() names) runs EVERY guest .EXE
+// under one fixed process name, so it can never be told apart by title
+// alone, and title-matching below is exactly what missed Discworld II (its
+// title contains none of this function's keywords) - the same root cause
+// the userland dock's tb_icon_for_window() had for the same class of window
+// (#41/#208), fixed there by resolving identity before falling back to a
+// title guess. Every DOS title shipped today is a game, so the existing
+// ICON_GAME bitmap (a real, working glyph already in this kernel-compiled-in
+// icon set) is the correct generic answer - adding a dedicated DOS-specific
+// bitmap to this set is a reasonable follow-up but is new pixel art, out of
+// scope for this fix (see blame.md).
+static icon_id_t window_title_icon(window_t *win) {
+    const char *t = win->title;
+    if (win->owner_pid != 0) {
+        process_t *owner = proc_get(win->owner_pid);
+        if (owner && (strcmp(owner->name, "dos") == 0 ||
+                      strcmp(owner->name, "dosrun") == 0)) {
+            return ICON_GAME;
+        }
+    }
     if (win_ci_has(t, "setting"))  return ICON_COG;
     if (win_ci_has(t, "file"))     return ICON_FOLDER;
     if (win_ci_has(t, "terminal") || win_ci_has(t, "console")) return ICON_TERMINAL;
@@ -1707,6 +1935,35 @@ static int kicon_blit(const char *name, int x, int y, int sz, uint32_t ink, uint
     return 1;
 }
 
+// #uiscale: the titlebar button BOX already scales (CLOSE_BUTTON_SIZE is a
+// theme metric, TM_PX), but every glyph drawn INSIDE it below was a bare
+// literal sized for the 16px 1x box - kicon_blit's icon size/inset (12, +2)
+// and every hand-drawn fallback's offset from center (3, 4). At 200% the box
+// doubled to 32px and the glyph stayed a fixed ~12px stuck in the corner (or,
+// for maximize - which has no icon file and is ALWAYS hand-drawn - a fixed
+// 7x7 square dead-center in a box that grew around it): a small mark
+// rattling around in an oversized square, the same "box scaled, glyph did
+// not" shape as the compositor's AI-launcher button (taskbar.c). Both
+// helpers are derived from CLOSE_BUTTON_SIZE against its own 1x value (16),
+// so every call site below is byte-identical at 100% (16 -> size 12, off 2 -
+// exactly the literals they replace) and grows with the button at any other
+// scale.
+static inline int32_t titlebar_glyph_size(void) {
+    int32_t s = CLOSE_BUTTON_SIZE - 4;
+    return (s < 8) ? 8 : s;
+}
+static inline int32_t titlebar_glyph_off(void) {
+    return (CLOSE_BUTTON_SIZE - titlebar_glyph_size()) / 2;
+}
+// A fallback glyph's hand-drawn half-extent (arm length, inset from a
+// corner, square half-side), expressed as `num` sixteenths of
+// CLOSE_BUTTON_SIZE so it reproduces the exact 1x literal it replaces
+// (num=3 -> 3px, num=4 -> 4px at the 16px 1x box) and scales with it above.
+static inline int32_t titlebar_glyph_half(int32_t num) {
+    int32_t v = CLOSE_BUTTON_SIZE * num / 16;
+    return (v < 2) ? 2 : v;
+}
+
 // ---- Window decorator popup (#165, Task A redesign) ----------------------
 // Opened by the titlebar decorator button. Anchored under that button and drawn
 // ON TOP of all window content (see wm_draw_decor_popup() call after
@@ -1768,6 +2025,7 @@ void wm_draw_winmenu(void) {
     if (!g_winmenu.open || !g_winmenu.win) return;
     extern int g_win_blit_suppressed;
     if (g_win_blit_suppressed) return;
+    if (wm_fullscreen_active()) return;   // #158: no chrome popups while fullscreen
     window_t *win = g_winmenu.win;
     decor_pal_t p = decor_palette();
     int32_t x = g_winmenu.x, y = g_winmenu.y;
@@ -2024,7 +2282,6 @@ void window_draw(window_t *win) {
         extern int g_win_blit_suppressed;
         if (g_win_blit_suppressed) return;   // screensaver owns the FB; suppress frames + decor
     }
-
     int32_t x = win->bounds.x;
     int32_t y = win->bounds.y;
     int32_t w = win->bounds.width;
@@ -2067,6 +2324,16 @@ void window_draw(window_t *win) {
     if (win->flags & WINDOW_FLAG_NOCHROME) {
         int32_t cx, cy, cw, ch;
         window_get_content_bounds(win, &cx, &cy, &cw, &ch);
+        // #131 (local 151): unconditional again. The #131(150) debounce
+        // gated this fill on the app's content_buffer having "settled"
+        // because the compositor used to blit content_buffer directly -
+        // erasing then blitting a buffer a DIFFERENT process might still be
+        // mid-write to could publish a blank rectangle. The compositor now
+        // blits content_presented (proc/syscall.c, uw_commit_content()),
+        // a read-only snapshot the app's write syscalls never touch, so
+        // this erase-then-reblit sequence is safe again exactly the way it
+        // was before #131 existed: both this fill and the reblit happen
+        // before fb_flip() presents anything to the real screen.
         if (win->opacity >= 255)
             fb_fill_rect(cx, cy, cw, ch, ov_bg);
         widget_t *wd = win->widgets;
@@ -2151,14 +2418,23 @@ void window_draw(window_t *win) {
     {
         int32_t isz = 16;
         int32_t iy = y + BORDER_WIDTH + (TITLEBAR_HEIGHT - isz) / 2;
-        icon_draw_scaled(window_title_icon(win->title), title_x, iy, isz, tb_ink);
+        icon_draw_scaled(window_title_icon(win), title_x, iy, isz, tb_ink);
         title_x += isz + 3;
     }
     // #162: crisp TTF title (smaller/lighter than the chunky bitmap font), with a
     // bitmap fallback if TTF is not ready.
     if (ttf_is_ready()) {
-        int32_t tty = y + BORDER_WIDTH + (TITLEBAR_HEIGHT - 14) / 2;
-        ttf_draw_string(title_x, tty, win->title, 14, tb_ink);
+        // The title's type size comes from the THEME (type.title), which the
+        // global UI scale factor multiplies at the metric accessor, so the
+        // title grows with the title bar instead of staying 14px inside a bar
+        // that got half again as tall. It was the bare literal 14 in both the
+        // draw call and the centring expression - two copies of one number,
+        // the second of which silently stopped centring the moment the first
+        // changed.
+        int32_t title_px = win_metric_or(TM_TYPE_TITLE, 14);
+        if (title_px < 6) title_px = 6;
+        int32_t tty = y + BORDER_WIDTH + (TITLEBAR_HEIGHT - title_px) / 2;
+        ttf_draw_string(title_x, tty, win->title, title_px, tb_ink);
     } else {
         draw_text_transparent(title_x, title_y, win->title, tb_ink);
     }
@@ -2173,64 +2449,96 @@ void window_draw(window_t *win) {
     const theme_t *th_btn = theme_get_current();
     uint32_t btn_hover_bg = th_btn->c_titlebar_btn_hover;
 
+    // #158: native fullscreen button - NEW leftmost slot, left of the cog.
+    // Only ever drawn here: a fullscreen window draws no chrome at all (see
+    // wm_draw_all()'s wm_fullscreen_active() guard), so this button is only
+    // ever visible on a windowed/maximized window, and always means "enter".
+    {
+        int32_t btn_x = titlebar_btn_x(x, w, TITLEBAR_SLOT_FULLSCREEN);
+        uint32_t fill = (win->tb_hover_btn == 5) ? btn_hover_bg : tb_col;
+        fb_fill_rect(btn_x, btn_y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, fill);
+        int32_t gsz = titlebar_glyph_size(), goff = titlebar_glyph_off();
+        if (!kicon_blit("EXPAND", btn_x + goff, btn_y + goff, gsz, tb_ink, fill)) {
+            // fallback: four small L-shaped corner brackets, the universal
+            // "enter fullscreen" glyph. No dependency on a Zest icon existing.
+            int32_t inset0 = titlebar_glyph_half(3), inset1 = titlebar_glyph_half(4);
+            int32_t x0 = btn_x + inset0, y0 = btn_y + inset0;
+            int32_t x1 = btn_x + CLOSE_BUTTON_SIZE - inset1, y1 = btn_y + CLOSE_BUTTON_SIZE - inset1;
+            int32_t arm = titlebar_glyph_half(3);
+            for (int i = 0; i < arm; i++) { fb_put_pixel(x0 + i, y0, tb_ink); fb_put_pixel(x0, y0 + i, tb_ink); }
+            for (int i = 0; i < arm; i++) { fb_put_pixel(x1 - i, y0, tb_ink); fb_put_pixel(x1, y0 + i, tb_ink); }
+            for (int i = 0; i < arm; i++) { fb_put_pixel(x0 + i, y1, tb_ink); fb_put_pixel(x0, y1 - i, tb_ink); }
+            for (int i = 0; i < arm; i++) { fb_put_pixel(x1 - i, y1, tb_ink); fb_put_pixel(x1, y1 - i, tb_ink); }
+        }
+    }
+
     // #165: transparency button (Zest Filter icon) - far left of the button group.
     {
-        int32_t btn_x = x + w - 4 * CLOSE_BUTTON_SIZE - 2 - 3 * TITLEBAR_BUTTON_SPACING;
+        int32_t btn_x = titlebar_btn_x(x, w, TITLEBAR_SLOT_COG);
         uint32_t fill = (win->tb_hover_btn == 1) ? btn_hover_bg : tb_col;
         fb_fill_rect(btn_x, btn_y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, fill);
-        if (!kicon_blit("FILTER", btn_x + 2, btn_y + 2, 12, tb_ink, fill)) {
+        int32_t gsz = titlebar_glyph_size(), goff = titlebar_glyph_off();
+        if (!kicon_blit("FILTER", btn_x + goff, btn_y + goff, gsz, tb_ink, fill)) {
             // fallback: a small funnel/triangle
             int32_t cx = btn_x + CLOSE_BUTTON_SIZE / 2;
             int32_t cy = btn_y + CLOSE_BUTTON_SIZE / 2;
-            for (int i = 0; i < 5; i++) fb_put_pixel(cx - 4 + i, cy - 3 + i, tb_ink);
-            for (int i = 0; i < 5; i++) fb_put_pixel(cx + 4 - i, cy - 3 + i, tb_ink);
-            for (int i = 0; i < 3; i++) fb_put_pixel(cx, cy + 1 + i, tb_ink);
+            int32_t h4 = titlebar_glyph_half(4), h3 = titlebar_glyph_half(3), h1 = titlebar_glyph_half(1);
+            for (int i = 0; i < 5; i++) fb_put_pixel(cx - h4 + i, cy - h3 + i, tb_ink);
+            for (int i = 0; i < 5; i++) fb_put_pixel(cx + h4 - i, cy - h3 + i, tb_ink);
+            for (int i = 0; i < 3; i++) fb_put_pixel(cx, cy + h1 + i, tb_ink);
         }
     }
 
     // #165: minimize button (Zest minus icon).
     {
-        int32_t btn_x = x + w - 3 * CLOSE_BUTTON_SIZE - 2 - 2 * TITLEBAR_BUTTON_SPACING;
+        int32_t btn_x = titlebar_btn_x(x, w, TITLEBAR_SLOT_MINIMIZE);
         uint32_t fill = (win->tb_hover_btn == 2) ? btn_hover_bg : tb_col;
         fb_fill_rect(btn_x, btn_y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, fill);
-        if (!kicon_blit("MINUS", btn_x + 2, btn_y + 2, 12, tb_ink, fill)) {
+        int32_t gsz = titlebar_glyph_size(), goff = titlebar_glyph_off();
+        if (!kicon_blit("MINUS", btn_x + goff, btn_y + goff, gsz, tb_ink, fill)) {
             int32_t cx = btn_x + CLOSE_BUTTON_SIZE / 2;
             int32_t cy = btn_y + CLOSE_BUTTON_SIZE / 2;
-            for (int i = -4; i <= 4; i++) fb_put_pixel(cx + i, cy, tb_ink);
+            int32_t half = titlebar_glyph_half(4);
+            for (int i = -half; i <= half; i++) fb_put_pixel(cx + i, cy, tb_ink);
         }
     }
 
     // Draw maximize button - middle
     {
-        int32_t btn_x = x + w - 2 * CLOSE_BUTTON_SIZE - 2 - TITLEBAR_BUTTON_SPACING;
+        int32_t btn_x = titlebar_btn_x(x, w, TITLEBAR_SLOT_MAXIMIZE);
         uint32_t fill = (win->tb_hover_btn == 3) ? btn_hover_bg : tb_col;
         fb_fill_rect(btn_x, btn_y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, fill);
 
-        // Draw square outline on maximize button
+        // Draw square outline on maximize button. #uiscale: no icon file
+        // backs this one (unlike its four siblings above) - it is ALWAYS
+        // this hand-drawn shape, so a fixed half-side made it the single
+        // most visible "box grew, glyph did not" case in the whole titlebar.
         int32_t cx = btn_x + CLOSE_BUTTON_SIZE / 2;
         int32_t cy = btn_y + CLOSE_BUTTON_SIZE / 2;
-        // Draw a small square (4x4 outline)
-        for (int i = -3; i <= 3; i++) {
-            fb_put_pixel(cx + i, cy - 3, tb_ink);  // Top
-            fb_put_pixel(cx + i, cy + 3, tb_ink);  // Bottom
-            fb_put_pixel(cx - 3, cy + i, tb_ink);  // Left
-            fb_put_pixel(cx + 3, cy + i, tb_ink);  // Right
+        int32_t half = titlebar_glyph_half(3);
+        for (int i = -half; i <= half; i++) {
+            fb_put_pixel(cx + i, cy - half, tb_ink);  // Top
+            fb_put_pixel(cx + i, cy + half, tb_ink);  // Bottom
+            fb_put_pixel(cx - half, cy + i, tb_ink);  // Left
+            fb_put_pixel(cx + half, cy + i, tb_ink);  // Right
         }
     }
 
     // Draw close button - rightmost
     if (win->flags & WINDOW_FLAG_CLOSABLE) {
-        int32_t btn_x = x + w - CLOSE_BUTTON_SIZE - 2;
+        int32_t btn_x = titlebar_btn_x(x, w, TITLEBAR_SLOT_CLOSE);
         // #711 loop 2: close_button_hover is a pre-#711 legacy key that
         // exists in every shipped theme (51-key format) but had never been
         // read anywhere. This is its first consumer.
         uint32_t close_bg = (win->tb_hover_btn == 4) ? THEME_CLOSE_BUTTON_HOVER : THEME_CLOSE_BUTTON;
         fb_fill_rect(btn_x, btn_y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, close_bg);
         // #165: Zest X (xmark) icon, tinted white over the red close button.
-        if (!kicon_blit("XMARK", btn_x + 2, btn_y + 2, 12, 0x00FFFFFF, close_bg)) {
+        int32_t gsz = titlebar_glyph_size(), goff = titlebar_glyph_off();
+        if (!kicon_blit("XMARK", btn_x + goff, btn_y + goff, gsz, 0x00FFFFFF, close_bg)) {
             int32_t cx = btn_x + CLOSE_BUTTON_SIZE / 2;
             int32_t cy = btn_y + CLOSE_BUTTON_SIZE / 2;
-            for (int i = -4; i <= 4; i++) {
+            int32_t half = titlebar_glyph_half(4);
+            for (int i = -half; i <= half; i++) {
                 fb_put_pixel(cx + i, cy + i, tb_ink);
                 fb_put_pixel(cx + i, cy - i, tb_ink);
             }
@@ -2244,6 +2552,12 @@ void window_draw(window_t *win) {
     // color: leave whatever is behind the window (wallpaper / lower windows) so
     // the content blit can alpha-blend against it (true see-through, not a
     // washed-out blend against bg_color).
+    // #131 (local 151): unconditional again - see the matching comment on
+    // the NOCHROME branch above. This fill runs twice per composite (once
+    // from wm_draw_all(), once again from wm_draw_apps() immediately before
+    // the content blit), and both are pre-flip: the compositor now blits
+    // content_presented, a snapshot the app's own write syscalls never
+    // touch, so there is nothing left for this fill to race.
     if (win->opacity >= 255)
         fb_fill_rect(content_x, content_y, content_w, content_h, ov_bg);
 
@@ -2314,6 +2628,11 @@ void window_invalidate(window_t *win) {
 void wm_draw_all(void) {
     extern int g_win_blit_suppressed;
     if (g_win_blit_suppressed) return;   // screensaver owns the FB; don't draw window frames
+    // #158: a fullscreen window owns the whole screen; no window (including
+    // itself) draws kernel chrome. The compositor's fast path
+    // (SYS_WM_FULLSCREEN_RENDER) is what puts that window's content on
+    // screen instead - see the #158 block above window_fullscreen_enter().
+    if (wm_fullscreen_active()) return;
     // #27: snapshot what is behind every cut corner BEFORE any window paints.
     wm_capture_corners();
     // Find the last window (lowest z-order)
@@ -2724,6 +3043,8 @@ bool wm_process_frame(void) {
 
 // Draw all registered app contents (in z-order, back to front)
 void wm_draw_apps(void) {
+    // #158: see the matching guard in wm_draw_all() above - same reasoning.
+    if (wm_fullscreen_active()) return;
     // Draw all windows back to front, with both decorations and app content
     // per window. This ensures the focused (front) window decorations are
     // never obscured by a background window app content.

@@ -90,6 +90,7 @@ typedef struct {
     float scale;
     glyph_cache_entry_t entries[MAX_CACHED_GLYPHS];
     int count;
+    uint64_t lru;   // monotonic stamp of the last use; 0 = slot never claimed
 } size_cache_t;
 
 // One installed font face.
@@ -112,6 +113,10 @@ static int g_nfaces = 0;
 static int g_active = 0;   // active face for the legacy (non-_f) API
 static int ttf_ready = 0;
 
+// The sizes a face's caches are PRE-SEEDED with. These are no longer a closed
+// list of the only sizes that can be rendered (see get_size_cache below); they
+// are the warm start, chosen because they are what the shipped UI asks for at
+// 1x, so a 1x machine behaves exactly as it did before.
 static const int size_cache_sizes[NUM_SIZE_CACHES] = {
     TTF_SIZE_SMALL,  // 12
     14,              // browser small
@@ -121,29 +126,78 @@ static const int size_cache_sizes[NUM_SIZE_CACHES] = {
     TTF_SIZE_LARGE,  // 24
     28,              // browser h1
     TTF_SIZE_XLARGE, // 32
-    // #569: DISPLAY sizes. get_size_cache() snaps every request to the CLOSEST
-    // entry in this table, so before these existed a request for a 64px or
-    // 100px face silently rendered at 32px - which is why the login/lock clock
-    // looked small no matter what size the caller asked for (the userland
-    // compositor hits the same renderer through SYS_DRAW_TTF, so its "size 64"
-    // clock was really 32 too). Two extra slots cost ~5 KB of glyph cache per
-    // face and unlock genuine display-size text.
+    // #569: DISPLAY sizes. Before these existed a request for a 64px or 100px
+    // face silently rendered at 32px - which is why the login/lock clock looked
+    // small no matter what size the caller asked for.
     48,              // display small
     96               // display large (login / lock clock)
 };
 
-static size_cache_t *get_size_cache(font_face_t *f, int size) {
-    // Exact match first
-    for (int i = 0; i < NUM_SIZE_CACHES; i++)
-        if (f->caches[i].size == size) return &f->caches[i];
-    // Closest match
-    int best = 0, best_diff = 1000;
-    for (int i = 0; i < NUM_SIZE_CACHES; i++) {
-        int diff = f->caches[i].size - size;
-        if (diff < 0) diff = -diff;
-        if (diff < best_diff) { best_diff = diff; best = i; }
+// ---------------------------------------------------------------------------
+// THIS USED TO BE A CLOSED LADDER OF TEN SIZES WITH CLOSEST-MATCH SNAPPING, AND
+// THAT IS INCOMPATIBLE WITH A UI SCALE FACTOR.
+//
+// The old get_size_cache() returned the NEAREST of the ten sizes above and
+// rendered at that instead. Measured consequences on the shipped UI, before any
+// scaling existed at all: the 70 call sites asking for 11px and the 14 asking
+// for 10px were ALL already drawing at 12px, and clock.c's 56px was drawing at
+// 48. Text size was quietly not a continuous quantity.
+//
+// Under a global scale that becomes actively wrong rather than merely blunt,
+// because the snapping is NON-UNIFORM. At 1.5x: 16 -> 24 (exactly 1.5x), but
+// 14 -> 21 -> snapped to 20 (1.43x), 20 -> 30 -> snapped to 28 (1.40x), and
+// 28 -> 42 -> snapped to 48 (1.71x). Body text, headings and captions would
+// each grow by a DIFFERENT factor. The type hierarchy the style guide defines
+// would visibly break, and it would read as a rendering bug.
+//
+// So the slots become an LRU cache keyed by the size actually requested. Any
+// size renders at that size, exactly. Cost: nothing at 1x (the ten seeded sizes
+// are the ten the UI asks for, so every lookup is still an exact hit), and no
+// extra memory at any scale, because the number of slots is unchanged. The
+// risk it introduces is THRASHING if more than NUM_SIZE_CACHES distinct sizes
+// are live at once: eviction frees that slot's glyph bitmaps and the next use
+// re-rasterises. That is a performance cliff, not a correctness one, and it is
+// strictly better than the alternative, which was silently drawing the wrong
+// size. NUM_SIZE_CACHES is 10 and the shipped UI uses about eight distinct
+// sizes at a time; if that ever stops being true, raise NUM_SIZE_CACHES (each
+// slot costs ~5 KB per face) rather than reinstating snapping.
+// ---------------------------------------------------------------------------
+static uint64_t g_size_cache_clock = 1;
+
+static void size_cache_release(size_cache_t *c) {
+    for (int i = 0; i < MAX_CACHED_GLYPHS; i++) {
+        if (c->entries[i].glyph.bitmap) {
+            kfree(c->entries[i].glyph.bitmap);
+            c->entries[i].glyph.bitmap = NULL;
+        }
     }
-    return &f->caches[best];
+    c->count = 0;
+}
+
+static size_cache_t *get_size_cache(font_face_t *f, int size) {
+    if (size < 1) size = 1;
+    // Exact match: the only outcome on an unscaled machine.
+    for (int i = 0; i < NUM_SIZE_CACHES; i++) {
+        if (f->caches[i].size == size) {
+            f->caches[i].lru = g_size_cache_clock++;
+            return &f->caches[i];
+        }
+    }
+    // No exact slot. Take an unclaimed one if there is one, else the least
+    // recently used, and RE-KEY it to the requested size. Never snap: a
+    // caller that asked for 21 gets 21.
+    int victim = -1;
+    uint64_t oldest = (uint64_t)-1;
+    for (int i = 0; i < NUM_SIZE_CACHES; i++) {
+        if (f->caches[i].size == 0) { victim = i; break; }
+        if (f->caches[i].lru < oldest) { oldest = f->caches[i].lru; victim = i; }
+    }
+    if (victim < 0) victim = 0;
+    size_cache_release(&f->caches[victim]);
+    f->caches[victim].size  = size;
+    f->caches[victim].scale = stbtt_ScaleForPixelHeight(&f->info, (float)size);
+    f->caches[victim].lru   = g_size_cache_clock++;
+    return &f->caches[victim];
 }
 
 static font_face_t *face_at(int idx) {
@@ -295,6 +349,7 @@ static int face_full_load(font_face_t *f, const char *fallback_name, int fill_na
         f->caches[i].size  = size_cache_sizes[i];
         f->caches[i].scale = stbtt_ScaleForPixelHeight(&f->info, (float)size_cache_sizes[i]);
         f->caches[i].count = 0;
+        f->caches[i].lru   = 0;   // seeded, never yet used: evicted first
     }
     if (fill_names)
         extract_names(&f->info, f->name, TTF_NAME_MAX, f->style, TTF_STYLE_MAX, fallback_name);
@@ -601,9 +656,22 @@ ttf_glyph_t *ttf_get_glyph_f(int face_idx, int codepoint, int size, int style) {
     size_cache_t *cache = get_size_cache(f, size);
 
     /* CRITICAL (#302): the glyph cache is SHARED global state and stb_truetype
-       uses SSE float math (context_switch.asm does NOT save/restore xmm). Hold
-       the whole operation in one interrupt-disabled critical section and
-       SAVE/RESTORE RFLAGS so nested calls do not prematurely re-enable IRQs. */
+       uses SSE float math (this file is compiled with TTF_CFLAGS, Makefile:1725,
+       which strips -mno-sse/-mno-sse2 and adds -msse -msse2, unlike the rest of
+       the kernel). Hold the whole operation in one interrupt-disabled critical
+       section and SAVE/RESTORE RFLAGS so nested calls do not prematurely
+       re-enable IRQs.
+
+       CORRECTED 2026-08-15 (#151). This comment used to justify the cli with
+       "context_switch.asm does NOT save/restore xmm". That is FALSE, and has
+       been since #446/#588: proc/context_switch.asm does fxsave64 (or xsave64
+       where XCR0 covers AVX) of the FULL FPU/SSE state on EVERY switch, so
+       being PREEMPTED here is safe on its own. What is still true, and is the
+       real reason the cli stays, is that INTERRUPT ENTRY saves no xmm at all
+       (cpu/idt.asm pushes 15 GPRs and nothing else), so an ISR that touched xmm
+       would corrupt the rasterizer mid-glyph; kernel C being built -mno-sse is
+       what stops that. The shared-cache race is the second, independent
+       reason. */
     uint64_t saved_flags;
     __asm__ volatile("pushfq; pop %0; cli" : "=r"(saved_flags) :: "memory");
     #define TTF_GLYPH_RETURN(v) do { \
@@ -618,20 +686,15 @@ ttf_glyph_t *ttf_get_glyph_f(int face_idx, int codepoint, int size, int style) {
         }
     }
 
-    // Cache full: evict all
+    // Cache full: evict all (one shared release path with the size-slot
+    // eviction above, so a bitmap can only ever be freed by one piece of code)
     if (cache->count >= MAX_CACHED_GLYPHS) {
-        for (int i = 0; i < MAX_CACHED_GLYPHS; i++) {
-            if (cache->entries[i].glyph.bitmap) {
-                kfree(cache->entries[i].glyph.bitmap);
-                cache->entries[i].glyph.bitmap = NULL;
-            }
-        }
-        cache->count = 0;
+        size_cache_release(cache);
     }
 
     glyph_cache_entry_t *entry = &cache->entries[cache->count];
 
-    // Render glyph (interrupts already disabled -> xmm safe across the rasterizer)
+    // Render glyph (interrupts already disabled: no ISR can clobber xmm here)
     int w, h, xoff, yoff;
     uint8_t *bmp = stbtt_GetCodepointBitmap(
         &f->info, cache->scale, cache->scale,

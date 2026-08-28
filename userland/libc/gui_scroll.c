@@ -284,6 +284,58 @@ void gui_scroll_colors(int hot, uint32_t surface,
                      : rest;
 }
 
+// (#117) The walk this used to do inline (walk_dir(), forcing each side of
+// the bevel to a pinned dark/light direction rather than letting the
+// caller-agnostic gui_ensure_contrast() choose) turned out to be exactly
+// what gui_checkbox(), gui_textfield2(), gui_card() and gui_button()'s
+// CLASSIC bevel needed too - they had each been carrying their own copy of
+// the OLD fixed-magnitude bug (a hardcoded darken(70)/lighten(80) or
+// similar) that this trough fix (#96) was written to replace. Rather than
+// forking a second copy of the walk into gui.c, it moved THERE as the
+// general-purpose gui_bevel_pair() (gui.c/gui_style.h) and this function is
+// now a one-line wrapper, so the trough and every other bevelled widget
+// share one repair. See gui_bevel_pair()'s comment in gui.c for the full
+// rationale; this wrapper's own doc comment in gui_scroll.h is unchanged
+// because every existing caller's contract (surface in, shadow/highlight
+// out) is identical.
+void gui_scroll_trough_bevel(uint32_t surface, uint32_t *shadow_out, uint32_t *highlight_out) {
+    gui_bevel_pair(surface, shadow_out, highlight_out);
+}
+
+// (#117) The trough boundary draw itself, factored out of gui_scroll_draw_on()
+// so the apps that own their OWN scrollbar geometry (Files' two lists, the
+// browser page bar, the recycle bin - see gui_scroll_colors()'s comment for
+// why they exist) can draw the SAME boundary this widget draws, instead of
+// getting only the fill/thumb colours and staying borderless. Before this,
+// those apps called gui_scroll_colors() for colour and drew their own
+// track+thumb rects with no edge at all, so their troughs never inherited
+// #96's fix even though the shared widget did.
+// `track` is the trough's own fill colour (from gui_scroll_colors()); it is
+// the background the MODERN/FLAT single ring is measured against being
+// perceptible FROM, same as gui_scroll_draw_on() below. `surface` is what the
+// gutter sits on, same meaning as everywhere else in this file.
+void gui_scroll_trough_border(int handle, int x, int y, int w, int h,
+                              uint32_t track, uint32_t surface) {
+    // gui_active_style() is used instead of a compile-time family because the
+    // active theme can flip it at runtime (Settings > Appearance).
+    if (gui_active_style().base == GUI_STYLE_CLASSIC) {
+        uint32_t shadow, hi;
+        gui_scroll_trough_bevel(surface, &shadow, &hi);
+        win_draw_rect(handle, x, y, w, 1, shadow);              // top
+        win_draw_rect(handle, x, y, 1, h, shadow);              // left
+        win_draw_rect(handle, x, y + h - 1, w, 1, hi);           // bottom
+        win_draw_rect(handle, x + w - 1, y, 1, h, hi);          // right
+    } else {
+        // Modern/flat: a single edge_strong-style ring, the same treatment
+        // gui_progress() already gives its well, rather than a two-tone bevel.
+        uint32_t edge = gui_ensure_contrast(track, surface, GUI_AIM_NONTEXT);
+        win_draw_rect(handle, x, y, w, 1, edge);
+        win_draw_rect(handle, x, y, 1, h, edge);
+        win_draw_rect(handle, x, y + h - 1, w, 1, edge);
+        win_draw_rect(handle, x + w - 1, y, 1, h, edge);
+    }
+}
+
 void gui_scroll_draw_on(int handle, const gui_scroll_t *s, uint32_t surface) {
     if (!s) return;
     int ty, th;
@@ -294,6 +346,9 @@ void gui_scroll_draw_on(int handle, const gui_scroll_t *s, uint32_t surface) {
     gui_scroll_colors(s->drag || s->hover, surface, &track, &thumb);
 
     win_draw_rect(handle, bx, s->y, GUI_SCROLL_W, s->h, track);
+    // (#96) The fill alone leaves the trough with no perceptible edge (see
+    // gui_scroll_trough_bevel()'s comment in gui_scroll.h for the measurement).
+    gui_scroll_trough_border(handle, bx, s->y, GUI_SCROLL_W, s->h, track, surface);
     win_draw_rect(handle, bx + 2, ty, GUI_SCROLL_W - 4, th, thumb);
 }
 

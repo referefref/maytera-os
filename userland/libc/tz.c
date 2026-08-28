@@ -8,6 +8,7 @@
 #include "tz.h"
 #include "userconf.h"
 #include "syscall.h"
+#include "stdio.h"   // #148: snprintf() for tz_local_stamp()
 
 // ---------------------------------------------------------------------------
 // THE list. 35 zones, ORDERED BY ASCENDING OFFSET.
@@ -334,4 +335,13 @@ void tz_local_date(int *day, int *month, int *year) {
     if (day)   *day   = t.day;
     if (month) *month = t.month;
     if (year)  *year  = t.year;
+}
+
+// #148: see tz.h. Zero-padded 4/2/2/2/2/2 so string sort == time sort.
+void tz_local_stamp(char *out, unsigned long cap) {
+    if (!out || cap == 0) return;
+    tz_time_t t;
+    tz_local_now(&t);
+    snprintf(out, cap, "%04d%02d%02d-%02d%02d%02d",
+             t.year, t.month, t.day, t.hour, t.min, t.sec);
 }

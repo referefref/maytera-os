@@ -293,30 +293,28 @@ void gui_itoa_hex(unsigned long num, char *buf, int digits) {
 }
 
 // ============== Fullscreen/Direct Framebuffer Syscalls ==============
-
-#define SYS_FB_INFO         90
-#define SYS_FB_MAP          91
-#define SYS_FB_FLIP         92
-#define SYS_FB_EXCLUSIVE    93
-
-extern long syscall1(long num, long arg1);
-extern long syscall0(long num);
-
-// Get framebuffer info - returns width | (height << 16) | (pitch << 32)
-long fb_get_info(int *width, int *height, int *pitch) {
-    long result = syscall0(SYS_FB_INFO);
-    if (width) *width = result & 0xFFFF;
-    if (height) *height = (result >> 16) & 0xFFFF;
-    if (pitch) *pitch = (result >> 32) & 0xFFFFFFFF;
-    return result;
-}
-
-// fb_map() and fb_flip() are provided as static inline in syscall.h
-
-// Enter or exit exclusive fullscreen mode
-void fb_set_exclusive(int enable) {
-    syscall1(SYS_FB_EXCLUSIVE, enable);
-}
+//
+// REMOVED at #222. This block held a SECOND set of SYS_FB_* numbers:
+//
+//     #define SYS_FB_INFO 90 / SYS_FB_MAP 91 / SYS_FB_FLIP 92 / SYS_FB_EXCLUSIVE 93
+//
+// written BELOW the #include "syscall.h" above, which defines the real ones as
+// SYS_FB_MAP 200, SYS_FB_INFO 201, SYS_FB_FLIP 202. The later definition wins,
+// so the two functions that lived here did not call the framebuffer at all:
+// 90 is SYS_DUP and 93 is SYS_FCNTL. fb_get_info() duplicated a file descriptor
+// and reported the returned fd as width | height<<16 | pitch<<32;
+// fb_set_exclusive() performed an fcntl. SYS_FB_EXCLUSIVE never existed in the
+// kernel at any number.
+//
+// Nothing called either one, which is why it survived: userland/libc/gui.h does
+// not declare them, and DOOM (i_video.c) carries its own static inline copies
+// that use the correct 201 and SYS_GRAB_INPUT 213. So this was a latent trap,
+// not a live fault - the first caller would have got SYS_DUP.
+//
+// They are DELETED rather than renumbered because the shared primitive already
+// exists and is correct: syscall.h provides fb_map(), fb_info(fb_info_t *),
+// fb_flip() and fb_damage() as static inlines against the real numbers. A
+// third hand-rolled copy is the fault this ticket is about.
 
 // ============================================================================
 // Widget-Style Engine (Phase 0-2) - see gui_style.h
@@ -512,6 +510,58 @@ uint32_t gui_ensure_contrast2(uint32_t fg, uint32_t bg1, uint32_t bg2, int min_x
     return best_t < 256 ? best_clear : best;
 }
 
+// (#117) Generic two-tone bevel pair. Walk `base` independently toward pure
+// black (shadow) and pure white (highlight) until each side clears
+// GUI_AIM_NONTEXT against `base` ITSELF (the colour the bevel sits on: the
+// surrounding surface for a sunken well like a checkbox/textfield, or the
+// element's own raised fill like a card/button), forcing the DIRECTION per
+// side rather than letting gui_ensure_contrast() pick whichever is easier -
+// a bevel needs one side pinned dark and the other pinned light regardless
+// of which an automatic chooser would prefer.
+//
+// WHY THIS EXISTS (#117, following on from #96). gui_scroll_trough_bevel()
+// was the first widget to get this treatment: #96 found the shared
+// scrollbar trough at 1.00-1.42:1 against its surface on every shipped
+// theme and fixed it by walking each side to a floor instead of a fixed
+// offset. #96's own comment on that function already flagged that
+// gui_checkbox() and gui_textfield2() used the SAME fixed darken(70)/
+// lighten(80) magnitude the trough used to, measured BELOW the floor on
+// every sampled theme - that finding is ticket #117. Auditing the rest of
+// the shared widget library (userland/libc/gui.c) found the identical
+// defect in gui_card() (lighten(70)/darken(60) of surface_raised) and
+// gui_button()'s CLASSIC bevel (darken(40..55)/lighten(70) of the button's
+// own fill). All four now call this ONE walk instead of each carrying its
+// own fixed-offset copy, and gui_scroll_trough_bevel() itself is now a
+// one-line wrapper around it so the scrollbar trough and every other
+// bevelled widget share one repair instead of five near-identical copies.
+//
+// *cleared (returned via the two _ok flags at the call site) is 0 only when
+// even full saturation (pure black/white) cannot clear the floor, which is
+// only possible when `base` is already at that extreme (gui_style.h's own
+// guarantee: at least one of pure white or pure black always reaches
+// 4.58:1 against any background, so at most one direction can ever fail).
+static uint32_t gs_bevel_walk(uint32_t from, uint32_t bg, int min_x100, int to_white, int *cleared) {
+    uint32_t target = to_white ? 0x00FFFFFF : 0x00000000;
+    if (gui_contrast_x100(from, bg) >= min_x100) { *cleared = 1; return from; }
+    for (int t = 8; t < 256; t += 8) {
+        uint32_t c = gui_mix(from, target, t);
+        if (gui_contrast_x100(c, bg) >= min_x100) { *cleared = 1; return c; }
+    }
+    *cleared = (gui_contrast_x100(target, bg) >= min_x100);
+    return target;
+}
+
+void gui_bevel_pair(uint32_t base, uint32_t *shadow_out, uint32_t *highlight_out) {
+    int dark_ok, light_ok;
+    uint32_t dark  = gs_bevel_walk(base, base, GUI_AIM_NONTEXT, 0, &dark_ok);
+    uint32_t light = gs_bevel_walk(base, base, GUI_AIM_NONTEXT, 1, &light_ok);
+    // Both directions saturating without clearing cannot happen (see the
+    // comment above), so at least one of the two `_ok` flags is set and the
+    // fallback below always has something to fall back TO.
+    if (shadow_out)    *shadow_out    = dark_ok  ? dark  : light;
+    if (highlight_out) *highlight_out = light_ok ? light : dark;
+}
+
 static int gs_isqrt(int n) { if (n<=0) return 0; int x=n, y=(x+1)/2; while (y<x){ x=y; y=(x+n/x)/2; } return x; }
 static int gs_corner_inset(int r, int d) {
     if (r <= 0) return 0;
@@ -595,6 +645,59 @@ int gui_ttf_render_width(const char *s, int size) {
     return gui_ttf_width(s, size);
 }
 
+// #204: word-wrap `body` into up to `max_lines` lines that each fit `max_w`
+// pixels at TTF size `size`, measured with the REAL glyph metrics
+// (gui_ttf_width) - a proportional TTF face has no fixed char width, so
+// guessing "N chars per line" is wrong for any string with wide glyphs.
+// Breaks at the last space that still fits; a single word wider than max_w
+// is hard-broken so it can never leave the box. Any text left over once
+// max_lines is reached is dropped and the last line ellipsized (real-
+// measured, not a fixed suffix count) so it still fits. Verbatim port of
+// the compositor's notif.c wrap_text_ttf() (#762) - same algorithm, a
+// second copy only because gui_confirm_open() (this file's caller) runs in
+// an app process, not the compositor, and has no text_width_ttf() to call.
+int gui_wrap_text_ttf(const char *body, int size, int max_w, int max_lines,
+                      char out[][GUI_WRAP_COL]) {
+    int nlines = 0;
+    const char *p = body;
+    while (*p && nlines < max_lines) {
+        int len = 0, last_space = -1;
+        char probe[GUI_WRAP_COL];
+        while (p[len]) {
+            if (p[len] == ' ' && len > 0) last_space = len;
+            int pl = len + 1; if (pl > GUI_WRAP_COL - 1) pl = GUI_WRAP_COL - 1;
+            memcpy(probe, p, pl); probe[pl] = 0;
+            if (gui_ttf_width(probe, size) > max_w) break;
+            if (pl >= GUI_WRAP_COL - 1) { len = pl; break; }
+            len++;
+        }
+        int cut;
+        if (!p[len]) {
+            cut = len;                 // rest of the string fits on this line
+        } else if (last_space > 0) {
+            cut = last_space;          // break at the last word boundary that fit
+        } else {
+            cut = (len > 0) ? len : 1; // single word wider than max_w: hard-break it
+        }
+        int cl = cut; if (cl > GUI_WRAP_COL - 1) cl = GUI_WRAP_COL - 1;
+        memcpy(out[nlines], p, cl); out[nlines][cl] = 0;
+        nlines++;
+        p += cut;
+        while (*p == ' ') p++;
+    }
+    if (*p && nlines > 0) {
+        // Text remains beyond max_lines: ellipsize the last line, measuring
+        // the actual "..." glyph width rather than assuming a fixed suffix.
+        char *last = out[nlines - 1];
+        int ellw = gui_ttf_width("...", size);
+        int l = (int)strlen(last);
+        while (l > 0 && gui_ttf_width(last, size) + ellw > max_w) last[--l] = 0;
+        if (l + 3 < GUI_WRAP_COL) { last[l]='.'; last[l+1]='.'; last[l+2]='.'; last[l+3]=0; }
+    }
+    if (nlines < 1) { nlines = 1; out[0][0] = 0; }
+    return nlines;
+}
+
 void gui_text_ttf_centered(int handle, int x, int y, int w, int h,
                            const char *s, uint32_t color, int size) {
     // #B3: center using the RENDERED width (see gui_ttf_render_width above),
@@ -616,6 +719,28 @@ void gui_text_ttf_centered(int handle, int x, int y, int w, int h,
     if (line_h <= 0) line_h = size;
     int ty = y + (h - line_h) / 2; if (ty < y) ty = y;
     win_draw_text_ttf(handle, tx, ty, s, size, color);
+}
+
+// (#307 follow-up) See gui_style.h for why this lives here and not as a
+// private static in one app. Rows/columns of width 7,5,3,1 from base to apex,
+// centred on (cx, cy). 7 is odd and a chevron is usually centred in an
+// even-sized box, so one side keeps a 1px larger margin; that is inherent to
+// an odd-width mark, not a centring error.
+void gui_chevron(int handle, int cx, int cy, int dir, uint32_t col) {
+    for (int r = 0; r < 4; r++) {
+        int w = 7 - r * 2;                 // 7, 5, 3, 1 - base first, apex last
+        if (w < 1) w = 1;
+        switch (dir) {
+        case GUI_CHEV_DOWN:                // base at top, apex at bottom
+            win_draw_rect(handle, cx - w / 2, cy - 2 + r, w, 1, col); break;
+        case GUI_CHEV_UP:                  // base at bottom, apex at top
+            win_draw_rect(handle, cx - w / 2, cy + 1 - r, w, 1, col); break;
+        case GUI_CHEV_RIGHT:               // base at left, apex at right
+            win_draw_rect(handle, cx - 2 + r, cy - w / 2, 1, w, col); break;
+        default:                           // GUI_CHEV_LEFT
+            win_draw_rect(handle, cx + 1 - r, cy - w / 2, 1, w, col); break;
+        }
+    }
 }
 
 void gui_fill_rounded_grad(int handle, int x, int y, int w, int h, int r,
@@ -778,20 +903,64 @@ void gui_button(int handle, int x, int y, int w, int h, const char *label,
     gui_palette_t *p = gui_pal();
     bool disabled = (st == GUI_ST_DISABLED);
     uint32_t base, ink, bord;
-    if (variant == GUI_BTN_PRIMARY)      { base = p->accent; ink = gui_ink_on(p->accent); bord = gui_darken(p->accent, 40); }
+    // (#117) bord used to be a FIXED gui_darken(x,40) regardless of what
+    // p->surface actually was, which on a dark theme (base already close to
+    // black) barely moves and can land below GUI_FLOOR_NONTEXT against the
+    // surface the button sits on. gui_ensure_contrast() keeps the darkened
+    // hue as its starting point and only walks further if that starting
+    // point does not already clear the floor, so most themes are unchanged.
+    if (variant == GUI_BTN_PRIMARY)      { base = p->accent; ink = gui_ink_on(p->accent); bord = gui_ensure_contrast(gui_darken(p->accent, 40), p->surface, GUI_FLOOR_NONTEXT); }
     else if (variant == GUI_BTN_GHOST)   { base = p->surface; ink = p->accent; bord = p->edge_strong; }
-    else if (variant == GUI_BTN_SUCCESS) { base = 0x003FA34D; ink = gui_ink_on(0x003FA34D); bord = gui_darken(0x003FA34D, 40); }
+    else if (variant == GUI_BTN_SUCCESS) { base = 0x003FA34D; ink = gui_ink_on(0x003FA34D); bord = gui_ensure_contrast(gui_darken(0x003FA34D, 40), p->surface, GUI_FLOOR_NONTEXT); }
+    // (#appstyle) DANGER reads the theme's own error token rather than pinning
+    // a literal the way SUCCESS above has to: every shipped .mtheme defines
+    // color_error and they differ on purpose. theme_color() answering 0 (an
+    // older kernel, or a theme with the key missing) would render an invisible
+    // black button, so a red fallback is applied on exactly that condition -
+    // this is a "0 means unset" test on a colour that no theme would ever
+    // legitimately author as pure black for an error state.
+    else if (variant == GUI_BTN_DANGER)  { base = theme_color(THEME_COLOR_ERROR); if (!base) base = 0x00CC0000;
+                                           ink = gui_ink_on(base); bord = gui_ensure_contrast(gui_darken(base, 40), p->surface, GUI_FLOOR_NONTEXT); }
     else                                 { base = gui_mix(p->surface_raised, p->ink, 8); ink = p->ink; bord = p->edge_strong; }
     if (!disabled) {
         if (st == GUI_ST_HOVER)        base = (variant==GUI_BTN_PRIMARY) ? p->accent_hover : gui_lighten(base, 18);
         else if (st == GUI_ST_PRESSED) base = gui_darken(base, 18);
-    } else { base = gui_mix(base, p->surface, 150); ink = gui_mix(ink, p->surface, 110); }
+    } else {
+        base = gui_mix(base, p->surface, 150);
+        ink  = gui_mix(ink,  p->surface, 110);
+        // (#appstyle) ...AND THEN GUARANTEE THE DISABLED LABEL IS STILL
+        // READABLE. Both lines above walk toward p->surface by a FIXED amount,
+        // which works for a SECONDARY button (whose ink was already the surface
+        // ink) and fails for every saturated variant, because their ink is
+        // gui_ink_on(base) - white on a red or teal fill. Mixing white 110/255
+        // toward a light surface leaves white-on-pale: MEASURED on the
+        // installer's disabled "Erase and install" (GUI_BTN_DANGER on
+        // retro_unix) the label was invisible, and disabled PRIMARY had the
+        // same fault everywhere it appears.
+        //
+        // The floor is the 3:1 NON-TEXT one, not the 4.5:1 text one, and that
+        // is deliberate: WCAG 1.4.3 exempts disabled controls, and lifting them
+        // to full text contrast would delete the visual difference between
+        // "you can press this" and "you cannot", which is the whole point of
+        // the state. 3:1 keeps the label clearly de-emphasised AND readable,
+        // which matters most on exactly the screens where a disabled button is
+        // telling the user what they have not done yet.
+        ink = gui_ensure_contrast(ink, base, GUI_FLOOR_NONTEXT);
+    }
 
     if (g_style.base == GUI_STYLE_CLASSIC) {
         bool pressed = (st == GUI_ST_PRESSED);
         win_draw_rect(handle, x, y, w, h, base);
-        uint32_t lt = pressed ? gui_darken(base,40) : gui_lighten(base,70);
-        uint32_t dk = pressed ? gui_lighten(base,70) : gui_darken(base,55);
+        // (#117) was a fixed darken(40/55)/lighten(70) of `base`, the same
+        // defect class as the checkbox/textfield/card bevels below: see
+        // gui_bevel_pair()'s comment. shadow/highlight are `base` walked to
+        // GUI_AIM_NONTEXT against `base` itself; not-pressed shows the raised
+        // look (highlight top/left), pressed shows the sunken press feedback
+        // (shadow top/left), same swap the fixed-magnitude code did.
+        uint32_t shadow, highlight;
+        gui_bevel_pair(base, &shadow, &highlight);
+        uint32_t lt = pressed ? shadow : highlight;
+        uint32_t dk = pressed ? highlight : shadow;
         win_draw_rect(handle, x, y, w, 2, lt);
         win_draw_rect(handle, x, y, 2, h, lt);
         win_draw_rect(handle, x, y+h-2, w, 2, dk);
@@ -833,15 +1002,25 @@ void gui_checkbox(int handle, int x, int y, int sz, bool checked,
     gui_palette_t *p = gui_pal();
     bool disabled = (st == GUI_ST_DISABLED);
     uint32_t boxbg = checked ? p->accent : p->field_bg;
-    uint32_t bord  = checked ? gui_darken(p->accent,30) : p->field_border;
+    // (#117) checked-ring border used to be a fixed gui_darken(accent,30);
+    // gui_ensure_contrast() keeps that as its starting point and only walks
+    // further where it does not already clear the floor against p->surface
+    // (the ring is drawn by gui_fill_rounded_aa below, blended toward
+    // p->surface at its AA edge, so that is the background that matters).
+    uint32_t bord  = checked ? gui_ensure_contrast(gui_darken(p->accent,30), p->surface, GUI_FLOOR_NONTEXT) : p->field_border;
     if (disabled) boxbg = gui_mix(boxbg, p->surface, 130);
 
     if (g_style.base == GUI_STYLE_CLASSIC) {
         win_draw_rect(handle, x, y, sz, sz, checked ? p->accent : 0x00FFFFFF);
-        win_draw_rect(handle, x, y, sz, 1, gui_darken(p->surface,70));
-        win_draw_rect(handle, x, y, 1, sz, gui_darken(p->surface,70));
-        win_draw_rect(handle, x, y+sz-1, sz, 1, gui_lighten(p->surface,80));
-        win_draw_rect(handle, x+sz-1, y, 1, sz, gui_lighten(p->surface,80));
+        // (#117) was a fixed darken(70)/lighten(80) of p->surface - the
+        // exact defect this ticket is about (measured 1.82:1 on retro_unix).
+        // gui_bevel_pair() walks each side to GUI_AIM_NONTEXT instead.
+        uint32_t shadow, hi;
+        gui_bevel_pair(p->surface, &shadow, &hi);
+        win_draw_rect(handle, x, y, sz, 1, shadow);
+        win_draw_rect(handle, x, y, 1, sz, shadow);
+        win_draw_rect(handle, x, y+sz-1, sz, 1, hi);
+        win_draw_rect(handle, x+sz-1, y, 1, sz, hi);
     } else {
         int r = (g_style.base == GUI_STYLE_MODERN) ? 4 : 0;
         gui_fill_rounded_aa(handle, x, y, sz, sz, r, bord, p->surface);
@@ -865,20 +1044,34 @@ void gui_checkbox(int handle, int x, int y, int sz, bool checked,
 
 void gui_toggle(int handle, int x, int y, int w, int h, bool on, gui_state_t st) {
     gui_palette_t *p = gui_pal();
-    (void)st;
+    // (#237) st used to be entirely ignored ((void)st;) - gui_toggle() was the
+    // one shared control with no GUI_ST_DISABLED treatment at all, discovered
+    // while giving the Wi-Fi/Bluetooth panels an inert power switch (a real
+    // adapter detected with no driver to back it, #237). Faded the same way
+    // gui_button()/gui_checkbox() already fade toward p->surface, so a
+    // disabled toggle now actually reads as disabled instead of looking live.
+    bool disabled = (st == GUI_ST_DISABLED);
     uint32_t tr = on ? p->accent : p->field_bg;
+    if (disabled) tr = gui_mix(tr, p->surface, 140);
     if (g_style.base == GUI_STYLE_CLASSIC) {
         win_draw_rect(handle, x, y, w, h, tr);
-        gui_draw_rect_outline(handle, x, y, w, h, on ? gui_darken(p->accent,30) : p->field_border);
+        // (#117) was a fixed gui_darken(accent,30); repaired against
+        // p->surface (the panel the toggle sits on) the same way as the
+        // checkbox's checked-ring border above.
+        uint32_t bord = on ? gui_ensure_contrast(gui_darken(p->accent,30), p->surface, GUI_FLOOR_NONTEXT) : p->field_border;
+        if (disabled) bord = gui_mix(bord, p->surface, 140);
+        gui_draw_rect_outline(handle, x, y, w, h, bord);
         int kx = on ? (x + w - (h-4) - 2) : (x + 2);
-        win_draw_rect(handle, kx, y+2, h-4, h-4, p->surface_raised);
-        gui_draw_rect_outline(handle, kx, y+2, h-4, h-4, p->border);
+        uint32_t knob = disabled ? gui_mix(p->surface_raised, p->surface, 140) : p->surface_raised;
+        uint32_t kbord = disabled ? gui_mix(p->border, p->surface, 140) : p->border;
+        win_draw_rect(handle, kx, y+2, h-4, h-4, knob);
+        gui_draw_rect_outline(handle, kx, y+2, h-4, h-4, kbord);
     } else {
         int r = h/2;
         gui_fill_rounded_aa(handle, x, y, w, h, r, tr, p->surface);
-        if (!on) gui_rounded_border(handle, x, y, w, h, r, p->field_border);
+        if (!on) gui_rounded_border(handle, x, y, w, h, r, disabled ? gui_mix(p->field_border, p->surface, 140) : p->field_border);
         int kd = h - 6, kx = on ? (x + w - kd - 3) : (x + 3), ky = y + 3;
-        if (g_style.shadows) gui_fill_circle_aa(handle, kx+1, ky+1, kd, gui_mix(tr, 0x00000000, 45), tr);
+        if (g_style.shadows && !disabled) gui_fill_circle_aa(handle, kx+1, ky+1, kd, gui_mix(tr, 0x00000000, 45), tr);
         gui_fill_circle_aa(handle, kx, ky, kd, 0x00FFFFFF, tr);
     }
 }
@@ -906,7 +1099,12 @@ void gui_slider(int handle, int x, int y, int w, int value, int max_val, gui_sta
         if (tx < x) tx = x; if (tx > x + w - td) tx = x + w - td;
         if (g_style.shadows) gui_fill_circle_aa(handle, tx+1, y+1, td, gui_mix(p->surface, 0x00000000, 45), p->surface);
         gui_fill_circle_aa(handle, tx, y, td, 0x00FFFFFF, p->surface);
-        gui_rounded_border(handle, tx, y, td, td, td/2, gui_darken(p->accent, 20));
+        // (#117) was a fixed gui_darken(accent,20). The ring sits between the
+        // thumb's own pure-white fill (inside) and p->surface (outside, via
+        // the AA blend above), so it has to clear the floor against BOTH -
+        // gui_ensure_contrast2() is the same two-background repair
+        // gui_set_palette() already uses for the focus ring.
+        gui_rounded_border(handle, tx, y, td, td, td/2, gui_ensure_contrast2(gui_darken(p->accent, 20), 0x00FFFFFF, p->surface, GUI_FLOOR_NONTEXT));
     }
 }
 
@@ -914,16 +1112,81 @@ void gui_textfield2(int handle, int x, int y, int w, int h, const char *text, bo
     gui_palette_t *p = gui_pal();
     if (g_style.base == GUI_STYLE_CLASSIC) {
         win_draw_rect(handle, x, y, w, h, p->field_bg);
-        win_draw_rect(handle, x, y, w, 1, gui_darken(p->surface,70));
-        win_draw_rect(handle, x, y, 1, h, gui_darken(p->surface,70));
-        win_draw_rect(handle, x, y+h-1, w, 1, gui_lighten(p->surface,80));
-        win_draw_rect(handle, x+w-1, y, 1, h, gui_lighten(p->surface,80));
+        // (#117) NAMED IN THE TICKET: was a fixed darken(70)/lighten(80) of
+        // p->surface, measured 1.27:1 on retro_unix. See gui_bevel_pair().
+        uint32_t shadow, hi;
+        gui_bevel_pair(p->surface, &shadow, &hi);
+        win_draw_rect(handle, x, y, w, 1, shadow);
+        win_draw_rect(handle, x, y, 1, h, shadow);
+        win_draw_rect(handle, x, y+h-1, w, 1, hi);
+        win_draw_rect(handle, x+w-1, y, 1, h, hi);
     } else {
         int r = (g_style.base == GUI_STYLE_MODERN) ? GUI_RADIUS : 0;
         gui_fill_rounded(handle, x, y, w, h, r, focused ? p->focus : p->field_border);
         gui_fill_rounded(handle, x+1, y+1, w-2, h-2, r>0?r-1:0, p->field_bg);
     }
     if (text && *text) win_draw_text_ttf(handle, x+8, y + (h-GUI_TTF_SIZE)/2, text, GUI_TTF_SIZE, p->ink);
+}
+
+// (#appstyle) See gui_style.h for why this exists and why it takes primitives.
+// The chrome is gui_textfield2()'s, verbatim, so a plain field and a
+// caret-aware field are the same control in every theme; only the contents
+// differ.
+void gui_textfield_tf(int handle, int x, int y, int w, int h,
+                      const char *text, int len, int cursor, int sel_anchor,
+                      bool focused, const char *placeholder) {
+    gui_palette_t *p = gui_pal();
+    int size = GUI_TTF_SIZE;
+    gui_textfield2(handle, x, y, w, h, 0, focused);   // chrome only, no text
+
+    int tx = x + 8;
+    int ty = y + (h - size) / 2;
+    if (len < 0) len = 0;
+    if (cursor < 0) cursor = 0;
+    if (cursor > len) cursor = len;
+
+    if (!text || len == 0) {
+        if (placeholder && *placeholder) {
+            // The placeholder must clear the TEXT floor against the field, not
+            // merely look lighter than the real ink: a "hint" nobody can read
+            // is a blank box with extra steps.
+            uint32_t ph = gui_ensure_contrast(p->ink_dim, p->field_bg, GUI_FLOOR_TEXT);
+            win_draw_text_ttf(handle, tx, ty, placeholder, size, ph);
+        }
+    } else {
+        // Selection highlight FIRST, so the ink lands on top of it. Both edges
+        // are measured with gui_ttf_render_width() against a NUL-terminated
+        // prefix copy, because that is the only width function documented to
+        // agree with win_draw_text_ttf() below.
+        if (sel_anchor >= 0 && sel_anchor != cursor) {
+            int lo = sel_anchor < cursor ? sel_anchor : cursor;
+            int hi = sel_anchor < cursor ? cursor : sel_anchor;
+            if (lo < 0) lo = 0;
+            if (hi > len) hi = len;
+            char pre[512];
+            int n = lo < (int)sizeof(pre) - 1 ? lo : (int)sizeof(pre) - 1;
+            for (int i = 0; i < n; i++) pre[i] = text[i];
+            pre[n] = 0;
+            int sx = gui_ttf_render_width(pre, size);
+            n = hi < (int)sizeof(pre) - 1 ? hi : (int)sizeof(pre) - 1;
+            for (int i = 0; i < n; i++) pre[i] = text[i];
+            pre[n] = 0;
+            int ex = gui_ttf_render_width(pre, size);
+            if (ex > sx) win_draw_rect(handle, tx + sx, ty, ex - sx, size, p->accent);
+        }
+        win_draw_text_ttf(handle, tx, ty, text, size, p->ink);
+    }
+
+    if (focused) {
+        char pre[512];
+        int n = cursor < (int)sizeof(pre) - 1 ? cursor : (int)sizeof(pre) - 1;
+        for (int i = 0; i < n; i++) pre[i] = text ? text[i] : 0;
+        pre[n] = 0;
+        int cx = tx + (text ? gui_ttf_render_width(pre, size) : 0);
+        // Caret is a full line-box bar, not a size-tall one: a 12px bar beside
+        // a 14-unit glyph run reads as a stray tick.
+        win_draw_rect(handle, cx, ty - 1, 1, size + 2, p->ink);
+    }
 }
 
 void gui_progress(int handle, int x, int y, int w, int h, int pct) {
@@ -945,10 +1208,17 @@ void gui_card(int handle, int x, int y, int w, int h) {
     gui_palette_t *p = gui_pal();
     if (g_style.base == GUI_STYLE_CLASSIC) {
         win_draw_rect(handle, x, y, w, h, p->surface_raised);
-        win_draw_rect(handle, x, y, w, 1, gui_lighten(p->surface_raised,70));
-        win_draw_rect(handle, x, y, 1, h, gui_lighten(p->surface_raised,70));
-        win_draw_rect(handle, x, y+h-1, w, 1, gui_darken(p->surface_raised,60));
-        win_draw_rect(handle, x+w-1, y, 1, h, gui_darken(p->surface_raised,60));
+        // (#117) was a fixed lighten(70)/darken(60) of p->surface_raised,
+        // the same defect class as gui_checkbox/gui_textfield2 above (a
+        // raised bevel rather than a sunken one: highlight top/left, shadow
+        // bottom/right, derived from the card's OWN fill rather than the
+        // surface it sits on, same as gui_button's CLASSIC bevel).
+        uint32_t shadow, hi;
+        gui_bevel_pair(p->surface_raised, &shadow, &hi);
+        win_draw_rect(handle, x, y, w, 1, hi);
+        win_draw_rect(handle, x, y, 1, h, hi);
+        win_draw_rect(handle, x, y+h-1, w, 1, shadow);
+        win_draw_rect(handle, x+w-1, y, 1, h, shadow);
     } else {
         int r = (g_style.base == GUI_STYLE_MODERN) ? GUI_RADIUS : 0;
         if (g_style.base == GUI_STYLE_MODERN && g_style.shadows) gui_soft_shadow(handle, x, y, w, h, r, p->surface);

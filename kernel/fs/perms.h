@@ -49,6 +49,16 @@ int perms_check_leaf(const char *path, uint32_t uid, uint32_t gid, int access);
 // allowed). Called from perms_init(); logs [PERMS-SELFTEST].
 void perms_selftest(void);
 
+// #PERMSKIP: the SESSION-SCOPED run of the same vectors, against THE ACTUAL
+// LOGGED-IN USER'S HOME, whatever the first-boot wizard let the owner call the
+// account. perms_init() runs long before any session exists, so the boot run
+// above can only enumerate what /CONFIG/PERMS.DB already holds; this one is
+// called from kernel/main.c straight after the login-time home claim (#745) and
+// is the definitive run. `home` is the session user's home ("/" for root, which
+// is NOT a home directory: see the comment on the definition). Logs
+// [PERMS-SELFTEST], durably.
+void perms_selftest_session(const char *home, uint32_t uid, uint32_t gid);
+
 // Set permissions for a file
 void perms_set(const char *path, uint32_t uid, uint32_t gid, uint16_t mode);
 

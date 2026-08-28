@@ -45,10 +45,16 @@
 #include "../fs/vfs.h"
 #include "../net/smb.h"
 #include "../net/nfs.h"
+#include "../drivers/hotplug.h"   // #250: removable-volume path routing
 #include "../gui/syslog.h"
 #include "../cpu/dlprof.h"
+#include "../cpu/scprof.h"  // #121: read-path phase attribution
 #include "../security/validate.h"
 #include "../security/uaccess_smap.h"  // #19/#645: AC brackets on the user-buffer copies
+#include "../security/selftest_registry.h"  // #PERMSKIP
+#include "fdown.h"                           // #fdguard: legacy fd ownership guard
+#include "../security/seclog.h"              // #fdguard: seclog_report_io_boundary
+#include "../fs/bootlog.h"                   // #fdguard: bootlog_write on bypass
 
 // DECLARED NEW LINE (not moved): the mounted FAT volume. There is no
 // `extern fat_fs_t g_fat_fs;` in fs/fat.h, so all 12 files that touch it carry
@@ -118,6 +124,69 @@ static int fd_used[LEGACY_MAX_FDS];
 // never inherit a previous file's error.
 static int fd_werr[LEGACY_MAX_FDS];
 
+// ===========================================================================
+// #FDNS: THE LEGACY FD NUMBERS LIVE IN THEIR OWN, DISJOINT RANGE.
+//
+// THE BUG THIS REMOVES (measured on golden build 2025, VM <vmid>, 2026-08-23).
+// This kernel has TWO descriptor namespaces:
+//
+//   * proc->fds[0..MAX_FDS-1]  per-process file_t: console, pipes, PTYs,
+//                              sockets, /dev nodes. Allocated by fd_alloc(3).
+//   * the three tables above   SYSTEM-WIDE: FAT fd_table[], ext2 e2fd[],
+//                              SMB/NFS smbfd[]. Allocated by the scan in
+//                              sys_open_k(), which also started at 3.
+//
+// Both handed out the SAME small integers, and neither allocator could see the
+// other, so one process could hold BOTH a per-process fd 3 and a legacy fd 3 at
+// the same time. Every fd-consuming syscall then disambiguated by PROBING: VFS
+// first, legacy second. Probing cannot recover information the number does not
+// carry, so the second of the two descriptions was simply unreachable and its
+// operations landed on the first one:
+//
+//   1. Terminal runs a foreground command: open("/dev/ptmx") -> VFS fd 3 (the
+//      pty master), held for the whole command.
+//   2. Terminal calls getpwuid() (libc/pwd.c) -> sys_open("/CONFIG/PASSWD") ->
+//      the legacy scan hands back 3, because the legacy table knows nothing
+//      about the VFS table.
+//   3. read(3) is answered by the PTY MASTER, so the password parse silently
+//      eats the child's output and gets nothing.
+//   4. close(3) closes the PTY MASTER and leaves the ext2 description for
+//      /CONFIG/PASSWD open, with the file cached in its read window.
+//   5. The terminal's pump loop reads its master again. proc->fds[3] is NULL
+//      now, so the read FALLS THROUGH to the orphaned legacy slot 3 and the
+//      terminal renders /CONFIG/PASSWD into its window, in place of the
+//      command's output. That is the user-reported bug: `ls -lat` printing
+//      "root:0:0:/:Root:/APPS/MSH". Measured leak rate before this change:
+//      20/20 runs of `sleep 3`, 4/40 runs of `ls -lat`.
+//
+// WHY A RANGE AND NOT AN ORDERING RULE. userland/apps/terminal/main.c already
+// carried a rule ("close the pipe before opening the file, or the write hits
+// the pipe") that is the write-side face of this exact defect. A rule every
+// caller must remember is not a control; it is a note, and this is the second
+// time the same collision has been paid for. Giving the families disjoint
+// number ranges makes the collision UNREPRESENTABLE: a legacy fd can never
+// equal a VFS fd, so the probe order stops being load-bearing and every
+// fd-consuming syscall can route on the NUMBER instead of guessing.
+//
+// The _Static_assert is the durable half. Raising MAX_FDS past LEGACY_FD_BASE
+// would re-create the overlap silently; it now fails the build instead.
+// ===========================================================================
+#define LEGACY_FD_BASE 256
+_Static_assert(LEGACY_FD_BASE >= MAX_FDS,
+               "#FDNS: the legacy fd range must not overlap proc->fds[]; "
+               "raising MAX_FDS above LEGACY_FD_BASE re-creates the "
+               "/CONFIG/PASSWD-into-terminal-output collision");
+
+// Is `fd` (as userland sees it) one of ours?
+static inline int lfd_is(int fd) {
+    return fd >= LEGACY_FD_BASE && fd < LEGACY_FD_BASE + LEGACY_MAX_FDS;
+}
+// Userland fd -> index into fd_table[]/e2fd[]/smbfd[]. Only valid when lfd_is().
+static inline int lfd_idx(int fd) { return fd - LEGACY_FD_BASE; }
+// Index -> the number userland gets back. The ONE place the offset is applied.
+static inline int lfd_ext(int idx) { return LEGACY_FD_BASE + idx; }
+
+
 // #444: fd_used[]/e2fd[]/smbfd[] above are a SYSTEM-WIDE table (128 slots,
 // 125 usable as of #793; originally 16 slots / 13 usable) shared by every
 // process on the box, but sys_open()'s "find a free
@@ -147,6 +216,72 @@ static inline void legacy_fd_release(int fd) {
     uint64_t fl = spinlock_acquire_irqsave(&g_legacy_fd_lock);
     fd_used[fd] = 0;
     spinlock_release_irqrestore(&g_legacy_fd_lock, fl);
+    fdown_release_rs((uint32_t)fd);   // #fdguard: drop cross-process ownership
+}
+
+// #fdguard: the identity a legacy fd slot is stamped with and the only
+// identity that may operate on it. A thread group, not a raw pid, so
+// pthreads sharing an open file all match (rustkern/fdown.rs). 0 means no
+// process context (an early-boot kernel open), which fdown treats as free.
+static inline uint32_t legacy_owner_id(void) {
+    process_t *p = proc_current();
+    if (!p) return 0;
+    return p->tgid ? p->tgid : p->pid;
+}
+
+// #fdguard: rate-limited audit of a refused cross-process legacy-fd op,
+// capped like fs/perms.c's [PERMS-DENY] so a Ring 3 loop guessing slots
+// cannot flood the audit ring / console. security_audit() (behind
+// seclog_report_io_boundary) is non-blocking, so this is safe from every
+// fd syscall path. The record carries the actor pid, the target slot and
+// its owner, and the reason.
+#define FDGUARD_AUDIT_MAX 200
+static uint32_t g_fdguard_audits = 0;
+static void legacy_owner_refused(int slot, uint32_t me, const char *op) {
+    if (g_fdguard_audits < FDGUARD_AUDIT_MAX) {
+        uint32_t owner = fdown_owner_rs((uint32_t)slot);
+        char d[64];
+        snprintf(d, sizeof(d), "fd op=%s slot=%d owner=%u cross-proc refused",
+                 op, slot, owner);
+        seclog_report_io_boundary(me, d);
+        if (++g_fdguard_audits == FDGUARD_AUDIT_MAX)
+            seclog_report_io_boundary(me,
+                "fd boundary: further refusals silent this boot");
+    }
+}
+
+// #fdguard: DEV-ONLY runtime bypass, so the guard can be demonstrated going
+// BOTH ways on ONE build (the same "prove a control can fail" discipline as
+// the RTCLKTESTFAIL / NOBLOCKTEST build knobs). Default is ENFORCE. It is
+// armed only by the presence of /CONFIG/FDGUARD.BYPASS, a marker that ships
+// on NO production golden (same class as /CONFIG/DOSDIAG.CFG and CRONTEST.CFG)
+// and is read ONCE at boot by the fdgtest worker, never per-op. Arming it is
+// logged CRITICAL to the audit trail, serial and /BOOTLOG.TXT so a bypassed
+// image can never be mistaken for a healthy one.
+static int g_fdguard_bypass = 0;
+int fdguard_bypass(void) { return g_fdguard_bypass; }
+void fdguard_set_bypass(int on) {
+    g_fdguard_bypass = on ? 1 : 0;
+    if (g_fdguard_bypass) {
+        kprintf("[FDGUARD] *** BYPASS ACTIVE - fd/pts ownership NOT enforced - "
+                "INSECURE DEV IMAGE ***\n");
+        seclog_report_io_boundary(0,
+            "FDGUARD BYPASS ACTIVE: fd/pts ownership NOT enforced (dev image)");
+        bootlog_write("[FDGUARD] BYPASS ACTIVE - fd/pts ownership NOT enforced "
+                      "(dev image, /CONFIG/FDGUARD.BYPASS present)");
+    }
+}
+
+// #fdguard: THE CHOKEPOINT, called right after `fd = lfd_idx(fd)` in every
+// legacy-fd consumer. `slot` is the lfd_idx() index. Returns 1 to PROCEED
+// (the caller owns it, or the slot is free and the existing used-check will
+// answer), 0 to REFUSE (the slot is live and owned by another process).
+static int legacy_owner_ok(int slot, const char *op) {
+    if (g_fdguard_bypass) return 1;   // #fdguard dev-only bypass (see above)
+    uint32_t me = legacy_owner_id();
+    int r = fdown_check_rs((uint32_t)slot, me);
+    if (r == FDOWN_R_NOTOWNER) { legacy_owner_refused(slot, me, op); return 0; }
+    return 1;   // FDOWN_R_OK (mine) or FDOWN_R_FREE (existing check answers)
 }
 
 // ---- #99 Phase B: additive ext2 mount at the "/ext2" path prefix ------------
@@ -205,6 +340,9 @@ typedef struct {
     // than the bound is REFUSED at open (-EFBIG) rather than silently served
     // by a mode that would destroy it.
     int      rw;          // 1 = POSIX read-write fd; wbuf holds the whole file
+    // #745 local 109: 1 = the fd is in the whole-file `rw` mode above but was
+    // opened O_WRONLY, so read() must refuse it.
+    int      noread;
     int      rw_append;   // O_APPEND on an rw fd: every write lands at wlen
     uint32_t rwpos;       // the ONE position an rw fd reads and writes at
 } ext2_fd_t;
@@ -280,12 +418,191 @@ int64_t sys_fcntl(int fd, int cmd, long arg) {
 int64_t sys_open(const char *upath, int flags) {
     char kpath[SC_PATH_MAX];
     if (upath) {
-        if (strncpy_from_user(kpath, upath, sizeof(kpath)) < 0) return -14;
+        // #58: bounce AND resolve against the caller's cwd, so that after
+        // chdir("/GAMES/FOO") open("data/x") means /GAMES/FOO/data/x and not
+        // /data/x. sys_open_k() keeps its kernel-pointer contract and its
+        // callers (sys_chdir, the boot self-tests) already pass absolute
+        // kernel paths, so the core is deliberately NOT changed: resolution
+        // belongs at the user boundary, once, or it happens twice.
+        int prc = sc_path_from_user(upath, kpath, sizeof(kpath));
+        if (prc != 0) return (prc == -14) ? -14 : -MOS_ENOENT;
     }
     return sys_open_k(upath ? kpath : (const char *)0, flags);
 }
 
+// ===========================================================================
+// #58 END-TO-END BOOT TEST: does a relative path OPEN THE RIGHT FILE?
+//
+// path_resolve_selftest_rs() proves the STRING TRANSFORM. That is necessary and
+// it is not sufficient: a resolver can be perfectly correct and still be wired
+// to nothing, which is the failure this project keeps rediscovering
+// (validate_user_ptr, sse_save, the prompt-injection matcher were all fully
+// built and never invoked; #58 itself IS that fault, applied to sys_chdir).
+// So this test goes all the way to a real file on the real filesystem.
+//
+// IT IS DIFFERENTIAL ON PURPOSE, and that is the whole design. One relative
+// name, "COMPOSIT", resolved from two different working directories:
+//
+//   from "/APPS"  -> /APPS/COMPOSIT  -> MUST OPEN     (it is there)
+//   from "/"      -> /COMPOSIT       -> MUST NOT OPEN (nothing is there)
+//
+// A file that exists in ONE place and not the other is what makes a wrong
+// resolution VISIBLE. Testing only the first half would pass just as happily if
+// the cwd were being ignored and the name were resolving against the root by
+// luck, because before #58 the root is exactly where it went. The second half
+// is the half that can only pass if the cwd is genuinely being consulted.
+//
+// It reads through sc_path_resolve(), the SAME chokepoint every path syscall
+// uses, and it reads the cwd out of the CURRENT PROCESS, so it exercises
+// proc_cwd() and the process field rather than a hand-passed string. The only
+// link it does not cover is strncpy_from_user, which is unchanged pre-existing
+// code shared with every other syscall.
+//
+// NO WRITES. It opens two paths read-only and closes them. A boot self-test
+// that mutates the filesystem is a boot self-test that eventually corrupts one.
+//
+// Justified-C, not Rust: it calls sys_open_k(), sys_close() and reads/restores
+// process_t::cwd. The DECISION it checks is already in Rust; this is the
+// plumbing that proves the decision is connected.
+// ===========================================================================
+void path_resolve_e2e_selftest(void) {
+    process_t *p = proc_current();
+    if (!p) {
+        // Say so rather than silently reporting nothing: a test that quietly
+        // skips is indistinguishable from a test that passed (#514).
+        selftest_notrun("path/cwd-e2e",
+                    "no current process exists to carry a cwd, so the ONLY end-to-end "
+                    "proof that chdir() is wired into path resolution did not run");
+        return;
+    }
+
+    // WHY THIS TEST NEVER WRITES p->cwd. The first version set the live
+    // process's cwd to "/APPS", tested, set it to "/", tested, and restored it.
+    // That is a data race in shipping code: process_t::cwd is shared by every
+    // THREAD of the process, and a sibling thread that happens to open a
+    // relative path inside that window resolves it against a directory this
+    // self-test invented. A test whose own mechanism can corrupt the thing it
+    // is testing is not evidence. So the cwd is only ever READ here, and the
+    // two contrasting directories are passed to the resolver DIRECTLY.
+    //
+    // ---- choose a probe, and PROVE it is a valid one ----------------------
+    // THE PROBE IS THE EXPERIMENT. The first version hard-coded "COMPOSIT" on
+    // the assumption it lived only under /APPS. It does not: this golden also
+    // carries a stale /COMPOSIT at the ext2 root, so the must-not-open arm
+    // opened a real file and the test reported a failure that was entirely its
+    // own. A probe whose validity is ASSUMED rots the moment someone adds a
+    // file, so a candidate now qualifies only if /APPS/<name> opens AND
+    // /<name> does not. Two arms that both hit real files can no longer happen
+    // silently.
+    static const char *const cands[] = {
+        "TERMINAL", "SETTINGS", "CALC", "BROWSER", "APPSTORE", "ADDUSER",
+    };
+    const char *probe = 0;
+    char apath[SC_PATH_MAX], rpath[SC_PATH_MAX];
+    for (unsigned ci = 0; ci < sizeof(cands) / sizeof(cands[0]); ci++) {
+        const char *c = cands[ci];
+        int i, j;
+        apath[0]='/'; apath[1]='A'; apath[2]='P'; apath[3]='P'; apath[4]='S'; apath[5]='/';
+        for (j = 0; c[j] && j < 200; j++) apath[6 + j] = c[j];
+        apath[6 + j] = '\0';
+        rpath[0] = '/';
+        for (i = 0; c[i] && i < 200; i++) rpath[1 + i] = c[i];
+        rpath[1 + i] = '\0';
+
+        int64_t fa = sys_open_k(apath, 0);
+        if (fa < 0) continue;                            // not installed here
+        sys_close((int)fa);
+        int64_t fr = sys_open_k(rpath, 0);
+        if (fr >= 0) { sys_close((int)fr); continue; }   // ambiguous: also at root
+        probe = c;
+        break;
+    }
+    if (!probe) {
+        selftest_notrun("path/cwd-e2e",
+                    "none of the probe names exists under /APPS and only there, so the "
+                    "ONLY end-to-end proof that chdir() is wired into path resolution "
+                    "did not run. The probe list is a hardcoded set of app names and "
+                    "this is what it looks like when they drift");
+        return;
+    }
+
+    extern int path_resolve_cwd_rs(const char *cwd, char *buf, uint32_t cap);
+    int bad = 0;
+    char buf[SC_PATH_MAX];
+    #define R58_SET(dst, src) do { uint64_t _i = 0; \
+        while ((src)[_i]) { (dst)[_i] = (src)[_i]; _i++; } (dst)[_i] = '\0'; } while (0)
+
+    // ---- arm 1: the CHOKEPOINT reads the REAL process cwd ------------------
+    // This is the link that proves proc_cwd() and process_t::cwd are actually
+    // on the path a syscall takes, without writing to either.
+    {
+        const char *cwd = proc_cwd();
+        char want[SC_PATH_MAX];
+        if (!cwd) { want[0] = '/'; R58_SET(want + 1, probe); }
+        else {
+            uint64_t n = 0;
+            while (cwd[n]) { want[n] = cwd[n]; n++; }
+            if (n == 0 || want[n - 1] != '/') want[n++] = '/';
+            R58_SET(want + n, probe);
+        }
+        R58_SET(buf, probe);
+        if (sc_path_resolve(buf, sizeof(buf)) != 0 || strcmp(buf, want) != 0) {
+            kprintf("[#58] e2e FAIL: chokepoint gave '%s', process cwd implies '%s'\n",
+                    buf, want);
+            bad++;
+        }
+    }
+
+    // ---- arm 2: from /APPS, the bare name MUST resolve and open -----------
+    R58_SET(buf, probe);
+    if (path_resolve_cwd_rs("/APPS", buf, sizeof(buf)) < 0) {
+        kprintf("[#58] e2e FAIL: '%s' from /APPS did not resolve\n", probe); bad++;
+    } else if (strcmp(buf, apath) != 0) {
+        kprintf("[#58] e2e FAIL: '%s' from /APPS became '%s'\n", probe, buf); bad++;
+    } else {
+        int64_t fd = sys_open_k(buf, 0);
+        if (fd < 0) { kprintf("[#58] e2e FAIL: open('%s') rc=%ld\n", buf, (long)fd); bad++; }
+        else sys_close((int)fd);
+    }
+
+    // ---- arm 3: from /, THE SAME NAME must NOT find that file -------------
+    // The half that can only pass if the cwd is genuinely consulted: before #58
+    // a bare name went to the root, so a root-only test would have passed just
+    // as happily while the feature did nothing at all.
+    R58_SET(buf, probe);
+    if (path_resolve_cwd_rs("/", buf, sizeof(buf)) < 0) {
+        kprintf("[#58] e2e FAIL: '%s' from / did not resolve\n", probe); bad++;
+    } else if (strcmp(buf, rpath) != 0) {
+        kprintf("[#58] e2e FAIL: '%s' from / became '%s'\n", probe, buf); bad++;
+    } else {
+        int64_t fd = sys_open_k(buf, 0);
+        if (fd >= 0) {
+            kprintf("[#58] e2e FAIL: '%s' opened; the two cwds are not distinguishable\n", rpath);
+            sys_close((int)fd); bad++;
+        }
+    }
+    #undef R58_SET
+
+    kprintf("[#58] cwd end-to-end selftest: %s (%d failing) "
+            "[probe '%s': opens as %s from cwd /APPS, absent as %s from cwd /]\n",
+            bad == 0 ? "PASS" : "FAIL", bad, probe, apath, rpath);
+}
+
+// #58: run the end-to-end test ONCE, at the first open that has a real process
+// behind it. WHY HERE AND NOT AT INIT: it needs a current process to carry a
+// cwd, and every init-time hook in this kernel runs before the first process
+// exists. Wired into perms_init() it printed "e2e SKIPPED: no current process"
+// on every boot, which is a test that never ran - the exact zero-callers shape
+// #58 is about. The latch is set BEFORE the test runs, so the test's own opens
+// cannot re-enter it, and after the first boot open it costs one predictable
+// branch.
+static int g_path_e2e_done = 0;
+
 int64_t sys_open_k(const char *path, int flags) {
+    if (!g_path_e2e_done && proc_current()) {
+        g_path_e2e_done = 1;          // set FIRST: the test itself calls us
+        path_resolve_e2e_selftest();
+    }
     // #396: /dev/<name> device nodes (CDC-ACM serial, etc.) resolve through the
     // in-kernel dev namespace and install a file_t in the per-process fd table.
     if (path && path[0]=='/' && path[1]=='d' && path[2]=='e' && path[3]=='v' && path[4]=='/') {
@@ -317,7 +634,14 @@ int64_t sys_open_k(const char *path, int flags) {
         if (flags & 2)  access = R_OK | W_OK;   // O_RDWR
         // #317: SMB/NFS shares enforce access server-side (NTLM/RPC auth + share
         // ACLs); local POSIX perms (which default-deny W_OK to non-root) don't apply.
-        if (!path_is_smb(path) && !path_is_nfs(path)) {
+        // #250: a removable volume carries no POSIX ownership. perms_check()'s
+        // no-entry default is root-owned, which denies W_OK to every non-root
+        // process, so leaving removable paths in would make a USB stick
+        // read-only to the user who plugged it in. Same carve-out, and the
+        // same reasoning, as the SMB/NFS one it joins: access on those media
+        // is decided by the medium, not by our permission table.
+        if (!path_is_smb(path) && !path_is_nfs(path) &&
+            hotplug_resolve_path(path, 0) < 0) {
             // #676: O_CREAT was not part of the access derivation at all, so
             // open(path, O_RDONLY|O_CREAT) asked for R_OK on a path that does
             // not exist, was answered by perms_check()'s permissive no-entry
@@ -372,6 +696,54 @@ int64_t sys_open_k(const char *path, int flags) {
     if (fd < 0) {
         return -MOS_EMFILE;  // no free fd
     }
+    // #fdguard: stamp the opening thread-group as this slot's owner. Any
+    // FD_FAIL below releases the slot via legacy_fd_release(), which also
+    // clears this ownership, so a failed open leaves nothing stamped.
+    fdown_claim_rs((uint32_t)fd, legacy_owner_id());
+
+    // #250 REMOVABLE VOLUME. A path under a hot-plugged volume's mount point
+    // (/USB0/...) is served by that volume's OWN fat_fs_t, not by g_fat_fs.
+    //
+    // THIS IS NOT A NEW FD KIND. fat_open() has always been parameterised by
+    // fat_fs_t and the legacy fd table already stores a fat_file_t, which
+    // carries its own `fs` back-pointer. So every operation below this one -
+    // read, write, seek, readdir, close, stat - already works on this handle
+    // with no change at all. The ONLY thing that was missing was choosing the
+    // right fat_fs_t at open time, which is what these eight lines do. A
+    // parallel usbfd[] table, in the shape of smbfd[] and e2fd[], would have
+    // been a second implementation of something that already existed.
+    //
+    // It must come BEFORE the ext2-root branch: with ext2 as root, every "/"
+    // path is a candidate for ext2 resolution, and /USB0 is not an ext2 path.
+    {
+        const char *vrel = 0;
+        int vslot = hotplug_resolve_path(path, &vrel);
+        if (vslot >= 0) {
+            fat_fs_t *vfs = hotplug_volume_fat(vslot);
+            // NULL means mounted-but-not-readable (exFAT) or not mounted.
+            // Refusing here is what keeps a volume the UI labels
+            // "not browsable" from half-opening.
+            if (!vfs) FD_FAIL(-MOS_ENOENT);
+            if (fat_open(vfs, vrel, &fd_table[fd]) != 0) {
+                extern int fat_create(fat_fs_t *fs, const char *path);
+                if (om.create && fat_create(vfs, vrel) == 0 &&
+                    fat_open(vfs, vrel, &fd_table[fd]) == 0) {
+                    // created
+                } else {
+                    FD_FAIL(-MOS_ENOENT);
+                }
+            }
+            if (om.trunc && fd_table[fd].file_size > 0) {
+                if (fat_truncate(&fd_table[fd]) != 0) {
+                    fat_close(&fd_table[fd]);
+                    FD_FAIL(-1);
+                }
+            }
+            if (om.append) fd_table[fd].position = fd_table[fd].file_size;
+            fd_used[fd] = 1;
+            return lfd_ext(fd);
+        }
+    }
 
     // #317 pass 2: SMB network share. Mount on demand, then open as a directory
     // (dir handle), a read cache (whole-file), or a write/upload buffer.
@@ -405,7 +777,7 @@ int64_t sys_open_k(const char *path, int flags) {
         }
         s->used = 1;
         fd_used[fd] = 1;
-        return fd;
+        return lfd_ext(fd);
     }
 
     // #317 pass 4: NFS export. Same smbfd[] slot, is_nfs=1. Mount must exist
@@ -440,7 +812,7 @@ int64_t sys_open_k(const char *path, int flags) {
         }
         s->used = 1;
         fd_used[fd] = 1;
-        return fd;
+        return lfd_ext(fd);
     }
 
     // #99: serve from the ext2 volume for explicit "/ext2..." paths, and for all
@@ -480,7 +852,32 @@ int64_t sys_open_k(const char *path, int flags) {
             if (ext2_read_inode(ino, &in) != 0) FD_FAIL(-1);
             if ((in.i_mode & 0xF000) == 0x4000) {       // directory
                 e->is_dir = 1; e->dir_ino = ino; e->dir_pos = 0;
-            } else if (om.rdwr) {
+            } else if (om.rdwr || (om.can_write && !om.trunc && !om.append)) {
+                // #745 local 109: THE CONDITION IS THE FIX. This branch used to
+                // read `om.rdwr` alone, so a plain O_WRONLY open with NEITHER
+                // O_TRUNC NOR O_APPEND fell into the write-only branch below,
+                // which starts wlen at 0 with wdirty SET. Measured on golden
+                // 1882: opening an existing 33-byte file O_WRONLY and closing
+                // it WITHOUT WRITING left it 0 bytes, and writing 3 bytes into
+                // it left it 3 bytes with the other 30 gone. On the FAT ESP the
+                // same two programs are correct, because a FAT fd writes in
+                // place at a real position.
+                //
+                // That is the #746 defect one flag over: O_TRUNC was fixed and
+                // its ABSENCE was not. POSIX only shortens a file when
+                // something asks it to, so the question "when is a file
+                // emptied" has ONE answer on this path: om.trunc, decoded once
+                // by open_mode_decode() in fs/vfs.h. It is read on the wdirty
+                // line below and nowhere else in this branch.
+                //
+                // busybox vi is the caller that made this urgent in BOTH
+                // directions: it opens O_WRONLY|O_CREAT deliberately without
+                // O_TRUNC and then calls ftruncate(), so the old behaviour was
+                // what made saving a shortened file work on ext2 at all, and
+                // correcting it here without making ftruncate real would have
+                // broken it. SYS_FTRUNCATE lands in the same commit for that
+                // reason, not as a bonus.
+                //
                 // #746 O_RDWR ON AN EXISTING FILE. This branch did not exist:
                 // O_RDWR fell into the write-only branch below, which starts
                 // wlen at 0 with wdirty set, so the close EMPTIED the file and
@@ -501,8 +898,8 @@ int64_t sys_open_k(const char *path, int flags) {
                 // target, which is the very defect being fixed. Refuse loudly
                 // instead of falling back to a mode that would destroy the file.
                 if (sz > EXT2_WSPILL_BYTES) {
-                    kprintf("[EXT2-RW] refusing O_RDWR on %s: %u bytes exceeds "
-                            "the %u-byte read-write bound\n",
+                    kprintf("[EXT2-RW] refusing a preserving write open on %s: "
+                            "%u bytes exceeds the %u-byte whole-file bound\n",
                             e->path, sz, (unsigned)EXT2_WSPILL_BYTES);
                     FD_FAIL(-MOS_EFBIG);
                 }
@@ -537,6 +934,12 @@ int64_t sys_open_k(const char *path, int flags) {
                     e->wlen = sz;
                 }
                 e->rw = 1;
+                // #745 local 109: `rw` means "wbuf holds the whole file and
+                // writes land at rwpos". It must NOT also mean "this fd may be
+                // read": an O_WRONLY fd reaching this branch would otherwise
+                // start serving read(), which POSIX forbids and which would
+                // hand a caller bytes its own open said it could not have.
+                e->noread = !om.can_read;
                 e->writing = 1;
                 e->rwpos = 0;
                 e->rw_append = om.append;
@@ -609,7 +1012,7 @@ int64_t sys_open_k(const char *path, int flags) {
         }
         e->used = 1;
         fd_used[fd] = 1;
-        return fd;
+        return lfd_ext(fd);
     }
 
     // TODO: Validate user pointer
@@ -659,9 +1062,68 @@ int64_t sys_open_k(const char *path, int flags) {
     if (om.append) fd_table[fd].position = fd_table[fd].file_size;
 
     fd_used[fd] = 1;
-    return fd;
+    return lfd_ext(fd);
 }
 #undef FD_FAIL
+
+// ===========================================================================
+// #745 local 109: SYS_FTRUNCATE
+// ===========================================================================
+//
+// WHY IT EXISTS. The userland libc answered ftruncate()/truncate() with
+//     int ftruncate(int fd, long length) { (void)fd; (void)length; return 0; }
+// in TWO copies (userland/libc and the CPython port's private src-libc), with a
+// comment saying the kernel has no truncate primitive. It had one for FAT
+// (fat_truncate, length 0 only) and needed none for ext2, and the stub's
+// RETURN VALUE was the real damage: busybox vi saves by writing the new text
+// over the old and calling ftruncate() to cut the remainder, so every save of a
+// shortened file silently kept its tail and reported success.
+//
+// ONE DEFINITION. This does not introduce a second notion of truncation. It
+// routes each fd family to the same mechanism that family already uses to
+// decide a file's length at close:
+//   ext2, whole-file buffer  ->  clamp wlen; the close already rewrites the
+//                                file as exactly wbuf[0, wlen).
+//   FAT                      ->  fat_truncate_to(), which fat_truncate() (the
+//                                O_TRUNC path) is now itself defined in terms of.
+// Families that cannot express it say so instead of returning 0: a spilled or
+// appending ext2 stream has already committed bytes with no resumable rewind,
+// and SMB/NFS upload whole files on close with no server-side truncate here.
+//
+// GROWING IS REFUSED, on every family. A grow must write zeroes to the medium,
+// which is a different operation; pretending to do it is how this started.
+int64_t sys_ftruncate(int fd, int64_t length) {
+    if (fd < 0 || length < 0) return -1;
+
+    // Per-process descriptions (pipes, PTYs, devices, the shell-redirect file
+    // objects). file_ops_t has no truncate op, so there is nothing to route to
+    // and nothing to pretend about.
+    process_t *proc = proc_current();
+    if (proc && fd < MAX_FDS && proc->fds[fd]) return -1;
+
+    if (!lfd_is(fd)) return -1;          // #FDNS
+    fd = lfd_idx(fd);
+    if (!legacy_owner_ok(fd, "ftruncate")) return -1;   // #fdguard
+    if (fd < 3) return -1;
+
+    if (smbfd[fd].used) return -1;      // whole-file upload on close
+
+    if (e2fd[fd].used) {
+        ext2_fd_t *e = &e2fd[fd];
+        if (e->is_dir || !e->writing) return -1;
+        if (e->wstream || e->wsealed || e->appending || e->werr) return -1;
+        if (!e->wbuf) return -1;
+        if ((uint64_t)length > (uint64_t)e->wlen) return -1;   // grow: refused
+        e->wlen = (uint32_t)length;
+        if (e->rwpos > e->wlen) e->rwpos = e->wlen;
+        e->rsize = e->wlen;
+        e->wdirty = 1;                  // the medium is owed the shorter file
+        return 0;
+    }
+
+    if (!fd_used[fd]) return -1;
+    return fat_truncate_to(&fd_table[fd], (uint32_t)length) == 0 ? 0 : -1;
+}
 
 int64_t sys_close(int fd) {
     if (fd < 0) return -1;
@@ -671,6 +1133,12 @@ int64_t sys_close(int fd) {
     if (proc && fd < MAX_FDS && proc->fds[fd]) {
         return fd_close(fd);
     }
+
+    // #FDNS: everything below operates on the legacy tables, which are indexed
+    // by lfd_idx(fd), not by fd. A number outside the legacy range is not ours.
+    if (!lfd_is(fd)) return -1;
+    fd = lfd_idx(fd);
+    if (!legacy_owner_ok(fd, "close")) return -1;   // #fdguard
 
     // #317: SMB-backed fd. Flush an upload (write-on-close), close dir handle.
     if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used) {
@@ -808,6 +1276,10 @@ int64_t sys_fsync(int fd) {
         return file_flush(proc->fds[fd]);
     }
 
+    if (!lfd_is(fd)) return -1;          // #FDNS
+    fd = lfd_idx(fd);
+    if (!legacy_owner_ok(fd, "fsync")) return -1;   // #fdguard
+
     // --- family 2: SMB / NFS upload-on-close buffer.
     if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used) {
         smb_fd_t *s = &smbfd[fd];
@@ -902,13 +1374,22 @@ int64_t sys_read(int fd, void *buf, size_t count) {
     // fault that throws them away. No-op if the range is already backed
     // (the overwhelmingly common case for a buffer the app has reused).
     if (proc && count > 0) {
+        scp_span_t __sp = scp_begin();   // #121
         mm_prefault_range(proc, (uint64_t)buf, (uint64_t)count, 1);
+        scp_end(SCP_PREFAULT, __sp);
     }
 
     if (proc && fd >= 0 && fd < 64 && proc->fds[fd]) {
         extern int64_t file_read(struct file *f, void *buf, size_t count);
-        return file_read(proc->fds[fd], buf, count);
+        scp_span_t __sp = scp_begin();   // #121
+        int64_t __r = file_read(proc->fds[fd], buf, count);
+        scp_end(SCP_FILEREAD, __sp);
+        return __r;
     }
+
+    if (!lfd_is(fd)) return -1;          // #FDNS
+    fd = lfd_idx(fd);
+    if (!legacy_owner_ok(fd, "read")) return -1;   // #fdguard
 
     // #317: SMB-backed fd: serve from the cached file image.
     if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used) {
@@ -936,6 +1417,7 @@ int64_t sys_read(int fd, void *buf, size_t count) {
         // `!e->rbuf` refusal below and every read on it returned -1.
         if (e->rw) {
             if (e->is_dir || !e->wbuf) return -1;
+            if (e->noread) return -1;   // #745 local 109: O_WRONLY cannot read
             uint32_t avail = (e->rwpos < e->wlen) ? (e->wlen - e->rwpos) : 0;
             uint32_t n = (count < avail) ? (uint32_t)count : avail;
             // #19/#645: see the SMB branch above.
@@ -959,6 +1441,7 @@ int64_t sys_read(int fd, void *buf, size_t count) {
                 // #614: fill the window one EXT2_RSLICE_BYTES slice at a time so
                 // ext2_lock is released between slices (see the macro comment).
                 int64_t got = 0;
+                scp_span_t __sf = scp_begin();   // #121
                 while ((uint32_t)got < want) {
                     uint32_t slice = want - (uint32_t)got;
                     if (slice > EXT2_RSLICE_BYTES) slice = EXT2_RSLICE_BYTES;
@@ -967,6 +1450,7 @@ int64_t sys_read(int fd, void *buf, size_t count) {
                     if (g1 <= 0) { if (got == 0) got = g1; break; }
                     got += g1;
                 }
+                scp_end(SCP_EXT2FILL, __sf);   // #121
                 if (got <= 0) {
                     // #609 DIAGNOSIS. A refill that returns <=0 is the ONLY way
                     // this fd can report a short read, and it is what the App
@@ -991,9 +1475,11 @@ int64_t sys_read(int fd, void *buf, size_t count) {
             if (chunk > n - produced) chunk = n - produced;
             // #19/#645: the one copy into the caller's buffer; the refill
             // above (which takes ext2_lock) stays OUTSIDE the AC window.
-            {   uaccess_ac_t __ac = uaccess_begin();
+            {   scp_span_t __sc = scp_begin();   // #121
+                uaccess_ac_t __ac = uaccess_begin();
                 memcpy((uint8_t *)buf + produced, e->rbuf + inoff, chunk);
-                uaccess_end(__ac); }
+                uaccess_end(__ac);
+                scp_end(SCP_EXT2COPY, __sc); }
             produced += chunk;
         }
         e->rpos += produced;
@@ -1005,7 +1491,10 @@ int64_t sys_read(int fd, void *buf, size_t count) {
         return -1;
     }
 
-    return fat_read(&fd_table[fd], buf, count);
+    {   scp_span_t __sp = scp_begin();   // #121
+        int64_t __r = fat_read(&fd_table[fd], buf, count);
+        scp_end(SCP_FATREAD, __sp);
+        return __r; }
 }
 
 static int64_t sys_write_inner(int fd, const void *buf, size_t count);
@@ -1022,6 +1511,10 @@ static int64_t sys_write_inner(int fd, const void *buf, size_t count) {
     if (proc && fd >= 0 && fd < 64 && proc->fds[fd]) {
         return file_write(proc->fds[fd], buf, count);
     }
+
+    if (!lfd_is(fd)) return -1;          // #FDNS
+    fd = lfd_idx(fd);
+    if (!legacy_owner_ok(fd, "write")) return -1;   // #fdguard
 
     // #317: SMB-backed fd: buffer writes; uploaded to the share on close.
     if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used) {
@@ -1240,6 +1733,20 @@ static int64_t sys_write_inner(int fd, const void *buf, size_t count) {
 }
 
 int64_t sys_seek(int fd, int64_t offset, int whence) {
+    // #FDNS: this function had NO per-process branch at all, so an lseek() on a
+    // pipe/PTY/socket fd fell straight into the legacy tables and seeked
+    // whichever unrelated file happened to occupy that slot. With the ranges
+    // now disjoint the VFS half can be answered where it belongs, through the
+    // same file_seek() every other VFS operation uses, and a number in neither
+    // range is refused rather than silently applied to a stranger's file.
+    {   process_t *proc = proc_current();
+        if (proc && fd >= 0 && fd < MAX_FDS && proc->fds[fd])
+            return file_seek(proc->fds[fd], offset, whence);
+    }
+    if (!lfd_is(fd)) return -1;
+    fd = lfd_idx(fd);
+    if (!legacy_owner_ok(fd, "seek")) return -1;   // #fdguard
+
     // #317: SMB-backed fd: seek within the cached read image.
     if (fd >= 3 && fd < LEGACY_MAX_FDS && smbfd[fd].used) {
         smb_fd_t *s = &smbfd[fd];
@@ -1315,7 +1822,10 @@ int64_t sys_readdir(int fd, void *entry_buf) {
 
 int64_t sys_readdir_k(int fd, sc_dirent_t *de) {
     // Read next directory entry from an open directory fd.
-    if (fd < 0 || fd >= LEGACY_MAX_FDS || !fd_used[fd]) {
+    if (!lfd_is(fd)) return -1;          // #FDNS
+    fd = lfd_idx(fd);
+    if (!legacy_owner_ok(fd, "readdir")) return -1;   // #fdguard
+    if (!fd_used[fd]) {
         return -1;
     }
 
@@ -1399,9 +1909,100 @@ int64_t sys_readdir_k(int fd, sc_dirent_t *de) {
 // does not try to say WHAT kind of file it is: every one of the three is a
 // regular file and POSIX gives regular files one answer.
 int fd_legacy_is_open(int fd) {
-    if (fd < 0 || fd >= LEGACY_MAX_FDS) return 0;
+    if (!lfd_is(fd)) return 0;           // #FDNS
+    fd = lfd_idx(fd);
+    if (!legacy_owner_ok(fd, "poll")) return 0;   // #fdguard
     if (fd_used[fd]) return 1;
     if (e2fd[fd].used) return 1;
     if (smbfd[fd].used) return 1;
     return 0;
 }
+
+// #120: see the contract in fdlayer.h. The probe order matches
+// fd_legacy_is_open() and sys_seek() above: SMB/NFS, then ext2, then FAT.
+int fd_legacy_stat_src(int fd, const fat_file_t **fat_out,
+                       char *path_out, uint32_t cap, int64_t *live_size_out) {
+    if (fat_out) *fat_out = 0;
+    if (live_size_out) *live_size_out = -1;
+    if (path_out && cap) path_out[0] = 0;
+    if (!lfd_is(fd)) return FDL_STAT_NONE;   // #FDNS
+    fd = lfd_idx(fd);
+    if (!legacy_owner_ok(fd, "fstat")) return FDL_STAT_NONE;   // #fdguard
+
+    if (smbfd[fd].used) {
+        smb_fd_t *s = &smbfd[fd];
+        if (path_out && cap) {
+            uint32_t i = 0;
+            while (i + 1 < cap && s->path[i]) { path_out[i] = s->path[i]; i++; }
+            path_out[i] = 0;
+        }
+        // Mirrors sys_seek's SMB branch: the description serves reads out of
+        // its whole-file cache, and an upload is buffered until close.
+        if (live_size_out) *live_size_out = s->writing ? (int64_t)s->wlen
+                                                       : (int64_t)s->rsize;
+        return FDL_STAT_PATH;
+    }
+
+    if (e2fd[fd].used) {
+        ext2_fd_t *e = &e2fd[fd];
+        if (path_out && cap) {
+            uint32_t i = 0;
+            while (i + 1 < cap && e->path[i]) { path_out[i] = e->path[i]; i++; }
+            path_out[i] = 0;
+        }
+        // ONLY when the description holds bytes the inode does not. A READ fd
+        // is deliberately left at -1 so the caller uses the inode's i_size:
+        // e->rsize is the #572 bounded read WINDOW (<=128 KB), not the file
+        // length, so reporting it would UNDER-report every file larger than the
+        // window. sys_seek(SEEK_END) has that limit today; fstat need not
+        // inherit it, and the inode is the better answer for a read fd.
+        if (live_size_out) {
+            if (e->rw)            *live_size_out = (int64_t)e->wlen;
+            else if (e->writing)  *live_size_out = (int64_t)e->wlen;
+        }
+        return FDL_STAT_PATH;
+    }
+
+    if (fd_used[fd]) {
+        if (fat_out) *fat_out = &fd_table[fd];
+        // The legacy FAT family is write-THROUGH (fat_write -> blk_write), so
+        // the handle's file_size is already the medium's. Left at -1; the
+        // caller fills size from the handle it was just given.
+        return FDL_STAT_FAT;
+    }
+    return FDL_STAT_NONE;
+}
+
+// #fdguard: proc_exit backstop. Poison every legacy slot the exiting group
+// still owns to DEAD, so a future process handed the same pid cannot inherit
+// a leaked slot. This does NOT flush or free the slot's buffers: that is a
+// separate pre-existing on-exit leak, and an ext2 flush would block, which
+// proc_exit() under cli() cannot do. It only makes a leaked slot unreachable.
+// One compare_exchange per slot, no allocation, no block.
+void fdown_proc_exit(uint32_t owner) {
+    if (!owner) return;
+    int n = 0;
+    for (int i = 0; i < LEGACY_MAX_FDS; i++)
+        n += fdown_mark_dead_if_owner_rs((uint32_t)i, owner);
+    if (n)
+        kprintf("[FDGUARD] exit owner=%u poisoned %d leaked legacy fd(s); "
+                "refusals so far=%u\n", owner, n, fdown_refusals_rs());
+}
+
+// #fdguard: boot check. Run the self-test and prove the Rust slot count matches
+// LEGACY_MAX_FDS, so the guard cannot silently cover fewer slots than exist.
+// Named _check, not _selftest, so diaglog-gate does not require a durable sink
+// for this kprintf (same as fetchown_boot_check); the durable audit is the
+// per-refusal SECURITY.LOG line, not this boot summary.
+void fdown_boot_check(void) {
+    int rs = fdown_slots_rs();
+    int st = fdown_selftest_rs();
+    kprintf("[FDGUARD] fdown selftest=%s slots=%d/%d\n",
+            st == 0 ? "PASS" : "FAIL", rs, LEGACY_MAX_FDS);
+    if (st != 0 || rs != LEGACY_MAX_FDS)
+        kprintf("[FDGUARD] fdown SELF-TEST FAILED step=%d - legacy fd "
+                "cross-process ownership is NOT trustworthy on this build\n", st);
+}
+_Static_assert(LEGACY_MAX_FDS == 128,
+               "#fdguard: fdown.rs LEGACY_SLOTS is hardcoded 128; keep it in "
+               "sync with LEGACY_MAX_FDS or the boot check will flag it");

@@ -218,6 +218,34 @@ CFLAGS = -ffile-prefix-map=$(CURDIR)=/maytera-kernel $(REPRO_DEFS) \
          -I$(SRCDIR) \
          -isystem $(GCC_INCLUDE)
 
+# #189: SILENCE-ON-STARVE for the HD Audio output ring (rustkern/hdastarve.rs).
+# ON by default, and it must stay on: without it a producer that stops feeding
+# but leaves its stream open leaves the cyclic DMA engine replaying its last
+# ring lap indefinitely, which is both the most audible defect on the real
+# iMac14,4 and a way for a capture-based audio test to PASS a program that has
+# already exited.
+#
+# The toggle exists ONLY so the two arms of that proof can be built from ONE
+# commit: `make HDA_STARVE=0` reproduces the defect, `make` fixes it, and the
+# two binaries then differ in nothing else. Never ship HDA_STARVE=0.
+HDA_STARVE ?= 1
+ifeq ($(HDA_STARVE),1)
+CFLAGS += -DRUST_HDA_STARVE
+endif
+
+# #190: the ONE hardware output stream is shared by MAX_STREAMS software
+# streams, and audio_stop() used to stop it unconditionally - so the boot chime
+# finishing silenced a DOS guest's music PERMANENTLY and discarded 76-88% of its
+# OPL2 register writes for the rest of the session (measured, #187). ON by
+# default and it must stay on.
+#
+# Same reason as HDA_STARVE for the toggle: `make SHARED_ENGINE=0` reproduces
+# the stall so both arms of the proof come from ONE commit. Never ship it off.
+SHARED_ENGINE ?= 1
+ifeq ($(SHARED_ENGINE),1)
+CFLAGS += -DAUDIO_SHARED_ENGINE_FIX
+endif
+
 # #500/#503: `make SECTEST=1` dispatches SYS_SECTEST (the negative-control
 # battery). DEBUG ONLY - never set for a golden/shipped kernel. Appended to the
 # real CFLAGS rather than passed as `make CFLAGS+=...` on the command line,
@@ -225,6 +253,17 @@ CFLAGS = -ffile-prefix-map=$(CURDIR)=/maytera-kernel $(REPRO_DEFS) \
 # build the whole kernel without -ffreestanding.
 ifeq ($(SECTEST),1)
 CFLAGS += -DSECTEST_SYSCALL
+endif
+
+# (local 79) make FOCUSDIAG=1 arms the compiled-out focus-path probe in
+# kernel/gui/window.c (see the comment above FOCUSDIAG_ENABLED there). DEBUG
+# ONLY - never set for a golden/shipped kernel. The probe comment used to say
+# `make CFLAGS_EXTRA=-DFOCUSDIAG_ENABLED=1`, which this Makefile never read
+# (CFLAGS_EXTRA was not a variable referenced anywhere below); that
+# instruction was untested and silently did nothing. Same append-to-CFLAGS
+# form as SECTEST above.
+ifeq ($(FOCUSDIAG),1)
+CFLAGS += -DFOCUSDIAG_ENABLED=1
 endif
 
 # #510 verification builds. DEBUG ONLY - never set for a golden/shipped kernel.
@@ -310,6 +349,75 @@ ifeq ($(NOBLOCKTEST),1)
 CFLAGS += -DWQ_NOBLOCK_SELFTEST
 endif
 
+# AUDLEAD: `make AUDSTARVETEST=1` arms a DELIBERATE producer stall in
+# drivers/audio.c, two seconds into any file playback, long enough to drain the
+# whole 743 ms HDA ring. Same argument and same placement as NOBLOCKTEST above:
+# an underrun counter that has only ever been observed reading ZERO is not
+# evidence that underruns are being counted, it is evidence that nothing has
+# tested the counter. The shipped counter reads 0 on every clean run, which is
+# exactly what a BROKEN counter also reads. NEVER for a golden.
+ifeq ($(AUDSTARVETEST),1)
+CFLAGS += -DAUDIO_STARVE_SELFTEST
+endif
+
+# #62: `make XHCIEPTEST=1` / `=2` arm the destructive control-endpoint recovery
+# proof in drivers/xhci.c. Same argument and same top-level placement as
+# NOBLOCKTEST / CANARYTEST / SMAPTEST above: a recovery path nobody has watched
+# repair a REAL halted endpoint is a comment, not a fix. NEVER for a golden.
+#   =1  GREEN arm: recovery compiled in. Expect [EPTEST] VERDICT ... PASS.
+#   =2  RED arm:   -DXHCI_EPTEST_NORECOVER removes the recovery call, restoring
+#                  the pre-fix behaviour. Expect [EPTEST] VERDICT ... FAIL.
+# If the RED arm also passes, the test proves nothing and must be discarded.
+ifeq ($(XHCIEPTEST),1)
+CFLAGS += -DXHCI_EPTEST
+endif
+ifeq ($(XHCIEPTEST),2)
+CFLAGS += -DXHCI_EPTEST -DXHCI_EPTEST_NORECOVER
+endif
+
+# #156: `make XHCIMSI=1` arms #139's xHCI MSI. IT IS OFF IN A NORMAL/GOLDEN
+# BUILD. #139 added the first xHCI MSI this kernel has ever had, and it could
+# not run on the test rig (qemu-xhci exposes MSI-X 0x11, not MSI 0x05, so
+# pci_enable_msi() declined), so xhci_msi_isr() shipped in build 1921 having
+# executed zero times anywhere. The owner's iMac14,4 is the one machine that
+# can execute it, and 1921 hangs at boot there where 1910 did not. Until the
+# handler has been watched working on that machine, arming it is opt-in.
+#
+# OFF is the pre-#139 behaviour exactly: the event ring is drained by the two
+# always-armed timer-driven workers. #139's Endpoint Context Interval fix (the
+# `+= 3` that made every full-speed interrupt endpoint 8x slower) lives in
+# xhci_configure_endpoint_ep() and is UNAFFECTED by this flag - it is in every
+# build either way, which is the point of gating the MSI and nothing else.
+#
+# A/B ARM FROM ONE COMMIT, so a bisect control can be pinned to a hash:
+#   make            -> MSI off  (control)
+#   make XHCIMSI=1  -> MSI on   (test)
+# and either build can still be flipped at boot without a rebuild by dropping
+# /XHCIMSI.TXT (force on) or /XHCIMSI.OFF (force off, wins) on the FAT ESP.
+ifeq ($(XHCIMSI),1)
+CFLAGS += -DXHCI_MSI_DEFAULT_ON=1
+endif
+
+# #133: `make HIDPARKTEST=1` / `=2` arm the destructive proof that a PARKED HID
+# device is actually recovered. Same argument and same top-level placement as
+# NOBLOCKTEST / XHCIEPTEST / CANARYTEST above. No VM halts a HID endpoint on its
+# own (QEMU does not even complete an in-flight interrupt-IN TD with a
+# transaction error on device_del - blame.md #134), so without this arm
+# usb_hid_retry_failed() would ship having never executed.
+#   =1  GREEN arm: park the device by hand at reports 300 and 900; the re-scan
+#                  worker must un-park it and [HIDLAT] gap statistics must
+#                  resume. Expect [USB-HID] #133: ... un-parked ... re-arm=OK.
+#   =2  RED arm:   -DHID_PARKTEST_NOREVIVE removes the un-park call, restoring
+#                  the pre-#133 behaviour. Reports must stop for ever at 300.
+# If the RED arm also recovers, the test proves nothing and must be discarded.
+# NEVER for a golden build.
+ifeq ($(HIDPARKTEST),1)
+CFLAGS += -DHID_PARKTEST
+endif
+ifeq ($(HIDPARKTEST),2)
+CFLAGS += -DHID_PARKTEST -DHID_PARKTEST_NOREVIVE
+endif
+
 # #624 step 2: `make CANARYTEST=1` arms a DELIBERATE stack smash so the canary
 # can be SEEN to fire, exactly as `make NOBLOCKTEST=1` arms a deliberate
 # wait_event violation. A canary that has never been observed catching anything
@@ -339,6 +447,42 @@ ifeq ($(SMAPTEST),1)
 CFLAGS += -DSMAPTEST
 endif
 
+# #745 (#116): `make SPAWNRACETEST=1` REOPENS the spawn fd-install window that
+# ticket 116 closed - it drops the preemption bracket in spawn_impl() and yields
+# to the scheduler on purpose the moment the child is queued - so the
+# [SPAWNFD-RACE] guard can be SEEN to fire. Same argument as NOBLOCKTEST /
+# CANARYTEST / SMAPTEST above, and the same rule: this block stays at TOP LEVEL
+# (nesting one of these inside another is exactly how CANARYTEST came to
+# silently do nothing), and it must NEVER be set for a golden.
+ifeq ($(SPAWNRACETEST),1)
+CFLAGS += -DSPAWN_FD_RACETEST
+endif
+
+# #745 (#62): the negative controls for the redundant tick source. A redundancy
+# nobody has watched carry the system is indistinguishable from one that is
+# switched off - both produce a clean boot - which is the same argument as
+# NOBLOCKTEST/CANARYTEST/SMAPTEST above, and these blocks must likewise stay at
+# TOP LEVEL (nesting one inside another is exactly how CANARYTEST came to
+# silently do nothing).
+#
+#   make TICKFAULT=1      - MASK IRQ0 at the 8259 a fixed time after boot, which
+#                           reproduces the iMac symptom (a periodic timer that is
+#                           programmed and counting, whose interrupt never
+#                           arrives) on hardware that would otherwise never fail.
+#                           QEMU always delivers, so without this the failover
+#                           could only ever be reasoned about, never observed.
+#   make TICKNOREDUNDANT=1 - build WITHOUT the redundant source. This is the
+#                           control arm: with TICKFAULT=1 it must FREEZE. If it
+#                           does not freeze, the fault injector is not working
+#                           and the test arm proves nothing.
+# NEVER set either for a golden.
+ifeq ($(TICKFAULT),1)
+CFLAGS += -DTICKWATCH_FAULT_TEST
+endif
+ifeq ($(TICKNOREDUNDANT),1)
+CFLAGS += -DTICKWATCH_NO_REDUNDANT
+endif
+
 # #746 fatlock. DEBUG ONLY - never for a golden/shipped kernel.
 #   make FATLOCKTEST=1     - compile in fs/fat_lock_test.c: 4 kernel threads
 #                            hammer the FAT ESP concurrently while fs/fat.c
@@ -350,6 +494,27 @@ endif
 #                            excludes nobody. Expect "RESULT: FAIL". A safety
 #                            test that has never been seen to fail is not a
 #                            test, it is a comment (the #624 lesson).
+# #745 local 107 YMM. DEBUG ONLY - never for a golden/shipped kernel, and the
+# only configuration in which the kernel contains a VEX-encoded instruction at
+# all (proc/fpu_ymm.asm is %ifdef'd on the nasm flag below).
+#   make YMMTEST=1   - 4 kernel threads sign all 16 YMM registers, sleep one
+#                      tick on a wait queue, and check the value survived the
+#                      context switch. Expect "[YMMTEST] RESULT: PASS".
+#   make YMMTEST=red - the NEGATIVE CONTROL, and it is the real bug rather than
+#                      a mutation of the test: cpu/sse.c still enables AVX
+#                      (CR4.OSXSAVE + XCR0.YMM) but forces the fxsave64 save
+#                      path, which cannot preserve YMM_Hi128. Expect
+#                      "RESULT: FAIL" with low128_mismatches=0 and
+#                      high128_mismatches>0.
+# Requires a CPU that actually has AVX: a kvm64 guest masks it and the test
+# prints SKIPPED. Use cpu=host or cpu=kvm64,+avx.
+ifeq ($(YMMTEST),1)
+CFLAGS  += -DFPU_YMM_SELFTEST
+endif
+ifeq ($(YMMTEST),red)
+CFLAGS  += -DFPU_YMM_SELFTEST -DFPU_YMM_SELFTEST_RED
+endif
+
 ifeq ($(FATLOCKTEST),1)
 CFLAGS += -DFAT_LOCK_SELFTEST
 endif
@@ -410,6 +575,18 @@ CFLAGS += -DPTWALK_SELFTEST
 endif
 ifeq ($(PTWALKNORESERVE),1)
 CFLAGS += -DPTWALK_NO_RESERVE
+endif
+
+# #75 (enqrace75b): `make ENQTEST=1` compiles in proc/process.c's enqueue-probe
+# SELF-TEST, which CONSTRUCTS the state each #75 enqueue probe claims to detect,
+# prints whether it fired, and leaves the rest of the boot as the neighbouring-
+# state control. Same argument as NOBLOCKTEST / CANARYTEST / SMAPTEST /
+# PTWALKTEST above, and #75 is the ticket that most needs it: the [PINENQ] guard
+# has never been observed to fire, and "never fired" says nothing about the world
+# until the probe has been shown to be capable of firing at all. OFF by default,
+# never in the golden - it deliberately manufactures a pinned enqueue.
+ifeq ($(ENQTEST),1)
+CFLAGS += -DENQ_PROBE_SELFTEST
 endif
 
 # -DRUST_IP_CHECKSUM (#404 / #479 Phase B): route the live ip_checksum() symbol
@@ -991,6 +1168,13 @@ endif
 
 # Assembler flags
 ASFLAGS = -f elf64
+# #745 local 107: gate proc/fpu_ymm.asm's VEX instructions on the YMMTEST
+# builds. This append MUST stay below the assignment above; putting it up with
+# the CFLAGS block (where the YMMTEST documentation lives) would be silently
+# discarded by it.
+ifneq ($(YMMTEST),)
+ASFLAGS += -dFPU_YMM_SELFTEST
+endif
 
 # Linker flags
 # -z noexecstack (#404 Phase A): a Rust staticlib member can omit the
@@ -1246,11 +1430,145 @@ CFLAGS += -DSCHEDRACE_US=$(SCHEDRACE_US)
 endif
 endif
 
+# #135: `make RTCBINTEST=1` compiles in drivers/rtc.c's LIVE hardware
+# differential, which puts the RTC into the other data mode, writes the time
+# with the OLD (shipped, broken) encoder and with the new one, prints both, and
+# restores everything. OFF by default and never in the golden: it writes Status
+# Register B, and doing that unasked on a real machine is how you leave someone
+# with a halted clock. Same gating shape as NOBLOCKTEST.
+ifeq ($(RTCBINTEST),1)
+CFLAGS += -DRTC_LIVE_TEST
+endif
+
+# #740: `make DPMITEST=1` compiles in dos/dpmi_rmcs.c's DPMI 0300h harness,
+# which drives the bridge with synthesised DPMI real-mode call structures
+# against the REAL INT 21h service core and prints the before/after register
+# files to serial. DEBUG ONLY, NEVER for a golden, for one concrete reason
+# and not as boilerplate: the harness runs before any user has authenticated,
+# so it arms the #708 guest filesystem slot explicitly as uid 0 (there is no
+# session to inherit an identity from at that point, and guestfs_arm_session()
+# correctly refuses). It also creates, writes and deletes a file at the
+# filesystem root. Same top-level placement and same append-to-CFLAGS form as
+# NOBLOCKTEST above, for the same two reasons (blame.md: `make CFLAGS+=...`
+# REPLACES CFLAGS; #624: a flag nested inside another ifeq silently does
+# nothing while appearing to be set).
+ifeq ($(DPMITEST),1)
+CFLAGS += -DDPMI_RMCS_SELFTEST
+endif
+
+# #192: `make FATTRACE=1` restores fat_read_file()'s four per-read narration
+# lines, which are OFF by default because they printed six serial lines for
+# every whole-file read in the system - config files, app launches and the
+# 2-second timezone refresh alike. Failure lines are never gated. Same top-level
+# placement and same append-to-CFLAGS form as NOBLOCKTEST/DPMITEST above, for
+# the same two reasons (blame.md: `make CFLAGS+=...` REPLACES CFLAGS; #624: a
+# flag nested inside another ifeq silently does nothing while appearing set).
+ifeq ($(FATTRACE),1)
+CFLAGS += -DFAT_TRACE_READS
+endif
+
 RUST_LIB         = librustkern.a
 RUSTC            = rustc
 RUST_PIN_VERSION = 1.97.0
 RUSTFLAGS = --edition 2021 --crate-type staticlib --target x86_64-unknown-none \
             -C opt-level=2 -C panic=abort
+
+# #113: `make RTCLKTESTFAIL=1` feeds rtclock_selftest_rs a deliberately WRONG
+# expectation so the [RTCLK] boot line can be SEEN to say FAIL on an otherwise
+# healthy machine. Same argument as `make NOBLOCKTEST=1`: a self-test nobody has
+# watched go red is indistinguishable from one that is not wired up (#514/#665).
+#
+# THIS BLOCK MUST STAY BELOW THE RUSTFLAGS DEFINITION ABOVE. It was first
+# written up beside NOBLOCKTEST, ~1100 lines EARLIER in this file, where the
+# `+=` was silently discarded by the plain `=` here: the flag existed, the build
+# accepted it, and the self-test stayed green. A build option that appears to
+# work and does nothing is worse than no option at all.
+ifeq ($(RTCLKTESTFAIL),1)
+RUSTFLAGS += --cfg rtclk_test_fail
+endif
+
+# #86: `make KTZTESTFAIL=1` makes ktz_selftest_rs assert a WRONG offset, so the
+# [KTZ] boot line can be SEEN to say FAIL. Must stay below RUSTFLAGS, as above.
+ifeq ($(KTZTESTFAIL),1)
+RUSTFLAGS += --cfg ktz_test_fail
+endif
+
+# #192: `make CFGTESTFAIL=1` makes cfgread_selftest_rs assert that an ABSENT
+# config file deserves a WARNING (it does not; that is the whole ticket), so the
+# [CFG] boot line can be SEEN to say FAIL on an otherwise healthy machine. Same
+# argument as KTZTESTFAIL/RTCLKTESTFAIL: a self-test nobody has watched go red
+# is indistinguishable from one that is not wired up (#514/#665). Must stay
+# below the RUSTFLAGS definition, as above.
+ifeq ($(CFGTESTFAIL),1)
+RUSTFLAGS += --cfg cfg_test_fail
+endif
+
+# #ASUSDIAG: `make FLTTESTFAIL=1` makes fltrec_selftest_rs assert a WRONG value,
+# so the [FLTREC] boot line can be SEEN to say FAIL on an otherwise healthy
+# machine. Same argument as CFGTESTFAIL/KTZTESTFAIL/RTCLKTESTFAIL above: a
+# self-test nobody has watched go red is indistinguishable from one that is not
+# wired up (#514/#665), and this one guards the record layout of a diagnostic
+# that is only ever read AFTER the machine it was recording has failed. Must stay
+# below the RUSTFLAGS definition, for the reason that block spells out.
+ifeq ($(FLTTESTFAIL),1)
+RUSTFLAGS += --cfg fltrec_test_fail
+endif
+
+# #SB: `make BLKSTAGE_UNSAFE=1` REMOVES the single-owner claim over the block
+# write staging buffer, restoring the exact pre-fix shape in which a second
+# writer could overwrite a first writer's staged payload while that first
+# writer was parked on msc_cmd_lock(). That is the fault that destroyed the
+# ext2 primary superblock on the owner's stick (golden build 2215); see
+# rustkern/blkstage.rs. It exists so `make BLKSTAGETEST=1 BLKSTAGE_UNSAFE=1`
+# can be WATCHED reporting FAIL, because a guard nobody has seen go red is
+# indistinguishable from one that is switched off (#514/#665).
+#
+# NEVER SHIP A KERNEL BUILT WITH THIS. It is a knowingly data-destroying build.
+#
+# Note it sets BOTH a CFLAG and a RUSTFLAG: the C side stops taking the claim
+# and the Rust side stops hiding the raw buffer address. Must stay BELOW the
+# RUSTFLAGS definition above, for the reason the four *TESTFAIL blocks give.
+#
+# It is a RUSTFLAG ONLY, on purpose: fs/blockdev.c compiles to the SAME object
+# either way, so the only difference between the RED kernel and the GREEN one
+# is whether blkstage_try_claim_rs() is exclusive. A knob that also changed the
+# C would leave a reader wondering which of the two differences produced the
+# red result.
+ifeq ($(BLKSTAGE_UNSAFE),1)
+RUSTFLAGS += --cfg blkstage_unsafe
+endif
+
+# #SB: `make BLKSTAGETEST=1` builds the staging-race self-test into the kernel
+# and runs it just before the login stage. It performs NO device I/O (see the
+# rationale in fs/blockdev.c); it exercises the staging layer, which is where
+# the defect is. Off by default: it costs three worker threads and ~1 second.
+ifeq ($(BLKSTAGETEST),1)
+CFLAGS += -DBLKSTAGE_TEST
+endif
+
+# #SB: `make BLKSTAGETEST=1 BLKSTAGE_TEST_DEVICE=1` adds PHASE B, which drives
+# REAL concurrent writes into the root filesystem so that ext2's own metadata
+# updates (block bitmap, group descriptor, PRIMARY SUPERBLOCK free counts) run
+# under contention. On a BLKSTAGE_UNSAFE kernel that is expected to DESTROY THE
+# FILESYSTEM, which is the point: it is how the corruption was reproduced on a
+# throwaway image rather than merely reasoned about.
+#
+# THROWAWAY IMAGES ONLY. Never point this at anything you want to keep.
+ifeq ($(BLKSTAGE_TEST_DEVICE),1)
+CFLAGS += -DBLKSTAGE_TEST_DEVICE
+endif
+
+# `make DIAG_SELF_DEMO=1` builds a THROWAWAY kernel that can be WATCHED doing
+# the two things the boot instrumentation exists for: it holds 12s with the
+# early framebuffer still owning the screen (so the stage list and the bottom
+# banner can be looked at, which is impossible otherwise because the whole
+# pre-console window is well under a second), and it forces the
+# no-root-filesystem branch (so the paged hardware report can be seen rendering
+# on a machine that mounted perfectly well). NEVER SHIP THIS: it deliberately
+# refuses to reach a desktop. Same argument as the four *TESTFAIL knobs above.
+ifeq ($(DIAG_SELF_DEMO),1)
+CFLAGS += -DDIAG_SELF_DEMO
+endif
 
 # rustkern.rs is the crate ROOT only (panic handler + probes + `mod`
 # declarations). The subsystems live in rustkern/*.rs, one module per subsystem
@@ -1266,7 +1584,43 @@ RUST_MODULES = $(wildcard rustkern/*.rs)
 # otherwise. That is the silent-staleness class this project keeps hitting.
 RUST_BLOBS   = rustkern/pwbreach.bin
 
-$(RUST_LIB): rustkern.rs $(RUST_MODULES) $(RUST_BLOBS) rust-toolchain.toml
+# #113: THE ARCHIVE MUST REBUILD WHEN RUSTFLAGS CHANGES, NOT ONLY WHEN A SOURCE
+# FILE'S TIMESTAMP MOVES.
+#
+# THIS MECHANISM ALREADY EXISTED FOR C and was simply never extended to Rust
+# when the Rust archive was added: $(FLAGS_STAMP) above ($(OBJDIR)/.cflags-stamp,
+# #526) forces a full C rebuild when CFLAGS changes. librustkern.a had no
+# equivalent, so it depended on FILE TIMESTAMPS alone.
+#
+# MEASURED CONSEQUENCE, not a theoretical one. `make RTCLKTESTFAIL=1` appends
+# `--cfg rtclk_test_fail` to RUSTFLAGS, but no .rs file changed, so make
+# considered librustkern.a up to date and rustc was NEVER RE-RUN. The build
+# succeeded, the flag was accepted, and kernel.elf came out BYTE-IDENTICAL to
+# the build without it (md5 a3401a44 both ways). That flag exists ONLY to prove
+# a self-test can go red, so it would have been reported as "proven RED" on the
+# strength of a compilation that never happened.
+#
+# Same shape as the C stamp: content is the expanded RUSTFLAGS, rewritten ONLY
+# when it actually differs, so a no-op make stays a no-op. It lives under
+# $(OBJDIR), which .gitignore already excludes, so it cannot dirty the working
+# tree and trip build/repo-guard.sh's clean-tree requirement (the exact problem
+# that got .cflags-stamp untracked at build 974).
+RUST_FLAGS_STAMP = $(OBJDIR)/.rustflags-stamp
+
+.PHONY: rustflags-stamp-force
+rustflags-stamp-force:
+
+$(RUST_FLAGS_STAMP): rustflags-stamp-force
+	@mkdir -p $(OBJDIR)
+	@printf '%s\n' '$(RUSTFLAGS)' > $@.tmp
+	@if cmp -s $@.tmp $@; then \
+	   rm -f $@.tmp; \
+	 else \
+	   if [ -f $@ ]; then echo ">>> RUSTFLAGS CHANGED - forcing a Rust rebuild (#113)"; fi; \
+	   mv $@.tmp $@; \
+	 fi
+
+$(RUST_LIB): rustkern.rs $(RUST_MODULES) $(RUST_BLOBS) rust-toolchain.toml $(RUST_FLAGS_STAMP)
 	@echo "Compiling Rust static lib $(RUST_LIB) (pinned rustc $(RUST_PIN_VERSION))..."
 	@ver=`$(RUSTC) --version | awk '{print $$2}'`; \
 	 if [ "$$ver" != "$(RUST_PIN_VERSION)" ]; then \
@@ -1507,6 +1861,65 @@ syscall-number-lint:
 syscall-number-lint-selftest:
 	@bash tools/syscall-number-lint/selftest
 
+# --- SYS_MPROTECT argument validator self-test (#404) ------------------------
+# NOT wired into the link. It needs a HOST rustc target (it runs the validator
+# as an ordinary program), whereas the kernel build targets x86_64-unknown-none,
+# so making it a build prerequisite would break the kernel build container.
+# Run it by hand when touching rustkern/mprotect.rs.
+#
+#   make mprotect-validate-selftest     # the validator as shipped
+#   make mprotect-validate-selftest-red # PROVE it goes red on a removed guard
+mprotect-validate-selftest:
+	@bash tools/mprotect-validate-test/selftest
+
+mprotect-validate-selftest-red:
+	@bash tools/mprotect-validate-test/selftest --prove-red
+
+# --- Duplicate-constant lint (#222) -----------------------------------------
+# FAILS THE BUILD when a constant defined in a HEADER is also defined, with a
+# DIFFERENT value, somewhere else.
+#
+# This is the most expensive recurring fault in the project and it is not a
+# hard bug, it is a value written down twice: FIVE version.h files each with a
+# different MAYTERA_VERSION_STRING behind one include guard (#106); five copies
+# of the #145 fix where the fifth still held the baseline (#178); a SIXTH
+# CPU-count constant read out of bounds when five were thought to be all of
+# them (#166); two branches allocating syscall 373 and git merging both without
+# a conflict (#745). Someone fixes one copy, review agrees, and the shipped
+# binary reads the other.
+#
+# Scoped to `--dirs kernel` for the same reason as concurrency-lint: the kernel
+# build container only receives `git archive <commit> kernel`, so a gate that
+# also scanned userland would give a DIFFERENT verdict depending on where it
+# ran. build/repo-guard.sh runs it --strict over the WHOLE tree at the release
+# chokepoint, which is where the kernel-vs-userland and C-vs-Rust divergences
+# (SYS_* headers, struct termios, the #745 fifth copy) can actually be seen.
+#
+# The tool travels INSIDE kernel/ and is an order-only prerequisite of the link,
+# exactly like the gates above, because #514 is what happens otherwise: a lint
+# living at <repo>/tools that build-golden.sh never shipped, and that nothing
+# depended on, sat here for months looking exactly like a working guardrail.
+#
+# `make dup-const-lint-selftest` PROVES it: RED on a header contradicted
+# elsewhere, on a Rust const disagreeing with a C #define, and on a declared
+# value contract drifting; GREEN on 0x2C vs 44, on #ifdef branches in one file,
+# and on two .c files whose private constants happen to collide.
+DUPCONST_LINT = tools/dup-const-lint/dup-const-lint
+
+.PHONY: dup-const-lint
+dup-const-lint:
+	@if [ ! -f $(DUPCONST_LINT) ]; then \
+	   echo "ERROR: $(DUPCONST_LINT) is missing. The duplicate-constant lint"; \
+	   echo "       cannot run, and a gate that skips silently is how the next"; \
+	   echo "       second copy of a constant ships (#222/#514)."; \
+	   exit 1; \
+	 fi
+	@python3 $(DUPCONST_LINT) .. --dirs kernel
+
+.PHONY: dup-const-lint-selftest
+dup-const-lint-selftest:
+	@python3 $(DUPCONST_LINT) --self-test
+
 CONC_LINT = tools/concurrency-lint/concurrency-lint
 
 .PHONY: concurrency-lint
@@ -1558,6 +1971,70 @@ persist-extern-gate:
 persist-extern-gate-selftest:
 	@python3 $(PERSIST_EXTGATE) --root . --manifest $(PERSIST_EXTMAN) --self-test
 
+# #DIAGLOG: FAIL THE BUILD when a boot-path diagnostic can only be read over a
+# serial port. Serial is silent in GUI mode and the laptop and iMac targets have
+# no serial port at all, so a kprintf-only diagnostic produces NOTHING on the
+# machines it exists for. Measured on golden 2219: the one line that was the
+# only evidence the block write-staging fix works on real hardware, plus its
+# CORRUPTION IN PROGRESS alarm, plus 20 more boot-path report/selftest
+# functions, were all in that shape. The durable sink (bootlog_write, and
+# bootlog_fault_write for code on the storage path) already existed; the choice
+# of sink was simply left to each author. Same placement rationale as the gates
+# above: the tool travels INSIDE kernel/ so it runs where the kernel is built.
+DIAGLOG_GATE  = tools/diaglog-gate/diaglog-gate
+DIAGLOG_ALLOW = tools/diaglog-gate/allowlist.txt
+
+.PHONY: diaglog-gate
+diaglog-gate:
+	@if [ ! -f $(DIAGLOG_GATE) ]; then \
+	   echo "ERROR: $(DIAGLOG_GATE) is missing. A gate that skips silently is"; \
+	   echo "       how a diagnostic ships that nobody can read on the machine"; \
+	   echo "       it was written for."; \
+	   exit 1; \
+	 fi
+	@python3 $(DIAGLOG_GATE) --root . --allowlist $(DIAGLOG_ALLOW)
+
+# Prove it: RED on a synthetic serial-only boot diagnostic, GREEN when the same
+# fixture uses bootlog_write(), plus the allowlist suppressing and a stale
+# allowlist entry failing. The fixture is self-contained, so the proof does not
+# depend on the state of any real kernel file.
+.PHONY: diaglog-gate-selftest
+diaglog-gate-selftest:
+	@python3 $(DIAGLOG_GATE) --self-test
+
+# ---------------------------------------------------------------------------
+# #PERMSKIP: skipgate - FAIL THE BUILD when a self-test can decline to run and
+# says so in a line that reads like ordinary boot noise.
+#
+# fs/perms.c perms_selftest() printed "[PERMS-SELFTEST] SKIP traversal vectors
+# (/HOME/ADMIN not 1000:0750)" on every boot of every CORRECTLY PROVISIONED
+# machine, because the first-boot wizard lets the owner name the account and
+# the owner is not called "admin". MEASURED on golden 2234: the shipped
+# PERMS.DB holds three entries and PASSWD is empty, so it could not run before
+# provisioning either. The traversal half of the permission model had probably
+# never been exercised anywhere. Same placement rationale as the gates above:
+# the tool travels INSIDE kernel/ so it runs where the kernel is built.
+SKIP_GATE  = tools/skipgate/skipgate
+SKIP_ALLOW = tools/skipgate/allowlist.txt
+
+.PHONY: skipgate
+skipgate:
+	@if [ ! -f $(SKIP_GATE) ]; then \
+	   echo "ERROR: $(SKIP_GATE) is missing. A gate that skips silently is how"; \
+	   echo "       a self-test ships that stopped testing years ago."; \
+	   exit 1; \
+	 fi
+	@python3 $(SKIP_GATE) --root . --allowlist $(SKIP_ALLOW)
+
+# Prove it: RED on a self-test printing its own SKIP, GREEN when the same
+# fixture registers through selftest_notrun(), RED on UNDERCOUNT (one branch
+# registered, a second still printing its own - the case that caught this
+# gate's FIRST rule going green on a real violation), plus the allowlist
+# suppressing and a stale allowlist entry failing.
+.PHONY: skipgate-selftest
+skipgate-selftest:
+	@python3 $(SKIP_GATE) --self-test
+
 # Link kernel
 # librustkern.a is linked LAST (after all C objects) - the proven strangler
 # link order from the PoC, so archive members are pulled to satisfy C
@@ -1575,7 +2052,7 @@ RUST_FORCE = -u rust_marker
 # but being order-only it does not mark kernel.elf out of date, so it never
 # forces a needless 15 MB relink. If the gate fails, make stops here and the
 # kernel is not linked.
-$(TARGET): $(OBJECTS) $(RUST_LIB) | increment_build dirs rust-symbol-gate syscall-dispatch-gate syscall-ptr-lint copy-user-lint smap-uaccess-lint concurrency-lint persist-extern-gate syscall-number-lint
+$(TARGET): $(OBJECTS) $(RUST_LIB) | increment_build dirs rust-symbol-gate syscall-dispatch-gate syscall-ptr-lint copy-user-lint smap-uaccess-lint concurrency-lint persist-extern-gate syscall-number-lint dup-const-lint diaglog-gate skipgate
 	@echo "Linking $(DEBUG_TARGET)..."
 	$(LD) $(LDFLAGS) -o $(DEBUG_TARGET) $(OBJECTS) $(RUST_FORCE) $(RUST_LIB)
 	@# #670: the SHIPPED kernel is the stripped copy. Link once, strip into

@@ -381,3 +381,118 @@ int sntp_sync(const char *server, uint32_t timeout_ms, sntp_result_t *out) {
     }
     return last;
 }
+
+// ---------------------------------------------------------------------------
+// #135: BOOT-TIME SNTP PROBE - `make RTCBINTEST=1`. OFF in the golden.
+//
+// Two things need proving and neither is provable from a GUI panel on a
+// headless VM: that a sync actually corrects the clock end to end, and that
+// with NO usable network it FAILS FAST and does not hang. The owner's machine
+// is often offline, so the second is the one that matters more.
+//
+// It runs in its OWN kernel thread, never on the boot path: sntp_sync() sleeps
+// on a wait queue, and wq_assert_may_block() would (correctly) fire on a
+// pre-scheduler caller. It reports ELAPSED time from the monotonic TSC clock,
+// never timer_ticks, which is not a measure of elapsed time (#524/#525) and
+// would make a hang look instant under vCPU starvation.
+// ---------------------------------------------------------------------------
+#ifdef RTC_LIVE_TEST
+#include "../cpu/mono.h"
+#include "../fs/bootlog.h"
+#include "../proc/process.h"
+
+extern void rtc_read_time(int *hour, int *minute, int *second);
+extern void rtc_read_date(int *day, int *month, int *year, int *weekday);
+
+static void sntp_probe_worker(void *arg) {
+    (void)arg;
+    // Let DHCP/ARP settle so this measures SNTP and not "the stack was not up
+    // yet". 20 seconds is well past the point where the net worker has either
+    // bound a lease or given up.
+    proc_sleep(20000);
+
+    // DELIBERATELY BREAK THE CLOCK FIRST, by exactly the amount #135 produced,
+    // so "the sync corrected it" is a visible correction rather than a clock
+    // that happened to be right already. +6h06m, wrapped into a legal hour.
+    {
+        int h = 0, m = 0, sec = 0;
+        rtc_read_time(&h, &m, &sec);
+        int total = (h * 60 + m + 366) % (24 * 60);
+        extern int rtc_set_time(int hour, int minute, int second);
+        rtc_set_time(total / 60, total % 60, sec);
+    }
+
+    int h0 = 0, m0 = 0, s0 = 0, d0 = 1, mo0 = 1, y0 = 2026, w0 = 0;
+    rtc_read_time(&h0, &m0, &s0);
+    rtc_read_date(&d0, &mo0, &y0, &w0);
+    kprintf("[SNTPTEST] clock BEFORE (deliberately set +6h06m wrong): "
+            "%04d-%02d-%02d %02d:%02d:%02d\n", y0, mo0, d0, h0, m0, s0);
+    bootlog_write("[SNTPTEST] before(+6h06m wrong) %04d-%02d-%02d %02d:%02d:%02d",
+                  y0, mo0, d0, h0, m0, s0);
+
+    sntp_result_t res;
+    uint64_t t0 = mono_ms_rs();
+    int rc = sntp_sync(NULL, 5000, &res);
+    uint64_t dt = mono_ms_rs() - t0;
+
+    int h1 = 0, m1 = 0, s1 = 0, d1 = 1, mo1 = 1, y1 = 2026, w1 = 0;
+    rtc_read_time(&h1, &m1, &s1);
+    rtc_read_date(&d1, &mo1, &y1, &w1);
+
+    kprintf("[SNTPTEST] sntp_sync -> %d (%s) in %llu ms\n",
+            rc, sntp_strerror(rc), (unsigned long long)dt);
+    int moved = (h1 * 60 + m1) - (h0 * 60 + m0);
+    if (moved < 0) moved += 24 * 60;
+    kprintf("[SNTPTEST] clock AFTER : %04d-%02d-%02d %02d:%02d:%02d "
+            "(moved %+d min; -366 mod 1440 = %d means the 6h06m error was undone)\n",
+            y1, mo1, d1, h1, m1, s1, moved, (24 * 60 - 366));
+    bootlog_write("[SNTPTEST] rc=%d (%s) elapsed=%llums after=%04d-%02d-%02d %02d:%02d:%02d",
+                  rc, sntp_strerror(rc), (unsigned long long)dt,
+                  y1, mo1, d1, h1, m1, s1);
+
+    // The offline assertion. The caller asked for a 5000ms budget over a
+    // three-server default list; sntp_sync() gives each an equal share of it.
+    // Anything much past that is a hang, which is the failure mode that
+    // actually hurts (#426): a wrong clock is visible, a frozen UI is not
+    // attributable.
+    if (rc != SNTP_OK) {
+        kprintf("[SNTPTEST] %s: no-network path returned an ERROR in %llums "
+                "(budget 5000ms), clock UNTOUCHED\n",
+                dt <= 12000 ? "PASS" : "FAIL", (unsigned long long)dt);
+        bootlog_write("[SNTPTEST] offline-path %s elapsed=%llums",
+                      dt <= 12000 ? "PASS" : "FAIL", (unsigned long long)dt);
+    }
+    // THE HARDER OFFLINE CASE. "No IP configured" short-circuits in 0ms, which
+    // is right but proves nothing about the WAIT. This arm has a live network
+    // and names a server that cannot answer: 192.0.2.1 is TEST-NET-1
+    // (RFC 5737), reserved for documentation and guaranteed unroutable, so the
+    // request goes out and nothing ever comes back. That is the shape of the
+    // real offline failure on a machine with a captive or broken uplink, and
+    // it is the one that hangs a UI if the wait is unbounded.
+    {
+        uint64_t t2 = mono_ms_rs();
+        int rc2 = sntp_sync("192.0.2.1", 5000, NULL);
+        uint64_t dt2 = mono_ms_rs() - t2;
+        int hx = 0, mx = 0, sx = 0;
+        rtc_read_time(&hx, &mx, &sx);
+        int drift = (hx * 60 + mx) - (h1 * 60 + m1);
+        if (drift < 0) drift += 24 * 60;
+        kprintf("[SNTPTEST] unreachable-server arm: rc=%d (%s) in %llu ms "
+                "(budget 5000ms); clock moved %d min -> %s\n",
+                rc2, sntp_strerror(rc2), (unsigned long long)dt2, drift,
+                (rc2 != SNTP_OK && dt2 <= 8000 && drift <= 1)
+                    ? "PASS bounded wait, clock untouched"
+                    : "FAIL");
+        bootlog_write("[SNTPTEST] unreachable rc=%d elapsed=%llums drift=%dmin %s",
+                      rc2, (unsigned long long)dt2, drift,
+                      (rc2 != SNTP_OK && dt2 <= 8000 && drift <= 1) ? "PASS" : "FAIL");
+    }
+
+    proc_exit(0);
+}
+
+void sntp_probe_start(void) {
+    int pid = proc_create("sntpprobe", sntp_probe_worker, NULL, PRIO_NORMAL);
+    kprintf("[SNTPTEST] probe thread started, pid=%d\n", pid);
+}
+#endif // RTC_LIVE_TEST

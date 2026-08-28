@@ -24,7 +24,7 @@ BUILD_DIR     = build
 # fetch-upstream.sh populates vendor/ClassiCube from the pinned commit and
 # its `verify` subcommand proves the vendored tree still equals that commit.
 CC_MK_DIR    := $(dir $(lastword $(MAKEFILE_LIST)))
-CC_VENDOR    ?= $(firstword $(wildcard $(CC_MK_DIR)vendor/ClassiCube/src) $(HOME)/cc-stage/ClassiCube/src)
+CC_VENDOR    ?= $(firstword $(wildcard $(CC_MK_DIR)vendor/ClassiCube/src) <workspace>)
 
 # The engine source is COMPILED FROM A STAGED COPY under $(BUILD_DIR)/src, not
 # from vendor/ in place. Core.h needs a MayteraOS platform branch, and patching
@@ -69,7 +69,7 @@ TARGET = CLASSICUBE
 # passes -mno-sse -mno-sse2). -msse -msse2 are stated explicitly below so the
 # choice is visible in the file rather than inherited silently.
 CFLAGS = -fPIE -ffreestanding -fstack-protector-strong -mstack-protector-guard=global \
-         -mno-red-zone -msse -msse2 -nostdlib -nostdinc -fno-builtin -O2 -g \
+         -mno-red-zone -msse -msse2 -nostdlib -nostdinc -fno-builtin -O3 -g \
          -DPLAT_MAYTERA \
          -DCC_GFX_BACKEND=$(GFX_BACKEND) \
          -DCC_AUD_BACKEND=$(AUD_BACKEND) \

@@ -403,3 +403,75 @@ int fprintf(FILE *f, const char *fmt, ...) {
     va_end(ap);
     return n;
 }
+
+// ---------------------------------------------------------------------------
+// freopen()/tmpfile()/tmpnam(), added for the Lua 5.4 port (local queue 91).
+// They live down here because all three need the FILE internals above.
+// ---------------------------------------------------------------------------
+
+// freopen(): close the stream's current file and re-point the SAME FILE object
+// at 'path'. The stream object survives, which is the whole reason callers use
+// it: Lua's luaL_loadfilex() has already handed its FILE to a reader and needs
+// the same one to continue in binary mode once it discovers the script is a
+// precompiled chunk.
+//
+// The mode-only form freopen(NULL, mode, f) is REFUSED with EINVAL rather than
+// silently ignored. It means "change this stream's mode in place", which needs
+// an fd whose access mode can be changed after the fact; this kernel has no
+// such call, and a caller that thinks it switched a read stream to write would
+// be badly wrong.
+FILE *freopen(const char *path, const char *mode, FILE *f) {
+    int of, mb;
+    if (!f) { errno = EBADF; return 0; }
+    if (!path) { errno = EINVAL; return 0; }
+    if (parse_mode(mode, &of, &mb) < 0) { errno = EINVAL; return 0; }
+
+    flush_writes(f);
+    close(f->fd);
+
+    // Keep whatever buffer the stream already owns; only the fd and the
+    // read/write mode bits change.
+    char  *buf   = f->rd_buf ? f->rd_buf : f->wr_buf;
+    size_t bufsz = f->rd_buf ? f->rd_size : f->wr_size;
+    int    owns  = f->owns_buf;
+
+    int fd = open(path, of);
+    if (fd < 0) {
+        // C says the stream is closed on failure. Leave it in a state where
+        // every further operation fails rather than reading a stale fd.
+        stream_init(f, -1, mb, _IOFBF, buf, bufsz);
+        f->owns_buf = owns;
+        f->error = 1;
+        return 0;
+    }
+    stream_init(f, fd, mb, _IOFBF, buf, bufsz);
+    f->owns_buf = owns;
+    return f;
+}
+
+// tmpnam(): MayteraOS HAS NO TEMPORARY FILE FACILITY, and this says so in the
+// way ISO C provides for. (tmpfile() says the same thing and lives in its own
+// translation unit, tmpfile.c - see the comment there for why.)
+//
+// This is deliberate, and it is not laziness. tmpfile() is specified to create
+// a file that is REMOVED WHEN IT IS CLOSED, which needs a filesystem that can
+// unlink an open file; neither the FAT nor the ext2 path in this kernel can.
+// tmpnam() is specified to return a name that IS NOT the name of an existing
+// file, and there is no temporary directory anywhere in the image to put one
+// in - inventing "/TMPnnnn.TMP" at the root of the system volume would be a
+// filesystem-layout policy decision smuggled in through libc, and it would
+// leave litter that nothing ever collects.
+//
+// Returning NULL is a conforming outcome for both (C99 7.21.4.3 and 7.21.4.4),
+// and it is loud: every caller has to handle it, and Lua's io.tmpfile() and
+// os.tmpname() turn it into a script-visible error. The alternative - handing
+// back a file that is not temporary - would be the dishonest answer, and the
+// caller would never find out.
+//
+// If MayteraOS ever grows a real temporary directory with a collector, THIS is
+// the place to implement them, for every app at once.
+char *tmpnam(char *s) {
+    (void)s;
+    errno = ENOSYS;
+    return 0;
+}

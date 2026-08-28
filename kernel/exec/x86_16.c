@@ -1149,161 +1149,21 @@ static uint32_t shift_op(x86_16_cpu_t *cpu, int op, uint32_t val, int size, uint
 
 static void fp_reset(x86_16_cpu_t *cpu) { cpu->fp_top = X86_16_FP_STACK; }
 
-// signed 64-bit integer -> IEEE-754 double bits.
-static uint64_t fp_from_i64(int64_t v) {
-    if (v == 0) return 0;
-    uint64_t sign = 0;
-    uint64_t mag;
-    if (v < 0) { sign = 1ULL << 63; mag = (uint64_t)(-(v + 1)) + 1ULL; }
-    else       { mag = (uint64_t)v; }
-    // Normalise: find highest set bit.
-    int msb = 63;
-    while (!((mag >> msb) & 1ULL)) msb--;
-    int exp = msb + 1023;
-    // mantissa: bits below the implicit leading 1, scaled to 52 bits.
-    uint64_t mant;
-    if (msb >= 52) mant = mag >> (msb - 52);
-    else           mant = mag << (52 - msb);
-    mant &= (1ULL << 52) - 1ULL;
-    return sign | ((uint64_t)exp << 52) | mant;
-}
-
-// IEEE-754 double bits -> signed 64-bit integer (round toward nearest, ties to
-// even is not required by these apps; we use round-half-away which matches the
-// default FISTP rounding closely enough for pixel geometry).
-static int64_t fp_to_i64(uint64_t b) {
-    uint64_t sign = b >> 63;
-    int exp = (int)((b >> 52) & 0x7FF);
-    uint64_t mant = b & ((1ULL << 52) - 1ULL);
-    if (exp == 0) return 0;                 // zero / subnormal -> 0
-    if (exp == 0x7FF) return 0;             // inf/nan -> 0 (defensive)
-    int e = exp - 1023;
-    if (e < 0) {
-        // |x| < 1: round to nearest integer (0 or 1).
-        // value = 1.mant * 2^e ; for e == -1 it is in [0.5,1) -> rounds to 1.
-        int64_t r = (e == -1) ? 1 : 0;
-        return sign ? -r : r;
-    }
-    uint64_t full = (1ULL << 52) | mant;    // 53-bit significand (1.mant)
-    int64_t r;
-    if (e >= 52) {
-        if (e - 52 >= 11) return 0;         // overflow guard (>2^63) -> 0
-        r = (int64_t)(full << (e - 52));
-    } else {
-        int sh = 52 - e;
-        uint64_t intpart = full >> sh;
-        uint64_t frac_top = (full >> (sh - 1)) & 1ULL;   // round bit
-        r = (int64_t)(intpart + frac_top);               // round half up
-    }
-    return sign ? -r : r;
-}
-
-// Multiply two IEEE-754 doubles (bit patterns). Integer-only; uses the 128-bit
-// integer type (available under -mno-sse, it is not a floating-point feature) to
-// hold the 106-bit significand product, then normalises back to a 53-bit double.
-static uint64_t fp_mul(uint64_t a, uint64_t b) {
-    uint64_t sa = a >> 63, sb = b >> 63, sign = sa ^ sb;
-    int ea = (int)((a >> 52) & 0x7FF), eb = (int)((b >> 52) & 0x7FF);
-    uint64_t ma = a & ((1ULL << 52) - 1ULL), mb = b & ((1ULL << 52) - 1ULL);
-    if (ea == 0 || eb == 0) return sign << 63;   // zero/subnormal operand -> 0
-    if (ea == 0x7FF || eb == 0x7FF) return (sign << 63) | (0x7FFULL << 52); // inf
-    uint64_t fa = (1ULL << 52) | ma;             // 53-bit significand 1.mant
-    uint64_t fb = (1ULL << 52) | mb;
-    unsigned __int128 P = (unsigned __int128)fa * (unsigned __int128)fb;  // <=106 bits
-    // True value = P / 2^104. Leading 1 sits at bit 104 (value in [1,2)) or
-    // bit 105 (value in [2,4)). Find it and renormalise to 1.xxx * 2^exp.
-    int msb = 105;
-    while (msb >= 0 && !((P >> msb) & 1)) msb--;
-    if (msb < 0) return sign << 63;
-    int exp = ea + eb - 1023 + (msb - 104);
-    uint64_t mant;
-    int shift = msb - 52;
-    if (shift >= 0) mant = (uint64_t)(P >> shift) & ((1ULL << 52) - 1ULL);
-    else            mant = (uint64_t)(P << (-shift)) & ((1ULL << 52) - 1ULL);
-    if (exp <= 0)     return sign << 63;                       // underflow -> 0
-    if (exp >= 0x7FF) return (sign << 63) | (0x7FFULL << 52);  // overflow -> inf
-    return (sign << 63) | ((uint64_t)exp << 52) | mant;
-}
-
-// Add (sub=0) or subtract (sub=1) two IEEE-754 doubles, integer-only.
-static uint64_t fp_add(uint64_t a, uint64_t b, int sub) {
-    uint64_t sa = a >> 63, sb = (b >> 63) ^ (sub ? 1u : 0u);
-    int ea = (int)((a >> 52) & 0x7FF), eb = (int)((b >> 52) & 0x7FF);
-    uint64_t ma = a & ((1ULL << 52) - 1), mb = b & ((1ULL << 52) - 1);
-    if (ea == 0 && ma == 0) return sub ? (b ^ (1ULL << 63)) : b;  // a==0
-    if (eb == 0 && mb == 0) return a;                              // b==0
-    if (ea == 0x7FF || eb == 0x7FF)
-        return (ea == 0x7FF) ? a : (b ^ ((uint64_t)(sub ? 1u : 0u) << 63));
-    uint64_t fa = (1ULL << 52) | ma, fb = (1ULL << 52) | mb;
-    fa <<= 3; fb <<= 3;                 // 3 guard bits (keeps sums within int64)
-    int e;
-    if (ea >= eb) { fb >>= (ea - eb); e = ea; }
-    else          { fa >>= (eb - ea); e = eb; }
-    int64_t va = sa ? -(int64_t)fa : (int64_t)fa;
-    int64_t vb = sb ? -(int64_t)fb : (int64_t)fb;
-    int64_t r = va + vb;
-    uint64_t sign = 0;
-    if (r < 0) { sign = 1ULL << 63; r = -r; }
-    if (r == 0) return 0;
-    uint64_t m = (uint64_t)r;
-    int msb = 63; while (!((m >> msb) & 1ULL)) msb--;
-    int target = 55;                    // 52 + 3 guard bits
-    e += (msb - target);
-    if (msb >= target) m >>= (msb - target); else m <<= (target - msb);
-    uint64_t mant = (m >> 3) & ((1ULL << 52) - 1);
-    if (e <= 0)     return sign;
-    if (e >= 0x7FF) return sign | (0x7FFULL << 52);
-    return sign | ((uint64_t)e << 52) | mant;
-}
-
-// Divide a/b (IEEE-754 doubles), integer-only.
-static uint64_t fp_div(uint64_t a, uint64_t b) {
-    uint64_t sa = a >> 63, sb = b >> 63, sign = sa ^ sb;
-    int ea = (int)((a >> 52) & 0x7FF), eb = (int)((b >> 52) & 0x7FF);
-    uint64_t ma = a & ((1ULL << 52) - 1), mb = b & ((1ULL << 52) - 1);
-    if (ea == 0) return sign << 63;                       // 0 / x -> 0
-    if (eb == 0) return (sign << 63) | (0x7FFULL << 52);  // x / 0 -> inf
-    uint64_t fa = (1ULL << 52) | ma, fb = (1ULL << 52) | mb;
-    // q = (fa << 53) / fb, computed by restoring binary long division using only
-    // 64-bit arithmetic (freestanding has no __udivti3 for 128-bit division).
-    // fa,fb are <= 53 bits, so the running remainder never overflows 64 bits.
-    uint64_t q = 0, rem = 0;
-    for (int bit = 105; bit >= 0; bit--) {           // dividend = fa << 53
-        rem <<= 1;
-        if (bit >= 53) rem |= (fa >> (bit - 53)) & 1ULL;
-        if (rem >= fb) { rem -= fb; if (bit < 64) q |= (1ULL << bit); }
-    }
-    int msb = 63; while (msb >= 0 && !((q >> msb) & 1ULL)) msb--;
-    if (msb < 0) return sign << 63;
-    int exp = ea - eb + 1023 + (msb - 53);
-    uint64_t mant; int sh = msb - 52;
-    if (sh >= 0) mant = (q >> sh) & ((1ULL << 52) - 1);
-    else         mant = (q << (-sh)) & ((1ULL << 52) - 1);
-    if (exp <= 0)     return sign << 63;
-    if (exp >= 0x7FF) return (sign << 63) | (0x7FFULL << 52);
-    return (sign << 63) | ((uint64_t)exp << 52) | mant;
-}
-
-// IEEE-754 single (32-bit bits) <-> double (64-bit bits) conversions.
-static uint64_t f32_to_f64(uint32_t f) {
-    uint64_t s = (uint64_t)(f >> 31) << 63;
-    int e = (int)((f >> 23) & 0xFF);
-    uint64_t mn = f & 0x7FFFFF;
-    if (e == 0)    return s;                          // zero/subnormal -> +-0
-    if (e == 0xFF) return s | (0x7FFULL << 52) | (mn << 29);
-    return s | ((uint64_t)(e - 127 + 1023) << 52) | (mn << 29);
-}
-static uint32_t f64_to_f32(uint64_t b) {
-    uint64_t s = b >> 63;
-    int e = (int)((b >> 52) & 0x7FF);
-    uint64_t mn = (b >> 29) & 0x7FFFFF;     // top 23 fraction bits (truncate)
-    if (e == 0)     return (uint32_t)(s << 31);
-    if (e == 0x7FF) return (uint32_t)((s << 31) | (0xFFu << 23) | mn);
-    int e32 = e - 1023 + 127;
-    if (e32 <= 0)   return (uint32_t)(s << 31);       // underflow -> 0
-    if (e32 >= 0xFF) return (uint32_t)((s << 31) | (0xFFu << 23)); // overflow -> inf
-    return (uint32_t)((s << 31) | ((uint32_t)e32 << 23) | mn);
-}
+// (#211) THE SOFT-FLOAT ARITHMETIC USED TO LIVE HERE AS SEVEN `static`
+// FUNCTIONS. It now lives in exec/softfpu.c, unchanged, because the 32-bit
+// guest core (rustkern/x87.rs) needs the SAME arithmetic and this project's
+// standing rule is to share the primitive rather than fork it. The bodies were
+// cut from this file, not retyped: only the names gained an `sfp_` prefix.
+// The `fp_*` spellings below keep every call site in this file byte-identical,
+// so the move carries no behavioural risk for the Win16 apps that depend on it.
+#include "softfpu.h"
+#define fp_from_i64 sfp_fp_from_i64
+#define fp_to_i64   sfp_fp_to_i64
+#define fp_mul      sfp_fp_mul
+#define fp_add      sfp_fp_add
+#define fp_div      sfp_fp_div
+#define f32_to_f64  sfp_f32_to_f64
+#define f64_to_f32  sfp_f64_to_f32
 
 static int jcc_cond(x86_16_cpu_t *cpu, uint8_t cc) {
     uint16_t f = cpu->flags;
@@ -1459,6 +1319,172 @@ void x86_16_ring_dump(const char *tag, int n) {
                 e->ax, e->bx, e->cx, e->dx, e->ds, e->es, e->ss, e->sp, e->flags);
     }
     kprintf("[x86ring] --- end %s ---\n", tag ? tag : "-");
+}
+
+
+// ---------------------------------------------------------------------------
+// (#745) MISS SKIP-WALK: get the LENGTH right even when the effect is missing.
+//
+// blame.md records why a MISS that only logs is worse than useless: the guest's
+// instruction pointer lands mid-instruction and every subsequent decode is
+// garbage, so the reported failure is nowhere near its cause. The 32-bit core
+// (tools/x86-32-oracle) sets the standard: its skip-walk lengths are proven
+// against the assembler's own lengths, not against the author's belief about
+// them. tools/x86-16-oracle/lenwalk does the same for this table.
+//
+// This is a MEASUREMENT INSTRUMENT and it is OFF in the shipping kernel. With
+// g_x86_16_miss_skip == 0 an unimplemented opcode still stops the run and
+// returns -1, exactly as before. The offline probe (tools/dos-probe) turns it
+// on so ONE run yields the whole MISS histogram instead of only the first
+// opcode: without it, scoping 386 coverage costs one four-minute VM boot per
+// opcode.
+//
+// Skipping is not executing. A skipped instruction leaves registers, flags and
+// memory wrong, so everything after the FIRST skip in a run is a hypothesis
+// about which opcodes the guest reaches, never a claim about its behaviour.
+// ---------------------------------------------------------------------------
+int g_x86_16_miss_skip = 0;
+
+// Trailing-byte shape of an instruction, after its opcode byte(s).
+#define SK_NONE   0   // no operands
+#define SK_M      1   // modrm (+sib/disp)
+#define SK_M_I8   2   // modrm + imm8
+#define SK_M_IZ   3   // modrm + imm16/imm32 (operand size)
+#define SK_I8     4   // imm8
+#define SK_IZ     5   // imm16/imm32 (operand size)
+#define SK_I16    6   // imm16 always
+#define SK_JZ     7   // rel16/rel32 (operand size)
+#define SK_J8     8   // rel8
+#define SK_PTR    9   // ptr16:16 / ptr16:32 (far immediate)
+#define SK_ESC38 10   // 3-byte escape 0F 38 xx: one more opcode byte, then modrm
+#define SK_ESC3A 11   // 3-byte escape 0F 3A xx: one more opcode byte, modrm, imm8
+
+// Two-byte (0F) opcode map. Only the SHAPE matters here, not the semantics.
+static const uint8_t k_sk_0f[256] = {
+    /*00*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_NONE,SK_NONE,SK_NONE,SK_NONE,
+    /*08*/ SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_M,   SK_NONE,SK_M_I8,
+    /*10*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*18*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*20*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_NONE,SK_M,   SK_NONE,
+    /*28*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*30*/ SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,
+    /*38*/ SK_ESC38,SK_NONE,SK_ESC3A,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,
+    /*40*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*48*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*50*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*58*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*60*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*68*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*70*/ SK_M_I8,SK_M_I8,SK_M_I8,SK_M_I8,SK_M,   SK_M,   SK_M,   SK_NONE,
+    /*78*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*80*/ SK_JZ,  SK_JZ,  SK_JZ,  SK_JZ,  SK_JZ,  SK_JZ,  SK_JZ,  SK_JZ,
+    /*88*/ SK_JZ,  SK_JZ,  SK_JZ,  SK_JZ,  SK_JZ,  SK_JZ,  SK_JZ,  SK_JZ,
+    /*90*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*98*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*a0*/ SK_NONE,SK_NONE,SK_NONE,SK_M,   SK_M_I8,SK_M,   SK_NONE,SK_NONE,
+    /*a8*/ SK_NONE,SK_NONE,SK_NONE,SK_M,   SK_M_I8,SK_M,   SK_M,   SK_M,
+    /*b0*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*b8*/ SK_M,   SK_M,   SK_M_I8,SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*c0*/ SK_M,   SK_M,   SK_M_I8,SK_M,   SK_M_I8,SK_M_I8,SK_M_I8,SK_M,
+    /*c8*/ SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,
+    /*d0*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*d8*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*e0*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*e8*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*f0*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*f8*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+};
+
+// One-byte opcode map. Every one of these is implemented today; the table is
+// here so the default: arm of the dispatch can skip-walk a future gap rather
+// than desynchronise, and so lenwalk can prove BOTH maps against the assembler.
+static const uint8_t k_sk_1b[256] = {
+    /*00*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_I8,  SK_IZ,  SK_NONE,SK_NONE,
+    /*08*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_I8,  SK_IZ,  SK_NONE,SK_NONE,
+    /*10*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_I8,  SK_IZ,  SK_NONE,SK_NONE,
+    /*18*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_I8,  SK_IZ,  SK_NONE,SK_NONE,
+    /*20*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_I8,  SK_IZ,  SK_NONE,SK_NONE,
+    /*28*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_I8,  SK_IZ,  SK_NONE,SK_NONE,
+    /*30*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_I8,  SK_IZ,  SK_NONE,SK_NONE,
+    /*38*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_I8,  SK_IZ,  SK_NONE,SK_NONE,
+    /*40*/ SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,
+    /*48*/ SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,
+    /*50*/ SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,
+    /*58*/ SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,
+    /*60*/ SK_NONE,SK_NONE,SK_M,   SK_M,   SK_NONE,SK_NONE,SK_NONE,SK_NONE,
+    /*68*/ SK_IZ,  SK_M_IZ,SK_I8,  SK_M_I8,SK_NONE,SK_NONE,SK_NONE,SK_NONE,
+    /*70*/ SK_J8,  SK_J8,  SK_J8,  SK_J8,  SK_J8,  SK_J8,  SK_J8,  SK_J8,
+    /*78*/ SK_J8,  SK_J8,  SK_J8,  SK_J8,  SK_J8,  SK_J8,  SK_J8,  SK_J8,
+    /*80*/ SK_M_I8,SK_M_IZ,SK_M_I8,SK_M_I8,SK_M,   SK_M,   SK_M,   SK_M,
+    /*88*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*90*/ SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,
+    /*98*/ SK_NONE,SK_NONE,SK_PTR, SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,
+    /*a0*/ SK_IZ,  SK_IZ,  SK_IZ,  SK_IZ,  SK_NONE,SK_NONE,SK_NONE,SK_NONE,
+    /*a8*/ SK_I8,  SK_IZ,  SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,
+    /*b0*/ SK_I8,  SK_I8,  SK_I8,  SK_I8,  SK_I8,  SK_I8,  SK_I8,  SK_I8,
+    /*b8*/ SK_IZ,  SK_IZ,  SK_IZ,  SK_IZ,  SK_IZ,  SK_IZ,  SK_IZ,  SK_IZ,
+    /*c0*/ SK_M_I8,SK_M_I8,SK_I16, SK_NONE,SK_M,   SK_M,   SK_M_I8,SK_M_IZ,
+    /*c8*/ SK_NONE,SK_NONE,SK_I16, SK_NONE,SK_NONE,SK_I8,  SK_NONE,SK_NONE,
+    /*d0*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_I8,  SK_I8,  SK_NONE,SK_NONE,
+    /*d8*/ SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,   SK_M,
+    /*e0*/ SK_J8,  SK_J8,  SK_J8,  SK_J8,  SK_I8,  SK_I8,  SK_I8,  SK_I8,
+    /*e8*/ SK_JZ,  SK_JZ,  SK_PTR, SK_J8,  SK_NONE,SK_NONE,SK_NONE,SK_NONE,
+    /*f0*/ SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_M,   SK_M,
+    /*f8*/ SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_NONE,SK_M,   SK_M,
+};
+
+// 0xC8 ENTER is imm16+imm8, which no single shape covers; and 0xF6/0xF7 carry an
+// immediate only for sub-opcodes 0 and 1. Both are handled as special cases.
+//
+// cpu->ip is already past the opcode byte(s) when this is called. It advances ip
+// past the remainder, using the SAME decoder the executing path uses, so a
+// modrm/SIB/disp can never be counted differently here than there.
+static void miss_skip_walk(x86_16_cpu_t *cpu, int two_byte, uint8_t op,
+                           int seg_ovr, int asize, int osize) {
+    uint8_t shape = two_byte ? k_sk_0f[op] : k_sk_1b[op];
+    modrm_t m;
+
+    if (!two_byte) {
+        if (op == 0xC8) { (void)fetch16(cpu); (void)fetch8(cpu); return; }  // ENTER iw, ib
+        if (op == 0xF6 || op == 0xF7) {
+            decode_modrm_a(cpu, &m, seg_ovr, asize);
+            if (m.reg <= 1) {                       // TEST rm, imm
+                if (op == 0xF6) (void)fetch8(cpu);
+                else if (osize == 4) (void)fetch32(cpu);
+                else (void)fetch16(cpu);
+            }
+            return;
+        }
+    }
+
+    switch (shape) {
+    case SK_NONE: break;
+    case SK_M:    decode_modrm_a(cpu, &m, seg_ovr, asize); break;
+    case SK_M_I8: decode_modrm_a(cpu, &m, seg_ovr, asize); (void)fetch8(cpu); break;
+    case SK_M_IZ: decode_modrm_a(cpu, &m, seg_ovr, asize);
+                  if (osize == 4) (void)fetch32(cpu); else (void)fetch16(cpu); break;
+    case SK_I8:
+    case SK_J8:   (void)fetch8(cpu); break;
+    case SK_IZ:
+    case SK_JZ:   if (osize == 4) (void)fetch32(cpu); else (void)fetch16(cpu); break;
+    case SK_I16:  (void)fetch16(cpu); break;
+    case SK_PTR:  if (osize == 4) (void)fetch32(cpu); else (void)fetch16(cpu);
+                  (void)fetch16(cpu); break;
+    case SK_ESC38:(void)fetch8(cpu); decode_modrm_a(cpu, &m, seg_ovr, asize); break;
+    case SK_ESC3A:(void)fetch8(cpu); decode_modrm_a(cpu, &m, seg_ovr, asize);
+                  (void)fetch8(cpu); break;
+    default:      break;
+    }
+}
+
+// (#745) A moffs displacement follows the ADDRESS size, not the operand size:
+// two bytes normally, four under a 0x67 prefix. The result is truncated into the
+// 16-bit segment window for the same reason decode_modrm32() truncates: the
+// segments here are 16-bit selectors / real-mode paragraphs whose backing
+// windows are at most 64 KiB. Split out so all four A0-A3 forms share one
+// definition and cannot drift apart again.
+static uint16_t moffs(x86_16_cpu_t *cpu, int asize) {
+    return (asize == 4) ? (uint16_t)(fetch32(cpu) & 0xFFFF) : fetch16(cpu);
 }
 
 int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
@@ -2644,7 +2670,10 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                 kprintf("[W6GATE] 223:0d4a IsWindowVisible RETURNED ax=%04x -> gate=%d\n", cpu->ax, cpu->ax==1?1:0); } }
             }
           } }
-                int seg_ovr = -1;   // segment override index (ES=0,CS=1,SS=2,DS=3) or -1
+                // (#221) The instruction's own IP, before any prefix is eaten.
+        // An int_fn that returns X86_16_INT_RETRY rewinds to this.
+        cpu->ins_ip = cpu->ip;
+        int seg_ovr = -1;   // segment override index (ES=0,CS=1,SS=2,DS=3) or -1
         int rep = 0;        // 0 none, 1 REP/REPE (F3), 2 REPNE (F2)
         int osize = 2;      // (#194) operand size: 2=16-bit (default), 4=32-bit (0x66)
         int asize = 2;      // (#194) address size: 2=16-bit (default), 4=32-bit (0x67)
@@ -3566,26 +3595,26 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
 
         // ---- mov AL/AX <-> moffs (A0-A3) ----
         case 0xA0: { // mov al, [moffs]
-            uint16_t off = fetch16(cpu);
+            uint16_t off = moffs(cpu, asize);
             uint16_t seg = (seg_ovr >= 0) ? get_sreg(cpu, seg_ovr) : cpu->ds;
             set_reg8(cpu, 0, x86_16_rd8(cpu, seg, off));
             break;
         }
         case 0xA1: { // mov ax/eax, [moffs]   (#194 0x66 -> 32-bit)
-            uint16_t off = fetch16(cpu);
+            uint16_t off = moffs(cpu, asize);
             uint16_t seg = (seg_ovr >= 0) ? get_sreg(cpu, seg_ovr) : cpu->ds;
             if (osize == 4) set_reg32(cpu, 0, rd32(cpu, seg, off));
             else            cpu->ax = x86_16_rd16(cpu, seg, off);
             break;
         }
         case 0xA2: { // mov [moffs], al
-            uint16_t off = fetch16(cpu);
+            uint16_t off = moffs(cpu, asize);
             uint16_t seg = (seg_ovr >= 0) ? get_sreg(cpu, seg_ovr) : cpu->ds;
             x86_16_wr8(cpu, seg, off, (uint8_t)(cpu->ax & 0xFF));
             break;
         }
         case 0xA3: { // mov [moffs], ax/eax   (#194 0x66 -> 32-bit)
-            uint16_t off = fetch16(cpu);
+            uint16_t off = moffs(cpu, asize);
             uint16_t seg = (seg_ovr >= 0) ? get_sreg(cpu, seg_ovr) : cpu->ds;
             if (osize == 4) wr32(cpu, seg, off, get_reg32(cpu, 0));
             else            x86_16_wr16(cpu, seg, off, cpu->ax);
@@ -3687,8 +3716,18 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         // ---- test al/ax, imm ----
         case 0xA8: { uint8_t imm = fetch8(cpu);
             do_logic(cpu, (uint32_t)((cpu->ax & 0xFF) & imm), 1); break; }
-        case 0xA9: { uint16_t imm = fetch16(cpu);
-            do_logic(cpu, (uint32_t)(cpu->ax & imm), 2); break; }
+        case 0xA9: {   // (#745) TEST eAX, imm: the immediate follows the OPERAND
+            // size, so 0x66 makes it four bytes. This fetched 16 bits
+            // unconditionally, so `66 a9 imm32` consumed two bytes too few and
+            // desynchronised every following instruction. Found by
+            // tools/x86-16-oracle as a length disagreement with GNU objdump,
+            // not by inspection: the wrong result is invisible until the
+            // decoder has already walked off the instruction stream.
+            if (osize == 4) { uint32_t imm = fetch32(cpu);
+                do_logic(cpu, get_reg32(cpu, 0) & imm, 4); }
+            else            { uint16_t imm = fetch16(cpu);
+                do_logic(cpu, (uint32_t)(cpu->ax & imm), 2); }
+            break; }
 
         // ---- mov r8, imm8 (B0-B7) ----
         case 0xB0: case 0xB1: case 0xB2: case 0xB3:
@@ -3814,7 +3853,30 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         }
         case 0xCD: {
             uint8_t intno = fetch8(cpu);
-            if (cpu->int_fn) { if (cpu->int_fn(cpu, intno)) return 0; }
+            if (cpu->int_fn) {
+                int r = cpu->int_fn(cpu, intno);
+                // (#221) RETRY: the handler declined to service this INT yet
+                // (a blocking console read with an empty keyboard queue). Put
+                // IP back on the instruction so the guest executes it again on
+                // the next burst, by which time the caller's run loop will have
+                // pumped input. Nothing else is unwound because nothing else
+                // happened: the handler contracts to leave the register file
+                // exactly as it found it.
+                //
+                // RETURN 1, NOT 0. `return 0` here is what an int_fn STOP has
+                // always returned, and dos_run_file()'s loop reads
+                // `if (r == 0) break;   // halted normally` - it treats a zero
+                // from x86_16_run() as THE GUEST HAVING FINISHED. Returning 0
+                // on a retry therefore TERMINATED the guest the first time it
+                // waited for a key: measured on Epyx Rogue, whose title screen
+                // polls AH=01h and then calls AH=00h twice, the second finding
+                // the queue empty - one keypress and the DOS window vanished
+                // with exit=0, no 4Ch, no derail and nothing in the log.
+                // 1 is what a spent instruction budget returns, i.e. "stopped,
+                // nothing wrong, call me again", which is exactly this.
+                if (r == X86_16_INT_RETRY) { cpu->ip = cpu->ins_ip; return 1; }
+                if (r) return 0;
+            }
             break;
         }
         case 0xCE: {   // INTO: INT 4 when OF is set, otherwise a no-op.
@@ -4387,6 +4449,51 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
                 } else {
                     cpu->flags &= ~F_ZF;               // invalid selector
                 }
+            } else if (op2 == 0xA0 || op2 == 0xA1 || op2 == 0xA8 || op2 == 0xA9) {
+                // ---- 0F A0/A1: PUSH/POP FS,  0F A8/A9: PUSH/POP GS ----------
+                //
+                // MEASURED, not guessed (#745). tools/dos-probe ran all ten
+                // shipped DOS titles through this interpreter and these four
+                // opcodes are the ONLY unimplemented ones any of them reaches.
+                // Aladdin hits 0F A0 2608 instructions in and the run stops
+                // there; the other three are the rest of the same save/restore
+                // pair around the routine at 0428:0ee7.
+                //
+                // FS/GS have existed in this struct since #390 (Corel's 386 DLLs
+                // use 0x64/0x65 segment overrides) and `mov fs,rm16` has always
+                // worked. Only the stack forms were missing, which is why the
+                // gap survived: code that LOADS fs worked, code that SAVES it
+                // did not.
+                //
+                // OPERAND SIZE. With no 0x66 prefix this pushes 2 bytes and SP
+                // moves by 2; with 0x66 the 386 moves SP by 4. Aladdin's are the
+                // unprefixed 16-bit form (the two MISSes at 0ee7 and 0ee9 are
+                // two bytes apart, so no prefix byte sits between them).
+                //
+                // WHAT IS VERIFIED AND WHAT IS NOT, precisely:
+                //   * The 16-bit form's SP delta, the bytes it writes, and the
+                //     pop round-trip are checked by tools/x86-16-oracle against
+                //     a NATIVE execution of the same instruction, so they are
+                //     not this author's opinion.
+                //   * The instruction LENGTH is proven against the assembler by
+                //     tools/x86-16-oracle/lenwalk.
+                //   * The 32-bit-operand form's UPPER 16 BITS are NOT verified.
+                //     Intel documents the upper half of a 4-byte segment-
+                //     register push as implementation-specific, so no single
+                //     host can settle it and a differential run against this one
+                //     would be measuring this CPU, not the architecture. Zero-
+                //     extending is what the 386 and every emulator in reach do,
+                //     and it is what is implemented; it is called out here
+                //     rather than hidden behind a hand-written expectation.
+                int sreg   = (op2 >= 0xA8) ? 5 : 4;      // 4 = FS, 5 = GS
+                int is_pop = (op2 & 1);
+                if (!is_pop) {
+                    if (ow == 4) push32(cpu, (uint32_t)get_sreg(cpu, sreg));
+                    else         push16(cpu, get_sreg(cpu, sreg));
+                } else {
+                    uint16_t v = (ow == 4) ? (uint16_t)(pop32(cpu) & 0xFFFF) : pop16(cpu);
+                    set_sreg(cpu, sreg, v);
+                }
             } else if (op2 == 0xA2) {
                 // ---- 0F A2: CPUID -------------------------------------------
                 //
@@ -4425,7 +4532,8 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
             } else {
                 kprintf("[x86_16] unimpl opcode 0x0f%02x at %04x:%04x\n",
                         op2, cpu->cs, (uint16_t)(cpu->ip - 2));
-                return -1;
+                if (!g_x86_16_miss_skip) return -1;
+                miss_skip_walk(cpu, 1, op2, seg_ovr, asize, osize);
             }
             break;
         }
@@ -4433,7 +4541,9 @@ int x86_16_run(x86_16_cpu_t *cpu, unsigned long max_insns) {
         default:
             kprintf("[x86_16] unimpl opcode 0x%02x at %04x:%04x\n",
                     op, cpu->cs, (uint16_t)(cpu->ip - 1));
-            return -1;
+            if (!g_x86_16_miss_skip) return -1;
+            miss_skip_walk(cpu, 0, op, seg_ovr, asize, osize);
+            break;
         }
     }
     return 0;

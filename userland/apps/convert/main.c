@@ -537,8 +537,11 @@ static void on_key(gui_event_t *ev) {
     if (ch == '-') { input_negate(); return; }
     if (ch == 'c' || ch == 'C' || ch == 27) { input_clear(); return; }
     if (ch == 's' || ch == 'S' || ch == '\t') { do_swap(); return; }
-    if (ev->keycode == 0x48) { select_cat((g_cat + NCATS - 1) % NCATS); return; }  // Up
-    if (ev->keycode == 0x50) { select_cat((g_cat + 1) % NCATS); return; }          // Down
+    // #191: these were 0x48/0x50, PS/2 scancodes the kernel never delivers, so
+    // arrow selection had never worked; 0x48/0x50 are ASCII 'H'/'P', so
+    // shift-H and shift-P moved the category instead.
+    if (ev->keycode == GUI_KEY_UP)   { select_cat((g_cat + NCATS - 1) % NCATS); return; }
+    if (ev->keycode == GUI_KEY_DOWN) { select_cat((g_cat + 1) % NCATS); return; }
 }
 
 int main(int argc, char **argv) {

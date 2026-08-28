@@ -29,8 +29,12 @@ static inline uint32_t get_current_apic_id(void) {
 
 // Parse Local APIC entry (Type 0)
 static void parse_local_apic(madt_local_apic_t *entry) {
-    if (madt_state.cpu_count >= MAX_CPUS) {
-        kprintf("[MADT] Warning: Max CPU count exceeded\n");
+    if (madt_state.cpu_count >= MAYTERA_MAX_CPUS) {
+        // #143: name the number. This fires at MAYTERA_MAX_CPUS, and a
+        // truncation warning that says neither what it truncated to nor
+        // how many it saw cannot be acted on from a serial log.
+        kprintf("[MADT] Warning: more than %u CPUs in MADT, ignoring the rest\n",
+                (unsigned)MAYTERA_MAX_CPUS);
         return;
     }
     
@@ -128,8 +132,12 @@ static void parse_local_apic_override(madt_local_apic_override_t *entry) {
 
 // Parse x2APIC entry (Type 9)
 static void parse_local_x2apic(madt_local_x2apic_t *entry) {
-    if (madt_state.cpu_count >= MAX_CPUS) {
-        kprintf("[MADT] Warning: Max CPU count exceeded\n");
+    if (madt_state.cpu_count >= MAYTERA_MAX_CPUS) {
+        // #143: name the number. This fires at MAYTERA_MAX_CPUS, and a
+        // truncation warning that says neither what it truncated to nor
+        // how many it saw cannot be acted on from a serial log.
+        kprintf("[MADT] Warning: more than %u CPUs in MADT, ignoring the rest\n",
+                (unsigned)MAYTERA_MAX_CPUS);
         return;
     }
     

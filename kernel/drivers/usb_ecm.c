@@ -30,6 +30,10 @@
 #include "../string.h"
 #include "../mm/pmm.h"
 #include "../fs/bootlog.h"
+#include "../fs/fat.h"          // #155: /USBNETQ.OFF ESP lever
+#include "../sync/spinlock.h"   // #155: RX queue + frame FIFO serialisation
+#include "../sync/waitq.h"      // #155: the shared wait primitive, never a poll
+#include "../proc/process.h"    // #155: proc_create for the bulk-IN reaper
 
 usbnet_dev_t g_usbnet;
 
@@ -37,8 +41,18 @@ usbnet_dev_t g_usbnet;
 // Frame FIFO (RX side, between the bulk-IN parser and nic_receive())
 // =============================================================================
 
-#define USBNET_FIFO_SLOTS  16
-#define USBNET_FRAME_MAX   1520
+// #362: 48 slots (was 16). One 16 KiB AX88772 bulk-IN transfer can carry
+// ~10 full-size frames, and many more small ones; the FIFO is filled in one
+// go by the de-framer before nic_receive() pops any of it. Overflow is still
+// a safe drop (Ethernet is lossy), this just stops it happening in normal
+// bulk transfer.
+// #155: 128 slots (was 48), and the reason is now a rate, not a transfer size.
+// The producer is the bulk-IN reaper thread, which can wake up to 250 times a
+// second (one timer tick) and empties the whole in-flight queue on each pass;
+// the consumer is net_poll()'s RX drain at ~85 Hz. Between two drains, 100
+// Mbit delivers ~100 full-size frames. 48 slots overflowed that by 2x the
+// moment the queue got deep. 128 * 1520 = 195 KiB of BSS.
+#define USBNET_FIFO_SLOTS  128
 
 static uint8_t  fifo_frame[USBNET_FIFO_SLOTS][USBNET_FRAME_MAX];
 static uint16_t fifo_len[USBNET_FIFO_SLOTS];
@@ -46,22 +60,41 @@ static int fifo_head = 0;   // next slot to pop
 static int fifo_tail = 0;   // next slot to fill
 static int fifo_count = 0;
 
+// #155: the FIFO now has TWO contexts on it - the reaper thread pushes with
+// interrupts ON, net_poll() pops under net_lock() with interrupts OFF - so it
+// needs a lock where before it had one caller and none. The critical section is
+// ONE memcpy of at most 1520 bytes and nothing else: it is never held across a
+// de-frame pass, so the worst case a net_poll() spinner can pay is sub-
+// microsecond, which is what keeps [NETSTARVE] holdmax where it was.
+// LOCK ORDER: net_lock -> fifo_lock. The reaper takes fifo_lock alone and never
+// takes net_lock, so there is no cycle.
+static spinlock_t fifo_lock = SPINLOCK_INIT;
+uint64_t g_usbnet_fifo_drops = 0;   // frames dropped because the FIFO was full
+
 void usbnet_fifo_push(const uint8_t *frame, uint32_t len) {
     if (len < 14 || len > USBNET_FRAME_MAX) return;   // runt / oversize
-    if (fifo_count >= USBNET_FIFO_SLOTS) return;      // overflow: drop
+    uint64_t fl = spinlock_acquire_irqsave(&fifo_lock);
+    if (fifo_count >= USBNET_FIFO_SLOTS) {            // overflow: drop
+        g_usbnet_fifo_drops++;
+        spinlock_release_irqrestore(&fifo_lock, fl);
+        return;
+    }
     memcpy(fifo_frame[fifo_tail], frame, len);
     fifo_len[fifo_tail] = (uint16_t)len;
     fifo_tail = (fifo_tail + 1) % USBNET_FIFO_SLOTS;
     fifo_count++;
+    spinlock_release_irqrestore(&fifo_lock, fl);
 }
 
 static int usbnet_fifo_pop(uint8_t *out, uint32_t out_size) {
-    if (fifo_count == 0) return 0;
+    uint64_t fl = spinlock_acquire_irqsave(&fifo_lock);
+    if (fifo_count == 0) { spinlock_release_irqrestore(&fifo_lock, fl); return 0; }
     uint32_t len = fifo_len[fifo_head];
     if (len > out_size) len = out_size;
     memcpy(out, fifo_frame[fifo_head], len);
     fifo_head = (fifo_head + 1) % USBNET_FIFO_SLOTS;
     fifo_count--;
+    spinlock_release_irqrestore(&fifo_lock, fl);
     return (int)len;
 }
 
@@ -77,24 +110,76 @@ static int usbnet_fifo_pop(uint8_t *out, uint32_t out_size) {
 // occur the worst case is a single dropped frame, which Ethernet tolerates.
 #define USBNET_TX_RING_SLOTS 8
 
+// #155: HOW MANY BULK-IN TDs TO KEEP IN FLIGHT, AND WHY THAT NUMBER.
+//
+// A bulk-IN TD retires on the FIRST SHORT PACKET, i.e. at the end of whatever
+// burst the chip had ready - as little as ONE Ethernet frame (1514 + 4 header =
+// 1518 bytes = two 512-byte packets plus a 494-byte short one). So the queue is
+// consumed at up to the FRAME rate, not the transfer-size rate: 100 Mbit is
+// ~8200 full-size frames/s, one every ~122 us.
+//
+// The reaper thread is woken by the xHCI event-ring wait queue. With MSI armed
+// that is microseconds, but MSI is DEFAULT-OFF on this kernel (/XHCIMSI.OFF,
+// #156), so the guaranteed floor is the periodic drainers: one timer tick at
+// g_timer_hz = 250 Hz, i.e. 4 ms. In 4 ms at line rate ~33 TDs can retire.
+//
+// 32 is that number. It is a DEPTH chosen from the reaper's worst-case wake
+// period times the frame rate, not a round number: below it the endpoint runs
+// dry between wakes and the controller stops asking the device for data, which
+// is the whole #155 defect in miniature. Above it costs memory for slack that
+// the chip's own RX FIFO already provides.
+//
+// The per-slot SIZE is unchanged at whatever the vendor driver asked for
+// (16 KiB for AX88772). Shrinking it to pay for depth would newly invoke the
+// split-frame carry-over path, which has NEVER EXECUTED on hardware
+// (usbsplit=0 over 2 MiB / ~6800 frames, #362) and is therefore the least
+// trustworthy code in this driver. 32 * 16 KiB = 512 KiB of identity-mapped
+// PMM, allocated once at attach.
+#define USBNET_RX_SLOTS 32
+
 int usbnet_alloc_buffers(usbnet_dev_t *d, uint32_t rx_len, uint32_t tx_len) {
     // Page allocations are identity-mapped (phys == virt). One page each is
     // enough for ECM/AX88772 (<= 2KB per transfer); AX88179 asks for more.
-    uint32_t rx_pages = (rx_len + PAGE_SIZE - 1) / PAGE_SIZE;
+    // #155: rx_len is the PER-SLOT size; USBNET_RX_SLOTS slots are allocated.
+    // #155: DEGRADE, NEVER FAIL. 32 x 16 KiB is 512 KiB of PHYSICALLY CONTIGUOUS
+    // pages, 32x what this driver used to ask for. If the PMM cannot satisfy it
+    // the old code's behaviour would be to fail usbnet_alloc_buffers(), fail the
+    // attach, and leave the machine with NO NETWORK AT ALL - trading "the
+    // network is slow" for "the network is gone", which is a far worse bug than
+    // the one being fixed. So halve the slot count until it fits; depth 1 is the
+    // pre-#155 behaviour and always allocatable.
+    int slots = USBNET_RX_SLOTS;
+    uint64_t rx_phys = 0;
+    uint32_t rx_pages = 0;
+    while (slots >= 1) {
+        rx_pages = (rx_len * (uint32_t)slots + PAGE_SIZE - 1) / PAGE_SIZE;
+        rx_phys = pmm_alloc_pages(rx_pages);
+        if (rx_phys) break;
+        if (slots == 1) break;
+        slots /= 2;
+    }
+    if (slots != USBNET_RX_SLOTS)
+        kprintf("[USB-NET] #155: only %d RX slot(s) allocatable (wanted %d)\n",
+                slots, USBNET_RX_SLOTS);
     uint32_t tx_pages = (tx_len + PAGE_SIZE - 1) / PAGE_SIZE;
     // #549: the TX DMA ring is the source handed to the HC; tx_buf stays as the
     // staging buffer where the ASIX vendor header is built.
     uint32_t ring_bytes = tx_len * USBNET_TX_RING_SLOTS;
     uint32_t ring_pages = (ring_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-    uint64_t rx_phys = pmm_alloc_pages(rx_pages);
     uint64_t tx_phys = pmm_alloc_pages(tx_pages);
     uint64_t ring_phys = pmm_alloc_pages(ring_pages);
     if (!rx_phys || !tx_phys || !ring_phys) {
         kprintf("[USB-NET] DMA buffer allocation failed\n");
         return -1;
     }
-    d->rx_buf = (uint8_t *)rx_phys;
+    d->rx_ring = (uint8_t *)rx_phys;
+    d->rx_buf = (uint8_t *)rx_phys;        // slot 0
     d->rx_buf_len = rx_len;
+    d->rx_slots = slots;
+    d->rx_qlen = 1;                        // depth 1 until the reaper ramps it
+    d->rx_sub_seq = 0;
+    d->rx_reap_seq = 0;
+    d->rx_resync = 0;
     d->tx_buf = (uint8_t *)tx_phys;
     d->tx_buf_len = tx_len;
     d->tx_ring = (uint8_t *)ring_phys;
@@ -189,9 +274,332 @@ int usbnet_bulk_out(usbnet_dev_t *d, const void *data, uint32_t len,
     return 0;   // submitted; completion is reaped lazily (Ethernet is lossy)
 }
 
+// =============================================================================
+// #155: RX PIPELINING - keep several bulk-IN TDs queued on the endpoint
+// =============================================================================
+//
+// THE DEFECT. Before this, exactly ONE bulk-IN TD existed and it was re-armed
+// only inside usb_eth_receive(), which runs from net_poll() at ~85 Hz. Between
+// the completion of one transfer and the next net_poll pass the endpoint had
+// NOTHING queued, so the host controller did not ask the device for data at all.
+// MEASURED on an AX88772B: 374 KB/s of a 100 Mbit link, from ~4.4 KB captured
+// per transfer x 85 transfers/s. That is a ~3% duty cycle, and it is a
+// PIPELINING limit: a bigger buffer cannot fix it, and did not (usbagg peaked at
+// 13662 against a 16384 buffer, i.e. the buffer was never the thing that filled).
+//
+// THE FIX has two halves, and BOTH are needed:
+//   (a) N TDs queued, so when one retires the next is already the controller's
+//       current TD and the device is drained continuously;
+//   (b) a dedicated reaper thread, so the queue is refilled on the xHCI event
+//       ring's own cadence instead of the 85 Hz net_poll tick.
+//
+// WHY A COMPLETION RING AND NOT xhci_int_in_poll(). xhci.c records completions
+// in g_xfer_cc[slot][dci], ONE CELL per endpoint. That is exactly right for
+// every other driver in the tree, all of which keep one TD outstanding, and it
+// is structurally unusable here: the second completion overwrites the first and
+// its residual, so both the byte count and the fact that a transfer happened are
+// lost. xhci.c grew ONE optional hook (xhci_xfer_observer) for this; the queue
+// itself lives here, in the one driver that needs it.
+//
+// TDs on a transfer ring retire IN ORDER, so a single monotonic sequence number
+// identifies both the buffer a completion belongs to (rx_reap_seq % rx_slots)
+// and the buffer to re-arm (rx_sub_seq % rx_slots). Submission leads reaping by
+// exactly rx_qlen, so a buffer is never handed back to the controller while its
+// contents are still being de-framed.
+
+// Completion ring, filled by the observer (which runs inside the event drainer)
+// and drained by usbnet_rx_service(). At most rx_qlen <= USBNET_RX_SLOTS
+// completions can be outstanding at once, because that is how many TDs exist,
+// so at 2x USBNET_RX_SLOTS this ring CANNOT overflow. The overflow branch is
+// kept anyway, counted, and treated as a resync rather than ignored: a lost
+// completion would slide the buffer sequence by one and de-frame the wrong
+// buffer forever after, which is silent RX corruption, not a dropped packet.
+#define USBNET_RXC_SLOTS  64   // power of two, >= 2 * USBNET_RX_SLOTS
+static volatile uint8_t  s_rxc_cc[USBNET_RXC_SLOTS];
+static volatile uint32_t s_rxc_resid[USBNET_RXC_SLOTS];
+static volatile uint32_t s_rxc_head = 0;   // consumer (usbnet_rx_service)
+static volatile uint32_t s_rxc_tail = 0;   // producer (the observer)
+
+// #155: RX SERVICE TOKEN, and why it is a token rather than a held lock.
+//
+// TWO contexts can service the queue: the reaper thread (interrupts on) and
+// net_poll()'s inline fallback (net_lock held, interrupts OFF). They share more
+// than the completion ring - they share the AX88772 de-framer's split-frame
+// carry state (s_rx_have/s_rx_need/s_rx_part in usb_asix.c), which is file-
+// static because there has only ever been one caller. Two concurrent de-frames
+// would corrupt it.
+//
+// Holding a lock across the whole service pass would fix that and create a
+// worse problem: the pass parses up to a full queue of 16 KiB buffers, and
+// net_poll() would spin on it with interrupts off for the duration. That is the
+// #381/#549 freeze class, i.e. the thing [NETSTARVE] holdmax exists to catch.
+//
+// So the pass is guarded by a TRY-token instead: whoever gets it services,
+// whoever does not RETURNS IMMEDIATELY having done nothing. Missing a pass
+// costs the inline fallback nothing (the reaper is already doing the work and
+// the frames land in the FIFO it is about to pop), and it can never make a
+// context with interrupts off wait for a context that has them on.
+//
+// rx_lock is held only across the token test-and-set and the resync flag: a
+// handful of instructions, never across a de-frame, a submit or a log.
+// LOCK ORDER: net_lock -> rx_lock -> fifo_lock; the reaper takes rx_lock and
+// fifo_lock only, so there is no cycle.
+//
+// The token holder EXCLUSIVELY owns: s_rxc_head, rx_sub_seq, rx_reap_seq, the
+// de-framer carry state, and bulk-IN TD submission. The observer is the only
+// producer and touches only s_rxc_tail, so the ring is single-producer /
+// single-consumer with no lock on the producer side at all.
+static spinlock_t rx_lock = SPINLOCK_INIT;
+static volatile int s_rx_busy = 0;
+
+// Returns 1 if the caller now owns the service token.
+static int usbnet_rx_try_claim(usbnet_dev_t *d, int allow_resync) {
+    uint64_t fl = spinlock_acquire_irqsave(&rx_lock);
+    if (s_rx_busy || (d->rx_resync && !allow_resync)) {
+        spinlock_release_irqrestore(&rx_lock, fl);
+        return 0;
+    }
+    s_rx_busy = 1;
+    spinlock_release_irqrestore(&rx_lock, fl);
+    return 1;
+}
+
+static void usbnet_rx_release(void) {
+    uint64_t fl = spinlock_acquire_irqsave(&rx_lock);
+    s_rx_busy = 0;
+    spinlock_release_irqrestore(&rx_lock, fl);
+}
+
+uint64_t g_usbnet_rx_reaped   = 0;   // bulk-IN completions processed
+uint64_t g_usbnet_rxc_drops   = 0;   // completions lost to a full ring (see above)
+uint64_t g_usbnet_rx_resyncs  = 0;   // full pipe restarts (endpoint error/lost cc)
+uint64_t g_usbnet_rx_dry      = 0;   // service passes that found the queue empty
+uint64_t g_usbnet_rx_refills  = 0;   // passes that had to top the queue back up
+
+// Submit ONE bulk-IN TD into the ring slot the submit sequence is pointing at.
+// Caller holds rx_lock (or is the single-threaded start/restart path).
+static int usbnet_rx_submit_one(usbnet_dev_t *d) {
+    if (d->rx_slots <= 0) return -1;      // never modulo by zero
+    uint32_t idx = d->rx_sub_seq % (uint32_t)d->rx_slots;
+    uint8_t *buf = d->rx_ring + (uint64_t)idx * d->rx_buf_len;
+    int r = xhci_int_in_submit(d->xhc, d->slot_id, d->in_dci,
+                               (uint64_t)buf, d->rx_buf_len);
+    if (r == 0) d->rx_sub_seq++;
+    return r;
+}
+
+// Kept under its historical name so usb_eth_start() reads unchanged: arm the
+// queue to its current depth.
 static int usbnet_rx_submit(usbnet_dev_t *d) {
-    return xhci_int_in_submit(d->xhc, d->slot_id, d->in_dci,
-                              (uint64_t)d->rx_buf, d->rx_buf_len);
+    int armed = 0;
+    while ((int)(d->rx_sub_seq - d->rx_reap_seq) < d->rx_qlen) {
+        if (usbnet_rx_submit_one(d) != 0) break;
+        armed++;
+    }
+    return armed ? 0 : -1;
+}
+
+// #155: THE OBSERVER. Runs inside xhci_drain_events() with the event-ring lock
+// held, possibly with interrupts off and possibly from an MSI handler. It does
+// one bounds check and two stores. Nothing else is permitted here (see the
+// contract on xhci_xfer_observer in xhci.h).
+static void usbnet_xfer_observer(uint32_t slot, uint32_t dci,
+                                 uint8_t cc, uint32_t residual) {
+    usbnet_dev_t *d = &g_usbnet;
+    if (!d->active || (int)slot != d->slot_id || (int)dci != d->in_dci) return;
+    uint32_t t = s_rxc_tail;
+    if ((uint32_t)(t - s_rxc_head) >= USBNET_RXC_SLOTS) {
+        g_usbnet_rxc_drops++;
+        d->rx_resync = 1;      // see the ring-size note above: never silent
+        return;
+    }
+    s_rxc_cc[t & (USBNET_RXC_SLOTS - 1)] = cc;
+    s_rxc_resid[t & (USBNET_RXC_SLOTS - 1)] = residual;
+    __asm__ volatile("" ::: "memory");   // publish payload before the index
+    s_rxc_tail = t + 1;
+}
+
+// Non-blocking, side-effect-free test: legal as a wait-queue condition.
+static int usbnet_rxc_pending(void) { return s_rxc_tail != s_rxc_head; }
+
+// Reap up to `budget` completed bulk-IN TDs: de-frame each into the frame FIFO
+// and re-arm its buffer. Returns the number reaped.
+//
+// SAFE FROM BOTH CONTEXTS. The reaper thread calls it with interrupts on; the
+// pre-scheduler boot path and net_poll()'s empty-FIFO fallback call it under
+// net_lock with interrupts off. Nothing in here blocks: the de-frame is a pure
+// parse, the submit is a TRB write plus a doorbell, and the only lock taken is
+// rx_lock (held for a handful of instructions at a time, never across the
+// de-frame). Endpoint RECOVERY is deliberately NOT done here - it issues
+// command-ring operations that block - it is flagged and left to the reaper.
+static int usbnet_rx_service(usbnet_dev_t *d, int budget) {
+    if (!d->active || !d->started || d->rx_slots <= 0) return 0;
+    if (!usbnet_rx_try_claim(d, 0)) return 0;      // someone else is servicing
+    xhci_poll_events(d->xhc);          // drain -> the observer fills the ring
+    int n = 0;
+    while (n < budget && usbnet_rxc_pending()) {
+        uint32_t h = s_rxc_head;
+        uint8_t  cc = s_rxc_cc[h & (USBNET_RXC_SLOTS - 1)];
+        uint32_t rs = s_rxc_resid[h & (USBNET_RXC_SLOTS - 1)];
+        s_rxc_head = h + 1;
+        uint32_t idx = d->rx_reap_seq % (uint32_t)d->rx_slots;
+        d->rx_reap_seq++;
+        if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) {
+            // xHCI 4.10.2.1: this endpoint is now HALTED and every TD still
+            // queued behind it is dead. Only a full restart fixes it, and that
+            // blocks, so it is flagged here and done on the reaper thread.
+            d->rx_resync = 1;
+            break;
+        }
+        uint32_t got = (rs <= d->rx_buf_len) ? (d->rx_buf_len - rs) : 0;
+        uint8_t *buf = d->rx_ring + (uint64_t)idx * d->rx_buf_len;
+        if (got > 0) {
+            g_usbnet_rx_completions++;
+            switch (d->type) {
+                case USBNET_TYPE_ECM:
+                    // One transfer == one Ethernet frame (short/ZLP terminated).
+                    usbnet_fifo_push(buf, got);
+                    break;
+                case USBNET_TYPE_AX88772:
+                case USBNET_TYPE_AX88179:
+                    usb_asix_rx_fixup(d, buf, got);
+                    break;
+            }
+        }
+        usbnet_rx_submit_one(d);       // re-arm; keeps the depth constant
+        g_usbnet_rx_reaped++;
+        n++;
+    }
+    if (n == 0) g_usbnet_rx_dry++;
+    // SELF-HEAL THE DEPTH. usbnet_rx_submit_one() advances the submit sequence
+    // only when the TRB actually went onto the ring, so a transient enqueue
+    // failure permanently shortens the queue by one - and repeated often enough
+    // it drains to zero, at which point RX stops dead with no error anywhere.
+    // Topping up here makes the depth a target the pipe converges back to
+    // rather than a count that can only go down.
+    if ((int)(d->rx_sub_seq - d->rx_reap_seq) < d->rx_qlen) {
+        g_usbnet_rx_refills++;
+        usbnet_rx_submit(d);
+    }
+    usbnet_rx_release();
+    return n;
+}
+
+// Full pipe restart. BLOCKS (command ring), so this runs ONLY on the reaper
+// thread. Recovers the halted endpoint, throws away every half-assembled frame
+// and every stale completion, and re-arms the whole queue from a clean ring.
+// xhci_set_tr_dequeue() rewinds the transfer ring to index 0 / cycle 1, exactly
+// what a freshly initialised ring looks like, so restarting the sequence
+// counters at 0 is not an approximation, it is the matching state.
+#define USBNET_RX_MAX_RESYNCS 32
+static void usbnet_rx_restart(usbnet_dev_t *d) {
+    static uint32_t s_resyncs = 0;
+    if (s_resyncs >= USBNET_RX_MAX_RESYNCS) { d->rx_resync = 0; return; }
+    s_resyncs++;
+    g_usbnet_rx_resyncs++;
+    // Take the service token FIRST, and keep it across the (blocking) endpoint
+    // recovery. That is safe precisely because it is a token and not a held
+    // spinlock: an inline fallback that cannot claim it returns immediately
+    // instead of spinning, so nothing waits on us while the command ring works.
+    // Claiming it is also what proves no other context is mid-service, i.e. that
+    // nobody is about to enqueue a TRB onto the ring we are resetting.
+    // ONE attempt, no retry loop. The only other token holder is net_poll()'s
+    // inline fallback, which holds it for a single bounded completion; if it has
+    // it right now, this returns and the reaper's next pass (at most one timer
+    // tick away) tries again. A `while (!claim) proc_sleep(1)` here would be a
+    // hand-rolled poll, which #426 bans and the concurrency lint fails the build
+    // over - and it would buy nothing, because the caller is already a loop with
+    // a wait-queue sleep in it.
+    if (!usbnet_rx_try_claim(d, 1)) { s_resyncs--; g_usbnet_rx_resyncs--; return; }
+    (void)xhci_recover_endpoint(d->xhc, d->slot_id, d->in_dci);
+    s_rxc_head = s_rxc_tail;           // discard every stale completion
+    d->rx_sub_seq = 0;
+    d->rx_reap_seq = 0;
+    usb_asix_rx_reset();               // a gap makes a half-frame unusable
+    usbnet_rx_submit(d);
+    d->rx_resync = 0;
+    usbnet_rx_release();
+    bootlog_write("[USB-NET] #155: bulk-IN pipe restarted (resync %u/%u, "
+                  "depth %d)", s_resyncs, (unsigned)USBNET_RX_MAX_RESYNCS,
+                  d->rx_qlen);
+}
+
+// #155: the dedicated bulk-IN reaper.
+//
+// WAKE SOURCES, redundant by construction (CLAUDE.md preference 1):
+//   (a) the xHCI MSI handler, which wakes g_xhci_evt_wq on every interrupt -
+//       microsecond latency, but DEFAULT-OFF on this kernel (/XHCIMSI.OFF);
+//   (b) xhci_evt_worker() and usb_hid_poll_worker(), which drain the event ring
+//       periodically and wake the same queue unconditionally on every pass;
+//   (c) a one-tick timeout on the wait itself.
+// So the queue is refilled at worst once per timer tick even on hardware that
+// never interrupts, and immediately when it does. There is no busy-poll here and
+// no hand-rolled sleep: the timeout is the third leg of an already-armed wake,
+// not a substitute for one.
+//
+// The MSI-sequence half of the condition is the #139 idiom: the ISR does not
+// drain (it must not), so a completion recorded by nobody would leave the
+// condition false; comparing xhci_msi_seq() against the value we last acted on
+// turns "an interrupt arrived" into a wake reason without draining anything
+// inside the wait macro.
+#define USBNET_RX_BACKSTOP_MS 1        // rounds up to exactly one timer tick
+
+static void usbnet_rx_worker(void *arg) {
+    (void)arg;
+    usbnet_dev_t *d = &g_usbnet;
+    wait_queue_head_t *evtq = (wait_queue_head_t *)xhci_event_waitq();
+
+    // #156-style ESP lever, resolved HERE and not at attach, because attach runs
+    // during xHCI enumeration when the boot volume is not necessarily mounted.
+    // By the time this thread runs, it is. /USBNETQ.OFF pins the queue at depth
+    // 1, which is byte-for-byte the pre-#155 behaviour, so the owner can undo
+    // this change on the real machine with no toolchain.
+    int deep = 1;
+    extern fat_fs_t g_fat_fs;
+    if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/USBNETQ.OFF")) {
+        deep = 0;
+        bootlog_write("[USB-NET] #155: /USBNETQ.OFF present -> bulk-IN queue "
+                      "pinned at depth 1 (pre-#155 behaviour)");
+    }
+    int announced = 0;
+
+    for (;;) {
+        if (d->rx_resync) usbnet_rx_restart(d);
+        // Ramp to full depth as a ONE-SHOT inside the normal loop, so a token
+        // held by the inline fallback costs one more pass rather than a retry
+        // loop. Until it succeeds the queue runs at depth 1, which is exactly
+        // the pre-#155 behaviour, so a failed ramp is a slowdown and never a
+        // broken NIC.
+        if (deep && d->rx_qlen != d->rx_slots && usbnet_rx_try_claim(d, 0)) {
+            d->rx_qlen = d->rx_slots;
+            usbnet_rx_submit(d);       // arm the rest of the queue
+            usbnet_rx_release();
+        }
+        if (!announced && (!deep || d->rx_qlen == d->rx_slots)) {
+            announced = 1;
+            bootlog_write("[USB-NET] #155: bulk-IN reaper running, %d TD(s) in "
+                          "flight, %u bytes each, %ums backstop", d->rx_qlen,
+                          d->rx_buf_len, (unsigned)USBNET_RX_BACKSTOP_MS);
+            kprintf("[USB-NET] bulk-IN reaper: depth %d x %u bytes\n",
+                    d->rx_qlen, d->rx_buf_len);
+        }
+        // Budget = one full queue plus one, so a single pass can empty the whole
+        // in-flight set and still notice a completion that landed during it.
+        usbnet_rx_service(d, d->rx_qlen + 1);
+        uint64_t seen = xhci_msi_seq();
+        (void)wait_event_timeout(evtq,
+                                 usbnet_rxc_pending() || xhci_msi_seq() != seen,
+                                 wq_ms_to_ticks(USBNET_RX_BACKSTOP_MS));
+    }
+}
+
+static int g_usbnet_rx_worker_started = 0;
+
+void usb_eth_start_rx_worker(void) {
+    if (g_usbnet_rx_worker_started) return;
+    if (!g_usbnet.active) return;
+    g_usbnet_rx_worker_started = 1;
+    proc_create("usbnet_rx", usbnet_rx_worker, NULL, PRIO_NORMAL);
 }
 
 // =============================================================================
@@ -219,11 +627,21 @@ int usb_eth_start(void) {
     // arrive continuously (the HID poll worker sets this too, but the NIC may
     // start first when DHCP runs during boot).
     xhci_iso_quiet = 1;
+    // #362: the ASIX de-framer carries split-frame state across transfers;
+    // clear it whenever the pipe (re)starts so bytes from either side of a gap
+    // can never be glued into one bogus frame.
+    usb_asix_rx_reset();
+    // #155: install the completion observer BEFORE the first submit, or the
+    // very first transfer's completion is recorded nowhere and the queue is
+    // stuck at zero in flight forever. Ordering, not decoration.
+    xhci_xfer_observer = usbnet_xfer_observer;
+    d->started = 1;
     if (usbnet_rx_submit(d) != 0) {
         kprintf("[USB-NET] initial bulk-IN submit failed\n");
+        d->started = 0;
+        xhci_xfer_observer = 0;
         return -1;
     }
-    d->started = 1;
     kprintf("[USB-NET] %s started: MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
             usb_eth_name(), d->mac[0], d->mac[1], d->mac[2],
             d->mac[3], d->mac[4], d->mac[5]);
@@ -315,34 +733,22 @@ int usb_eth_receive(void *buffer, uint16_t buffer_size) {
     if (!d->active || !buffer) return 0;
     if (!d->started && usb_eth_start() != 0) return 0;
 
-    // Reap a completed bulk-IN (if any), parse it, resubmit.
-    uint32_t got = 0;
-    int r = xhci_int_in_poll(d->xhc, d->slot_id, d->in_dci, &got, d->rx_buf_len);
-    if (r > 0) {
-        // #745 (task #69): counter, not a log line. usb_eth_receive() runs
-        // inside net_poll()'s RX drain, which holds net_lock() with interrupts
-        // off; a bootlog_write() here is a synchronous write to the SAME USB
-        // stack the frame just arrived on, from a context that cannot be
-        // preempted. See usbnet_bulk_out() above.
-        if (got > 0) g_usbnet_rx_completions++;
-        if (got > 0) {
-            switch (d->type) {
-                case USBNET_TYPE_ECM:
-                    // One transfer == one Ethernet frame (short packet /
-                    // ZLP terminated).
-                    usbnet_fifo_push(d->rx_buf, got);
-                    break;
-                case USBNET_TYPE_AX88772:
-                case USBNET_TYPE_AX88179:
-                    usb_asix_rx_fixup(d, d->rx_buf, got);
-                    break;
-            }
-        }
-        usbnet_rx_submit(d);
-    } else if (r < 0) {
-        // Endpoint error/STALL: try to keep the pipe alive by resubmitting.
-        usbnet_rx_submit(d);
-    }
+    // #155: FAST PATH. Once the reaper thread is running it has already
+    // de-framed everything into the FIFO off this path, so net_poll()'s RX
+    // drain becomes a memcpy under net_lock instead of an event-ring drain plus
+    // a 16 KiB parse. That is a strict REDUCTION in what net_lock covers with
+    // interrupts off, which is why [NETSTARVE] holdmax must not regress.
+    int n = usbnet_fifo_pop((uint8_t *)buffer, buffer_size);
+    if (n > 0) return n;
+
+    // FIFO empty. Service ONE completion inline. This is both the pre-scheduler
+    // path (boot DHCP runs before the reaper thread exists) and the redundant
+    // second service source afterwards, so a wedged reaper degrades to exactly
+    // the pre-#155 behaviour rather than to a dead NIC. Bounded to one
+    // completion so this can never become a long net_lock hold (#381/#549).
+    // Endpoint recovery is NOT attempted here: it blocks, and this context
+    // cannot. usbnet_rx_service() flags it and the reaper does it.
+    usbnet_rx_service(d, 1);
 
     // Lazy PHY link refresh for ASIX parts (cheap counter-gated inside).
     if (d->type != USBNET_TYPE_ECM) usb_asix_refresh_link(d);

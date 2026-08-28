@@ -6,6 +6,7 @@
 #include "nova.h"
 #include "aiguard.h"   /* #745: the policy layer that gives nova.c a caller */
 #include "../serial.h"
+#include "../fs/bootlog.h"   /* #ASUSDIAG: the pre-flight verdict must survive to /BOOTLOG.TXT */
 #include "../string.h"
 
 // ============================================================================
@@ -298,12 +299,49 @@ void security_init(void) {
     // a failed probe is exactly as good a reason not to enable SMAP as
     // /NOSMAP.TXT is, and it is one the machine can work out for itself.
     bool smap_ok = g_smap_requested;
-    if (smap_ok && sec_cpu_has_smap_rs() != 0) {
-        smap_ok = smap_preflight_ok();
+    bool smep_ok = g_smep_requested;
+    // #ASUSDIAG: RUN THE PRE-FLIGHT ONCE AND APPLY IT TO BOTH BITS.
+    //
+    // The measurement above was computed and then folded into the SMAP request
+    // ONLY; the SMEP request was passed to sec_init_rs() raw, gated on CPUID
+    // alone. That asymmetry is backwards, because SMEP's failure mode is the
+    // WORSE of the two. SMEP faults a Ring-0 INSTRUCTION FETCH from a
+    // user-accessible page. If this firmware's identity map marks kernel text
+    // U/S=1, the fault fires on the very next instruction after CR4 is written,
+    // the fault handler is itself such a fetch, and the machine goes double
+    // fault into triple fault into an instant reboot loop, having written
+    // nothing, anywhere. On a laptop with no serial port that is a completely
+    // silent, completely undiagnosable brick.
+    //
+    // smap_preflight_ok() already samples KERNEL TEXT (the SMEP-relevant one)
+    // alongside static data and the live stack, so the answer we need is
+    // already being computed and thrown away.
+    //
+    // HONEST SCOPE, twice over. First, the probe's own limit is unchanged: it
+    // samples three representative addresses, not the whole address space.
+    // Second, using the COMBINED verdict for SMEP is deliberately conservative:
+    // it will also decline SMEP when only .data or the stack came back
+    // user-accessible, which is stricter than SMEP strictly requires. Given the
+    // failure being avoided is an unrecoverable boot loop with no record, a
+    // false decline is a good trade for a false arm, and saying so is better
+    // than silently splitting the samples per feature.
+    if (smap_ok || smep_ok) {
+        bool probe = true;
+        if ((smap_ok && sec_cpu_has_smap_rs() != 0) ||
+            (smep_ok && sec_cpu_has_smep_rs() != 0)) {
+            probe = smap_preflight_ok();
+        }
+        if (!probe) {
+            kprintf("[SECURITY] pre-flight FAILED: kernel memory is user-accessible in "
+                    "the firmware page tables; NOT arming SMEP or SMAP\n");
+            bootlog_write("[SECURITY] pre-flight FAILED, SMEP and SMAP both declined");
+            smap_ok = false;
+            smep_ok = false;
+        }
     }
 
     sec_init_report_t rep;
-    sec_init_rs(g_smep_requested ? 1u : 0u, smap_ok ? 1u : 0u, &rep);
+    sec_init_rs(smep_ok ? 1u : 0u, smap_ok ? 1u : 0u, &rep);
     g_security_features = rep.features;
 
     // #645: arm the live SMAP switch ONLY from the feature bit, which seccore.rs
@@ -563,6 +601,17 @@ void seclog_report_elevation(unsigned int pid, const char *detail) {
  * only in the log. */
 void seclog_report_ai_injection(unsigned int pid, const char *detail) {
     security_audit(AUDIT_AI_INJECTION, (uint32_t)pid, detail);
+}
+
+/* #fdguard: cross-process I/O boundary refusals (a legacy fd owned by
+ * another process, or a /dev/pts attach the caller does not own). WARNING
+ * severity, like a permission denial: an app reaching for another process's
+ * open file or terminal is a real attempted boundary crossing. The detail
+ * string carries the target and the reason; the actor pid is the record's
+ * own pid field. Non-blocking by construction (security_audit is), so it is
+ * safe from the fd syscall paths and from the pty open factory. */
+void seclog_report_io_boundary(unsigned int pid, const char *detail) {
+    security_audit(AUDIT_IO_BOUNDARY, (uint32_t)pid, detail);
 }
 
 uint64_t security_audit_seq(void) {

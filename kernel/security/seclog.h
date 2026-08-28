@@ -46,4 +46,12 @@ void seclog_report_elevation(unsigned int pid, const char *detail);
 // /CONFIG/SECURITY.LOG carries the ACTOR pid and the rule for each one.
 void seclog_report_ai_injection(unsigned int pid, const char *detail);
 
+// #fdguard: the same narrow-producer pattern for cross-process I/O boundary
+// refusals, so proc/fdlayer.c and drivers/pty.c need no security.h include
+// (they already include this header) and the audit ordinal stays in one
+// place. Every refused cross-process fd op and every refused /dev/pts attach
+// goes through here, so /CONFIG/SECURITY.LOG carries the actor pid, the
+// target and the reason for each one.
+void seclog_report_io_boundary(unsigned int pid, const char *detail);
+
 #endif // SECLOG_H

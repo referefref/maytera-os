@@ -1,5 +1,5 @@
---- a/syscall.h
-+++ b/syscall.h
+--- <workspace>	2026-07-07 16:27:23.212844378 +0000
++++ <workspace>	2026-07-07 16:29:06.264900773 +0000
 @@ -255,6 +255,7 @@
  #define SYS_DUP                        90
  #define SYS_DUP2                       91

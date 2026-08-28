@@ -7,6 +7,7 @@
 #include "../gui/desktop.h"
 #include "../gui/icons.h"
 #include "../gui/filebrowser.h"
+#include "../fs/bootlog.h"
 
 // =============================================================================
 // Global State
@@ -18,6 +19,17 @@ static hotplug_event_callback_t g_event_callback = NULL;
 
 // Mount point counter for unique names
 static int g_mount_counter = 0;
+
+// #250 MOUNT GENERATION SOURCE. Monotonic, never reused, never 0. Stamped into
+// each removable fat_fs_t at mount and BUMPED at teardown, which is what turns
+// every fat_file_t still open on a pulled stick into a handle that fails
+// (fat_handle_stale) instead of one that reads the next stick's sectors. A
+// counter and not a flag, because the slot can be refilled: a flag would be
+// cleared by the very next mount and the stale handle would come back to life.
+static uint32_t g_vol_gen = 0;
+
+_Static_assert(sizeof(hotplug_raw_t) == 136,
+               "#250: rustkern/hotplug.rs HpRaw mirrors this; sizes must match");
 
 // Forward declaration for desktop integration
 extern int desktop_add_icon(const char *name, int icon_id, int grid_x, int grid_y, void (*launch)(void));
@@ -199,6 +211,26 @@ static uint64_t find_partition_start(usb_msc_device_t *msc) {
 void hotplug_init(void) {
     kprintf("[Hotplug] Initializing USB hotplug manager\n");
 
+    // #250 BOOT PROOF. There is no C twin to run a differential against, so
+    // what stands in for one is a vector test over the pure routing core, run
+    // on every boot with one line of output. It exists because the thing it
+    // protects cannot be exercised without a second physical USB stick: the
+    // shipping VMs boot from one device, and a routing regression would show
+    // up as a file silently opening on the WRONG volume, which is exactly the
+    // shape that does not announce itself.
+    {
+        extern uint32_t hotplug_selftest_rs(uint32_t *out_checks);
+        uint32_t checks = 0;
+        uint32_t fails = hotplug_selftest_rs(&checks);
+        if (fails == 0) {
+            kprintf("[Hotplug] volume/path self-test PASS (%u checks)\n", checks);
+            bootlog_write("[Hotplug] volume/path self-test PASS (%u checks)", checks);
+        } else {
+            kprintf("[Hotplug] *** volume/path self-test FAIL: %u/%u ***\n", fails, checks);
+            bootlog_write("[Hotplug] *** volume/path self-test FAIL %u/%u ***", fails, checks);
+        }
+    }
+
     memset(g_devices, 0, sizeof(g_devices));
     g_device_count = 0;
     g_event_callback = NULL;
@@ -246,6 +278,31 @@ void hotplug_handle_usb_event(usb_msc_event_t *event) {
                 break;
             }
 
+            // #250 SAFETY: NEVER take a hotplug slot for the BOOT MEDIUM.
+            //
+            // This does not fire today, and that is exactly why the guard
+            // exists. main.c registers this callback (hotplug_init, line
+            // ~1067) AFTER usb_init() has already enumerated the boot stick,
+            // so its MOUNT_READY event was fired before anyone was listening.
+            // That is an ORDERING accident, not an invariant: the port re-scan
+            // worker re-enumerates any port whose enumerated flag is cleared,
+            // and a single confirmed flap on the boot port would deliver this
+            // event for the root device.
+            //
+            // The consequence would not be cosmetic. The volume would appear
+            // in the Files sidebar and on the desktop with an Eject button,
+            // and eject issues SCSI STOP UNIT on the medium the running
+            // system's root filesystem is served from.
+            {
+                extern int blk_root_is_usb(void);
+                extern int blk_root_usb_index(void);
+                if (blk_root_is_usb() && event->device_index == blk_root_usb_index()) {
+                    kprintf("[Hotplug] index %d is the BOOT medium; not a removable volume\n",
+                            event->device_index);
+                    break;
+                }
+            }
+
             hotplug_device_t *dev = &g_devices[slot];
             memset(dev, 0, sizeof(hotplug_device_t));
 
@@ -276,7 +333,11 @@ void hotplug_handle_usb_event(usb_msc_event_t *event) {
             dev->block_size = msc->block_size;
 
             // Create mount point
-            snprintf(dev->mount_point, sizeof(dev->mount_point), "/usb%d", g_mount_counter++);
+            // Uppercase, like every other top-level path this OS ships
+            // (/APPS, /CONFIG, /FONTS). Lowercase worked, but the Files app
+            // shows the literal string and a lone lowercase row next to
+            // uppercase ones reads as a bug.
+            snprintf(dev->mount_point, sizeof(dev->mount_point), "/USB%d", g_mount_counter++);
 
             g_device_count++;
 
@@ -303,13 +364,44 @@ void hotplug_handle_usb_event(usb_msc_event_t *event) {
                         hotplug_remove_desktop_icon(i);
                     }
 
+                    // #250 SURPRISE REMOVAL. The slot used to be cleared with
+                    // the filesystem still marked mounted, so a fat_file_t
+                    // opened on it kept a live fat_fs_t pointer describing a
+                    // medium that is no longer there, and the next stick to
+                    // land in this slot would be read through it.
+                    //
+                    // Two things fix that, in this order:
+                    //   1. mounted = 0, so no NEW handle can be opened.
+                    //   2. a fresh generation, so every EXISTING handle is
+                    //      stale and every read/seek/readdir on it returns -1.
+                    // Nothing is written to the device: it is gone, and a write
+                    // attempt would only stall the caller on a dead endpoint.
+                    // An application with a file open on the volume therefore
+                    // sees read errors, which is the truth, rather than
+                    // silence or another volume's bytes.
+                    if (dev->status == HOTPLUG_STATUS_MOUNTED) {
+                        switch (dev->fs_type) {
+                            case HOTPLUG_FS_FAT16:
+                            case HOTPLUG_FS_FAT32:
+                                fat_unmount(&dev->fs.fat);
+                                if (++g_vol_gen == 0) g_vol_gen = 1;
+                                dev->fs.fat.vol_gen = g_vol_gen;
+                                break;
+                            case HOTPLUG_FS_EXFAT:
+                                exfat_unmount(&dev->fs.exfat);
+                                break;
+                        }
+                        kprintf("[Hotplug] %s torn down on surprise removal\n",
+                                dev->mount_point);
+                    }
+
                     // Fire event
                     fire_event(HOTPLUG_EVENT_REMOVED, dev);
 
                     // Clear slot
                     dev->active = 0;
                     dev->status = HOTPLUG_STATUS_DISCONNECTED;
-                    g_device_count--;
+                    if (g_device_count > 0) g_device_count--;
                     break;
                 }
             }
@@ -384,11 +476,26 @@ int hotplug_mount(int device_index) {
     switch (dev->fs_type) {
         case HOTPLUG_FS_FAT16:
         case HOTPLUG_FS_FAT32:
-            // Mount as FAT
-            result = fat_mount_lba(0, part_start, &dev->fs.fat);
+            // #250 THE BUG THIS REPLACES. This used to be
+            //     fat_mount_lba(0, part_start, &dev->fs.fat);
+            //     dev->fs.fat.drive = -1;   // "Mark as USB drive"
+            // and the comment was the whole of the USB routing: nothing ever
+            // read drive == -1. fat_mount_lba(0, ...) reads through blk_read(),
+            // which serves the ROOT block device, so this mounted whatever
+            // happened to sit at that LBA on the BOOT medium and then called it
+            // the stick. On a USB-booted golden it produced a plausible FAT
+            // mount of the boot volume, and a write to a "file on the stick"
+            // would have gone to the boot volume's sectors.
+            //
+            // fat_mount_lba_usb() binds the mount to THIS device for every
+            // sector it will ever touch, and stamps a generation so handles
+            // can be invalidated when it is pulled.
+            if (++g_vol_gen == 0) g_vol_gen = 1;
+            result = fat_mount_lba_usb(dev->msc_device_index, (uint32_t)part_start,
+                                       g_vol_gen, &dev->fs.fat);
             if (result >= 0) {
-                dev->fs.fat.drive = -1;  // Mark as USB drive
-                kprintf("[Hotplug] FAT filesystem mounted at %s\n", dev->mount_point);
+                kprintf("[Hotplug] FAT filesystem mounted at %s (usb dev %d, gen %u)\n",
+                        dev->mount_point, dev->msc_device_index, g_vol_gen);
             }
             break;
 
@@ -414,7 +521,13 @@ int hotplug_mount(int device_index) {
     if (result >= 0) {
         dev->status = HOTPLUG_STATUS_MOUNTED;
 
-        // Calculate free space
+        // Calculate free space.
+        // #250: on a removable FAT volume this is 0 and means UNKNOWN, not
+        // "full". fat_mount_lba_usb deliberately skips the whole-FAT free
+        // scan, because on a cacheless aux volume it is one SCSI round trip
+        // per FAT sector (~16,000 of them on a 32 GB stick) between plugging
+        // the drive in and it appearing. The UI reports the size and says the
+        // free figure is unknown rather than showing a wrong one.
         switch (dev->fs_type) {
             case HOTPLUG_FS_FAT16:
             case HOTPLUG_FS_FAT32:
@@ -452,6 +565,12 @@ int hotplug_unmount(int device_index) {
         case HOTPLUG_FS_FAT16:
         case HOTPLUG_FS_FAT32:
             fat_unmount(&dev->fs.fat);
+            // #250: same reason as the surprise-removal path. An explicit
+            // eject must invalidate open handles too, or an app that still
+            // holds one keeps reading a volume the user was told was safe to
+            // pull.
+            if (++g_vol_gen == 0) g_vol_gen = 1;
+            dev->fs.fat.vol_gen = g_vol_gen;
             break;
         case HOTPLUG_FS_EXFAT:
             exfat_unmount(&dev->fs.exfat);
@@ -477,18 +596,41 @@ int hotplug_eject(int device_index) {
 
     kprintf("[Hotplug] Ejecting device %s\n", dev->name);
 
+    // #250 THE BUG. These two statements used to be the other way round:
+    //
+    //     dev->status = HOTPLUG_STATUS_EJECTING;
+    //     if (dev->status == HOTPLUG_STATUS_MOUNTED) hotplug_unmount(...);
+    //
+    // The test could never be true, because the line above it had just made
+    // it false. So eject NEVER unmounted: the filesystem stayed mounted, the
+    // handles stayed live, and the only thing that happened was the SCSI
+    // START STOP UNIT. The device reported "safe to remove" without anything
+    // having been flushed or torn down. Read the status FIRST.
+    int was_mounted = (dev->status == HOTPLUG_STATUS_MOUNTED);
     dev->status = HOTPLUG_STATUS_EJECTING;
 
-    // Unmount if mounted
-    if (dev->status == HOTPLUG_STATUS_MOUNTED) {
+    if (was_mounted) {
+        // hotplug_unmount() refuses on a status that is not MOUNTED (it is
+        // also the "already unmounted" fast path), so restore it for the call.
+        dev->status = HOTPLUG_STATUS_MOUNTED;
         hotplug_unmount(device_index);
+        dev->status = HOTPLUG_STATUS_EJECTING;
     }
 
-    // Safe eject USB device
+    // Safe eject USB device. usb_msc_safe_remove -> usb_msc_eject issues
+    // SYNCHRONIZE CACHE on every LUN before ALLOW MEDIUM REMOVAL, so this is
+    // where the flush to the physical medium actually happens.
     usb_msc_safe_remove(dev->msc_device_index);
 
     // Fire event
     fire_event(HOTPLUG_EVENT_EJECT_SAFE, dev);
+
+    // The slot is released so the volume leaves the UI immediately. The
+    // physical device is still attached and still enumerated by USB MSC; if it
+    // is now pulled, the REMOVED event simply finds no active hotplug slot.
+    dev->active = 0;
+    dev->status = HOTPLUG_STATUS_DISCONNECTED;
+    if (g_device_count > 0) g_device_count--;
 
     kprintf("[Hotplug] Device %s can be safely removed\n", dev->name);
     return 0;
@@ -591,24 +733,117 @@ void hotplug_show_context_menu(int device_index, int x, int y) {
 // File Browser Integration
 // =============================================================================
 
+// #250: ONE fill, two shapes. hotplug_vol_raw() below is the single reader of
+// g_devices[]; this function, which predates it and was written for the
+// in-kernel file browser, is now expressed in terms of it. Two independent
+// copies of "what does the UI show for a volume" is exactly the shape that
+// gave this tree two Task Managers and two g_wallpapers[] arrays.
 int hotplug_get_sidebar_entries(hotplug_sidebar_entry_t *entries, int max_entries) {
     if (!entries || max_entries <= 0) return 0;
 
     int count = 0;
     for (int i = 0; i < HOTPLUG_MAX_DEVICES && count < max_entries; i++) {
-        if (g_devices[i].active) {
-            hotplug_sidebar_entry_t *entry = &entries[count];
-            entry->device_index = i;
-            strncpy(entry->name, g_devices[i].name, sizeof(entry->name) - 1);
-            strncpy(entry->mount_point, g_devices[i].mount_point, sizeof(entry->mount_point) - 1);
-            entry->total_bytes = g_devices[i].capacity_bytes;
-            entry->free_bytes = g_devices[i].free_bytes;
-            entry->is_mounted = (g_devices[i].status == HOTPLUG_STATUS_MOUNTED);
-            entry->is_removable = 1;  // All USB devices are removable
-            count++;
-        }
+        hotplug_raw_t raw;
+        if (hotplug_vol_raw(i, &raw) != 0 || !raw.present) continue;
+        hotplug_sidebar_entry_t *entry = &entries[count];
+        entry->device_index = i;
+        strncpy(entry->name, raw.name, sizeof(entry->name) - 1);
+        entry->name[sizeof(entry->name) - 1] = '\0';
+        strncpy(entry->mount_point, raw.mount_point, sizeof(entry->mount_point) - 1);
+        entry->mount_point[sizeof(entry->mount_point) - 1] = '\0';
+        entry->total_bytes = raw.capacity_bytes;
+        entry->free_bytes = raw.free_known ? raw.free_bytes : 0;
+        entry->is_mounted = raw.mounted;
+        entry->is_removable = 1;  // All USB devices are removable
+        count++;
     }
     return count;
+}
+
+// =============================================================================
+// #250: the pieces that carry the above across the syscall boundary
+// =============================================================================
+
+int hotplug_fs_readable(int fs_type) {
+    // exFAT is deliberately NOT readable here even though it mounts and
+    // reports free space. fs/exfat.c implements mount, unmount and
+    // get_free_space and NOTHING ELSE: exfat_read_file() has a definition, a
+    // prototype and no callers anywhere in the tree, and there is no exFAT
+    // branch in the fd layer. Reporting it as browsable would put a volume in
+    // the sidebar whose every file fails to open with no explanation. The
+    // volume is still listed and still ejectable; it is labelled read-only-
+    // unsupported instead of being hidden, because a stick the user can see
+    // in their hand and cannot see on screen is the complaint this task
+    // exists to fix.
+    switch (fs_type) {
+        case HOTPLUG_FS_FAT16:
+        case HOTPLUG_FS_FAT32:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+int hotplug_vol_raw(int index, hotplug_raw_t *out) {
+    if (!out || index < 0 || index >= HOTPLUG_MAX_DEVICES) return -1;
+    memset(out, 0, sizeof(*out));
+
+    hotplug_device_t *dev = &g_devices[index];
+    if (!dev->active) return 0;          // present stays 0
+
+    out->present = 1;
+    out->mounted = (dev->status == HOTPLUG_STATUS_MOUNTED) ? 1 : 0;
+    out->fs_type = dev->fs_type;
+    out->readable = hotplug_fs_readable(dev->fs_type);
+    out->capacity_bytes = dev->capacity_bytes;
+    out->free_bytes = dev->free_bytes;
+    // See the free-space comment in hotplug_mount(): a removable FAT volume
+    // does not pay for the whole-FAT scan, so 0 means UNKNOWN there. exFAT
+    // computes it from the allocation bitmap header at mount, cheaply.
+    out->free_known = (dev->free_bytes > 0) ? 1 : 0;
+    strncpy(out->name, dev->name, sizeof(out->name) - 1);
+    out->name[sizeof(out->name) - 1] = '\0';
+    strncpy(out->mount_point, dev->mount_point, sizeof(out->mount_point) - 1);
+    out->mount_point[sizeof(out->mount_point) - 1] = '\0';
+    return 0;
+}
+
+fat_fs_t *hotplug_volume_fat(int index) {
+    hotplug_device_t *dev = hotplug_get_device(index);
+    if (!dev) return NULL;
+    if (dev->status != HOTPLUG_STATUS_MOUNTED) return NULL;
+    if (!hotplug_fs_readable(dev->fs_type)) return NULL;
+    if (!dev->fs.fat.mounted) return NULL;
+    return &dev->fs.fat;
+}
+
+int hotplug_eject_slot(int index) {
+    if (!hotplug_get_device(index)) return -1;
+    return hotplug_eject(index);
+}
+
+int hotplug_resolve_path(const char *path, const char **rel_out) {
+    if (!path || path[0] != '/') return -1;
+
+    for (int i = 0; i < HOTPLUG_MAX_DEVICES; i++) {
+        hotplug_device_t *dev = &g_devices[i];
+        if (!dev->active || dev->status != HOTPLUG_STATUS_MOUNTED) continue;
+        if (!dev->mount_point[0]) continue;
+        // The match itself lives in Rust: "does /USB1 prefix-match /USB10"
+        // is exactly the off-by-one a hand-rolled strncmp gets wrong, and it
+        // would silently route one volume's paths to another.
+        extern int hotplug_path_split_rs(const char *path, const char *mount, int *rel_off);
+        int rel_off = -1;
+        if (hotplug_path_split_rs(path, dev->mount_point, &rel_off) == 1) {
+            // rel_off == -1 means `path` IS the mount point, i.e. the volume
+            // root, which has no offset inside `path` at all. The relative
+            // path is then the literal "/".
+            static const char root_rel[] = "/";
+            if (rel_out) *rel_out = (rel_off < 0) ? root_rel : (path + rel_off);
+            return i;
+        }
+    }
+    return -1;
 }
 
 int hotplug_eject_from_browser(const char *mount_point) {

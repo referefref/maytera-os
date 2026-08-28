@@ -32,6 +32,13 @@ extern void mouse_inject_hid(int dx, int dy, uint8_t buttons, int wheel); // dri
 // ---------------------------------------------------------------------------
 extern uint8_t hid_usage_to_set1_rs(uint8_t usage, uint8_t *out_ext);
 
+// #148: shared cooked-key ring push (cpu/isr.h) for HID usages with no honest
+// single-(code,extended) PS/2 set-1 encoding. See drivers/usb_hid.c's
+// matching comment; a Bluetooth keyboard's PrintScreen key gets the same fix
+// as a USB one, through the same one-line special case, not a private copy.
+extern void keyboard_push_cooked_key(uint8_t code);   // cpu/isr.c
+#define BT_HID_USAGE_PRINTSCREEN 0x46   // HID_KEY_PRINTSCREEN, drivers/usb_hid.h
+
 static void emit_set1(uint8_t code, int extended, int pressed) {
     if (!code) return;
     if (extended) keyboard_process_scancode(0xE0);
@@ -41,6 +48,11 @@ static void emit_set1(uint8_t code, int extended, int pressed) {
 // usage 0xE0..0xE7 are the eight modifier bits; everything else is a usage
 // from the report's keycode array. The shared translator handles both.
 static void emit_key(uint8_t usage, int pressed) {
+    // #148: see drivers/usb_hid.c's hid_kernel_key_cb for the full rationale.
+    if (usage == BT_HID_USAGE_PRINTSCREEN) {
+        if (pressed) keyboard_push_cooked_key(0x9D /* KEY_PRINTSCREEN, cpu/isr.h */);
+        return;
+    }
     uint8_t ext = 0;
     uint8_t code = hid_usage_to_set1_rs(usage, &ext);
     emit_set1(code, ext, pressed);

@@ -41,19 +41,38 @@
 #define FW 8
 #define FH 16
 
-// key codes (from kernel)
-#define K_UP 0x80
-#define K_DOWN 0x81
-#define K_LEFT 0x82
-#define K_RIGHT 0x83
-#define K_HOME 0x47
-#define K_END 0x4F
-#define K_PGUP 0x49
-#define K_PGDN 0x51
-#define K_DEL 0x53
+// key codes. #243: aliased onto libc/keys.h rather than restated. The four
+// arrow values here were correct, but a private copy that happens to agree
+// today is exactly what #191 found in six apps and what vnc.c still held four
+// stale values of. There is ONE table.
+#define K_UP    GUI_KEY_UP
+#define K_DOWN  GUI_KEY_DOWN
+#define K_LEFT  GUI_KEY_LEFT
+#define K_RIGHT GUI_KEY_RIGHT
+// #243: these five were a PRIVATE copy of the nav-key table, holding the raw
+// make codes, which are the ASCII letters G/O/I/Q/S. Aliased onto the shared
+// GUI_KEY_* constants (libc/keys.h) so there is one declaration, not two.
+#define K_HOME GUI_KEY_HOME
+#define K_END  GUI_KEY_END
+#define K_PGUP GUI_KEY_PGUP
+#define K_PGDN GUI_KEY_PGDN
+#define K_DEL  GUI_KEY_DEL
+// K_BS / K_ENTER are the PS/2 SCANCODES, not the cooked codes (which are 0x08
+// and 0x0A). Both `kc == K_BS` / `kc == K_ENTER` tests are therefore dead, and
+// both are paired with a working `c == '\b'` / `c == '\n'` test, so nothing is
+// broken. DELIBERATELY LEFT ALONE (#243): correcting K_BS to GUI_KEY_BKSP would
+// make `if (c == 8 && kc != K_BS)` at the Ctrl+H site below stop firing, which
+// would regress Ctrl+H (replace). Neither value can collide with a printable
+// character, so this is dead code, not a live defect. Fix with the Ctrl+H site
+// in hand, not as a drive-by.
 #define K_BS 0x0E
 #define K_ENTER 0x1C
-#define K_F5 0x3F
+// #243: was 0x3F, the SCANCODE for F5 (and ASCII '?'). The cooked code an app
+// actually receives is GUI_KEY_F5 (0x84), so this constant could never have
+// matched an F5 press. It has ZERO uses in this file, so nothing changes
+// behaviourally; corrected so that wiring it up later works rather than
+// silently binding to '?'.
+#define K_F5 GUI_KEY_F5
 
 // ---------------------------------------------------------------- buffer ----
 #define MAXTABS 12

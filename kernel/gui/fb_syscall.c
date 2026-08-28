@@ -11,6 +11,7 @@
 #include "../video/framebuffer.h"
 #include "../string.h"
 #include "../fs/panic.h"   // #418: STAGE_COMPOSITOR_UP / STAGE_DESKTOP_READY breadcrumbs
+#include "../fs/bootstage.h"  // the screen + flight-recorder breadcrumb trail
 #include "../sync/spinlock.h"   // b740: partial-present damage accumulator
 #include "../cpu/dlprof.h"      // #632: dp_tsc() - the shared rdtsc helper
 #include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
@@ -123,8 +124,20 @@ static bool is_compositor(void) {
     }
 
     if (fbown_claim_rs(p->pid) == 1) {
+        // BACKSTOP for the explicit UISC_NATIVE mark: whatever owns the
+        // framebuffer draws in real screen pixels by definition, so it must
+        // never have its coordinates scaled underneath it.
+        extern void uiscale_mark_native_rs(int32_t pid);
+        uiscale_mark_native_rs((int32_t)p->pid);
         kprintf("[FB] Process %u registered as compositor\n", p->pid);
         stage_set(STAGE_COMPOSITOR_UP, NULL);  // #418 breadcrumb
+        // Same event, the other breadcrumb trail. fs/bootstage.h's enum is the
+        // one that reaches the SCREEN and the raw flight recorder, which are the
+        // two channels that survive a machine with no serial port and no
+        // mounted filesystem. Wired HERE, next to its sibling, rather than left
+        // as an enum value with no writer: that is exactly the shape of dead
+        // instrumentation this work was written up in blame.md for.
+        boot_stage(BSTAGE_COMPOSITOR);
         return true;
     }
     return false;
@@ -135,6 +148,24 @@ static bool is_compositor(void) {
 // ---------------------------------------------------------------------------
 
 void fb_owner_arm(uint32_t pid) {
+    // THE EXACT MOMENT THE COMPOSITOR'S IDENTITY IS KNOWN, AND THEREFORE THE
+    // RIGHT PLACE TO MARK IT SCALE-NATIVE.
+    //
+    // The compositor must see REAL screen pixels while every other Ring 3
+    // program sees logical ones (see rustkern/uiscale.rs). Two weaker tests
+    // were tried and both are wrong in the same way - they are only true AFTER
+    // something else has happened:
+    //   * "is the framebuffer owner" is false until it claims, and it calls
+    //     SYS_FB_INFO to learn the screen size BEFORE claiming. Measured at
+    //     150%: it laid its whole desktop out for 1280x720 on a 1920x1080
+    //     display and left two thirds of the screen unpainted.
+    //   * "did it call UISC_NATIVE" requires the compositor to cooperate, and a
+    //     capability that depends on a program remembering to ask for it is the
+    //     kind of control this project has watched fail three times.
+    // The kernel LAUNCHES the compositor and arms this window with the exact
+    // pid it launched. Nothing is inferred and nothing has to be remembered.
+    extern void uiscale_mark_native_rs(int32_t pid);
+    uiscale_mark_native_rs((int32_t)pid);
     if (fbown_arm_rs(pid)) {
         kprintf("[FB] framebuffer claim window armed for pid %u\n", pid);
     }
@@ -155,10 +186,77 @@ uint32_t fb_owner_pid(void) { return fbown_owner_rs(); }
 // 99.9% of processes that never owned the framebuffer; no allocation, no lock,
 // no block.
 void fb_owner_proc_exit(uint32_t pid) {
+    // Drop the scale-native mark with the same pid that took it, so a recycled
+    // pid can never inherit it and start being handed physical coordinates.
+    extern void uiscale_clear_native_rs(int32_t pid);
+    uiscale_clear_native_rs((int32_t)pid);
     if (fbown_release_rs(pid)) {
         kprintf("[FB] compositor pid %u exited; framebuffer latch released\n",
                 pid);
     }
+}
+
+// ============================================================================
+// #COMPRESPAWN: THE sys_fb_map() WINDOW MUST BE UNMAPPED WHEN ITS MAPPER DIES.
+//
+// The full argument is at the call site in proc/process.c's proc_exit(). The
+// short version: sys_fb_map() below maps the framebuffer BACK BUFFER, which is
+// kmalloc_aligned() KERNEL HEAP, into a Ring-3 address space with the USER bit
+// set. vmm_destroy_user_space() frees every PRESENT|USER leaf it can prove it
+// owns, and it can prove it owns PML4[192] because the kernel has no such slot.
+// So without this, every compositor exit donated ~8 MB of live kernel heap to
+// the PMM free list.
+//
+// Only ONE mapping can exist at a time (is_compositor() gates sys_fb_map on the
+// framebuffer ownership latch, which is single-holder), so one record is
+// enough. If a second mapper ever becomes possible this must become a table -
+// and the record below will make that obvious rather than silent, because the
+// arm would overwrite a live entry.
+// ============================================================================
+static uint32_t g_fbmap_pid   = 0;
+static uint64_t g_fbmap_cr3   = 0;
+static uint64_t g_fbmap_vaddr = 0;
+static uint64_t g_fbmap_pages = 0;
+
+void fb_unmap_proc_exit(uint32_t pid, uint64_t cr3) {
+    if (g_fbmap_pid == 0 || g_fbmap_pid != pid) return;
+    // cr3 is taken from the dying process rather than the record, so a stale
+    // record can never cause a write into some other address space's tables.
+    // If they disagree, trust neither and drop the record.
+    if (cr3 != 0 && cr3 == g_fbmap_cr3) {
+        for (uint64_t i = 0; i < g_fbmap_pages; i++) {
+            vmm_unmap_page_in(cr3, g_fbmap_vaddr + i * VMM_PAGE_SIZE_4K);
+        }
+        kprintf("[FB] pid %u exited; unmapped %lu framebuffer pages at 0x%lx "
+                "(they are KERNEL HEAP, not this process's memory)\n",
+                pid, g_fbmap_pages, g_fbmap_vaddr);
+    } else {
+        kprintf("[FB] pid %u exited with cr3 0x%lx but the fb-map record says "
+                "0x%lx; NOT unmapping, dropping the record\n",
+                pid, cr3, g_fbmap_cr3);
+    }
+    g_fbmap_pid = 0; g_fbmap_cr3 = 0; g_fbmap_vaddr = 0; g_fbmap_pages = 0;
+}
+
+// The back buffer's virtual and physical addresses.
+//
+// KEPT BECAUSE THE ANSWER IS NOT WHAT ANYONE ASSUMES, AND IT IS AN OPEN
+// QUESTION. MEASURED on VM <vmid>, 2026-08-26: fbvirt=0x10001000,
+// fbphys=0x7a7000. The kernel heap is NOT identity-mapped - mm/heap.c maps it
+// at virtual 0x10000000 from whatever pages pmm_alloc_page() returned - so the
+// back buffer's virtual address is not its physical address. sys_fb_map() below
+// nevertheless passes fb_get_back_buffer() (a VIRTUAL address) as the PHYSICAL
+// address of the pages it maps into the compositor. On the face of it that maps
+// the wrong physical memory, and yet the compositor demonstrably renders, so
+// one of those three facts is not what it looks like and NONE of them has been
+// run to ground. Do not "fix" sys_fb_map on the strength of this comment;
+// measure vmm_get_physical() against the table the kernel is actually running
+// on first (mm/vmm.c's current_pml4_phys is a software shadow the scheduler
+// never updates, which is the obvious suspect).
+void fb_backbuffer_addrs(uint64_t *virt, uint64_t *phys) {
+    uint64_t v = (uint64_t)fb_get_back_buffer();
+    if (virt) *virt = v;
+    if (phys) *phys = v ? vmm_get_physical(v) : 0;
 }
 
 // Boot-time proof that the state machine's rules hold, printed so the guard is
@@ -210,6 +308,18 @@ int64_t sys_fb_map(void) {
         }
     }
     
+    // #COMPRESPAWN: remember it so proc_exit() can take it back down. See
+    // fb_unmap_proc_exit() above for why leaving it mapped corrupts the heap.
+    if (g_fbmap_pid != 0 && g_fbmap_pid != p->pid) {
+        kprintf("[FB] WARNING: fb-map record still held by pid %u while pid %u "
+                "maps; the old mapping will not be torn down\n",
+                g_fbmap_pid, p->pid);
+    }
+    g_fbmap_pid   = p->pid;
+    g_fbmap_cr3   = p->cr3;
+    g_fbmap_vaddr = vaddr;
+    g_fbmap_pages = num_pages;
+
     kprintf("[FB] Mapped %lu pages (%lu KB) at 0x%lx for compositor\n",
             num_pages, fb_size / 1024, vaddr);
     
@@ -239,9 +349,40 @@ int64_t sys_fb_info(fb_info_user_t *info) {
     
     // #19/#645: five stores into a Ring-3 struct; the bracket is the five
     // stores and nothing else.
+    // THE GLOBAL UI SCALE FACTOR. An app asks for the screen size to centre a
+    // window or to decide which of two layouts fits, and it thinks in LOGICAL
+    // pixels - the same coordinate system win_create(), win_get_size() and its
+    // mouse events use. Reporting the PHYSICAL size here while scaling the
+    // window it then creates puts every self-centring window off-centre, which
+    // includes the first-run wizard: it reads this, computes (sw - 688)/2, and
+    // would land a 1032px-wide card at x=616 instead of x=444.
+    //
+    // The COMPOSITOR is the exception and must see the real screen: it owns the
+    // framebuffer and draws the dock and desktop at absolute physical
+    // coordinates, applying the scale factor to its own chrome itself.
+    extern uint32_t fbown_owner_rs(void);
+    extern int32_t uiscale_unpx_rs(int32_t v);
+    extern int32_t uiscale_pct_rs(void);
+    extern int32_t uiscale_is_native_rs(int32_t pid);
+    uint32_t rw = g_fb_width, rh = g_fb_height;
+    {
+        process_t *cp = proc_current();
+        // NOT is_compositor(): that function CLAIMS the framebuffer as a side
+        // effect, and a size query must never take the screen. NOT bare
+        // ownership either: the compositor asks for the size BEFORE it claims,
+        // which is precisely the call that was being answered wrongly. The
+        // explicit scale-native mark is the test; ownership is the backstop.
+        int is_comp = cp && (uiscale_is_native_rs((int32_t)cp->pid) ||
+                             fbown_owner_rs() == cp->pid);
+        if (cp && !is_comp && uiscale_pct_rs() != 100) {
+            rw = (uint32_t)uiscale_unpx_rs((int32_t)g_fb_width);
+            rh = (uint32_t)uiscale_unpx_rs((int32_t)g_fb_height);
+        }
+    }
+
     uaccess_ac_t __ac = uaccess_begin();
-    info->width = g_fb_width;
-    info->height = g_fb_height;
+    info->width = rw;
+    info->height = rh;
     info->pitch = g_fb_pitch;
     info->bpp = g_fb_bpp;
     info->phys_addr = g_fb_phys_addr;
@@ -304,6 +445,13 @@ volatile uint64_t g_flip_cli_tot_cyc  = 0;  // TOTAL cycles with interrupts off
 volatile uint64_t g_flip_net_tot_cyc  = 0;  // TOTAL cycles in the throttled net_poll
 volatile uint64_t g_flip_cpy_tot_cyc  = 0;  // TOTAL cycles in CR3 switch + copy
 volatile uint64_t g_flip_cli_max_cyc  = 0;  // longest whole interrupts-off region
+// #COMPIDLE: a SECOND accumulator for the same quantity, owned by the durable
+// /HEARTBEAT.TXT record. This is not duplication for its own sake - it is the
+// rule this file already learned the hard way for g_flip_gap_max (see its
+// comment): two consumers sharing one read-and-reset maximum means whichever
+// runs first zeroes it and the second reads 0 forever. [FLIPPROF] owns
+// g_flip_cli_max_cyc; the heartbeat owns this one.
+volatile uint64_t g_flip_cli_max_hb_cyc = 0;
 volatile uint64_t g_flip_net_max_cyc  = 0;  // longest net_poll() within a present
 volatile uint64_t g_flip_cpy_max_cyc  = 0;  // longest CR3-switch + back->front copy
 volatile uint64_t g_flip_cli_over1ms  = 0;  // presents whose cli region exceeded 1ms
@@ -330,7 +478,7 @@ volatile uint64_t g_flip_net_calls    = 0;  // presents that actually ran net_po
 // the present-gap maximum - the [NETSTARVE] serial line and the enriched
 // /HEARTBEAT.TXT record - and they run in the SAME heartbeat loop iteration.
 // Sharing one variable meant whichever ran first zeroed it and the second read
-// 0 forever (MEASURED: gapmax=0ms in every sample on VM 2462, with the
+// 0 forever (MEASURED: gapmax=0ms in every sample on VM <vmid>, with the
 // compositor genuinely presenting only 8 frames in 132s, so the true value was
 // tens of seconds). Each consumer now owns its own accumulator, both updated
 // at the single producer site below.
@@ -490,6 +638,7 @@ int64_t sys_fb_flip(void) {
         g_flip_cli_tot_cyc += cli_cyc;
         g_flip_cpy_tot_cyc += cpy_cyc;
         if (cli_cyc > g_flip_cli_max_cyc) g_flip_cli_max_cyc = cli_cyc;
+        if (cli_cyc > g_flip_cli_max_hb_cyc) g_flip_cli_max_hb_cyc = cli_cyc;
         if (cpy_cyc > g_flip_cpy_max_cyc) g_flip_cpy_max_cyc = cpy_cyc;
         // 1ms threshold, in cycles, from the calibrated TSC rate (khz cycles == 1ms).
         extern uint64_t mono_tsc_khz_rs(void);
@@ -573,6 +722,24 @@ int64_t sys_get_mouse(int32_t *x, int32_t *y, uint32_t *buttons) {
     if (y) *y = cy;
     if (buttons) *buttons = cb;
     uaccess_end(__ac);
+
+    // #197: the SAMPLED leg of the click ledger. This call sits at the point of
+    // return with the value actually handed over, which is what makes the
+    // counter mean "the compositor's own edge detector fired": this syscall is
+    // is_compositor()-gated with a single caller (process_input() in
+    // userland/apps/compositor/main.c), and that caller's test is
+    // `(buttons & 1) && !(prev & 1)` over exactly this sequence of values.
+    //
+    // On an EDGE (rare - only a real button transition) wake the test-input
+    // channel, which may be latching an injected click until it is observed.
+    // No edge, no wake, so the poll-every-frame hot path costs one atomic add
+    // and one compare.
+    {
+        extern int  clickacct_note_sample_rs(uint32_t buttons);
+        extern void testinput_click_edge(int edge);
+        int __edge = clickacct_note_sample_rs(cb);
+        if (__edge) testinput_click_edge(__edge);
+    }
 
     return 0;
 }
@@ -677,6 +844,15 @@ int64_t sys_inject_mouse(int32_t x, int32_t y, int32_t type, int32_t button) {
             break;
         case 1:  // button down
             if (window_get_at_point(x, y)) hit = 1;
+            // #197: the ROUTED leg of the click ledger. Reaching here means the
+            // compositor sampled the edge AND its whole chrome hit-test chain
+            // (start menu, tray, notifications, taskbar, ...) declined to
+            // consume the click, so it made it down to the window manager. Left
+            // button only: the ledger tracks the left-click path.
+            if (button == 1) {
+                extern void clickacct_note_routed_rs(int hit);
+                clickacct_note_routed_rs((int)hit);
+            }
             // Right button (2) only routes a content event to the app under the
             // cursor (for its own context menu); it must NOT drive window chrome
             // (focus/drag/resize/min/max/close all belong to the left button),

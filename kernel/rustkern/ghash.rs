@@ -2,7 +2,7 @@
 //
 // WHY THIS EXISTS (measured, not assumed). Build 975 instrumented the App Store
 // download path with rdtsc region counters. Over a 103,563,185-byte OpenArena
-// install on VM 2620, every 2-second sample during the download read:
+// install on VM <vmid>, every 2-second sample during the download read:
 //
 //   [DLPROF] ... gcm=42%/3549KB gh=40%/228130 poll=2%/332 tcprx=0% ...
 //

@@ -9,6 +9,7 @@
 #include "../string.h"
 #include "../fs/fat.h"
 #include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
+#include "../fs/bootlog.h"  // #PERMSKIP: NOT-ARMED notice must be durable
 
 extern fat_fs_t g_fat_fs;
 extern void *fat_read_file(fat_fs_t *fs, const char *path, unsigned int *size_out);
@@ -330,7 +331,23 @@ static uint64_t parse_u64(const char *s) {
 void diskimg_boot_harness(void) {
     unsigned int sz = 0;
     char *cfg = (char *)fat_read_file(&g_fat_fs, "/CDTEST.TXT", &sz);
-    if (!cfg || sz == 0) { if (cfg) kfree(cfg); return; }
+    if (!cfg || sz == 0) {
+        if (cfg) kfree(cfg);
+        // #PERMSKIP: it used to return here in SILENCE. main.c's own comment
+        // records what that cost: this harness and img_shadow_selftest() are
+        // "compiled, linked and CALLED every boot" and both return at their
+        // first line, so "every dead-code check passes because the CALLER
+        // runs". Silence when unarmed is what made them indistinguishable from
+        // working code for months. One durable line ends that.
+        //
+        // NOT a selftest_notrun(): a developer harness that ships disarmed on
+        // purpose is not missing coverage, and putting it in the per-boot
+        // [SELFTEST] summary would make that summary into the noise it exists
+        // to cut through.
+        bootlog_write("[CDTEST] #196 disk-image harness NOT ARMED (no "
+                      "/CDTEST.TXT). Developer harness, not coverage.");
+        return;
+    }
 
     log_line("[CDTEST] #196 disk-image harness: /CDTEST.TXT found");
 
@@ -340,6 +357,17 @@ void diskimg_boot_harness(void) {
     const char *p = cfg;
     const char *end = cfg + sz;
     int disc = 0, keep = 0;
+    // #234g: THE DRIVE LETTER IS NOW A VARIABLE, and that is a bug fix rather
+    // than a convenience. It was the literal 'E' at eight sites, so this
+    // harness could only ever exercise the CD-ROM class: drvmap.rs assigns
+    // A:/B: to floppies and E:..Z: to CDs, so handing it a FAT12 image got
+    // DRVMAP_E_CLASS (-3) and there was NO way to boot-test the floppy path at
+    // all. The one harness for disk images could not test half of what the
+    // disk-image layer does.
+    //
+    // Default stays 'E' so every existing /CDTEST.TXT keeps its exact meaning.
+    // A line "LETTER A" changes it for the discs that follow.
+    char letter = 'E';
     while (p < end) {
         // Skip blank lines and comments.
         while (p < end && (*p == '\n' || *p == '\r')) p++;
@@ -361,6 +389,27 @@ void diskimg_boot_harness(void) {
             keep = 1;
             continue;
         }
+        // "LETTER <c>" as a whole line: mount the discs that FOLLOW on that
+        // drive. Placed here, beside KEEP, because it is the same kind of
+        // thing: a directive rather than a disc.
+        if (imgpath[0] == 'L' && imgpath[1] == 'E' && imgpath[2] == 'T' &&
+            imgpath[3] == 'T' && imgpath[4] == 'E' && imgpath[5] == 'R' &&
+            (imgpath[6] == ' ' || imgpath[6] == '\t')) {
+            int li = 7;
+            while (imgpath[li] == ' ' || imgpath[li] == '\t') li++;
+            char lc = imgpath[li];
+            if (lc >= 'a' && lc <= 'z') lc = (char)(lc - 32);
+            while (lp < end && *lp != '\n') lp++;
+            p = lp;
+            if (lc >= 'A' && lc <= 'Z') {
+                letter = lc;
+                kprintf("[CDTEST] drive letter set to %c:\n", letter);
+            } else {
+                kprintf("[CDTEST] LETTER: '%c' is not A-Z, keeping %c:\n",
+                        imgpath[li] ? imgpath[li] : '?', letter);
+            }
+            continue;
+        }
         if (!take_field(&lp, relpath, sizeof relpath)) relpath[0] = 0;
         if (!take_field(&lp, offs, sizeof offs)) offs[0] = 0;
         if (!take_field(&lp, lens, sizeof lens)) lens[0] = 0;
@@ -368,19 +417,19 @@ void diskimg_boot_harness(void) {
         p = lp;
         disc++;
 
-        kprintf("[CDTEST] --- disc %d: mounting %s on E: ---\n", disc, imgpath);
-        int mr = diskimg_mount('E', imgpath);
+        kprintf("[CDTEST] --- disc %d: mounting %s on %c: ---\n", disc, imgpath, letter);
+        int mr = diskimg_mount(letter, imgpath);
         if (mr != 0) {
             kprintf("[CDTEST] MOUNT FAILED rc=%d\n", mr);
             continue;
         }
         kprintf("[CDTEST] mounted='%s' fmt=%d size=%llu joliet=%d\n",
-                diskimg_mounted_name('E'), diskimg_format('E'),
-                (unsigned long long)diskimg_image_size('E'),
-                diskimg_has_joliet('E'));
+                diskimg_mounted_name(letter), diskimg_format(letter),
+                (unsigned long long)diskimg_image_size(letter),
+                diskimg_has_joliet(letter));
 
         struct listctx lc = { 0, 0 };
-        int n = diskimg_listdir('E', "/", harness_list_cb, &lc);
+        int n = diskimg_listdir(letter, "/", harness_list_cb, &lc);
         kprintf("[CDTEST] root listing: %d entries (shown %d)\n", n, lc.shown);
 
         // The GUEST path. Everything above went through diskimg_* directly;
@@ -391,18 +440,23 @@ void diskimg_boot_harness(void) {
         {
             fat_file_t fd;
             int dents = 0;
-            if (fat_open(&g_fat_fs, "/WINDIR/DRIVE_E", &fd) == 0) {
+            char droot[24]; int dn = 0;
+            for (const char *q = "/WINDIR/DRIVE_"; *q; q++) droot[dn++] = *q;
+            droot[dn++] = letter; droot[dn] = 0;
+            if (fat_open(&g_fat_fs, droot, &fd) == 0) {
                 fat_dir_entry_t de; char nm[128];
                 while (fat_readdir_n(&fd, &de, nm, sizeof nm) == 0 && dents < 4096) dents++;
                 fat_close(&fd);
             }
-            kprintf("[CDTEST] fat_open(/WINDIR/DRIVE_E) readdir -> %d entries\n", dents);
+            kprintf("[CDTEST] fat_open(%s) readdir -> %d entries\n", droot, dents);
         }
         if (relpath[0]) {
             char gpath[224];
             int gp = 0;
-            const char *gp1 = "/WINDIR/DRIVE_E/";
+            const char *gp1 = "/WINDIR/DRIVE_";
             for (int i = 0; gp1[i] && gp < (int)sizeof gpath - 1; i++) gpath[gp++] = gp1[i];
+            if (gp < (int)sizeof gpath - 1) gpath[gp++] = letter;
+            if (gp < (int)sizeof gpath - 1) gpath[gp++] = '/';
             for (int i = 0; relpath[i] && gp < (int)sizeof gpath - 1; i++) gpath[gp++] = relpath[i];
             gpath[gp] = 0;
             fat_file_t ff;
@@ -431,7 +485,7 @@ void diskimg_boot_harness(void) {
 
         if (relpath[0]) {
             uint64_t fsz = 0; int isdir = 0;
-            if (!diskimg_stat('E', relpath, &fsz, &isdir)) {
+            if (!diskimg_stat(letter, relpath, &fsz, &isdir)) {
                 kprintf("[CDTEST] STAT MISS %s\n", relpath);
             } else {
                 uint64_t off = parse_u64(offs);
@@ -446,7 +500,7 @@ void diskimg_boot_harness(void) {
                 while (done < len) {
                     uint64_t want = len - done;
                     if (want > 65536) want = 65536;
-                    int64_t got = diskimg_read_range('E', relpath, off + done, want, chunk);
+                    int64_t got = diskimg_read_range(letter, relpath, off + done, want, chunk);
                     if (got <= 0) { failed = 1; break; }
                     for (int64_t i = 0; i < got; i++) {
                         h ^= (uint64_t)chunk[i];
@@ -472,9 +526,10 @@ void diskimg_boot_harness(void) {
     // Default: leave the drive empty. The harness proves eject works and does
     // not leave a test disc mounted into the running system. A trailing KEEP
     // line overrides that for the DOS-guest stage.
-    if (!keep) diskimg_eject('E');
-    kprintf("[CDTEST] done, %d disc(s); keep=%d; E: mounted=%d name='%s'\n",
-            disc, keep, diskimg_is_mounted('E'), diskimg_mounted_name('E'));
+    if (!keep) diskimg_eject(letter);
+    kprintf("[CDTEST] done, %d disc(s); keep=%d; %c: mounted=%d name='%s'\n",
+            disc, keep, letter, diskimg_is_mounted(letter),
+            diskimg_mounted_name(letter));
     kfree(chunk);
     kfree(cfg);
 }

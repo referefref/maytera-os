@@ -50,6 +50,7 @@
 #include "stdlib.h"     // write()
 #include "unistd.h"     // _exit(), read(), close()
 #include "fcntl.h"      // O_RDONLY
+#include "syscall.h"    // sys_bootlog(): see __stack_chk_fail() below
 
 // The symbol gcc emits references to under -mstack-protector-guard=global.
 // Must NOT be static, and must not be const.
@@ -115,6 +116,23 @@ void __stack_chk_fail(void) {
     static const char msg[] =
         "*** stack smashing detected: __stack_chk_fail, terminating ***\n";
     write(2, msg, sizeof(msg) - 1);
+    // #307: AND SAY IT SOMEWHERE THAT SURVIVES A MACHINE WITH NO SERIAL PORT.
+    //
+    // fd 2 for a process with no stdout falls through to the kernel console,
+    // i.e. serial. The owner's iMac14,4 has no serial port, so on the one
+    // machine where this fires in the field the message above goes nowhere.
+    // Measured there on golden 2039: 'COMPOSIT' exited with code 127 twice in
+    // 15.6 hours, and /BOOTLOG.TXT could say only "code 127" - which in this
+    // libc means a canary trip HERE, an assert()/abort(), or a Rust
+    // panic_handler, three different bugs sharing one number.
+    //
+    // sys_bootlog() is a static-inline syscall1 over a string constant: no
+    // formatting, no stack buffer, no allocation, nothing this already-corrupt
+    // stack has to survive. It runs AFTER the write above so the serial path is
+    // never made worse, and its failure is ignored because there is nothing
+    // sensible left to do about it.
+    (void)sys_bootlog("libc: STACK SMASHING DETECTED (__stack_chk_fail); "
+                      "process terminating with exit 127");
     _exit(127);
     for (;;) { }                          // _exit does not return; belt and braces
 }

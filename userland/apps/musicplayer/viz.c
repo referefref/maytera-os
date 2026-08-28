@@ -371,11 +371,17 @@ void viz_frame(void) {
             if (g_ch > VIZ_MAXH) g_ch = VIZ_MAXH;
         }
         if (ev.type == EVENT_KEY_DOWN) {
-            if (ev.keycode == 0x01) { viz_close(); return; }             // Esc closes
+            // #191: all four of these were PS/2 SCANCODES (Esc 0x01, Enter
+            // 0x1C, Right 0x4D, Left 0x4B). None of them is what reaches an
+            // app: ordinary keys arrive as their ASCII byte (Esc 0x1B, Enter
+            // 0x0A) and the arrows are remapped to 0x82/0x83. So Esc did not
+            // close the visualiser and the arrow keys did not change preset;
+            // only the p/space and [/] fallbacks ever worked.
+            if (ev.keycode == GUI_KEY_ESC) { viz_close(); return; }
             if (ev.key_char == 'p' || ev.key_char == 'P' ||
-                ev.key_char == ' ' || ev.keycode == 0x1C) viz_next_preset();
-            if (ev.keycode == 0x4D || ev.key_char == ']') viz_next_preset();
-            if (ev.keycode == 0x4B || ev.key_char == '[') g_preset = (g_preset + NPRESET - 1) % NPRESET;
+                ev.key_char == ' ' || ev.keycode == GUI_KEY_ENTER) viz_next_preset();
+            if (ev.keycode == GUI_KEY_RIGHT || ev.key_char == ']') viz_next_preset();
+            if (ev.keycode == GUI_KEY_LEFT || ev.key_char == '[') g_preset = (g_preset + NPRESET - 1) % NPRESET;
         }
         if (ev.type == EVENT_MOUSE_DOWN) viz_next_preset();              // click = next preset
     }

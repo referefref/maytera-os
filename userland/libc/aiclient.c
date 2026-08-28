@@ -19,6 +19,7 @@
 #include "aicap.h"      // #293 capability tokens + consent + audit
 #include "aiguard.h"    // #745 prompt-injection screen (kernel-owned ruleset)
 #include "userconf.h"   // #684: per-user protected AI settings
+#include "contract.h"   // #235: THE settings surface, asked not re-described
 
 // ===========================================================================
 // #684: THE AI KEY IS PROVISIONED, NOT READ FROM /etc
@@ -605,7 +606,12 @@ static const char *system_prompt(void) {
         "FreeCell, Tetris, Chips) use app.launch with a lowercase app_id, e.g. "
         "ACTION app.launch {\"app_id\":\"doom\"} or {\"app_id\":\"skifree\"}.\n"
         "For disk space use storage.free (no args). For reading settings use "
-        "settings.get {\"key\":\"theme\"}.\n"
+        "settings.get {\"key\":\"theme\"}. Setting keys are the Settings app's own "
+        "contract names, e.g. clock.use_24hour, display.brightness, "
+        "sound.master_volume, appearance.theme; the short leaf on its own "
+        "(brightness) also works when it is unambiguous. If a key is unknown the "
+        "OBSERVATION lists every key that exists - read that list and retry, do "
+        "not guess a second time.\n"
         "Some tools are HIGH-RISK and permission-gated by the OS: settings.set "
         "(change a setting), fs.write {\"path\":\"/HOME/X.TXT\",\"content\":\"...\"} "
         "(write a file), and fs.delete. Just call them directly with the final "
@@ -1018,40 +1024,179 @@ static void exec_storage_info(const char *args, char *obs, int ocap) {
 
 // ===========================================================================
 // Settings get/set (#292) + capability-token permission gate (#293)
+//                     + #235: DELEGATION, not a second implementation
 // ===========================================================================
-// Generic settings.get(category,key) / settings.set(category,key,value) wired to
-// the REAL kernel setters/getters the Settings app uses, so changes apply LIVE.
+// WHAT THIS USED TO BE, so nobody re-adds it.
 //
-// PERMISSION GATE (#293): settings.get is LOW-risk (ungated, still audited).
-// settings.set is HIGH-risk: aicap_authorize() runs BEFORE this executor (in the
-// tool loop) and either finds a valid capability token or pops a user consent
-// dialog; only an authorized call reaches settings_apply() below. Every call is
-// audit-logged to /CONFIG/AIAUDIT.LOG. Settings without a real live setter return
-// a typed "not-supported" error rather than pretending to change.
+// A hardcoded if-else chain over theme / font_size / transparency / volume /
+// mute / brightness / night_light / screensaver / cursor / ip, calling the
+// kernel setters directly. It was real and it worked, and it was ALSO the
+// fourth partial description of the Settings surface (contract.h "WHAT WAS
+// HERE BEFORE"), covering a DIFFERENT key set from the real one: it had no
+// clock format, no double-click speed, no pointer speed, no accent colour, and
+// its theme ids were KERNEL ids while the Settings app indexes its own
+// file-based g_th[] list - the two did not even share an index space. It was
+// reachable only from AI chat, so a setting the AI could change was not
+// necessarily a setting the UI could, and vice versa.
+//
+// It now DELEGATES: /APPS/SETTINGS --contract get|set|call, through the one
+// libc helper contract_invoke() (#235), which is the same path the ctl debug
+// client takes. The Settings app answers from SETTINGS_ITEMS[] - the same table
+// that persists /CONFIG/SETTINGS.CFG and that tools/contract-lint gates - so
+// what the AI can reach and what the UI can reach are the same set by
+// construction, and adding a control adds it to both in one edit.
+//
+// PERMISSION GATE (#293) is unchanged and still runs HERE, before this
+// executor: settings.get is LOW-risk (ungated, audited), settings.set is
+// HIGH-risk and aicap_authorize() has already found a token or shown the user a
+// consent dialog by the time we are called. The Settings process then applies
+// its OWN row-level risk class as well (CT_SAFE / CT_GUARDED / CT_DENIED), so a
+// GUARDED row still fails closed for a headless caller. That is two gates on
+// the same call by design, not by accident: this one bounds the AI, that one
+// bounds every caller.
+//
+// WHAT IS DELIBERATELY NOT DELEGATED: the network keys below. Settings' Network
+// panel has 3 controls and ZERO contract rows (docs/CONTRACT_API.md section 6),
+// and its IP configuration is a MODAL whose fields need rows of their own
+// (section 9). So network here reads and writes the NETWORK stack, not a
+// Settings control, and it is labelled that way in its own error text rather
+// than pretending to be part of the Settings surface.
 
-// Theme id <-> name (kernel ids: 0=Retro,1=Dark,2=Light,4=Classic,5=Ocean,9=Nord/ModernDark)
-static const char *theme_name_of(int t) {
-    switch (t) {
-        case 0: return "Retro"; case 1: return "Dark"; case 2: return "Light";
-        case 4: return "Classic"; case 5: return "Ocean"; case 9: return "Nord";
-        default: return "Theme";
+#define AISET_APP "settings"
+
+// The app's reply line, verbatim. "ok name=X type=bool value=1" /
+// "err code=out-of-range name=X value=9 min=0 max=3". Pull one field out.
+// Fields are space-separated key=value with no quoting, which is why this is
+// eight lines and not a parser.
+static int ct_field(const char *line, const char *key, char *out, int ocap) {
+    int kl = 0; while (key[kl]) kl++;
+    for (const char *p = line; *p; p++) {
+        if ((p == line || p[-1] == ' ' || p[-1] == '\n') &&
+            !strncmp(p, key, (size_t)kl) && p[kl] == '=') {
+            const char *v = p + kl + 1;
+            int o = 0;
+            while (*v && *v != ' ' && *v != '\n' && o < ocap - 1) out[o++] = *v++;
+            out[o] = 0;
+            return o > 0;
+        }
     }
-}
-static int theme_id_of(const char *s) {
-    if (id_eq_ci(s, "retro")) return 0;
-    if (id_eq_ci(s, "dark") || id_eq_ci(s, "midnight")) return 1;
-    if (id_eq_ci(s, "light")) return 2;
-    if (id_eq_ci(s, "classic") || id_eq_ci(s, "gray") || id_eq_ci(s, "grey")) return 4;
-    if (id_eq_ci(s, "ocean")) return 5;
-    if (id_eq_ci(s, "nord")) return 9;
-    // numeric fallback
-    int v = 0, any = 0; for (const char *p = s; *p >= '0' && *p <= '9'; p++) { v = v*10 + (*p-'0'); any = 1; }
-    return any ? v : -1;
+    if (ocap > 0) out[0] = 0;
+    return 0;
 }
 
-// Build "category.key" into a small buffer for matching/messages.
-static void catkey(const char *cat, const char *key, char *out, int ocap) {
-    snprintf(out, ocap, "%s.%s", cat && cat[0] ? cat : "?", key && key[0] ? key : "?");
+// The FIRST line of the app's reply (probe/get/set/call all answer in one).
+static void ct_first_line(char *buf) {
+    for (char *p = buf; *p; p++) if (*p == '\n') { *p = 0; return; }
+}
+
+// Cached `--contract list` for this process. One spawn per chat session, not
+// one per tool call. The list is the app's own enumeration; we never hold a
+// copy of what the names MEAN, only of what they ARE.
+static char s_ct_names[2048];
+static int  s_ct_listed = 0;
+
+static const char *settings_item_list(void) {
+    if (!s_ct_listed) {
+        s_ct_listed = 1;
+        char *av[1]; av[0] = (char *)"list";
+        contract_invoke(AISET_APP, 1, av, s_ct_names, (int)sizeof(s_ct_names));
+    }
+    return s_ct_names;
+}
+
+// Resolve a caller's key to a contract item name, using ONLY the app's own
+// list: exact match, then the leaf after the last dot ("brightness" ->
+// "display.brightness"), then a unique substring. An ambiguous or absent key
+// resolves to nothing and the caller reports the live list, so the AI corrects
+// itself from what the app says it has rather than from a table here - a table
+// here is precisely what this ticket removed.
+static int settings_resolve(const char *key, char *out, int ocap) {
+    const char *L = settings_item_list();
+    if (!L[0]) return 0;
+    int kl = 0; while (key[kl]) kl++;
+    if (!kl) return 0;
+
+    const char *best = 0; int bestlen = 0, nhit = 0;
+    for (int pass = 0; pass < 3 && nhit != 1; pass++) {
+        best = 0; nhit = 0;
+        for (const char *p = L; *p; ) {
+            const char *e = p; while (*e && *e != '\n') e++;
+            int len = (int)(e - p);
+            if (len > 0) {
+                int hit = 0;
+                if (pass == 0) {
+                    hit = (len == kl && !strncmp(p, key, (size_t)kl));
+                } else if (pass == 1) {
+                    const char *leaf = p; 
+                    for (const char *q = p; q < e; q++) if (*q == '.') leaf = q + 1;
+                    hit = ((int)(e - leaf) == kl && !strncmp(leaf, key, (size_t)kl));
+                } else {
+                    for (int i = 0; i + kl <= len; i++)
+                        if (!strncmp(p + i, key, (size_t)kl)) { hit = 1; break; }
+                }
+                if (hit) { nhit++; best = p; bestlen = len; }
+            }
+            p = *e ? e + 1 : e;
+        }
+    }
+    if (nhit != 1 || !best) return 0;
+    if (bestlen >= ocap) bestlen = ocap - 1;
+    for (int i = 0; i < bestlen; i++) out[i] = best[i];
+    out[bestlen] = 0;
+    return 1;
+}
+
+// Emit "here is what actually exists" instead of a bare not-supported. The list
+// is the app's, so it cannot be stale.
+static void settings_unknown(const char *key, char *obs, int ocap) {
+    const char *L = settings_item_list();
+    int o = snprintf(obs, ocap,
+        "{\"error\":\"unknown-setting\",\"key\":\"%s\",\"note\":\"ask "
+        "/APPS/SETTINGS for the live list\",\"available\":\"", key);
+    for (const char *p = L; *p && o < ocap - 4; p++)
+        obs[o++] = (*p == '\n') ? ',' : *p;
+    while (o > 0 && obs[o-1] == ',') o--;
+    snprintf(obs + o, ocap - o, "\"}");
+}
+
+// Turn the app's own reply line into the JSON observation shape the tool loop
+// expects. We pass its text through rather than paraphrasing it: a client that
+// reworded the answer would be a second description of the result.
+static void settings_reply(const char *name, char *line, char *obs, int ocap) {
+    ct_first_line(line);
+    char v[128], t[32], prev[64], code[48], detail[160];
+    if (!strncmp(line, "ok ", 3)) {
+        ct_field(line, "value", v, sizeof(v));
+        ct_field(line, "type",  t, sizeof(t));
+        ct_field(line, "prev",  prev, sizeof(prev));
+        ct_field(line, "result", detail, sizeof(detail));
+        if (prev[0])
+            snprintf(obs, ocap,
+                "{\"applied\":true,\"setting\":\"%s\",\"value\":%s,\"previous\":%s%s}",
+                name, v[0] ? v : "null", prev,
+                strstr(line, "note=clamped-or-ignored-by-app")
+                    ? ",\"note\":\"the app clamped or ignored this value\"" : "");
+        else if (v[0])
+            snprintf(obs, ocap, "{\"setting\":\"%s\",\"type\":\"%s\",\"value\":\"%s\"}",
+                     name, t[0] ? t : "?", v);
+        else
+            snprintf(obs, ocap, "{\"applied\":true,\"setting\":\"%s\",\"result\":\"%s\"}",
+                     name, detail[0] ? detail : "ok");
+        return;
+    }
+    ct_field(line, "code",   code,   sizeof(code));
+    ct_field(line, "detail", detail, sizeof(detail));
+    snprintf(obs, ocap, "{\"error\":\"%s\",\"setting\":\"%s\",\"detail\":\"%s\"}",
+             code[0] ? code : "settings-app-error", name,
+             detail[0] ? detail : line);
+}
+
+// The network branch, kept whole. See the header note: this is the NETWORK
+// stack's surface, not a Settings control, and it says so.
+static int settings_is_network_key(const char *cat, const char *key) {
+    return !strcmp(cat, "network") || !strcmp(key, "ip") || !strcmp(key, "static_ip") ||
+           !strcmp(key, "gateway") || !strcmp(key, "dns") || !strcmp(key, "netmask") ||
+           !strcmp(key, "dhcp");
 }
 
 // settings.get(category,key) -> {value:...} or typed error. READ-only, ungated.
@@ -1061,136 +1206,37 @@ static void exec_settings_get(const char *args, char *obs, int ocap) {
     if (!json_get_str(args, "key", key, sizeof(key)) || !key[0]) {
         strlcpy(obs, "{\"error\":\"missing key\"}", ocap); return;
     }
-    char ck[100]; catkey(cat, key, ck, sizeof(ck));
 
-    if (!strcmp(key, "theme")) {
-        int t = get_theme();
-        snprintf(obs, ocap, "{\"category\":\"appearance\",\"key\":\"theme\",\"value\":%d,\"name\":\"%s\"}",
-                 t, theme_name_of(t));
-        return;
-    }
-    if (!strcmp(key, "font_size")) {
-        snprintf(obs, ocap, "{\"key\":\"font_size\",\"value\":%d,\"range\":\"0-3\"}", get_font_size());
-        return;
-    }
-    if (!strcmp(key, "transparency") || !strcmp(key, "opacity")) {
-        int o = get_win_opacity();
-        snprintf(obs, ocap, "{\"key\":\"transparency\",\"opacity_0_255\":%d,\"percent\":%d}",
-                 o, (o * 100) / 255);
-        return;
-    }
-    if (!strcmp(key, "master_volume") || !strcmp(key, "volume")) {
-        snprintf(obs, ocap, "{\"key\":\"master_volume\",\"value\":%d,\"range\":\"0-100\"}", get_volume());
-        return;
-    }
-    if (!strcmp(key, "brightness")) {
-        int fx = get_display_fx();
-        snprintf(obs, ocap, "{\"key\":\"brightness\",\"value\":%d,\"range\":\"0-100\"}", fx & 0xFF);
-        return;
-    }
-    if (!strcmp(key, "night_light")) {
-        int fx = get_display_fx();
-        snprintf(obs, ocap, "{\"key\":\"night_light\",\"value\":%d,\"range\":\"0-100\"}", (fx >> 8) & 0xFF);
-        return;
-    }
-    if (!strcmp(key, "screensaver_delay")) {
-        snprintf(obs, ocap, "{\"key\":\"screensaver_delay\",\"seconds\":%d}", get_ss_delay());
-        return;
-    }
-    if (!strcmp(key, "screensaver")) {
-        snprintf(obs, ocap, "{\"key\":\"screensaver\",\"value\":%d}", get_screensaver());
-        return;
-    }
-    if (!strcmp(key, "cursor")) {
-        snprintf(obs, ocap, "{\"key\":\"cursor\",\"value\":%ld}", get_cursor_theme());
-        return;
-    }
-    if (!strcmp(cat, "network") || !strcmp(key, "ip") || !strcmp(key, "gateway") ||
-        !strcmp(key, "dns") || !strcmp(key, "netmask") || !strcmp(key, "dhcp")) {
+    if (settings_is_network_key(cat, key)) {
         net_info_t ni;
         if (get_net_info(&ni, sizeof(ni)) < 0) { strlcpy(obs, "{\"error\":\"network-unavailable\"}", ocap); return; }
         snprintf(obs, ocap,
-            "{\"ip\":\"%s\",\"gateway\":\"%s\",\"netmask\":\"%s\",\"dns\":\"%s\","
-            "\"mac\":\"%s\",\"connected\":%d}",
+            "{\"source\":\"network-stack\",\"ip\":\"%s\",\"gateway\":\"%s\","
+            "\"netmask\":\"%s\",\"dns\":\"%s\",\"mac\":\"%s\",\"connected\":%d}",
             ni.ip, ni.gateway, ni.netmask, ni.dns, ni.mac, ni.connected);
         return;
     }
-    snprintf(obs, ocap, "{\"error\":\"not-supported\",\"setting\":\"%s\",\"note\":\"no live getter for this setting\"}", ck);
+
+    char name[CT_NAME_MAX];
+    if (!settings_resolve(key, name, sizeof(name))) { settings_unknown(key, obs, ocap); return; }
+
+    static char line[1024];
+    char *av[2]; av[0] = (char *)"get"; av[1] = name;
+    contract_invoke(AISET_APP, 2, av, line, (int)sizeof(line));
+    settings_reply(name, line, obs, ocap);
 }
 
-// Apply a verified setting write. Returns 1 if applied (writes result into obs),
-// 0 if the setting has no real live setter (writes a not-supported error).
+// Apply a verified setting write. Returns 1 in every case that produced a typed
+// answer (the old contract of this function), 0 only when nothing could answer.
 static int settings_apply(const char *cat, const char *key, const char *val, char *obs, int ocap) {
-    char ck[100]; catkey(cat, key, ck, sizeof(ck));
-    int iv = 0, ivany = 0;
-    { const char *p = val; if (*p=='-'||*p=='+') p++; for (; *p>='0'&&*p<='9'; p++){iv=iv*10+(*p-'0'); ivany=1;} if (val[0]=='-') iv=-iv; }
-
-    if (!strcmp(key, "theme")) {
-        int t = theme_id_of(val);
-        if (t < 0) { snprintf(obs, ocap, "{\"error\":\"bad-value\",\"hint\":\"theme: Dark|Light|Classic|Ocean|Nord|Retro\"}"); return 1; }
-        set_theme(t);
-        snprintf(obs, ocap, "{\"applied\":true,\"setting\":\"appearance.theme\",\"value\":%d,\"name\":\"%s\"}", t, theme_name_of(t));
-        return 1;
-    }
-    if (!strcmp(key, "font_size")) {
-        if (!ivany || iv < 0 || iv > 3) { strlcpy(obs, "{\"error\":\"bad-value\",\"hint\":\"font_size 0-3\"}", ocap); return 1; }
-        set_font_size(iv);
-        snprintf(obs, ocap, "{\"applied\":true,\"setting\":\"appearance.font_size\",\"value\":%d}", iv); return 1;
-    }
-    if (!strcmp(key, "transparency") || !strcmp(key, "opacity")) {
-        if (!ivany) { strlcpy(obs, "{\"error\":\"bad-value\"}", ocap); return 1; }
-        // accept percent (0-100) or raw 0-255
-        int o = (iv <= 100) ? (iv * 255 / 100) : iv;
-        if (o < 0) o = 0; if (o > 255) o = 255;
-        set_win_opacity(o);
-        snprintf(obs, ocap, "{\"applied\":true,\"setting\":\"appearance.transparency\",\"opacity_0_255\":%d}", o); return 1;
-    }
-    if (!strcmp(key, "master_volume") || !strcmp(key, "volume")) {
-        if (!ivany) { strlcpy(obs, "{\"error\":\"bad-value\"}", ocap); return 1; }
-        if (iv < 0) iv = 0; if (iv > 100) iv = 100;
-        set_volume(iv);
-        snprintf(obs, ocap, "{\"applied\":true,\"setting\":\"sound.master_volume\",\"value\":%d}", iv); return 1;
-    }
-    if (!strcmp(key, "mute")) {
-        int m = (id_eq_ci(val,"true")||id_eq_ci(val,"on")||(ivany&&iv));
-        set_mute(m);
-        snprintf(obs, ocap, "{\"applied\":true,\"setting\":\"sound.mute\",\"value\":%d}", m); return 1;
-    }
-    if (!strcmp(key, "brightness")) {
-        if (!ivany) { strlcpy(obs, "{\"error\":\"bad-value\"}", ocap); return 1; }
-        if (iv < 0) iv = 0; if (iv > 100) iv = 100;
-        int nl = (get_display_fx() >> 8) & 0xFF;
-        set_display_fx(iv, nl);
-        snprintf(obs, ocap, "{\"applied\":true,\"setting\":\"display.brightness\",\"value\":%d}", iv); return 1;
-    }
-    if (!strcmp(key, "night_light")) {
-        if (!ivany) { strlcpy(obs, "{\"error\":\"bad-value\"}", ocap); return 1; }
-        if (iv < 0) iv = 0; if (iv > 100) iv = 100;
-        int br = get_display_fx() & 0xFF;
-        set_display_fx(br, iv);
-        snprintf(obs, ocap, "{\"applied\":true,\"setting\":\"display.night_light\",\"value\":%d}", iv); return 1;
-    }
-    if (!strcmp(key, "screensaver_delay")) {
-        if (!ivany) { strlcpy(obs, "{\"error\":\"bad-value\",\"hint\":\"seconds\"}", ocap); return 1; }
-        set_ss_delay(iv);
-        snprintf(obs, ocap, "{\"applied\":true,\"setting\":\"appearance.screensaver_delay\",\"seconds\":%d}", iv); return 1;
-    }
-    if (!strcmp(key, "screensaver")) {
-        if (!ivany) { strlcpy(obs, "{\"error\":\"bad-value\"}", ocap); return 1; }
-        set_screensaver(iv);
-        snprintf(obs, ocap, "{\"applied\":true,\"setting\":\"appearance.screensaver\",\"value\":%d}", iv); return 1;
-    }
-    if (!strcmp(key, "cursor")) {
-        if (!ivany) { strlcpy(obs, "{\"error\":\"bad-value\"}", ocap); return 1; }
-        set_cursor_theme(iv);
-        snprintf(obs, ocap, "{\"applied\":true,\"setting\":\"appearance.cursor\",\"value\":%d}", iv); return 1;
-    }
-    if (!strcmp(key, "dhcp")) {
-        net_dhcp();
-        snprintf(obs, ocap, "{\"applied\":true,\"setting\":\"network.dhcp\",\"note\":\"DHCP requested\"}"); return 1;
-    }
-    if (!strcmp(key, "ip") || !strcmp(key, "static_ip")) {
-        // expects value like "ip,mask,gw" or just ip (keep current mask/gw from net_info)
+    if (settings_is_network_key(cat, key)) {
+        if (!strcmp(key, "dhcp")) {
+            net_dhcp();
+            snprintf(obs, ocap, "{\"applied\":true,\"source\":\"network-stack\","
+                     "\"setting\":\"network.dhcp\",\"note\":\"DHCP requested\"}");
+            return 1;
+        }
+        // "ip[,mask,gw]"; missing parts keep the current ones.
         char ip[20]={0}, mask[20]={0}, gw[20]={0}; int part=0, pi=0;
         for (const char *p = val; *p; p++) {
             if (*p == ',') { if (part==0) ip[pi]=0; else if (part==1) mask[pi]=0; else gw[pi]=0; part++; pi=0; continue; }
@@ -1205,13 +1251,34 @@ static int settings_apply(const char *cat, const char *key, const char *val, cha
         }
         if (!ip[0]) { strlcpy(obs, "{\"error\":\"bad-value\",\"hint\":\"ip[,mask,gw]\"}", ocap); return 1; }
         net_set_static(ip, mask[0]?mask:"255.255.255.0", gw[0]?gw:ip);
-        snprintf(obs, ocap, "{\"applied\":true,\"setting\":\"network.ip\",\"ip\":\"%s\",\"mask\":\"%s\",\"gateway\":\"%s\"}", ip, mask, gw); return 1;
+        snprintf(obs, ocap, "{\"applied\":true,\"source\":\"network-stack\",\"setting\":\"network.ip\","
+                 "\"ip\":\"%s\",\"mask\":\"%s\",\"gateway\":\"%s\"}", ip, mask, gw);
+        return 1;
     }
-    // honestly-unsupported writes (no live kernel setter)
-    snprintf(obs, ocap,
-        "{\"error\":\"not-supported\",\"setting\":\"%s\","
-        "\"note\":\"no live setter; this setting cannot be changed from chat yet\"}", ck);
-    return 0;
+
+    char name[CT_NAME_MAX];
+    if (!settings_resolve(key, name, sizeof(name))) { settings_unknown(key, obs, ocap); return 1; }
+
+    static char line[1024];
+    char *av[3];
+    av[0] = (char *)"set"; av[1] = name; av[2] = (char *)val;
+    contract_invoke(AISET_APP, 3, av, line, (int)sizeof(line));
+
+    // ONE routing rule, not a name table: a theme is the value the caller is
+    // most likely to give by NAME rather than by index, and appearance.theme is
+    // a CT_INT because its index space is the app's own /THEMES list. Settings
+    // exposes appearance.set_theme_by_name for exactly that case, and the list
+    // of names lives THERE. We only decide which verb to use; we never decide
+    // what the names are.
+    if (strstr(line, "unparseable-value") && !strcmp(name, "appearance.theme")) {
+        char *cv[3];
+        cv[0] = (char *)"call"; cv[1] = (char *)"appearance.set_theme_by_name"; cv[2] = (char *)val;
+        contract_invoke(AISET_APP, 3, cv, line, (int)sizeof(line));
+        settings_reply("appearance.set_theme_by_name", line, obs, ocap);
+        return 1;
+    }
+    settings_reply(name, line, obs, ocap);
+    return 1;
 }
 
 static void exec_settings_set(const char *args, char *obs, int ocap) {
@@ -1224,10 +1291,11 @@ static void exec_settings_set(const char *args, char *obs, int ocap) {
         // value may be numeric/unquoted; try a loose grab
         val[0] = 0;
     }
-    // #293: consent + capability-token enforcement now happens in aicap_authorize
+    // #293: consent + capability-token enforcement happens in aicap_authorize
     // BEFORE this executor is ever reached (the runtime shows the user a consent
-    // dialog and mints a token). By the time we get here the write is authorized,
-    // so just apply it. (The old in-band confirm/"yes"-word handshake is gone.)
+    // dialog and mints a token). By the time we get here the write is authorized
+    // as far as the AI gate is concerned; the Settings process then applies its
+    // own row-level risk class as well.
     settings_apply(cat, key, val, obs, ocap);
 }
 

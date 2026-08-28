@@ -51,6 +51,11 @@
 #define CTX_ACTION_DOCK_UNPIN        207   // Unpin from Favorites (PINNED/MERGED)
 #define CTX_ACTION_DOCK_CHANGE_ICON  208
 
+// #250 removable-volume icon actions (contextmenu_open_for_volume() mode).
+// Own disjoint range, same discipline as the MI_* and DOCK_* blocks above.
+#define CTX_ACTION_VOL_OPEN          301
+#define CTX_ACTION_VOL_EJECT         302
+
 // ============================================================================
 // Static state
 // ============================================================================
@@ -71,6 +76,12 @@ static int       g_ctx_dock_win_id;               // -1 = no window (pinned, not
 static char      g_ctx_dock_app_id[32];            // "" = no resolvable pid
 static char      g_ctx_dock_exec_path[128];        // "" = no resolvable identity
 static icon_id_t g_ctx_dock_icon_id;                // meaningful iff exec_path[0]
+
+// #250 VOLUME mode target: which desktop icon the menu was opened on.
+// The icon index and not the kernel volume index, because desktop.c owns the
+// mapping between the two and matches it by mount point; capturing the kernel
+// index here would be a second, independently-staleable copy of it.
+static int g_ctx_vol_icon = -1;
 
 // ============================================================================
 // Internal helpers
@@ -321,14 +332,14 @@ bool contextmenu_handle_mouse(int32_t x, int32_t y, bool clicked) {
         switch (action) {
             case CTX_ACTION_WALLPAPER:
                 // #74: open Settings on the Appearance tab (wallpaper/themes).
-                set_settings_tab(0);   // PANEL_APPEARANCE
-                sys_spawn("/APPS/SETTINGS");
+                // #129: settings_open_panel() focuses an already-open Settings
+                // window instead of spawning a duplicate (see compositor.h).
+                settings_open_panel(SETTINGS_PANEL_APPEARANCE);
                 break;
 
             case CTX_ACTION_SETTINGS:
                 // #74: "Display Settings" opens Settings on the Display tab.
-                set_settings_tab(1);   // PANEL_DISPLAY
-                sys_spawn("/APPS/SETTINGS");
+                settings_open_panel(SETTINGS_PANEL_DISPLAY);
                 break;
 
             case CTX_ACTION_REFRESH:
@@ -372,6 +383,17 @@ bool contextmenu_handle_mouse(int32_t x, int32_t y, bool clicked) {
                 break;
             case CTX_ACTION_MI_PROPERTIES:
                 startmenu_item_open_properties(g_ctx_target_item);
+                break;
+
+            // #250 removable-volume actions. g_ctx_vol_icon was captured at
+            // open time; desktop.c re-resolves the volume from the icon's
+            // mount point on each call, so a drive pulled while the menu was
+            // open simply resolves to nothing and both actions no-op.
+            case CTX_ACTION_VOL_OPEN:
+                desktop_icon_open_volume(g_ctx_vol_icon);
+                break;
+            case CTX_ACTION_VOL_EJECT:
+                desktop_icon_eject(g_ctx_vol_icon);
                 break;
 
             // #44 dock item actions. win_id/app_id/exec_path were validated
@@ -528,6 +550,36 @@ static void ctx_push_sep(void) {
 // SYS_PROC_LIST for a pid - see taskbar_force_quit_app_id()), since a window
 // can have a resolvable app_id even when the FULL start-menu identity
 // (exec_path) does not resolve.
+// ============================================================================
+// contextmenu_open_for_volume (#250: removable-volume desktop icon right-click)
+// ============================================================================
+// Eject has to live somewhere the user can reach it, and the desktop
+// right-click was reaching the BACKGROUND menu regardless of what was under
+// the cursor, so there was nowhere to put it. This is the same
+// rebuild-per-target pattern as the two menus above, not a new mechanism.
+//
+// Open is omitted, not disabled, when the volume's filesystem cannot serve
+// reads: an enabled menu row that does nothing is exactly what #745 retired
+// two of.
+void contextmenu_open_for_volume(int32_t x, int32_t y, int icon_idx, int readable) {
+    g_ctx_mode     = CTX_MODE_VOLUME;
+    g_ctx_vol_icon = icon_idx;
+
+    g_ctx_item_count = 0;
+    if (readable) {
+        ctx_push_action("Open", CTX_ACTION_VOL_OPEN);
+        ctx_push_sep();
+    }
+    ctx_push_action("Eject", CTX_ACTION_VOL_EJECT);
+    if (g_ctx_item_count == 0) return;
+
+    g_context_menu_x    = x;
+    g_context_menu_y    = y;
+    g_context_menu_open = true;
+    g_ctx_hover         = -1;
+    g_needs_redraw      = true;
+}
+
 void contextmenu_open_for_dock(int32_t x, int32_t y, int win_id, bool maximized,
                                const char *app_id, const char *exec_path,
                                icon_id_t icon_id, bool is_favorite) {

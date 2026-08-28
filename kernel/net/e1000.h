@@ -123,6 +123,7 @@ void e1000_irq_handler(void);
 // Crash context management - call these to prevent MMIO access during crashes
 void e1000_enter_crash_context(void);
 void e1000_exit_crash_context(void);
+int  e1000_crash_context_active(void);
 
 // Check if E1000 is safe to use
 int e1000_is_safe(void);

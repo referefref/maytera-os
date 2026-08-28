@@ -33,6 +33,8 @@
 #include "syscall.h"
 #include "syscall_argtab.h"
 #include "../fs/ext2.h"      // #610 ext2_fsck_report_t
+#include "../fs/vfs.h"       // #120 kstat_kind_t
+#include "procinfo.h"        // #120 PI_KIND_* (the ONE kind numbering)
 #include "../fs/graphfs/journal.h"   // #711
 #include "../fs/graphfs/fold.h"      // #711 slice 2
 
@@ -49,6 +51,10 @@ _Static_assert(sizeof(devinfo_irq_t) == 16,
                "#503 argtab: SZ_DEVINFO_IRQ in rustkern.rs is stale");
 _Static_assert(sizeof(proc_info_t) == 64,
                "#503 argtab: SZ_PROC_INFO in rustkern.rs is stale");
+_Static_assert(sizeof(drag_info_t) == 104,
+               "#503 argtab: SZ_DRAG_INFO in rustkern/argtab.rs is stale. "
+               "drag_info_t is duplicated in userland/libc/syscall.h and "
+               "mirrored by DragInfo in rustkern/dragsess.rs; update all four.");
 _Static_assert(sizeof(wm_window_info_t) == 136,   /* #44: + int maximized (#41: + char app_id[32]) */
                "#503 argtab: SZ_WM_WINDOW_INFO in rustkern.rs is stale");
 _Static_assert(sizeof(cron_job_t) == 128,
@@ -104,6 +110,20 @@ _Static_assert(USER_PTR_SX_PREFIX == 0xFFFFFFFF00000000ULL,
 
 // sc_user_info_t, k_stat_t and dirent_t are private to proc/syscall.c and are
 // locked there, at their definitions, where a reader changing them will see it.
+
+// #120: kstat_kind_t (fs/vfs.h) is written by fstat_kind_rs (rustkern/
+// fstatkind.rs) across the FFI. A layout drift would have Rust write past, or
+// short of, what C reads - and because every field has a plausible zero value,
+// a short write would look like "unknown kind" rather than like a bug.
+_Static_assert(sizeof(kstat_kind_t) == 24,
+               "#120: KStatKind in rustkern/fstatkind.rs is stale");
+// The KIND_* consts in rustkern/fstatkind.rs MIRROR these. #120's first draft
+// had DEV and PIPE transposed against them and nothing would have failed: both
+// values are plausible, so Task Manager would simply have labelled every pipe a
+// device and every device a pipe.
+_Static_assert(PI_KIND_FILE == 0 && PI_KIND_DEV == 1 && PI_KIND_PIPE == 2 &&
+               PI_KIND_SOCKET == 3 && PI_KIND_UNKNOWN == 4,
+               "#120: PI_KIND_* renumbered without rustkern/fstatkind.rs");
 
 // --- Access-flag encoding the Rust table mirrors ----------------------------
 // The table asks for ACCESS_RW_USER / ACCESS_READ_USER by numeric value across

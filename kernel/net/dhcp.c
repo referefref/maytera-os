@@ -4,6 +4,7 @@
 #include "ip.h"
 #include "ethernet.h"
 #include "arp.h"
+#include "dns.h"      // #786: apply the lease's option-6 resolver
 #include "../serial.h"
 #include "../string.h"
 #include "../cpu/isr.h"
@@ -571,8 +572,8 @@ int dhcp_discover(void) {
     // (RFC 2131 4.1: "chosen by the client"), not a bump of a constant seed.
     // dhcp_init() ran `dhcp_xid = timer_ticks ^ 0xDEADBEEF` BEFORE sti(), when
     // timer_ticks is always 0, so every MayteraOS box on earth started at
-    // 0xDEADBEEF and sent its first DISCOVER as 0xDEADBEF0. OBSERVED on the build
-    // host LAN: two independent MayteraOS VMs, with distinct NIC MACs, both
+    // 0xDEADBEEF and sent its first DISCOVER as 0xDEADBEF0. OBSERVED on the the build host
+    // LAN: two independent MayteraOS VMs (00:00:5E:00:53:00 and 00:00:5E:00:53:00)
     // broadcasting DISCOVERs with the IDENTICAL xid 0xdeadbef0 at the same time.
     // Two consequences, both real:
     //   1) CORRECTNESS: OFFERs are broadcast (we set flags=0x8000), so box A's
@@ -823,6 +824,19 @@ void dhcp_poll(void) {
                 p = (uint8_t *)&dhcp_dns;
                 kprintf("[DHCP] DNS: %d.%d.%d.%d\n", p[3], p[2], p[1], p[0]);
             }
+            // #786 THE MISSING LINE. Everything above this point already
+            // existed: the option-6 value was parsed into dhcp_dns, latched
+            // for dhcp_get_dns(), and PRINTED right here - and then never
+            // handed to the resolver. dns_set_server() had exactly ONE caller
+            // in the entire kernel (net_apply_static_config), so every
+            // DHCP-configured machine resolved through dns_init()'s
+            // compiled-in 8.8.8.8 forever while Settings displayed the
+            // offered address as if it were in use. Measured on VM <vmid>:
+            // dhcp=BOUND, lease offered 192.0.2.1, packets went to 8.8.8.8.
+            //
+            // _dhcp() and not dns_set_server(): a lease must never overrule a
+            // resolver the user or /CONFIG/NETIP.CFG chose explicitly.
+            dns_set_server_dhcp(dhcp_dns);
             // Announce our verified-unique address (RFC 5227 ANNOUNCE).
             arp_announce();
             arp_announce();

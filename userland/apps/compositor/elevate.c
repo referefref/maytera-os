@@ -41,6 +41,7 @@
 //     follow-on, not a claim this file makes.
 // ===========================================================================
 #include "compositor.h"
+#include "../../libc/string.h"   // #73 secure_zero
 #include "syscall.h"
 #include "string.h"
 
@@ -331,7 +332,7 @@ static void elev_close(void)
 {
     g_elev_open = 0;
     // Zero the buffer on EVERY exit, including cancel and lockout.
-    memset(g_elev_pw, 0, sizeof(g_elev_pw));
+    secure_zero(g_elev_pw, sizeof(g_elev_pw));   /* #73: was memset, which -O2 may elide */
     g_elev_pwlen = 0;
     g_elev_errs[0] = 0;
     g_elev_errflag = 0;
@@ -355,7 +356,7 @@ static void elev_submit(void)
 {
     if (g_elev_pwlen == 0) return;   // no-op, no error, no flash
     int r = (int)sys_elev_resolve(g_elev.seq, ELEV_ACT_SUBMIT, g_elev_pw);
-    memset(g_elev_pw, 0, sizeof(g_elev_pw));
+    secure_zero(g_elev_pw, sizeof(g_elev_pw));   /* #73: was memset, which -O2 may elide */
     g_elev_pwlen = 0;
     if (r == 0) { elev_close(); return; }             // granted: no success dialog
     if (r == ELEV_EATTEMPTS) { elev_close(); return; } // three used: abandoned
@@ -537,7 +538,7 @@ void elevate_poll(void)
     if (!g_elev_open || v.seq != g_elev.seq) {
         g_elev = v;
         g_elev_open = 1;
-        memset(g_elev_pw, 0, sizeof(g_elev_pw));
+        secure_zero(g_elev_pw, sizeof(g_elev_pw));   /* #73: was memset, which -O2 may elide */
         g_elev_pwlen = 0;
         g_elev_errs[0] = 0;
         g_elev_errflag = 0;

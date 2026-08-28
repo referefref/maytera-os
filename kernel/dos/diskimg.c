@@ -18,6 +18,7 @@
 #include "../sync/spinlock.h"
 #include "../sync/waitq.h"
 #include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
+#include "../drivers/hotplug.h"   // #234i: hotplug_raw_t, the ONE volume-record shape
 
 extern fat_fs_t g_fat_fs;
 extern void *fat_read_file(fat_fs_t *fs, const char *path, unsigned int *size_out);
@@ -61,6 +62,11 @@ typedef struct {
     imgfile_t img;
     iso_vol_t pvd;              // primary descriptor (kind 1)
     iso_vol_t jol;              // Joliet descriptor (kind 2), root_len 0 if none
+    // #184: set by iso_probe() when a PRIMARY descriptor parsed but pointed its
+    // root directory outside the file. Only meaningful during img_build(), which
+    // turns it into DISKIMG_E_TRUNC and frees the image; no mounted image ever
+    // carries it set.
+    int       truncated;
 
     // FAT12 (RAM-resident)
     unsigned char *buf;
@@ -589,7 +595,16 @@ static int iso_probe(diskimg_t *im) {
     memset(&im->pvd, 0, sizeof im->pvd);
     memset(&im->jol, 0, sizeof im->jol);
 
+    // #184: the bounds check lives in Rust (rustkern/iso9660.rs). Read the doc
+    // comment on iso_root_within_rs() before changing anything here: a valid
+    // descriptor is NOT the same fact as a present disc, and this function used
+    // to conflate them.
+    extern int iso_root_within_rs(uint32_t root_lba, uint32_t root_len,
+                                  uint32_t block_size, uint64_t image_size);
+    extern uint64_t iso_vd_declared_bytes_rs(const uint8_t *sec, uint32_t len);
+
     int got_pvd = 0;
+    im->truncated = 0;
     for (unsigned s = 16; s < 16 + 32; s++) {
         int64_t got = imgfile_read(&im->img, (uint64_t)s * ISO_SECT, ISO_SECT, sect);
         if (got < (int64_t)ISO_SECT) break;
@@ -599,7 +614,40 @@ static int iso_probe(diskimg_t *im) {
         iso_vol_t v;
         int r = iso_vd_parse(sect, ISO_SECT, &v);
         if (r == 1) {
-            if (v.kind == 1 && !got_pvd) { im->pvd = v; got_pvd = 1; }
+            // #184: REFUSE a descriptor whose root directory is not in the file.
+            // Nothing below this point can read a directory that is not there,
+            // so accepting it produces a drive that mounts, reports its size,
+            // and answers every lookup with "not found" - the failure mode this
+            // tree deletes tools for (#98, #103). Recorded on the image rather
+            // than returned directly so a Joliet SVD pointing outside a
+            // otherwise-good disc degrades to "no Joliet" instead of failing
+            // the whole mount.
+            if (!iso_root_within_rs(v.root_lba, v.root_len, v.block_size,
+                                    im->size)) {
+                kprintf("[diskimg] %s: %s descriptor at sector %u has its root "
+                        "directory at lba=%u len=%u (byte %llu), past the end of "
+                        "a %llu-byte image: TRUNCATED or corrupt, refusing\n",
+                        im->path, (v.kind == 1) ? "primary" : "Joliet", s,
+                        (unsigned)v.root_lba, (unsigned)v.root_len,
+                        (unsigned long long)v.root_lba * v.block_size,
+                        (unsigned long long)im->size);
+                if (v.kind == 1) im->truncated = 1;
+                continue;
+            }
+            if (v.kind == 1 && !got_pvd) {
+                im->pvd = v; got_pvd = 1;
+                // Not a refusal, on purpose: real rips drop trailing padding and
+                // still work. Say it once so a later "file not found" on a big
+                // file at the end of the disc has an explanation on the record.
+                uint64_t decl = iso_vd_declared_bytes_rs(sect, ISO_SECT);
+                if (decl && decl > im->size) {
+                    kprintf("[diskimg] %s: descriptor declares %llu bytes but the "
+                            "file is %llu; the tail is missing, files near the end "
+                            "of the disc will not read\n",
+                            im->path, (unsigned long long)decl,
+                            (unsigned long long)im->size);
+                }
+            }
             else if (v.kind == 2 && !im->jol.root_len) { im->jol = v; }
         }
     }
@@ -633,6 +681,15 @@ static diskimg_t *img_build(const char *imgpath, int *err) {
     if (iso_probe(im)) {
         im->fmt = DISKIMG_FMT_ISO9660;
         return im;
+    }
+    // #184: it WAS an ISO, and its root directory is not in the file. Say that,
+    // rather than falling through to the FAT12 attempt and reporting whatever
+    // that fails with - "unrecognised image format" for a file that is plainly a
+    // recognised format sends the user looking in the wrong place.
+    if (im->truncated) {
+        imgfile_close(&im->img); kfree(im);
+        *err = DISKIMG_E_TRUNC;
+        return 0;
     }
 
     // Not an ISO: try FAT12, which needs the image in RAM.
@@ -885,14 +942,50 @@ int diskimg_volume_label(char letter, char *out, int cap) {
     return got;
 }
 
-// The total size of the medium in the drive, for INT 21h 36h. 0 if the letter
-// holds no image.
-uint64_t diskimg_media_size(char letter) {
+// #234e. See the header for why this exists. The ONE place that turns a
+// mounted medium into the (bytes/sector, sectors/cluster, clusters) triple
+// DOS asks for, so no caller has to invent one again.
+//
+// ISO 9660: 2048-byte sectors is not a convention here, it is a hard refusal
+// point. rustkern/iso9660.rs rejects any volume whose logical block size at
+// descriptor offset 128 is not 2048, so a mounted ISO cannot have any other
+// sector size. One sector per cluster keeps the cluster count inside the 16
+// bits DX has to hold it in, up to a 128 GB medium.
+//
+// FAT12: bps and spc are read straight out of the BPB by fat12_parse(), and
+// the data area is what is left after the reserved sectors, the FATs and the
+// root directory, which is exactly what data_off already measures. A 720 KB
+// disk gives 512/2/713; a 1.44 MB disk gives 512/1/2847. Neither is a
+// constant in this file, which is the point: the geometry comes off the disk.
+int diskimg_geometry(char letter, uint32_t *bps_out, uint32_t *spc_out,
+                     uint32_t *clusters_out) {
     diskimg_t *im = img_acquire(idx_for(letter), 0);
     if (!im) return 0;
-    uint64_t sz = im->img.size;
+    uint32_t bps = 0, spc = 0;
+    uint64_t clusters = 0;
+    if (im->fmt == DISKIMG_FMT_ISO9660) {
+        bps = ISO_SECT;
+        spc = 1;
+        clusters = (im->img.size + (ISO_SECT - 1)) / ISO_SECT;
+    } else if (im->fmt == DISKIMG_FMT_FAT12) {
+        bps = im->bps;
+        spc = im->spc;
+        uint32_t per = im->bps * im->spc;
+        // fat12_parse() has already refused bps == 0 and spc == 0, and has
+        // already refused data_off > bufsize, so neither guard below can be
+        // the thing that saves us. They are here because this function is
+        // reachable from a syscall and a divide by zero in Ring 0 is a panic,
+        // not a bad answer.
+        if (per && im->bufsize > im->data_off)
+            clusters = (uint64_t)(im->bufsize - im->data_off) / per;
+    }
     img_release(im);
-    return sz;
+    if (!bps || !spc) return 0;
+    if (clusters > 0xFFFFu) clusters = 0xFFFFu;
+    if (bps_out)      *bps_out = bps;
+    if (spc_out)      *spc_out = spc;
+    if (clusters_out) *clusters_out = (uint32_t)clusters;
+    return 1;
 }
 
 int diskimg_query(int idx, diskimg_info_t *out) {
@@ -983,6 +1076,88 @@ int diskimg_has_joliet(char letter) {
     int j = im->jol.root_len ? 1 : 0;
     img_release(im);
     return j;
+}
+
+// ===========================================================================
+// #234i: A MOUNTED IMAGE IS A VOLUME, AND THERE IS ONLY ONE VOLUME LIST.
+// ===========================================================================
+// The image mounter and the USB hot-plug layer had nothing in common except
+// the thing a USER cares about: a drive that appeared and can be browsed and
+// ejected. #250 built exactly that surface (SYS_VOL_LIST -> the Files
+// sidebar and the desktop icons) and wired only USB into it, so mounting a
+// floppy or a CD put a browsable filesystem on the machine that nothing in
+// the GUI ever mentioned. You had to already know the path.
+//
+// The fix is NOT a second list in Files. It is this function: the mounter,
+// which is the thing that knows what is mounted, publishes into the list that
+// already exists, in the record shape that already exists. Files, the desktop
+// and anything added later ask ONE question and get one answer. That is the
+// same reasoning that put the drive-letter policy in rustkern/drvmap.rs after
+// #739 found the same decision open-coded in three places that had already
+// disagreed.
+//
+// WHAT IT DOES NOT DO. It does not decide how a volume is DRAWN, which flag
+// bits it gets or what the filesystem is called on screen: rustkern/hotplug.rs
+// derives all of that from fs_type, so there is one marshaller for both
+// producers rather than two that can disagree about what "read-only" means.
+//
+// NON-BLOCKING: img_acquire()/img_release() around RAM fields only, plus the
+// label, which dos/diskimg.h states reads no sector. No turnstile is taken,
+// so this cannot wait behind an in-flight read of a 653 MB disc.
+int diskimg_vol_raw(int idx, hotplug_raw_t *out) {
+    if (!out || idx < 0 || idx >= 26) return 0;
+    char letter = (char)('A' + idx);
+
+    memset(out, 0, sizeof(*out));
+    if (!diskimg_is_mounted(letter)) return 0;
+
+    int fmt = diskimg_format(letter);
+    if (fmt != DISKIMG_FMT_ISO9660 && fmt != DISKIMG_FMT_FAT12) return 0;
+
+    out->present   = 1;
+    out->mounted   = 1;
+    // Both formats have real file operations behind them (fat_open() redirects
+    // into the image), which is what `readable` means. It is NOT "writable":
+    // read-only-ness travels as a separate flag derived from fs_type.
+    out->readable  = 1;
+    out->fs_type   = (fmt == DISKIMG_FMT_ISO9660) ? HOTPLUG_FS_ISO9660
+                                                  : HOTPLUG_FS_FAT12;
+    out->capacity_bytes = diskimg_image_size(letter);
+    // A disc has no free space worth reporting and a floppy's would cost a
+    // whole-FAT scan for a number nobody asked for. Say "unknown" rather than
+    // print a confident zero.
+    out->free_bytes = 0;
+    out->free_known = 0;
+
+    // NAME. The label written ON the medium if it has one, because that is
+    // what the disc calls itself and what the user recognises; otherwise the
+    // image's own basename, which always exists. Never empty: an unlabelled
+    // row is indistinguishable from any other row.
+    {
+        char label[16];
+        int n = 0;
+        if (diskimg_volume_label(letter, label, sizeof(label)) && label[0]) {
+            while (label[n] && n < (int)sizeof(out->name) - 1) { out->name[n] = label[n]; n++; }
+        } else {
+            const char *bn = diskimg_mounted_name(letter);
+            while (bn[n] && n < (int)sizeof(out->name) - 1) { out->name[n] = bn[n]; n++; }
+        }
+        out->name[n] = '\0';
+    }
+
+    // MOUNT POINT. The native spelling of a DOS drive, which is what
+    // rustkern/drvmap.rs's drvmap_windir_split_rs() parses and what
+    // fat_open()'s image redirect keys on. Built here rather than passed in,
+    // so the browsable path a UI is handed is the same string the kernel
+    // resolves.
+    {
+        const char *pfx = "/WINDIR/DRIVE_";
+        int n = 0;
+        while (pfx[n]) { out->mount_point[n] = pfx[n]; n++; }
+        out->mount_point[n++] = letter;
+        out->mount_point[n] = '\0';
+    }
+    return 1;
 }
 
 // ---------------------------------------------------------------------------

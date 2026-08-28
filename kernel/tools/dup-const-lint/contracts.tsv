@@ -1,0 +1,42 @@
+# contracts.tsv (#222) - DECLARED VALUE CONTRACTS. Rule C.
+#
+# Columns, tab separated:
+#   1  contract name (dotted, describes the QUANTITY, not any one macro)
+#   2  the value every site must carry (decimal, or 0x...)
+#   3  sites, ';'-separated, each  repo/relative/path.c:MACRO_NAME
+#   4  why these really are one number
+#
+# WHY THIS FILE EXISTS AND WHY IT IS NOT AUTOMATIC
+#
+# Rules A and B are anchored on the NAME. The fault that opened #222 has no
+# shared name: userland/apps/settings/main.c calls the dock's default height
+# DOCK_HEIGHT_DEFAULT and userland/apps/compositor/taskbar.c calls the same
+# number XFCE_DOCK_H_DEFAULT. Nothing textual can know those are one quantity,
+# so nothing textual can detect that pair drifting. What CAN be done is to write
+# the contract down once, in a file the build reads, instead of in a source
+# comment the build cannot read. settings/main.c:323 currently says
+#
+#     #define DOCK_HEIGHT_DEFAULT  59   // must match taskbar.c XFCE_DOCK_H_DEFAULT
+#
+# and that comment has exactly no enforcement behind it. This row does.
+#
+# A site does not have to be a bare literal: XFCE_DOCK_H_DEFAULT is
+# (XFCE_DOCK_ICON + XFCE_DOCK_PAD + XFCE_DOCK_IND + XFCE_DOCK_PAD_BOT), and the
+# lint folds same-file macro arithmetic to reach 59. So changing any TERM of
+# that sum is caught too, which is the realistic way this one drifts: nobody
+# edits XFCE_DOCK_H_DEFAULT, they retune the padding.
+#
+# A site whose file or macro has gone away FAILS. It is not skipped. A contract
+# that describes something that is not there has stopped describing the thing
+# that is, and a gate that silently stops checking is the entire subject of the
+# ticket this file was written for.
+#
+# ADD A ROW whenever you catch yourself writing "must match <other file>".
+# That sentence is the symptom; this file is the treatment.
+
+dock.height.default	59	userland/apps/settings/main.c:DOCK_HEIGHT_DEFAULT;userland/apps/compositor/taskbar.c:XFCE_DOCK_H_DEFAULT	The dock the compositor draws IS the dock Settings configures. Settings seeds its slider from its own copy, so a drift shows as a slider whose default position is not where the dock actually is.
+dock.height.min	44	userland/apps/settings/main.c:DOCK_HEIGHT_MIN;userland/apps/compositor/taskbar.c:XFCE_DOCK_H_MIN	Settings clamps the slider to its copy and the taskbar re-clamps to its own; if Settings' floor is the lower of the two, the user picks a height that silently snaps back and the control looks broken.
+dock.height.max	96	userland/apps/settings/main.c:DOCK_HEIGHT_MAX;userland/apps/compositor/taskbar.c:XFCE_DOCK_H_MAX	Same clamp pair as the floor. taskbar.c documents that 96 is what GLASS_DOCK_PX in draw.c is sized for, so a Settings ceiling above the taskbar's would let the user request a dock that loses its blur.
+dock.zoom.min	100	userland/apps/settings/main.c:DOCK_ZOOM_MIN;userland/apps/compositor/taskbar.c:XFCE_DOCK_ZOOM_MIN	Magnification floor, clamped independently in both binaries exactly like the height bounds.
+dock.zoom.max	200	userland/apps/settings/main.c:DOCK_ZOOM_MAX;userland/apps/compositor/taskbar.c:XFCE_DOCK_ZOOM_MAX	Magnification ceiling, clamped independently in both binaries exactly like the height bounds.
+dock.zoom.default	128	userland/apps/settings/main.c:DOCK_ZOOM_DEFAULT;userland/apps/compositor/taskbar.c:XFCE_DOCK_ZOOM_DEFAULT	The value a profile that has never set a zoom gets. Two different defaults means the dock renders at one magnification while the Settings slider shows another.

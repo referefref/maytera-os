@@ -35,6 +35,9 @@ everyone benefits. Do not fork a private copy into your subsystem.
 | `YIELD_SPIN`    | a loop whose only wait mechanism is `proc_yield()` (no shared primitive in the body) |
 | `SLEEP_POLL`    | a loop containing `proc_sleep(N)` / `msleep(N)` with a small `N`, not routed through a blocking primitive |
 | `NOBLOCK_BLOCK` | a sleep/yield/block call inside an IRQ/ISR handler or a compositor draw callback |
+| `DELAY_SPIN`    | a loop whose body is nothing but hardware delay calls (`io_wait`/`pause`/`udelay`), which pegs a core for the whole wait |
+| `PRIVATE_SPINLOCK_IRQON` | **(#114)** a hand-rolled spinlock acquire loop that never masks `RFLAGS.IF`. This is the #75 AB-BA deadlock shape |
+| `PRIVATE_SPINLOCK` | **(#114)** a hand-rolled spinlock acquire loop that does mask `RFLAGS.IF`: not the deadlock shape, but still a private copy of `sync/spinlock.h` |
 
 A loop whose body already uses a canonical primitive (`wait_event`,
 `futex_wait`, `wake_up`, ...) is considered correctly routed and is NOT flagged.
@@ -44,6 +47,88 @@ tails are not mistaken for empty loops, and vendored third-party trees
 (`media/opus`, `media/tremor`, `media/faad2`, `grep-gnu`, `micropython`,
 `rogue`, DOOM) plus the build `obj/` and the primitives' own `sync/` dir are
 excluded.
+
+## The `PRIVATE_SPINLOCK` family (#114), and why it is a rule and not a patch
+
+`mm/heap.c` had a private `volatile int` + test-and-set lock that never touched
+`RFLAGS.IF`. #347 fixed it. `mm/pmm.c`, **in the same directory**, had the
+identical defect and was not fixed at the same time. It survived for months and
+took a bespoke instrument plus a QMP dump of guest memory to find again.
+
+What #75 measured, six samples 30 seconds apart with every value identical: a
+core took `pmm_lock` with IF=1 and **without** the Big Kernel Lock, was
+interrupted, and `cpu/idt.c` wraps every ISR in `bkl_acquire()`, so the holder
+became a **BKL waiter while still holding its own lock**. A second core inside a
+`SYSCALL` (which takes the BKL at entry) then wanted `pmm_lock`. AB-BA. Both
+cores spun with IF=1 and neither halted, which is why "the owner stops taking
+interrupts" and "a core halted holding the lock" were both the wrong picture.
+
+Fixing three or four instances leaves the fifth free to appear next month, which
+is exactly how `pmm.c` survived #347. Hence a rule.
+
+**What it detects.** A loop (`while`, `for`, **or `do`/`while`**, whose body
+precedes its condition and which the ordinary header scan skips) that retries an
+atomic lock acquire. The acquire may be spelled with any of the `__sync_*`
+builtins, any of the `__atomic_*` builtins, our own `atomic_xchg*` /
+`atomic_cas*` helpers, **or raw inline asm** (`xchg`, `lock cmpxchg`,
+`lock bts`). The asm branch scans a comment-stripped but string-PRESERVING copy
+of the source: the instruction only ever appears inside an asm string literal,
+which the normal stripper blanks out, while prose about `xchg` (`fs/blockdev.c`
+and `exec/x86_16.c` both discuss it in comments) must not count. Spelling-breadth is load-bearing: the sweep that opened
+#114 grepped only for `__sync_lock_test_and_set` and therefore **missed
+`net/net_perf.c` entirely**, which uses `__atomic_test_and_set`. There is a
+self-test case pinning that specific spelling, so narrowing the rule back to one
+builtin fails the gate.
+
+**What it deliberately does NOT flag.**
+
+* A **trylock that gives up** (`if (test_and_set(&L,1)) return BUSY;`) is not a
+  spin: a BKL owner that fails it returns instead of spinning, so the second
+  half of the inversion cannot form. `net/sntp.c` and `drivers/xhci.c` are this
+  shape.
+* An acquire loop that **parks on the shared wait queue** (`__wait_prepare` +
+  `__wait_event_wait_deadline`, the `fs/fat.c` `fat_lock()` and
+  `drivers/usb_msc.c` `msc_cmd_lock()` shape) is correctly routed. Flagging it
+  would push authors back towards a raw spin. There is a GREEN self-test control
+  for this.
+* Taking the **shared** `sync/spinlock.h` primitive. There is also a GREEN
+  control for that, because a rule that flags the fix it is demanding gets muted.
+
+**Kernel-only by construction.** `RFLAGS.IF` and the BKL exist only in Ring 0.
+
+**Measured coverage** (`--self-test` pins each of these; the table is the
+output of an adversarial probe run at #114, not an aspiration):
+
+| Shape | Result |
+|---|---|
+| `while (__sync_lock_test_and_set(&L,1))` | caught |
+| `while (__atomic_test_and_set(&L,...))` | caught |
+| `do { } while (__sync_lock_test_and_set(&L,1));` | caught |
+| `for(;;){ if(tas(&L,1)==0) break; }` | caught |
+| `while(1){ if(!tas(&L,1)) return; }` | caught |
+| `while (atomic_xchg32(&L,1) != 0)` / `atomic_cas32` | caught |
+| `__atomic_exchange_n`, `__sync_bool_compare_and_swap` | caught |
+| raw inline asm `xchgl` acquire | caught |
+| plain non-atomic `while (L) { }` flag loop | caught, by `SPIN_BUSYWAIT` |
+| **acquire hidden behind a called helper** | **NOT caught** |
+| trylock that gives up | not flagged, by design |
+| acquire loop that parks on the wait queue | not flagged, by design |
+| `spinlock_acquire_irqsave` (the fix) | not flagged, by design |
+
+**Known blind spot, stated rather than discovered later.** Detection is textual
+and per-loop, so an acquire hidden behind a *called* helper is invisible: the
+`for(...)` in `fs/fat.c` `fat_lock_noblock()` retries via `fat_lock_try()`, and
+no atomic appears in the loop text. `find_delay_wrappers()` solves the analogous
+problem for sleeps, scoped to one file; the same treatment for lock acquires is
+not implemented. Judge the backlog by reading code, not by the hit count.
+
+**IF-masking is judged on the enclosing function's RAW text**, not the
+comment/string-stripped copy, because `cli` and `pushfq` only ever appear inside
+asm string literals which the stripper blanks out. A consequence: if the `cli`
+lives in the *caller* rather than in the acquire helper, the site is reported as
+`PRIVATE_SPINLOCK_IRQON`. That is a false positive by construction and is
+allowlistable, but the better answer is almost always to put the masking inside
+the helper, which is what `spinlock_acquire_irqsave()` already does.
 
 ## Baseline / allowlist
 

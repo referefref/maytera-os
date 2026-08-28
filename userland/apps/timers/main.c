@@ -507,8 +507,11 @@ static void on_key(gui_event_t *ev) {
     char c = ev->key_char;
     if (tm_finished && g_tab == 1) { tm_finished = 0; return; }  // any key dismisses
     if (c == '1' || c == '2' || c == '3') { g_tab = c - '1'; g_hover = -1; return; }
-    if (ev->keycode == 0x4B) { g_tab = (g_tab + 2) % 3; g_hover = -1; return; }  // Left
-    if (ev->keycode == 0x4D) { g_tab = (g_tab + 1) % 3; g_hover = -1; return; }  // Right
+    // #191: these were 0x4B/0x4D, PS/2 scancodes the kernel never delivers, so
+    // arrow tab-switching had never worked; 0x4B/0x4D are ASCII 'K'/'M', so
+    // shift-K and shift-M switched tabs instead.
+    if (ev->keycode == GUI_KEY_LEFT)  { g_tab = (g_tab + 2) % 3; g_hover = -1; return; }
+    if (ev->keycode == GUI_KEY_RIGHT) { g_tab = (g_tab + 1) % 3; g_hover = -1; return; }
     if (c == ' ') {
         if (g_tab == 0) sw_startpause();
         else if (g_tab == 1) tm_startpause();

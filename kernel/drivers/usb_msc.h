@@ -198,6 +198,17 @@ typedef struct {
     // Mount state
     int mounted;                // Is filesystem mounted?
     char mount_point[32];       // Mount point (e.g., "/usb0")
+
+    // #250 SLOT OCCUPANCY. 1 while a physical device occupies this slot.
+    // Before #250 removal COMPACTED the array (memmove every later element
+    // down one), which silently renumbered every device above the removed
+    // one. Two holders of those indices are not notified and cannot be:
+    // blockdev.c's g_root_usb_index (the BOOT MEDIUM) and hotplug.c's
+    // msc_device_index. Pulling a second stick out therefore pointed the
+    // root block device at the wrong device, so a write meant for the boot
+    // stick could land on a data stick. Slots are now STABLE for the life of
+    // the device and freed in place.
+    int present;
 } usb_msc_device_t;
 
 // =============================================================================

@@ -22,6 +22,9 @@
 // guess for the gate to get wrong.
 #define GUESTFS_SLOT_DOS    0u
 #define GUESTFS_SLOT_WIN16  1u
+// #740: the DOS/4GW guest reaching DOS through the DPMI 0300h bridge.
+// MUST match SLOT_DPMI in rustkern/guestfs.rs.
+#define GUESTFS_SLOT_DPMI   2u
 
 // ---- the Rust policy core (rustkern/guestfs.rs) --------------------------
 int      guestfs_arm_rs(uint32_t slot, uint32_t kind, uint32_t want_uid);

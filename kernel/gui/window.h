@@ -40,6 +40,17 @@ struct window;
 // pixels in the first place.
 #define WINDOW_FLAG_SHADOW      (1 << 10)
 
+// #158: NATIVE FULLSCREEN. Set only by window_fullscreen_enter(), cleared only
+// by window_fullscreen_exit() (or its forced-exit callers - focus loss, close,
+// screen lock/screensaver, watchdog timeout - see window.c). Distinct from
+// WINDOW_FLAG_MAXIMIZED: maximize fills the WORK AREA and keeps the taskbar
+// and kernel-drawn chrome; fullscreen fills the ENTIRE screen, draws NO kernel
+// chrome for ANY window, and lets the userland compositor skip the whole
+// per-window composite (SYS_COMPOSITOR_RENDER_WINDOWS) in favour of one direct
+// content blit (SYS_WM_FULLSCREEN_RENDER) - the "compositor redraw" cost #158
+// exists to cut. At most one window holds this at a time; see g_fullscreen_win.
+#define WINDOW_FLAG_FULLSCREEN  (1 << 11)
+
 // Default window flags
 #define WINDOW_FLAGS_DEFAULT (WINDOW_FLAG_VISIBLE | WINDOW_FLAG_MOVABLE | WINDOW_FLAG_CLOSABLE)
 
@@ -134,6 +145,54 @@ static inline int32_t win_metric_or(int metric_id, int32_t fallback) {
 #define TITLEBAR_BUTTON_Y_OFFSET \
     (BORDER_WIDTH + (TITLEBAR_HEIGHT - CLOSE_BUTTON_SIZE) / 2)
 
+
+// ---------------------------------------------------------------------------
+// THE ONE DEFINITION OF WHERE A TITLE-BAR BUTTON IS.
+//
+// This expression was written out by hand at TEN sites in window.c - five that
+// DRAW a button and five that HIT-TEST one - plus an ELEVENTH copy across the
+// process boundary in the compositor's taskbar.c, which synthesises a click on
+// the close button. Eleven textual copies of one geometry, each carrying its
+// own literal `- 2` right inset.
+//
+// While every copy stayed in step that was merely ugly. Under a UI scale
+// factor it stops being ugly and becomes the #208 fault: CLOSE_BUTTON_SIZE and
+// TITLEBAR_BUTTON_SPACING are now theme metrics that the scale factor
+// multiplies, so any copy that drifts, or that forgets one term, draws a
+// button in one place and tests for a click in another. A close button that
+// draws normally and does nothing when clicked is exactly the bug class this
+// project already has a ticket for.
+//
+// `slot` counts from the RIGHT EDGE, 0 = close, 1 = maximize, 2 = minimize,
+// 3 = cog, 4 = fullscreen, which is the order they are laid out in.
+//
+// TITLEBAR_BTN_INSET is the gap between the close button and the window's
+// right border. It was the bare literal 2 at all eleven sites; it is a length
+// in pixels, so it scales with everything else rather than staying 2px while
+// the buttons beside it grow.
+#define TITLEBAR_BTN_INSET_FALLBACK 2
+static inline int32_t titlebar_btn_inset(void) {
+    int32_t v = win_metric_or(TM_TITLEBAR_BTN_GAP, TITLEBAR_BUTTON_SPACING_FALLBACK);
+    (void)v;
+    // Derived from the button gap rather than given its own theme key: it is
+    // the same kind of gap, and one more key that no shipped theme sets would
+    // be one more thing to keep in step for no benefit.
+    return win_metric_or(TM_TITLEBAR_BTN_GAP, TITLEBAR_BTN_INSET_FALLBACK);
+}
+
+// x of the button in `slot`, given the window's left edge and width.
+static inline int32_t titlebar_btn_x(int32_t win_x, int32_t win_w, int slot) {
+    int32_t bs  = CLOSE_BUTTON_SIZE;
+    int32_t gap = TITLEBAR_BUTTON_SPACING;
+    return win_x + win_w - (slot + 1) * bs - titlebar_btn_inset() - slot * gap;
+}
+
+#define TITLEBAR_SLOT_CLOSE      0
+#define TITLEBAR_SLOT_MAXIMIZE   1
+#define TITLEBAR_SLOT_MINIMIZE   2
+#define TITLEBAR_SLOT_COG        3
+#define TITLEBAR_SLOT_FULLSCREEN 4
+
 // Event types
 typedef enum {
     EVENT_NONE = 0,
@@ -148,7 +207,18 @@ typedef enum {
     EVENT_WINDOW_BLUR,
     EVENT_BUTTON_CLICK,
     EVENT_REDRAW,
-    EVENT_RESIZE
+    EVENT_RESIZE,
+    // --- cross-window drag ("docking"), SYS_DRAG_* -----------------------
+    // APPENDED, NEVER INSERTED: these values are the ABI shared with
+    // userland/libc/gui.h. Reordering this enum silently re-points every
+    // event an already-built app is switching on.
+    EVENT_DRAG_DROP,   // to the resolved TARGET: mouse_x/y are CONTENT coords.
+                       // Call sys_drag_take() to claim the payload.
+    EVENT_DRAG_END     // to the SOURCE: the drag is over. target_id is the
+                       // accepting window handle + 1, or 0 for "nobody took
+                       // it" (drop on empty desktop = detach here).
+                       // mouse_x/y are SCREEN coords for this event, because
+                       // the drop point is meaningful outside any window.
 } event_type_t;
 
 // Mouse button flags
@@ -246,6 +316,13 @@ typedef struct window {
     // Stored bounds for restore from maximize
     rect_t stored_bounds;           // Original bounds before maximize
 
+    // #158: stored bounds/state for restore from NATIVE FULLSCREEN. Kept
+    // SEPARATE from stored_bounds (maximize's own restore point) because
+    // fullscreen can be entered from either a normal or an already-maximized
+    // window, and exiting must return to THAT state, not silently clear it.
+    rect_t fs_stored_bounds;
+    uint8_t fs_was_maximized;       // 1 if WINDOW_FLAG_MAXIMIZED was set on entry
+
     // Transparency (0-255, 255=opaque) + lock-in-place
     uint8_t opacity;
     uint8_t locked;
@@ -295,6 +372,26 @@ void window_minimize(window_t *win);
 void window_maximize(window_t *win);
 void window_restore(window_t *win);
 void wm_toggle_maximize_focused(void);
+
+// #158 NATIVE FULLSCREEN. Enter/exit are idempotent (no-op if already in the
+// requested state). Only the FOCUSED window may enter (callers must check);
+// exit can be called on any window, from any context, and is always safe -
+// this is the single restore path every revocation trigger (focus loss,
+// close, lock, screensaver, watchdog) funnels through. See window.c for the
+// full contract and blame.md #158 for why each caller exists.
+void window_fullscreen_enter(window_t *win);
+void window_fullscreen_exit(window_t *win);
+// The currently-fullscreen window, or NULL. SELF-HEALING: re-validates the
+// window is still visible, still focused and its owning process still alive
+// on every call, and force-exits+clears if not - so a stale pointer can never
+// suppress the desktop composite past the condition that justified it. Never
+// cache the result across a frame; call it fresh each time it is needed.
+window_t *wm_fullscreen_active(void);
+// Force-exit whatever window is fullscreen right now, if any. Safe to call
+// unconditionally (no-op when nothing is fullscreen). Used by the syscall
+// chokepoints that must revoke fullscreen outright: session lock and the
+// screensaver/blank-FB latch (kernel/proc/syscall.c).
+void wm_force_exit_fullscreen(void);
 
 // Move a window
 void window_move(window_t *win, int32_t x, int32_t y);

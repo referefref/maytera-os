@@ -336,7 +336,7 @@ static inline uint32_t ss_bilerp(uint32_t c00, uint32_t c10, uint32_t c01, uint3
 // each it is ~60-80 Mcycle/frame, which accounts for essentially the whole
 // measured cost.
 //
-// MEASURED before this change (throwaway VM 2630, golden-998 kernel, plasma
+// MEASURED before this change (throwaway VM <vmid>, golden-998 kernel, plasma
 // saver, serial logging silenced over the timed region):
 //     1280x800   18.0 fps   COMPOSIT 34%   18.4 ms-core per Mpx
 //     1920x1080  11.5 fps   COMPOSIT 58%   24.3 ms-core per Mpx

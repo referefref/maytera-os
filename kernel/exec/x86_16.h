@@ -29,6 +29,13 @@
 // {aka 'struct x86_16_cpu *'}".
 struct x86_16_cpu;
 
+// int_fn return values. 0 = serviced, carry on. Nonzero = stop this burst and
+// return to the caller's run loop. X86_16_INT_RETRY additionally means "I did
+// NOT service it: rewind to cpu->ins_ip so the guest executes the same INT
+// again" - the mechanism a blocking console read uses to wait without blocking
+// the interpreter thread (#221, and see #426 on why it must not block).
+#define X86_16_INT_STOP   1
+#define X86_16_INT_RETRY  2
 typedef int      (*x86_16_int_fn)   (struct x86_16_cpu *cpu, uint8_t intno);
 typedef int      (*x86_16_farcall_fn)(struct x86_16_cpu *cpu, uint16_t off);
 typedef uint16_t (*x86_16_in_fn)    (struct x86_16_cpu *cpu, uint16_t port, int width);
@@ -60,7 +67,16 @@ typedef struct x86_16_cpu {
     int halted;        // set when the program ends (INT 21/4Ch, HLT, or exit)
     int exit_code;
     unsigned long insn_count;
-    // (#194) high 16 bits of EAX..EDI (index order 0=AX..7=DI, matching reg16_ptr).
+    // (#194) high 16 bits of the 386 E-registers. THE INDEX IS THE x86 ModRM
+    // REGISTER ENCODING, NOT ALPHABETICAL ORDER:
+    //     0=AX  1=CX  2=DX  3=BX  4=SP  5=BP  6=SI  7=DI
+    // which is what reg16_ptr() (x86_16.c) returns and what get_reg32()/
+    // set_reg32() index with. This line used to read "index order 0=AX..7=DI,
+    // matching reg16_ptr", which invites the reading 0=AX,1=BX,2=CX. Anything
+    // marshalling 32-bit registers in or out of this struct (dos/dpmi_rmcs.c,
+    // #740) has to index exhi[] directly, and getting it wrong puts the high
+    // half of EAX into ECX: invisible to every 16-bit path, silent at runtime.
+    // See blame.md, 2026-08-18.
     uint16_t exhi[8];
 
     // ---- #736 Stage 1b: per-instance environment (appended, so every field
@@ -82,6 +98,15 @@ typedef struct x86_16_cpu {
     // when fp_top == X86_16_FP_STACK.
     uint64_t          fp[X86_16_FP_STACK];
     int               fp_top;
+    // (#221) IP of the instruction currently executing, captured before the
+    // prefix loop consumes anything. An int_fn that wants the guest to RE-EXECUTE
+    // the INT it was called for (a blocking BIOS/DOS read with no key yet) sets
+    // cpu->ip = cpu->ins_ip and returns X86_16_INT_RETRY. Computed rather than
+    // derived as "ip - 2" because an instruction may carry prefixes, and a
+    // rewind that lands one byte inside an instruction is the kind of failure
+    // that shows up nowhere near its cause. Appended, so every offset above is
+    // byte-identical (see the #736 note on `owner`).
+    uint16_t          ins_ip;
 } x86_16_cpu_t;
 
 // Far-CALL trap callback. Registered for a single trap segment (e.g. the Win16

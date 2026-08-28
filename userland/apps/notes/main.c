@@ -544,25 +544,30 @@ static void handle_key(gui_event_t *ev) {
     if (g_sel < 0) return;
     note_t *n = &g_notes[g_sel];
 
-    // arrow keys via keycode (best effort: many builds deliver as control chars)
-    // Use key_char for printable + the common control chars.
+    // Printable characters and the common control chars come through key_char.
+    // Arrows carry no character and are matched on the keycode below.
     if (c == '\b') { editor_backspace(n); return; }
     if (c == '\r' || c == '\n') { editor_insert(n, '\n'); return; }
     if (c == '\t') { editor_insert(n, ' '); editor_insert(n, ' '); return; }
     if (c == 27) return;   // Esc ignored in editor
     if (c >= 32 && c < 127) { editor_insert(n, c); return; }
 
-    // keycode-based navigation (left/right/up/down/home/end if provided)
+    // keycode-based navigation. #191: these four cases were the raw PS/2
+    // scancodes 0x4B/0x4D/0x48/0x50, which the kernel remaps before an app can
+    // see them, so the cursor keys in this editor had never once moved the
+    // caret. (Unlike the other #191 apps there was no shift-H side effect
+    // either: the printable-character branch above consumes 'H'/'P'/'K'/'M'
+    // and returns before reaching this switch, so the branch was purely dead.)
     switch (ev->keycode) {
-        case 0x4B: if (g_cursor > 0) g_cursor--; break;             // Left
-        case 0x4D: if (g_cursor < n->body_len) g_cursor++; break;   // Right
-        case 0x48: {                                                // Up
+        case GUI_KEY_LEFT:  if (g_cursor > 0) g_cursor--; break;
+        case GUI_KEY_RIGHT: if (g_cursor < n->body_len) g_cursor++; break;
+        case GUI_KEY_UP: {
             int col = 0, i = g_cursor;
             while (i > 0 && n->body[i-1] != '\n') { i--; col++; }
             if (i > 0) { int j = i - 1; while (j > 0 && n->body[j-1] != '\n') j--; int k = j; int cc = 0; while (k < i - 1 && cc < col) { k++; cc++; } g_cursor = k; }
             break;
         }
-        case 0x50: {                                                // Down
+        case GUI_KEY_DOWN: {
             int col = 0, i = g_cursor;
             while (i > 0 && n->body[i-1] != '\n') { i--; col++; }
             int e = g_cursor; while (e < n->body_len && n->body[e] != '\n') e++;

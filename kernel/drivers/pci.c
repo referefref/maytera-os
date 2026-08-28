@@ -2,13 +2,30 @@
 #include "pci.h"
 #include "../serial.h"
 #include "../string.h"
+#include "../fs/bootlog.h"   // ASUS bring-up: LOUD overflow, on disk as well as serial
 
-// Maximum devices to track
-#define MAX_PCI_DEVICES 64
+// Maximum PCI functions to track.
+//
+// This was 64, and overflow was SILENT: pci_check_device() simply returned
+// once the table was full, so every function past the 64th was invisible to
+// EVERY subsystem (storage, USB, network, audio) and nothing anywhere said so.
+// On unfamiliar hardware, "the controller we needed was the 65th function" is
+// precisely the evidence we would need and would not have had. A modern laptop
+// chipset plus its PCIe root ports, bridges and multi-function devices gets
+// close enough to 64 that this is not a theoretical margin.
+//
+// 256 costs sizeof(pci_device_t) * 256 = 60 * 256 = 15360 bytes of .bss
+// (up from 3840, so +11520 bytes), which is nothing against the kernel's
+// existing static footprint, and is a fixed cost with no allocator involved,
+// so it cannot fail at the point of use the way a kmalloc'd table could.
+#define MAX_PCI_DEVICES 256
 
 // Discovered devices
 static pci_device_t pci_devices[MAX_PCI_DEVICES];
 static int pci_device_count = 0;
+// Functions seen by the scan but NOT recorded because the table was full.
+// Counted rather than merely detected, so the report can say HOW MUCH was lost.
+static int pci_dropped_count = 0;
 
 // Forward declaration
 static const char *pci_class_name(uint8_t class_code, uint8_t subclass);
@@ -65,7 +82,13 @@ static void pci_check_device(uint8_t bus, uint8_t slot, uint8_t func) {
     // Check if device exists
     if (vendor_id == 0xFFFF) return;
 
-    if (pci_device_count >= MAX_PCI_DEVICES) return;
+    if (pci_device_count >= MAX_PCI_DEVICES) {
+        // Count it. Deliberately no kprintf here: this is inside the scan loop
+        // and a machine that overflows could emit hundreds of lines. pci_init()
+        // reports the total once, loudly, on both serial and /BOOTLOG.TXT.
+        pci_dropped_count++;
+        return;
+    }
 
     pci_device_t *dev = &pci_devices[pci_device_count++];
 
@@ -119,7 +142,33 @@ void pci_init(void) {
         pci_scan_bus(bus);
     }
 
-    kprintf("[PCI] Found %d devices\n", pci_device_count);
+    // Greppable and unconditional: the count is evidence in its own right on a
+    // machine nobody has booted before, whether or not anything overflowed.
+    kprintf("[PCI] Found %d devices (table cap %d, dropped %d)\n",
+            pci_device_count, MAX_PCI_DEVICES, pci_dropped_count);
+    bootlog_write("[PCI] found=%d cap=%d dropped=%d",
+                  pci_device_count, MAX_PCI_DEVICES, pci_dropped_count);
+
+    if (pci_dropped_count > 0) {
+        // This is a correctness failure, not a curiosity: those functions are
+        // invisible to every driver, so a missing storage/USB controller here
+        // looks exactly like "no driver for it". Say so in both places, because
+        // a stick-booted laptop has no serial port and /BOOTLOG.TXT is the only
+        // surviving channel.
+        kprintf("[PCI] BUG: PCI device table FULL - %d function(s) NOT recorded "
+                "and invisible to all drivers; raise MAX_PCI_DEVICES\n",
+                pci_dropped_count);
+        bootlog_write("[PCI] BUG: device table FULL - %d function(s) NOT "
+                      "recorded and invisible to all drivers (cap %d)",
+                      pci_dropped_count, MAX_PCI_DEVICES);
+    }
+}
+
+// ASUS bring-up: how many PCI functions the scan found but could NOT record.
+// Non-zero means the inventory in /DEVLOG.TXT is INCOMPLETE and any
+// "no such device" conclusion drawn from it is unsound. See pci.h.
+int pci_get_dropped_count(void) {
+    return pci_dropped_count;
 }
 
 // #418: record that a driver successfully claimed this PCI function. See

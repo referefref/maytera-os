@@ -1,0 +1,18 @@
+--- a/src/regex/regcomp.c
++++ b/src/regex/regcomp.c
+@@ -861,7 +861,14 @@
+ 			}
+ 			/* fallthrough */
+ 		default:
+-			if (!ere && (unsigned)*s-'1' < 9) {
++			/* MayteraOS (#745 local 97): upstream allows \1..\9 only in
++			   BRE, because POSIX leaves them undefined in ERE. GNU grep
++			   accepts them in BOTH, and `grep -E '(ab)\1'` is a pattern
++			   people write; without this the escape silently becomes a
++			   literal digit and the match quietly disappears. MEASURED as
++			   a divergence against host grep -oE before this line was
++			   changed; see tools/pcre2-oracle/divergence.py. */
++			if ((unsigned)*s-'1' < 9) {
+ 				/* back reference */
+ 				int val = *s - '0';
+ 				node = tre_ast_new_literal(ctx->mem, BACKREF, val, ctx->position++);

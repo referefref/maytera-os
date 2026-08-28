@@ -35,7 +35,7 @@ void glopClear(GLParam* p) {
 	 * satisfies - so EVERY fragment's per-pixel depth test fails, even
 	 * though the rasterizer's outer scanline span is wide open and the
 	 * PUT_PIXEL inner loop runs normally. MEASURED (#594, this session,
-	 * VM 2611, instrumented ztriangle.c/ZB_oaTriDumpAndReset): thousands
+	 * VM <vmid>, instrumented ztriangle.c/ZB_oaTriDumpAndReset): thousands
 	 * of triangles/frame entering the rasterizer, ~95-98% of them running
 	 * the inner pixel loop ("drew"), ZERO rejected by the #582 bounds
 	 * clamp, yet zb->pbuf measured 0 nonzero pixels on nearly every frame

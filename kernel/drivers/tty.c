@@ -172,8 +172,23 @@ void tty_input_byte(tty_t *t, uint8_t byte) {
         return;
     }
     if (byte == tm->c_cc[VEOF]) {
-        // EOF: commit whatever is in the edit buffer (may be empty -> EOF).
-        tty_commit_line(t);
+        // POSIX ^D: deliver the partial line if there is one (with no
+        // terminating newline, which is what makes `read()` return a short
+        // line); on an EMPTY line it means end-of-input instead.
+        //
+        // #745 (local 99): the empty case used to call tty_commit_line() too,
+        // which put ZERO bytes in the ring and woke the reader. tty_read()
+        // re-tested `input_ring.count == 0` and slept again, so ^D was
+        // silently swallowed and a foreground process on a pty had no way to
+        // reach EOF at all. MEASURED on golden build 1872: `cat` with no
+        // arguments could not be ended by ^D (nor by ^C, see fg_pgrp), which
+        // wedged the Terminal window for the rest of its life.
+        if (t->edit.len > 0) {
+            tty_commit_line(t);
+        } else {
+            t->eof_pending = 1;
+            wake_up(&t->input_wq);
+        }
         return;
     }
     if (byte == '\n' || byte == tm->c_cc[VEOL]) {
@@ -200,10 +215,19 @@ int64_t tty_read(tty_t *t, void *buf, size_t count, int nonblock) {
     size_t got = 0;
 
     while (t->input_ring.count == 0) {
+        // #745 (local 99): ^D on an empty line. Consumed here so that the NEXT
+        // read() blocks again as POSIX requires -- an EOF that stayed latched
+        // would turn one ^D into a permanent end-of-file for the whole
+        // session. Tested before `hangup` only because both return 0; tested
+        // before `nonblock` because a pending EOF is an answer, not an
+        // absence, and -EAGAIN would send a non-blocking reader round again
+        // forever.
+        if (t->eof_pending) { t->eof_pending = 0; return 0; }
         if (t->hangup) return 0;  // EOF from transport
         if (nonblock) return -11; // -EAGAIN
         int rc = wait_event_interruptible(&t->input_wq,
-                                          t->input_ring.count > 0 || t->hangup);
+                                          t->input_ring.count > 0 || t->hangup ||
+                                          t->eof_pending);
         if (rc == WAIT_EINTR) return -4;  // -EINTR
     }
 
@@ -310,6 +334,7 @@ int tty_ioctl(tty_t *t, unsigned cmd, void *arg) {
                 // Flush pending input.
                 t->input_ring.head = t->input_ring.tail = t->input_ring.count = 0;
                 t->edit.len = 0;
+                t->eof_pending = 0;   // #745 (local 99): flush the latch too
             }
             return 0;
         case TIOCGWINSZ:

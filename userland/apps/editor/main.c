@@ -7,6 +7,7 @@
 #include "../../libc/gui_font.h"
 #include "../../libc/gui_menu.h"
 #include "../../libc/userconf.h"   // #743: checked whole-file write + per-user paths
+#include "../../libc/keys.h"   // #243: GUI_KEY_* nav codes
 
 // Editor dimensions
 static int g_ed_w = 640, g_ed_h = 480;  // live content size (EVENT_RESIZE)
@@ -171,9 +172,28 @@ static uint32_t scroll_col = 0;
 static bool has_selection = false;
 static uint32_t sel_anchor = 0;        // where the selection began
 static bool mouse_selecting = false;   // dragging with the mouse button held
-// Keyboard selection mode. The kernel gui_event_t has no shift/modifier field,
-// so shift+arrow cannot be detected from userland. Ctrl+Space toggles a
-// selection mode in which arrow/home/end/pgup/pgdn keys extend the selection.
+// Keyboard selection mode: Ctrl+Space toggles a mode in which arrow/home/end/
+// pgup/pgdn extend the selection.
+//
+// CORRECTED 2026-08-25 (#221 phase 0). This comment used to end with "The
+// kernel gui_event_t has no shift/modifier field, so shift+arrow cannot be
+// detected from userland", and the Ctrl+Space mode existed BECAUSE of that
+// sentence. The premise is true and the conclusion is FALSE: gui_event_t
+// carries no modifier field, but Shift, Ctrl and Alt arrive as ordinary
+// keycoded press AND release events in the same per-window queue as the key
+// they modify, so the state is trivially trackable.
+//
+// MEASURED, by typing, on VM <vmid> / golden build 2040 with a Ring-3 probe
+// (tools/testing/probes/keyprobe.c) rather than by reading the source:
+// Shift+Up delivered LSHIFT press (0x95), UP (0x80), UP release, LSHIFT
+// release (0x87) - the exact sequence this comment said was unobservable.
+//
+// A false claim in the tree is more expensive than no claim: this one was
+// quoted back during the #221 terminal design pass as a reason the whole
+// Ctrl+Shift shortcut scheme could not be built. libc/gui_mods.h is now the
+// shared tracker. Wiring real shift+arrow selection into this editor is a
+// separate change and has deliberately NOT been done here; the Ctrl+Space
+// mode below still works exactly as before.
 static bool kbd_sel_mode = false;
 
 // Clipboard
@@ -637,6 +657,16 @@ static void sync_menu_theme(void) {
     p.bar_bg             = MENU_BG;
     p.bar_text            = MENU_TEXT;
     p.bar_hover_bg        = gui_lighten(MENU_BG, 24);
+    // Hover and OPEN are separate states in the widget now (they shared one
+    // token, so a hovered label and a label with its menu down looked the
+    // same). The editor's open state uses its own accent, the same pair the
+    // status bar uses, rather than the kernel theme accent the widget defaults
+    // to - this app keeps its VSCode-style chrome on purpose (see below).
+    // EVERY FIELD OF gui_menu_palette_t IS ASSIGNED HERE BY NAME: `p` is an
+    // uninitialised local, so a field added to the struct and not assigned here
+    // is not "the old colour", it is stack garbage.
+    p.bar_open_bg         = STATUS_BG;
+    p.bar_open_text       = STATUS_TEXT;
     p.popup_bg            = MENU_BG;
     p.popup_border        = MENU_HINT;
     p.item_text           = MENU_TEXT;
@@ -1298,6 +1328,28 @@ int main(int argc, char **argv) {
         }
 
         if (event_type == 0) {
+            // Idle healing for the menu bar: the window lost focus, so drop
+            // any open menu and any hover highlight. A window stops receiving
+            // EVENT_MOUSE_MOVE the instant the pointer crosses into another
+            // window, so the hover state freezes at the edge and the bar goes
+            // on drawing a hovered label indefinitely.
+            //
+            // THIS KERNEL EMITS NO FOCUS OR BLUR EVENT TO AN APP.
+            // EVENT_WINDOW_BLUR appears in the tree only as an enum
+            // declaration; kernel/proc/syscall.h says so at SYS_KEY_MODS and
+            // again at SYS_WIN_GET_STATE. An earlier version of this fix
+            // handled EVENT_WINDOW_BLUR and was DEAD CODE, caught by running
+            // it and not by reading it. SYS_WIN_GET_STATE (#221) is the
+            // purpose-built replacement: it reports the caller's OWN window
+            // state, focus included. Checked here on the existing 100 ms idle
+            // branch, beside the theme poll that already uses this point.
+            if (gui_menu_is_open(&g_menu) || g_menu.hot_top >= 0) {
+                int st = win_get_state(window_handle);
+                if (st >= 0 && !(st & WIN_STATE_FOCUSED)) {
+                    gui_menu_leave(&g_menu);
+                    editor_redraw();
+                }
+            }
             continue;
         }
 
@@ -1403,7 +1455,7 @@ int main(int argc, char **argv) {
                     else if (c == '\b' || keycode == 0x0E) {
                         delete_char(); recompute_lint(); kbd_sel_mode = false; handled = true;
                     }
-                    else if (keycode == 0x53) {         // Delete key
+                    else if (keycode == GUI_KEY_DEL) {  // Delete key
                         if (has_selection && selection_range(NULL, NULL)) {
                             delete_selection();
                         } else if (cursor_pos < buffer_len) {
@@ -1416,14 +1468,14 @@ int main(int argc, char **argv) {
                     else if (keycode == 0x83) { move_right(ext); recompute_lint(); handled = true; }
                     else if (keycode == 0x80) { move_up(ext); recompute_lint(); handled = true; }
                     else if (keycode == 0x81) { move_down(ext); recompute_lint(); handled = true; }
-                    else if (keycode == 0x47) { move_home(ext); recompute_lint(); handled = true; }
-                    else if (keycode == 0x4F) { move_end(ext); recompute_lint(); handled = true; }
-                    else if (keycode == 0x49) {         // Page Up
+                    else if (keycode == GUI_KEY_HOME) { move_home(ext); recompute_lint(); handled = true; }
+                    else if (keycode == GUI_KEY_END) { move_end(ext); recompute_lint(); handled = true; }
+                    else if (keycode == GUI_KEY_PGUP) { // Page Up
                         int r = visible_rows();
                         for (int i = 0; i < r && cursor_line > 0; i++) move_up(ext);
                         handled = true;
                     }
-                    else if (keycode == 0x51) {         // Page Down
+                    else if (keycode == GUI_KEY_PGDN) { // Page Down
                         int r = visible_rows();
                         for (int i = 0; i < r && cursor_line < line_count - 1; i++) move_down(ext);
                         handled = true;

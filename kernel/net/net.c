@@ -10,6 +10,7 @@
 #include "tcp.h"
 #include "dhcp.h"
 #include "dns.h"
+#include "firewall.h"   // #238: packet filter boot load
 #include "https.h"
 #include "ftp.h"
 #include "wget.h"
@@ -23,6 +24,25 @@
 #include "../proc/process.h"   // #381: proc_create/proc_sleep/PRIO_* for net worker
 #include "../cpu/dlprof.h"
 #include "../cpu/mono.h"   // #549: mono_ms() paces the FAULTY re-probe
+#include "irqwin.h"        // #69: per-site interrupts-off window accounting
+
+// #69: the NIC CR3 window. THIRD copy of this idiom in the tree (proc/syscall.c
+// net_cr3_enter/exit and net/socket.c sk_cr3_enter/exit are the other two); the
+// chunked drain below is the one that unifies the drain callers onto it.
+// NIC MMIO/DMA lives in the kernel lower-half identity map, which a user
+// process CR3 does not have, so a drain reached from a syscall must run on the
+// kernel pml4. A caller already on the kernel pml4 rewrites the same value.
+extern uint64_t vmm_get_pml4(void);
+static inline uint64_t net_drain_cr3_enter(void) {
+    uint64_t saved;
+    __asm__ volatile("mov %%cr3, %0" : "=r"(saved));
+    uint64_t kcr3 = vmm_get_pml4();
+    __asm__ volatile("mov %0, %%cr3" : : "r"(kcr3) : "memory");
+    return saved;
+}
+static inline void net_drain_cr3_exit(uint64_t saved) {
+    __asm__ volatile("mov %0, %%cr3" : : "r"(saved) : "memory");
+}
 
 static int net_initialized = 0;
 static net_driver_type_t active_driver = NET_DRIVER_NONE;
@@ -45,7 +65,7 @@ int g_net_static_configured = 0;
 // failed fetch drives DNS/SYN retransmits; on the iMac's USB Ethernet dongle
 // every single send busy-polls the xHCI up to 40ms (usbnet_bulk_out), so the
 // retry storm pegged a core. (On an e1000 VM the same sends are cheap MMIO, which
-// is why a test VM and an e1000 repro stay idle - the spin is USB-amplified.)
+// is why VM <vmid> and an e1000 repro stay idle - the spin is USB-amplified.)
 //
 // THE FIX (the user's stated design): DETECT persistent unreachability, then
 // FAIL SAFE AND QUIET - mark the interface NET_STATE_FAULTY, make net_is_up()
@@ -265,9 +285,21 @@ static int net_apply_static_config(void) {
 
     kfree(data);
 
-    // Require at least a valid IP. Default mask/gateway if omitted.
+    // #786: a dns= line WITHOUT an ip= line is a legitimate, useful file: it
+    // means "keep using DHCP for the address, but resolve through THIS
+    // server". That is what Settings writes when the user changes only the
+    // DNS on a DHCP machine, and it must NOT be discarded as malformed the way
+    // the old "no ip= line; ignoring" path did. Apply the resolver, then return
+    // 0 so the caller still runs DHCP.
     if (!have_ip) {
-        kprintf("[NET] %s present but no valid ip= line; ignoring\n", src);
+        if (have_dns) {
+            dns_set_server(dns);
+            uint8_t *pd0 = (uint8_t *)&dns;
+            kprintf("[NET] %s: dns-only config, resolver %d.%d.%d.%d (DHCP still runs)\n",
+                    src, pd0[3], pd0[2], pd0[1], pd0[0]);
+        } else {
+            kprintf("[NET] %s present but no valid ip= or dns= line; ignoring\n", src);
+        }
         return 0;
     }
     if (!have_mask) mask = 0xFFFFFF00;          // 255.255.255.0
@@ -292,6 +324,75 @@ static int net_apply_static_config(void) {
         kprintf(" dns %d.%d.%d.%d", pd[3], pd[2], pd[1], pd[0]);
     kprintf("\n");
     return 1;
+}
+
+// ---------------------------------------------------------------------------
+// #786: persist the LIVE configuration to /CONFIG/NETIP.CFG.
+// ---------------------------------------------------------------------------
+// See net.h for why this lives in Ring 0 rather than in Settings.
+//
+// Format is the one net_apply_static_config() above already parses, and it is
+// generated from the SAME live accessors that NETDIAG and SYS_NET_STATUS read,
+// so "what the panel shows", "what the stack is doing" and "what boots next
+// time" cannot drift apart.
+//
+// This is a plain buffer format and a single fat_write_file(); it does not
+// wait, take a lock, or touch the NIC, so it is safe from a syscall context.
+// It is deliberately NOT called from the net worker or any IRQ path.
+static void netcfg_put_quad(char **pp, uint32_t v) {
+    // Host order: (a<<24)|(b<<16)|(c<<8)|d, matching net_cfg_find_ip().
+    char *p = *pp;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        uint32_t byte = (v >> shift) & 0xFF;
+        if (byte >= 100) *p++ = (char)('0' + byte / 100);
+        if (byte >= 10)  *p++ = (char)('0' + (byte / 10) % 10);
+        *p++ = (char)('0' + byte % 10);
+        if (shift) *p++ = '.';
+    }
+    *pp = p;
+}
+
+static void netcfg_put_kv(char **pp, const char *key, uint32_t v) {
+    char *p = *pp;
+    while (*key) *p++ = *key++;
+    *p++ = '=';
+    *pp = p;
+    netcfg_put_quad(pp, v);
+    p = *pp;
+    *p++ = '\n';
+    *pp = p;
+}
+
+int net_persist_netcfg(void) {
+    extern uint32_t ip_get_address(void);
+    extern uint32_t ip_get_netmask(void);
+    extern uint32_t ip_get_gateway(void);
+    if (!g_fat_fs.mounted) return -2;
+
+    char buf[128];
+    char *p = buf;
+    uint32_t dns = dns_get_server();
+
+    // ONLY write an address block when the machine is actually statically
+    // configured. On DHCP this writes a dns-only file (see net.h).
+    if (g_net_static_configured) {
+        uint32_t ip = ip_get_address();
+        if (ip == 0) return -1;             // nothing coherent to persist
+        netcfg_put_kv(&p, "ip",   ip);
+        netcfg_put_kv(&p, "mask", ip_get_netmask());
+        netcfg_put_kv(&p, "gw",   ip_get_gateway());
+    }
+    if (dns) netcfg_put_kv(&p, "dns", dns);
+
+    if (p == buf) return -1;                // neither static nor a resolver
+    if (fat_write_file(&g_fat_fs, "/CONFIG/NETIP.CFG", buf,
+                       (uint32_t)(p - buf)) != 0) {
+        kprintf("[NET] FAILED to persist /CONFIG/NETIP.CFG\n");
+        return -1;
+    }
+    kprintf("[NET] persisted /CONFIG/NETIP.CFG (%d bytes, %s)\n",
+            (int)(p - buf), g_net_static_configured ? "static+dns" : "dns-only");
+    return 0;
 }
 
 // Initialize network stack
@@ -390,6 +491,16 @@ int net_init(void) {
     // Boot-time static IP override: if /CONFIG/NETIP.CFG exists and parses,
     // apply it now and signal main.c to skip its default static/DHCP path.
     // The NIC is up and the protocol stack is initialized at this point.
+    // #238: load the packet-filter policy BEFORE any address is configured
+    // and therefore before the first DHCP DISCOVER leaves the machine. The
+    // compiled-in fail-safe policy is already in force from the first packet
+    // of boot (fwfilter.rs DEFAULT_CFG), so this only ever REPLACES a working
+    // policy with the operator's; it can never open a window where nothing is
+    // filtering. The root filesystem is mounted well before net_init()
+    // (main.c ext2_mount at boot, net_init much later), which is the same
+    // assumption net_apply_static_config() on the next line already makes.
+    fw_boot_load();
+
     g_net_static_configured = net_apply_static_config();
 
     // Send test ARP packet to verify TX works
@@ -605,14 +716,135 @@ void net_unlock(void) {
 // profile line; no cost beyond two increments.
 uint64_t g_net_poll_calls = 0, g_net_poll_pkts = 0, g_net_poll_max = 0;
 
+// ---------------------------------------------------------------------------
+// #69: THE SHARED CHUNKED RX DRAIN, and the one place the NIC CR3 window is
+// opened for a drain.
+//
+// WHAT WAS MEASURED (golden 1963 + this instrumentation, e1000, VM <vmid>, a
+// userland load of 671 x 512 KB bulk TCP transfers over BOTH syscall families):
+//
+//   trecv (whole tcp_recv_kcr3 window)   max  890us   avg 34us
+//   _drain (the 64-frame loop ALONE)     max  889us   avg 33us
+//   _trcv (tcp_recv itself)              max   84us   avg  3us
+//   _tmr  (tcp_timer)                    max   20us   avg  0us
+//   dfr   (frames in the deepest drain)       26
+//
+// The drain IS the window: 889 of 890us, and 33 of 34us. Everything else in
+// there is noise. So this is a "shrink the critical section" problem, not a
+// "restructure the lock" problem, and net_lock (holdmax 20-53us idle) was never
+// the thing to fix.
+//
+// AND THE OBVIOUS FIX IS THE WRONG ONE. The natural move is to lower the 64
+// bound. dfr=26 says the bound is NEVER REACHED, so lowering it to 32 would
+// change nothing at all and lowering it to 8 would change the tail by dropping
+// work, not by shortening a window. The cost is ~35us PER FRAME (890us / 26
+// frames), so the tail is simply "a burst of 26 frames arrived and we processed
+// all of them with interrupts off".
+//
+// THE FIX IS TO CLOSE THE WINDOW BETWEEN CHUNKS. Same total work, same frames,
+// same order, but the interrupts-off window is one CHUNK instead of one BURST.
+//
+// WHY THIS DOES NOT REGRESS #549, BY CONSTRUCTION RATHER THAN BY TESTING. The
+// window is reopened with the CALLER's saved RFLAGS.IF, never with an
+// unconditional `sti`. A caller that already had interrupts off - every
+// pre-scheduler boot path, and any context that reached here under an outer
+// `cli` - gets IF=0 restored at every chunk boundary, so the loop collapses to
+// exactly the old single-window behaviour for them. TX stays fire-and-forget
+// and nothing here can sleep: there is no wait_event, no proc_sleep and no
+// allocation on this path. The no-block regime cannot tell this change from its
+// predecessor.
+//
+// WHY IT TAKES net_lock WHEN THE CALLERS DID NOT. The five socket.c sites and
+// the eleven *_kcr3 helpers reach the RX ring holding NO lock at all; their
+// only mutual exclusion is the `cli`, which is exclusion on ONE core and
+// nothing at all on two. Opening the window between chunks would weaken even
+// that, so the chunk takes the lock the ring is supposed to be under. net_lock
+// is recursive per-owner, so a caller that already holds it nests harmlessly.
+// This makes these paths strictly better protected than before, not worse.
+//
+// COST. Reopening the window costs one CR3 write (a TLB flush) per chunk. That
+// is paid ONLY on a burst: the measured average drain takes ~1 frame, so the
+// common case is a single chunk and a single CR3 write, exactly as today. A
+// full 26-frame burst pays three extra CR3 writes to remove ~600us of
+// interrupts-off time.
+//
+// KEPT IN C: it is the `cli`/`pushfq`/`mov %cr3` window itself, the same
+// irreducible paging+asm entanglement that net_lock(), net_trylock() and the
+// existing net_cr3_enter() shims in this tree already state as their reason.
+// CHUNK SIZE, CHOSEN BY MEASUREMENT, NOT BY FEEL. With the empty-chunk cost
+// split out into its own site (_dry), the two costs are no longer confounded:
+//
+//   _dry   (chunk that found the ring empty)  max 4-9us    avg 0us   380,231 calls
+//   _drain (chunk that consumed >=1 frame)    max 558-812us avg 194us  71,058 calls
+//
+// So reopening the window - cli, two CR3 writes, net_lock, one failed
+// eth_receive - costs UNDER 10us worst case and rounds to 0 on average, while a
+// frame costs ~24us on average and ~100us in the tail. The window is made of
+// FRAMES, and the per-chunk overhead is close to free.
+//
+// That is measured refutation of the intuition this started from. The first
+// reading (drain avg 31us over ALL calls) looked like a large fixed per-call
+// cost, which would have argued for FEWER, BIGGER chunks. It was an average
+// over 380k nearly-free empty chunks and 71k expensive full ones, and it
+// pointed the opposite way to the truth.
+//
+// Because overhead is ~free, the chunk should be as small as the throughput
+// will tolerate. 4 frames puts the worst case at roughly 4 x 100us.
+#define NET_DRAIN_CHUNK  4      // frames per interrupts-off window
+#define NET_DRAIN_TOTAL 64      // unchanged overall bound (was the loop's 64)
+
+unsigned net_rx_drain_chunked(void) {
+    // Bounded by construction: NET_DRAIN_TOTAL/NET_DRAIN_CHUNK iterations max,
+    // and the loop also exits the moment the ring runs dry. No progress
+    // condition is being polled, so this is not the shape the concurrency lint
+    // exists to refuse.
+    int done = 0;
+    for (; done < NET_DRAIN_TOTAL; ) {
+        IRQWIN_DECL;
+        IRQWIN_ENTER();                       // cli, remembering the caller's IF
+        uint64_t saved = net_drain_cr3_enter();
+        net_lock();
+        int n = 0;
+        while (n < NET_DRAIN_CHUNK && (done + n) < NET_DRAIN_TOTAL) {
+            if (!eth_receive()) break;
+            n++;
+        }
+        net_unlock();
+        net_drain_cr3_exit(saved);
+        // Charge an empty chunk to its own site: a drain that found nothing
+        // is measuring the FIXED cost of asking, not the cost of a frame.
+        IRQWIN_EXIT(n ? IRQWIN_SUB_DRAIN : IRQWIN_SUB_DRAIN0);
+        if ((unsigned)n > g_irqwin_drain_max_frames)
+            g_irqwin_drain_max_frames = (unsigned)n;
+        done += n;
+        if (n < NET_DRAIN_CHUNK) break;       // ring dry: nothing left to chunk
+    }
+    return (unsigned)done;
+}
+
 void net_poll(void) {
     if (!net_initialized) return;
     uint64_t _dp_t0 = dp_tsc();
 
+    // #69: THE DRAIN RUNS FIRST, OUTSIDE THIS FUNCTION'S net_lock, IN CHUNKS.
+    //
+    // It used to run inside the net_lock below, which meant the whole 64-frame
+    // burst was one interrupts-off window. With the syscall-side drains chunked
+    // and this one left alone, this became the longest remaining window on the
+    // machine by a wide margin: measured holdmax=1521us here against 549us for
+    // the chunked drain on the same boot, with holdra= resolving to this exact
+    // function. Fixing fifteen call sites and leaving the sixteenth is not a
+    // fix, it just moves which name is on the worst number.
+    //
+    // Hoisting is safe in the direction that matters: arp_flush_ready() must
+    // run AFTER the drain has cached freshly resolved MACs and must not be
+    // nested inside eth_receive() (#333/#747), and draining first then taking
+    // the lock preserves exactly that order. The drain takes net_lock itself,
+    // per chunk, so the ring is still accessed under the lock throughout - more
+    // consistently than the syscall paths managed before this change, since
+    // those took no lock at all.
+    uint32_t _got = net_rx_drain_chunked();
     net_lock();
-    // Drain up to 64 packets per poll (bounded to prevent desktop starvation)
-    uint32_t _got = 0;
-    for (int i = 0; i < 64; i++) { if (!eth_receive()) break; _got++; }
     g_net_poll_calls++; g_net_poll_pkts += _got;
     if (_got > g_net_poll_max) g_net_poll_max = _got;
     // #333/#747: now that the RX drain has cached any freshly resolved MACs,
@@ -1086,6 +1318,16 @@ static void net_pump_worker(void *arg) {
 void net_start_worker(void) {
     int pid = proc_create("netmon", net_worker, NULL, PRIO_NORMAL);
     kprintf("[NET] background net worker started, pid=%d\n", pid);
+    // #155: the USB-Ethernet bulk-IN reaper. Started HERE, not at attach,
+    // because it must not exist before the scheduler does: until it runs, RX
+    // stays at one TD in flight serviced inline from net_poll(), which is
+    // exactly the pre-#155 behaviour, so the pre-scheduler boot/DHCP path gains
+    // no new variables. Only started when the USB NIC is actually the active
+    // NIC (usb_eth_start_rx_worker no-ops otherwise).
+    if (net_get_driver_type() == NET_DRIVER_USB) {
+        extern void usb_eth_start_rx_worker(void);
+        usb_eth_start_rx_worker();
+    }
 #if FLIP_NET_BLOCKING
     // #745 (task #62) A/B arm: the pre-fix build has no dedicated pump thread,
     // because before this change sys_fb_flip() was the only thing pumping the
@@ -1095,6 +1337,13 @@ void net_start_worker(void) {
 #else
     int ppid = proc_create("netpump", net_pump_worker, NULL, PRIO_NORMAL);
     kprintf("[NET] net pump thread started, pid=%d\n", ppid);
+#endif
+#ifdef RTC_LIVE_TEST
+    // #135: `make RTCBINTEST=1` only. One-shot SNTP probe in its own thread,
+    // proving end-to-end correction when there is a network and a FAST,
+    // clock-untouched failure when there is not. See net/sntp.c.
+    extern void sntp_probe_start(void);
+    sntp_probe_start();
 #endif
 }
 
@@ -1127,12 +1376,49 @@ int net_diag_line(char *buf, unsigned long len) {
                       (dt == NET_DRIVER_VIRTIO) ? "virtio" :
                       (dt == NET_DRIVER_USB)    ? usb_eth_name() : "NONE";
     int carrier = nic_link_up() ? 1 : 0;
+    // #NETDROP: distinguish "the link is down" from "the driver has switched
+    // its own MMIO off". e1000_link_up() returns 0 for BOTH, and reporting the
+    // second as NO-CARRIER is an actively misleading diagnostic: it points at
+    // the cable, the switch port and the DHCP lease, none of which are involved.
+    int crashctx = (dt == NET_DRIVER_E1000) ? e1000_crash_context_active() : 0;
     const char *state = (g_net_conn_state == NET_STATE_FAULTY) ? "FAULTY" :
+                        crashctx  ? "NIC-DISABLED-BY-CRASHCTX" :
                         !carrier  ? "NO-CARRIER" :
                         (ip == 0) ? "NO-ADDRESS" : "UP";
+    // #362: usbagg/usbsplit/usbdesync are the USB-Ethernet RX de-framer's own
+    // health, on the line that already answers "did anything reach the wire".
+    // usbagg is the largest bulk-IN transfer the chip has handed us: it says
+    // directly whether the RX buffer is the throughput limit (a value pinned at
+    // rx_buf_len means the buffer is the cap, which is exactly the bug the 2048
+    // -> 16384 change fixed). usbsplit/usbdesync exist so the split-frame
+    // carry-over path is OBSERVABLE rather than a defensive path nobody can
+    // tell has never run; on an AX88772B both measured ZERO.
+    extern uint64_t g_asix_rx_split_frames, g_asix_rx_desync, g_asix_rx_max_xfer;
+    // #155: the PIPELINE's own health, because "how fast is RX" is now a
+    // question about queue depth and reap rate, not about buffer size.
+    //   usbq    - bulk-IN TDs kept in flight. 1 = the pre-#155 single-TD
+    //             behaviour (reaper not started, or /USBNETQ.OFF present),
+    //             32 = ramped. This is the FIRST thing to read if throughput
+    //             is back at ~3 Mbit.
+    //   usbrx   - completions reaped. Divided by uptime this is transfers/s,
+    //             the number that was 85/s (one per net_poll tick) before.
+    //   usbdry  - service passes that found nothing. A large ratio against
+    //             usbrx means the reaper is waking faster than the wire.
+    //   usbfd   - frames dropped because the frame FIFO was full, i.e. the
+    //             reaper is outrunning net_poll()'s 64-per-pass RX drain.
+    //   usbrsy  - full pipe restarts after an endpoint halt / lost completion.
+    //             Anything other than 0 wants investigating.
+    //   usbref  - passes that had to top the queue back up after a failed TD
+    //             submit. Growing steadily means the transfer ring is refusing
+    //             enqueues, which would silently drain the depth to zero.
+    extern uint64_t g_usbnet_rx_reaped, g_usbnet_rx_dry, g_usbnet_rx_resyncs;
+    extern uint64_t g_usbnet_rx_refills;
+    extern uint64_t g_usbnet_fifo_drops;
     return snprintf(buf, len,
         "drv=%s carrier=%d state=%s cfg=%s dhcp=%s ip=%d.%d.%d.%d "
-        "gw=%d.%d.%d.%d gwarp=%s dns=%d.%d.%d.%d rx=%lu tx=%lu txfail=%lu",
+        "gw=%d.%d.%d.%d gwarp=%s dns=%d.%d.%d.%d rx=%lu tx=%lu txfail=%lu "
+        "usbagg=%lu usbsplit=%lu usbdesync=%lu "
+        "usbq=%d usbrx=%lu usbdry=%lu usbfd=%lu usbrsy=%lu usbref=%lu",
         drv, carrier, state,
         g_net_static_configured ? "static" : "dhcp",
         dhcp_is_bound() ? "BOUND" : "unbound",
@@ -1142,7 +1428,16 @@ int net_diag_line(char *buf, unsigned long len) {
         pd[3], pd[2], pd[1], pd[0],
         (unsigned long)g_net_poll_pkts,
         (unsigned long)g_nic_tx_ok,
-        (unsigned long)g_nic_tx_fail);
+        (unsigned long)g_nic_tx_fail,
+        (unsigned long)g_asix_rx_max_xfer,
+        (unsigned long)g_asix_rx_split_frames,
+        (unsigned long)g_asix_rx_desync,
+        g_usbnet.rx_qlen,
+        (unsigned long)g_usbnet_rx_reaped,
+        (unsigned long)g_usbnet_rx_dry,
+        (unsigned long)g_usbnet_fifo_drops,
+        (unsigned long)g_usbnet_rx_resyncs,
+        (unsigned long)g_usbnet_rx_refills);
 }
 
 // ---------------------------------------------------------------------------

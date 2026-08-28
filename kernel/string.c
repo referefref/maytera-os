@@ -56,13 +56,35 @@ char *strcpy(char *dest, const char *src) {
     return dest;
 }
 
+// #231: SECOND LIVE INSTANCE of the userland libc off-by-one, found while
+// auditing the blast radius of the userland fix. This kernel strncpy() had
+// the IDENTICAL bug (same logic, just brace-wrapped): the copy-then-decrement
+// idiom copies the source's terminating NUL as part of the loop body but
+// skips n-- for that same iteration, because the loop CONDITION (the
+// just-copied byte) is false and short-circuits before the decrement runs.
+// n is left one too high, and the follow-on padding loop
+// `while (n--) { *d++ = 0; }` then writes ONE BYTE PAST dest[n-1]. This is a
+// RING-0 overflow: it fires on every ordinary call
+// strncpy(dst, src, sizeof(dst)) where src is a NUL-terminated string
+// shorter than n (i.e. almost every real caller), across 218 call sites in
+// kernel/. See userland/libc/string.c for the original finding (#231) and
+// CHANGELOG.md / blame.md for the #223 userland incident this class of bug
+// caused (dock favourites corrupted and persisted to disk).
+//
+// Same fix as userland: count the index explicitly instead of decrementing n
+// on a condition that can be starved, so every write, including the final
+// NUL, is accounted for and the total is always exactly n bytes. The
+// standard's other half is preserved: a source n bytes or longer with no NUL
+// in the first n bytes is copied exactly (n bytes, no terminator) and is
+// UNCHANGED by this fix - callers that add their own dst[n-1] = 0 depend on
+// that shape.
 char *strncpy(char *dest, const char *src, size_t n) {
-    char *d = dest;
-    while (n && (*d++ = *src++)) {
-        n--;
+    size_t i = 0;
+    for (; i < n && src[i] != '\0'; i++) {
+        dest[i] = src[i];
     }
-    while (n--) {
-        *d++ = '\0';
+    for (; i < n; i++) {
+        dest[i] = '\0';
     }
     return dest;
 }

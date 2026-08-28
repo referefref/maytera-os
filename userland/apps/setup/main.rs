@@ -200,6 +200,37 @@ const SYS_USER_CREATE_PW: i64 = 362;
 // project often enough to be a rule.
 const SYS_PW_CHECK: i64 = 369;
 const SYS_FIRSTBOOT_ADMIN: i64 = 370;
+// #229 FIRST-RUN STATE. THE fifth copy of these numbers, and the reason the
+// kernel asserts them on every boot: this app is no_std and cannot include
+// either header, which is how 373/374 above went stale and shipped.
+//
+// WHY THIS EXISTS AT ALL. Every durable thing this wizard used to do was an
+// open(O_CREAT) under /CONFIG, and /CONFIG is root-owned 0711 because it holds
+// SHADOW, AUTHKEYS, SSHD.CFG and the owner's API keys. Since #226 removed
+// autologin=root the wizard runs as the session user, so all four writes were
+// refused - including skip_to_desktop()'s, which is the ONLY way out of a step
+// that fails while the desktop chrome is gated off. See
+// kernel/rustkern/firstrun.rs.
+//
+// FR_SKIP_* and FR_HANDOVER_SET ALWAYS RETURN 0. They are bits of kernel RAM,
+// not a filesystem. Do not write a caller that gives up when one "fails": that
+// exact shape is what made the escape hatch share a failure mode with the
+// thing it existed to escape.
+const SYS_FIRSTRUN: i64 = 397;
+const FR_MARK_DONE: i64 = 0;
+const FR_SKIP_SET: i64 = 1;
+const FR_HANDOVER_SET: i64 = 4;
+// #OOBEAUTH (2026-08-23): -> 1 iff THIS session may call SYS_FIRSTBOOT_ADMIN
+// right now (see machine_admin() below and firstboot_bootstrap_ok_rs() in
+// kernel/rustkern/firstrun.rs for the predicate this asks). True for real
+// root, and true for the one narrow first-boot bootstrap session besides.
+const FR_BOOTSTRAP_QUERY: i64 = 6;
+// #229/#OOBEAUTH: whether this session may act on the machine decides which
+// pages this wizard may show. A session with neither real root NOR the
+// first-boot bootstrap exception cannot create an account or rewrite
+// /CONFIG/LOGIN.CFG, and offering it a form that is guaranteed to fail is
+// worse than not offering it.
+const SYS_GETEUID: i64 = 124;
 const SYS_OPEN: i64 = 10;    // verified against libc/syscall.h
 const SYS_READ: i64 = 12;
 const SYS_CLOSE: i64 = 11;
@@ -225,7 +256,12 @@ const NET_ERR_FAULTY: i64 = -3;
 const SYS_HTTP_FETCH_POLL: i64 = 256;    // -> 0 running, 1 done, 2 error
 const SYS_HTTP_FETCH_CANCEL: i64 = 258;  // frees the job slot
 const SYS_UPTIME_MS: i64 = 252;          // monotonic ms since boot
-// (#745) Present a repaint the APP started. Measured on VM 2617: the staged
+// #136: verified against libc/syscall.h (SYS_POWEROFF=206, SYS_REBOOT=207),
+// same numbers login.c/lockscreen.c already call reboot()/poweroff() with -
+// this is that same existing power path, not a new one.
+const SYS_POWEROFF: i64 = 206;
+const SYS_REBOOT: i64 = 207;
+// (#745) Present a repaint the APP started. Measured on VM <vmid>: the staged
 // connection test ran to completion (diagnostic counters proved the state
 // machine reached "reached the internet (HTTP 200)") while the SCREEN kept
 // showing a frame from 256ms after the page opened. This wizard never called
@@ -340,12 +376,33 @@ fn pw_policy_check(username: &[u8], pw: &Field) -> i32 {
 // is chosen because it is not a printable character, so a text field cannot
 // swallow it, and because nothing else in the kernel or the compositor claims
 // it (F11 = 0x85 is the desktop's, F12 = 0x86 launches DOOM).
-const KC_F10: u32 = 0x87;
+// #191: the number itself now comes from libc/keys.rs, the one table, rather
+// than being restated here. The name and every call site are unchanged.
+#[path = "../../libc/keys.rs"]
+mod keys;
+use keys::GUI_KEY_F10 as KC_F10;
 
-const KC_UP: u32 = 0x80;
-const KC_DOWN: u32 = 0x81;
-const KC_LEFT: u32 = 0x82;
-const KC_RIGHT: u32 = 0x83;
+// #136: same table (kernel/cpu/isr.c). Checked against
+// userland/apps/compositor/main.c's global-shortcut dispatch before picking
+// these: only 0x88 (F1, launcher) and 0x85 (F11, fullscreen) are intercepted
+// there and never reach the focused app; F2/F3/F9 are not claimed by
+// anything else in the kernel or the compositor and pass straight through,
+// same as F10 above. Deliberately NOT F10 itself or a new use of the word
+// "Skip" alone: F10/self.skip() already means something different (finish
+// with defaults, page_skippable() pages only) - see corner_hit()'s block
+// comment.
+use keys::GUI_KEY_F2 as KC_F2;   // Restart
+use keys::GUI_KEY_F3 as KC_F3;   // Shut Down
+use keys::GUI_KEY_F9 as KC_F9;   // Skip to Desktop
+
+// #191: these four were already RIGHT (a comment further up records them being
+// fixed off the 0x48/0x50 scancodes once before, which is why the wizard was
+// the one app cleared rather than fixed). They are aliases now for the same
+// reason the wrong ones spread: a private copy is the mechanism, correct or not.
+use keys::GUI_KEY_UP as KC_UP;
+use keys::GUI_KEY_DOWN as KC_DOWN;
+use keys::GUI_KEY_LEFT as KC_LEFT;
+use keys::GUI_KEY_RIGHT as KC_RIGHT;
 const MOUSE_LEFT: u32 = 1;
 
 // ---------------------------------------------------------------------------
@@ -425,6 +482,132 @@ const PG_APPSW: usize = 7;
 const PG_AI: usize = 8;
 const PG_APPLY: usize = 9;
 const PG_DONE: usize = 10;
+
+// ---------------------------------------------------------------------------
+// TEMPORARY SWITCH: the Network page is currently OFF (owner request,
+// 2026-08-18, mid real-hardware test loop).
+//
+// TO TURN IT BACK ON: set NETWORK_PAGE_ENABLED to `true`. That is the ENTIRE
+// revert; there is nothing else to undo. NOTHING was deleted: PG_NETWORK,
+// dk_draw_network(), network_rule(), net_tick() and apply()'s
+// /CONFIG/NETIP.CFG writer are all still present and still compiled, they are
+// simply never reached while this is false.
+//
+// What `false` means, part by part:
+//   - STEP MODEL. page_enabled() filters whichever flow list is current
+//     (#126 gave the wizard two: STEP_PAGES and PERS_PAGES), so the
+//     header reads "Step N of 8" instead of "of 9", the footer draws 8 dots,
+//     and every page after Network renumbers itself. None of those three
+//     numbers is written down anywhere, so they cannot disagree.
+//   - NAVIGATION. next()/back() move via flow_next()/flow_prev(), which
+//     step OVER a disabled page in BOTH directions. Continue on Signing in
+//     lands on Date & Time; Back on Date & Time lands on Signing in. Neither
+//     direction can reach the hidden page, so Back cannot fall into it.
+//   - WHAT IT WOULD HAVE WRITTEN: NOTHING. apply() writes /CONFIG/NETIP.CFG
+//     only when `!self.dhcp`, and `dhcp` starts `true` in App::new() and is
+//     cleared ONLY by this page's own DHCP/static toggle (on_key / on_click,
+//     both unreachable now). So with the page off the wizard makes no
+//     statement about the network at all: whatever DHCP lease or static
+//     configuration the machine already had survives untouched. That is the
+//     safe side of #144 (the wizard overwriting a static IP configured after
+//     it ran), not a new exposure. Nothing downstream requires NETIP.CFG to
+//     exist: its absence is the ordinary "no static override, use DHCP"
+//     state that every machine that never ran the wizard is already in.
+//   - COSMETIC, LEFT ALONE DELIBERATELY: the PG_APPLY progress checklist
+//     still shows a "Configure network" row and a "Configuring network..."
+//     caption. That sub-step is not dead - it is also where the time zone is
+//     written - and re-labelling it would be extra surface to revert. It is
+//     noted here rather than silently changed.
+// ---------------------------------------------------------------------------
+const NETWORK_PAGE_ENABLED: bool = false;
+
+// ---------------------------------------------------------------------------
+// #OOBEAUTH (2026-08-23, supersedes the #229 version of this comment): CAN
+// THIS SESSION ACT ON THE MACHINE?
+// ---------------------------------------------------------------------------
+// Set ONCE in main(), before the App exists, from geteuid() OR the kernel's
+// FR_BOOTSTRAP_QUERY answer (whichever is true). Read-only afterwards, which
+// is why a plain static is enough and why every reader goes through
+// machine_admin().
+//
+// #229 SHIPPED THIS WIZARD WITH PG_ACCOUNT AND PG_SIGNIN PERMANENTLY HIDDEN
+// FOR EVERY NON-ROOT SESSION, because on the images of the day the ONLY
+// non-root session that could ever run this wizard was a NORMAL post-setup
+// user, for whom both pages are correctly refused (PG_ACCOUNT would try to
+// mint a second admin and rewrite root's password; PG_SIGNIN's gate demands
+// proof of a password this app never collected). That reasoning is still
+// correct for that caller - it is unchanged below.
+//
+// WHAT CHANGED IS THAT A SECOND KIND OF NON-ROOT SESSION NOW EXISTS: the
+// FIRST-BOOT BOOTSTRAP session gui/login.c hands out when the account table
+// is empty (owner decision 2026-08-23, replacing the kernel's OWN duplicate
+// "Create your account" form with a handoff to THIS page). For that caller
+// both pages are not merely safe but the reason the session exists:
+// PG_ACCOUNT collects the fields SYS_FIRSTBOOT_ADMIN needs, and by the time
+// apply() reaches PG_SIGNIN's SYS_SET_AUTOLOGIN / SYS_SET_LOGIN_MODE calls
+// the account SYS_FIRSTBOOT_ADMIN just created is real, so login_cfg_
+// authorize()'s ordinary non-root path (own account, proven password) admits
+// them using the SAME self.pw this page collected - no elevated privilege
+// needed for that second call at all, see apply() below.
+//
+// machine_admin() cannot tell these two non-root cases apart by asking
+// geteuid() (both are uid 1000) or by asking anything about ITSELF - the
+// distinguishing fact, "is the account table still empty and am I the
+// process the compositor spawned for this", lives in the kernel's process
+// tree and its user table, neither of which this app can see. So it ASKS:
+// SYS_FIRSTRUN(FR_BOOTSTRAP_QUERY) runs the EXACT SAME predicate
+// (firstboot_bootstrap_ok_rs(), kernel/rustkern/firstrun.rs) that
+// sys_firstboot_admin() itself evaluates, so this page is shown if and only
+// if its Continue button's syscall would actually succeed.
+//
+// SO THE PAGES ARE NOT SHOWN to a session with neither real root nor the
+// bootstrap exception. Not greyed out, not shown-and-failed: removed from the
+// flow, which the step model already knows how to do (page_enabled is the
+// ONE predicate that the counter, the dots and both navigation directions all
+// consult, so a page cannot end up hidden from the dots yet reachable with
+// Back). Such a first run is Welcome, Date & time, Appearance, Desktop
+// picture, Apps & widgets, AI - every step it CAN complete, and it completes
+// all of them.
+//
+// THE PRIVILEGE BOUNDARY, one more time, because it matters: the bootstrap
+// exception is not "this app is trusted", it is "this ONE process, while the
+// account table is EMPTY, may make this ONE syscall succeed". It disappears
+// the instant SYS_FIRSTBOOT_ADMIN succeeds (the table is no longer empty) and
+// it was never reachable by any other process (kernel/rustkern/firstrun.rs
+// checks the caller is a direct child of the compositor). See the long
+// comment on firstboot_bootstrap_ok_rs() there for the full argument,
+// including the honest cost: a virgin machine now runs this whole wizard,
+// not a small kernel-drawn form, before any account exists.
+static mut MACHINE_ADMIN: bool = false;
+
+fn machine_admin() -> bool {
+    unsafe { core::ptr::read_volatile(core::ptr::addr_of!(MACHINE_ADMIN)) }
+}
+
+/// Is this page part of the wizard right now? THE one predicate: the step
+/// model and both navigation directions all ask it, so a page cannot end up
+/// hidden from the dots yet still reachable with Back (or the reverse).
+///
+/// #229 made this a runtime question. It was `const fn` while the only input
+/// was a compile-time switch; the session's euid is not one, and there is
+/// deliberately still only ONE predicate rather than a second "and can I" test
+/// bolted on at the call sites.
+fn page_enabled(page: usize) -> bool {
+    if page == PG_NETWORK && !NETWORK_PAGE_ENABLED { return false; }
+    if (page == PG_ACCOUNT || page == PG_SIGNIN) && !machine_admin() { return false; }
+    true
+}
+
+// #210 MERGE NOTE (agent/session126 -> dev): page_after()/page_before() lived
+// here and walked page INDICES, which only worked while there was exactly one
+// flow whose pages were consecutive. #126 gave the wizard two flows, so the
+// walkers now step through the CURRENT FLOW'S LIST instead - flow_next() and
+// flow_prev(), further down, next to flow() itself. They ask this same
+// page_enabled() predicate, so the property those two functions existed to
+// guarantee is unchanged: a page cannot be hidden from the dots yet still
+// reachable with Back. They were DELETED rather than left in place, because a
+// second navigation helper that no longer agrees with the flow model is the
+// next person's bug.
 
 // PG_WALL grid geometry. ONE definition, because the draw loop, the
 // arrow-key/wheel pager and the click hit-test all have to agree about how
@@ -805,6 +988,11 @@ struct App {
     // apply() leaves the RTC alone instead of writing this wizard's untouched
     // defaults over it and presenting that as the user's choice.
     clock_skip: bool,
+    // #126 (reduced flow only): the page at which Skip was pressed. apply()
+    // writes nothing belonging to this page or any page after it, so a skip
+    // preserves the settings the user already had instead of overwriting them
+    // with list-index 0. usize::MAX = nothing was skipped.
+    pers_skip_from: usize,
     // PG_TIME: world-map city picker + manual/NTP clock (docs/
     // OOBE_TIME_APPEARANCE.html section 2).
     tzc_sel: usize,
@@ -1635,7 +1823,7 @@ fn wp_corner_native(x: i32, y: i32) -> Option<u32> {
 // wallpaper pixel one column outside the window, only against the true
 // wallpaper's OWN colour at that spot.
 //
-// MEASURED on a real boot (VM 2900, golden build 1843/cda94b8, wallpaper
+// MEASURED on a real boot (VM <vmid>, golden build 1843/cda94b8, wallpaper
 // BOATING.BMP): windows_render_shadows() (userland/apps/compositor/main.c)
 // draws its shadow onto the desktop wallpaper OUTSIDE this window's
 // rectangle before the window's own content is composited over it. At
@@ -2097,12 +2285,159 @@ fn card_paint_backdrop(win: i32) {
 // counter and no dots.
 const STEP_PAGES: [usize; 9] = [PG_WELCOME, PG_ACCOUNT, PG_SIGNIN, PG_NETWORK,
                                 PG_TIME, PG_APPEAR, PG_WALL, PG_APPSW, PG_AI];
-const STEP_COUNT: usize = STEP_PAGES.len();
 
-fn step_index(page: usize) -> i32 {
+// ---------------------------------------------------------------------------
+// #126: THE SAME ORDERED-LIST MODEL, NOW WITH TWO FLOWS.
+// ---------------------------------------------------------------------------
+// The wizard has a MODE, and everything about page order, the step counter, the
+// dots, Back, Continue and Skip is derived from the ONE list belonging to that
+// mode - exactly the property the comment above this block was written to
+// protect. There is still no second place that can disagree; there are two
+// lists and one set of derivations over them.
+//
+// FIRST BOOT (the machine is unconfigured, /CONFIG/SETUPDONE absent): the full
+// nine-step flow, unchanged, including Create your account. This is the path
+// that turns a shipped image into a machine with a real owner, and nothing
+// about it may become optional.
+//
+// EVERY LATER USER'S FIRST LOGIN (the machine is configured but THIS user has
+// never personalised, <home>/CONFIG/SETUPUSR absent): four pages, personalisa-
+// tion only. Welcome, then the three pages that own the four things the ticket
+// names - theme and dock style (Appearance), wallpaper (Desktop picture),
+// widgets and dock pins (Apps & widgets).
+//
+// WHAT IS DELIBERATELY NOT IN THE REDUCED FLOW, and why:
+//   * Create your account - the account already exists; the person is signed
+//     into it. Offering it again would be offering to create a SECOND account.
+//   * Sign-in options - startup/autologin is a property of the MACHINE (one
+//     LOGIN.CFG, one boot), not of whoever happens to be signing in.
+//   * Network - one NIC, one /CONFIG/NETIP.CFG, machine scope.
+//   * Date & time - machine scope for the same reason: one RTC.
+//   * AI settings - per-user in storage (AISVC.CFG goes through userconf), but
+//     it is not one of the four the ticket asks for, and it is the one page
+//     that asks for a secret. Settings > AI already owns it. FLAGGED for the
+//     owner rather than decided quietly, same as timezone below.
+//
+// TIMEZONE IS THE ARGUABLE ONE AND IS DELIBERATELY LEFT OUT, FLAGGED. A second
+// user in a different timezone is a real case, and the clock is the one thing
+// on the Date & time page that could sensibly be per-user. It is excluded here
+// because TZ.CFG is written through tz_set_index(), a MACHINE-scope writer
+// shared with Settings, so making it per-user is a change to that writer and
+// to every reader of it, not a change to this wizard. Splitting it is a
+// separate piece of work with its own risk; this ticket does not smuggle it in.
+const PERS_PAGES: [usize; 4] = [PG_WELCOME, PG_APPEAR, PG_WALL, PG_APPSW];
+
+// Set ONCE in main(), before the App exists, from the two markers on disk.
+// Read-only afterwards, which is why a plain static is enough and why every
+// reader goes through personalise() rather than touching it.
+static mut PERSONALISE: bool = false;
+
+fn personalise() -> bool { unsafe { core::ptr::read_volatile(core::ptr::addr_of!(PERSONALISE)) } }
+
+fn flow() -> &'static [usize] {
+    if personalise() { &PERS_PAGES } else { &STEP_PAGES }
+}
+
+// #210 MERGE NOTE (agent/session126 -> dev). Every derivation below filters the
+// flow through page_enabled(), which is what dev's STEP_COUNT/step_index did
+// over STEP_PAGES before this branch replaced them. Dropping that filter would
+// have silently put the temporarily disabled Network page (NETWORK_PAGE_ENABLED)
+// back into the step total, back into the dots and back into both navigation
+// directions. ONE predicate, both flows, both directions: a page cannot end up
+// hidden from the dots yet still reachable with Back.
+
+// The number of steps ACTUALLY SHOWN in the current flow.
+fn step_count() -> usize {
+    let f = flow();
     let mut i = 0usize;
-    while i < STEP_COUNT { if STEP_PAGES[i] == page { return i as i32; } i += 1; }
+    let mut n = 0usize;
+    while i < f.len() { if page_enabled(f[i]) { n += 1; } i += 1; }
+    n
+}
+
+// Position among the ENABLED steps of the current flow, so the pages after a
+// disabled one shift down by one rather than leaving a hole (a wizard that
+// jumps 3 -> 5 reads as broken). A disabled page, or a page not in this flow at
+// all, has no position and returns -1 - the same answer PG_APPLY/PG_DONE get,
+// which is_step_page()/card_chrome() already treat as "no counter, no dots".
+fn step_index(page: usize) -> i32 {
+    if !page_enabled(page) { return -1; }
+    let f = flow();
+    let mut i = 0usize;
+    let mut n = 0i32;
+    while i < f.len() {
+        let p = f[i];
+        if page_enabled(p) {
+            if p == page { return n; }
+            n += 1;
+        }
+        i += 1;
+    }
     -1
+}
+
+/// The page AFTER `page` in the current flow, or None if `page` is the last
+/// one (the caller then runs Apply). None is also returned for a page that is
+/// not in the flow at all, which is the correct refusal: PG_APPLY and PG_DONE
+/// are not steps and must never be walked into by arithmetic.
+// Position of `page` in the flow ARRAY (not among the enabled steps). Private
+// to the two walkers below, which need the raw slot so they can then walk over
+// disabled neighbours in either direction.
+fn flow_slot(page: usize) -> Option<usize> {
+    let f = flow();
+    let mut i = 0usize;
+    while i < f.len() { if f[i] == page { return Some(i); } i += 1; }
+    None
+}
+
+fn flow_next(page: usize) -> Option<usize> {
+    let f = flow();
+    let at = match flow_slot(page) { Some(a) => a, None => return None };
+    let mut j = at + 1;
+    while j < f.len() {
+        if page_enabled(f[j]) { return Some(f[j]); }
+        j += 1;
+    }
+    None
+}
+
+fn flow_prev(page: usize) -> Option<usize> {
+    let f = flow();
+    let at = match flow_slot(page) { Some(a) => a, None => return None };
+    let mut j = at;
+    while j > 0 {
+        j -= 1;
+        if page_enabled(f[j]) { return Some(f[j]); }
+    }
+    None
+}
+
+/// The last page of the flow: what Back from the Done page returns to, and the
+/// page whose Continue runs Apply.
+fn flow_last() -> usize {
+    let f = flow();
+    let mut j = f.len();
+    while j > 0 { j -= 1; if page_enabled(f[j]) { return f[j]; } }
+    f[0]
+}
+
+/// Where Apply sends the person when it FAILS. In the full flow that is the
+/// account page, because account creation is the only step that can fail in a
+/// way the person can fix. The reduced flow has no account page, so it is the
+/// first page they can actually act on.
+/// #229: ...and if the account page is not in this flow (a non-root session
+/// cannot create an account, see machine_admin()), send them to the FIRST page
+/// that is. Returning a disabled page here would have landed the wizard on a
+/// screen the dots say does not exist and that Continue cannot navigate away
+/// from, which is a second dead end reached only on a failure path - the worst
+/// possible place for one.
+fn flow_error_page() -> usize {
+    if personalise() { return PG_APPEAR; }
+    if page_enabled(PG_ACCOUNT) { return PG_ACCOUNT; }
+    let f = flow();
+    let mut i = 0usize;
+    while i < f.len() { if page_enabled(f[i]) { return f[i]; } i += 1; }
+    PG_WELCOME
 }
 
 // ---------------------------------------------------------------------------
@@ -2498,7 +2833,14 @@ impl App {
         // 5. Subtitle, content y=340, 20 px, #FFFFFF @ 0.92.
         let sy = 340 - HDR_H;
         let subtitle_col = wel_blend_over(0xFFFFFF, wel_composite_at(W / 2, sy), 920);
-        dk_centered(win, sy, b"Your AI-first desktop. Let's get it set up.\0", 20, false, subtitle_col);
+        // #126: the reduced flow is not setting up a machine, it is setting
+        // up a DESKTOP for a person who has just signed in for the first time.
+        // Saying "let's get it set up" to someone on a machine that is already
+        // set up describes the wrong thing.
+        dk_centered(win, sy,
+            if personalise() { b"Let's set up your desktop the way you like it.\0" }
+            else             { b"Your AI-first desktop. Let's get it set up.\0" },
+            20, false, subtitle_col);
 
         // 6. Primary button pill: x=197, content y=420, 246x51, r=25.
         // Fill #6AE2CF @ 0.20, edge #FFFFFF @ 0.34. The fill is deliberately
@@ -2738,7 +3080,7 @@ fn card_chrome(win: i32, page: usize) {
     buf[k] = b'0' + (one % 10) as u8; k += 1;
     let mid = b" of ";
     let mut j = 0usize; while j < mid.len() { buf[k] = mid[j]; k += 1; j += 1; }
-    let tot = STEP_COUNT as i32;
+    let tot = step_count() as i32;
     if tot >= 10 { buf[k] = b'0' + (tot / 10) as u8; k += 1; }
     buf[k] = b'0' + (tot % 10) as u8; k += 1;
     buf[k] = 0;
@@ -3291,7 +3633,7 @@ fn dk_line(win: i32, x0: i32, y0: i32, x1: i32, y1: i32, t: i32, color: u32) {
 // icon (rect(310,168,3,10)+rect(313,172,14,3) around a 48px circle) - that
 // shape is two PERPENDICULAR bars, which reads as an "I-beam"/dash at small
 // icon size but is unmistakably NOT a checkmark once scaled to the 72px
-// Finish-page circle (confirmed visually on VM 2281, screendump p_done).
+// Finish-page circle (confirmed visually on VM <vmid>, screendump p_done).
 // A real diagonal reads correctly at every size used here (13px status
 // icon, 16px thumbnail badge, 72px Finish circle).
 fn dk_checkmark(win: i32, cx: i32, cy: i32, scale_tenths: i32, color: u32) {
@@ -3427,7 +3769,7 @@ fn dk_list(win: i32, x: i32, y: i32, w: i32, h: i32, count: usize, sel: usize,
 // measures 2.43:1 and fails). 8 dots span 168 px; at 12 steps it is 264 px,
 // still inside the 640 px content box, so growing the wizard does not break it.
 fn dk_step_dots(win: i32, active_idx: i32, y: i32) {
-    let count = STEP_COUNT as i32;
+    let count = step_count() as i32;
     let span = (count - 1) * 24;
     let x0 = W / 2 - span / 2;
     let mut k = 0i32;
@@ -4241,6 +4583,17 @@ const NET_BTN: (i32, i32, i32, i32) = (486, 216, 122, 24);
 // /CONFIG/SETUPDONE, so the wizard does not come back on the next boot.
 // ---------------------------------------------------------------------------
 fn page_skippable(page: usize) -> bool {
+    // #126: in the reduced flow every page IS optional - the account the full
+    // flow refuses to skip into already exists, which is the entire reason
+    // that refusal was written. Welcome is still not skippable, for the same
+    // reason it is not skippable in the full flow: it has nothing to skip.
+    if personalise() {
+        return match page {
+            PG_WELCOME => false,
+            PG_APPEAR | PG_WALL | PG_APPSW => true,
+            _ => false,
+        };
+    }
     match page {
         // Not optional: nothing exists to skip into yet.
         PG_WELCOME | PG_ACCOUNT => false,
@@ -4272,6 +4625,90 @@ fn skip_link_bounds() -> (i32, i32, i32, i32) {
     let w = unsafe { gui_ttf_width(SKIP_LABEL.as_ptr(), 11) };
     (294 - w / 2, FOOTER_Y, w, FOOTER_H)
 }
+
+// ===========================================================================
+// #136 (owner ticket): bottom-right corner controls - Skip to Desktop,
+// Restart, Shut Down. On EVERY page except the transient PG_APPLY progress
+// screen, INCLUDING Welcome and Account, which is the one thing that makes
+// this a genuinely different control from SKIP_LABEL/skip_link_bounds()
+// above:
+//
+//   - skip_link_bounds()'s link only ever appears where page_skippable() is
+//     true (i.e. AFTER an account exists), and clicking it FINISHES the
+//     wizard with defaults - it runs apply() and writes /CONFIG/SETUPDONE,
+//     so the wizard never reappears. That is correct for what it is: "I
+//     don't want to answer these last few questions right now."
+//   - This is "I don't want to be in this wizard AT ALL right now", which
+//     has to work even before an account exists (Welcome/Account have no
+//     account to defer setup INTO - see page_skippable()'s own block
+//     comment for why the old link was removed from those two pages rather
+//     than fixed). Reusing skip_link_bounds()'s contract there would mean
+//     writing SETUPDONE with no account created, which is the exact
+//     half-configured state the wizard exists to prevent.
+//
+// So skip_to_desktop() below writes a DIFFERENT, throwaway marker
+// (/CONFIG/SETUPSKIP, not /CONFIG/SETUPDONE) and writes nothing else at
+// all - no apply(), no partial config. See skip_to_desktop()'s own comment
+// for the full contract and userland/apps/compositor/main.c's
+// setup_pending_recheck() / boot-time SETUP spawn site for the other half
+// (compositor-owned; touched here only because this feature is impossible
+// without it - see the CHANGELOG entry for #136).
+//
+// Restart/Shut Down reuse the EXACT existing power path: login.c and
+// lockscreen.c already put unauthenticated Restart/Shut Down controls
+// bottom-right of the screen (same "Restart"/"Shut Down" wording, same
+// reboot()/poweroff() libc calls straight to SYS_REBOOT/SYS_POWEROFF, no
+// confirmation dialog) precisely because a session has not started yet
+// there either - this wizard is the same situation.
+//
+// Text links, not buttons: matches lockscreen.c's own choice for these two
+// controls ("Switch User / Restart / Shut Down as high-contrast shadowed
+// TEXT with no surrounds", lockscreen.c:28) and costs far less of the
+// footer-chrome strip's width than a bordered button would, which matters
+// here - see the geometry comment below.
+//
+// GEOMETRY: card-mode ONLY (CARD_MODE gates both draw and click below).
+// dk_step_dots() already draws in this same 40px FTR_H strip (body-local
+// y 480..520, see the CARD_H/CONTENT_H comment above) at y=500, and for
+// STEP_COUNT=9 its dots span body-x 224..416 (span=(9-1)*24=192, centred
+// on W/2=320) plus a few px of AA radius - so this row is placed BELOW
+// that (CORNER_Y=504, clear of the dots' own y radius) and right-aligned
+// well clear of x=416, leaving the dots undisturbed. In the legacy
+// 640x480 fallback (small-screen, no separate header/footer chrome) there
+// is no room for a fourth row at all: F2/F3/F9 (on_key) still work there,
+// this is a visual-only gap, stated rather than silently dropped.
+const CORNER_LABEL_SKIP: &[u8]     = b"Skip to Desktop\0";
+const CORNER_LABEL_RESTART: &[u8]  = b"Restart\0";
+const CORNER_LABEL_SHUTDOWN: &[u8] = b"Shut Down\0";
+const CORNER_FONT: i32 = 10;
+const CORNER_Y: i32 = 504;
+const CORNER_PAD: i32 = 8;    // hit-rect slack added around the drawn glyphs
+const CORNER_GAP: i32 = 14;   // gap between adjacent controls
+const CORNER_RIGHT: i32 = W - 20;   // matches login.c/lockscreen.c's own 20px
+                                     // right margin for this exact pair
+
+// Text origin x + width for skip/restart/shutdown, right-aligned to
+// CORNER_RIGHT. ONE function shared by draw and hit-test (same reasoning
+// as footer_bounds() above): they cannot disagree about where the controls
+// are because there is only one place either of them could read it from.
+fn corner_layout() -> [(i32, i32); 3] {
+    let sw = unsafe { gui_ttf_width(CORNER_LABEL_SHUTDOWN.as_ptr(), CORNER_FONT) };
+    let rw = unsafe { gui_ttf_width(CORNER_LABEL_RESTART.as_ptr(), CORNER_FONT) };
+    let kw = unsafe { gui_ttf_width(CORNER_LABEL_SKIP.as_ptr(), CORNER_FONT) };
+    let shutdown_x = CORNER_RIGHT - sw;
+    let restart_x  = shutdown_x - CORNER_GAP - rw;
+    let skip_x     = restart_x  - CORNER_GAP - kw;
+    [(skip_x, kw), (restart_x, rw), (shutdown_x, sw)]
+}
+
+// index: 0 = Skip to Desktop, 1 = Restart, 2 = Shut Down.
+fn corner_hit(idx: usize) -> (i32, i32, i32, i32) {
+    let (x, w) = corner_layout()[idx];
+    (x - CORNER_PAD, CORNER_Y - CORNER_PAD, w + 2 * CORNER_PAD, CORNER_FONT + 2 * CORNER_PAD)
+}
+
+fn do_reboot()   { unsafe { syscall0(SYS_REBOOT); } }
+fn do_poweroff() { unsafe { syscall0(SYS_POWEROFF); } }
 
 // ===========================================================================
 // #745 task #15: PG_APPSW, "Apps and widgets" (docs/OOBE_APPS_WIDGETS.html).
@@ -4320,11 +4757,14 @@ const APPS_UI: [AppUi; 12] = [
     // fragment itself names it this way.
     AppUi { label: b"Task Manager\0", path: b"/APPS/taskmgr\0" },
 ];
-// Browser, Files, Terminal, Settings, App Store (indices 0,1,2,4,5): the
-// compiled-in desktop icon set (compositor/desktop.c) minus the Recycle Bin
-// sentinel, so the dock this page proposes agrees with the desktop the
-// person is already looking at (spec 5.1).
-const APPS_DEFAULT_MASK: u16 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 4) | (1 << 5);
+// Owner decision (2026-08-18): all twelve dock candidates default checked.
+// Previously only Browser, Files, Terminal, Settings, App Store (indices
+// 0,1,2,4,5, the compiled-in desktop icon set minus Recycle Bin) were on;
+// the person now sees every candidate pre-pinned and can uncheck what they
+// do not want, rather than opt in to the other seven.
+const APPS_DEFAULT_MASK: u16 =
+    (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4) | (1 << 5) |
+    (1 << 6) | (1 << 7) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11);
 
 // The fifteen widgets (spec section 5.2/9.1), column-major display order
 // (col = i/5, row = i%5): column 3 is entirely "needs something first", which
@@ -4375,10 +4815,47 @@ const WIDGETS_UI: [WidgetUi; 15] = [
     WidgetUi { label: b"Maytera AI\0", bind: b"show_aichat\0", profkey: b"show_aichat\0",
                ring: true, detail_on: b"Opens the Maytera AI panel. Needs an API key, which the next step sets up.\0", detail_off: b"\0" },
 ];
-// Home Assistant + AI Chat (indices 13, 14): the two widgets that ship ON and
-// EMPTY (g_show_ha=1 with no server configured, g_aichat_enabled=1 with no
-// API key) - the strongest reason this page exists (spec 2.3).
-const WIDGETS_DEFAULT_MASK: u16 = (1 << 13) | (1 << 14);
+// Owner decision (2026-08-18): six widgets default checked - Digital Clock,
+// Calendar, Uptime, Weather, Home Assistant and Maytera AI. Two of these
+// (Home Assistant, Maytera AI - indices 13, 14) ship ON and EMPTY
+// (g_show_ha=1 with no server configured, g_aichat_enabled=1 with no API
+// key) - the strongest reason this page exists (spec 2.3); Weather (index
+// 10) ships ON and empty too until a network exists (WIDGETS_UI[10]'s own
+// detail_off text). Named indices, not a bare hex literal, so a reorder of
+// WIDGETS_UI is at least visible in a diff here; the const asserts
+// immediately below make a SILENT reorder a build failure instead of a
+// mis-selection (the exact trap: initialising a mask by position and
+// trusting WIDGETS_UI never moves).
+const WIDX_DIGCLOCK: usize = 0;
+const WIDX_CALENDAR: usize = 2;
+const WIDX_UPTIME: usize = 6;
+const WIDX_WEATHER: usize = 10;
+const WIDX_HA: usize = 13;
+const WIDX_AICHAT: usize = 14;
+const WIDGETS_DEFAULT_MASK: u16 =
+    (1 << WIDX_DIGCLOCK) | (1 << WIDX_CALENDAR) | (1 << WIDX_UPTIME) |
+    (1 << WIDX_WEATHER) | (1 << WIDX_HA) | (1 << WIDX_AICHAT);
+
+// Compile-time proof that the indices above still name what this comment
+// claims. bytes_eq is a const fn so these run at build time, not on the
+// draw path. Add/adjust one of these whenever WIDX_* changes; a stale
+// WIDX_* pointing at the wrong profkey fails the build instead of quietly
+// defaulting the wrong widget on.
+const fn bytes_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() { return false; }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] { return false; }
+        i += 1;
+    }
+    true
+}
+const _: () = assert!(bytes_eq(WIDGETS_UI[WIDX_DIGCLOCK].profkey, b"show_digclock\0"));
+const _: () = assert!(bytes_eq(WIDGETS_UI[WIDX_CALENDAR].profkey, b"show_calendar\0"));
+const _: () = assert!(bytes_eq(WIDGETS_UI[WIDX_UPTIME].profkey, b"show_uptime\0"));
+const _: () = assert!(bytes_eq(WIDGETS_UI[WIDX_WEATHER].profkey, b"show_weather\0"));
+const _: () = assert!(bytes_eq(WIDGETS_UI[WIDX_HA].profkey, b"show_ha\0"));
+const _: () = assert!(bytes_eq(WIDGETS_UI[WIDX_AICHAT].profkey, b"show_aichat\0"));
 
 const APP_X0: i32 = 32;
 const APP_Y0: i32 = 96;
@@ -4409,9 +4886,12 @@ fn appsw_net_present() -> bool {
 // hardcoded fallback profile_load() itself uses (compositor/profile.c
 // prof_path()) - so this plain root-relative open reads the SAME file the
 // compositor guarantees exists (compositor_init() calls profile_save() right
-// after profile_load()). Falls back to the compiled-in defaults (HA + AI
-// Chat on, everything else off) only if the read fails, matching the profile
-// key's own compiled-in default the moment nothing on disk says otherwise.
+// after profile_load()). Falls back to the compiled-in defaults (2026-08-18:
+// Digital Clock, Calendar, Uptime, Weather, HA, Maytera AI on, everything
+// else off - kept in lockstep with clock.c/widgets.c's own g_show_* C
+// initialisers, see WIDGETS_DEFAULT_MASK above) only if the read fails,
+// matching the profile key's own compiled-in default the moment nothing on
+// disk says otherwise.
 // Modelled on write_dock_style()'s read side: same SYS_OPEN/SYS_READ/SYS_CLOSE
 // shape, same "/UIPROFIL.YML" path, same "profile.c applies keys in file
 // order, so a later duplicate line wins and no de-duplication is needed"
@@ -4543,6 +5023,24 @@ impl App {
         }
     }
 
+    // (#wizflash) ONE table of PG_ACCOUNT's six field boxes (x, y, w, h,
+    // placeholder), shared by the full page draw below AND draw_field_delta()
+    // (see its own comment for why a keystroke needs a way to redraw ONE field
+    // without repainting the page). Factored out rather than duplicating the
+    // six dk_field() calls' literals a second time: blame.md already records a
+    // case where two copies of the same layout numbers drifted apart because
+    // nothing forced them to agree.
+    fn account_field_geom(i: usize) -> (i32, i32, i32, i32, &'static [u8]) {
+        match i {
+            0 => (32, 90, 272, 28, b"Ada Lovelace\0" as &[u8]),
+            1 => (336, 90, 272, 28, b"\0" as &[u8]),
+            2 => (32, 146, 272, 28, b"\0" as &[u8]),
+            3 => (336, 146, 272, 28, b"\0" as &[u8]),
+            4 => (32, 228, 272, 28, b"\0" as &[u8]),
+            _ => (336, 228, 272, 28, b"\0" as &[u8]),
+        }
+    }
+
     fn dk_draw_account(&mut self) {
         // #745: six fields now. Root's password is collected HERE, next to the
         // account password, rather than on a page of its own: the two rules
@@ -4555,14 +5053,18 @@ impl App {
             b"This account signs you in. The root account owns the system files.\0");
 
         dk_label(win, 32, 76, b"FULL NAME\0", false);
-        dk_field(win, 32, 90, 272, 28, &self.fullname, b"Ada Lovelace\0", self.focus == 0, false);
+        let (x, y, w, h, ph) = Self::account_field_geom(0);
+        dk_field(win, x, y, w, h, &self.fullname, ph, self.focus == 0, false);
         dk_label(win, 336, 76, b"USERNAME\0", false);
-        dk_field(win, 336, 90, 272, 28, &self.username, b"\0", self.focus == 1, false);
+        let (x, y, w, h, ph) = Self::account_field_geom(1);
+        dk_field(win, x, y, w, h, &self.username, ph, self.focus == 1, false);
 
         dk_label(win, 32, 132, b"PASSWORD\0", false);
-        dk_field(win, 32, 146, 272, 28, &self.pw, b"\0", self.focus == 2, false);
+        let (x, y, w, h, ph) = Self::account_field_geom(2);
+        dk_field(win, x, y, w, h, &self.pw, ph, self.focus == 2, false);
         dk_label(win, 336, 132, b"CONFIRM PASSWORD\0", false);
-        dk_field(win, 336, 146, 272, 28, &self.pw2, b"\0", self.focus == 3, false);
+        let (x, y, w, h, ph) = Self::account_field_geom(3);
+        dk_field(win, x, y, w, h, &self.pw2, ph, self.focus == 3, false);
 
         if !self.err.is_empty() {
             // Rows: 0/1 name+username (fields y=90..118), 2/3 passwords
@@ -4584,9 +5086,11 @@ impl App {
         dk_hr(win, 32, 200, 576);
 
         dk_label(win, 32, 214, b"ROOT PASSWORD\0", false);
-        dk_field(win, 32, 228, 272, 28, &self.rootpw, b"\0", self.focus == 4, false);
+        let (x, y, w, h, ph) = Self::account_field_geom(4);
+        dk_field(win, x, y, w, h, &self.rootpw, ph, self.focus == 4, false);
         dk_label(win, 336, 214, b"CONFIRM ROOT PASSWORD\0", false);
-        dk_field(win, 336, 228, 272, 28, &self.rootpw2, b"\0", self.focus == 5, false);
+        let (x, y, w, h, ph) = Self::account_field_geom(5);
+        dk_field(win, x, y, w, h, &self.rootpw2, ph, self.focus == 5, false);
 
         dk_solid(win, 32, 266, b"root owns the system files and must have its OWN password.\0",
                  12, false, DK_FINE_PRINT);
@@ -4711,6 +5215,18 @@ impl App {
         if self.signin_focus == 3 { dk_focus_frame(win, 468, FOOTER_Y, 140, FOOTER_H); }
     }
 
+    // (#wizflash) Same reasoning as account_field_geom() above: ONE table for
+    // PG_NETWORK's four static-address fields, shared by the full page draw
+    // and draw_field_delta().
+    fn network_field_geom(i: usize) -> (i32, i32, i32, i32, &'static [u8]) {
+        match i {
+            0 => (32, 126, 272, 28, b"192.0.2.1\0" as &[u8]),
+            1 => (336, 126, 272, 28, b"255.255.255.0\0" as &[u8]),
+            2 => (32, 176, 272, 28, b"192.0.2.1\0" as &[u8]),
+            _ => (336, 176, 272, 28, b"Same as gateway\0" as &[u8]),
+        }
+    }
+
     fn dk_draw_network(&mut self) {
         let win = self.win;
         let static_on = !self.dhcp;
@@ -4724,14 +5240,18 @@ impl App {
         if static_on {
             // Manual configuration: unchanged editable form.
             dk_label(win, 32, 112, b"IP ADDRESS\0", false);
-            dk_field(win, 32, 126, 272, 28, &self.ip, b"192.0.2.1\0", self.focus == 0, false);
+            let (x, y, w, h, ph) = Self::network_field_geom(0);
+            dk_field(win, x, y, w, h, &self.ip, ph, self.focus == 0, false);
             dk_label(win, 336, 112, b"NETMASK\0", false);
-            dk_field(win, 336, 126, 272, 28, &self.mask, b"255.255.255.0\0", self.focus == 1, false);
+            let (x, y, w, h, ph) = Self::network_field_geom(1);
+            dk_field(win, x, y, w, h, &self.mask, ph, self.focus == 1, false);
 
             dk_label(win, 32, 162, b"GATEWAY\0", false);
-            dk_field(win, 32, 176, 272, 28, &self.gw, b"192.0.2.1\0", self.focus == 2, false);
+            let (x, y, w, h, ph) = Self::network_field_geom(2);
+            dk_field(win, x, y, w, h, &self.gw, ph, self.focus == 2, false);
             dk_label(win, 336, 162, b"DNS SERVER\0", false);
-            dk_field(win, 336, 176, 272, 28, &self.dns, b"Same as gateway\0", self.focus == 3, false);
+            let (x, y, w, h, ph) = Self::network_field_geom(3);
+            dk_field(win, x, y, w, h, &self.dns, ph, self.focus == 3, false);
 
             if !self.err.is_empty() { dk_solid(win, 32, 210, self.err, 12, false, DK_ERROR); }
             return;
@@ -5239,6 +5759,40 @@ impl App {
         }
     }
 
+    // (#wizflash) PG_AI's own shift constant, factored out to ONE place: it
+    // used to be a local `let shift = if is_custom {28} else {0}` inside
+    // dk_draw_ai only, which meant ai_field_geom() below (needed so
+    // draw_field_delta() can redraw a single field without repainting the
+    // page - same reasoning as account_field_geom()/network_field_geom())
+    // would otherwise have carried a SECOND copy of the same "28". One
+    // function, two call sites, per this file's own standing rule against
+    // exactly that kind of drift.
+    fn ai_shift(is_custom: bool) -> i32 { if is_custom { 28 } else { 0 } }
+
+    // (#wizflash) ONE table of PG_AI's three text fields (endpoint, model,
+    // key), shared by the full page draw (dk_draw_ai) and draw_field_delta().
+    // Depends on is_custom because selecting the Custom provider shifts the
+    // model/key rows down 28px (ai_shift() above) - the endpoint row itself
+    // never moves, it only appears/disappears.
+    fn ai_field_geom(focus: usize, is_custom: bool) -> (i32, i32, i32, i32, &'static [u8]) {
+        let shift = Self::ai_shift(is_custom);
+        match focus {
+            1 => (32, 194, 576, 26,
+                  b"https://my-llm-gateway.internal/v1/chat/completions\0" as &[u8]),
+            2 => (32, 214 + shift, 576, 28, b"your-model-id\0" as &[u8]),
+            _ => (32, 280 + shift, 576, 30, b"Paste your API key\0" as &[u8]),
+        }
+    }
+
+    // (#wizflash) A saved key with nothing typed THIS session shows the fixed
+    // 12-dot "KEY SET" state (spec Stage C) instead of the live field; the
+    // instant the person types anything (or backspaces a live edit back to
+    // empty), the page's own visible STRUCTURE changes, not just the field's
+    // text - so the event loop below must NOT treat that keystroke as a
+    // cheap single-field redraw. Shared by dk_draw_ai and the event loop's
+    // before/after snapshot so both agree on what "changed" means.
+    fn ai_key_show_saved(&self) -> bool { self.ai_key_saved && self.aikey.is_empty() }
+
     fn dk_draw_ai(&mut self) {
         self.nfields = 0;   // focus lives in ai_focus, not the generic nfields ring
         self.ai_ensure_saved_checked();
@@ -5263,22 +5817,20 @@ impl App {
         // line for an editable Endpoint URL field, and shifts everything
         // below it down 28px to make room - one shift constant, not two
         // parallel layouts, so the two states cannot drift apart.
-        let shift = if is_custom { 28 } else { 0 };
+        let shift = Self::ai_shift(is_custom);
 
         if is_custom {
             dk_label(win, 32, 180, b"ENDPOINT URL\0", false);
-            dk_field(win, 32, 194, 576, 26, &self.ai_endpoint,
-                     b"https://my-llm-gateway.internal/v1/chat/completions\0",
-                     self.ai_focus == 1, false);
+            let (x, y, w, h, ph) = Self::ai_field_geom(1, is_custom);
+            dk_field(win, x, y, w, h, &self.ai_endpoint, ph, self.ai_focus == 1, false);
         } else {
             dk_alpha(win, 32, 180, p.endpoint_info, 12, false, DK_BODY, 880);
         }
 
         let model_label_y = 200 + shift;
-        let model_field_y = 214 + shift;
         dk_label(win, 32, model_label_y, b"MODEL\0", false);
-        dk_field(win, 32, model_field_y, 576, 28, &self.ai_model, b"your-model-id\0",
-                 self.ai_focus == 2, false);
+        let (x, model_field_y, w, h, ph) = Self::ai_field_geom(2, is_custom);
+        dk_field(win, x, model_field_y, w, h, &self.ai_model, ph, self.ai_focus == 2, false);
         if is_custom {
             dk_solid(win, 32, model_field_y + 34,
                      b"No default for a custom endpoint. Enter the exact model id your server expects. Uses Bearer auth.\0",
@@ -5294,30 +5846,30 @@ impl App {
         }
 
         let key_label_y = 266 + shift;
-        let key_field_y = 280 + shift;
+        let (kx, key_field_y, kw, kh, kph) = Self::ai_field_geom(3, is_custom);
         dk_label(win, 32, key_label_y, b"API KEY\0", false);
         // A saved key with nothing typed THIS session shows the fixed
         // 12-dot "KEY SET" state (spec Stage C): the real saved length is
         // never drawn, only whether one exists at all. The instant the
         // person types anything, the normal live field takes over below.
-        let show_saved = self.ai_key_saved && self.aikey.is_empty();
+        let show_saved = self.ai_key_show_saved();
         if show_saved {
             let bw2 = unsafe { gui_ttf_width(b"KEY SET\0".as_ptr(), 9) } + 12;
             let (bx, by) = (88, key_label_y - 2);
             gui_rr(win, bx, by, bw2, 14, 3, DK_BADGE_FILL, wel_composite_at(bx + bw2 / 2, by));
             dk_solid(win, bx + 6, by + 3, b"KEY SET\0", 9, true, DK_BADGE_TEXT);
-            dk_mask_preview(win, 32, key_field_y, 576, 30, 12);
+            dk_mask_preview(win, kx, key_field_y, kw, kh, 12);
             if self.ai_focus == 3 {
                 // Was a 2 px INWARD border, i.e. the same grammar grids use for
                 // selection. Uses the shared ring like every other control now.
-                dk_focus_frame(win, 32, key_field_y, 576, 30);
+                dk_focus_frame(win, kx, key_field_y, kw, kh);
             }
         } else {
-            dk_field(win, 32, key_field_y, 576, 30, &self.aikey, b"Paste your API key\0",
+            dk_field(win, kx, key_field_y, kw, kh, &self.aikey, kph,
                      self.ai_focus == 3, false);
         }
 
-        let status_y = key_field_y + 30 + 6;
+        let status_y = key_field_y + kh + 6;
         if show_saved {
             dk_solid(win, 32, status_y,
                      b"A key is already saved. Type to replace it, or leave it as-is.\0",
@@ -5392,13 +5944,25 @@ impl App {
         dk_centered(win, 118, b"PLEASE WAIT\0", 10, true, DK_EYEBROW);
         dk_centered(win, 136, b"Setting up MayteraOS\0", 26, true, DK_HEADLINE);
 
-        let msg: &[u8] = match self.substep {
-            0 | 1 => b"Creating your account...\0",
-            2 | 3 => b"Configuring network...\0",
-            4     => b"Applying your theme...\0",
-            5     => b"Setting your desktop picture...\0",
-            6     => b"Saving AI settings...\0",
-            _     => b"Finishing setup...\0",
+        // #126: the reduced flow does none of the machine-scope work, so it
+        // must not claim to. A checklist that ticks "Create user account" for a
+        // step that never ran is the same class of lie as the old "Set up
+        // later" button that skipped nothing.
+        let msg: &[u8] = if personalise() {
+            match self.substep {
+                0 | 1 | 2 | 3 | 4 => b"Applying your theme...\0",
+                5     => b"Setting your desktop picture...\0",
+                _     => b"Finishing up...\0",
+            }
+        } else {
+            match self.substep {
+                0 | 1 => b"Creating your account...\0",
+                2 | 3 => b"Configuring network...\0",
+                4     => b"Applying your theme...\0",
+                5     => b"Setting your desktop picture...\0",
+                6     => b"Saving AI settings...\0",
+                _     => b"Finishing setup...\0",
+            }
         };
         dk_centered_alpha(win, 172, msg, 12, false, DK_BODY, 880);
 
@@ -5412,7 +5976,7 @@ impl App {
 
         // (label, "done" sub-step boundary); "in progress" is
         // [previous boundary, this boundary).
-        let rows: [(&[u8], i32); 6] = [
+        let full_rows: [(&[u8], i32); 6] = [
             (b"Create user account\0", 2),
             (b"Configure network\0", 4),
             (b"Apply theme\0", 5),
@@ -5420,10 +5984,19 @@ impl App {
             (b"Save AI settings\0", 7),
             (b"Finish setup\0", 8),
         ];
-        let mut prev: i32 = 0;
+        // Same sub-step boundaries as the real work in apply(): theme lands at
+        // 5, wallpaper at 6, the per-user marker at 8. Derived from the code
+        // that runs, not invented for the picture.
+        let pers_rows: [(&[u8], i32); 3] = [
+            (b"Apply theme\0", 5),
+            (b"Set desktop picture\0", 6),
+            (b"Finish up\0", 8),
+        ];
+        let nrows: usize = if personalise() { 3 } else { 6 };
+        let mut prev: i32 = if personalise() { 4 } else { 0 };
         let mut i: usize = 0;
-        while i < 6 {
-            let (label, done_at) = rows[i];
+        while i < nrows {
+            let (label, done_at) = if personalise() { pers_rows[i] } else { full_rows[i] };
             let y = 232 + (i as i32) * 22;
             let state = if self.substep >= done_at { 2 } else if self.substep >= prev { 1 } else { 0 };
             dk_status_icon(win, 200, y, state);
@@ -5483,6 +6056,19 @@ impl App {
         }
     }
 
+    // #136: see corner_hit()'s block comment for the full geometry/contract.
+    // CARD_MODE-only (no room in the legacy 640x480 fallback); F2/F3/F9 in
+    // on_key still work there regardless.
+    fn draw_corner_controls(&self) {
+        if self.page == PG_APPLY { return; }
+        if !unsafe { CARD_MODE } { return; }
+        let win = self.win;
+        let l = corner_layout();
+        dk_solid(win, l[0].0, CORNER_Y, CORNER_LABEL_SKIP, CORNER_FONT, false, DK_BACK_LABEL);
+        dk_solid(win, l[1].0, CORNER_Y, CORNER_LABEL_RESTART, CORNER_FONT, false, DK_BACK_LABEL);
+        dk_solid(win, l[2].0, CORNER_Y, CORNER_LABEL_SHUTDOWN, CORNER_FONT, false, DK_ERROR);
+    }
+
     fn draw(&mut self) {
         match self.page {
             // Welcome is page 0 of THIS SAME window (see the block comment
@@ -5506,6 +6092,31 @@ impl App {
             PG_DONE    => self.dk_draw_done(),
             _ => {}
         }
+        // #136: corner controls (Skip to Desktop / Restart / Shut Down) draw
+        // on top of whatever the match above just painted, on every page
+        // except PG_APPLY - see corner_hit()'s block comment. Placed here,
+        // ONE call before the win_invalidate() below rather than after each
+        // of the ten match arms, for the exact reason the comment on that
+        // call gives: this is the one place every redraw path funnels
+        // through, so a page added later cannot forget it either.
+        self.draw_corner_controls();
+        // #155: PRESENT the repaint that was just made. Since #131 (local 151)
+        // the compositor blits content_presented, published only by this call,
+        // so a page drawn without it reached the content buffer and stopped
+        // there. That is what rendered every page after Welcome as an empty
+        // glass card: the only thing publishing anything was SYS_WIN_DRAW_IMAGE
+        // (self-committing since #131), so each page was published frozen at
+        // its LAST image blit - the final backdrop strip, drawn before a single
+        // glyph of the page. Welcome looked better only because its logo blit
+        // comes after the header/footer chrome, so it published those three
+        // things and none of its own text.
+        // Put HERE, at the one place every redraw path funnels through
+        // (EV_REDRAW / EV_KEY_DOWN / EV_MOUSE_DOWN / EV_MOUSE_SCROLL / the
+        // hover band / net_tick), rather than at the eight call sites, so a
+        // page or an event added later cannot forget it. sys_win_invalidate()
+        // deliberately does not re-arm redraw_pending (#564), so this cannot
+        // ping-pong with EV_REDRAW.
+        win_invalidate(self.win);
     }
 
     // The ORIGINAL light-theme chrome + PG_TIME content, extracted verbatim
@@ -5619,80 +6230,196 @@ fn is_dotted_quad(f: &Field) -> bool {
     parts == 3 && digits > 0
 }
 
+// #154 (owner-reported 2026-08-17): the wizard's validation message used to
+// be SET once, at Continue-time, and then left alone no matter what the
+// person typed afterwards - clear both password fields to start over and
+// "The passwords do not match." just sat there, describing a state that no
+// longer existed. The general defect was "the message is an EVENT, not a
+// STATE": every branch below used to live inline in validate() and nowhere
+// else re-ran them.
+//
+// The fix makes the message a function of CURRENT field state instead of a
+// latch: account_rule()/network_rule() are pure (no &mut self, no writes)
+// and are the ONE place each rule is written down. validate() (Continue-time)
+// and live_recheck() (after every keystroke, see below) both read from them,
+// so the rules cannot drift into two different answers for the same fields.
+//
+// `tolerant` (account_rule only) relaxes ONLY the two password-pair equality
+// checks, from "equal right now" to "not yet PROVABLY different"
+// (pw_diverged: neither field is a prefix of the other). Retyping the second
+// password one keystroke at a time spends most of its time as a valid prefix
+// of a password that might still end up matching - that is ordinary typing,
+// not an error, and must not keep a stale warning up or make it flicker back
+// on for each correct character. Continue-time validation (tolerant = false)
+// keeps plain equality: a field that is simply shorter and was never
+// finished IS wrong at the moment Continue is pressed, however it got there.
+fn pw_diverged(a: &Field, b: &Field) -> bool {
+    if a.is_empty() || b.is_empty() { return false; }
+    let n = if a.n < b.n { a.n } else { b.n };
+    let mut i = 0;
+    while i < n { if a.b[i] != b.b[i] { return true; } i += 1; }
+    false
+}
+
+// The C-string convention this whole file uses for "cleared": every
+// `self.err = b"\0"` (and its siblings, e.g. self.apply_err) writes a
+// ONE-byte slice containing a single NUL, never a zero-length slice - so
+// `.is_empty()` on it is ALWAYS false (len 1, not 0) and cannot be used to
+// ask "is there currently a message". The draw-time `!self.err.is_empty()`
+// guards elsewhere in this file get away with that because the text
+// routine they feed stops at the leading NUL and paints nothing either way;
+// live_recheck() below cannot get away with it, because it uses the answer
+// to decide whether to do any work at all. Use this everywhere the question
+// is "is this NUL-terminated slice logically empty", not `.is_empty()`.
+fn strlen0(s: &[u8]) -> usize {
+    let mut i = 0; while i < s.len() && s[i] != 0 { i += 1; } i
+}
+
 impl App {
+    // Returns the first PG_ACCOUNT rule the CURRENT field state violates, as
+    // (message, err_focus), or None if the page is currently valid. err_focus
+    // of -1 means "no specific field" (draws at the default y). This never
+    // touches self.focus (the KEYBOARD focus) - only validate() does that,
+    // and only at Continue-time; a live recheck must never yank the cursor
+    // out from under whatever field the person is still typing in.
+    fn account_rule(&self, tolerant: bool) -> Option<(&'static [u8], i32)> {
+        if self.fullname.is_empty() {
+            return Some((b"Enter your full name.\0", 0));
+        }
+        if self.username.is_empty() {
+            return Some((b"Enter a username.\0", 1));
+        }
+        let mut i = 0;
+        while i < self.username.n {
+            let c = self.username.b[i];
+            let ok = (c >= b'a' && c <= b'z') || (c >= b'0' && c <= b'9')
+                     || c == b'_' || c == b'-';
+            if !ok { return Some((b"Use lowercase letters, digits, '-' or '_' only.\0", -1)); }
+            i += 1;
+        }
+        // 'root' is a reserved system account (SYS_USER_CREATE_PW refuses it);
+        // say so here rather than surfacing a bare -2 at the last step.
+        if self.username.n == 4 && &self.username.b[0..4] == b"root" {
+            return Some((b"'root' is reserved. Choose another username.\0", -1));
+        }
+        // #745. This used to be `self.pw.n < 6` against a kernel minimum of
+        // EIGHT, plus seven other kernel rules and a 50,000-entry breached
+        // list this page knew nothing about. So the page could accept a
+        // password the kernel then refused at Apply, seven pages later, at
+        // the one moment the user can do least about it. It now asks the
+        // kernel the same question the kernel will answer again later.
+        //
+        // The kernel remains the authority: a negative return means the
+        // syscall is unavailable, and the only correct response to that is
+        // to keep a floor and let the kernel refuse at Apply, which apply()
+        // handles and reports per-rule.
+        let pc = pw_policy_check(self.username.cstr(), &self.pw);
+        if pc > 0 { return Some((pw_msg(pc), 2)); }
+        if pc < 0 && self.pw.n < 8 {
+            return Some((b"Password must be at least 8 characters.\0", 2));
+        }
+        let pw_bad = if tolerant { pw_diverged(&self.pw, &self.pw2) } else { !self.pw.eq(&self.pw2) };
+        if pw_bad { return Some((b"The passwords do not match.\0", 3)); }
+
+        // Root's password, checked against the name "root" and NOT against
+        // the human's: the contains-username rule is per name, and the
+        // kernel splits it the same way (users_check_first_boot_pair).
+        let rc = pw_policy_check(b"root\0", &self.rootpw);
+        if rc > 0 { return Some((pw_msg_root(rc), 4)); }
+        if rc < 0 && self.rootpw.n < 8 {
+            return Some((b"Root password must be at least 8 characters.\0", 4));
+        }
+        let rootpw_bad = if tolerant { pw_diverged(&self.rootpw, &self.rootpw2) } else { !self.rootpw.eq(&self.rootpw2) };
+        if rootpw_bad { return Some((b"The root passwords do not match.\0", 5)); }
+
+        // Identical passwords put uid 0 back behind the desktop credential,
+        // which is the whole thing the second field exists to prevent. The
+        // kernel refuses this too; it is repeated here so the message
+        // arrives while the fields are still on screen.
+        if self.pw.eq(&self.rootpw) {
+            return Some((pw_msg_root(PW_ERR_SAME_AS_OTHER), 4));
+        }
+        // Tell the user NOW, on the page where the field is, rather than
+        // after they have walked seven more pages and hit Set Up.
+        if username_taken(&self.username) {
+            return Some((b"That username is already taken. Choose another.\0", -1));
+        }
+        None
+    }
+
+    // Same shape for PG_NETWORK's static-address fields. No tolerant variant:
+    // a dotted-quad check has no "still might complete correctly" ambiguity
+    // the way a two-field equality check does, so a plain re-check on every
+    // keystroke already behaves correctly (stays up while genuinely
+    // incomplete/invalid, clears the moment it parses).
+    fn network_rule(&self) -> Option<(&'static [u8], i32)> {
+        if !self.dhcp {
+            if !is_dotted_quad(&self.ip) { return Some((b"Enter a valid IP address, e.g. 192.0.2.1.\0", -1)); }
+            if !is_dotted_quad(&self.mask) { return Some((b"Enter a valid netmask, e.g. 255.255.255.0.\0", -1)); }
+            if !self.gw.is_empty() && !is_dotted_quad(&self.gw) { return Some((b"Gateway is not a valid address.\0", -1)); }
+            if !self.dns.is_empty() && !is_dotted_quad(&self.dns) { return Some((b"DNS server is not a valid address.\0", -1)); }
+        }
+        None
+    }
+
     fn validate(&mut self) -> bool {
         self.err = b"\0"; self.err_focus = -1;
         if self.page == PG_ACCOUNT {
-            if self.fullname.is_empty() {
-                self.err = b"Enter your full name.\0"; self.focus = 0; self.err_focus = 0; return false;
-            }
-            if self.username.is_empty() {
-                self.err = b"Enter a username.\0"; self.focus = 1; self.err_focus = 1; return false;
-            }
-            let mut i = 0;
-            while i < self.username.n {
-                let c = self.username.b[i];
-                let ok = (c >= b'a' && c <= b'z') || (c >= b'0' && c <= b'9')
-                         || c == b'_' || c == b'-';
-                if !ok { self.err = b"Use lowercase letters, digits, '-' or '_' only.\0"; return false; }
-                i += 1;
-            }
-            // 'root' is a reserved system account (SYS_USER_CREATE_PW refuses it);
-            // say so here rather than surfacing a bare -2 at the last step.
-            if self.username.n == 4 && &self.username.b[0..4] == b"root" {
-                self.err = b"'root' is reserved. Choose another username.\0"; return false;
-            }
-            // #745. This used to be `self.pw.n < 6` against a kernel minimum of
-            // EIGHT, plus seven other kernel rules and a 50,000-entry breached
-            // list this page knew nothing about. So the page could accept a
-            // password the kernel then refused at Apply, seven pages later, at
-            // the one moment the user can do least about it. It now asks the
-            // kernel the same question the kernel will answer again later.
-            //
-            // The kernel remains the authority: a negative return means the
-            // syscall is unavailable, and the only correct response to that is
-            // to keep a floor and let the kernel refuse at Apply, which apply()
-            // handles and reports per-rule.
-            let pc = pw_policy_check(self.username.cstr(), &self.pw);
-            if pc > 0 { self.err = pw_msg(pc); self.focus = 2; self.err_focus = 2; return false; }
-            if pc < 0 && self.pw.n < 8 {
-                self.err = b"Password must be at least 8 characters.\0"; self.focus = 2; self.err_focus = 2; return false;
-            }
-            if !self.pw.eq(&self.pw2) { self.err = b"The passwords do not match.\0"; self.focus = 3; self.err_focus = 3; return false; }
-
-            // Root's password, checked against the name "root" and NOT against
-            // the human's: the contains-username rule is per name, and the
-            // kernel splits it the same way (users_check_first_boot_pair).
-            let rc = pw_policy_check(b"root\0", &self.rootpw);
-            if rc > 0 { self.err = pw_msg_root(rc); self.focus = 4; self.err_focus = 4; return false; }
-            if rc < 0 && self.rootpw.n < 8 {
-                self.err = b"Root password must be at least 8 characters.\0"; self.focus = 4; self.err_focus = 4; return false;
-            }
-            if !self.rootpw.eq(&self.rootpw2) {
-                self.err = b"The root passwords do not match.\0"; self.focus = 5; self.err_focus = 5; return false;
-            }
-            // Identical passwords put uid 0 back behind the desktop credential,
-            // which is the whole thing the second field exists to prevent. The
-            // kernel refuses this too; it is repeated here so the message
-            // arrives while the fields are still on screen.
-            if self.pw.eq(&self.rootpw) {
-                self.err = pw_msg_root(PW_ERR_SAME_AS_OTHER); self.focus = 4; self.err_focus = 4; return false;
-            }
-            // Tell the user NOW, on the page where the field is, rather than
-            // after they have walked seven more pages and hit Set Up.
-            if username_taken(&self.username) {
-                self.err = b"That username is already taken. Choose another.\0";
+            if let Some((msg, ef)) = self.account_rule(false) {
+                self.err = msg; self.err_focus = ef;
+                // Land the keyboard on the offending field, same as before
+                // this was refactored - but only for a real field index
+                // (0..=5); the char-set/reserved-name/taken checks return
+                // ef == -1 and, as before, leave focus wherever it was.
+                if ef >= 0 { self.focus = ef as usize; }
                 return false;
             }
             return true;
         }
-        if self.page == PG_NETWORK && !self.dhcp {
-            if !is_dotted_quad(&self.ip) { self.err = b"Enter a valid IP address, e.g. 192.0.2.1.\0"; return false; }
-            if !is_dotted_quad(&self.mask) { self.err = b"Enter a valid netmask, e.g. 255.255.255.0.\0"; return false; }
-            if !self.gw.is_empty() && !is_dotted_quad(&self.gw) { self.err = b"Gateway is not a valid address.\0"; return false; }
-            if !self.dns.is_empty() && !is_dotted_quad(&self.dns) { self.err = b"DNS server is not a valid address.\0"; return false; }
+        if self.page == PG_NETWORK {
+            if let Some((msg, _)) = self.network_rule() { self.err = msg; return false; }
         }
         true
+    }
+
+    // #154: re-derive the on-screen message from current state after every
+    // keystroke, so it can never go stale. Deliberately does nothing while
+    // self.err is already empty - it only ever REFRESHES a message that is
+    // already up (clearing it, changing it to whatever IS currently wrong,
+    // or leaving it as-is), it never invents a new warning on a page nobody
+    // has tried to advance from yet. That keeps the wizard's existing
+    // "quiet until Continue" first impression: fields do not turn red just
+    // because they are empty on a page you have not tried to leave.
+    fn live_recheck(&mut self) {
+        // NOTE: this is deliberately strlen0(), not self.err.is_empty().
+        // Every "cleared" assignment in this file (including this function's
+        // own None arms two lines down) writes the ONE-byte slice b"\0", a
+        // C-string convention the draw-time checks (dk_solid's own
+        // `!self.err.is_empty()` gates) tolerate only because the text
+        // routine itself stops at the leading NUL and paints nothing - the
+        // slice is never Rust-empty (len 1, not 0), so `.is_empty()` here
+        // would ALWAYS be false and this guard would never fire, defeating
+        // the whole "do nothing while nothing is shown" contract below.
+        // Caught with a temporary debug-log build made for this ticket's own
+        // verification (append self.err to a file on every live_recheck()
+        // call, read it back offline): a version of this guard written as
+        // `self.err.is_empty()` fired on the VERY FIRST keystroke of a blank
+        // page, before Continue was ever pressed, because b"\0" is never
+        // Rust-empty - it would have painted a live error early. Fixed to
+        // strlen0() before this landed; left as a documented trap because it
+        // is an easy mistake to reintroduce anywhere else in this file.
+        if strlen0(self.err) == 0 { return; }
+        if self.page == PG_ACCOUNT {
+            match self.account_rule(true) {
+                Some((msg, ef)) => { self.err = msg; self.err_focus = ef; }
+                None => { self.err = b"\0"; self.err_focus = -1; }
+            }
+        } else if self.page == PG_NETWORK {
+            match self.network_rule() {
+                Some((msg, ef)) => { self.err = msg; self.err_focus = ef; }
+                None => { self.err = b"\0"; self.err_focus = -1; }
+            }
+        }
     }
 
     // #745 task #15: apply the dock pin selection through FAVCH.CFG, the
@@ -5754,6 +6481,41 @@ impl App {
     fn apply(&mut self) -> bool {
         self.substep = 0; self.draw();
 
+        // #126: THE REDUCED FLOW APPLIES ONLY WHAT IT ASKED ABOUT.
+        //
+        // Everything between here and the "self.substep = 4" theme block is
+        // MACHINE scope: creating the first admin account, the startup/autologin
+        // preference, the sign-in screen mode, the static IP, the timezone and
+        // the hardware clock. A second user personalising their desktop has no
+        // business writing any of it, and several of those calls would actively
+        // damage the machine if they ran again (SYS_FIRSTBOOT_ADMIN would try to
+        // mint another admin; SYS_SET_AUTOLOGIN would rewrite LOGIN.CFG for
+        // whoever the wizard happened to be run by).
+        //
+        // Guarded as ONE block rather than per-call, because "which of these is
+        // machine scope" is a single question with a single answer and splitting
+        // it into six independent conditions is six chances to get it wrong.
+        if !personalise() {
+        // #229: MACHINE SCOPE SPLITS IN TWO, BECAUSE ROOT-ONLY AND MACHINE-WIDE
+        // ARE NOT THE SAME PROPERTY.
+        //
+        // Everything under `!personalise()` is machine scope. Of it, exactly two
+        // things additionally require ROOT: creating the account (root's
+        // password is one of the three arguments) and rewriting
+        // /CONFIG/LOGIN.CFG. Their pages are not in a non-root session's flow at
+        // all (page_enabled / machine_admin), so running their apply steps
+        // anyway would submit fields nobody was ever shown - empty ones - and
+        // then report the kernel's refusal of them as the wizard's own failure.
+        // That is exactly what a non-root first boot did: "The account could not
+        // be created. Try a different username."
+        //
+        // The rest of the block - the time zone, the hardware clock - is machine
+        // scope but NOT root-gated (sys_set_rtc_time/date take no euid check),
+        // so it still runs and still takes effect. Guarded as ONE condition for
+        // the same reason the outer block is: "which of these needs root" is a
+        // single question with a single answer, and splitting it per call is a
+        // chance to get it wrong per call.
+        if machine_admin() {
         // #745. ONE call that creates the human account AND gives root its own
         // password, validating both under one decision before either lands.
         //
@@ -5831,8 +6593,19 @@ impl App {
             self.apply_err = b"Sign-in screen preference not saved; it will ask for a name and password.\0";
         }
 
+        }   // #229 end of the ROOT-ONLY part of the machine-scope block
+
         self.substep = 2; self.draw();
-        if !self.dhcp {
+        // #229: `&& machine_admin()`. /CONFIG/NETIP.CFG is a write to the same
+        // root-owned directory as everything else this ticket moved, so a
+        // non-root session cannot make it. It is a guard rather than a move to
+        // SYS_FIRSTRUN because this branch is currently UNREACHABLE - the
+        // Network page is compile-disabled and `dhcp` starts true and is
+        // cleared only by that page - and an op with zero callers is a feature
+        // that has never run. When NETWORK_PAGE_ENABLED goes back to true, add
+        // FR_SET_NETIP (with a dotted-quad validator) in kernel/rustkern/
+        // firstrun.rs and call it from here; do not reach for open() again.
+        if !self.dhcp && machine_admin() {
             let mut b: [u8; 200] = [0; 200];
             let mut n = 0usize;
             n += put(&mut b, n, b"ip=");   n += putf(&mut b, n, &self.ip);   n += put(&mut b, n, b"\n");
@@ -5894,7 +6667,15 @@ impl App {
             }
         }
 
+        }   // #126 end of the machine-scope block
+
+        // From here down is PER-USER, and is the whole of the reduced flow.
+        // Every write below already lands in the session user's own home
+        // (userconf/UIPROFIL.YML/THEME.CFG all resolve through the passwd
+        // table), which is why the second user's choices cannot touch root's -
+        // that half already worked and is deliberately untouched.
         self.substep = 4; self.draw();
+        if self.pers_skip_from > PG_APPEAR {
         if self.nthemes > 0 && self.theme < self.nthemes {
             unsafe { gui_theme_activate(THEMES[self.theme].slug.as_ptr()); }
         }
@@ -5904,6 +6685,7 @@ impl App {
         // userconf_open_write().
         write_dock_style_live(self.dock_style);
         write_dock_style(self.dock_style);
+        }
 
         // #745 dark port: this used to be one sub-step ("theme and desktop
         // picture") but the dark PG_APPLY checklist draws "Apply theme" and
@@ -5915,7 +6697,7 @@ impl App {
         // a time" rule with a fabricated instant. Substep numbering below is
         // renumbered accordingly: 0..7 (8 states), not the old 0..6.
         self.substep = 5; self.draw();
-        if self.nwalls > 0 && self.wall < self.nwalls {
+        if self.pers_skip_from > PG_WALL && self.nwalls > 0 && self.wall < self.nwalls {
             unsafe { syscall1(SYS_SET_WALLPAPER, self.wall as i64); }
         }
 
@@ -5929,10 +6711,13 @@ impl App {
         // nothing else: both are independent per-user channel files, so their
         // relative order to each other does not matter, only that both land
         // well before /CONFIG/SETUPDONE at the very end of this function.
-        self.write_appsw_favs();
-        self.write_appsw_widgets();
+        if self.pers_skip_from > PG_APPSW {
+            self.write_appsw_favs();
+            self.write_appsw_widgets();
+        }
 
         self.substep = 6; self.draw();
+        if !personalise() {
         {
             // #745 follow-up: write the REAL AISVC.CFG contract aiclient.c's
             // load_aisvc() reads (provider=/endpoint=/model=/api_style=/
@@ -5983,12 +6768,60 @@ impl App {
             }
         }
 
+        }   // #126 end of the AI block (machine-scope flow only)
+
+        // ------------------------------------------------------------------
+        // #126: TWO MARKERS, TWO DIFFERENT STATEMENTS.
+        //
+        //   /CONFIG/SETUPDONE       "THE MACHINE has been set up."
+        //                           One absolute path, written once, on first
+        //                           boot only. Unchanged meaning, unchanged
+        //                           readers (compositor main.c :307/:1425/
+        //                           :2594, setup_pending_recheck()).
+        //
+        //   <home>/CONFIG/SETUPUSR  "THIS USER has personalised their desktop."
+        //                           Per user, resolved by the SAME passwd-table
+        //                           join that already puts UIPROFIL.YML in the
+        //                           right home (libc/userconf.c). Not a new
+        //                           config system: it is one more name in the
+        //                           per-user namespace that already exists.
+        //
+        // Root's home is "/", so root's per-user marker is /CONFIG/SETUPUSR -
+        // beside SETUPDONE, and a different file from it. That is the same
+        // no-op-for-root property userconf.c was built around, not a collision.
+        //
+        // ORDER: the per-user marker FIRST, then the machine marker. If the
+        // machine marker landed first and the per-user write then failed, the
+        // machine would be "configured" with a user who is told to personalise
+        // again on the next login. The other way round, a failure means the
+        // whole wizard re-runs, which is the failure the existing comment below
+        // already argues for.
+        //
         // The marker goes LAST and only once the account exists, so a hard
         // failure above re-runs setup on the next boot rather than stranding a
         // machine with no account and no way back into this wizard.
         self.substep = 7; self.draw();
-        let r = unsafe { userconf_write_all(b"/CONFIG/SETUPDONE\0".as_ptr(), b"1\n".as_ptr(), 2) };
-        if r != 0 { self.err = b"Could not save setup state. Setup will run again.\0"; return false; }
+        {
+            let fd = unsafe { userconf_open_write(b"SETUPUSR\0".as_ptr()) };
+            let ok = fd >= 0 && unsafe { userconf_finish_write(fd, b"1\n".as_ptr(), 2) } == 0;
+            if !ok {
+                self.err = b"Could not save your setup state. This will run again next time.\0";
+                return false;
+            }
+        }
+        if !personalise() {
+            // #229: ASKED FOR, NOT WRITTEN. This was
+            // userconf_write_all("/CONFIG/SETUPDONE"), which a uid-1000 session
+            // cannot do, so on a virgin machine the wizard could never record
+            // that it had finished and came back at every boot. The kernel owns
+            // the marker now (SYS_FIRSTRUN / rustkern/firstrun.rs) and writes it
+            // from Ring 0, after checking the fact the marker actually asserts:
+            // that the machine has at least one account. This is the ONE op here
+            // that can legitimately fail (-2 no account, -1 no disk), so unlike
+            // the two per-boot signals it is checked.
+            let r = unsafe { syscall1(SYS_FIRSTRUN, FR_MARK_DONE) };
+            if r != 0 { self.err = b"Could not save setup state. Setup will run again.\0"; return false; }
+        }
         true
     }
 }
@@ -6116,17 +6949,204 @@ impl App {
         }
     }
 
+    // Read-only twin of field_mut(), for draw_field_delta() below, which only
+    // ever needs to READ the field it is repainting.
+    fn field_ref(&self, i: usize) -> &Field {
+        match (self.page, i) {
+            (PG_ACCOUNT, 0) => &self.fullname,
+            (PG_ACCOUNT, 1) => &self.username,
+            (PG_ACCOUNT, 2) => &self.pw,
+            (PG_ACCOUNT, 3) => &self.pw2,
+            (PG_ACCOUNT, 4) => &self.rootpw,
+            (PG_ACCOUNT, 5) => &self.rootpw2,
+            (PG_NETWORK, 0) => &self.ip,
+            (PG_NETWORK, 1) => &self.mask,
+            (PG_NETWORK, 2) => &self.gw,
+            (PG_NETWORK, _) => &self.dns,
+            _ => &self.aikey,
+        }
+    }
+
+    // (#wizflash) Redraw ONLY the field that just changed, for the common
+    // case of a keystroke that edits PG_ACCOUNT/PG_NETWORK text in place
+    // (same page, same focus, no validation-message change - see the call
+    // site in main()'s event loop for the exact guard). This is what makes a
+    // keystroke stop flashing the wizard window on real hardware.
+    //
+    // WHY THIS IS SAFE WITHOUT REPAINTING THE BACKDROP FIRST, WHICH IS WHAT
+    // draw() ALWAYS DOES: dk_field() (see its own doc comment) always fills
+    // its ENTIRE box with an opaque colour before drawing its border/text, so
+    // it never depends on what a previous frame left behind - unlike a label
+    // or the page title, which alpha-blend their anti-aliased glyph edges
+    // against whatever is already in the content buffer and would visibly
+    // thicken, redrawn twice in a row without the backdrop under them being
+    // repainted first. That is why this function touches ONLY the field box,
+    // nothing else on the page.
+    //
+    // WHY THE FULL draw() FLASHES AND THIS DOES NOT: every full draw() starts
+    // with dk_page_chrome() -> dk_fill_bg() -> card_paint_backdrop(), which
+    // blits the translucent card background as up to 20 separate SYS_WIN_
+    // DRAW_IMAGE calls (see card_paint_backdrop()'s own comment: "20 blits,
+    // not 423,808 rects"). Each of those calls self-commits in the kernel
+    // (sys_win_draw_image() always calls wm_invalidate_rect_async() +
+    // uw_commit_content(), by design, for apps that never call
+    // win_invalidate() themselves - see the block comment above
+    // uw_commit_content() in kernel/proc/syscall.c). This app DOES call
+    // win_invalidate() itself, once, at the end of every draw(), so those
+    // per-strip self-commits are pure overhead for it: each one publishes an
+    // INCOHERENT partial frame (part of the OLD frame's field text still
+    // sitting under a freshly repainted patch of backdrop) that the
+    // compositor's own, independently scheduled redraw can and does pick up
+    // and show on the real screen before the next strip - or the final
+    // win_invalidate() - ever runs. This does not need two cores: it is
+    // ordinary preemptive scheduling landing between two of this app's own
+    // syscalls, so it reproduces even with the single user core #514
+    // measured on the reporting machine. dk_field()'s own primitives
+    // (win_draw_rect/win_draw_pixel/win_draw_text_ttf_ex, reached through
+    // gui_fill_rounded_aa()/gui_fill_circle_aa()/rect()/dk_solid()) never
+    // self-commit, so calling only those and then ONE win_invalidate() here
+    // publishes exactly one coherent frame, same as the ideal case draw()
+    // itself is aiming for but defeats by also drawing the backdrop.
+    //
+    // This is NOT the #67/local-128 cross-core race (see blame.md): that bug
+    // was window_invalidate() painting the shared framebuffer FROM THE WRONG
+    // CORE and was fixed by routing through wm_invalidate_rect_async()
+    // instead - a fix already present at every self-commit site this comment
+    // just named. "Single-core, those two can never overlap" is that fix's
+    // own conclusion, and the reporting machine has exactly one user core
+    // (#514: g_smp_user_sched=0), so that mechanism is excluded here by
+    // construction. This is a different bug the same self-commit machinery
+    // can still produce on any core count: too many published intermediate
+    // states, not a torn write to one of them.
+    fn draw_field_delta(&mut self) {
+        let win = self.win;
+        match self.page {
+            PG_ACCOUNT => {
+                let (x, y, w, h, ph) = Self::account_field_geom(self.focus);
+                let f = self.field_ref(self.focus);
+                dk_field(win, x, y, w, h, f, ph, true, false);
+            }
+            PG_NETWORK => {
+                let (x, y, w, h, ph) = Self::network_field_geom(self.focus);
+                let f = self.field_ref(self.focus);
+                dk_field(win, x, y, w, h, f, ph, true, false);
+            }
+            // (#wizflash) PG_AI's text fields (endpoint/model/key) measured
+            // 21 SYS_WIN_DRAW_IMAGE publishes per keystroke before this fix
+            // (card_paint_backdrop()'s 20 self-committing blits, plus the
+            // page's own win_invalidate()) - the same full-page-redraw cost
+            // PG_ACCOUNT/PG_NETWORK had, applied here with the same fix.
+            // The event loop's guard only reaches this arm for ai_focus in
+            // {1,2,3} (never 0, the provider grid - selecting a different
+            // provider changes the card highlights, the endpoint info line,
+            // the model prefill and the Custom shift, which is a real
+            // structural change) AND only when ai_key_show_saved() has NOT
+            // just flipped (that transition swaps a "KEY SET" badge for the
+            // live field, also structural - see ai_key_show_saved()'s own
+            // comment).
+            PG_AI => {
+                let is_custom = self.ai_provider == AI_CUSTOM;
+                match self.ai_focus {
+                    1 if is_custom => {
+                        let (x, y, w, h, ph) = Self::ai_field_geom(1, is_custom);
+                        dk_field(win, x, y, w, h, &self.ai_endpoint, ph, true, false);
+                    }
+                    2 => {
+                        let (x, y, w, h, ph) = Self::ai_field_geom(2, is_custom);
+                        dk_field(win, x, y, w, h, &self.ai_model, ph, true, false);
+                    }
+                    3 => {
+                        let (x, y, w, h, ph) = Self::ai_field_geom(3, is_custom);
+                        dk_field(win, x, y, w, h, &self.aikey, ph, true, false);
+                    }
+                    _ => {}
+                }
+            }
+            // Any other page falls back to the caller doing a full draw() -
+            // see the guard in main()'s event loop, which only ever reaches
+            // here for PG_ACCOUNT/PG_NETWORK/PG_AI. Kept exhaustive rather
+            // than unreachable!() so a future page added to that guard
+            // without a matching arm here fails safe (draws nothing extra)
+            // instead of panicking the wizard.
+            _ => {}
+        }
+        win_invalidate(win);
+    }
+
     fn next(&mut self) -> bool {
         if !self.validate() { return true; }
-        if self.page == PG_AI {
+        if self.page == PG_DONE {
+            // FINISH. ===============================================
+            // #203/#126: this is the moment the machine changes hands.
+            //
+            // The owner reported "in the first run wizard we created a user
+            // (james) and then it logged us in as root?", and every write this
+            // wizard makes SUCCEEDS: the account exists, LOGIN.CFG says james.
+            // The machine stays root's because the wizard runs INSIDE the
+            // session that shipped autologin=root, and Finish only exits THIS
+            // process. The compositor beneath it never goes anywhere.
+            //
+            // The handover the machine already has is Log Out: the compositor
+            // exits, gui/desktop.c notices, and main.c's login gate re-runs
+            // login_check_autologin() in the same boot. So Finish has to tell
+            // the compositor to do exactly that.
+            //
+            // WHY A MARKER AND NOT /CONFIG/SETUPDONE. SETUPDONE is written at
+            // the END OF apply(), which runs when Continue is pressed on the
+            // last page - BEFORE this Done page is ever drawn. Keying the
+            // compositor's exit off SETUPDONE takes the desktop away about
+            // half a second after Apply, so the person never sees the Done
+            // page and never presses Finish. The marker's NAME suggests
+            // otherwise; its write site is what decides.
+            //
+            // ONLY THE FIRST-BOOT FLOW. In the reduced personalisation flow
+            // (#126 Part B) the person is already signed in as themselves,
+            // there is nothing to hand over, and exiting the compositor would
+            // log them out for having chosen a wallpaper.
+            //
+            // Same shape as #136's /CONFIG/SETUPSKIP, deliberately: one
+            // transient marker, written here, consumed and unlinked in
+            // userland/apps/compositor/main.c. Not a new mechanism.
+            //
+            // #229: A KERNEL FLAG, NOT A FILE, AND ONLY WHEN THE MACHINE
+            // ACTUALLY CHANGED HANDS.
+            //
+            // The file write was refused outright on a non-root session
+            // (/CONFIG is root-owned 0711), and the compositor's own
+            // "delete any stale SETUPNEW" cleanup - added by #203 because a
+            // leftover marker logged somebody out of a machine that had not
+            // changed hands - was a write to the same directory and so failed
+            // on the same session. A one-boot signal stored on persistent
+            // media manufactures that bug; a bit of kernel RAM starts clear at
+            // every boot and cannot leave one behind. FR_HANDOVER_TAKE is a
+            // CONSUMING read, so it also cannot fire twice.
+            //
+            // AND IT IS NOW CONDITIONAL ON machine_admin(). The handover
+            // exists for one situation: the wizard created an account while
+            // running inside somebody else's session (the shipped
+            // autologin=root one), so the machine has to be handed to the
+            // account that was just made. A non-root session did not create an
+            // account - PG_ACCOUNT is not in its flow at all - and it is
+            // ALREADY signed in as the owner. Logging that person out at
+            // Finish would be a full sign-in cycle charged for choosing a
+            // wallpaper.
+            if !personalise() && machine_admin() {
+                unsafe { syscall1(SYS_FIRSTRUN, FR_HANDOVER_SET); }
+            }
+            return false;   // Finish -> exit
+        }
+        // #126: the LAST page of the current flow runs Apply, whichever page
+        // that is. The old `if self.page == PG_AI` hardcoded the full flow's
+        // last page, so a reduced flow would have walked past its own end.
+        if flow_next(self.page).is_none() {
             self.page = PG_APPLY;
             let ok = self.apply();
-            self.page = if ok { PG_DONE } else { PG_ACCOUNT };
+            self.page = if ok { PG_DONE } else { flow_error_page() };
             self.focus = 0;
             return true;
         }
-        if self.page == PG_DONE { return false; }   // Finish -> exit
-        self.page += 1; self.focus = 0; self.err = b"\0";
+        self.page = match flow_next(self.page) { Some(p) => p, None => self.page };
+        self.focus = 0; self.err = b"\0";
         // #745: PG_SIGNIN's entry focus is the startup group, arriving from
         // either direction. The SELECTIONS are not reset - coming Back from
         // page 4 restores what was chosen - only the keyboard position is.
@@ -6152,9 +7172,106 @@ impl App {
         self.reset_optional_from(self.page);
         self.page = PG_APPLY;
         let ok = self.apply();
-        self.page = if ok { PG_DONE } else { PG_ACCOUNT };
+        // #229: flow_error_page(), not a hardcoded PG_ACCOUNT. next()'s Apply
+        // path already went through that helper; this one did not, and on a
+        // non-root session PG_ACCOUNT is not in the flow, so a failed "Set up
+        // later" landed on a page the dots say does not exist and that Continue
+        // cannot navigate out of. Two call sites, one answer.
+        self.page = if ok { PG_DONE } else { flow_error_page() };
         self.focus = 0;
         true
+    }
+
+    // #136: the bottom-right "Skip to Desktop" corner control. See
+    // corner_hit()'s block comment for the full contract this exists to
+    // satisfy; in short - unlike skip() above, this must work with NO
+    // account yet, must write NOTHING durable except a throwaway per-boot
+    // marker, and must NOT write /CONFIG/SETUPDONE (that would be exactly
+    // the "half-configured, but marked done forever" failure mode the
+    // ticket calls out).
+    //
+    // Deliberately skips apply() entirely: nothing downstream ever reads a
+    // half-chosen theme/wallpaper/network/AI setting from a session that
+    // never finished, so writing any of it here would be pure risk (a
+    // stale static IP, a wrong RTC write) for zero benefit. Leaving the
+    // machine untouched is what "must not end up half-configured" means.
+    //
+    // /CONFIG/SETUPSKIP is consumed on the userland/apps/compositor/main.c
+    // side: setup_pending_recheck() treats its presence as "let the
+    // desktop chrome through for the REST OF THIS BOOT ONLY", and the
+    // boot-time SETUP spawn site (main(), where g_setup_pending is armed)
+    // deletes any stale copy before arming, so a previous skip can never
+    // mask the next boot's fresh /CONFIG/SETUPDONE-absent respawn. Returns
+    // false (same as PG_DONE's Finish/next()) so the caller's event loop
+    // breaks, win_destroy() runs and this process exits normally - that IS
+    // "reaching the desktop": nothing else needs to be launched, the
+    // compositor is already running underneath this window.
+    //
+    // #229: IT IS NOW A KERNEL FLAG AND IT CANNOT FAIL.
+    //
+    // This used to write /CONFIG/SETUPSKIP, and refuse to exit if the write
+    // failed - a refusal that was correct given the design and fatal given the
+    // permissions. /CONFIG is root-owned 0711 and the session is uid 1000, so
+    // on a virgin machine the write ALWAYS failed and the escape hatch reported
+    // "Could not reach the desktop; try again." forever. Measured on golden
+    // 2011; the kernel logged its own refusal each time,
+    // [PERMS-DENY] proc=SETUP uid=1000 gid=1000 want=-wx path=/CONFIG.
+    //
+    // An escape hatch must not share a failure mode with the thing it exists to
+    // escape. SYS_FIRSTRUN(FR_SKIP_SET) sets one bit of kernel RAM: no
+    // filesystem, no permission check, no policy in front of it, and by
+    // construction no way to return anything but 0. The return value is
+    // deliberately DISCARDED rather than checked, because there is no failure
+    // to handle and a check would only invite someone to add a refusal path
+    // back in. Returning false exits the event loop, win_destroy() runs and
+    // this process ends - which IS reaching the desktop: the compositor is
+    // already running underneath this window and clears its first-run gate off
+    // the same flag within ~330ms.
+    //
+    // #228 (found verifying #OOBEAUTH): THIS ESCAPE HATCH REACHED A DESKTOP
+    // WITH NO ACCOUNT AT ALL.
+    //
+    // Before #OOBEAUTH moved account creation out of the kernel's own login
+    // gate and into this wizard's PG_ACCOUNT + apply(), an account already
+    // existed by the time this process ever got control - the kernel gate
+    // was a mandatory, unskippable wall in front of it. So "Skip to Desktop"
+    // could only ever skip PERSONALISATION (network/time/appearance/...),
+    // never the account. #OOBEAUTH removed that wall, and this function did
+    // not gain the check it silently lost: F9 pressed on PG_WELCOME or
+    // PG_ACCOUNT still just sets the kernel flag and exits, with apply()
+    // (the only thing that ever calls SYS_FIRSTBOOT_ADMIN) never having run.
+    // MEASURED on golden 2030/2031: `/HOME` has no entry for the session's
+    // account, PERMS.DB grants it nothing, the shell's cwd is forced to
+    // `/` (no home to start in), and the only writable path anywhere on the
+    // image is /WINDIR/DRIVE_C (0777) - a desktop that cannot save a single
+    // file from any app.
+    //
+    // THE FIX ASKS THE KERNEL, LIVE, NOT A SESSION-START SNAPSHOT.
+    // FR_BOOTSTRAP_QUERY answers exactly the fact that matters: is the
+    // account table STILL empty right now. It is true only for the first-
+    // boot bootstrap session (see kernel/rustkern/firstrun.rs) and it flips
+    // false the instant SYS_FIRSTBOOT_ADMIN succeeds, so this check can never
+    // go stale - unlike MACHINE_ADMIN, which is a one-time snapshot by
+    // design and would be the wrong thing to read here.
+    //
+    // If it is still true, this is not an escape from a failing
+    // PERSONALISATION step, it is an attempt to leave before the one
+    // MANDATORY step #229 already treats as such (FR_MARK_DONE's own gate:
+    // "the machine must already have at least one active account"). Redirect
+    // to the one page that can still fix that (flow_error_page(), the same
+    // helper apply()'s own failure path already uses - one answer for "where
+    // does someone go who has not finished the mandatory step", not two)
+    // rather than reaching a homeless desktop. The escape hatch still cannot
+    // fail: it always does SOMETHING with the keypress, it just does the
+    // right something before an account exists.
+    fn skip_to_desktop(&mut self) -> bool {
+        if unsafe { syscall1(SYS_FIRSTRUN, FR_BOOTSTRAP_QUERY) } == 1 {
+            self.page = flow_error_page();
+            self.focus = 0;
+            return true;
+        }
+        unsafe { syscall1(SYS_FIRSTRUN, FR_SKIP_SET); }
+        false
     }
 
     // The defaults each optional page would have applied if it had been shown
@@ -6162,6 +7279,25 @@ impl App {
     // may have half-typed before pressing the link: a static IP with no netmask
     // must not be written just because the page was open when they gave up.
     fn reset_optional_from(&mut self, from: usize) {
+        // #126: IN THE REDUCED FLOW, SKIP MEANS "LEAVE MY SETTINGS ALONE",
+        // NOT "SET THEM TO THE FIRST ENTRY OF EACH LIST".
+        //
+        // On first boot there is nothing to preserve, so restoring the page
+        // defaults IS the honest reading of a skip. For a user who already has
+        // a theme and a wallpaper, writing theme 0 and wallpaper 0 because they
+        // declined to choose would be the wizard making a decision it was
+        // explicitly told not to make - and it would do it silently, which is
+        // the exact fault the "Set up later" comment above objects to.
+        //
+        // So the reduced flow records WHERE the person stopped and apply()
+        // writes nothing from that page onwards. Pages they already passed are
+        // decisions and are still applied, which is the same rule the full flow
+        // uses ("a network configuration the user already confirmed two pages
+        // ago is a decision, not a leftover").
+        if personalise() {
+            self.pers_skip_from = from;
+            return;
+        }
         // Sign-in: REQUIRE a password. The secure default, and the one the
         // wizard already starts with; stated here so a skip can never be the
         // path that quietly turns autologin back on.
@@ -6184,12 +7320,22 @@ impl App {
         // #745 task #15: apps/widgets. "I did not choose" means the system
         // keeps its shipped defaults (spec 9.3), which for apps is ZERO
         // favourites (that IS the shipped state - write_appsw_favs() already
-        // no-ops on an empty selection) and for widgets is simply not writing
-        // WIDGETCH.CFG at all, so Home Assistant and AI Chat stay on exactly
-        // as shipped. Clearing widgets_sel back to the compiled-in default
-        // would be harmless here (apply() never reads it when untouched) but
-        // is deliberately left alone: the touched flag, not the bitset, is
-        // what apply() gates on.
+        // no-ops on an empty selection, regardless of what APPS_DEFAULT_MASK
+        // proposes on the page) and for widgets is simply not writing
+        // WIDGETCH.CFG at all, so whatever the compositor already shipped
+        // (2026-08-18: Digital Clock, Calendar, Uptime, Weather, Home
+        // Assistant, Maytera AI - see clock.c/widgets.c compiled-in
+        // defaults) stays on exactly as shipped. Clearing widgets_sel back
+        // to the compiled-in default would be harmless here (apply() never
+        // reads it when untouched) but is deliberately left alone: the
+        // touched flag, not the bitset, is what apply() gates on. CONFIRMED
+        // deliberate, not the Back-reset bug it might look like: resetting
+        // apps_sel to 0 here means "propose nothing, change nothing", which
+        // is correct precisely because write_appsw_favs() no-ops on zero -
+        // resetting to APPS_DEFAULT_MASK instead would make a declined visit
+        // FORCE-WRITE the defaults, which is the opposite of "I did not
+        // choose" (verified against write_appsw_favs()'s own zero-guard
+        // above; do not "fix" this without re-reading that guard).
         if from <= PG_APPSW { self.apps_sel = 0; self.appsw_widgets_touched = false; }
         // AI: no key. An empty key is already "not configured" in apply().
         if from <= PG_AI {
@@ -6222,11 +7368,12 @@ impl App {
         // rough edge of this addition - flagged in the #745 port report,
         // not fixed here (out of scope for a colour/geometry port).
         if self.page == PG_DONE {
-            self.page = PG_AI; self.focus = 0; self.err = b"\0";
+            // #126: the last page of the CURRENT flow, not a hardcoded PG_AI.
+            self.page = flow_last(); self.focus = 0; self.err = b"\0";
             return;
         }
-        if self.page > PG_WELCOME && self.page <= PG_AI {
-            self.page -= 1; self.focus = 0; self.err = b"\0";
+        if let Some(prev) = flow_prev(self.page) {
+            self.page = prev; self.focus = 0; self.err = b"\0";
             self.signin_focus = 0;   // #745: see next()
         }
     }
@@ -6364,6 +7511,17 @@ impl App {
         // so pressing it on Welcome or Create-your-account does nothing at all,
         // which is the same answer the missing link gives.
         if ev.keycode == KC_F10 { return self.skip(); }
+        // #136: keyboard equivalents of the bottom-right corner controls,
+        // checked here for the same reason as KC_F10 just above (PG_TIME/
+        // PG_APPEAR consume every key). Unlike the mouse path, these are
+        // NOT gated on CARD_MODE - draw_corner_controls()/on_click() hide
+        // the legacy small-screen fallback's row for lack of space, but a
+        // keyboard-only path to a working Restart/Shut Down/Skip to Desktop
+        // must exist regardless of screen size (#334: mouse is unreliable,
+        // keyboard is the fallback that has to always work).
+        if ev.keycode == KC_F9 && self.page != PG_APPLY { return self.skip_to_desktop(); }
+        if ev.keycode == KC_F2 { do_reboot(); return true; }
+        if ev.keycode == KC_F3 { do_poweroff(); return true; }
 
         if self.page == PG_TIME { return self.time_on_key(ev); }
         if self.page == PG_APPEAR { return self.appear_on_key(ev); }
@@ -6405,7 +7563,18 @@ impl App {
                 // a security setting the person was not looking at.
                 return true;
             }
-            PG_NETWORK if self.nfields == 0 => { if c == b' ' { self.dhcp = !self.dhcp; net_test_reset(); } return true; }
+            PG_NETWORK if self.nfields == 0 => {
+                if c == b' ' {
+                    self.dhcp = !self.dhcp; net_test_reset();
+                    // #154: switching back to DHCP makes the static-address
+                    // fields moot, so any "not a valid address" warning they
+                    // raised is no longer a real problem - network_rule()
+                    // already no-ops while self.dhcp is true, so this just
+                    // clears whatever was showing.
+                    self.live_recheck();
+                }
+                return true;
+            }
             // #745 task #15: PG_APPSW. Arrows move the cursor WITHIN the
             // focused zone, clamped (never wrapped, matching PG_WALL's own
             // "no escape from the grid" rule above); Space TOGGLES the
@@ -6447,10 +7616,32 @@ impl App {
         let fld = self.field_mut(f);
         if c == 8 || c == 127 { fld.pop(); }
         else if c >= 32 && c < 127 { fld.push(c); }
+        // #154: an edit to ANY text field on this page can resolve (or
+        // change) whatever validation message is currently on screen -
+        // re-derive it from current state instead of leaving it latched
+        // from whenever it was first shown.
+        self.live_recheck();
         true
     }
 
     fn on_click(&mut self, mx: i32, my: i32) -> bool {
+        // #136: checked FIRST and unconditionally on self.page, because the
+        // PG_WELCOME arm immediately below returns unconditionally and would
+        // otherwise make a later check here dead code on that page - and
+        // Welcome/Account are exactly the two pages this control has to
+        // reach (see corner_hit()'s block comment).
+        if self.page != PG_APPLY && unsafe { CARD_MODE } {
+            for i in 0..3usize {
+                let (bx, by, bw, bh) = corner_hit(i);
+                if mx >= bx && mx < bx + bw && my >= by && my < by + bh {
+                    return match i {
+                        0 => self.skip_to_desktop(),
+                        1 => { do_reboot(); true }
+                        _ => { do_poweroff(); true }
+                    };
+                }
+            }
+        }
         if self.page == PG_WELCOME {
             // One control, one action. The second rect here was the "Set up
             // later" link, and it called the very same self.next() - see
@@ -6511,7 +7702,10 @@ impl App {
                 }
             }
             PG_NETWORK => {
-                if my >= 76 && my < 93 && mx >= 572 && mx < 606 { self.dhcp = !self.dhcp; net_test_reset(); }
+                if my >= 76 && my < 93 && mx >= 572 && mx < 606 {
+                    self.dhcp = !self.dhcp; net_test_reset();
+                    self.live_recheck();   // #154: see the keyboard toggle above
+                }
                 else if self.dhcp && my >= NET_BTN.1 && my < NET_BTN.1 + NET_BTN.3
                         && mx >= NET_BTN.0 && mx < NET_BTN.0 + NET_BTN.2 { self.net_retry(); }
                 else if !self.dhcp {
@@ -6931,6 +8125,52 @@ pub extern "C" fn main() -> i32 {
     // chromed window, passing an OUTER size bigger than W,H here would leave
     // a dead margin instead of filling it; W,H already IS the outer size for
     // a borderless window.
+    // -----------------------------------------------------------------------
+    // #126: WHICH WIZARD IS THIS? Decided here, from the two markers on disk,
+    // before a single pixel is drawn, and never revisited.
+    //
+    // The compositor already gates the spawn on the same two facts, so this is
+    // in principle a second reader of the same state. It is deliberate: the
+    // wizard is also launchable by hand and by an autorun line, and a wizard
+    // that decided its own scope from an argument it was not given would
+    // default to "create an account on a machine that already has one". The
+    // markers are the contract; both ends read the contract.
+    let machine_done = unsafe {
+        let fd = syscall3(SYS_OPEN, b"/CONFIG/SETUPDONE\0".as_ptr() as i64, 0, 0) as i32;
+        if fd >= 0 { syscall1(SYS_CLOSE, fd as i64); true } else { false }
+    };
+    // NO LEGACY FALLBACK for this one. userconf_open_read()'s second argument
+    // is the pre-#683 absolute path to fall back to, and passing NULL is how
+    // that file spells "there is no legacy location" (it returns -1 rather than
+    // opening anything). A fallback here would make root's presence/absence
+    // answer the question for every other user.
+    let user_done = unsafe {
+        let fd = userconf_open_read(b"SETUPUSR\0".as_ptr(), core::ptr::null());
+        if fd >= 0 { syscall1(SYS_CLOSE, fd as i64); true } else { false }
+    };
+    unsafe { PERSONALISE = machine_done; }
+    // #OOBEAUTH: and WHICH STEPS may this session perform? Decided here,
+    // once, before a pixel is drawn, from the two facts that can make it
+    // true: real root (geteuid() == 0, for any future caller that IS a
+    // signed-in root session), OR the kernel's own answer to "would my
+    // SYS_FIRSTBOOT_ADMIN call succeed right now" (FR_BOOTSTRAP_QUERY, true
+    // only for the narrow first-boot bootstrap session - see the long
+    // comment on MACHINE_ADMIN above and firstboot_bootstrap_ok_rs() in
+    // kernel/rustkern/firstrun.rs for exactly what that requires).
+    //
+    // geteuid(), not getuid(), for the first half: every gate downstream
+    // (sys_firstboot_admin's `p->euid != 0`, login_cfg_authorize's
+    // `p->euid == 0`) reads the EFFECTIVE uid, and asking a different
+    // question than the one that will be answered is how a wizard offers a
+    // step that then fails.
+    unsafe {
+        MACHINE_ADMIN = syscall0(SYS_GETEUID) == 0
+            || syscall1(SYS_FIRSTRUN, FR_BOOTSTRAP_QUERY) == 1;
+    }
+    // Nothing to ask. Exit rather than draw an empty wizard: this is the state
+    // every login after the first one is in, so it must cost nothing.
+    if machine_done && user_done { return 0; }
+
     let (sw, sh) = real_screen_size();
     unsafe { FB_W = sw; FB_H = sh; }
 
@@ -6999,17 +8239,26 @@ pub extern "C" fn main() -> i32 {
         nthemes: 0,
         nwalls: 0,
         substep: 0, apply_err: b"\0",
-        wel_btn: (0, 0, 0, 0), clock_skip: false,
+        wel_btn: (0, 0, 0, 0), clock_skip: false, pers_skip_from: usize::MAX,
         tzc_sel: 0, tzc_first: 0, tz_search: Field::new(false),
         time_focus: 0, ntp_on: false, ntp_server: Field::new(false), ntp_preset: 0,
         dt_year: 2026, dt_month: 1, dt_day: 1, dt_hour: 0, dt_min: 0, dt_sec: 0,
         dock_style: 0, appear_zone: 0,
         // #745 task #15: apps_sel seeded to the compiled-in default here
-        // (spec 6.1: "the five defaults... unless the person has already
-        // visited the page and gone Back", which just means never resetting
-        // it again after this one seed). widgets_sel is 0 here and
-        // overwritten below from the live profile, once, before the first
-        // draw - never re-read on a later visit, matching apps_sel.
+        // (spec 6.1: "the defaults... unless the person has already visited
+        // the page and gone Back", which just means never resetting it again
+        // after this one seed; APPS_DEFAULT_MASK held five bits when that
+        // spec text was written and now holds all twelve, 2026-08-18 owner
+        // decision - the "never reset it again" rule is unaffected by how
+        // many bits the mask sets). widgets_sel is 0 here and overwritten
+        // below from the live profile, once, before the first draw - never
+        // re-read on a later visit, matching apps_sel. That live-profile read
+        // is also how the six-widget owner default actually reaches this
+        // page on a fresh install: WIDGETS_DEFAULT_MASK only fires as
+        // read_widgets_from_profile()'s fallback when /UIPROFIL.YML cannot
+        // be read at all, so the widgets that must default on were made to
+        // match the compositor's OWN compiled-in defaults (clock.c,
+        // widgets.c) instead - see CHANGELOG 2026-08-18.
         apps_sel: APPS_DEFAULT_MASK, apps_focus: 0,
         widgets_sel: 0, widgets_cursor: 0,
         appsw_zone: 0, appsw_widgets_touched: false,
@@ -7132,7 +8381,41 @@ pub extern "C" fn main() -> i32 {
         if got == 0 { continue; }
         match ev.ty {
             EV_REDRAW => app.draw(),
-            EV_KEY_DOWN => { if !app.on_key(&ev) { break; } app.draw(); }
+            EV_KEY_DOWN => {
+                // (#wizflash) Snapshot BEFORE on_key() runs so the check right
+                // below can tell "a field's text changed in place" apart from
+                // "something else about the page changed" (focus moved,
+                // Enter/Esc navigated to a different page, a validation
+                // message appeared or disappeared). Only the first case is
+                // safe to redraw with the cheap single-field path - see
+                // draw_field_delta()'s own comment for exactly why.
+                let page_before = app.page;
+                let focus_before = app.focus;
+                // (#wizflash) PG_AI's own focus lives in ai_focus, not the
+                // generic `focus` ring (dk_draw_ai sets nfields = 0) - it needs
+                // its own before-snapshot, plus ai_key_show_saved() so a
+                // badge<->field transition on the key row is never mistaken
+                // for a same-shape text edit (see that method's comment).
+                let ai_focus_before = app.ai_focus;
+                let ai_key_show_saved_before = app.ai_key_show_saved();
+                let err_ptr_before = app.err.as_ptr();
+                let err_len_before = app.err.len();
+                if !app.on_key(&ev) { break; }
+                let simple_text_edit =
+                    app.page == page_before
+                    && app.err.as_ptr() == err_ptr_before
+                    && app.err.len() == err_len_before
+                    && (
+                        ((app.page == PG_ACCOUNT || app.page == PG_NETWORK)
+                            && app.focus == focus_before
+                            && app.nfields > 0)
+                        || (app.page == PG_AI
+                            && app.ai_focus == ai_focus_before
+                            && app.ai_focus != 0
+                            && app.ai_key_show_saved() == ai_key_show_saved_before)
+                    );
+                if simple_text_edit { app.draw_field_delta(); } else { app.draw(); }
+            }
             EV_MOUSE_DOWN => {
                 if ev.mouse_buttons & MOUSE_LEFT != 0 {
                     // Mouse coordinates arrive WINDOW-local; every hit-test in
@@ -7166,11 +8449,26 @@ pub extern "C" fn main() -> i32 {
         EV_MOUSE_MOVE => {
             let (mx, my) = win_to_body(ev.mouse_x, ev.mouse_y);
             if app.dragging { app.scroll_to_px(my); app.draw(); }
-                let (bx0, bx1, px0, px1, fy0, fy1) = footer_bounds(app.page);
-                let nv = if my >= fy0 && my <= fy1 {
-                    if mx >= px0 && mx <= px1 { 2 }
-                    else if mx >= bx0 && mx <= bx1 { 1 } else { 0 }
-                } else { 0 };
+                // (local 128) PG_WELCOME has NO footer nav. footer_bounds()
+                // deliberately ignores its page argument, and on_click() already
+                // returns early for PG_WELCOME above rather than consulting it,
+                // so the hover path was the one place that still applied the
+                // Back/Continue band to a page that draws neither. Crossing that
+                // band on page 1 flipped hover_nav and ran a FULL draw_welcome()
+                // - twenty 32-row backdrop strips plus every glyph - to produce a
+                // pixel-identical frame, because draw_welcome() never reads
+                // hover_nav. Wasted work at rest; under #67 AP scheduling it is
+                // also a window the compositor can composite the card in
+                // mid-repaint, which is the flashing this ticket started from.
+                // Gated here, next to the same early-return on_click() makes, so
+                // the two hit-test paths agree about which pages have a footer.
+                let nv = if app.page == PG_WELCOME { 0 } else {
+                    let (bx0, bx1, px0, px1, fy0, fy1) = footer_bounds(app.page);
+                    if my >= fy0 && my <= fy1 {
+                        if mx >= px0 && mx <= px1 { 2 }
+                        else if mx >= bx0 && mx <= bx1 { 1 } else { 0 }
+                    } else { 0 }
+                };
                 if nv != app.hover_nav { app.hover_nav = nv; app.draw(); }
             }
             // No window-close case: setup is not dismissable. Closing it would

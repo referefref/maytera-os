@@ -24,6 +24,9 @@ typedef struct {
     int   flags;
     int (*fn3)(const char *, const struct stat *, int);
     int (*fn4)(const char *, const struct stat *, int, struct FTW *);
+    // #120: FTW_MOUNT. The st_dev of the tree's ROOT. A directory whose st_dev
+    // differs is on another filesystem and is reported but not descended into.
+    unsigned long root_dev;
 } ftw_ctx;
 
 static int ftw_call(ftw_ctx *c, const struct stat *st, int type, int base, int level) {
@@ -54,6 +57,39 @@ static int ftw_walk(ftw_ctx *c, size_t plen, int base, int level) {
         type = FTW_D;
     } else {
         type = FTW_F;
+    }
+
+    // #120: FTW_MOUNT is now IMPLEMENTABLE and therefore implemented. It used
+    // to be refused with EINVAL, correctly, on the stated grounds that
+    // "this kernel's stat() zero-fills st_dev for every file on every
+    // filesystem. There is no information to make the decision with". #115 made
+    // st_dev real and #120's own measurement shows the distinction is not
+    // theoretical on this OS: under one root, /EFI reports st_dev 1 (the FAT
+    // ESP) and /APPS reports st_dev 2 (the ext2 root). A walk from "/" really
+    // does cross a filesystem boundary, and now it can decline to.
+    //
+    // The directory is still REPORTED (the callback sees it, as POSIX
+    // requires); it is simply not descended into.
+    //
+    // HONEST STATUS, MEASURED: THIS BRANCH IS UNEXERCISED ON THE CURRENT IMAGE
+    // AND IS THEREFORE NOT PROVEN TO WORK. It is correct by inspection and no
+    // more than that. The reason is not the flag, it is the layout: /EFI lives
+    // ONLY on the FAT ESP, and readdir("/") enumerates the EXT2 ROOT, which has
+    // no EFI entry at all. The ESP is reachable BY NAME (fat_open falls through
+    // to FAT when a path misses on ext2) but is never LISTED, so a tree walk
+    // from "/" cannot reach the boundary to decline it. Measured on build 1905:
+    // nftw("/") with and without FTW_MOUNT both visit 4212 entries and both see
+    // /EFI zero times.
+    //
+    // So st_dev genuinely differs across this machine's two filesystems (#120
+    // measured /EFI at st_dev 1 and /APPS at st_dev 2 by path), and a walk
+    // still cannot observe it. Do not delete this as dead code and do not
+    // claim it works: it becomes live the moment anything makes a mount point
+    // enumerable, and it needs a real test then.
+    if (type == FTW_D && (c->flags & FTW_MOUNT) && level > 0 &&
+        st.st_dev != c->root_dev) {
+        rc = ftw_call(c, &st, FTW_D, base, level);
+        goto done_rc;
     }
 
     if (type == FTW_D) {
@@ -138,7 +174,7 @@ static int ftw_start(const char *dirpath,
     // more is satisfiable; zero or negative is a caller error.
     if (nopenfd < 1) { errno = EINVAL; return -1; }
     // Refuse what cannot be honoured, rather than ignore it. See ftw.h.
-    if (flags & ~(FTW_PHYS | FTW_DEPTH)) { errno = EINVAL; return -1; }
+    if (flags & ~(FTW_PHYS | FTW_DEPTH | FTW_MOUNT)) { errno = EINVAL; return -1; }
 
     len = strlen(dirpath);
     if (len == 0 || len + 1 > (size_t)PATH_MAX) { errno = ENAMETOOLONG; return -1; }
@@ -153,6 +189,7 @@ static int ftw_start(const char *dirpath,
     c.flags = flags;
     c.fn3   = fn3;
     c.fn4   = fn4;
+    c.root_dev = probe.st_dev;   // #120: FTW_MOUNT reference, from the root stat above
 
     // base of the root is the offset of its own last component.
     base = 0;

@@ -7,6 +7,24 @@
 .global _start
 .global _exit
 
+# On entry the kernel (proc/process.c setup_user_stack) has built the SysV
+# x86-64 initial process stack:
+#
+#     (%rsp)               argc
+#     8(%rsp)              argv[0] .. argv[argc-1]
+#     8+8*argc(%rsp)       NULL                      argv terminator
+#     16+8*argc(%rsp)      envp[0] .. envp[envc-1]
+#                          NULL                      envp terminator
+#
+# #112: envp USED TO BE IGNORED HERE, and that was one of the two halves of
+# "MayteraOS has no cross-process environment" (the other was the kernel not
+# writing it). The kernel reserved the slot from the beginning and its own
+# comment called it "envp terminator (future)"; crt0 never looked past argv, so
+# `environ` started NULL in every process on the system. It is read now.
+#
+# The env strings live on the initial stack, which is mapped for the life of
+# the process and never freed, so __libc_init_env() stores the POINTERS
+# directly rather than copying the strings.
 _start:
     # Clear frame pointer for clean stack traces
     xor %rbp, %rbp
@@ -15,11 +33,21 @@ _start:
     mov (%rsp), %r12        # argc
     lea 8(%rsp), %r13       # argv
 
+    # envp = argv + (argc + 1) * 8, i.e. just past argv's NULL terminator.
+    lea 8(%r13, %r12, 8), %r14
+
     # Align stack to 16 bytes before any call
     and $-16, %rsp
 
     # Initialize libc state (stdio streams, etc.)
     call __libc_init
+
+    # Adopt the environment the kernel put on the stack. Done AFTER
+    # __libc_init because it needs the stack guard seeded and, in principle,
+    # malloc; done BEFORE main because getenv() has to work from the very
+    # start of main.
+    mov %r14, %rdi
+    call __libc_init_env
 
     # Call main(argc, argv)
     mov %r12, %rdi

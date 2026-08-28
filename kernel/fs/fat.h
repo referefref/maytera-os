@@ -142,6 +142,27 @@ typedef struct {
     uint8_t  volume_label[12];
     int      mounted;
     uint32_t free_cluster_count;  // Cached free clusters (updated incrementally)
+
+    // #250 REMOVABLE-VOLUME BACKING. Which BLOCK DEVICE this mount's sectors
+    // come from. ZERO means the ROOT device (blk_read/blk_write, which is what
+    // every mount in this kernel was before #250, so a memset-to-zero mount is
+    // unchanged by construction). A non-zero value N means USB MSC device
+    // index N-1, reached through blk_read_aux/blk_write_aux, which bypass the
+    // root device's LBA-keyed RAM cache. The +1 bias is not decoration: both
+    // mount entry points memset the struct, so a plain index field would make
+    // "device 0" and "never set" the same bit pattern, and USB MSC index 0 is
+    // exactly the boot stick.
+    uint32_t usb_vol_p1;
+
+    // #250 MOUNT GENERATION, the same mechanism as fat_file_t::img_gen (#739)
+    // and for the same reason. A hot-plugged volume can be pulled out while
+    // handles onto it are open, and the hotplug slot it occupied can then be
+    // filled by a DIFFERENT stick. Without a generation, a stale fat_file_t
+    // still points at this fat_fs_t and would happily read the new volume's
+    // sectors and report them as the old file. Stamped onto every handle by
+    // fat_open(); checked by fat_read/fat_seek/fat_readdir_n. 0 on every
+    // fixed mount, which is why those paths cost a compare against 0.
+    uint32_t vol_gen;
 } fat_fs_t;
 
 // File handle
@@ -157,6 +178,18 @@ typedef struct {
     int      open;
     uint32_t dirent_lba;        // absolute LBA of the sector holding this file's
     uint32_t dirent_off;        // directory entry, and byte offset within it (0=unknown)
+    // #115: the entry's packed FAT date/time words, carried on the handle so a
+    // stat does not have to re-read the directory sector it has already read.
+    // 0 in mtime_date means UNSTAMPED, which is what every entry this kernel
+    // created before #115 has on disk, and it must stay distinguishable from a
+    // real date: ktime_dos_to_unix_rs() maps it to 0 = "this filesystem does
+    // not know", never to 1980-01-01. Meaningless (and left 0) on an ext2- or
+    // image-backed handle, exactly like dirent_lba/dirent_off above.
+    uint16_t mtime_date;        // dirent modify_date  (bits: 0-4 day, 5-8 month, 9-15 year-1980)
+    uint16_t mtime_time;        // dirent modify_time  (bits: 0-4 sec/2, 5-10 min, 11-15 hour)
+    uint16_t atime_date;        // dirent access_date  (FAT records no access TIME)
+    uint16_t ctime_date;        // dirent create_date
+    uint16_t ctime_time;        // dirent create_time
     // #725 ext2-root backing. A non-zero ext2_ino means this handle is served
     // from the ext2 ROOT volume, not from a FAT cluster chain: first_cluster,
     // current_cluster, dirent_lba and dirent_off are then meaningless and must
@@ -188,6 +221,11 @@ typedef struct {
     // and fat_readdir_n(), cleared by fat_close(). 0 means "unstamped", which
     // only a handle that was never image-backed can be.
     uint32_t img_gen;
+    // #250: the fat_fs_t::vol_gen this handle was opened against. See the
+    // vol_gen comment on fat_fs_t. A mismatch means the medium this handle
+    // describes is GONE; every operation on it fails rather than reading
+    // whatever is in that slot now.
+    uint32_t vol_gen;
 } fat_file_t;
 
 // Directory iteration
@@ -229,6 +267,19 @@ int fat_mount(int drive, int partition, fat_fs_t *fs);
 // Mount FAT from a specific LBA offset (for GPT partitions or raw FAT)
 int fat_mount_lba(int drive, uint32_t start_lba, fat_fs_t *fs);
 
+// #250: mount a FAT volume that lives on a HOT-PLUGGED USB MSC device rather
+// than on the root block device. `usb_index` indexes the USB MSC device table.
+// Identical to fat_mount_lba() except that every sector this mount ever reads
+// or writes is routed to that device (blk_read_aux/blk_write_aux) and the mount
+// is stamped with a fresh generation so handles onto it can be invalidated when
+// the medium is pulled. `gen` must be non-zero and unique per mount.
+int fat_mount_lba_usb(int usb_index, uint32_t start_lba, uint32_t gen, fat_fs_t *fs);
+
+// #250: non-zero if this handle's medium has been removed (its mount
+// generation no longer matches the filesystem's). The single definition of
+// "this handle is stale"; every fat_* operation asks it.
+int fat_handle_stale(const fat_file_t *file);
+
 // Unmount
 void fat_unmount(fat_fs_t *fs);
 
@@ -237,6 +288,13 @@ int fat_open(fat_fs_t *fs, const char *path, fat_file_t *file);
 
 // Close file
 void fat_close(fat_file_t *file);
+
+// #115: set the modify (and optionally access) date on an existing FAT entry,
+// the FAT half of utime(2). `atime`/`mtime` are seconds since the UNIX epoch;
+// pass -1 to leave one unchanged. FAT's access field stores a DATE ONLY, so an
+// atime set here is truncated to midnight - stated because that is a real
+// limitation of the on-disk format, not a shortcut. Returns 0 on success.
+int fat_set_times(fat_fs_t *fs, const char *path, int64_t atime, int64_t mtime);
 
 // Read from file
 int fat_read(fat_file_t *file, void *buffer, uint32_t size);
@@ -308,6 +366,23 @@ int fat_rename(fat_fs_t *fs, const char *old_path, const char *new_path);
 // Write data to a file at current position
 // Returns bytes written, -1 on failure
 MUST_CHECK int fat_write(fat_file_t *file, const void *buffer, uint32_t size);
+// #745 local 109: shrink an open FAT file to `new_size` bytes. This is the ONE
+// FAT truncation primitive; fat_truncate() below is now fat_truncate_to(f, 0).
+//
+// WHY IT HAD TO BE GENERALISED. fat_truncate() could only produce an EMPTY
+// file, so the kernel had no way to answer ftruncate(fd, n) for n > 0 and the
+// userland libc answered it with a no-op that RETURNED SUCCESS. busybox vi
+// deliberately opens without O_TRUNC and calls ftruncate() after writing ("we
+// do not open file with O_TRUNC ... might reduce amount of data lost on power
+// fail"), so on the FAT ESP every save that made a file SHORTER left the old
+// tail on disk and reported success.
+//
+// Growing a file is NOT implemented and is refused rather than silently
+// ignored: a grow has to write zero bytes to the medium, which is a different
+// operation from freeing clusters.
+// Returns 0 on success, -1 on refusal or I/O failure.
+int fat_truncate_to(fat_file_t *file, uint32_t new_size);
+
 // #746: empty an open FAT file (O_TRUNC). Frees the cluster chain and persists
 // size 0 / cluster 0 to the directory entry. Returns 0, or -1 if the file is
 // still not empty on disk - which the caller MUST treat as a failed open, since

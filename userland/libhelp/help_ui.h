@@ -33,10 +33,20 @@
 extern "C" {
 #endif
 
-// Default F1 keycode delivered in gui_event_t.keycode for MayteraOS windows.
-// The kernel keyboard driver maps F1 (scancode 0x3B) to KEY_F1 == 0x3B. Apps
-// may pass their own keycode to help_ui_is_f1() if this ever changes.
-#define HELP_UI_KEY_F1 0x3B
+// F1 as delivered in gui_event_t.keycode for MayteraOS windows.
+//
+// #191: this was 0x3B, under a comment asserting "the kernel keyboard driver
+// maps F1 (scancode 0x3B) to KEY_F1 == 0x3B". It does not, and never did:
+// kernel/cpu/isr.c:840 turns scancode 0x3B into KEY_F1, and KEY_F1 is 0x88
+// (isr.h). 0x3B is the ASCII byte for ';'. So help_ui_is_f1() answered true
+// only for a semicolon, F1 has never once opened help in any app that calls
+// it (Settings is the caller), and pressing ';' opened it instead. Same class
+// as the #188 arrow-scancode bug and, again, with a confident comment above it.
+//
+// There is now exactly ONE table of these values, libc/keys.h, checked by
+// build/keycode-gate.sh. Do not restate the number here.
+#include "../libc/keys.h"
+#define HELP_UI_KEY_F1 GUI_KEY_F1
 
 // Hover delay before a tooltip appears, in milliseconds.
 #define HELP_UI_HOVER_MS 600

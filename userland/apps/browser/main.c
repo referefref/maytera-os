@@ -19,6 +19,7 @@
 #include "css_select_bind.h"
 #include "layout.h"
 #include "duk_dom.h"  // Duktape JS + DOM binding (Phase 2)
+#include "../../libc/keys.h"   // #243: GUI_KEY_* nav codes
 
 // Route in-window text through the antialiased TrueType path (matches Settings).
 #define br_text(h, x, y, s, c)       win_draw_text_ttf((h), (x), (y), (s), 14, (c))
@@ -985,7 +986,11 @@ static void draw_scrollbar(void) {
     // is white on EVERY theme, not window_bg.
     gui_scroll_colors(0, 0x00FFFFFF, &sb_track, &sb_thumb);
     gui_fill_rect(window_handle, tx, ty, SB_W, th, sb_track);
-    gui_fill_rect(window_handle, tx, ty, 1, th, COL_SEPARATOR);
+    // (#117) was a single hardcoded-per-theme COL_SEPARATOR pixel on the left
+    // edge only, not contrast-checked against the page surface; the shared,
+    // floor-verified trough border (see gui_scroll_trough_border() in
+    // gui_scroll.h) draws all four edges and supersedes it.
+    gui_scroll_trough_border(window_handle, tx, ty, SB_W, th, sb_track, 0x00FFFFFF);
     gui_fill_rect(window_handle, tx + 2, thumb_y, SB_W - 4, thumb_h, sb_thumb);
     // The outline used to be a hardcoded mid-grey, which is invisible on a
     // dark theme and fights the thumb on a light one. Derive it from the
@@ -1666,10 +1671,10 @@ static void handle_key(gui_event_t *event) {
         switch (event->keycode) {
             case 0x80: scroll_offset -= 40; break;     // Up
             case 0x81: scroll_offset += 40; break;     // Down
-            case 0x49: scroll_offset -= page; break;   // Page Up
-            case 0x51: scroll_offset += page; break;   // Page Down
-            case 0x47: scroll_offset = 0; break;       // Home
-            case 0x4F: scroll_offset = m; break;       // End
+            case GUI_KEY_PGUP: scroll_offset -= page; break;
+            case GUI_KEY_PGDN: scroll_offset += page; break;
+            case GUI_KEY_HOME: scroll_offset = 0; break;
+            case GUI_KEY_END:  scroll_offset = m; break;
             default: handled_scroll = 0; break;
         }
         if (handled_scroll) {

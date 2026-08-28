@@ -1,5 +1,8 @@
 # MayteraOS Notifications Subsystem - design
 
+> STATUS: SUPERSEDED (2026-08-22, #242) — this design specified kernel syscalls SYS_NOTIFY_* 238-241 that do not exist; notifications shipped userland-only (#168, `libc/notify.c`).
+
+
 Goal: an OS notification service that lets any app push alerts. Alerts surface as
 (1) a tray bell with a popup history list and (2) transient toast cards, are
 user-controlled per-app in a Settings "Alerts" tab, and respect fullscreen apps.

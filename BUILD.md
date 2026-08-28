@@ -265,10 +265,21 @@ in silently under cover of the existing known ones.
    `MAYTERA_SSHD=1 build/build-golden.sh`; note this still ships **no**
    `/CONFIG/SSHD.CFG`, so the resulting image has no listener until one is
    configured.
-4. Builds the kernel (section 3) and the userland app set (section 4) from a
+4. Builds the kernel (section 3), the **UEFI bootloader** (`uefi/bootloader.c`
+   into `EFI/BOOT/BOOTX64.EFI`) and the userland app set (section 4) from a
    `git archive` of the resolved commit, not a copy of the live working tree, so
    the image the build produces is provably built from exactly that commit's
    source (no untracked or in-flight edits can sneak into a golden).
+
+   The bootloader step is newer than the rest and worth knowing about, because
+   its absence was invisible: nothing in `build/` ever compiled
+   `uefi/bootloader.c`, so every image inherited whatever `BOOTX64.EFI` the asset
+   base happened to carry. Measured on one golden, that file was six weeks old
+   and contained neither the `\boot\ROTATE.TXT` nor the `\boot\NOCHIME.TXT`
+   path string, so two committed features had never run on a shipping image. The
+   invariant gate now refuses an image whose `BOOTX64.EFI` does not contain the
+   `\boot\DIAG.TXT` marker path, which is only true of a loader built from this
+   repository, so the loader cannot silently go stale again.
 5. Assembles a **two-partition GPT image**: a FAT ESP no larger than 256 MiB
    (partition type `EF00`) plus an ext2 root (partition type `8300`). The kernel
    is copied to four boot paths on the ESP (`boot/kernel.elf`, `kernel.elf`,
@@ -455,6 +466,87 @@ skipping either is how a host disk gets overwritten by mistake:
    treat it as a failed write, not a cosmetic discrepancy, and redo it before
    trusting the media.
 
+## 8a. Boot diagnostics: quiet by default, armed by a file
+
+A normal boot shows the splash and nothing else. **Two** layers of boot output
+are off by default and armed by the **same** single marker file:
+
+1. The **UEFI bootloader's console**: the banner, the nine `[N/8]` step headings
+   and their success lines, the GOP report, the ACPI and memory-map lines, the
+   boot-chime brackets, and the display-mode enumeration. This is genuinely on
+   screen on a normal boot (the firmware console owns the glass until the kernel
+   takes the framebuffer), which is why it is in scope.
+2. The **kernel's boot-stage instrumentation**: the early-framebuffer diagnostic
+   page, the numbered stage list, the large stage ordinal, the bottom banner, and
+   the stage lines that would otherwise appear in the boot-log console.
+
+One marker for both, deliberately. A second file would be a second thing to
+forget, and the failure mode of forgetting is that a machine you took somewhere
+to diagnose tells you half of what it knows.
+
+The marker file on the ESP:
+
+```
+/boot/DIAG.TXT      empty file; PRESENCE is the switch, contents never read
+```
+
+The UEFI bootloader reads it before `ExitBootServices` and hands the verdict to
+the kernel in `boot_info_t.diag_flags`, because the kernel takes the firmware
+framebuffer in the first executable statement of `kernel_main`, long before any
+filesystem is mounted, and so cannot read a marker file in time to decide for
+itself. `/boot` and not `/` deliberately: the kernel-side FAT writer redirects
+any path that is not under `/boot` or `/EFI` to the ext2 root volume, so `/boot`
+is the one spelling that means the same file to the loader and to the kernel.
+
+**What the marker does NOT gate: failure.** The rule in the bootloader is that
+**quiet means quiet on SUCCESS**. Anything that failed, was refused, was
+reverted, was truncated, or is a warning prints unconditionally: a disk that
+cannot be opened, a missing or invalid kernel, a refused or reverted `MODE.TXT`
+selection, a PixelBltOnly firmware mode with no linear framebuffer, a truncated
+UEFI memory map, a failed `ExitBootServices`. At those moments there may be no
+kernel coming to write a log, so the screen is the only channel left. Use
+`DPRINT()` in `uefi/bootloader.c` for progress and success; use `Print()` for
+anything that means something is wrong. On a quiet boot that fails, the error
+epilogue also prints the banner, so a photograph of the failure says which
+program produced it.
+
+**What the marker does NOT gate: durable logs.** Every persistent log is written
+on every boot, armed or quiet: `/BOOTLOG.TXT`, `/DEVLOG.TXT`, `/boot/STAGE.TXT`,
+`/boot/PANIC.TXT`, the raw-LBA flight recorder in the GPT alignment gap, and the
+serial mirror. This specifically includes the **display-mode list**: the loader
+passes it to the kernel as an in-memory blob with a magic tag, and
+`print_video_mode_info()` in `kernel/main.c` writes it to `/BOOTLOG.TXT` under
+`[VIDEOMODE]` independently of whether the loader printed it on screen. Gating
+the loader's print therefore costs no data. That was confirmed by reading the
+kernel-side reporter and then by reading `/BOOTLOG.TXT` off a booted quiet
+image, not assumed from the fact that two code paths exist. Those are invisible to the user and are what makes an
+unknown-machine failure diagnosable, so they are not something to switch off.
+Nor does it gate the no-root-filesystem hardware report, which can only appear
+on a boot that has already failed to find a filesystem: that path arms the
+screen on demand rather than being silenced.
+
+**How to tell which mode a boot was in, without a hardware trip.** `/BOOTLOG.TXT`
+carries two lines:
+
+```
+[DIAG] quiet (no /boot/DIAG.TXT): on-screen boot diagnostics OFF, persistent logs unaffected
+[DIAG] marker cross-check OK: /boot/DIAG.TXT absent, screen diagnostics quiet
+```
+
+The second line is a cross-check between two independent readers of the same
+marker: the bootloader, using UEFI's FAT driver before handover, and the kernel,
+using its own FAT driver after the mount. If they disagree the line says
+`MARKER CROSS-CHECK FAILED` and names which side saw what. That exists because
+this tree already contains two harnesses (`diskimg_boot_harness()` and
+`img_shadow_selftest()`) that are compiled, linked and called on every boot and
+return at their first line because the files that arm them (`/CDTEST.TXT`,
+`/IMG193.TXT`) exist on no image and in no manifest. Every dead-code check passes
+them; what is missing is a file, and nothing anywhere says so.
+
+The instructions also ship on the image itself, at `/boot/README-DIAG.TXT`, so
+the person holding a machine that will not boot can find them with `ls` from any
+other computer, without access to this repository.
+
 ## 9. Documentation obligations
 
 `CHANGELOG.md` and `blame.md` at the repository root are mandatory. Every change
@@ -484,3 +576,68 @@ one worth remembering.
   outside this repository (see section 5) and this document does not attempt to
   describe how to build one from scratch, since that has not been verified
   against a committed script.
+
+## 9. Boot-verifying an image, and what a VIRGIN image looks like
+
+Section 7 checks an image's STRUCTURE. This section checks that it BOOTS, and it
+exists because the two are easy to confuse and the boot criterion was wrong for
+a year of copy-pasted scripts.
+
+### The criterion
+
+A boot is green if it reached EITHER defined interactive state with no fault:
+
+- `[STAGE] DESKTOP_READY` - the compositor presented a frame. Only possible on an
+  image whose account database already has an account and an autologin.
+- `[LOGIN] Login screen active` - the kernel reached the sign-in or
+  create-account screen and is waiting for a human. **This is the correct and
+  expected terminal state for an image with a VIRGIN account database**, i.e. one
+  that ships no accounts and no default password.
+
+**Do not gate on `DESKTOP_READY` alone.** On a virgin image that marker can never
+fire in an unattended run, because the machine is deliberately waiting for
+someone to type. A check that requires it reports every such image as broken and
+teaches you to ignore the check.
+
+**Do not collapse the two into one green tick either.** The verifier must say
+WHICH state it reached, because "the login gate came up" and "a person can use
+this computer" are different claims and #226 is the case where the first was true
+and the second was false.
+
+### What this does NOT prove
+
+Reaching the login gate proves the kernel booted and is waiting for input. It
+proves NOTHING about whether typing an account through that screen produces a
+usable desktop. That is an interactive test and it must be run by hand, with
+keystrokes, before shipping any image whose account database is virgin:
+
+1. Boot a throwaway VM from a COPY of the image (never the original, never the
+   canonical VM).
+2. Type a username and a password pair through the create-account screen.
+   **Keys on this screen are QUEUED, not dropped**, at roughly one per full
+   wallpaper redraw (measured ~11 s/key). A screendump taken seconds after
+   `sendkey` will show one character and look like input is broken. Wait, take a
+   second screendump, and count characters before concluding anything.
+3. Confirm the serial log shows the whole chain, not just the first link:
+   `[USERS] Created user`, `User database synced to disk`,
+   `[LOGIN] first-boot account '<name>' created`, `[SESSION] compositor pid N
+   spawned`, `[STAGE] COMPOSITOR_UP`, `[STAGE] DESKTOP_READY`.
+4. Confirm you can actually REACH and USE the desktop afterwards: open the start
+   menu and check the pixel delta is in the six figures. A modal first-run window
+   that cannot complete looks identical to a desktop in a screendump.
+5. Reboot the same VM and confirm the created account persists and produces
+   either an automatic session or a normal sign-in, rather than demanding account
+   creation again.
+
+### Running it
+
+On the build host:
+
+```
+<workspace> <image> <expected-md5> <vmid> <target-block-dev> [seconds]
+```
+
+It gates the source md5, gates that the target is a block device before any `dd`,
+reads the write back and compares, boots the VM, captures serial, applies the
+criterion above, prints the `BUILDINFO.TXT` stamp, and detaches its loop device.
+Exit 0 = green.

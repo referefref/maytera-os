@@ -391,6 +391,27 @@ void wallpaper_picker_close(void)
     g_wallpaper_picker_open = false;
 }
 
+// #uiscale hit-test fix: the close button rect and the grid content rect
+// were each written out twice - once in wallpaper_render_picker() (draw),
+// once again in the mouse handler (hit-test) - as literally identical
+// formulas over the same (already-scaled) macros. Two copies of an identical
+// formula cannot drift TODAY, but they are exactly the shape that drifts the
+// NEXT time either one is touched in isolation, which is the failure mode
+// this whole audit is about. Shared functions now, one source each.
+static void wallpaper_close_btn_rect(int32_t dlg_x, int32_t dlg_y,
+                                     int32_t *cx, int32_t *cy, int32_t *cw, int32_t *ch) {
+    *cw = PICKER_TITLE_H;
+    *cx = dlg_x + PICKER_WIDTH - *cw;
+    *cy = dlg_y;
+    *ch = PICKER_TITLE_H;
+}
+static void wallpaper_grid_rect(int32_t dlg_x, int32_t dlg_y,
+                                int32_t *gx, int32_t *gy, int32_t *gh) {
+    *gx = dlg_x + THUMB_PADDING;
+    *gy = dlg_y + PICKER_TITLE_H + THUMB_PADDING;
+    *gh = PICKER_HEIGHT - PICKER_TITLE_H - THUMB_PADDING * 2 - ui_px(16);
+}
+
 // ============================================================================
 // wallpaper_render_picker
 // Draws the wallpaper-chooser dialog centered on the screen.
@@ -423,9 +444,8 @@ void wallpaper_render_picker(void)
                        "Choose Wallpaper", CLR_TEXT_WHITE);
 
     // Close button: 16 x (PICKER_TITLE_H) in the top-right corner.
-    int32_t close_w = PICKER_TITLE_H;
-    int32_t close_x = dlg_x + PICKER_WIDTH - close_w;
-    int32_t close_y = dlg_y;
+    int32_t close_x, close_y, close_w, close_h;
+    wallpaper_close_btn_rect(dlg_x, dlg_y, &close_x, &close_y, &close_w, &close_h);   // #uiscale: shared with the hit-test
     draw_fill_rect(close_x, close_y, close_w, PICKER_TITLE_H, 0xFF662222);
     draw_rect_outline(close_x, close_y, close_w, PICKER_TITLE_H, CLR_PICKER_BORDER);
     // "X" glyph, centered.
@@ -437,9 +457,8 @@ void wallpaper_render_picker(void)
     draw_hline(dlg_x, dlg_y + PICKER_TITLE_H, PICKER_WIDTH, CLR_PICKER_BORDER);
 
     // Grid content area.
-    int32_t grid_x    = dlg_x + THUMB_PADDING;
-    int32_t grid_y    = dlg_y + PICKER_TITLE_H + THUMB_PADDING;
-    int32_t grid_h    = PICKER_HEIGHT - PICKER_TITLE_H - THUMB_PADDING * 2 - 16;
+    int32_t grid_x, grid_y, grid_h;
+    wallpaper_grid_rect(dlg_x, dlg_y, &grid_x, &grid_y, &grid_h);   // #uiscale: shared with the hit-test
     int32_t rows_vis  = grid_h / THUMB_CELL_H;
     if (rows_vis < 1) rows_vis = 1;
 
@@ -569,9 +588,8 @@ bool wallpaper_picker_handle_mouse(int32_t x, int32_t y, bool clicked)
     }
 
     // Close button hit test.
-    int32_t close_w = PICKER_TITLE_H;
-    int32_t close_x = dlg_x + PICKER_WIDTH - close_w;
-    int32_t close_y = dlg_y;
+    int32_t close_x, close_y, close_w, close_h;
+    wallpaper_close_btn_rect(dlg_x, dlg_y, &close_x, &close_y, &close_w, &close_h);   // #uiscale: shared with the draw side
     if (x >= close_x && x < close_x + close_w &&
         y >= close_y && y < close_y + PICKER_TITLE_H) {
         if (clicked) {
@@ -582,9 +600,8 @@ bool wallpaper_picker_handle_mouse(int32_t x, int32_t y, bool clicked)
     }
 
     // Grid content area.
-    int32_t grid_x   = dlg_x + THUMB_PADDING;
-    int32_t grid_y   = dlg_y + PICKER_TITLE_H + THUMB_PADDING;
-    int32_t grid_h   = PICKER_HEIGHT - PICKER_TITLE_H - THUMB_PADDING * 2 - 16;
+    int32_t grid_x, grid_y, grid_h;
+    wallpaper_grid_rect(dlg_x, dlg_y, &grid_x, &grid_y, &grid_h);   // #uiscale: shared with the draw side
     int32_t rows_vis = grid_h / THUMB_CELL_H;
     if (rows_vis < 1) rows_vis = 1;
 

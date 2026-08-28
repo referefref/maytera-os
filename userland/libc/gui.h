@@ -9,6 +9,12 @@
 
 #include "types.h"
 #include "syscall.h"
+// #191: the keycode table (GUI_KEY_*). gui.h is what declares
+// gui_event_t.keycode, so gui.h is what must also say what values that field
+// can hold. Before this, the table lived in gui_scroll.h -- a scrollbar
+// header -- and the apps that did not happen to include a scrollbar
+// open-coded their own copy, six of which had the arrows wrong.
+#include "keys.h"
 
 // ============================================================================
 // Event Types (must match kernel's window.h)
@@ -27,7 +33,18 @@ typedef enum {
     EVENT_WINDOW_BLUR,
     EVENT_BUTTON_CLICK,
     EVENT_REDRAW,
-    EVENT_RESIZE           // param: mouse_x = new width, mouse_y = new height
+    EVENT_RESIZE,          // param: mouse_x = new width, mouse_y = new height
+    // --- cross-window drag ("docking"), SYS_DRAG_* -----------------------
+    // APPENDED, NEVER INSERTED: these values are the ABI shared with
+    // userland/libc/gui.h. Reordering this enum silently re-points every
+    // event an already-built app is switching on.
+    EVENT_DRAG_DROP,   // to the resolved TARGET: mouse_x/y are CONTENT coords.
+                       // Call sys_drag_take() to claim the payload.
+    EVENT_DRAG_END     // to the SOURCE: the drag is over. target_id is the
+                       // accepting window handle + 1, or 0 for "nobody took
+                       // it" (drop on empty desktop = detach here).
+                       // mouse_x/y are SCREEN coords for this event, because
+                       // the drop point is meaningful outside any window.
 } event_type_t;
 
 // Mouse button flags
@@ -46,6 +63,13 @@ typedef struct {
     uint32_t keycode;       // Keyboard keycode
     char key_char;          // Printable character
 } gui_event_t;
+
+// #221 phase 0: THE modifier tracker (Shift/Ctrl/Alt held state). Included
+// HERE, immediately after gui_event_t exists, because its API is expressed in
+// terms of that type and it cannot be forward-declared (gui_event_t is an
+// anonymous-struct typedef). Every app that includes gui.h or maytera.h gets
+// the tracker; nobody needs to, or should, write a second one.
+#include "gui_mods.h"
 
 // ============================================================================
 // Common Colors

@@ -68,15 +68,19 @@ int svc_build_c(const svc_src_t *src, uint32_t n, svc_info_t *out, uint32_t cap)
 // Classify a handle by its recorded path. The path is the only thing file_t
 // carries that distinguishes a device from a regular file without reaching into
 // per-fs private state, and it is exactly what Process Explorer groups on.
+//
+// #120: THE PREFIX MATCHING THAT USED TO BE HERE IS GONE. It was an open-coded
+// p[0]=='p' && p[1]=='i' && ... chain, and SYS_FSTAT needed the same decision.
+// Two copies of one classification is this codebase's most repeated defect, so
+// there is now one, in rustkern/fstatkind.rs, and this asks it. Not a rewrite
+// for its own sake: the shared one also recognises "socket:[...]", so
+// PI_KIND_SOCKET - defined here since #487 and NEVER ONCE RETURNED, because
+// sockets recorded no path - is finally reachable.
 static uint32_t handle_kind_of(const file_t *f) {
     if (!f) return PI_KIND_UNKNOWN;
-    const char *p = f->path;
-    if (!p[0]) return PI_KIND_UNKNOWN;
-    if (p[0] == 'p' && p[1] == 'i' && p[2] == 'p' && p[3] == 'e' && p[4] == ':')
-        return PI_KIND_PIPE;
-    if (p[0] == '/' && p[1] == 'd' && p[2] == 'e' && p[3] == 'v' && p[4] == '/')
-        return PI_KIND_DEV;
-    return PI_KIND_FILE;
+    kstat_kind_t k;
+    fstat_kind_rs(f->path, (uint32_t)sizeof(f->path), &k);
+    return k.kind;
 }
 
 #define PI_MAX_HANDLES 64   // >= MAX_FDS; bounds the on-stack gather array

@@ -89,3 +89,19 @@ int      dos_drive_count(void);            // number of drive letters A..last (=
 int      dos_drive_image_mounted(char letter);
 
 #endif // DOS_DOSPATH_H
+
+// #rawrite: MATERIALISE A GUEST'S PER-USER WRITE OVERLAY.
+//
+// Creates `ovl` (and every missing parent), gives it to uid:gid mode 0750, and
+// on the run that CREATES it seeds it with every small file from `base`, so a
+// game that rewrites its own .INI in place finds a writable copy already there.
+// Returns 0 when the overlay is usable, -1 when it is not (and the caller must
+// then leave the overlay unconfigured rather than aim writes at a directory
+// that does not exist).
+int dos_overlay_prepare(const char *base, const char *ovl,
+                        unsigned int uid, unsigned int gid);
+
+// #rawrite: rustkern/dosovl.rs. Look up an installed program directory in the
+// per-title overlay registry; returns 1 and writes the home-relative overlay
+// tail (e.g. "GAMES/RA") into `out`, 0 when this title has no overlay.
+int dosovl_title_rs(const unsigned char *appdir, unsigned char *out, int outsz);

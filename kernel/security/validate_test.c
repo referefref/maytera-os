@@ -252,6 +252,38 @@ int64_t argtab_selftest(void *ubuf, uint64_t ubuf_len) {
     c[n++] = (at_case_t){ "A-N17", "WIN_BLIT src buffer -> kernel text (blit kernel image into a window)",
         false, syscall_validate_args(35, 0, 0, 0, 0x00100010, KT, 0) };
 
+    // ---- #blitguard: THE ZERO-DIMENSION HOLE, both directions --------------
+    //
+    // These two are the cases this battery was missing, and their absence is
+    // why a live arbitrary-kernel-read survived in sys_win_blit() with every
+    // lint green. Packed16 multiplies the two 16-bit halves of arg4, so EITHER
+    // half being zero makes the declared length zero, and syscall_validate_args
+    // SKIPS a zero-length range by design ("A zero-length buffer is
+    // dereferenced by nobody"). That premise was true of every other descriptor
+    // in this table and false of exactly this one: with src_h == 0 the handler's
+    // own clamp, `if (sy >= src_h) sy = src_h - 1`, drove the source row to
+    // MINUS ONE, so it read up to 65535 pixels from BELOW the pointer and
+    // painted them into a window. arg4 = 0 with arg5 = 0x400000 therefore
+    // returned kernel text to Ring 3, and an unmapped arg5 was a Ring-0 #PF.
+    //
+    // A-N14 above reasons about exactly this collapse-to-zero risk for
+    // ElemsClamped and was written deliberately. Nobody applied the same
+    // reasoning to Packed16, where BOTH factors are attacker-chosen directly.
+    //
+    // THE HANDLER now refuses src_w < 1 || src_h < 1 outright (winblit_plan_rs
+    // in rustkern/winblit.rs) and reaches user memory only through
+    // copy_from_user, which re-checks the range against the caller's CR3. So
+    // these cases document a hole that is closed in the handler rather than in
+    // the validator, and they are written to keep failing loudly if either
+    // half of that regresses. They are marked must_accept = true because the
+    // VALIDATOR's zero-length skip is still the validator's documented and
+    // deliberate behaviour: what changed is that the handler no longer
+    // dereferences anything when the declared length is zero.
+    c[n++] = (at_case_t){ "A-P14", "WIN_BLIT src_h=0 -> zero declared length, validator skips (handler must refuse instead)",
+        true, syscall_validate_args(35, 0, 0, 0, 0x00000010, KT, 0) };
+    c[n++] = (at_case_t){ "A-P15", "WIN_BLIT src_w=0 -> same zero-length skip on the other factor",
+        true, syscall_validate_args(35, 0, 0, 0, 0x00100000, KT, 0) };
+
     // ---- Kind::R + Len::Mul2 (SYS_WIN_DRAW_IMAGE 254) --------------------
     // Same idea, but w and h are separate args (arg4, arg5), so the multiply is
     // of two independent attacker-chosen values: the checked_mul is the control.

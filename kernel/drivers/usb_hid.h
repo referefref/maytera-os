@@ -164,8 +164,56 @@ typedef enum {
     HID_DEVICE_KEYBOARD,
     HID_DEVICE_MOUSE,
     HID_DEVICE_GAMEPAD,
+    // #162: an interface whose REPORT DESCRIPTOR says it carries Consumer-page
+    // (0x0C) controls and no Mouse or Keyboard collection. Appended at the END
+    // so every existing enumerator keeps its value; hid_device_type_t is
+    // compared, logged and switched on in several files.
+    HID_DEVICE_CONSUMER,
     HID_DEVICE_UNKNOWN
 } hid_device_type_t;
+
+// =============================================================================
+// #162: Consumer-page (media key) map, produced by rustkern/hidrepd.rs
+// =============================================================================
+// Layout-locked against HidConsMap in rustkern/hidrepd.rs. This struct is
+// OPAQUE to the C here in the sense that C never computes from its fields; it
+// only stores one per device and hands the address back to the Rust decode.
+// The lock exists anyway because it is embedded in hid_device_t, so a silent
+// size change would shift every field after it.
+typedef struct {
+    uint8_t  have;          // HIDCONS_* bitmask; 0 = no volume controls here
+    uint8_t  report_id;     // 0 = descriptor declared no Report ID at all
+    uint8_t  kind;          // HIDCONS_KIND_*
+    uint8_t  top_consumer;  // saw a top-level Consumer Control collection
+    uint8_t  top_mouse;     // saw a top-level Generic Desktop Mouse collection
+    uint8_t  top_keyboard;  // saw a top-level Generic Desktop Keyboard collection
+    uint8_t  report_bytes;  // input report payload size, diagnostic only
+    uint8_t  _pad;
+    uint16_t bit_vol_up;    // VARIABLE kind: bit offsets within the payload
+    uint16_t bit_vol_down;
+    uint16_t bit_mute;
+    uint16_t arr_bit_off;   // ARRAY kind: the usage-value field
+    uint16_t arr_bit_size;
+    uint16_t arr_count;
+} hid_cons_map_t;
+
+_Static_assert(sizeof(hid_cons_map_t) == 20,
+               "hid_cons_map_t must stay layout-identical to HidConsMap in "
+               "rustkern/hidrepd.rs (which asserts the same 20 bytes)");
+
+// Bits in hid_cons_map_t::have and in hidrepd_decode_rs()'s return value.
+#define HIDCONS_VOL_UP        (1 << 0)
+#define HIDCONS_VOL_DOWN      (1 << 1)
+#define HIDCONS_MUTE          (1 << 2)
+
+#define HIDCONS_KIND_NONE     0
+#define HIDCONS_KIND_VARIABLE 1
+#define HIDCONS_KIND_ARRAY    2
+
+// rustkern/hidrepd.rs
+int hidrepd_parse_rs(const uint8_t *desc, uint32_t len, hid_cons_map_t *out);
+uint8_t hidrepd_decode_rs(const hid_cons_map_t *map, const uint8_t *buf, uint32_t len);
+int hidrepd_selftest_rs(uint32_t *out_checks, uint32_t *out_first_fail);
 
 typedef struct {
     // USB device info
@@ -195,6 +243,16 @@ typedef struct {
     hid_device_type_t type;
     uint8_t protocol;       // Boot or Report protocol
 
+    // #162: Consumer-page media keys. `cons.have` is 0 on every device that
+    // does not have them, which is the overwhelmingly common case, and every
+    // consumer code path early-outs on it - so a machine with no media keys
+    // pays one predictable branch per report and nothing else.
+    hid_cons_map_t cons;
+    uint8_t  cons_prev;       // last decoded mask, for press-edge detection
+    uint16_t rd_len;          // wDescriptorLength from the HID class descriptor
+    uint32_t cons_hold_us;    // mono_us when the current mask was first seen
+    uint32_t cons_next_rep_us;// mono_us of the next auto-repeat, 0 = not armed
+
     // Keyboard state
     hid_keyboard_report_t keyboard_report;
     hid_keyboard_report_t prev_keyboard_report;
@@ -207,6 +265,64 @@ typedef struct {
     // Callbacks
     void (*key_callback)(uint8_t keycode, int pressed, uint8_t modifiers);
     void (*mouse_callback)(int32_t x, int32_t y, uint8_t buttons);
+
+    // #134: entry lifecycle. hid_devices[] used to be APPEND-ONLY with no
+    // detach path at all, so every replug consumed one of only 8 entries and
+    // freed nothing; the real iMac hit the cap after two replug cycles of a
+    // 2-interface keyboard and silently refused all further HID (total input
+    // lockout, no serial, no sshd). Entries are now reusable: in_use == 0 means
+    // the entry is FREE and may be re-bound by usb_hid_attach(). The DMA report
+    // page is deliberately NOT freed on detach - it stays owned by the entry and
+    // is reused, which bounds total report-page use at MAX_HID_DEVICES pages for
+    // the life of the boot AND removes any use-after-free window against the
+    // concurrently running poll worker (which never takes a lock).
+    int in_use;             // 0 = free entry, 1 = bound to a live device
+    int root_port;          // 0-based root port this device hangs off (-1 unknown)
+
+    // #133: bounded endpoint-halt recovery. An interrupt-IN endpoint that
+    // completes with Babble/Stall/Transaction-Error is left HALTED by the
+    // controller and ignores every subsequent doorbell, so the device is dead
+    // until reboot. usb_hid_poll() now runs the spec recovery (Reset Endpoint +
+    // Set TR Dequeue Pointer). consecutive_halts caps how many times we do that
+    // for one device before giving up, so a physically removed device cannot
+    // make the SHARED poll worker issue command-ring ops forever and starve the
+    // other HID devices. Any successful report resets it to 0.
+    uint32_t consecutive_halts;
+    int failed;             // recovery exhausted; parked (see revivals)
+    // #133: how many times this entry has been UN-PARKED by the re-scan
+    // worker. Before this existed, `failed` was terminal: nothing in the
+    // kernel ever cleared it except a fresh usb_hid_attach(), which requires
+    // the port to DISCONNECT. A wireless receiver never disconnects - it stays
+    // plugged in while its radio link comes and goes - so eight consecutive
+    // transaction errors killed the mouse until the next reboot while the
+    // wired keyboard on the same controller carried on perfectly. That is the
+    // reported "#133: the G7 degrades to unresponsive, the keyboard is fine".
+    // Bounded so a device that is genuinely gone cannot make the re-scan
+    // worker issue commands for ever.
+    uint32_t revivals;
+    uint32_t revive_skip;   // scans to wait before the next attempt (backoff)
+
+    // #139 MEASUREMENT. Mouse lag has been reported across many builds and had
+    // never been MEASURED: the poll rate, the controller's own endpoint
+    // schedule and the compositor were all plausible and nobody knew which
+    // dominated. These counters decompose the delay per device, in
+    // microseconds off the shared monotonic clock (cpu/mono.h - never
+    // timer_ticks, which a KVM tick burst can collapse):
+    //   submit_us      - when we armed the interrupt-IN TD;
+    //   observe (from xhci_xfer_done_us) - when a drainer saw its completion;
+    //   inject         - when we fed the report to mouse_inject_hid().
+    // submit->observe is the CONTROLLER's periodic schedule; observe->inject is
+    // OUR poll cadence. Kept permanently (a few adds per report) because the
+    // one machine that shows the fault has no serial console, so the only way
+    // to know its real numbers is a summary line in /BOOTLOG.TXT.
+    uint32_t submit_us;      // mono_us of the last interrupt-IN submit
+    uint32_t last_inject_us; // mono_us of the previous report injection
+    uint32_t st_n;           // samples accumulated in the current window
+    uint32_t st_e2e_sum, st_e2e_max;   // submit  -> inject (whole pipeline)
+    uint32_t st_lat_sum, st_lat_max;   // observe -> inject (our poll cadence)
+    uint32_t st_gap_sum, st_gap_max;   // inject  -> inject (delivered rate)
+    uint32_t st_windows;     // summaries emitted for this device
+    uint16_t st_gap_hist[8]; // gap buckets: <2 <4 <8 <12 <16 <24 <40 >=40 ms
 } hid_device_t;
 
 // =============================================================================
@@ -223,9 +339,16 @@ int usb_hid_probe(xhci_controller_t *xhc, int slot_id,
 
 // #307: full attach with the interrupt-IN endpoint already configured on the
 // controller. Called from xHCI enumeration. Returns the device index or -1.
+// #162: `rd_len` is wDescriptorLength from the interface's HID class
+// descriptor (bDescriptorType 0x21), or 0 if the configuration descriptor did
+// not carry one. Non-zero makes the driver fetch and parse the REPORT
+// descriptor, which is the only thing that can tell a media-key interface from
+// a mouse - bInterfaceProtocol demonstrably cannot (the owner's iMac keyboard
+// declares its media interface as a boot MOUSE). rd_len == 0, or any failure
+// along the way, leaves behaviour byte-identical to before #162.
 int usb_hid_attach(xhci_controller_t *xhc, int slot_id, int iface_num,
                    int ep_in, int ep_in_mps, int b_interval, int speed,
-                   uint8_t subclass, uint8_t protocol);
+                   uint8_t subclass, uint8_t protocol, int rd_len);
 
 // #307: poll every attached HID device once (drain completed interrupt-IN TDs,
 // feed the kernel input queue, resubmit). Called from the HID poll worker.
@@ -237,6 +360,24 @@ void usb_hid_start_poll_thread(void);
 // worker (proc_create()d early, then erased by proc_init()s proc_table memset)
 // can be recreated in the correct post-proc_init order. See usb_hid.c / main.c.
 void usb_hid_reset_poll_thread_guard(void);
+
+// #134: release every hid_devices[] entry bound to (xhc, slot_id) because the
+// device behind that slot has physically disconnected. Marks the entries FREE
+// for reuse (see hid_device_t::in_use); does not free the DMA report page, by
+// design. Returns the number of entries released. Called from the xHCI port
+// re-scan worker when it observes a root port go from connected to empty.
+int usb_hid_detach_slot(xhci_controller_t *xhc, int slot_id);
+
+// #134: does this (controller, slot) currently have any HID interface bound?
+// The re-scan teardown uses it to restrict slot teardown to HID-only slots, so
+// a disconnected MSC / network slot keeps exactly its previous behaviour and
+// the USB-boot path cannot regress.
+int usb_hid_slot_has_device(xhci_controller_t *xhc, int slot_id);
+
+// #133: un-park HID devices whose halt recovery was exhausted. Called from the
+// xHCI re-scan worker (a thread that may block), NOT from the HID poll worker.
+// Returns the number of devices revived on this pass.
+int usb_hid_retry_failed(void);
 
 // Set HID protocol (boot or report)
 int usb_hid_set_protocol(hid_device_t *dev, uint8_t protocol);

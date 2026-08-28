@@ -1,0 +1,40 @@
+--- a/src/regex/tre.h
++++ b/src/regex/tre.h
+@@ -37,6 +37,15 @@
+ 
+ #define NDEBUG
+ 
++
++/* MayteraOS (#745 local 97): `hidden` comes from musl's private features.h,
++ * which is not part of this port's source list.  Outside musl's own build the
++ * attribute is not needed: every one of these symbols is either static to the
++ * archive or an API we deliberately export. */
++#ifndef hidden
++#define hidden
++#endif
++
+ #define TRE_REGEX_T_FIELD __opaque
+ typedef int reg_errcode_t;
+ 
+--- a/src/regex/regerror.c
++++ b/src/regex/regerror.c
+@@ -1,7 +1,10 @@
+ #include <string.h>
+ #include <regex.h>
+ #include <stdio.h>
+-#include "locale_impl.h"
++/* MayteraOS (#745 local 97): musl's private locale_impl.h
++ * supplies LCTRANS_CUR, the message-catalogue lookup.  This
++ * userland has exactly one locale, so the untranslated string
++ * IS the answer. */
+ 
+ /* Error message strings for error codes listed in `regex.h'.  This list
+    needs to be in sync with the codes listed there, naturally. */
+@@ -32,6 +35,6 @@
+ 	const char *s;
+ 	for (s=messages; e && *s; e--, s+=strlen(s)+1);
+ 	if (!*s) s++;
+-	s = LCTRANS_CUR(s);
++	(void)preg;
+ 	return 1+snprintf(buf, size, "%s", s);
+ }

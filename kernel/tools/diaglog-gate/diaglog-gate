@@ -1,0 +1,252 @@
+#!/usr/bin/env python3
+"""diaglog-gate - FAIL THE BUILD when a boot-path diagnostic can only be read
+over a serial port.
+
+WHY THIS EXISTS
+---------------
+Serial is silent in GUI mode, and the machines we most need evidence from (the
+owner's ASUS laptop, the iMac14,4) have no serial port at all. The durable sink
+already exists and has existed for a long time: bootlog_write() mirrors to
+serial, buffers in RAM from the very first line of main(), and bootlog_arm()
+replays the whole buffer to /BOOTLOG.TXT once the root filesystem is writable.
+bootlog_fault_write() is its no-lock/no-allocation/no-filesystem sibling for
+code on the storage path itself.
+
+So the failure this gate closes is not a missing mechanism. It is that the
+CHOICE OF SINK was left to each author, and kprintf() is the one that is easier
+to type and the one the surrounding code already uses.
+
+MEASURED, 2026-08-26, on commit 3983a768 (golden build 2219, booted by the owner
+on his laptop, stick recovered):
+
+  * blk_stage_report() was the ONLY evidence that the write-staging corruption
+    fix works on real hardware. Its author intended it to print "every boot
+    including the golden", precisely because an exclusive claim makes the fault
+    invisible and a silent green line would prove nothing. It used kprintf().
+    `grep -aic blkstage` over the recovered 383 KB /BOOTLOG.TXT: 0.
+  * The [BLKSTAGE] CORRUPTION IN PROGRESS alarm - the line that names the
+    victim LBAs when a filesystem's bytes are being replaced under it - had the
+    same sink. On the machine class that lost a root filesystem to this bug, it
+    could not have been read.
+  * A sweep of the boot-path report/selftest functions main.c calls found 20
+    more in the same shape.
+
+THE RULE
+--------
+A function that kernel/main.c calls, whose name ends in one of
+_report/_selftest/_stats/_summary/_diag/_dump, and which emits anything at all,
+must reach a durable sink (bootlog_write, bootlog_fault_write, usblog_write,
+audiolog_write, bootlog_heartbeat, panic_log_write) - or be listed in
+allowlist.txt with [LEGIT]/[DEBT]/[LEGACY] and a real justification.
+
+The scope is deliberately NARROW. It is not "every kprintf in the kernel" (there
+are 545 distinct bracketed tags; a gate that fires on ordinary tracing gets
+disabled, and then it is #514 all over again). It is the boot-path summary
+functions, which is exactly the shape of both measured failures.
+
+An allowlist entry that no longer matches anything also fails, so the baseline
+cannot rot into a list of names nobody has looked at since.
+
+Exit 0 clean, 1 violation, 2 cannot run (fail closed).
+"""
+import os, re, sys, tempfile, shutil
+
+NAME_RE = re.compile(r'^[a-z_0-9]+_(report|selftest|stats|summary|diag|dump)$')
+CALL_RE = re.compile(r'^[ \t]*([a-z_0-9]+_(?:report|selftest|stats|summary|diag|dump))[ \t]*\(')
+EMIT = ('kprintf', 'kprintf_nolock', 'serial_write', 'gfx_boot_log')
+DURABLE = ('bootlog_write', 'bootlog_fault_write', 'usblog_write',
+           'audiolog_write', 'bootlog_heartbeat', 'panic_log_write',
+           'bootlog_fault_flush', 'bootlog_heartbeat_flush')
+VALID_TAGS = ('[LEGIT]', '[DEBT]', '[LEGACY]')
+
+
+def boot_calls(root):
+    """Names main.c calls in statement position."""
+    path = os.path.join(root, 'main.c')
+    if not os.path.isfile(path):
+        return None
+    names = set()
+    for line in open(path, errors='replace'):
+        m = CALL_RE.match(line)
+        if m:
+            names.add(m.group(1))
+    return names
+
+
+def find_def(root, name):
+    """(file, line, body) of the definition, or None."""
+    pat = re.compile(r'^[A-Za-z_].*[^A-Za-z0-9_]' + re.escape(name) + r'\s*\([^;]*\)\s*\{\s*$')
+    short = re.compile(r'^[A-Za-z_].*[^A-Za-z0-9_]' + re.escape(name) + r'\s*\(')
+    for dirpath, dirnames, files in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in ('tools', 'build', 'obj', '.git')]
+        for f in sorted(files):
+            if not f.endswith('.c'):
+                continue
+            p = os.path.join(dirpath, f)
+            lines = open(p, errors='replace').read().split('\n')
+            for i, line in enumerate(lines):
+                if not short.match(line):
+                    continue
+                if not (pat.match(line) or line.rstrip().endswith('{')):
+                    continue
+                body = []
+                for j in range(i, len(lines)):
+                    body.append(lines[j])
+                    if j > i and lines[j].startswith('}'):
+                        break
+                return (os.path.relpath(p, root), i + 1, '\n'.join(body))
+    return None
+
+
+def scan(root):
+    """-> (violations, seen_names). A violation is (name, loc, nemit)."""
+    names = boot_calls(root)
+    if names is None:
+        print('diaglog-gate: FAIL-CLOSED: no main.c under %s' % root, file=sys.stderr)
+        sys.exit(2)
+    viol, seen = [], set()
+    for name in sorted(names):
+        if not NAME_RE.match(name):
+            continue
+        d = find_def(root, name)
+        if d is None:
+            continue          # declared elsewhere / not in this tree: not our call to make
+        rel, ln, body = d
+        nemit = sum(body.count(e) for e in EMIT)
+        if nemit == 0:
+            continue          # emits nothing at all; there is no sink to get wrong
+        if any(s in body for s in DURABLE):
+            continue
+        seen.add(name)
+        viol.append((name, '%s:%d' % (rel, ln), nemit))
+    return viol, seen
+
+
+def load_allowlist(path):
+    """-> {name: (tag, justification)}; exits 2 on a malformed entry."""
+    out = {}
+    if not os.path.isfile(path):
+        return out
+    for n, raw in enumerate(open(path, errors='replace'), 1):
+        line = raw.split('#', 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[1] not in VALID_TAGS or len(parts[2].strip()) < 12:
+            print('diaglog-gate: FAIL-CLOSED: allowlist line %d is not '
+                  '"<name> [LEGIT|DEBT|LEGACY] <real justification>": %s'
+                  % (n, raw.rstrip()), file=sys.stderr)
+            sys.exit(2)
+        out[parts[0]] = (parts[1], parts[2].strip())
+    return out
+
+
+def report(root, allow_path):
+    viol, seen = scan(root)
+    allow = load_allowlist(allow_path)
+    new = [v for v in viol if v[0] not in allow]
+    stale = sorted(set(allow) - seen)
+    if not new and not stale:
+        print('diaglog-gate: OK (%d boot-path diagnostic(s) baselined, 0 new)'
+              % len(allow))
+        return 0
+    for name, loc, nemit in new:
+        print('diaglog-gate: VIOLATION %s (%s): %d emit call(s), no durable sink.'
+              % (name, loc, nemit), file=sys.stderr)
+    if new:
+        print('', file=sys.stderr)
+        print('  main.c calls this on the boot path and it can only be read over a', file=sys.stderr)
+        print('  serial port. Serial is silent in GUI mode and absent entirely on the', file=sys.stderr)
+        print('  laptop and iMac targets, so on the machines the diagnostic exists for', file=sys.stderr)
+        print('  it produces nothing at all. Use bootlog_write() (safe from the first', file=sys.stderr)
+        print('  line of main(); it mirrors to serial anyway), or bootlog_fault_write()', file=sys.stderr)
+        print('  if the code runs on the storage path and a flush would re-enter it.', file=sys.stderr)
+        print('  If it genuinely must stay serial-only, add it to', file=sys.stderr)
+        print('  %s with [LEGIT]/[DEBT]/[LEGACY] and why.' % allow_path, file=sys.stderr)
+    for name in stale:
+        print('diaglog-gate: STALE allowlist entry %s: it is no longer a serial-only'
+              % name, file=sys.stderr)
+        print('              boot-path diagnostic. Delete the line.', file=sys.stderr)
+    return 1
+
+
+# --------------------------------------------------------------------------
+# PROVE IT. A gate nobody has watched go red is indistinguishable from one that
+# is switched off, so the fixture is synthetic and self-contained: it does not
+# depend on the state of the real tree, which is what lets it keep working after
+# somebody fixes or breaks any particular kernel file.
+# --------------------------------------------------------------------------
+SELFTEST_MAIN = '''#include "x.h"
+void kernel_main(void) {
+    fixture_report();
+    plain_helper();
+}
+'''
+SELFTEST_RED = '''#include "x.h"
+void fixture_report(void) {
+    kprintf("[FIXTURE] claims=%d STOLEN=%d\\n", 1, 0);
+}
+void plain_helper(void) { kprintf("not a diagnostic name\\n"); }
+'''
+SELFTEST_GREEN = SELFTEST_RED.replace('kprintf("[FIXTURE]', 'bootlog_write("[FIXTURE]')
+
+
+def self_test():
+    ok = True
+    tmp = tempfile.mkdtemp(prefix='diaglog-selftest-')
+    try:
+        for label, src, want in (('RED', SELFTEST_RED, 1), ('GREEN', SELFTEST_GREEN, 0)):
+            open(os.path.join(tmp, 'main.c'), 'w').write(SELFTEST_MAIN)
+            open(os.path.join(tmp, 'fixture.c'), 'w').write(src)
+            al = os.path.join(tmp, 'empty-allowlist.txt')
+            open(al, 'w').write('# empty\n')
+            viol, _ = scan(tmp)
+            got = 1 if [v for v in viol if v[0] not in load_allowlist(al)] else 0
+            good = (got == want)
+            ok = ok and good
+            print('  %-5s fixture: expected %s, gate says %s ... %s'
+                  % (label, 'VIOLATION' if want else 'clean',
+                     'VIOLATION' if got else 'clean', 'PASS' if good else 'FAIL'))
+        # And prove the allowlist actually suppresses, and that a stale entry fails.
+        open(os.path.join(tmp, 'fixture.c'), 'w').write(SELFTEST_RED)
+        al = os.path.join(tmp, 'allow.txt')
+        open(al, 'w').write('fixture_report [DEBT] fixture, allowlisted on purpose\n')
+        rc = report(tmp, al)
+        print('  allowlisted RED fixture: expected clean, rc=%d ... %s'
+              % (rc, 'PASS' if rc == 0 else 'FAIL'))
+        ok = ok and rc == 0
+        open(al, 'w').write('nobody_report [DEBT] this name does not exist any more\n')
+        rc = report(tmp, al)
+        print('  stale allowlist entry: expected VIOLATION, rc=%d ... %s'
+              % (rc, 'PASS' if rc == 1 else 'FAIL'))
+        ok = ok and rc == 1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('diaglog-gate --self-test: %s' % ('PASS' if ok else 'FAIL'))
+    return 0 if ok else 1
+
+
+def main():
+    root, allow, st = '.', None, False
+    a = sys.argv[1:]
+    i = 0
+    while i < len(a):
+        if a[i] == '--root':
+            i += 1; root = a[i]
+        elif a[i] == '--allowlist':
+            i += 1; allow = a[i]
+        elif a[i] == '--self-test':
+            st = True
+        else:
+            print('diaglog-gate: unknown argument %s' % a[i], file=sys.stderr)
+            return 2
+        i += 1
+    if st:
+        return self_test()
+    if allow is None:
+        allow = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'allowlist.txt')
+    return report(root, allow)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

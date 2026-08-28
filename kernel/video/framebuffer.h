@@ -24,6 +24,31 @@
 // Initialize framebuffer from boot info
 void fb_init(framebuffer_info_t *info);
 
+// #745 (local 102): display rotation. fb_get_width()/fb_get_height()/
+// fb_get_pitch() below, and every draw primitive in this file, operate in
+// LOGICAL space - the screen as the user is meant to see it, already
+// rotation-corrected. Only fb_swap_buffers()/fb_swap_dirty_rects() (the
+// present chokepoint) and fb_get_phys_*() below know about the raw,
+// possibly-portrait GOP layout. See the block comment above fb_rotation in
+// framebuffer.c for the full rationale.
+typedef enum {
+    FB_ROTATE_NONE = 0,
+    FB_ROTATE_90   = 1,
+    FB_ROTATE_180  = 2,
+    FB_ROTATE_270  = 3,
+} fb_rotation_t;
+
+fb_rotation_t fb_get_rotation(void);
+uint32_t fb_get_phys_width(void);
+uint32_t fb_get_phys_height(void);
+
+// Cumulative TSC-cycle cost of the rotated present copy (fb_present_rect_
+// rotated in framebuffer.c). All-zero and meaningless when fb_get_rotation()
+// is FB_ROTATE_NONE - there is nothing to measure on the code path every
+// non-rotated machine still takes. Read by main.c's [ROTPROF] boot log line.
+void fb_rotate_profile_get(uint64_t *tot_cyc, uint64_t *max_cyc,
+                            uint64_t *calls, uint64_t *px_tot);
+
 // Get framebuffer dimensions
 uint32_t fb_get_width(void);
 uint32_t fb_get_height(void);

@@ -14,11 +14,21 @@
 #define S_IFDIR  0x4000
 #define S_IFCHR  0x2000
 #define S_IFIFO  0x1000
+// #120: SYS_FSTAT can now report these two, so callers need to be able to test
+// for them. S_IFLNK is declared for completeness and because an ext2 volume
+// written elsewhere can carry one (the kernel reports i_mode verbatim); nothing
+// in MayteraOS creates one. See the lstat() note in sys/stat.c.
+#define S_IFSOCK 0xC000
+#define S_IFLNK  0xA000
+#define S_IFBLK  0x6000
 
 #define S_ISREG(m)  (((m) & S_IFMT) == S_IFREG)
 #define S_ISDIR(m)  (((m) & S_IFMT) == S_IFDIR)
 #define S_ISCHR(m)  (((m) & S_IFMT) == S_IFCHR)
 #define S_ISFIFO(m) (((m) & S_IFMT) == S_IFIFO)
+#define S_ISSOCK(m) (((m) & S_IFMT) == S_IFSOCK)
+#define S_ISLNK(m)  (((m) & S_IFMT) == S_IFLNK)
+#define S_ISBLK(m)  (((m) & S_IFMT) == S_IFBLK)
 
 struct stat {
     unsigned long st_dev;

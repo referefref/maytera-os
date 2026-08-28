@@ -1,11 +1,23 @@
 // version.h - MayteraOS Version Information
-#ifndef VERSION_H
-#define VERSION_H
+//
+// THE ONE version definition. Nothing else in kernel/ or userland/ may define
+// MAYTERA_VERSION_STRING, the MAJOR/MINOR/PATCH triple, or MAYTERA_BUILD_NUMBER;
+// build/version-gate.sh fails the golden build if anything does.
+//
+// The guard is MAYTERA_VERSION_H, not the old bare VERSION_H, because four other
+// headers used to carry that same bare guard. Measured consequence: a TU under
+// proc/ that wrote #include "version.h" got proc/version.h, and its later
+// #include "../version.h" was OPENED and then discarded whole by the shared
+// guard, so the TU compiled clean against MAYTERA_VERSION_STRING "1.25.22" and
+// build 272. A distinctive guard makes that shadowing impossible rather than
+// merely absent (#745, local 106).
+#ifndef MAYTERA_VERSION_H
+#define MAYTERA_VERSION_H
 
 // Version format: MAJOR.MINOR.PATCH (e.g., 1.8.2)
-#define MAYTERA_VERSION_MAJOR    1
-#define MAYTERA_VERSION_MINOR    95
-#define MAYTERA_VERSION_PATCH    0
+#define MAYTERA_VERSION_MAJOR    2
+#define MAYTERA_VERSION_MINOR    0
+#define MAYTERA_VERSION_PATCH    2
 
 // Build number (increment for each build)
 // #418 iMac debug/test kernel: crash-dialog CR3 fix + /STAGE.TXT + /PANIC.TXT
@@ -57,7 +69,7 @@
 // MED - 4Kn logical sector size read IDENTIFY words 118/119 instead of the
 // correct 117/118. Added ahci_selftest_ncq() (drives ahci_read_ncq/
 // ahci_write_ncq directly, separate scratch LBA from ahci_selftest()),
-// called from ata_init(). VERIFIED on VM 2500 (q35, two virtio SATA/AHCI
+// called from ata_init(). VERIFIED on VM <vmid> (q35, two virtio SATA/AHCI
 // disks): both selftests PASS on real write+readback round-trips -
 // "[AHCI] selftest: write+readback of LBA 2047992 -> PASS" (non-NCQ, no
 // regression) and "[AHCI] selftest_ncq: NCQ write+readback of LBA 2047984
@@ -89,7 +101,7 @@
 // LIVE-VERIFIED TLS certificate-validation kernel. Valid public HTTPS sites
 // (coingecko/yahoo/wttr.in/musicbrainz/archive.org) verify OK + fetch 200;
 // a self-signed and a wrong-host cert are both REJECTED with a certificate
-// error (proven on a test VM against an openssl s_server bad-cert endpoint).
+// error (proven on VM <vmid> against an openssl s_server bad-cert endpoint).
 // #433 xHCI HID enumeration race fix: mark-port-enumerated-on-success +
 // bounded retry, warm-reboot per-port PP off->on power-cycle, CONFIG_EP return
 // check + retry for HID interrupt-IN, and a periodic port re-scan worker.
@@ -97,6 +109,18 @@
 // path EAPD/amp/GPIO + output-stream DMA state), plus the CS4208 speaker-amp
 // enable (EAPD on the speaker pins + GPIO0 mask/dir/data on the AFG node,
 // mirroring Linux patch_cirrus.c). fresh5 diagnostic image.
+// #205 audio mixer: drivers/audio_pcm.c served ONE stream (PCM_MAX_STREAMS 1),
+// so /APPS/FMSYNTH holding the sink for a DOS session refused every other
+// producer on the machine with EBUSY - the owner's MIDI player and Monkey
+// Island were both silent for that reason. There is now ONE mixer thread
+// summing up to four producers into the single hardware stream, with
+// fixed-point resampling per producer (rustkern/pcmmix.rs), and
+// audio_play_file()/audio_play_buffer() feed it too, so hda_write() has exactly
+// one caller. /AUDIOLOG.TXT is now written on EVERY boot (it was advertised in
+// /boot/LOGS.TXT and had one caller behind an opt-in that no shipping image
+// carries) and records controller/codec selection, every PCM open with its
+// grant or refusal and reason, stream start/stop, both underrun counters and
+// the OPL2 register-write count.
 // #444 ATA DMA data-integrity/stability fix: drivers/ata.c's global I/O lock
 // (g_ata_io_lock) and fs/ext2.c's block-cache lock (g_e2c_lock) both used a
 // non-atomic lazy "if (!ready) { spinlock_init(); ready = 1; }" pattern. Under
@@ -341,7 +365,7 @@
 // client instead of replaying plaintext at port 443, and the #333 net
 // self-test is actually CALLED at boot for the first time (it was dead code).
 // b863 (Win16 #278-toolbar): Word 6 toolbar-icon BLACK SQUARES, root-caused
-// and fixed. legacy-app-re method on a test VM: u_peekmessage (win16api.c) had
+// and fixed. legacy-app-re method on VM <vmid>: u_peekmessage (win16api.c) had
 // no win16_trace flush (Word's WinMain loop is PeekMessage-based, per the
 // pre-existing gated [W6PMSG] trace; only u_getmessage flushed, #205), so
 // /WIN16LOG.TXT stayed stale for an entire Word 6 run - fixed that first
@@ -373,7 +397,7 @@
 // the toolbar (measured zero calls even with the real handler in place), but
 // correct and worth keeping for any app that does use it.
 //
-// MEASURED result (a test VM, two screendumps + advancing clock each stage):
+// MEASURED result (VM <vmid>, two screendumps + advancing clock each stage):
 // toolbar buttons no longer render as solid black squares; real bitmap pixel
 // data (including the source DIB's own magenta/0xFF00FF colour-key marker)
 // now reaches the screen. Regression-clean: FreeCell and Golf (MS
@@ -429,13 +453,19 @@
 // I/O, inode/bitmap allocation and i_size stay in C. Live under
 // -DRUST_EXT2_DIRADD, C kept as ext2_dirblock_insert_c for one-line rollback.
 // Build numbers 944..951 were burned by the #446 FPU differential builds.
-#define MAYTERA_BUILD_NUMBER 1862
+#define MAYTERA_BUILD_NUMBER 2213
 
 // Version string helper macros
 #define STRINGIFY(x) STRINGIFY_HELPER(x)
 #define STRINGIFY_HELPER(x) #x
 
-#define MAYTERA_VERSION_STRING "1.95.0"
+// DERIVED, not hand-written. The STRINGIFY helpers above already existed and
+// were unused: MAYTERA_VERSION_STRING was a SECOND, independent spelling of the
+// same number, so the triple and the string could disagree and nothing would
+// notice. Deriving it makes that drift unrepresentable (local 106).
+#define MAYTERA_VERSION_STRING   STRINGIFY(MAYTERA_VERSION_MAJOR) "." \
+                                 STRINGIFY(MAYTERA_VERSION_MINOR) "." \
+                                 STRINGIFY(MAYTERA_VERSION_PATCH)
 
 // Build date (set at compile time)
 #ifndef MAYTERA_BUILD_DATE
@@ -450,6 +480,13 @@
 
 // Changelog for this version
 #define MAYTERA_CHANGELOG \
+    "v2.0.1 - August 2026\n" \
+    "- Interactive tty: a real program now runs under the terminal on a pty\n" \
+    "  (VEOF, Ctrl-C to the foreground group, raw mode, stdin from the pty)\n" \
+    "- mports: the third-party ports mechanism, with zlib, PCRE2 and Lua 5.4\n" \
+    "- Display rotation 90/180/270 for natively-portrait panels\n" \
+    "- grep is now real GNU grep; the 67-line substring fake is gone\n" \
+    "- SMP correctness: 83 per-CPU reads no longer use a BSP-published global\n" \
     "v1.95.0 - July 2026\n" \
     "- #418: crash-dialog CR3 fix (gui/crashhandler.c mirrors sys_fb_flip's\n" \
     "  kernel-CR3 switch around fb_swap_buffers())\n" \
@@ -490,4 +527,4 @@
     "- Direct framebuffer mode for compositor\n" \
     "- Input event extraction for compositor syscall\n"
 
-#endif // VERSION_H
+#endif // MAYTERA_VERSION_H

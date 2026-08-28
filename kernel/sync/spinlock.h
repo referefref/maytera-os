@@ -2,10 +2,46 @@
 // Part of Task #41 (SMP Support)
 //
 // These spinlocks use atomic compare-and-swap operations to ensure
-// mutual exclusion across multiple CPUs. They include:
-// - Basic spinlock (busy-wait)
-// - Ticket spinlock (fair, FIFO ordering)
-// - Read-write spinlock (multiple readers, single writer)
+// mutual exclusion across multiple CPUs. There is ONE lock type here: the
+// basic test-and-test-and-set spinlock, with an irqsave form and an optional
+// contention-accounting form.
+//
+// TICKET (FAIR) LOCKS AND READER-WRITER LOCKS WERE HERE AND WERE DELETED
+// (2026-08-23). Do not re-add either without first invalidating the
+// measurements below. They were written for Task #41 alongside this file, were
+// never acquired ONCE anywhere in the kernel, and could not have helped:
+//
+//  1. THE SHIPPING KERNEL RUNS ON ONE CPU. cpu/smp.c: g_smp_user_sched = 0,
+//     and main.c gates smp_start_aps() behind it, so no application processor
+//     is ever started unless /SMPSCHED.TXT is dropped on the ESP. With one
+//     core there is no second core to read in parallel with (the rwlock has no
+//     purpose) and none to queue behind (the ticket lock has no purpose). A
+//     spinlock here is an interrupt-masking device, not a contention one.
+//  2. EVEN WITH APs ON, a whole-kernel BKL serialises all kernel execution:
+//     cpu/smp.c g_smp_bkl_full = 1, and cpu/idt.c:201 (every ISR),
+//     proc/syscall.asm:89 (every SYSCALL) and proc/process.c:3473 (every
+//     kernel thread) take it. Two cores cannot be inside a kernel read
+//     critical section at the same time, so an rwlock cannot admit a second
+//     reader no matter which table it guards.
+//  3. THE TICKET LOCK IS STRUCTURALLY UNUSABLE AT THE ONE LOCK THAT DOES
+//     CONTEND. The BKL (cpu/smp.c bkl_take_locked) is recursive, and its wait
+//     loop deliberately runs with interrupts ENABLED, so a waiter can be
+//     interrupted and cpu/idt.c will call bkl_acquire() again on the same
+//     core. Under FIFO that nested acquire takes ticket N+1 while the
+//     interrupted context still holds ticket N: now_serving reaches N and the
+//     only context that can consume it is stuck below the nested wait for N+1.
+//     That is a hard deadlock on the first preempted contended acquire.
+//  4. THE RWLOCK HAD NO IRQSAVE FORM AT ALL, and 98 of the kernel's 125
+//     spinlock acquisition sites are spinlock_acquire_irqsave precisely because
+//     their data is touched from interrupt context. On a single-CPU kernel a
+//     lock whose holder CAN be preempted is a hang generator: the waiter spins
+//     forever because the holder can never be scheduled to release it.
+//     Adopting the rwlock anywhere real meant first writing four new irqsave
+//     entry points, i.e. new untested locking code to serve no measured need.
+//
+// If you need a read-mostly primitive, sync/seqlock.h already exists and is
+// live (proc/syscall.c window content commit). If you need to wait, use
+// sync/waitq.h or sync/futex.c. See CHANGELOG 2026-08-23 for the full survey.
 //
 // IMPORTANT: Never hold a spinlock across operations that might sleep!
 
@@ -59,85 +95,6 @@ void spinlock_release(spinlock_t *lock);
 int spinlock_is_locked(spinlock_t *lock);
 
 // ============================================================================
-// Ticket Spinlock (Fair)
-// ============================================================================
-
-// Ticket spinlock - guarantees FIFO ordering
-// Uses ticket/turn mechanism like a deli counter
-typedef struct {
-    volatile uint32_t next_ticket;  // Next ticket to be issued
-    volatile uint32_t now_serving;  // Current ticket being served
-#ifdef SMP_DEBUG
-    uint32_t owner_cpu;
-    const char *name;
-    uint64_t acquire_count;
-    uint64_t spin_count;
-#endif
-} ticket_lock_t;
-
-// Static initializer
-#ifdef SMP_DEBUG
-#define TICKET_LOCK_INIT { .next_ticket = 0, .now_serving = 0, .owner_cpu = 0xFFFFFFFF, .name = NULL, .acquire_count = 0, .spin_count = 0 }
-#else
-#define TICKET_LOCK_INIT { .next_ticket = 0, .now_serving = 0 }
-#endif
-
-// Initialize a ticket lock
-void ticket_lock_init(ticket_lock_t *lock);
-
-// Acquire ticket lock (waits in FIFO order)
-void ticket_lock_acquire(ticket_lock_t *lock);
-
-// Try to acquire ticket lock (non-blocking)
-int ticket_lock_try_acquire(ticket_lock_t *lock);
-
-// Release ticket lock
-void ticket_lock_release(ticket_lock_t *lock);
-
-// ============================================================================
-// Read-Write Spinlock
-// ============================================================================
-
-// Read-write spinlock - allows multiple readers OR single writer
-// Writers have priority to prevent starvation
-typedef struct {
-    volatile int32_t readers;       // Number of readers (negative = writer waiting)
-    volatile uint32_t writer;       // 0 = no writer, 1 = writer active
-    spinlock_t wait_lock;           // Serialize writer access
-#ifdef SMP_DEBUG
-    const char *name;
-#endif
-} rwlock_t;
-
-// Static initializer
-#ifdef SMP_DEBUG
-#define RWLOCK_INIT { .readers = 0, .writer = 0, .wait_lock = SPINLOCK_INIT, .name = NULL }
-#else
-#define RWLOCK_INIT { .readers = 0, .writer = 0, .wait_lock = SPINLOCK_INIT }
-#endif
-
-// Initialize a read-write lock
-void rwlock_init(rwlock_t *lock);
-
-// Acquire read lock (shared access)
-void rwlock_read_acquire(rwlock_t *lock);
-
-// Release read lock
-void rwlock_read_release(rwlock_t *lock);
-
-// Acquire write lock (exclusive access)
-void rwlock_write_acquire(rwlock_t *lock);
-
-// Release write lock
-void rwlock_write_release(rwlock_t *lock);
-
-// Try to acquire read lock (non-blocking)
-int rwlock_try_read_acquire(rwlock_t *lock);
-
-// Try to acquire write lock (non-blocking)
-int rwlock_try_write_acquire(rwlock_t *lock);
-
-// ============================================================================
 // Interrupt-safe Spinlock Operations
 // ============================================================================
 
@@ -147,12 +104,44 @@ int rwlock_try_write_acquire(rwlock_t *lock);
 // Save interrupt state, disable interrupts, then acquire lock
 uint64_t spinlock_acquire_irqsave(spinlock_t *lock);
 
+// ---------------------------------------------------------------------------
+// #143: OPTIONAL CONTENTION ACCOUNTING, on the shared primitive.
+// ---------------------------------------------------------------------------
+// #143 was raised as "8 run queues share one global lock". Before restructuring
+// the lock, the contention had to be a measured number rather than an adjective,
+// and there was no way to get one: the BKL has per-core acquire/contend/spin
+// counters (cpu/smp.c) but every other spinlock in the kernel has none outside
+// the SMP_DEBUG build, which is not what ships.
+//
+// This is deliberately an OPTION ON THE SHARED LOCK, not a private lock type in
+// the scheduler. Forking a counting spinlock into proc/ would have been the
+// exact anti-pattern this project keeps paying for; the primitive gets better
+// for everyone instead.
+//
+// It adds NO new spin loop. The accounting variant tries once, and on failure
+// falls into the SAME spinlock_acquire() every other caller uses, so there is
+// still one spin implementation in the kernel and the concurrency lint has
+// nothing new to look at.
+//
+// The counters are per-LOCK, not per-core, and are updated with lock-prefixed
+// atomics because the contended case is by definition concurrent. They are
+// DIAGNOSTIC: a torn read of a pair is acceptable and the consumer
+// (rustkern/rqlock.rs) is written to tolerate contended > acquires rather than
+// assume it cannot happen.
+typedef struct {
+    volatile uint64_t acquires;    // acquisitions attempted and completed
+    volatile uint64_t contended;   // of those, how many found the lock held
+} spin_acct_t;
+
+#define SPIN_ACCT_INIT { .acquires = 0, .contended = 0 }
+
+// Exactly spinlock_acquire_irqsave(), plus accounting. A NULL acct is legal and
+// makes this identical to the plain form.
+uint64_t spinlock_acquire_irqsave_acct(spinlock_t *lock, spin_acct_t *acct);
+
+
 // Release lock and restore interrupt state
 void spinlock_release_irqrestore(spinlock_t *lock, uint64_t flags);
-
-// Same for ticket locks
-uint64_t ticket_lock_acquire_irqsave(ticket_lock_t *lock);
-void ticket_lock_release_irqrestore(ticket_lock_t *lock, uint64_t flags);
 
 // ============================================================================
 // Atomic Operations

@@ -24,6 +24,17 @@
 // #695. Defined HERE, next to SYS_CLOSE, and not down with the high numbers:
 // sys_fsync()'s inline wrapper is ~100 lines above that block, and a #define
 // that appears after its only use is an "undeclared" error, not a style issue.
+// (#745 local 109) ftruncate(fd, length): shrink an open file. Shrink only;
+// a grow is refused rather than silently ignored, which is what the previous
+// no-op stub in posixextra.c did.
+#define SYS_FTRUNCATE       386
+// #115 (local 120): utime(path, atime, mtime). Seconds since the UNIX epoch.
+// -1 keeps a timestamp, -2 means "the KERNEL's now" - userland must use -2
+// rather than sending time(), which returns seconds since boot (#113).
+// The UTIME_KEEP / UTIME_NOW sentinels are declared in <utime.h>, next to the
+// functions that take them, so there is exactly one definition.
+#define SYS_UTIME           387
+
 #define SYS_FSYNC           358 // (#695) fsync(fd): commit this fd's buffered
                                 // bytes to the medium WITHOUT consuming the fd
 #define SYS_READ            12  // Read from file
@@ -39,9 +50,32 @@
 #define SYS_BRK             20  // Change data segment size
 #define SYS_MMAP            21  // Map memory
 #define SYS_MUNMAP          22  // Unmap memory
+#define SYS_MPROTECT        23  // Change protection of a mapped range (#404)
+
+// mprotect protection bits (POSIX values; kernel mm/demand.c decodes these).
+#define PROT_NONE           0x0
+#define PROT_READ           0x1
+#define PROT_WRITE          0x2
+#define PROT_EXEC           0x4
+
+// mprotect refusal codes, mirrored from kernel/proc/syscall.h. Distinct so a
+// caller can tell WHICH check refused it rather than only that it failed.
+#define MP_OK               0
+#define MP_E_PROT_BITS    (-1)
+#define MP_E_LEN          (-2)
+#define MP_E_ALIGN        (-3)
+#define MP_E_WX           (-4)   // W^X: PROT_WRITE|PROT_EXEC is refused
+#define MP_E_OVERFLOW     (-5)
+#define MP_E_RANGE        (-6)
+#define MP_E_NOMAP        (-7)
 
 // Graphics/Window (for GUI apps)
 #define SYS_WIN_CREATE      30  // Create window
+// #148 (local 164, 2026-08-18): defined here (not down by the other #390s,
+// where its number would suggest) because win_create_bg() below needs it -
+// C macros are textual and only see #defines that appear earlier in the
+// file. See kernel/proc/syscall.h SYS_WIN_CREATE_BG for the full contract.
+#define SYS_WIN_CREATE_BG   393 // Create window WITHOUT taking keyboard focus
 #define SYS_WIN_DESTROY     31  // Destroy window
 #define SYS_WIN_DRAW_RECT   32  // Draw rectangle
 #define SYS_WIN_DRAW_TEXT   33  // Draw text
@@ -59,7 +93,7 @@
 #define SYS_GETCHAR         41  // Read character
 
 // Time
-#define SYS_TIME            50  // Get current time
+#define SYS_TIME            50  // #113: seconds since the UNIX EPOCH (UTC). Was seconds since BOOT.
 #define SYS_CLOCK           51  // Get system clock ticks
 
 // Network
@@ -106,15 +140,18 @@
 #define SYS_WAITPID         98  // Wait for specific child
 #define SYS_GETCWD          99  // Get current working directory
 #define SYS_CHDIR           100 // Change directory
-// 101 SYS_FSTAT: DELETED, NOT MISSING (#745 local 82). fstat() has always
-// been implemented in sys/stat.c on top of SYS_SEEK (SEEK_CUR, SEEK_END,
-// restore). Adding a kernel fstat would have been a SECOND implementation of
-// a working function, and the number itself was a trap: anything that had
-// called it would have got a flat -1 from the dispatcher's default case. If
-// fstat ever needs to report a real st_mode/st_dev for a directory or a
-// device (the SEEK-based version always reports S_IFREG), the right change
-// is a kernel fstat that sys/stat.c calls INSTEAD of the seek trick, not a
-// second path alongside it.
+// 101 SYS_FSTAT: RECLAIMED AND REAL (#120). #745 deleted the unimplemented
+// declaration that used to sit on this number and recorded the exact condition
+// for taking it back: "if fstat ever needs to report a real st_mode/st_dev for
+// a directory or a device ... the right change is a kernel fstat that
+// sys/stat.c calls INSTEAD of the seek trick, not a second path alongside it."
+// That is what happened. The SEEK-based version was not a working function, it
+// was a fabrication - it hardcoded S_IFREG|0644 and returned 0 even for a
+// closed fd - and it is GONE from the success path, kept only as the
+// old-kernel -1 fallback. The kernel handler reuses the one per-backend fill
+// SYS_STAT uses (proc/syscall.c sc_stat_fill), so there is still exactly one
+// copy of the stat logic.
+#define SYS_FSTAT          101  // Get file status by descriptor
 // 102 SYS_GETDENTS: DELETED, NOT MISSING (#745 local 82). Directory reads go
 // through SYS_OPEN + SYS_READDIR (19), which is what dirent.c's opendir/
 // readdir/closedir already use and what the kernel already implements.
@@ -148,10 +185,22 @@
 #define SYS_SET_VOLUME      135 // Set master audio volume (0-100)
 #define SYS_GET_VOLUME      136 // Get master audio volume (0-100)
 #define SYS_SET_MUTE        137 // Set audio mute state (0=unmute, 1=mute)
+// #162 (2026-08-19): packed system volume state in ONE syscall.
+//   bits 0..7 level | bit 8 muted | bits 16..31 seq | bits 32..47 keyseq
+// Defined here next to its siblings (not down with the other 39x numbers)
+// because vol_state() below needs it, and C macros are textual: an inline
+// function only sees #defines that appear earlier in the file. Same reason
+// SYS_WIN_CREATE_BG (393) is defined up next to SYS_WIN_CREATE (30).
+#define SYS_VOL_STATE       395
 #define SYS_GET_DISK_TOTAL  138 // Get disk total size in MB
 #define SYS_GET_DISK_FREE   139 // Get disk free space in MB
 #define SYS_SET_MOUSE_SPEED 140 // Set mouse sensitivity (1-10)
 #define SYS_GET_MOUSE_SPEED 141 // Get mouse sensitivity (1-10)
+// #236: gap, not the top of the range - see the block comment in
+// kernel/proc/syscall.h next to this same number.
+#define SYS_SET_DBLCLICK_MS 282 // Push Double-click Speed (ms) to gui/window.c
+// #113: epoch MICROSECONDS (UTC). See kernel/cpu/wallclock.h. Zero args.
+#define SYS_REALTIME_US     396
 #define SYS_GET_RTC_TIME    142 // Get RTC time packed: (hour<<16)|(min<<8)|sec
 #define SYS_GET_RTC_DATE    143 // Get RTC date packed: (year<<16)|(month<<8)|day
 #define SYS_SET_RTC_TIME    144 // Set RTC time: packed (hour<<16)|(min<<8)|sec
@@ -221,6 +270,15 @@ static inline int sys_munmap(void *addr, unsigned long len) {
     return (int)syscall2(SYS_MUNMAP, (long)addr, len);
 }
 
+// (#404) mprotect(addr, len, prot). Returns 0, or a negative MP_E_* code.
+// NOTE: this kernel refuses PROT_WRITE|PROT_EXEC together (W^X) with MP_E_WX,
+// which is a deliberate divergence from POSIX. It also only covers ranges that
+// are backed by a VMA, i.e. memory obtained from mmap(): the ELF image, the brk
+// heap and the initial stack have no VMA in this kernel and return MP_E_NOMAP.
+static inline int sys_mprotect(void *addr, unsigned long len, int prot) {
+    return (int)syscall3(SYS_MPROTECT, (long)addr, (long)len, (long)prot);
+}
+
 static inline void *sys_brk(void *addr) {
     return (void *)syscall1(SYS_BRK, (long)addr);
 }
@@ -260,6 +318,15 @@ static inline long sys_time(void) {
     return syscall0(SYS_TIME);
 }
 
+// #113: epoch MICROSECONDS (UTC), or 0 if the kernel has no calendar yet.
+// This is what gettimeofday()/clock_gettime(CLOCK_REALTIME) are built on.
+// It shares ONE anchor with SYS_TIME in the kernel, so a sys_time() and a
+// sys_realtime_us() taken in the same instant agree about which second it is.
+// TIMEZONE IS NOT APPLIED: this is UTC, per POSIX. Use libc/tz.c to present it.
+static inline long long sys_realtime_us(void) {
+    return (long long)syscall0(SYS_REALTIME_US);
+}
+
 #define SYS_GET_TICKS 245
 // Monotonic 100Hz tick counter (each tick = 10ms). For double-click timing etc.
 static inline long get_ticks(void) {
@@ -288,6 +355,15 @@ static inline int sys_readdir_raw(int fd, void *entry_buf) {
 // Returns: window handle (>=0) on success, -1 on failure
 static inline int win_create(const char *title, int x, int y, int width, int height) {
     return (int)syscall5(SYS_WIN_CREATE, (long)title, x, y, width, height);
+}
+
+// #148 (local 164, 2026-08-18): same contract as win_create(), but the new
+// window does NOT take keyboard focus (kernel/proc/syscall.h SYS_WIN_CREATE_-
+// BG - the window is created and shown, whatever currently has focus keeps
+// it). For a window that must appear without disturbing what the user is
+// typing into (the PrintScreen-opens-Snapshot-with-a-preview flow).
+static inline int win_create_bg(const char *title, int x, int y, int width, int height) {
+    return (int)syscall5(SYS_WIN_CREATE_BG, (long)title, x, y, width, height);
 }
 
 // Destroy a window
@@ -352,6 +428,32 @@ static inline int win_draw_text_ttf(int handle, int x, int y, const char *text, 
 // (#563 app/kernel signing-key split) - do not reuse 334 for anything else.
 #define SYS_THEME_LOAD_FILE 335
 #define SYS_THEME_METRIC    357 // (#711) mtheme v2 integer metric getter
+
+// The GLOBAL UI SCALE FACTOR. MUST match kernel/proc/syscall.h exactly.
+// See userland/libc/uiscale.h for the Ring 3 API and rustkern/uiscale.rs for
+// the design.
+#define SYS_UI_SCALE        409
+#define UISC_GET     0
+#define UISC_SET     1
+#define UISC_AUTO    2
+#define UISC_MAX     3
+#define UISC_SRC     4
+#define UISC_GEN     5
+#define UISC_SAVE    6
+#define UISC_LAPTOP  7
+#define UISC_PX      8
+#define UISC_UNPX    9
+#define UISC_SPAN   10
+#define UISC_NATIVE 11   // mark the CALLING process as thinking in real screen
+                         // pixels (the compositor, and nothing else). Call it
+                         // FIRST, before any SYS_FB_INFO: the framebuffer-owner
+                         // backstop is not yet true at that point.
+// Mirrors UI_SRC_* in kernel/gui/uiscale.h.
+#define UI_SRC_DEFAULT 0
+#define UI_SRC_AUTO    1
+#define UI_SRC_CONFIG  2
+#define UI_SRC_USER    3
+#define UI_SRC_ESP     4   // pinned by /UISCALE.TXT on the FAT boot partition
 // (themes ticket, 2026-08-07) how many fg/bg pairs the runtime contrast floor
 // had to force-correct the last time this theme index was parsed. See
 // kernel proc/syscall.h and userland/libc/gui_theme.c.
@@ -379,6 +481,85 @@ static inline int win_draw_text_ttf(int handle, int x, int y, const char *text, 
 // dispatch table and (for 373's two string arguments) in rustkern/argtab.rs.
 #define SYS_SET_LOGIN_MODE     374  // (int mode, const char *user, const char *pass) -> 0/-1
 #define SYS_GET_LOGIN_MODE     375  // () -> 0 list / 1 typed / <0 error
+// The REAL display geometry, ((width << 16) | height), regardless of the
+// caller's scale. SYS_FB_INFO deliberately answers a scale-transparent app in
+// LOGICAL pixels, because that is the coordinate system it draws in - but
+// Settings has to SHOW the user the resolution their panel is actually
+// running at, and "1280 x 720" on a 1920x1080 display is a lie even though it
+// is the right answer to a different question.
+#define UISC_FBPHYS 12
+
+// Control-method battery (#battmeter). MUST match kernel/proc/syscall.h
+// exactly. See drivers/battery.h and rustkern/battery.rs for the design.
+#define SYS_BATTERY    410
+#define BATT_PRESENT   0   // -> 1 battery declared, 0 none, -1 could not ask
+#define BATT_PCT       1   // -> 0-100, or -1 unknown
+#define BATT_STATE     2   // -> BATT_ST_* below, or 0 (unknown)
+#define BATT_MINUTES   3   // -> minutes remaining, or -1 unknown
+#define BATT_GEN       4   // -> generation counter, bumped on every change
+#define BATT_ST_UNKNOWN     0
+#define BATT_ST_DISCHARGING 1
+#define BATT_ST_CHARGING    2
+#define BATT_ST_FULL        3
+
+// (#wizflash) UNSCALED (1x, theme-file-native) counterpart of SYS_THEME_METRIC
+// above. MUST match kernel/proc/syscall.h exactly. See that header's comment
+// on SYS_THEME_METRIC_RAW for why a caller (gui_theme_win_preview()) needs the
+// raw value rather than the pre-scaled one when it is about to draw through a
+// window that will scale the result itself.
+#define SYS_THEME_METRIC_RAW 412
+
+// (#231r) THE 5-BAND GRAPHIC EQUALISER. MUST match kernel/proc/syscall.h
+// exactly. See that header for the design and for why the number is 413.
+//
+// The faders in the tray Sound panel drive THIS, and this reaches real
+// per-band biquad DSP in the kernel's PCM mixer. #231 deleted the previous
+// EQ precisely because no such syscall existed, so nothing behind the faders
+// was real; do not add a UI control here that does not end up in
+// rustkern/pcmeq.rs.
+#define SYS_AUDIO_EQ   413
+#define AEQ_BANDS     0   // ()          -> number of bands (5)
+#define AEQ_GET       1   // (band)      -> fader 0..100 (50 = flat), -1 bad band
+#define AEQ_SET       2   // (band, pos) -> 0, or -1 bad band. pos clamps to 0..100
+#define AEQ_FREQ      3   // (band)      -> centre/corner frequency in Hz
+#define AEQ_DB10      4   // (band)      -> gain in TENTHS of a dB, signed
+#define AEQ_ACTIVE    5   // ()          -> 1 if any band is off flat
+#define AEQ_RESET     6   // ()          -> every band back to flat
+#define AEQ_LOG       7   // ()          -> write the current EQ to /AUDIOLOG.TXT
+#define AEQ_SELFTEST  8   // ()          -> boot spectral self-test mask, 0 = pass
+#define AEQ_POS_FLAT  50
+#define AEQ_RANGE_DB10 120
+
+
+// ===========================================================================
+// #229 FIRST-RUN (OOBE) STATE. Same argument as SYS_SET_LOGIN_MODE above, for
+// the same directory: /CONFIG is root-owned 0711 because it holds SHADOW and
+// the owner's API keys, so a Ring-3 wizard running as the session user cannot
+// create a name in it. Measured on golden 2011, all four of the first-boot
+// wizard's durable writes were refused, INCLUDING its "Skip to Desktop" escape
+// hatch - which is what turned a failed setup into a machine with no way out.
+//
+// So the state is asked for, not written. The kernel owns the set of legal
+// keys; there is no path from this call to any other name in that directory.
+// See kernel/rustkern/firstrun.rs for the full reasoning, including why
+// SETUPSKIP and SETUPNEW stopped being files at all (they are one-boot signals,
+// and storing a one-boot signal on persistent media manufactured the same
+// stale-marker bug twice, #136 and #203).
+//
+// MIRRORED from kernel/proc/syscall.h and kernel/rustkern/firstrun.rs. The
+// first-boot wizard is a no_std Rust app that cannot include either, so it
+// keeps a fifth copy in its own const block; firstrun_selftest_rs() asserts
+// these numeric values on every boot for exactly that reason.
+// ===========================================================================
+#define SYS_FIRSTRUN           397  // (int op) -> see FR_* below
+
+#define FR_MARK_DONE            0   // durable: /CONFIG/SETUPDONE. -> 0, or -2 if the machine has no account
+#define FR_SKIP_SET             1   // per-boot: escaped to the desktop. -> 0, ALWAYS (it cannot fail)
+#define FR_SKIP_GET             2   // per-boot: -> 1 if escaped this boot, else 0. Non-consuming
+#define FR_SKIP_CLEAR           3   // per-boot: arming a fresh first run. -> 0
+#define FR_HANDOVER_SET         4   // per-boot: the machine just changed hands. -> 0
+#define FR_HANDOVER_TAKE        5   // per-boot: CONSUMING read of the above. -> 1 once, then 0
+#define FR_BOOTSTRAP_QUERY      6   // #OOBEAUTH: -> 1 iff this caller may call SYS_FIRSTBOOT_ADMIN right now, else 0
 
 // ===========================================================================
 // #745 ELEVATION (kernel/proc/elevate.h). System-wide package installs.
@@ -646,6 +827,27 @@ static inline int win_get_size(int handle, int *width, int *height) {
     return (int)syscall3(SYS_WIN_GET_SIZE, handle, (long)width, (long)height);
 }
 
+// #221: THIS WINDOW'S OWN STATE. Until this existed an app could not discover
+// that it was minimized, and could not discover that it was unfocused either:
+// the kernel emits no focus/blur/minimize event to an app (EVENT_WINDOW_FOCUS
+// and EVENT_WINDOW_BLUR appear exactly once each in the kernel tree and it is
+// the enum declaration), and although wm_get_windows() reports `minimized` per
+// window, an app cannot find its own row - win_create() returns the
+// user_windows[] slot index while wm_window_info_t.id is the window manager's
+// window id, and nothing maps one to the other.
+//
+// Pass the handle win_create() returned. Returns the bitmask below, or -1 if
+// the handle is not a live window. Cannot block; safe to call on a throttle
+// from a draw loop (#426).
+#define SYS_WIN_GET_STATE   407
+#define WIN_STATE_VISIBLE   0x01
+#define WIN_STATE_MINIMIZED 0x02
+#define WIN_STATE_FOCUSED   0x04
+#define WIN_STATE_MAXIMIZED 0x08
+static inline int win_get_state(int handle) {
+    return (int)syscall1(SYS_WIN_GET_STATE, (long)handle);
+}
+
 // Get current window screen position (must call per-event as window may have moved)
 static inline void win_get_pos(int handle, int *x, int *y) {
     syscall3(SYS_WIN_GET_POS, (long)handle, (long)x, (long)y);
@@ -812,6 +1014,13 @@ static inline int futex(volatile unsigned int *addr, int op, unsigned int val,
 #define SYS_SET_SS_DELAY    250
 #define SYS_GET_SS_DELAY    251
 #define SYS_UPTIME_MS       252
+// perf62 (#62 revalidation): TSC-backed monotonic microseconds (cpu/mono.h
+// mono_us(), NOT timer_ticks). SYS_UPTIME_MS/SYS_GET_TICKS are tick-derived,
+// and blame.md's "timer-ticks-is-not-a-wall-clock" entry records that KVM
+// replays a starved vCPU's lost tick IRQs in BURSTS, so a tick interval can
+// misreport real elapsed time during exactly the kind of stall a frame-
+// interval instrument needs to see honestly.
+#define SYS_MONO_US         388
 #define SYS_DECODE_IMAGE    253
 #define SYS_WIN_DRAW_IMAGE  254
 #define SYS_HTTP_FETCH_START    255
@@ -821,6 +1030,10 @@ static inline int futex(volatile unsigned int *addr, int op, unsigned int val,
 #define SYS_HTTP_FETCH_PROGRESS 368  // (#25)
 #define SYS_SET_SETTINGS_TAB 229
 #define SYS_GET_SETTINGS_TAB 230
+// #745 (local 102): display rotation. MIRRORS kernel/proc/syscall.h exactly;
+// syscall-number-lint rule 3 checks the two agree.
+#define SYS_SET_ROTATION     384
+#define SYS_GET_ROTATION     385
 #endif
 static inline int set_icon_size(int sz) {
     return (int)syscall1(SYS_SET_ICON_SIZE, sz);
@@ -846,6 +1059,62 @@ static inline int set_mute(int mute) {
     return (int)syscall1(SYS_SET_MUTE, mute);
 }
 
+// (#231r) 5-band graphic EQ. Helpers rather than raw syscall3() at every call
+// site, for the same reason vol_state() has them just above: an opcode copied
+// wrong at one of several call sites is the silent-wrong-value class of bug
+// this project keeps finding.
+//
+// The fader unit is the SAME 0..100 the original panel's faders travelled,
+// with 50 as the centre detent. The kernel owns the fader-to-dB mapping
+// (rustkern/pcmeq.rs), so ask it with eq_band_db10() rather than
+// re-deriving it here - two copies of that mapping is how a UI ends up
+// labelling a gain it is not applying.
+static inline int eq_band_count(void) {
+    return (int)syscall1(SYS_AUDIO_EQ, AEQ_BANDS);
+}
+static inline int eq_band_get(int band) {
+    return (int)syscall2(SYS_AUDIO_EQ, AEQ_GET, band);
+}
+static inline int eq_band_set(int band, int pos) {
+    return (int)syscall3(SYS_AUDIO_EQ, AEQ_SET, band, pos);
+}
+static inline int eq_band_freq(int band) {
+    return (int)syscall2(SYS_AUDIO_EQ, AEQ_FREQ, band);
+}
+static inline int eq_band_db10(int band) {
+    return (int)syscall2(SYS_AUDIO_EQ, AEQ_DB10, band);
+}
+static inline int eq_is_active(void) {
+    return (int)syscall1(SYS_AUDIO_EQ, AEQ_ACTIVE);
+}
+static inline int eq_reset(void) {
+    return (int)syscall1(SYS_AUDIO_EQ, AEQ_RESET);
+}
+// Call ONCE when a fader drag ends, never during it: the kernel side rewrites
+// the whole of /AUDIOLOG.TXT per call.
+static inline void eq_log(void) {
+    (void)syscall1(SYS_AUDIO_EQ, AEQ_LOG);
+}
+static inline unsigned eq_selftest_mask(void) {
+    return (unsigned)syscall1(SYS_AUDIO_EQ, AEQ_SELFTEST);
+}
+
+// #162: one packed read of the system volume state. See SYS_VOL_STATE above.
+// Helpers rather than raw bit-fiddling at every call site, because a shifted
+// mask copied wrong at one of them is exactly the silent-wrong-value class of
+// bug this project keeps finding.
+static inline unsigned long long vol_state(void) {
+    return (unsigned long long)syscall0(SYS_VOL_STATE);
+}
+static inline int vol_state_level(unsigned long long st) { return (int)(st & 0xFF); }
+static inline int vol_state_muted(unsigned long long st) { return (int)((st >> 8) & 1); }
+static inline unsigned vol_state_seq(unsigned long long st) {
+    return (unsigned)((st >> 16) & 0xFFFF);
+}
+static inline unsigned vol_state_keyseq(unsigned long long st) {
+    return (unsigned)((st >> 32) & 0xFFFF);
+}
+
 // Disk info (returns MB)
 static inline long get_disk_total_mb(void) {
     return (long)syscall0(SYS_GET_DISK_TOTAL);
@@ -860,6 +1129,14 @@ static inline int set_mouse_speed(int speed) {
 }
 static inline int get_mouse_speed(void) {
     return (int)syscall0(SYS_GET_MOUSE_SPEED);
+}
+
+// #236: push the live Double-click Speed setting (ms) into the kernel's
+// title-bar maximize/restore detector (gui/window.c). See the
+// SYS_SET_DBLCLICK_MS block comment in kernel/proc/syscall.h. Kernel clamps
+// to [100, 3000]; this never fails from userland's point of view.
+static inline int sys_set_dblclick_ms(int ms) {
+    return (int)syscall1(SYS_SET_DBLCLICK_MS, ms);
 }
 
 // RTC time/date
@@ -916,6 +1193,20 @@ static inline int net_set_static(const char *ip, const char *mask, const char *g
 static inline int set_display_fx(int brightness, int nightlight) {
     return (int)syscall2(SYS_SET_DISPLAY_FX, brightness, nightlight);
 }
+// #745 (local 102): persists the rotation CHOICE (0=none 1=90cw 2=180
+// 3=270cw) to \ROTATE.TXT on the FAT ESP for the NEXT boot's fb_init() to
+// read; it does not re-rotate the running session (see kernel/proc/syscall.c
+// SYS_SET_ROTATION comment for why that is out of scope). Returns 0 on
+// success, -1 if value is out of range or the ESP is not mounted.
+static inline int set_display_rotation(int value) {
+    return (int)syscall1(SYS_SET_ROTATION, value);
+}
+// The rotation ACTIVE for this already-running session (what fb_init() chose
+// at boot from the persisted marker), 0..3. This can differ from the last
+// value passed to set_display_rotation() until the next reboot.
+static inline int get_display_rotation(void) {
+    return (int)syscall0(SYS_GET_ROTATION);
+}
 static inline void ttf_text(int x, int y, const char *str, int size, unsigned int color) {
     syscall5(SYS_DRAW_TTF, x, y, (long)str, size, (long)color);
 }
@@ -936,6 +1227,10 @@ static inline int get_ss_delay(void) {          // (#115)
 }
 static inline unsigned long uptime_ms(void) {   // monotonic ms since boot
     return (unsigned long)syscall0(SYS_UPTIME_MS);
+}
+// perf62: TSC-backed monotonic microseconds since boot. See SYS_MONO_US.
+static inline unsigned long long mono_us(void) {
+    return (unsigned long long)syscall0(SYS_MONO_US);
 }
 #define SYS_SET_WIN_BLANK 231
 static inline int set_win_blank(int on) {
@@ -1325,6 +1620,18 @@ static inline int sys_get_login_mode(void) {
 static inline int sys_getuid(void) {
     return (int)syscall0(SYS_GETUID); }
 
+// #229 first-run state. One wrapper, one op argument, no pointers.
+//
+// THE ESCAPE-HATCH CALLS CANNOT FAIL AND CALLERS MUST NOT TREAT THEM AS IF
+// THEY COULD. FR_SKIP_SET/CLEAR and FR_HANDOVER_SET mutate a bit of kernel
+// RAM and always return 0; the previous implementation of the same signals was
+// a file write, and a caller that refused to proceed on a failed write is
+// exactly how a failed setup became a machine with no way to the desktop.
+// FR_MARK_DONE is the one op that can legitimately fail (no disk, or no
+// account yet) and its callers do check it.
+static inline int sys_firstrun(int op) {
+    return (int)syscall1(SYS_FIRSTRUN, op); }
+
 #define SYS_DELETE_USER     159
 static inline int delete_user(const char *username) {
     return (int)syscall1(SYS_DELETE_USER, (long)username); }
@@ -1342,6 +1649,66 @@ typedef struct {
 } disk_info_t;
 static inline int get_disk_info(int idx, disk_info_t *out) {
     return (int)syscall2(SYS_GET_DISK_INFO, (long)idx, (long)out); }
+
+// ===========================================================================
+// #250 REMOVABLE VOLUMES (USB hotplug).
+//
+// disk_info_t above describes FIXED ATA disks and has no mount point, no
+// removable flag and no way to eject, so it cannot answer "what USB drive is
+// plugged in right now". These do.
+//
+// vol_list() is cheap enough to call from a UI tick: it is one syscall that
+// writes at most 8 records and touches no device. Compare the result with
+// what you drew last time and only redraw on a change; do NOT poll it from a
+// render path.
+// ===========================================================================
+#define SYS_VOL_LIST        283
+#define SYS_VOL_EJECT       284
+
+// MUST match sc_volume_t in kernel/proc/syscall.h (size locked there by
+// _Static_assert) and ScVolume in kernel/rustkern/hotplug.rs.
+typedef struct {
+    int            index;          // opaque handle: pass to vol_eject()
+    unsigned int   flags;          // MOSVOL_*
+    unsigned int   fs_type;        // informational; display `fsname`
+    unsigned int   pad;
+    unsigned long long total_bytes;
+    unsigned long long free_bytes; // meaningless when MOSVOL_FREE_UNKNOWN
+    char           name[64];       // "SanDisk Cruzer Blade"
+    char           mount[32];      // "/USB0" - a real, browsable path
+    char           fsname[8];      // "FAT32", "exFAT", ...
+} sc_volume_t;
+
+#define MOSVOL_MOUNTED       0x01
+#define MOSVOL_REMOVABLE     0x02
+// Files on this volume can actually be opened and read. CLEAR means the
+// volume is mounted and its size is known but its filesystem's file
+// operations are not implemented (exFAT today). Do not offer it as
+// browsable; say why instead.
+#define MOSVOL_READABLE      0x04
+// free_bytes is not meaningful. Show the total size only.
+#define MOSVOL_FREE_UNKNOWN  0x08
+// #234i. Writes to this volume are refused by the kernel. Set for every
+// mounted disk image (fs/fat.c refuses fat_write on an image-backed handle),
+// so a UI must not offer New / Rename / Delete / Paste there. Whether it is
+// enforced is not the UI's business; whether it is OFFERED is.
+#define MOSVOL_READONLY      0x10
+// #234i. What the volume IS, for the icon and the label. Exactly one of these
+// is set for a disk image and neither for a USB device.
+#define MOSVOL_OPTICAL       0x20  // CD-ROM / ISO 9660 disc image
+#define MOSVOL_FLOPPY        0x40  // floppy disk image
+
+// #234i: see kernel/proc/syscall.h. Buffer this many records and you can never
+// be truncated.
+#define SC_VOL_MAX           16
+#define SC_VOL_IMAGE_BASE    1000
+
+// Returns the number of records written (0..max), or -1.
+static inline int vol_list(sc_volume_t *buf, int max) {
+    return (int)syscall2(SYS_VOL_LIST, (long)buf, (long)max); }
+// Flush, unmount and tell the device it is safe to remove. 0 on success.
+static inline int vol_eject(int index) {
+    return (int)syscall1(SYS_VOL_EJECT, (long)index); }
 
 #define SYS_SET_WALLPAPER   204
 #define SYS_GET_WALLPAPER   205
@@ -1400,6 +1767,15 @@ static inline int sys_play_wav(const char *path) {
  * The stream is owned by the calling PID; another process cannot write or
  * close it. If the owner dies without closing, proc_exit() tears it down.
  * ------------------------------------------------------------------------- */
+// (#182) Drain the DOS guest's OPL2 register writes. See kernel/proc/syscall.h
+// for the number choice and for why this call is deliberately NON-BLOCKING.
+// Rule 3 of kernel/tools/syscall-number-lint requires this to agree with the
+// kernel header, and a silent divergence would mean userland calling one
+// syscall believing it is another.
+#ifndef SYS_DOS_FM_EVENTS
+#define SYS_DOS_FM_EVENTS   377
+#endif
+
 #ifndef SYS_AUDIO_PCM_OPEN
 #define SYS_AUDIO_PCM_OPEN  315
 #define SYS_AUDIO_PCM_WRITE 316
@@ -1432,11 +1808,37 @@ static inline long sys_get_disk_total(void) {
 #define SYS_SPAWN           196
 #define SYS_INJECT_KEY      197
 
+// #221 phase 0. The LIVE physical modifier bitmask, straight out of the state
+// cpu/isr.c uses to fold case and to turn Ctrl+letter into a control
+// character. Bits are kernel/drivers/keymod.h's KEY_MOD_*, re-spelled as
+// GUI_MOD_* in gui_mods.h. Never fails, never blocks, no pointer arguments.
+//
+// DO NOT POLL THIS TO IMPLEMENT A SHORTCUT. It answers "is Shift down NOW",
+// and an event you dequeued a moment ago was stamped by an earlier NOW. Track
+// the modifier press/release events instead (gui_mods.h does), which are in
+// the SAME ordered queue as the key they modify and therefore cannot race it.
+// This call exists for ONE job: correcting a held bit that went stale because
+// the release was delivered to a window that had taken focus. See
+// gui_mods_resync().
+#define SYS_KEY_MODS        400
+static inline unsigned int sys_key_mods(void) {
+    return (unsigned int)syscall0(SYS_KEY_MODS); }
+
 static inline int sys_spawn(const char *path) {
     return (int)syscall1(SYS_SPAWN, (long)path); }
 
 #define SYS_WM_MAXIMIZE_WINDOW 260
 static inline int sys_wm_maximize_focused(void) { return (int)syscall0(SYS_WM_MAXIMIZE_WINDOW); }
+
+// #158 NATIVE FULLSCREEN. See kernel/proc/syscall.h for the full contract.
+#define SYS_WM_FULLSCREEN_ENTER  389  // caller's own focused window only
+#define SYS_WM_FULLSCREEN_EXIT   390  // unconditional, safe from anywhere
+#define SYS_WM_FULLSCREEN_RENDER 391  // compositor per-frame fast-path blit
+#define SYS_WM_FULLSCREEN_STATUS 392  // watchdog probe: (id<<32)|commit_seq, or -1
+static inline int sys_wm_fullscreen_enter(void) { return (int)syscall0(SYS_WM_FULLSCREEN_ENTER); }
+static inline int sys_wm_fullscreen_exit(void)  { return (int)syscall0(SYS_WM_FULLSCREEN_EXIT); }
+static inline int sys_wm_fullscreen_render(void){ return (int)syscall0(SYS_WM_FULLSCREEN_RENDER); }
+static inline long long sys_wm_fullscreen_status(void) { return (long long)syscall0(SYS_WM_FULLSCREEN_STATUS); }
 
 // (#745) Publish the desktop work area: px reserved at each screen edge by the
 // ACTIVE dock style. Compositor-only (returns -1 for anyone else). The kernel
@@ -1452,6 +1854,8 @@ static inline int sys_wm_set_work_area(int left, int top, int right, int bottom)
 // #185: borderless panel + OS-wide mouse wheel
 #define SYS_WIN_SET_NOCHROME 262
 static inline int win_set_nochrome(int handle) { return (int)syscall1(SYS_WIN_SET_NOCHROME, (long)handle); }
+#define SYS_WIN_SET_NOCHROME_BG 398
+static inline int win_set_nochrome_bg(int handle) { return (int)syscall1(SYS_WIN_SET_NOCHROME_BG, (long)handle); }  // #216: nochrome, no focus grab
 // #745: opt in to the compositor-drawn soft drop shadow around this window.
 // One-way; see kernel/gui/window.h WINDOW_FLAG_SHADOW for why it is opt-in.
 #define SYS_WIN_SET_SHADOW   376
@@ -1470,7 +1874,27 @@ static inline int sys_inject_key(int key) {
     return (int)syscall1(SYS_INJECT_KEY, (long)key); }
 #define SYS_SPAWN_ARGS      198
 
+// #112: THESE TWO NOW CARRY THE CALLER'S ENVIRONMENT.
+//
+// They used to be raw syscall3/syscall6 to 198/247, which carry argv and
+// nothing else, so every child started with an empty `environ` no matter what
+// its parent had exported. They route through __spawn_with_env() (stdlib.c)
+// instead, which fills an sc_spawn_req_t with `environ` and issues 394.
+//
+// Done HERE rather than at the call sites on purpose: roughly a hundred places
+// in this tree call these two, and a facility that each caller has to opt into
+// is a facility most callers never get. The two raw numbers are still defined
+// below for anything that deliberately wants the no-environment shape.
+int __spawn_with_env(const char *path, char **argv, int argc,
+                     const char *infile, const char *outfile, int append);
+
 static inline int sys_spawn_args(const char *path, char **argv, int argc) {
+    return __spawn_with_env(path, argv, argc, 0, 0, 0);
+}
+
+// The pre-#112 spellings, kept because "spawn with NO environment" has to stay
+// expressible and because the syscall numbers are part of the ABI.
+static inline int sys_spawn_args_noenv(const char *path, char **argv, int argc) {
     return (int)syscall3(SYS_SPAWN_ARGS, (long)path, (long)argv, (long)argc);
 }
 
@@ -1479,8 +1903,51 @@ static inline int sys_spawn_args(const char *path, char **argv, int argc) {
 // infile/outfile may be NULL; append != 0 opens the output file for append.
 static inline int sys_spawn_redir(const char *path, char **argv, int argc,
                                   const char *infile, const char *outfile, int append) {
+    return __spawn_with_env(path, argv, argc, infile, outfile, append);
+}
+
+static inline int sys_spawn_redir_noenv(const char *path, char **argv, int argc,
+                                        const char *infile, const char *outfile, int append) {
     return (int)syscall6(SYS_SPAWN_REDIR, (long)path, (long)argv, (long)argc,
                          (long)infile, (long)outfile, (long)append);
+}
+
+// ---------------------------------------------------------------------------
+// #112: SPAWN WITH AN ENVIRONMENT.
+//
+// SYS_SPAWN_REDIR above already uses all six argument registers, so an
+// environment cannot be a seventh operand: 394 takes ONE pointer to this
+// fixed-size, version-locked request struct instead. The layout MUST match
+// sc_spawn_req_t in kernel/proc/syscall.h byte for byte; a _Static_assert
+// there locks its size to the 56 that rustkern/argtab.rs validates.
+//
+// envc IS NOT A COUNT WITH A CONVENIENT SENTINEL, it is three different
+// requests, and posix_spawn() in spawn.c depends on the distinction:
+//   envc <  0   no environment supplied. The child gets the kernel default
+//               block (PATH/SHELL/TERM), which is also what the two older
+//               spawn syscalls give it.
+//   envc == 0   an EMPTY environment, on purpose. This is `env -i`.
+//   envc >  0   envp points at envc "NAME=VALUE" strings.
+//
+// An entry that is not NAME=VALUE, or one longer than 511 bytes, REFUSES the
+// spawn (returns -1). It is never truncated and never dropped: a half PATH
+// still looks like a PATH to whatever reads it.
+// ---------------------------------------------------------------------------
+#define SYS_SPAWN_ENV       394
+typedef struct {
+    const char  *path;
+    char       **argv;
+    int          argc;
+    int          envc;
+    char       **envp;
+    const char  *infile;
+    const char  *outfile;
+    int          append;
+    int          reserved;   // MUST be 0
+} sc_spawn_req_t;
+
+static inline int sys_spawn_env(const sc_spawn_req_t *req) {
+    return (int)syscall1(SYS_SPAWN_ENV, (long)req);
 }
 
 // (#116) Live mouse-cursor style/size. Settings calls set_cursor() on change; the
@@ -1495,11 +1962,32 @@ static inline int get_cursor(void) {   // packed: style (low 8) | size<<8
 }
 
 #define SYS_WIN16_RUN       237
-// Run a Win16 (NE/.COM) executable by path. Blocks until the app window
-// closes, then returns 0 on success or <0 on error. Used by the Start menu
-// to launch installed Win3.x programs.
+// (#845) Per-app real/protected mode request, second argument to
+// win16_run_mode(). AUTO lets the kernel derive the mode from the NE header
+// (win16_decide_pmode() in kernel/exec/ne.c); the FORCE_* values are an
+// explicit override that wins over the derived answer either way.
+#define WIN16_MODE_AUTO       (-1)
+#define WIN16_MODE_FORCE_REAL 0
+#define WIN16_MODE_FORCE_PM   1
+// Run a Win16 (NE) executable by path, requesting a specific execution mode
+// (see WIN16_MODE_* above). NON-BLOCKING: the kernel arms the guest's
+// identity, spawns a dedicated proc + host window and returns immediately, 0
+// on a successful launch and <0 on error (an already-running Win16 guest, or
+// no usable identity).
+// (This comment previously said it "blocks until the app window closes".
+// win16_launch() in kernel/proc/syscall.c has never done that - it returns
+// straight after proc_create(). A caller that believed the old text would have
+// designed around a wait that does not happen.)
+static inline int win16_run_mode(const char *path, int mode) {
+    return (int)syscall2(SYS_WIN16_RUN, (long)path, (long)mode);
+}
+// Same as win16_run_mode(path, WIN16_MODE_AUTO): let the kernel derive the
+// mode from the NE header. Used by the Terminal (when a named file turns out
+// to carry an NE header) and the AI tool-contract launcher, neither of which
+// has an opinion on mode; the Start menu uses win16_run_mode() directly with
+// whatever its .MENU fragment or /WIN16GRP.CFG entry configured.
 static inline int win16_run(const char *path) {
-    return (int)syscall1(SYS_WIN16_RUN, (long)path);
+    return win16_run_mode(path, WIN16_MODE_AUTO);
 }
 
 #define SYS_DOS_RUN         240
@@ -1621,9 +2109,179 @@ _Static_assert(sizeof(net_status_t) == 48,
 #define NET_PROBE_ENOTSTARTED  (-3)
 #define NET_PROBE_ELINK        (-4) // no carrier: instant no-op (#381)
 
+// ============================================================================
+// #238 THE PACKET FILTER.
+//
+//   sys_net_fw(op, &xfer) -> 0, or negative
+//
+// The KERNEL owns the firewall policy AND the file it lives in
+// (/CONFIG/FWRULES.CFG). Userland does not parse that file and must not write
+// it: there is exactly one parser and one serialiser, both in
+// kernel/rustkern/fwfilter.rs. An app that wants to show or change the policy
+// reads it here and writes it here. That is the whole point of #238 - the
+// previous arrangement was a Settings panel writing a format with no reader,
+// over a capability the kernel did not have.
+//
+// EVERY OP FILLS THE WHOLE STRUCT FROM THE LIVE KERNEL STATE ON THE WAY OUT.
+// So after a set, `xfer.cfg` is what is ACTUALLY in force, which is not
+// necessarily what you asked for: an invalid ruleset is refused whole and the
+// previous policy stays. Compare what you sent with what came back; do not
+// assume.
+//
+// PORT SEMANTICS: a rule's port matches the DESTINATION port of the packet
+// that OPENS a flow. `in tcp 22` = "permit connections to my port 22";
+// `out tcp 443` = "permit me to connect to a remote port 443". Replies on a
+// flow the filter already allowed are not re-evaluated, which is why a
+// default inbound policy of DENY does not break outbound browsing.
+//
+// NOT FILTERED, and the UI must say so: ARP, ICMP and every IP protocol that
+// is not TCP or UDP (the rule model cannot express them), the DHCP client
+// exchange, and loopback.
+// ============================================================================
+#define SYS_NET_FW 399
+
+#define FW_OP_GET     0   // read policy + counters
+#define FW_OP_SET     1   // install cfg, persist it, read back
+#define FW_OP_RESET   2   // zero the counters, read back
+#define FW_OP_RELOAD  3   // re-read /CONFIG/FWRULES.CFG, install, read back
+
+#define FW_MAX_RULES  12
+#define FW_CFG_VERSION 1
+#define FW_DIR_IN     0
+#define FW_DIR_OUT    1
+#define FW_ACT_ALLOW  0
+#define FW_ACT_DENY   1
+#define FW_PROTO_TCP  0
+#define FW_PROTO_UDP  1
+
+// Mirror of fw_rule_t/fw_config_t/fw_stats_t/fw_xfer_t in kernel/net/firewall.h
+// and FwRule/FwConfig/FwStats/FwXfer in kernel/rustkern/fwfilter.rs. Four
+// copies of one layout; all four are sizeof-locked.
+typedef struct {
+    unsigned char  dir;        // FW_DIR_*
+    unsigned char  action;     // FW_ACT_*
+    unsigned char  proto;      // FW_PROTO_*
+    unsigned char  reserved;   // must be 0
+    unsigned short port;       // 1..65535
+    unsigned short reserved2;  // must be 0
+} fw_rule_t;
+
+typedef struct {
+    unsigned int  version;     // FW_CFG_VERSION
+    unsigned char enabled;
+    unsigned char pol_in;      // FW_ACT_*
+    unsigned char pol_out;     // FW_ACT_*
+    unsigned char rule_count;  // 0..FW_MAX_RULES
+    fw_rule_t     rules[FW_MAX_RULES];
+} fw_config_t;
+
+typedef struct {
+    unsigned long long calls;       // filter invocations
+    unsigned long long ct_hit;      // matched a tracked flow, skipped the rules
+    unsigned long long new_in, new_out;      // flow-opening packets evaluated
+    unsigned long long pass_in, pass_out;
+    unsigned long long drop_in, drop_out;    // THE proof the filter does anything
+    unsigned long long exempt;      // DHCP client / loopback
+    unsigned long long unfiltered;  // protocol the rule model cannot express
+    unsigned long long malformed;   // L4 header too short -> dropped
+    unsigned long long frag;        // non-first fragment -> dropped
+    unsigned long long ct_evict;
+    unsigned long long cyc_tot, cyc_max;     // TSC cycles inside the filter
+    unsigned int ct_used;
+    unsigned int enabled;
+    unsigned int rule_count;
+    unsigned int pol;               // pol_in | (pol_out << 8)
+} fw_stats_t;
+
+typedef struct {
+    fw_config_t cfg;
+    fw_stats_t  stats;
+} fw_xfer_t;
+
+_Static_assert(sizeof(fw_rule_t) == 8,
+               "fw_rule_t sizeof lock: must match kernel/net/firewall.h and "
+               "FwRule in kernel/rustkern/fwfilter.rs");
+_Static_assert(sizeof(fw_config_t) == 104,
+               "fw_config_t sizeof lock: must match kernel/net/firewall.h and "
+               "FwConfig in kernel/rustkern/fwfilter.rs");
+_Static_assert(sizeof(fw_stats_t) == 136,
+               "fw_stats_t sizeof lock: must match kernel/net/firewall.h and "
+               "FwStats in kernel/rustkern/fwfilter.rs");
+_Static_assert(sizeof(fw_xfer_t) == 240,
+               "fw_xfer_t sizeof lock: must match kernel/net/firewall.h and "
+               "SZ_FW_XFER in kernel/rustkern/argtab.rs");
+
+// Never blocks. Mutating ops (SET/RESET/RELOAD) require euid 0 and return -1
+// otherwise; FW_OP_GET is unprivileged.
+//   0    ok
+//  -1    refused (not root, bad op, null pointer, reload found nothing usable)
+//  -5    SET: the policy IS installed but could not be written to disk, so it
+//        will not survive a reboot. Distinct from -22 on purpose.
+// -14    bad user pointer
+// -22    SET: the ruleset failed validation. NOTHING changed; the previous
+//        policy is still in force.
+static inline int sys_net_fw(int op, fw_xfer_t *xfer) {
+    return (int)syscall2(SYS_NET_FW, op, (long)xfer);
+}
+
 // Returns 0 on success. Never blocks.
 static inline int sys_net_status(net_status_t *out) {
     return (int)syscall1(SYS_NET_STATUS, (long)out);
+}
+
+// ============================================================================
+// (#786) Change the LIVE DNS resolver and persist it, in one call.
+//
+// There was NO way to do this from Ring 3 at all. net_set_static() (217) takes
+// ip/mask/gw only, so Settings' "DNS Server" field went nowhere: the app copied
+// the typed text into its own display variable and the resolver never changed.
+// Proven on VM <vmid> / build 2054 - after a real OK click, [NETDIAG] still read
+// dns=8.8.8.8 and a host packet capture showed a fresh hostname resolved
+// through the old server.
+//
+// The kernel does the persisting (kernel/net/net.c net_persist_netcfg), NOT
+// this app: /CONFIG is root-owned 0711, so a Ring-3 write of
+// /CONFIG/NETIP.CFG is refused for every ordinary user, silently, and the
+// app's own failure log lives under "/" and was refused too.
+//
+//   ->  0  applied live AND saved
+//   -> -2  not a usable resolver address
+//   -> -3  applied LIVE but NOT saved: it will revert on reboot. Say so.
+#define SYS_NET_SET_DNS 408
+
+#define NET_SET_DNS_OK        0
+#define NET_SET_DNS_EINVAL  (-2)
+#define NET_SET_DNS_EPERSIST (-3)
+
+// Parse "a.b.c.d" into the HOST-ORDER u32 the syscall takes. Returns 0 for
+// anything that is not four decimal octets, and 0 is itself rejected by the
+// kernel, so a malformed string cannot be mistaken for a valid address.
+static inline unsigned int net_parse_ipv4(const char *s) {
+    unsigned int parts[4] = {0, 0, 0, 0};
+    int pi = 0, val = 0, digits = 0;
+    if (!s) return 0;
+    for (;; s++) {
+        if (*s >= '0' && *s <= '9') {
+            val = val * 10 + (*s - '0');
+            if (++digits > 3 || val > 255) return 0;
+        } else if (*s == '.' || *s == '\0') {
+            if (digits == 0 || pi > 3) return 0;
+            parts[pi++] = (unsigned int)val;
+            val = 0; digits = 0;
+            if (*s == '\0') break;
+        } else {
+            return 0;
+        }
+    }
+    if (pi != 4) return 0;
+    return (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+}
+
+// Convenience: takes the dotted-quad the user typed. Returns NET_SET_DNS_*.
+static inline int net_set_dns(const char *dotted) {
+    unsigned int v = net_parse_ipv4(dotted);
+    if (v == 0) return NET_SET_DNS_EINVAL;
+    return (int)syscall1(SYS_NET_SET_DNS, (long)v);
 }
 
 // NEVER BLOCKS, by design. Unlike sys_ping() (66), which sleeps the caller for
@@ -1758,7 +2416,17 @@ typedef struct {
     unsigned int       mem_kb;
     unsigned long long cpu_ticks;
     int                running_cpu; // #279: AP id or -1
+    unsigned int       flags;       // #145: PROC_INFO_F_*
 } proc_info_t;
+
+// #145: this row is a per-core IDLE process. Idle is CPU capacity nothing asked
+// for, so it must never appear in, or win, a ranked "what is eating the CPU"
+// list. It must however stay in the DENOMINATOR of a per-process share, because
+// that denominator is what makes a percentage mean "share of total CPU
+// capacity" and keeps it consistent with sys_get_cpu_usage(). Drop idle from
+// the denominator too and a compositor using 1% of a quiet machine reads 60%.
+// Kernel-authoritative bit; never match on the NAME "idle".
+#define PROC_INFO_F_IDLE   0x00000001u
 static inline int sys_proc_list(proc_info_t *buf, int max) {
     return (int)syscall2(SYS_PROC_LIST, (long)buf, (long)max);
 }
@@ -1969,6 +2637,122 @@ static inline int sys_diskimg_eject(int letter) {
 // How many images may be mounted at once (each pins a 256 KiB cache).
 static inline int sys_diskimg_max_mounts(void) {
     return (int)syscall4(SYS_DISKIMG, DISKIMG_CMD_MAX_MOUNTS, 0, 0, 0);
+}
+
+
+// ===========================================================================
+// CROSS-WINDOW DRAG ("docking"): SYS_DRAG_* 401-406
+// ===========================================================================
+//
+// Drag a thing out of one process's window and drop it into another's. See the
+// long block comment at the same numbers in kernel/proc/syscall.h for why this
+// exists, why it is small, and why the payload is serialized state rather than
+// a file descriptor (this kernel has no cross-process fd passing, and the
+// terminal has no long-lived shell to hand over even if it did; measured
+// 2026-08-25).
+//
+// TYPICAL SOURCE FLOW (the window the user dragged FROM):
+//   press on a tab, move past the drag threshold
+//     sys_drag_begin(my_win, DRAG_KIND_TERMTAB, blob, n, "tabname");
+//   ... the compositor now draws the ghost; you draw nothing outside your own
+//       window, and you stop receiving mouse events once the cursor leaves you.
+//   you are told the outcome by EVENT_DRAG_END, whose target_id is the
+//   accepting window handle + 1, or 0 for "nobody took it" (drop on empty
+//   desktop = detach into a new window at mouse_x/mouse_y, which are SCREEN
+//   coordinates for this event, not content coordinates).
+//
+// TYPICAL TARGET FLOW (a window willing to receive):
+//   once, after win_create:  sys_drag_accept(my_win, DRAG_KIND_TERMTAB);
+//   on EVENT_MOUSE_MOVE with a button held: sys_drag_peek(&info) tells you
+//     whether to draw an insertion caret. It returns -1 when nothing is being
+//     dragged, which is the common case, so this is cheap.
+//   on EVENT_DRAG_DROP (mouse_x/mouse_y are CONTENT coordinates):
+//     sys_drag_take(my_win, buf, sizeof buf);
+//
+// A window that never calls sys_drag_accept() is never resolved as a target
+// and can never be reached by this protocol.
+#define SYS_DRAG_BEGIN    401
+#define SYS_DRAG_PEEK     402
+#define SYS_DRAG_TAKE     403
+#define SYS_DRAG_ACCEPT   404
+#define SYS_DRAG_RELEASE  405
+#define SYS_DRAG_END      406
+
+#define DRAG_KIND_TERMTAB 0x1
+#define DRAG_KIND_TEXT    0x2
+#define DRAG_KIND_FILE    0x4
+
+#define DRAG_LABEL_CAP    64
+#define DRAG_PAYLOAD_CAP  4096
+
+// Must match drag_info_t in kernel/proc/syscall.h byte for byte, and DragInfo
+// in kernel/rustkern/dragsess.rs. The payload is deliberately NOT here: peek is
+// called every frame by the compositor to caption the drag ghost, and a
+// terminal payload can carry scrollback. Only sys_drag_take() returns bytes.
+typedef struct {
+    int          active;
+    int          src_win;
+    unsigned int src_pid;
+    unsigned int kind;
+    int          payload_len;
+    int          released;
+    int          drop_x;
+    int          drop_y;
+    int          target_win;
+    int          label_len;
+    unsigned char label[DRAG_LABEL_CAP];
+} drag_info_t;
+_Static_assert(sizeof(drag_info_t) == 104,
+               "drag_info_t layout is duplicated in kernel/proc/syscall.h and "
+               "kernel/rustkern/dragsess.rs; a one-sided edit breaks SYS_DRAG_PEEK");
+
+// Begin a drag. `payload` is opaque to everyone except the window that
+// eventually takes it. An over-length payload is REFUSED (returns -1), never
+// truncated: a half scrollback still looks like a scrollback. `label` is a
+// short caption the compositor draws in the ghost, and IS clamped, because a
+// shortened caption is cosmetic where a shortened payload is corruption.
+// Returns 0, or -1 (bad handle, unknown kind, payload too large, or a drag is
+// already in flight: exactly one exists system-wide).
+static inline int sys_drag_begin(int win, unsigned int kind,
+                                 const void *payload, int plen,
+                                 const char *label) {
+    int llen = 0;
+    if (label) { while (label[llen] && llen < DRAG_LABEL_CAP) llen++; }
+    return (int)syscall6(SYS_DRAG_BEGIN, (long)win, (long)kind,
+                         (long)payload, (long)plen, (long)label, (long)llen);
+}
+
+// Non-destructive look at the current session. Returns 0 and fills `info`, or
+// -1 when no drag is in flight (the overwhelmingly common case).
+static inline int sys_drag_peek(drag_info_t *info) {
+    return (int)syscall1(SYS_DRAG_PEEK, (long)info);
+}
+
+// Claim the payload. Only the window the kernel resolved as the drop target
+// may do this, and only after the button is up. Returns bytes copied
+// (min(payload_len, cap)), or -1.
+static inline int sys_drag_take(int win, void *dst, int cap) {
+    return (int)syscall3(SYS_DRAG_TAKE, (long)win, (long)dst, (long)cap);
+}
+
+// Declare which payload kinds this window will receive; mask 0 unregisters.
+// Call it once after win_create(). Returns 0, or -1 on a bad handle or an
+// unknown kind bit.
+static inline int sys_drag_accept(int win, unsigned int kind_mask) {
+    return (int)syscall2(SYS_DRAG_ACCEPT, (long)win, (long)kind_mask);
+}
+
+// COMPOSITOR ONLY: the mouse button came up at (x, y). The KERNEL resolves the
+// drop target itself from its own hit-test, so this call cannot name one.
+// Returns the resolved target handle, -1 for none, or -1 when idle.
+static inline int sys_drag_release(int x, int y) {
+    return (int)syscall2(SYS_DRAG_RELEASE, (long)x, (long)y);
+}
+
+// Abandon a drag (the source pressed ESC, or is exiting). Returns 0, or -1 if
+// there was nothing in flight.
+static inline int sys_drag_end(void) {
+    return (int)syscall0(SYS_DRAG_END);
 }
 
 #endif // _SYSCALL_H

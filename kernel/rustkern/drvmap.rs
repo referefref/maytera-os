@@ -206,6 +206,67 @@ pub extern "C" fn drvmap_place_rs(want: i32, fmt: u32, occupied: u32, mounted: u
     drvmap_alloc_rs(class, occupied)
 }
 
+// ---------------------------------------------------------------------------
+// INT 21h AH=44h IOCTL, THE DRIVE SUBFUNCTIONS (#740, measured on Discworld II)
+//
+// HOW A DOS PROGRAM FINDS THE CD, AND WHY IT WAS FINDING NOTHING.
+//
+// Discworld II does not use MSCDEX's INT 2Fh AX=1500h at all. Its whole CD
+// search is three INT 21h AX=4409h calls, BL = 5, 4, 3 (E:, D:, C:), looking
+// for a drive that answers "remote". MSCDEX drives are redirector drives and
+// answer exactly that, which is why the idiom works on real hardware.
+//
+// dos/int21svc.c's AH=44h arm implemented AL=00h and nothing else, so AL=09h
+// fell through the switch with CF already cleared by the dispatcher and DX
+// UNTOUCHED. The guest read its own leftover DX (measured: 0x01F8) as the
+// device attribute word, found bit 12 clear on all three drives, printed
+// "Discworld cannot locate the Discworld CD." and exited 15. It was not
+// answered wrongly; it was answered with its own stale register, which is the
+// silent-success shape this tree keeps rediscovering, and it did not even
+// register in the "unimplemented" count.
+//
+// These two functions are the ANSWER, kept pure and here rather than in the C
+// arm, because "what kind of drive is this letter" is already this file's job
+// and a second opinion about it in dos/int21svc.c is how the three copies of
+// the drive map drifted apart before #739.
+
+/// INT 21h AX=4408h, "does this drive use removable media".
+///
+/// Returns 0 for removable, 1 for fixed, DRVMAP_E_CLASS for a letter that is
+/// not a drive. The caller has already decided the drive EXISTS (a CD letter
+/// with no disc in it is not a drive at all); this maps the class only.
+#[no_mangle]
+pub extern "C" fn drvmap_ioctl_removable_rs(class: u32) -> i32 {
+    match class {
+        DRV_CLASS_FLOPPY | DRV_CLASS_CDROM => 0, // removable media
+        DRV_CLASS_FIXED => 1,                    // fixed media
+        _ => DRVMAP_E_CLASS,
+    }
+}
+
+/// INT 21h AX=4409h, the device attribute word returned in DX.
+///
+/// Bit 12 (0x1000) is THE bit: "the drive is remote", i.e. served by a
+/// redirector rather than by a local block device. A CD is exactly that here
+/// (dos_drive_type() already reports DOS_DRIVE_REMOTE for a CD letter, and has
+/// since before this function existed), so this is not a lie told to make a
+/// game happy; it is the same answer the rest of the tree already gives.
+///
+/// Bit 9 (0x0200) is "direct I/O is not allowed", which real MSCDEX also sets
+/// and which is likewise true: there is no INT 25h/26h path to a mounted image,
+/// and a program that believed there was would read the HOST's sectors.
+///
+/// A local fixed or floppy drive gets 0: local, direct I/O permitted.
+/// DRVMAP_E_CLASS for a letter that is not a drive.
+#[no_mangle]
+pub extern "C" fn drvmap_ioctl_attrword_rs(class: u32) -> i32 {
+    match class {
+        DRV_CLASS_CDROM => 0x1200, // remote (bit 12) + no direct I/O (bit 9)
+        DRV_CLASS_FLOPPY | DRV_CLASS_FIXED => 0x0000,
+        _ => DRVMAP_E_CLASS,
+    }
+}
+
 /// Derive the MSCDEX answer from the live CD occupancy mask.
 ///
 /// `cd_mask` has bit N set for every letter N that currently holds a CD image;
@@ -333,6 +394,86 @@ pub extern "C" fn drvmap_path_ok_rs(path: *const u8, maxlen: u32) -> i32 {
     len as i32
 }
 
+/// #193: SPLIT A NATIVE PATH INTO (DRIVE LETTER, PATH INSIDE THE DRIVE).
+///
+/// The native spelling of a DOS drive is the folder `/WINDIR/DRIVE_<L>`, so
+/// `/WINDIR/DRIVE_E/DATA/FOO.MIX` is `E:\DATA\FOO.MIX`. Two separate places in
+/// the kernel needed that decision and only one of them had it, which is the
+/// #193 defect: `fat_open()` knew the subtree belonged to a drive and the
+/// syscall layer's ext2-root redirect did not, so an open of a path that exists
+/// BOTH in a mounted image and in the (folder-backed) drive directory was
+/// answered by the folder while the DOS guest reading the very same path got
+/// the image. Silent wrong data, from one missing test.
+///
+/// The parse lives HERE because this file is already the authority on what a
+/// drive letter means (`drvmap_class_rs`, `drvmap_place_rs`); a second copy of
+/// "what does a drive path look like" in C is how the three hardcoded drive
+/// maps drifted apart before #739. `fat_img_path()` in fs/fat.c is now a
+/// wrapper over this, not a twin of it.
+///
+/// This function answers ONLY the string question. Whether a disc is actually
+/// in that drive is live table state (`diskimg_is_mounted`), so the C caller
+/// composes the two. Keeping them apart is what lets this be a pure function
+/// with a property test.
+///
+/// Returns the letter INDEX (0 = A .. 25 = Z), or -1 if `path` is not inside a
+/// drive subtree. On success `rel_off` (when non-null) receives the BYTE OFFSET
+/// within `path` of the path inside the drive, with the separator(s) after the
+/// letter already skipped: for `/WINDIR/DRIVE_E/A/B` that is the offset of
+/// `A/B`, and for `/WINDIR/DRIVE_E` (the drive root itself) it is the offset of
+/// the terminating NUL, i.e. the empty relative path.
+///
+/// # Safety
+/// `path` must be NUL-terminated. At most `MAXPATH` bytes are examined and the
+/// scan stops at the first NUL, so a shorter string is never walked past its
+/// terminator.
+#[no_mangle]
+pub extern "C" fn drvmap_windir_split_rs(path: *const u8, rel_off: *mut u32) -> i32 {
+    const MAXPATH: usize = 512;
+    const PFX: &[u8] = b"/WINDIR/DRIVE_";
+    if path.is_null() {
+        return -1;
+    }
+    // SAFETY: bounded at MAXPATH and every read below is guarded by an index
+    // check against `n`, which stops at the first NUL. The prefix compare bails
+    // on the first differing byte, so a string shorter than the prefix is never
+    // read past its terminator.
+    let s: &[u8] = unsafe { core::slice::from_raw_parts(path, MAXPATH) };
+
+    let mut i: usize = 0;
+    while i < PFX.len() {
+        if s[i] == 0 || s[i] != PFX[i] {
+            return -1;
+        }
+        i += 1;
+    }
+    let letter = s[i];
+    let idx: i32 = if letter >= b'A' && letter <= b'Z' {
+        (letter - b'A') as i32
+    } else if letter >= b'a' && letter <= b'z' {
+        (letter - b'a') as i32
+    } else {
+        return -1;
+    };
+    i += 1;
+    // The character after the letter must END the component. Without this,
+    // "/WINDIR/DRIVE_EXTRA" would be read as drive E plus "XTRA" and a folder
+    // with an unlucky name would start resolving out of a mounted disc.
+    if s[i] != 0 && s[i] != b'/' && s[i] != b'\\' {
+        return -1;
+    }
+    while i < MAXPATH && (s[i] == b'/' || s[i] == b'\\') {
+        i += 1;
+    }
+    if !rel_off.is_null() {
+        // SAFETY: the caller guarantees a writable u32 (or null, tested above).
+        unsafe {
+            *rel_off = i as u32;
+        }
+    }
+    idx
+}
+
 /// Boot-time PROPERTY TEST of the placement rules. Not a differential: there is
 /// no C twin to compare against, so what is proven here is that the allocator
 /// obeys its own stated invariants on this exact build.
@@ -395,6 +536,22 @@ pub extern "C" fn drvmap_selftest_rs(out_checks: *mut u32) -> i32 {
     // A NEW mount at the limit is refused, explicit letter or not.
     want!(drvmap_place_rs(5, FMT_ISO9660, 1 << 4, DRVMAP_MAX_MOUNTS) == DRVMAP_E_LIMIT);
     want!(drvmap_place_rs(-1, FMT_ISO9660, 1 << 4, DRVMAP_MAX_MOUNTS) == DRVMAP_E_LIMIT);
+
+    // (#740) INT 21h 4408h/4409h. The CD answer is the one Discworld II reads:
+    // bit 12 set means "remote", which is how a DOS program finds a CD-ROM
+    // without ever calling MSCDEX.
+    want!(drvmap_ioctl_attrword_rs(DRV_CLASS_CDROM) & 0x1000 != 0);
+    want!(drvmap_ioctl_attrword_rs(DRV_CLASS_CDROM) & 0x0200 != 0);
+    want!(drvmap_ioctl_attrword_rs(DRV_CLASS_FIXED) == 0);
+    want!(drvmap_ioctl_attrword_rs(DRV_CLASS_FLOPPY) == 0);
+    want!(drvmap_ioctl_attrword_rs(DRV_CLASS_NONE) == DRVMAP_E_CLASS);
+    want!(drvmap_ioctl_removable_rs(DRV_CLASS_CDROM) == 0);
+    want!(drvmap_ioctl_removable_rs(DRV_CLASS_FLOPPY) == 0);
+    want!(drvmap_ioctl_removable_rs(DRV_CLASS_FIXED) == 1);
+    want!(drvmap_ioctl_removable_rs(DRV_CLASS_NONE) == DRVMAP_E_CLASS);
+    // And the class of E:, which is the letter the first mounted disc lands on,
+    // is the CD class, so the two above compose into the answer the game gets.
+    want!(drvmap_class_rs(4) == DRV_CLASS_CDROM);
 
     // MSCDEX is derived, and counts only CD letters even when handed floppies.
     let mut mi = MscdexInfo { count: 0, first: 0, letters: [0u8; 32] };

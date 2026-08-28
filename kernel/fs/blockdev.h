@@ -59,10 +59,73 @@ void blk_toram_set_disabled(int disabled);
 // misses = sectors read from USB. *enabled: 0 off, 1 TO-RAM, 2 demand cache.
 void blk_cache_stats(uint64_t *hits, uint64_t *misses, int *enabled);
 
+// ===========================================================================
+// #250 AUXILIARY (NON-ROOT) VOLUME I/O.
+//
+// blk_read/blk_write above are the ROOT device's path: they consult the
+// TO-RAM copy and the demand cache, both of which are indexed by LBA ALONE
+// and hold sectors of exactly one device. A hot-plugged second USB stick has
+// its own LBA 0, so routing it through those functions would serve it the
+// ROOT device's sectors and, worse, a write would land on the boot medium.
+// That is why a hot-plugged volume gets its own entry point rather than a
+// "which device" argument on the existing one: there is no correct way to
+// share a device-blind cache between two devices.
+//
+// `usb_index` is an index into the USB MSC device table (usb_msc_get_device).
+// No caching of any kind: every call is a real SCSI transfer. Same return
+// convention as blk_read/blk_write (sectors transferred, <= 0 on error).
+int blk_read_aux(int usb_index, uint64_t lba, uint32_t count, void *buf);
+MUST_CHECK int blk_write_aux(int usb_index, uint64_t lba, uint32_t count, const void *buf);
+
 // #617: demand-cache installs DECLINED because a write completed while the
 // read's device I/O was in flight (the lost-read-modify-write guard). See the
 // g_wgen comment in blockdev.c. Non-zero means real read/write overlap on the
 // root device; it is a measurement, not an error.
 uint64_t blk_stale_skips(void);
+
+
+// ===========================================================================
+// #SB: WRITE-STAGING OWNERSHIP. See rustkern/blkstage.rs for the full defect
+// write-up (the ext2 superblock destroyed on golden build 2215) and for why
+// the staging buffer's address lives in Rust and nowhere else.
+// ===========================================================================
+
+// Mirrors BlkStageStats in rustkern/blkstage.rs. sizeof-locked on both sides.
+typedef struct {
+    uint64_t base;          // installed staging buffer, 0 = never installed
+    uint32_t bytes;         // its size
+    uint32_t owned;         // bitmask, see BLKSTAGE_OWNED_* below
+    uint64_t claims;
+    uint64_t releases;
+    uint64_t contended;     // claims that found the buffer already held
+    uint64_t bad_releases;  // releases by a non-owner: always a caller bug
+    uint64_t seal_broken;   // MUST STAY ZERO. Non-zero = active corruption.
+    uint64_t verifies;
+} blkstage_stats_t;
+_Static_assert(sizeof(blkstage_stats_t) == 64,
+               "blkstage_stats_t must match BlkStageStats in rustkern/blkstage.rs");
+
+// blkstage_stats_t.owned bits. Kept as one field rather than two so the
+// struct size stays locked at 64 across the FFI.
+#define BLKSTAGE_OWNED_HELD          0x1u  // a writer holds the claim right now
+#define BLKSTAGE_OWNED_UNSAFE_BUILD  0x2u  // built `make BLKSTAGE_UNSAFE=1`:
+                                           // the claim is REMOVED. Never ship.
+
+void     blkstage_stats_rs(blkstage_stats_t *out);
+uint64_t blkstage_seal_broken_rs(void);
+
+// One serial line summarising the staging counters. Called once late in boot
+// so a reader can tell "measured, zero" from "never measured" (blame.md).
+void blk_stage_report(void);
+
+// Total sectors whose staged payload was found altered between staging and the
+// device write. This is the counter that would have been non-zero on the boot
+// that destroyed the owner's root filesystem. Carried on the heartbeat line.
+extern uint64_t g_blk_seal_broken;
+
+// #SB: `make BLKSTAGETEST=1` only. Compiles to nothing otherwise.
+#ifdef BLKSTAGE_TEST
+void blk_stage_selftest(void);
+#endif
 
 #endif // BLOCKDEV_H

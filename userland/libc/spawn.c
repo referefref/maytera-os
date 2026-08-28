@@ -286,16 +286,29 @@ static int check_attr(const posix_spawnattr_t *at) {
     return 0;
 }
 
-// MayteraOS has no cross-process environment: environ lives in this libc's
-// heap, and the kernel spawn carries argv and nothing else. NULL and environ
-// both mean "whatever the child would have got anyway", so they are accepted;
-// a deliberately constructed different environment is refused rather than
-// silently discarded.
-static int check_envp(char *const envp[]) {
-    if (!envp) return 0;
-    if ((char **)(void *)envp == environ) return 0;
-    if (envp[0] == NULL) return 0;
-    return ENOSYS;
+// #112: THE ENVIRONMENT IS CARRIED NOW. This function used to return ENOSYS
+// for any envp that was not NULL and not `environ`, because there was nothing
+// to carry it in. SYS_SPAWN_ENV carries it, so the only remaining refusals are
+// real limits of the kernel block (rustkern/envblock.rs): at most 64 entries
+// of at most 511 bytes each, and every entry has to be NAME=VALUE.
+//
+// Counting here rather than letting the kernel truncate is the same rule this
+// file already applies to argv: a silently halved environment is exactly as
+// wrong as a silently dropped redirect, so E2BIG is returned instead.
+#define SPAWN_MAX_ENVC   64
+#define SPAWN_MAX_ENVLEN 511
+
+static int count_envp(char *const envp[], int *out) {
+    int n = 0;
+    if (!envp) { *out = -1; return 0; }        // -1: inherit, see below
+    while (envp[n]) {
+        if (n >= SPAWN_MAX_ENVC) return E2BIG;
+        if (!strchr(envp[n], '=')) return EINVAL;
+        if (strlen(envp[n]) > SPAWN_MAX_ENVLEN) return E2BIG;
+        n++;
+    }
+    *out = n;
+    return 0;
 }
 
 // The kernel collapses every spawn failure to -1. Work out what actually went
@@ -339,8 +352,23 @@ int posix_spawn(pid_t *pid, const char *path,
 
     rc = check_attr(attrp);
     if (rc) return rc;
-    rc = check_envp(envp);
+
+    // #112: envp == NULL means INHERIT on this OS, not "empty".
+    //
+    // POSIX leaves a NULL envp undefined and glibc treats it as empty. Here it
+    // is defined as "give the child what I have", for one reason: EVERY
+    // existing caller in this tree passes NULL (env, msh's spawner, every port
+    // that never had an environment to pass), and until this ticket NULL and
+    // "empty" were indistinguishable because nothing was ever carried. Making
+    // NULL mean empty would ship an environment facility that no shipped
+    // caller uses, which is the "code path nothing reaches" trap. A caller that
+    // genuinely wants an empty environment passes a vector whose first element
+    // is NULL, and gets exactly that.
+    char *const *use = envp ? envp : (char *const *)environ;
+    int envc;
+    rc = count_envp(use, &envc);
     if (rc) return rc;
+
     rc = translate_actions(file_actions, &infile, &outfile, &append);
     if (rc) return rc;
 
@@ -351,12 +379,21 @@ int posix_spawn(pid_t *pid, const char *path,
         argc++;
     }
 
-    int r;
-    if (infile || outfile)
-        r = sys_spawn_redir(path, (char **)(void *)argv, argc,
-                            infile, outfile, append);
-    else
-        r = sys_spawn_args(path, (char **)(void *)argv, argc);
+    // One call, one shape. SYS_SPAWN_ENV carries the redirects too, so the old
+    // two-syscall split is gone from this path; 198 and 247 stay for the apps
+    // that call them directly.
+    sc_spawn_req_t req;
+    memset(&req, 0, sizeof(req));
+    req.path     = path;
+    req.argv     = (char **)(void *)argv;
+    req.argc     = argc;
+    req.envc     = envc;
+    req.envp     = (char **)(void *)use;
+    req.infile   = infile;
+    req.outfile  = outfile;
+    req.append   = append;
+    req.reserved = 0;
+    int r = sys_spawn_env(&req);
 
     // A pid of 0 is not a valid child here either: proc pids start at 1, so
     // anything <= 0 is a failure however the kernel phrased it.

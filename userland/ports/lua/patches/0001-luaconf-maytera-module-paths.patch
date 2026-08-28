@@ -1,0 +1,42 @@
+--- a/src/luaconf.h
++++ b/src/luaconf.h
+@@ -223,20 +223,31 @@
+ 
+ #else			/* }{ */
+ 
+-#define LUA_ROOT	"/usr/local/"
+-#define LUA_LDIR	LUA_ROOT "share/lua/" LUA_VDIR "/"
+-#define LUA_CDIR	LUA_ROOT "lib/lua/" LUA_VDIR "/"
++/* MAYTERAOS (local queue 91): module search paths.
++** Upstream's defaults are /usr/local/share/lua/5.4/ and "./", and BOTH are
++** wrong here in ways that would only show up as a confusing "module not found"
++** message listing directories that can never exist:
++**   - There is no /usr/local on MayteraOS. /LUA/ is the module directory.
++**   - There is NO WORKING DIRECTORY on MayteraOS. chdir() succeeds and then
++**     nothing resolves relative to it, so a "./?.lua" template is a permanently
++**     dead search entry, not a convenience.
++**   - LUA_CPATH is emptied because this build has NO dynamic loader: neither
++**     LUA_USE_POSIX nor LUA_USE_DLOPEN nor LUA_DL_DLL is defined, so loadlib.c
++**     compiles its LUA_DL_NONE branch and package.loadlib() always fails with
++**     "dynamic libraries not enabled". Advertising "?.so" would send a user
++**     looking for a feature that cannot exist in this binary.
++*/
++#define LUA_ROOT	"/LUA/"
++#define LUA_LDIR	LUA_ROOT
++#define LUA_CDIR	LUA_ROOT
+ 
+ #if !defined(LUA_PATH_DEFAULT)
+ #define LUA_PATH_DEFAULT  \
+-		LUA_LDIR"?.lua;"  LUA_LDIR"?/init.lua;" \
+-		LUA_CDIR"?.lua;"  LUA_CDIR"?/init.lua;" \
+-		"./?.lua;" "./?/init.lua"
++		LUA_LDIR"?.lua;"  LUA_LDIR"?/init.lua"
+ #endif
+ 
+ #if !defined(LUA_CPATH_DEFAULT)
+-#define LUA_CPATH_DEFAULT \
+-		LUA_CDIR"?.so;" LUA_CDIR"loadall.so;" "./?.so"
++#define LUA_CPATH_DEFAULT	""
+ #endif
+ 
+ #endif			/* } */

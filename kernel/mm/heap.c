@@ -33,6 +33,12 @@ typedef struct heap_block {
 static uint64_t heap_start = 0;
 static uint64_t heap_end = 0;
 static uint64_t heap_size = 0;
+
+// #137 (see heap_expand below)
+static void heap_expand_rollback(uint64_t mapped);
+static int  heap_expand_once(size_t expand_size);
+extern uint64_t vmm_get_physical(uint64_t virt_addr);
+extern void     vmm_unmap_page(uint64_t virt_addr);
 static heap_block_t *free_list = NULL;
 
 // Statistics
@@ -71,21 +77,41 @@ static void heap_release_lock(uint64_t rflags) {
     }
 }
 
-// Expand the heap by allocating more pages
-static int heap_expand(size_t min_size) {
-    // Calculate how many pages we need
-    size_t expand_size = HEAP_INITIAL_SIZE;  // Expand in large chunks
-    if (min_size > expand_size) {
-        expand_size = (min_size + PMM_PAGE_SIZE - 1) & ~(PMM_PAGE_SIZE - 1);
-    }
-
-    // Check if we've reached max size
+// Expand the heap by allocating more pages.
+//
+// #137: this used to LEAK EVERY PAGE IT HAD ALREADY TAKEN whenever it gave up
+// partway. The loop below allocates and maps one page at a time, and both
+// failure exits simply `return -1`: the pages taken on earlier iterations were
+// never unmapped and never handed back to the PMM, and because heap_end and
+// heap_size were only advanced AFTER the loop, the heap did not know about them
+// either. Nothing in the system could ever reclaim them. A failure at the last
+// page of a 128 MB expansion orphaned 128 MB of RAM, and the failure is
+// REACHABLE FROM RING 3 (an unvalidated win_create() size, see
+// rustkern/winbuf.rs), so an unprivileged app could drain physical memory until
+// every kernel allocation failed - which presents as the machine stopping with
+// no panic, because the thing that fails next is whatever asks for memory next.
+//
+// Two changes:
+//   1. ROLL BACK on failure. Unmap and free exactly the pages this call took,
+//      leaving the PMM and the page tables as they were found. A failed
+//      expansion is now genuinely free of side effects.
+//   2. DO NOT OVER-ASK. The old code always tried for HEAP_INITIAL_SIZE
+//      (128 MB) even to satisfy a 4 KB allocation, so one large-ish request on
+//      a machine with less than 128 MB free failed even though the memory it
+//      actually needed was there. Try the big chunk first (large chunks keep
+//      the free list short, which matters because find_free_block is O(n)),
+//      then fall back to the smallest expansion that would actually satisfy
+//      the caller before reporting failure.
+static int heap_expand_once(size_t expand_size) {
+    if (expand_size == 0) return -1;
     if (heap_size + expand_size > HEAP_MAX_SIZE) {
         if (heap_size >= HEAP_MAX_SIZE) {
             return -1;  // Cannot expand further
         }
         expand_size = HEAP_MAX_SIZE - heap_size;
     }
+    expand_size &= ~((size_t)PMM_PAGE_SIZE - 1);
+    if (expand_size < PMM_PAGE_SIZE) return -1;
 
     uint64_t pages_needed = expand_size / PMM_PAGE_SIZE;
 
@@ -93,13 +119,14 @@ static int heap_expand(size_t min_size) {
     for (uint64_t i = 0; i < pages_needed; i++) {
         uint64_t phys = pmm_alloc_page();
         if (phys == 0) {
-            kprintf("[HEAP] ERROR: Failed to allocate physical page for heap expansion\n");
+            heap_expand_rollback(i);
             return -1;
         }
 
         uint64_t virt = heap_end + i * PMM_PAGE_SIZE;
         if (vmm_map_page(virt, phys, VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE) != 0) {
             pmm_free_page(phys);
+            heap_expand_rollback(i);
             kprintf("[HEAP] ERROR: Failed to map heap page\n");
             return -1;
         }
@@ -122,6 +149,38 @@ static int heap_expand(size_t min_size) {
     heap_size += expand_size;
 
     return 0;
+}
+
+// #137: undo a partial expansion. `mapped` is the number of pages this call
+// had already mapped at [heap_end, heap_end + mapped*PAGE). heap_end has NOT
+// been advanced yet, so this range is not part of the heap and nothing else can
+// be looking at it; unmapping and freeing it is safe and is the only way those
+// pages ever get back to the PMM.
+static void heap_expand_rollback(uint64_t mapped) {
+    for (uint64_t j = 0; j < mapped; j++) {
+        uint64_t virt = heap_end + j * PMM_PAGE_SIZE;
+        uint64_t phys = vmm_get_physical(virt);
+        vmm_unmap_page(virt);
+        if (phys) pmm_free_page(phys);
+    }
+}
+
+// Expand the heap for a caller that needs at least `min_size` contiguous bytes.
+// Prefers a large chunk (short free list) but never fails while a smaller
+// expansion would have worked.
+static int heap_expand(size_t min_size) {
+    size_t want = (min_size + BLOCK_HEADER_SIZE + PMM_PAGE_SIZE - 1)
+                  & ~((size_t)PMM_PAGE_SIZE - 1);
+    size_t big  = HEAP_INITIAL_SIZE;
+    if (want > big) big = want;
+
+    if (heap_expand_once(big) == 0) return 0;
+    if (want < big && heap_expand_once(want) == 0) return 0;
+
+    kprintf("[HEAP] ERROR: expansion for %lu bytes failed (heap %lu of %lu KB)\n",
+            (unsigned long)min_size, (unsigned long)(heap_size / KB),
+            (unsigned long)(HEAP_MAX_SIZE / KB));
+    return -1;
 }
 
 // Initialize the kernel heap

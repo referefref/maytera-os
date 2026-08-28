@@ -27,6 +27,7 @@
 #include "../../libc/userconf.h"
 #include "../../libc/assoc.h"
 #include "../../libc/notify.h"
+#include "../../libc/settingscfg.h"   // #236: settingscfg_dblclick_ms() - see desktop_release()
 
 // ============================================================================
 // Static state
@@ -35,7 +36,7 @@
 static desktop_icon_t g_icons[DESKTOP_ICON_MAX];
 static int            g_icon_count;
 static int            g_selected_icon;    // index of last single-selected icon, or -1
-static uint64_t       g_last_click_time;  // sys_clock() value at last click
+static uint64_t       g_last_click_time;  // uptime_ms() value at last click (#236: was sys_clock())
 static int            g_last_click_icon;  // icon index at last click, or -1
 
 // Drag / rubber-band state machine.
@@ -202,8 +203,32 @@ static int is_executable_file(const char *full, const char *name) {
 // ============================================================================
 
 // Full bounding box of an icon (image + label row).
+// #uiscale: the "+20" is the label row's own logical height allowance and
+// must scale with everything else in this box, same as DESKTOP_ICON_SIZE
+// (already scaled - see compositor_apply_icon_size() in main.c) does.
 static int32_t icon_box_w(void) { return DESKTOP_ICON_SIZE; }
-static int32_t icon_box_h(void) { return DESKTOP_ICON_SIZE + 20; }
+static int32_t icon_box_h(void) { return DESKTOP_ICON_SIZE + ui_px(20); }
+
+// #uiscale + pre-existing bug fix: find_icon_at() (hit-test) and the
+// selection-highlight fill in desktop_render() used to be TWO INDEPENDENT
+// literal rects - the highlight was drawn at (sx-4, sy-4, box_w+8, box_h+4),
+// i.e. 4px larger on the left/top/right but NOT the bottom edge, while
+// find_icon_at() tested the plain (ix, iy, box_w, box_h) box with no margin
+// at all. That drew a highlight whose left/top/right few pixels visually
+// invited a click that find_icon_at() would never register - a dead band
+// present even at 1x scale, independent of UI scaling, and exactly the class
+// of copy-paste drift this task's hit-testing audit called out elsewhere.
+// ONE shared, symmetric rect now, used by BOTH call sites, so they cannot
+// drift apart again: the highlight and the clickable area are pixel-
+// identical, with an equal small margin on all four sides.
+#define ICON_SEL_PAD 4
+static void icon_hit_rect(int i, int32_t *x, int32_t *y, int32_t *w, int32_t *h) {
+    int32_t pad = ui_px(ICON_SEL_PAD);
+    *x = g_icons[i].px - pad;
+    *y = g_icons[i].py - pad;
+    *w = icon_box_w() + 2 * pad;
+    *h = icon_box_h() + 2 * pad;
+}
 
 // Usable desktop bounds (between any top bar and the bottom bar) for clamping.
 // #387: layout-aware so icons stay clear of the active dock/menu bar(s).
@@ -272,10 +297,10 @@ static void snap_to_grid(int32_t *x, int32_t *y) {
 static int find_icon_at(int32_t px, int32_t py) {
     for (int i = g_icon_count - 1; i >= 0; i--) {
         if (!g_icons[i].visible) continue;
-        int32_t ix = g_icons[i].px;
-        int32_t iy = g_icons[i].py;
-        if (px >= ix && px < ix + icon_box_w() &&
-            py >= iy && py < iy + icon_box_h()) {
+        int32_t x, y, w, h;
+        icon_hit_rect(i, &x, &y, &w, &h);   // #uiscale: shared with the highlight draw
+        if (px >= x && px < x + w &&
+            py >= y && py < y + h) {
             return i;
         }
     }
@@ -337,8 +362,28 @@ static void add_icon(const char *name, const char *path, icon_id_t id) {
 // Place an icon on the first default-grid cell no other icon already occupies,
 // so a file that appears while the desktop is running does not land on top of
 // something. Used only for icons with no saved position.
+//
+// #deskicons: the occupancy test used to be "is another icon's saved (px,py)
+// within 8 raw pixels of this candidate cell" - a NEAR-EXACT-MATCH test, not
+// an overlap test. That is only correct if every icon's actual position is
+// already grid-aligned to the CURRENT scale's grid, which a position loaded
+// from a saved profile is not guaranteed to be (see the logical/physical
+// round-trip added in profile.c). At 200% the icon box is roughly 96x148 real
+// pixels, so two icons whose (px,py) differ by, say, 40px overlap heavily on
+// screen while the old 8px test called the slot free. Reported symptom: five
+// mounted CD-ROM volumes landing on top of Computer/Recycle Bin/Terminal on a
+// 4K 200% panel. Fixed to a real axis-aligned-box overlap test against every
+// OTHER icon's ACTUAL current box, which is correct regardless of whether
+// that icon's position came from the grid, a saved profile, or a user drag,
+// and regardless of scale.
+static int boxes_overlap(int32_t ax, int32_t ay, int32_t aw, int32_t ah,
+                         int32_t bx, int32_t by, int32_t bw, int32_t bh) {
+    return !(ax + aw <= bx || bx + bw <= ax || ay + ah <= by || by + bh <= ay);
+}
+
 static void place_free_slot(int idx) {
     int cols = grid_cols();
+    int32_t bw = icon_box_w(), bh = icon_box_h();
     for (int n = 0; n < DESKTOP_ICON_MAX * 2; n++) {
         int32_t x, y;
         grid_cell_pos(n % cols, n / cols, &x, &y);
@@ -346,8 +391,9 @@ static void place_free_slot(int idx) {
         int taken = 0;
         for (int j = 0; j < g_icon_count; j++) {
             if (j == idx || !g_icons[j].visible) continue;
-            int32_t dx = g_icons[j].px - x, dy = g_icons[j].py - y;
-            if (dx > -8 && dx < 8 && dy > -8 && dy < 8) { taken = 1; break; }
+            if (boxes_overlap(x, y, bw, bh, g_icons[j].px, g_icons[j].py, bw, bh)) {
+                taken = 1; break;
+            }
         }
         if (!taken) {
             g_icons[idx].px = x; g_icons[idx].py = y;
@@ -415,6 +461,10 @@ bool desktop_add_icon(const char *name, const char *path, icon_id_t icon) {
 // SIZE, so editing a file does not churn the icon list. The one thing that
 // escapes it is chmod +x on a file whose name did not change; that icon keeps
 // its old kind until the next add/remove/rename or an explicit Refresh.
+// #250: defined below, next to the rest of the removable-volume code; called
+// from the rescan, which comes first in this file.
+static void desktop_append_volume_icons(void);
+
 void desktop_rescan_home(int force) {
     // Never rebuild mid-drag: the user is holding an icon whose index and
     // position are both about to be rewritten underneath them.
@@ -506,10 +556,186 @@ void desktop_rescan_home(int force) {
         }
     }
 
+    // #250: removable volumes, appended AFTER the user icons so the
+    // [0, g_sys_icon_count) == SYSTEM invariant still holds. They are rebuilt
+    // here rather than maintained separately; see the block above.
+    desktop_append_volume_icons();
+
     // PASS 2, once every restored position is in place.
     desktop_place_unplaced();
 
     g_needs_redraw = true;
+}
+
+// ============================================================================
+// #250 REMOVABLE VOLUME ICONS
+// ============================================================================
+//
+// A hot-plugged USB drive has to appear on the desktop and vanish when it is
+// pulled, and it is neither a compiled-in shortcut nor a file in
+// <home>/DESKTOP, so it gets its own kind and its own source of truth: the
+// kernel's volume list (vol_list(), one syscall, no device I/O).
+//
+// It is REBUILT BY desktop_rescan_home(), not maintained independently. That
+// rescan already drops and reconstructs every non-SYSTEM icon, restoring
+// positions by identity key, so a volume icon the user has dragged keeps its
+// place, and there is exactly ONE routine that decides what is on the desktop.
+// A separate add/remove path alongside the rescan would be a second answer to
+// the same question, which is how this tree ended up with two Task Managers.
+
+// #234i: SC_VOL_MAX, not 8. Mounted floppy and CD-ROM disk images now come
+// back from the same vol_list() call as the USB devices, so a buffer sized for
+// only the physical ones would drop whichever came second.
+#define DESK_MAX_VOLS SC_VOL_MAX
+static sc_volume_t g_vols[DESK_MAX_VOLS];
+static int         g_vol_count = 0;
+
+static unsigned volumes_sig(void) {
+    unsigned sig = 2166136261u;
+    for (int i = 0; i < g_vol_count; i++) {
+        sig = (sig ^ (unsigned)g_vols[i].index) * 16777619u;
+        sig = (sig ^ g_vols[i].flags) * 16777619u;
+        sig = fnv1a(g_vols[i].mount, sig);
+        sig = fnv1a(g_vols[i].name, sig);
+    }
+    return sig ^ (unsigned)g_vol_count;
+}
+
+// Appends one icon per currently-plugged volume. Called from
+// desktop_rescan_home() AFTER the user icons, so the
+// [0, g_sys_icon_count) == SYSTEM invariant documented at the top of this
+// file still holds.
+static void desktop_append_volume_icons(void) {
+    for (int i = 0; i < g_vol_count; i++) {
+        if (g_icon_count >= DESKTOP_ICON_MAX) break;
+        const sc_volume_t *v = &g_vols[i];
+        char label[DESKTOP_ICON_NAME_LEN];
+        // Prefer the model string; fall back to the mount point, which always
+        // exists. An unnamed icon would be indistinguishable from any other.
+        if (v->name[0]) {
+            strncpy(label, v->name, DESKTOP_ICON_NAME_LEN - 1);
+            label[DESKTOP_ICON_NAME_LEN - 1] = '\0';
+        } else {
+            strncpy(label, v->mount, DESKTOP_ICON_NAME_LEN - 1);
+            label[DESKTOP_ICON_NAME_LEN - 1] = '\0';
+        }
+        int idx = g_icon_count;
+        // exec_path carries the MOUNT POINT. activate_icon() branches on the
+        // kind, so this is never spawned as a program.
+        // #234i: the icon says WHAT it is. Same three-way choice the Files
+        // sidebar makes, from the same flag bits, so a disc looks like a disc
+        // in both places.
+        icon_id_t glyph = (v->flags & MOSVOL_OPTICAL) ? ICON_CDROM
+                        : (v->flags & MOSVOL_FLOPPY)  ? ICON_FLOPPY
+                                                      : ICON_USBDRIVE;
+        add_icon_kind(label, v->mount, glyph, DESK_KIND_VOLUME);
+        if (g_icon_count == idx) break;
+    }
+}
+
+// Which volume record backs desktop icon `idx`. Matched by MOUNT POINT, which
+// is the icon's exec_path, rather than by position in either list: the two
+// lists are rebuilt independently and a positional assumption would silently
+// eject the wrong drive.
+static const sc_volume_t *volume_for_icon(int idx) {
+    if (idx < 0 || idx >= g_icon_count) return 0;
+    if (g_icons[idx].kind != DESK_KIND_VOLUME) return 0;
+    for (int i = 0; i < g_vol_count; i++) {
+        if (strcmp(g_vols[i].mount, g_icons[idx].exec_path) == 0) return &g_vols[i];
+    }
+    return 0;
+}
+
+int desktop_icon_volume(int idx, int *out_kernel_index, int *out_readable) {
+    const sc_volume_t *v = volume_for_icon(idx);
+    if (!v) return 0;
+    if (out_kernel_index) *out_kernel_index = v->index;
+    if (out_readable)
+        *out_readable = ((v->flags & MOSVOL_READABLE) && (v->flags & MOSVOL_MOUNTED)) ? 1 : 0;
+    return 1;
+}
+
+void desktop_icon_open_volume(int idx) {
+    const sc_volume_t *v = volume_for_icon(idx);
+    if (!v) return;
+    if (!(v->flags & MOSVOL_READABLE) || !(v->flags & MOSVOL_MOUNTED)) {
+        notify_post("Removable drive",
+                    "This volume's filesystem is recognised but MayteraOS cannot "
+                    "read files from it yet. You can still eject it.",
+                    NOTIFY_WARNING);
+        return;
+    }
+    char mount[64];
+    strncpy(mount, v->mount, sizeof(mount) - 1);
+    mount[sizeof(mount) - 1] = '\0';
+    char *av[2];
+    av[0] = (char *)"/APPS/FILES";
+    av[1] = mount;
+    if (sys_spawn_args("/APPS/FILES", av, 2) < 0)
+        notify_post("Cannot open drive", g_icons[idx].name, NOTIFY_ERROR);
+}
+
+int desktop_icon_eject(int idx) {
+    const sc_volume_t *v = volume_for_icon(idx);
+    if (!v) return 0;
+    char label[DESKTOP_ICON_NAME_LEN];
+    strncpy(label, g_icons[idx].name, sizeof(label) - 1);
+    label[sizeof(label) - 1] = '\0';
+    int ki = v->index;
+    if (vol_eject(ki) != 0) {
+        notify_post("Eject failed", label, NOTIFY_ERROR);
+        return 0;
+    }
+    notify_post("Safe to remove", label, NOTIFY_SUCCESS);
+    // Refresh immediately rather than waiting out the tick throttle, so the
+    // icon disappears on the same frame as the confirmation.
+    g_vol_count = 0;
+    { int n = vol_list(g_vols, DESK_MAX_VOLS); g_vol_count = (n > 0) ? n : 0; }
+    desktop_rescan_home(1);
+    return 1;
+}
+
+int desktop_icon_at(int32_t x, int32_t y) { return find_icon_at(x, y); }
+
+// Polled from the compositor loop. Throttled to 1s: a drive is plugged in at
+// human speed, and in the unchanged case this is ONE syscall that writes at
+// most eight records and touches no hardware.
+void desktop_volumes_tick(void) {
+    static uint64_t s_last;
+    static unsigned s_sig;
+    static int s_primed;
+    // Never rebuild mid-drag, and do not record the new signature either: the
+    // rescan below would refuse (desktop_rescan_home() bails while dragging),
+    // and remembering the signature anyway would mean the change is never
+    // applied at all once the drag ends. Same rule as desktop_home_tick().
+    if (desktop_is_dragging()) return;
+    uint64_t now = uptime_ms();
+    if (s_last != 0 && (now - s_last) < 1000) return;
+    s_last = now;
+
+    int n = vol_list(g_vols, DESK_MAX_VOLS);
+    g_vol_count = (n > 0) ? n : 0;
+    unsigned sig = volumes_sig();
+    if (s_primed && sig == s_sig) return;
+
+    int had = s_primed;
+    unsigned prev_sig = s_sig;
+    (void)prev_sig;
+    s_sig = sig;
+    s_primed = 1;
+
+    // force=1: the volume set is not part of the <home>/DESKTOP signature, so
+    // the rescan's own no-change early-out would skip the rebuild.
+    desktop_rescan_home(1);
+
+    if (had) {
+        // Tell the user something happened. Without this a drive appears or
+        // vanishes with no acknowledgement, which reads as a glitch.
+        if (g_vol_count > 0)
+            notify_post("Removable drive", "Drive connected", NOTIFY_INFO);
+        else
+            notify_post("Removable drive", "Drive removed", NOTIFY_INFO);
+    }
 }
 
 // Throttled caller. 2000ms: a desktop folder changes at human speed, and the
@@ -607,6 +833,11 @@ static void activate_icon(int idx) {
         return;
     }
 
+    // #250: a removable volume opens in Files at its mount point, exactly as a
+    // folder does. If its filesystem cannot serve reads, say so instead of
+    // opening a window that will be empty.
+    if (ic->kind == DESK_KIND_VOLUME) { desktop_icon_open_volume(idx); return; }
+
     // Any other file: the OS-wide association table. assoc_app_for() never
     // returns NULL and falls back to the text editor, so an unrecognised type
     // still opens in something rather than doing nothing. It is given the FULL
@@ -657,7 +888,7 @@ void desktop_init(void) {
     // root ships /APPS/APPSTORE (uppercase), which is also what the start menu
     // entry and main.c's ICON_APPSTORE loader already use. A name that does not
     // exist on the volume fails silently at spawn (#517 COMPOSIT/COMPOSITOR).
-    add_icon("App Store",   "/APPS/APPSTORE",       ICON_APPSTORE);
+    add_icon("App Repo",    "/APPS/APPSTORE",       ICON_APPSTORE);
 
     g_sys_icon_count = g_icon_count;   // everything above is a SYSTEM icon
 
@@ -698,6 +929,24 @@ void desktop_init(void) {
     for (int i = 0; i < g_icon_count; i++) g_icons[i].pos_set = 0;
 }
 
+// #uiscale bugfix: labels never overflowed at 1x because the label font
+// size and DESKTOP_ICON_SPACING_X happened to be tuned together by hand -
+// that was never an enforced guarantee, just a coincidence that broke the
+// moment the font got bigger under UI scale (names ran together into
+// neighboring icons' labels, e.g. "ComputRecycle BiTerminal..."). Ellipsize
+// against the actual (now correctly scaled) column width so a long name can
+// never collide with its neighbor AT ANY SCALE, not just a patch for one.
+// Same small, self-contained algorithm as notif.c's ellipsize_ttf() (that
+// one is static to notif.c, not shared infrastructure, so this is its own
+// copy rather than a cross-file dependency for one call site).
+static void desktop_ellipsize(const char *src, int size, int max_w, char *out, int outcap) {
+    int n = 0; while (src[n] && n < outcap - 1) { out[n] = src[n]; n++; } out[n] = 0;
+    if (text_width_ttf(out, size) <= max_w) return;
+    int ellw = text_width_ttf("...", size);
+    while (n > 0 && text_width_ttf(out, size) + ellw > max_w) out[--n] = 0;
+    if (n + 3 < outcap) { out[n]='.'; out[n+1]='.'; out[n+2]='.'; out[n+3]=0; }
+}
+
 // ============================================================================
 // desktop_render
 // ============================================================================
@@ -711,9 +960,9 @@ void desktop_render(void) {
 
         // Selection highlight behind the icon image + label row.
         if (g_icons[i].selected) {
-            draw_fill_rect(sx - 4, sy - 4,
-                           icon_box_w() + 8, icon_box_h() + 4,
-                           CLR_ICON_SEL_BG);
+            int32_t hx, hy, hw, hh;
+            icon_hit_rect(i, &hx, &hy, &hw, &hh);   // #uiscale: shared with find_icon_at()
+            draw_fill_rect(hx, hy, hw, hh, CLR_ICON_SEL_BG);
         }
 
         icon_draw_scaled(g_icons[i].icon_id, sx, sy,
@@ -722,10 +971,25 @@ void desktop_render(void) {
         int32_t label_y  = sy + DESKTOP_ICON_SIZE + 4;
         int32_t label_cx = sx + DESKTOP_ICON_SIZE / 2;
 
+        // #uiscale: DO NOT ui_px() THIS. Every size handed to draw_text_ttf()
+        // and text_width_ttf() is a LOGICAL size that those two functions scale
+        // themselves - that is the whole point of putting the multiply at the
+        // one text chokepoint. Pre-scaling here double-applies: measured at
+        // 200%, ui_px(14)=28 was then measured as ui_px(28)=56, so every label
+        // was ellipsized against twice its true width and "Computer" came out
+        // as "Comp...". The rule for this file, and for every caller of those
+        // two functions: PASS LOGICAL SIZES, ALWAYS.
         int lsz = (g_font_px <= 12) ? 12 : (g_font_px <= 16) ? 14 : (g_font_px <= 20) ? 18 : 20;
-        int32_t tw = text_width_ttf(g_icons[i].name, lsz);
+        // #uiscale: clamp to the actual column width (DESKTOP_ICON_SPACING_X,
+        // already scaled - see compositor_apply_icon_size()) minus a small
+        // gutter, so this never depends on the label font happening to fit.
+        char label_buf[40];
+        int32_t max_label_w = DESKTOP_ICON_SPACING_X - ui_px(8);
+        if (max_label_w < ui_px(20)) max_label_w = ui_px(20);   // never collapse to nothing
+        desktop_ellipsize(g_icons[i].name, lsz, max_label_w, label_buf, sizeof(label_buf));
+        int32_t tw = text_width_ttf(label_buf, lsz);
         int32_t label_x = label_cx - tw / 2;
-        const char *nm = g_icons[i].name;
+        const char *nm = label_buf;
         static const int ox[8] = { -1, 0, 1, -1, 1, -1, 0, 1 };
         static const int oy[8] = { -1, -1, -1, 0, 0, 1, 1, 1 };
         for (int o = 0; o < 8; o++)
@@ -839,24 +1103,18 @@ void desktop_set_icon_pos_by_key(const char *key, int axis, int v) {
     // is correct; it is re-derived if the file comes back.
 }
 
-// (#745) Folds the icon KEY and KIND in, not just the coordinates. profile_tick()
-// saves only when this changes, so without the key a rename that happened to
-// leave the icon at the same coordinates would never be written back. This is
-// still ONE term (prime 157) in profile_tick()'s hash; no new term is added, so
-// the every-term-a-unique-prime invariant is untouched.
-//
-// Masked to 22 bits on the way out: profile_tick() multiplies this by 157 and
-// adds it to a plain int, and an unbounded 32-bit value there would overflow.
-int desktop_positions_hash(void) {
-    unsigned h = 2166136261u;
-    for (int i = 0; i < g_icon_count; i++) {
-        h = fnv1a(g_icons[i].key, h);
-        h = h * 31u + (unsigned)(g_icons[i].px + 1);
-        h = h * 31u + (unsigned)(g_icons[i].py + 1);
-        h = h * 31u + (unsigned)g_icons[i].kind;
-    }
-    return (int)(h & 0x3FFFFFu);
-}
+// (#231) desktop_positions_hash() used to live here: profile_tick() folded it
+// in (prime 157) as a stand-in for "did any icon move/rename", because that
+// hand-maintained hash could not otherwise see into desktop.c's own icon
+// table. profile_tick() no longer keeps a parallel hash of individual
+// globals at all - it hashes the bytes profile_build() (profile.c) actually
+// serializes, which already includes every icon's key/kind/x/y as plain
+// "ic<key>x"/"ic<key>y" lines (see profile_save()'s icon loop). Any icon
+// move, rename or kind change shows up in that buffer directly, so this
+// function became a zero-caller duplicate of information already flowing
+// through the one true serialization path, and was removed rather than left
+// to bit-rot (see blame.md's zero-callers entries for why that is a defect
+// class here, not a style preference).
 
 // ============================================================================
 // Drag + rubber-band state machine (driven per-frame from main.c)
@@ -976,8 +1234,11 @@ void desktop_release(int32_t x, int32_t y) {
 
     if (mode == 1) {
         if (g_drag_moved) {
-            // A real drag happened: positions are already updated. profile_tick
-            // picks up the change via desktop_positions_hash and persists it.
+            // A real drag happened: positions are already updated. (#231)
+            // profile_tick() picks up the change because profile_build()
+            // (profile.c) serializes every icon's position directly, and the
+            // change-detection hash is now taken over that serialized output
+            // rather than a separate positions hash.
             g_band_w = g_band_h = 0;
             g_needs_redraw    = true;
             g_last_click_icon = -1;   // a drop is never a double-click
@@ -989,9 +1250,20 @@ void desktop_release(int32_t x, int32_t y) {
         if (hit < 0) hit = find_icon_at(x, y);
         if (hit < 0) { g_needs_redraw = true; return; }
 
-        uint64_t now = (uint64_t)sys_clock();
+        // #236: this is the REAL double-click detector for desktop icons (the
+        // main.c/s_dbl_click path only reaches desktop_handle_mouse() via a
+        // fallback branch the normal press/drag/release flow never takes -
+        // see main.c's dbl_click_threshold() comment). It used to be a SECOND,
+        // independent hardcoded threshold (`500ULL` compared against raw
+        // sys_clock() ticks, i.e. actually ~2.0s - see the same comment) with
+        // zero connection to the "Double-click Speed" setting, which is why
+        // that setting had no observable effect on golden 2016 no matter what
+        // main.c's (correctly wired but unreachable) detector did. Now reads
+        // the same settingscfg_dblclick_ms() getter directly, compared against
+        // uptime_ms() (real monotonic ms, not raw PIT ticks).
+        uint64_t now = (uint64_t)uptime_ms();
         bool should_launch = (hit == g_last_click_icon &&
-                              (now - g_last_click_time) < 500ULL);
+                              (now - g_last_click_time) < (uint64_t)settingscfg_dblclick_ms());
 
         // Single-click selects only this icon.
         clear_selection();
@@ -1019,6 +1291,22 @@ void desktop_handle_mouse(int32_t x, int32_t y,
                           bool left_click, bool right_click, bool dbl_click) {
     // Right-click: open context menu at cursor position.
     if (right_click) {
+        // #250: a right-click ON A VOLUME ICON gets the volume menu (Open /
+        // Eject). Before this, the desktop menu opened regardless of what was
+        // under the cursor, so there was no way to eject anything from the
+        // desktop at all. Every other icon keeps the background menu, which is
+        // the behaviour that was there.
+        int hit = find_icon_at(x, y);
+        if (hit >= 0 && g_icons[hit].kind == DESK_KIND_VOLUME) {
+            int readable = 0;
+            desktop_icon_volume(hit, 0, &readable);
+            clear_selection();
+            g_icons[hit].selected = true;
+            g_selected_icon = hit;
+            g_needs_redraw = true;
+            contextmenu_open_for_volume(x, y, hit, readable);
+            return;
+        }
         contextmenu_open(x, y);
         return;
     }

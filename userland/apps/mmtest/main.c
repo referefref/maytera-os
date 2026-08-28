@@ -23,11 +23,7 @@
 
 #define PGSZ            4096UL
 
-// mmap prot bits (kernel proc/syscall.c reads these)
-#define PROT_NONE       0x0
-#define PROT_READ       0x1
-#define PROT_WRITE      0x2
-#define PROT_EXEC       0x4
+// PROT_* now come from ../../libc/syscall.h (#404).
 
 // mmap flags
 #define MAP_SHARED      0x01
@@ -37,16 +33,13 @@
 
 #define MAP_FAILED      ((void *)-1)
 
-// SYS_MPROTECT: added by #522. Declared here so this app also builds and runs
-// against a kernel that does not have it yet (the call then returns -1 and the
-// subtest reports NOT-IMPLEMENTED rather than failing to build).
-#ifndef SYS_MPROTECT
-#define SYS_MPROTECT    23
-#endif
-
-static int sys_mprotect(void *addr, unsigned long len, int prot) {
-    return (int)syscall3(SYS_MPROTECT, (long)addr, (long)len, (long)prot);
-}
+// SYS_MPROTECT and sys_mprotect() now come from ../../libc/syscall.h for real
+// (#404). This app carried its own copy from #522, guessing the number 23
+// against a kernel that had no such syscall, so every call landed on the
+// dispatcher's default and returned -1 and subtest (3) reported
+// "mprotect unavailable" forever. The kernel adopted 23, so the guess became
+// correct rather than merely harmless; the local copy is removed because a
+// second definition of the same wrapper is exactly how the two drift apart.
 
 // ---------------------------------------------------------------------------
 // In-process fault probing
@@ -424,6 +417,131 @@ static void test_concurrency(void) {
                g_worker_maps == made * NITERS);
 }
 
+
+// ---------------------------------------------------------------------------
+// (8) REFUSAL. Every illegal or malicious mprotect argument must be REJECTED,
+// and must be rejected FOR ITS OWN REASON.
+//
+// This is the half that is easy to fake. A guard that never fires and a guard
+// that is absent look identical from the outside, and a validator that returned
+// one blanket -1 would pass a test that only asserted "it failed" even if a
+// single length check were doing all the work. So each case below asserts the
+// EXACT MP_E_* code, which is the only way to prove that specific check ran.
+// ---------------------------------------------------------------------------
+static void test_mprotect_refusals(void) {
+    const char *T = "(8) mprotect refuses bad input";
+    const unsigned long LEN = 2 * PGSZ;
+    char *p = (char *)sys_mmap(0, LEN, PROT_READ | PROT_WRITE, 0);
+    if (p == (char *)MAP_FAILED || p == 0) { verdict(T, 0); return; }
+
+    struct { const char *what; int got; int want; } c[8];
+    int n = 0;
+
+    // Unknown protection bits must not be silently masked off: do_mprotect
+    // stores prot verbatim into vma->prot.
+    c[n].what = "unknown prot bits";
+    c[n].got  = sys_mprotect(p, PGSZ, 0x40);
+    c[n].want = MP_E_PROT_BITS; n++;
+
+    c[n].what = "zero length";
+    c[n].got  = sys_mprotect(p, 0, PROT_READ);
+    c[n].want = MP_E_LEN; n++;
+
+    c[n].what = "unaligned addr";
+    c[n].got  = sys_mprotect(p + 1, PGSZ, PROT_READ);
+    c[n].want = MP_E_ALIGN; n++;
+
+    // W^X. Deliberate divergence from POSIX; see rustkern/mprotect.rs.
+    c[n].what = "W^X (write+exec)";
+    c[n].got  = sys_mprotect(p, PGSZ, PROT_READ | PROT_WRITE | PROT_EXEC);
+    c[n].want = MP_E_WX; n++;
+
+    // addr+len wraps the 64-bit address space. In C this addition silently
+    // produces a small number and every bound below it then passes; the
+    // validator is in Rust and uses checked_add precisely for this case.
+    c[n].what = "addr+len wraps";
+    c[n].got  = sys_mprotect(p, ~0UL - PGSZ, PROT_READ);
+    c[n].want = MP_E_OVERFLOW; n++;
+
+    // A KERNEL address. This is the privilege boundary the whole syscall sits
+    // on: Ring 3 must not be able to name kernel memory and have the kernel
+    // rewrite its page tables.
+    c[n].what = "kernel address";
+    c[n].got  = sys_mprotect((void *)0xFFFFFFFF80000000UL, PGSZ, PROT_READ);
+    c[n].want = MP_E_RANGE; n++;
+
+    // Low identity-mapped memory, below USER_SPACE_START.
+    c[n].what = "sub-4MB address";
+    c[n].got  = sys_mprotect((void *)0x1000UL, PGSZ, PROT_READ);
+    c[n].want = MP_E_RANGE; n++;
+
+    // Well-formed, in the user half, but nothing is mapped there. Must be a
+    // clean refusal, NOT a silent success, and must be distinguishable from
+    // the validator's refusals.
+    c[n].what = "unmapped user range";
+    c[n].got  = sys_mprotect((void *)0x60000000UL, PGSZ, PROT_READ);
+    c[n].want = MP_E_NOMAP; n++;
+
+    int ok = 1;
+    for (int i = 0; i < n; i++) {
+        int good = (c[i].got == c[i].want);
+        if (!good) ok = 0;
+        printf("MMTEST: (8) %-22s -> %d (want %d) %s\n",
+               c[i].what, c[i].got, c[i].want, good ? "OK" : "WRONG");
+    }
+
+    // The range must be UNCHANGED by all that refusing: a refusal that half-
+    // applied would be worse than one that did nothing.
+    int w = probe_write((volatile unsigned int *)p, 0x8888AAAAu);
+    unsigned int back = 0;
+    int r = probe_read((volatile unsigned int *)p, &back);
+    printf("MMTEST: (8) after refusals: write_fault=%d readback=0x%x (want 0 0x8888aaaa)\n",
+           w, back);
+    ok = ok && !w && !r && back == 0x8888AAAAu;
+
+    sys_munmap(p, LEN);
+    verdict(T, ok);
+}
+
+// ---------------------------------------------------------------------------
+// (9) PROT_NONE must make the page genuinely unreachable, and restoring access
+// must work. Contents are NOT preserved across PROT_NONE in this kernel (see
+// the #404 note in mm/demand.c vma_reprotect_pages) - that is asserted here
+// deliberately, so the divergence is a measured, documented fact rather than a
+// surprise, and so it fails loudly if anyone changes it.
+// ---------------------------------------------------------------------------
+static void test_mprotect_none(void) {
+    const char *T = "(9) mprotect PROT_NONE";
+    const unsigned long LEN = 2 * PGSZ;
+    char *p = (char *)sys_mmap(0, LEN, PROT_READ | PROT_WRITE, 0);
+    if (p == (char *)MAP_FAILED || p == 0) { verdict(T, 0); return; }
+    fill((volatile unsigned int *)p, LEN, 0x99990000u);
+
+    int rc = sys_mprotect(p, PGSZ, PROT_NONE);
+    // Page 0 must now fault on BOTH read and write; page 1 must be untouched.
+    int rf0 = probe_read((volatile unsigned int *)p, 0);
+    int wf0 = probe_write((volatile unsigned int *)p, 1);
+    unsigned int v1 = 0;
+    int rf1 = probe_read((volatile unsigned int *)(p + PGSZ), &v1);
+    unsigned int want1 = 0x99990000u + (unsigned int)(PGSZ / 4);
+    printf("MMTEST: (9) PROT_NONE rc=%d  p0 read_fault=%d write_fault=%d  "
+           "p1 read_fault=%d p1=0x%x (want 0x%x)\n",
+           rc, rf0, wf0, rf1, v1, want1);
+    int ok = (rc == MP_OK) && rf0 && wf0 && !rf1 && v1 == want1;
+
+    // Restore. The page must become usable again (a fresh zero page).
+    int rc2 = sys_mprotect(p, PGSZ, PROT_READ | PROT_WRITE);
+    int wf0b = probe_write((volatile unsigned int *)p, 0xC0DE0001u);
+    unsigned int back = 0;
+    int rf0b = probe_read((volatile unsigned int *)p, &back);
+    printf("MMTEST: (9) restore rc=%d write_fault=%d readback=0x%x (want 0xc0de0001)\n",
+           rc2, wf0b, back);
+    ok = ok && rc2 == MP_OK && !wf0b && !rf0b && back == 0xC0DE0001u;
+
+    sys_munmap(p, LEN);
+    verdict(T, ok);
+}
+
 int main(void) {
     printf("MMTEST: ===== #522 mmap/mprotect/munmap verification (pid=%d) =====\n",
            sys_getpid());
@@ -436,6 +554,8 @@ int main(void) {
     test_unmapped_range();
     test_map_fixed();
     test_shared_rejected();
+    test_mprotect_refusals();
+    test_mprotect_none();
     test_cow_munmap_uaf();
     test_concurrency();
 

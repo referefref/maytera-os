@@ -14,7 +14,7 @@
 
 `fetch-upstream.sh` re-creates the exact staged clone from that pinned commit, so
 the provenance is recorded as CODE and not only as prose. The buildable source is
-ALSO vendored in-repo (under `src/`), so a `git archive` of `maytera-src` can
+ALSO vendored in-repo (under `src/`), so a `git archive` of `the internal source repo` can
 rebuild ClassiCube with no network access, matching the convention already used
 by `userland/apps/assaultcube/`.
 

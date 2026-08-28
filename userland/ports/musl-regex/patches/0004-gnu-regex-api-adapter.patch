@@ -1,0 +1,412 @@
+--- a/src/regex/gnuregex.h
++++ b/src/regex/gnuregex.h
+@@ -0,0 +1,158 @@
++/* gnuregex.h - the GNU regex ENTRY POINTS, expressed on top of POSIX regcomp/
++ * regexec.  MayteraOS #745 local 97.
++ * SPDX-License-Identifier: MIT
++ * Copyright (c) MayteraOS contributors.
++ *
++ * WHY THIS FILE EXISTS.  MayteraOS ships two programs that were written
++ * against GNU regex: GNU grep 2.5.4 (src/search.c, src/dfa.c) and busybox vi
++ * (editors/vi.c).  Both call the POSIX API *and* the GNU-only API in the same
++ * translation unit.  The GNU regex implementation is LGPL-3.0-or-later, which
++ * is a copyleft obligation on two shipped binaries; the engine underneath this
++ * header is musl's MIT-licensed TRE-derived POSIX regex, which is a SEMANTIC
++ * drop-in (leftmost-longest POSIX BRE/ERE) rather than a behaviour change.
++ * This header plus gnu_compat.c is the whole of the difference.
++ *
++ * IT IS ONE COPY, ON PURPOSE.  Both consumers link the same libregex.a.  The
++ * defect this project keeps repeating is a second copy of a shared thing; an
++ * adapter written twice, once in grep and once in vi, would be that defect by
++ * construction.
++ *
++ * ABOUT THE RE_* BIT VALUES.  These are our own values, assigned here in the
++ * order the GNU regex manual documents the flags, not copied out of anybody's
++ * header.  Nothing outside this tree observes them: the only writers are
++ * grep's search.c and vi's char_search(), and the only readers are grep's
++ * dfa.c and gnu_compat.c, all compiled against THIS header.  What has to be
++ * faithful is the MEANING of each flag and the MEMBERSHIP of each RE_SYNTAX_*
++ * dialect, because grep's DFA prefilter parses the pattern itself using these
++ * bits and would silently disagree with the matcher if a dialect were wrong.
++ */
++#ifndef MAYTERA_GNUREGEX_H
++#define MAYTERA_GNUREGEX_H
++
++#include <regex.h>
++#include <stddef.h>
++#include <limits.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++typedef unsigned long reg_syntax_t;
++
++/* One bit per syntax decision.  The comment on each is what the bit MEANS;
++ * that is the part that has to stay true. */
++#define RE_BACKSLASH_ESCAPE_IN_LISTS ((reg_syntax_t)1 << 0)  /* \ is special inside [...] */
++#define RE_BK_PLUS_QM                ((reg_syntax_t)1 << 1)  /* \+ \? are the operators, + ? are literal */
++#define RE_CHAR_CLASSES              ((reg_syntax_t)1 << 2)  /* [[:alpha:]] and friends are understood */
++#define RE_CONTEXT_INDEP_ANCHORS     ((reg_syntax_t)1 << 3)  /* ^ and $ are anchors everywhere, not only at the ends */
++#define RE_CONTEXT_INDEP_OPS         ((reg_syntax_t)1 << 4)  /* * + ? { are operators everywhere */
++#define RE_CONTEXT_INVALID_OPS       ((reg_syntax_t)1 << 5)  /* an operator in an impossible position is an ERROR, not a literal */
++#define RE_DOT_NEWLINE               ((reg_syntax_t)1 << 6)  /* . matches a newline */
++#define RE_DOT_NOT_NULL              ((reg_syntax_t)1 << 7)  /* . does not match a NUL */
++#define RE_HAT_LISTS_NOT_NEWLINE     ((reg_syntax_t)1 << 8)  /* [^...] does not match a newline */
++#define RE_INTERVALS                 ((reg_syntax_t)1 << 9)  /* {n,m} intervals exist at all */
++#define RE_LIMITED_OPS               ((reg_syntax_t)1 << 10) /* no + ? | at all */
++#define RE_NEWLINE_ALT               ((reg_syntax_t)1 << 11) /* a newline in the pattern is an alternation */
++#define RE_NO_BK_BRACES              ((reg_syntax_t)1 << 12) /* {n,m} unbackslashed; \{ is literal */
++#define RE_NO_BK_PARENS              ((reg_syntax_t)1 << 13) /* (...) unbackslashed; this is the ERE/BRE discriminator */
++#define RE_NO_BK_REFS                ((reg_syntax_t)1 << 14) /* \1 is a literal 1, not a back reference */
++#define RE_NO_BK_VBAR                ((reg_syntax_t)1 << 15) /* | unbackslashed */
++#define RE_NO_EMPTY_RANGES           ((reg_syntax_t)1 << 16) /* [z-a] is an ERROR */
++#define RE_UNMATCHED_RIGHT_PAREN_ORD ((reg_syntax_t)1 << 17) /* a stray ) is an ordinary character */
++#define RE_NO_POSIX_BACKTRACKING     ((reg_syntax_t)1 << 18) /* stop at the first match found, not the longest */
++#define RE_NO_GNU_OPS                ((reg_syntax_t)1 << 19) /* \w \b \< \> \` \' are NOT available */
++#define RE_DEBUG                     ((reg_syntax_t)1 << 20) /* upstream's tracing; never set here */
++#define RE_INVALID_INTERVAL_ORD      ((reg_syntax_t)1 << 21) /* an unmatched { is ordinary, not an error */
++#define RE_ICASE                     ((reg_syntax_t)1 << 22) /* case-insensitive */
++#define RE_CARET_ANCHORS_HERE        ((reg_syntax_t)1 << 23) /* ^ anchors at this position only */
++#define RE_CONTEXT_INVALID_DUP       ((reg_syntax_t)1 << 24) /* a duplicate operator with nothing to repeat is an ERROR */
++#define RE_NO_SUB                    ((reg_syntax_t)1 << 25) /* do not report subexpression positions */
++
++/* The dialects.  Membership here is the load-bearing part: grep's dfa.c reads
++ * these bits to parse the pattern for its prefilter, so a wrong member makes
++ * the prefilter and the matcher disagree, which shows up as grep silently
++ * missing lines rather than as an error. */
++#define RE_SYNTAX_POSIX_COMMON \
++  (RE_CHAR_CLASSES | RE_DOT_NEWLINE | RE_DOT_NOT_NULL | RE_INTERVALS | RE_NO_EMPTY_RANGES)
++
++#define RE_SYNTAX_POSIX_BASIC \
++  (RE_SYNTAX_POSIX_COMMON | RE_BK_PLUS_QM | RE_CONTEXT_INVALID_DUP)
++
++#define RE_SYNTAX_POSIX_EXTENDED                                        \
++  (RE_SYNTAX_POSIX_COMMON  | RE_CONTEXT_INDEP_ANCHORS                   \
++   | RE_CONTEXT_INDEP_OPS  | RE_NO_BK_BRACES                            \
++   | RE_NO_BK_PARENS       | RE_NO_BK_VBAR                              \
++   | RE_CONTEXT_INVALID_OPS | RE_UNMATCHED_RIGHT_PAREN_ORD)
++
++#define RE_SYNTAX_EGREP                                                 \
++  (RE_CHAR_CLASSES        | RE_CONTEXT_INDEP_ANCHORS                    \
++   | RE_CONTEXT_INDEP_OPS | RE_HAT_LISTS_NOT_NEWLINE                    \
++   | RE_NEWLINE_ALT       | RE_NO_BK_PARENS                             \
++   | RE_NO_BK_VBAR)
++
++#define RE_SYNTAX_POSIX_EGREP \
++  (RE_SYNTAX_EGREP | RE_INTERVALS | RE_NO_BK_BRACES | RE_INVALID_INTERVAL_ORD)
++
++#define RE_SYNTAX_GREP                                                  \
++  (RE_BK_PLUS_QM | RE_CHAR_CLASSES | RE_HAT_LISTS_NOT_NEWLINE           \
++   | RE_INTERVALS | RE_NEWLINE_ALT)
++
++#define RE_SYNTAX_AWK                                                   \
++  (RE_BACKSLASH_ESCAPE_IN_LISTS | RE_DOT_NOT_NULL                       \
++   | RE_NO_BK_PARENS            | RE_NO_BK_REFS                         \
++   | RE_NO_BK_VBAR              | RE_NO_EMPTY_RANGES                    \
++   | RE_DOT_NEWLINE             | RE_CONTEXT_INDEP_ANCHORS              \
++   | RE_UNMATCHED_RIGHT_PAREN_ORD | RE_NO_GNU_OPS)
++
++/* grep's dfa.c bounds intervals with this while parsing for its prefilter, so
++ * it MUST be the same number the engine enforces, which is POSIX's RE_DUP_MAX
++ * out of <limits.h>.  It is 255 here where GNU's own regex.h says 32767: an
++ * interval count above 255 is a REG_BADBR error under this engine and was
++ * accepted by GNU regex.  That is a real, bounded behaviour change and it is
++ * written down in the CHANGELOG rather than hidden behind a larger constant
++ * that the matcher would then reject anyway. */
++#ifndef RE_DUP_MAX
++#define RE_DUP_MAX 255
++#endif
++
++/* GNU spells the success code REG_NOERROR where POSIX and musl spell it REG_OK.
++ * grep's dfa.c compares against the GNU name. */
++#ifndef REG_NOERROR
++#define REG_NOERROR REG_OK
++#endif
++
++/* GNU's register vector.  re_search() fills it and grows it on demand, which
++ * is what a caller that zeroed the struct (both of ours do) expects. */
++struct re_registers {
++	unsigned num_regs;
++	regoff_t *start;
++	regoff_t *end;
++};
++
++/* The syntax the NEXT re_compile_pattern() will use.  vi assigns it directly;
++ * grep goes through re_set_syntax(). */
++extern reg_syntax_t re_syntax_options;
++
++reg_syntax_t re_set_syntax(reg_syntax_t syntax);
++
++/* Returns NULL on success, or a human-readable error string (static storage,
++ * as in GNU) on failure.  PATTERN need not be NUL-terminated. */
++const char *re_compile_pattern(const char *pattern, size_t length,
++			       struct re_pattern_buffer *bufp);
++
++/* Leftmost match whose START lies in [startpos, startpos+range] (searching
++ * backwards when range is negative, in which case the LAST such start wins).
++ * Returns that start offset into STRING, -1 for no match, -2 for an error.
++ * STRING need not be NUL-terminated; SIZE is what bounds it. */
++int re_search(struct re_pattern_buffer *bufp, const char *string, int size,
++	      int startpos, int range, struct re_registers *regs);
++
++/* Match ANCHORED at POS.  Returns the length matched, or -1. */
++int re_match(struct re_pattern_buffer *bufp, const char *string, int size,
++	     int pos, struct re_registers *regs);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* MAYTERA_GNUREGEX_H */
+--- a/src/regex/gnu_compat.c
++++ b/src/regex/gnu_compat.c
+@@ -0,0 +1,248 @@
++/* gnu_compat.c - the GNU regex entry points on top of POSIX regcomp/regexec.
++ * MayteraOS #745 local 97.
++ * SPDX-License-Identifier: MIT
++ * Copyright (c) MayteraOS contributors.
++ *
++ * Read gnuregex.h first for why this exists and why the RE_* bit values are
++ * ours.  This file is the only place in MayteraOS that translates between the
++ * two APIs; GNU grep and busybox vi both link it out of libregex.a.
++ *
++ * THE ONE DESIGN DECISION WORTH ARGUING WITH.  GNU's re_search() takes a
++ * pointer and a LENGTH, so its subject need not be NUL-terminated; POSIX
++ * regexec() takes a NUL-terminated string.  Everything below is built on one
++ * bounded COPY of the window that is actually searchable, made once per
++ * re_search() call and then scanned in place.  The alternative, calling
++ * regexec() once per candidate start offset, is quadratic on a backward vi
++ * search over a whole file.  The copy is the window [lo, size), which for GNU
++ * grep is exactly one line, because that is the window its EGexecute() asks
++ * for.
++ */
++#include <regex.h>
++#include "gnuregex.h"
++#include <stdlib.h>
++#include <string.h>
++
++/* GNU's default before anyone calls re_set_syntax().  vi overwrites it on
++ * every search; grep calls re_set_syntax() before every compile. */
++reg_syntax_t re_syntax_options = RE_SYNTAX_POSIX_BASIC;
++
++reg_syntax_t re_set_syntax(reg_syntax_t syntax)
++{
++	reg_syntax_t old = re_syntax_options;
++	re_syntax_options = syntax;
++	return old;
++}
++
++/* The three POSIX cflags this engine has, derived from the GNU syntax bits.
++ *
++ *  - REG_EXTENDED tracks RE_NO_BK_PARENS.  That is not a shortcut: it is the
++ *    same test GNU grep itself uses to decide whether it is speaking BRE or
++ *    ERE (search.c: `int bk = !(syntax_bits & RE_NO_BK_PARENS);`).
++ *  - REG_ICASE tracks RE_ICASE.
++ *  - REG_NEWLINE tracks the ABSENCE of RE_DOT_NEWLINE.  A dialect in which
++ *    `.` does not match a newline is a line-oriented dialect, which is
++ *    exactly what REG_NEWLINE means in POSIX, and it is why busybox vi
++ *    clears RE_DOT_NEWLINE by hand.  It also gives ^ and $ the
++ *    match-at-embedded-newlines behaviour that GNU spells `newline_anchor`.
++ */
++static int cflags_from_syntax(reg_syntax_t syntax)
++{
++	int cflags = 0;
++	if (syntax & RE_NO_BK_PARENS)
++		cflags |= REG_EXTENDED;
++	if (syntax & RE_ICASE)
++		cflags |= REG_ICASE;
++	if (!(syntax & RE_DOT_NEWLINE))
++		cflags |= REG_NEWLINE;
++	return cflags;
++}
++
++const char *re_compile_pattern(const char *pattern, size_t length,
++			       struct re_pattern_buffer *bufp)
++{
++	/* GNU returns a pointer to static storage, and both consumers only
++	 * print it, so this matches the contract they were written against. */
++	static char errbuf[128];
++	char *nul;
++	int err;
++
++	if (!bufp || !pattern)
++		return "invalid argument";
++
++	nul = malloc(length + 1);
++	if (!nul)
++		return "Out of memory";
++	memcpy(nul, pattern, length);
++	nul[length] = '\0';
++
++	err = regcomp((regex_t *)bufp, nul, cflags_from_syntax(re_syntax_options));
++	free(nul);
++	if (err) {
++		regerror(err, (regex_t *)bufp, errbuf, sizeof errbuf);
++		return errbuf;
++	}
++
++	/* GNU's re_compile_pattern sets this, and grep's -x/-w wrappers rely
++	 * on ^ and $ meaning line boundaries.  REG_NEWLINE (above) is how the
++	 * engine was told; this field is what a caller can read back. */
++	bufp->newline_anchor = 1;
++	bufp->__gnu_syntax = re_syntax_options;
++	return NULL;
++}
++
++/* Is the byte at absolute offset POS a place where ^ may match?  Position 0 is
++ * governed by the caller's not_bol flag; anywhere else it is a line start only
++ * if the previous byte is a newline and this pattern anchors at newlines. */
++static int is_bol(const struct re_pattern_buffer *bufp, const char *string, int pos)
++{
++	if (pos == 0)
++		return !bufp->not_bol;
++	return bufp->newline_anchor && string[pos - 1] == '\n';
++}
++
++/* Grow REGS to hold N registers.  GNU allocates on demand for a caller that
++ * zeroed the struct, which is what both consumers do. */
++static int regs_ensure(struct re_registers *regs, unsigned n)
++{
++	regoff_t *s, *e;
++
++	if (regs->num_regs >= n && regs->start && regs->end)
++		return 1;
++	s = realloc(regs->start, n * sizeof *s);
++	if (!s)
++		return 0;
++	regs->start = s;
++	e = realloc(regs->end, n * sizeof *e);
++	if (!e)
++		return 0;
++	regs->end = e;
++	regs->num_regs = n;
++	return 1;
++}
++
++static void regs_fill(struct re_registers *regs, const regmatch_t *pm,
++		      unsigned n, int base)
++{
++	unsigned i;
++
++	if (!regs || !regs_ensure(regs, n))
++		return;
++	for (i = 0; i < n; i++) {
++		if (pm[i].rm_so < 0) {
++			regs->start[i] = -1;
++			regs->end[i] = -1;
++		} else {
++			regs->start[i] = pm[i].rm_so + base;
++			regs->end[i] = pm[i].rm_eo + base;
++		}
++	}
++}
++
++int re_search(struct re_pattern_buffer *bufp, const char *string, int size,
++	      int startpos, int range, struct re_registers *regs)
++{
++	unsigned nmatch;
++	regmatch_t *pm;
++	char *copy;
++	int lo, first_allowed, last_allowed, off, best = -1, eflags;
++
++	if (!bufp || !string || size < 0)
++		return -2;
++	if (startpos < 0 || startpos > size)
++		return -1;
++
++	if (range < 0) {
++		last_allowed = startpos;
++		first_allowed = startpos + range;
++		if (first_allowed < 0)
++			first_allowed = 0;
++	} else {
++		first_allowed = startpos;
++		last_allowed = startpos + range;
++		if (last_allowed > size)
++			last_allowed = size;
++	}
++	lo = first_allowed;
++
++	nmatch = (unsigned)bufp->re_nsub + 1;
++	pm = malloc(nmatch * sizeof *pm);
++	if (!pm)
++		return -2;
++
++	/* ONE copy of the searchable window, NUL-terminated at SIZE so that $
++	 * lands where GNU's length argument says it should. */
++	copy = malloc((size_t)(size - lo) + 1);
++	if (!copy) {
++		free(pm);
++		return -2;
++	}
++	memcpy(copy, string + lo, (size_t)(size - lo));
++	copy[size - lo] = '\0';
++
++	for (off = 0; lo + off <= last_allowed; ) {
++		eflags = 0;
++		if (!is_bol(bufp, string, lo + off))
++			eflags |= REG_NOTBOL;
++		if (bufp->not_eol)
++			eflags |= REG_NOTEOL;
++
++		if (regexec((regex_t *)bufp, copy + off, nmatch, pm, eflags) != 0)
++			break;
++		if (lo + off + (int)pm[0].rm_so > last_allowed)
++			break;
++
++		best = lo + off + (int)pm[0].rm_so;
++		regs_fill(regs, pm, nmatch, lo + off);
++		if (range >= 0)
++			break;			/* forward: leftmost wins */
++		off = off + (int)pm[0].rm_so + 1; /* backward: keep looking for a later one */
++	}
++
++	free(copy);
++	free(pm);
++	return best;
++}
++
++int re_match(struct re_pattern_buffer *bufp, const char *string, int size,
++	     int pos, struct re_registers *regs)
++{
++	unsigned nmatch;
++	regmatch_t *pm;
++	char *copy;
++	int eflags, len = -1;
++
++	if (!bufp || !string || size < 0)
++		return -2;
++	if (pos < 0 || pos > size)
++		return -1;
++
++	nmatch = (unsigned)bufp->re_nsub + 1;
++	pm = malloc(nmatch * sizeof *pm);
++	if (!pm)
++		return -2;
++	copy = malloc((size_t)(size - pos) + 1);
++	if (!copy) {
++		free(pm);
++		return -2;
++	}
++	memcpy(copy, string + pos, (size_t)(size - pos));
++	copy[size - pos] = '\0';
++
++	eflags = 0;
++	if (!is_bol(bufp, string, pos))
++		eflags |= REG_NOTBOL;
++	if (bufp->not_eol)
++		eflags |= REG_NOTEOL;
++
++	/* POSIX gives the LEFTMOST match; an anchored match therefore exists
++	 * if and only if the leftmost one starts at offset 0, and being
++	 * leftmost-LONGEST it is also the longest one there. */
++	if (regexec((regex_t *)bufp, copy, nmatch, pm, eflags) == 0 && pm[0].rm_so == 0) {
++		len = (int)pm[0].rm_eo;
++		regs_fill(regs, pm, nmatch, pos);
++	}
++
++	free(copy);
++	free(pm);
++	return len;
++}

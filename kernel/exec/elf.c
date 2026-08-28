@@ -398,7 +398,7 @@ typedef struct {
 // the target CR3, store, restore CR3, popfq. Writing CR3 flushes the entire
 // TLB, so that is TWO FULL TLB FLUSHES PER RELOCATION.
 //
-// MEASURED (VM2641, golden 998, kernel-only replacement): a PIE HEAPTEST with
+// MEASURED (VM <vmid>, golden 998, kernel-only replacement): a PIE HEAPTEST with
 // 743 relocations spent ~6.6M cycles in the relocation phase against ~2.1M for
 // the same app built fixed-base with zero relocations, i.e. ~6,100 cycles to
 // write eight bytes, 1,486 TLB flushes for one 53KB utility. The #633
@@ -2044,7 +2044,7 @@ static uint32_t elf_build_wellformed(uint8_t *buf, uint32_t cap, uint32_t *seed)
 // killed the kernel, loads each into a THROWAWAY user address space through the
 // live elf_load_user(), and asserts the verdict.
 //
-// PROVING IT CAN FAIL (both halves of the fix, MEASURED 2026-08-03 on VM2633
+// PROVING IT CAN FAIL (both halves of the fix, MEASURED 2026-08-03 on VM <vmid>
 // booting golden 998 with only the kernel replaced):
 //
 //   -DELF633_UNSAFE     removes the pre-flight AND the writable mapping. Vector

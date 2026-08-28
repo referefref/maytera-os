@@ -1,5 +1,6 @@
 // ip.c - Internet Protocol (IPv4) implementation
 #include "ip.h"
+#include "firewall.h"   // #238: the packet filter
 #include "ethernet.h"
 #include "arp.h"
 #include "../serial.h"
@@ -235,6 +236,30 @@ int ip_send(uint32_t dest_ip, uint8_t protocol, const void *data, uint16_t lengt
         return -1;
     }
 
+    // #238 THE OUTBOUND CHOKEPOINT. One site, and this is why it is this one.
+    //
+    // Every IPv4 datagram this stack emits passes through ip_send(): TCP,
+    // UDP, ICMP, DNS, DHCP, TLS, HTTP, SMB, NFS and the async fetcher all
+    // reach the wire here. ip_send_broadcast() is not a second egress point -
+    // it is only ever reached through the redirect three lines below, so the
+    // check sits ABOVE that redirect and covers both. The only IPv4 send that
+    // does not pass here is arp_flush_pending()'s replay of a packet that was
+    // ALREADY filtered on its first ip_send() call and then parked waiting for
+    // ARP (#333); re-filtering it would double-count and could reverse a
+    // decision mid-flight.
+    //
+    // Placed BEFORE the header build and the ARP resolve so a denied packet
+    // costs one table lookup and never touches the NIC, never queues, and
+    // never emits an ARP request that would tell a LAN observer we tried.
+    //
+    // `data`/`length` is the transport header and body, which is exactly what
+    // the filter needs to read ports from. `dest_ip` is host byte order.
+    if (!fw_check_out(dest_ip, protocol, data, length)) {
+        return -1;   // the caller's existing send-failed path; TCP will retry
+                     // and eventually give up, which is what a blocked
+                     // connection is supposed to look like.
+    }
+
     // Allow broadcast even without IP (for DHCP)
     if (dest_ip == 0xFFFFFFFF) {
         return ip_send_broadcast(protocol, data, length);
@@ -394,6 +419,34 @@ void ip_handle(const uint8_t *src_mac, const void *data, uint16_t length) {
 
     const uint8_t *payload = (const uint8_t *)data + ihl;
     uint16_t payload_length = total_length - ihl;
+
+    // #238 THE INBOUND CHOKEPOINT. One site, and this is why it is this one.
+    //
+    // Placed AFTER every structural check (version, IHL, checksum, addressed
+    // to us, total_length >= ihl) and BEFORE the protocol handler dispatch.
+    // That ordering matters in both directions:
+    //
+    //   * after, because the filter must never be handed a header the stack
+    //     has already judged malformed, and because a packet not addressed to
+    //     us is not a policy question - it is not ours;
+    //   * before, because this is the last point at which ONE decision covers
+    //     TCP, UDP, ICMP and anything else registered. Filtering inside
+    //     tcp_handle()/udp_handle() instead would be two sites that can
+    //     disagree, and would leave every future protocol unfiltered by
+    //     default.
+    //
+    // ARP is deliberately NOT covered: it is dispatched by ethertype one
+    // layer below, and a filter that could black-hole gateway resolution is a
+    // machine that cannot reach the UI that would fix it (see also #380).
+    //
+    // header->src_ip is network byte order; htonl() is the byte swap (this
+    // file already uses it as ntohl a few lines up for dest_ip). The fragment
+    // offset is the low 13 bits of flags_frag.
+    if (!fw_check_in(htonl(header->src_ip), header->protocol,
+                     (uint16_t)(ntohs(header->flags_frag) & 0x1FFF),
+                     payload, payload_length)) {
+        return;
+    }
 
     // kprintf("[IP] protocol=%d payload_len=%d\n", header->protocol, payload_length);
 

@@ -13,7 +13,15 @@
 // Static state
 // ============================================================================
 
-static screensaver_type_t g_ss_type    = SS_PLASMA;   // default Plasma (UIPROFIL screensaver:7); starfield selectable
+// #124: default is the CLASSIC plasma (id 22). NOTE this initializer is NOT
+// what decides the default on a running system: main.c syncs g_ss_type from
+// get_screensaver() (the kernel-held setting) on the FIRST main-loop pass
+// (s_cur_ss starts at -1), so the kernel's g_screensaver_type initializer in
+// kernel/proc/syscall.c wins on a fresh profile and UIPROFIL.YML's
+// screensaver:<n> wins on an existing one. Kept in agreement with both so the
+// three copies cannot disagree (the #652 lesson, applied to the TYPE default
+// rather than the DELAY default that commit was actually about).
+static screensaver_type_t g_ss_type    = SS_PLASMACLASSIC;   // default: Plasma (Classic), kernel id 22
 static int                g_ss_timeout = SS_DEFAULT_TIMEOUT; // seconds
 static uint32_t           g_ss_frame;
 static uint32_t           g_ss_seed    = 12345;
@@ -824,7 +832,7 @@ void screensaver_render(void) {
                 for (int x = 0; x < SS_FLAME_W; x++) {
                     int i = y * SS_FLAME_W + x;
 
-                    // MEASURED FIX (the build host VM 2410 live screendump): the first
+                    // MEASURED FIX (the build host VM <vmid> live screendump): the first
                     // cut of this ambient term used x*2/y*3 (a MULTIPLY, not
                     // the divide every other low-res effect in this file
                     // uses), which wraps the 256-entry SS_SIN table 2-3
@@ -946,6 +954,39 @@ void screensaver_render(void) {
         #undef SG_N
         break;
     }
+
+    // -----------------------------------------------------------------------
+    case SS_PLASMACLASSIC: {
+        // #124: the ORIGINAL plasma (#282), restored verbatim from ff3ca5f^.
+        // ff3ca5f replaced SS_PLASMA in place with "Plasma Reborn", which is a
+        // superset in capability but a DIFFERENT LOOK: smooth bilinear upscale
+        // vs these hard 4px blocks, a curated palette LUT vs the raw HSV
+        // wheel, plus a radial term, bloom and slow palette cycling this one
+        // deliberately has none of. Both ship now so the two are selectable
+        // side by side.
+        //
+        // #650/#652 NOTE: this predates both perf fixes but cannot reintroduce
+        // them. The frame cap (SS_FRAME_MIN_MS) and the blank-after stage
+        // (SS_BLANK_AFTER_MS) are type-independent gates in main.c's
+        // render_frame(), applied BEFORE screensaver_render() is called at
+        // all. #650's per-output-pixel divide lived in
+        // ss_lores_upscale_to_fb(), which this effect does not use: its
+        // divides are per 4x4 CELL (one sixteenth of the output pixel count),
+        // not per pixel, and there is no bloom pass.
+        int t = (int)g_ss_frame;
+        const int step = 4;
+        for (int y = 0; y < g_fb_height; y += step) {
+            for (int x = 0; x < g_fb_width; x += step) {
+                int v = SS_SIN(x / 6 + t)
+                      + SS_SIN(y / 8 - t)
+                      + SS_SIN((x + y) / 10 + t)
+                      + SS_SIN((x - y) / 14 - t / 2);
+                int hue = ((v >> 7) + t) & 0xFF;
+                draw_fill_rect(x, y, step, step, ss_hue(hue));
+            }
+        }
+        break;
+    }
     }
 
     g_ss_frame++;
@@ -1048,7 +1089,8 @@ void screensaver_set_type(int t) {
     // #319 allow GL saver ids, extended #560; extended again for the
     // psychedelic redesign's two new direct-pixel IDs (SS_FLAME,
     // SS_STAINEDGLASS, both >= 20, both NOT TinyGL).
-    if (t < 0 || t > SS_STAINEDGLASS) return;
+    // #124: upper bound follows the last enumerator, now SS_PLASMACLASSIC.
+    if (t < 0 || t > SS_PLASMACLASSIC) return;
     // #560/#571 GATE REMOVED (was: `if (t >= SS_GLTUNNEL && t <= SS_GLLAVA)
     // return;`). History: GLTUNNEL was measured to crash COMPOSIT (page
     // fault in gl_M4_Mul, zmath.c:65) from a GL_LINE_LOOP vertex-cache
@@ -1073,7 +1115,7 @@ void screensaver_set_type(int t) {
     // (stock, unmodified) one. MEASURED: all ten effects (GLTUNNEL,
     // GLKALEIDO, GLPLATONIC, GLLORENZ, GLMOBIUS, GLWAVEMESH, GLSPIROGRAPH,
     // GLHYPERCUBE, GLVORTEX, GLLAVA) were boot-tested via testhook.c's
-    // `SAVER <id>` on VM 2410 against this exact commit, two screendumps
+    // `SAVER <id>` on VM <vmid> against this exact commit, two screendumps
     // (~4s apart, differing md5 proving live animation) per effect, all
     // rendering their intended geometry with no gradient, no crash, no
     // hang, and returning cleanly to the desktop on dismiss. INFERRED: the

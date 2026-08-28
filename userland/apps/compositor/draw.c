@@ -12,6 +12,7 @@
 // per-pixel distance test. Ring-3 userland links real libgcc/libm - this is
 // not the kernel's -mno-sse target, see the design doc section 11.
 #include "../../libc/math.h"
+#include "../../libc/dock_opacity.h"   // #132: shared DOCK_OPACITY_MIN/MAX/DEFAULT/WARN
 
 // ============================================================================
 // 8x16 bitmap font (ASCII 32-126)
@@ -858,11 +859,14 @@ void draw_char(int32_t x, int32_t y, char c, uint32_t color)
 
     const uint8_t *glyph = font_data[idx];
 
-    for (int row = 0; row < FONT_CHAR_H; row++) {
+    // #uiscale: raw bitmap glyph dims (indexes font_data[128][16], must stay
+    // the true 8x16 source size, NOT the scaled FONT_CHAR_W/H used elsewhere
+    // for TTF layout math - see compositor.h).
+    for (int row = 0; row < FONT_CHAR_H_RAW; row++) {
         int32_t py = y + row;
         if (py < 0 || py >= g_fb_height) continue;
         uint8_t bits = glyph[row];
-        for (int col = 0; col < FONT_CHAR_W; col++) {
+        for (int col = 0; col < FONT_CHAR_W_RAW; col++) {
             if (bits & (0x80 >> col)) {
                 int32_t px = x + col;
                 if (px >= 0 && px < g_fb_width && draw_pt_in_clip(px, py))
@@ -879,7 +883,7 @@ void draw_text_bitmap(int32_t x, int32_t y, const char *text, uint32_t color)
     int32_t cx = x;
     while (*text) {
         draw_char(cx, y, *text, color);
-        cx += FONT_CHAR_W;
+        cx += FONT_CHAR_W_RAW;   // #uiscale: raw glyph advance, see draw_char() above
         text++;
     }
 }
@@ -968,6 +972,69 @@ uint32_t readable_accent(uint32_t color, uint32_t bg)
     return 0xFF000000 | (r << 16) | (g << 8) | b;
 }
 
+// ----------------------------------------------------------------------------
+// #127/#128: ONE shared "tray/system popup" panel primitive, so every popup
+// hung off the tray (notifications center, quick-control popups, the AI
+// launcher, per-widget menus) renders the SAME chrome instead of each file
+// hand-rolling its own rect+border+shadow combination with its own literal
+// colors - which is exactly how #128 got filed (traymenu.c's control popups
+// used flat hardcoded 0x00-prefixed literals that never tracked the active
+// theme at all, while notif.c/launcher.c already used CLR_MENU_* + a rounded
+// panel + drop shadow). Matches launcher.c's pre-existing panel treatment
+// (the AI prompt panel) and widgets.c's card treatment (the weather widget),
+// the two surfaces #128 names as the reference look: rounded rect body in
+// CLR_MENU_BG, a soft 2-layer offset drop shadow, a CLR_MENU_BORDER hairline,
+// and a 1px translucent top highlight for depth. Callers own their own
+// content; this only draws the surface underneath it.
+void draw_popup_panel(int32_t x, int32_t y, int32_t w, int32_t h, int32_t radius)
+{
+    int ob = g_draw_blend;
+    g_draw_blend = 40;
+    draw_rounded_rect(x - 2, y + 6, w + 4, h + 4, radius + 2, 0xFF000000);
+    draw_rounded_rect(x,     y + 3, w,     h + 6, radius,     0xFF000000);
+    g_draw_blend = 255;
+    draw_rounded_rect(x, y, w, h, radius, CLR_MENU_BG);
+    g_draw_blend = 30;
+    draw_hline(x + radius, y + 1, w - radius * 2, 0xFFFFFFFF);
+    g_draw_blend = ob;
+    draw_rect_outline(x, y, w, h, CLR_MENU_BORDER);
+}
+
+// #127: a NEUTRAL popup action button (e.g. "Clear all") - fill is CLR_MENU_BG
+// tinted toward its own ink, text is the same readable_ink() used for every
+// other label in a CLR_MENU_BG-family surface. Deliberately NOT a saturated
+// accent color: notif.c used to fill this exact button with sev_color(INFO)
+// (a fixed blue) under hardcoded white text, which measures 3.68:1 against
+// white - below the WCAG AA 4.5:1 text floor on EVERY theme, because the
+// severity blue was designed to be used as a small accent (bar/icon/dot via
+// readable_accent()), not as a button SURFACE with fixed white text sitting
+// on it (a different contrast contract nothing was checking). This
+// construction is provably >=7.6:1 on all 14 shipping themes (measured via a
+// host-side port of this exact math against every /THEMES/*.mtheme menu_bg -
+// see docs/TRAY_POPUP_DESIGN_LANGUAGE.md's contrast table), because both the
+// fill and the ink are derived from the SAME per-theme CLR_MENU_BG token
+// instead of a fixed literal that has to independently work everywhere.
+// Text is centered using the REAL measured glyph width (text_width_ttf), not
+// a guessed inset - the bug that made "Clear all" look nudged/off-center.
+void draw_popup_button_centered(int32_t x, int32_t y, int32_t w, int32_t h,
+                                int32_t radius, const char *label, int ttf_size)
+{
+    uint32_t fill = readable_ink_dim_mix(CLR_MENU_BG, 88);   // subtle wash, bg-dominant
+    uint32_t ink  = readable_ink(CLR_MENU_BG);
+    draw_rounded_rect(x, y, w, h, radius, fill);
+    draw_rect_outline(x, y, w, h, CLR_MENU_BORDER);
+    int tw = text_width_ttf(label, ttf_size);
+    int fm[3]; int th = ttf_size;
+    // #uiscale: font_metrics() is a direct kernel call (libc/syscall.h,
+    // off-limits here), not routed through draw_text_ttf()/text_width_ttf()
+    // above, so it needs its own ui_px() to stay proportional to what those
+    // two actually draw/measure at this same logical ttf_size.
+    if (font_metrics(0, ui_px(ttf_size), fm) == 0) th = fm[0] - fm[1];   // {ascent,descent,line_gap}
+    int tx = x + (w - tw) / 2;
+    int ty = y + (h - th) / 2;
+    draw_text_ttf(tx, ty, label, ttf_size, ink);
+}
+
 // ============================================================================
 // Scaled character rendering
 // ============================================================================
@@ -980,9 +1047,10 @@ void draw_char_large(int32_t x, int32_t y, char c, uint32_t color, int scale)
 
     const uint8_t *glyph = font_data[idx];
 
-    for (int row = 0; row < FONT_CHAR_H; row++) {
+    // #uiscale: raw bitmap glyph dims, same reasoning as draw_char() above.
+    for (int row = 0; row < FONT_CHAR_H_RAW; row++) {
         uint8_t bits = glyph[row];
-        for (int col = 0; col < FONT_CHAR_W; col++) {
+        for (int col = 0; col < FONT_CHAR_W_RAW; col++) {
             if (bits & (0x80 >> col)) {
                 int32_t bx = x + col * scale;
                 int32_t by = y + row * scale;
@@ -1007,7 +1075,7 @@ void draw_text_large(int32_t x, int32_t y, const char *text, uint32_t color, int
     int32_t cx = x;
     while (*text) {
         draw_char_large(cx, y, *text, color, scale);
-        cx += FONT_CHAR_W * scale;
+        cx += FONT_CHAR_W_RAW * scale;   // #uiscale: raw glyph advance, see draw_char() above
         text++;
     }
 }
@@ -1073,7 +1141,8 @@ int text_width_large(const char *text, int scale)
 #define GLASS_MIN_RECOMPUTE_MS  100    // at most 10 recomputes/second per surface
 #define GLASS_DIM_MIX           22     // readable_ink_dim mix on glass (vs 35 opaque)
 
-// The user preference (percent OPAQUE), NOT a theme key. 70..100, default 75.
+// The user preference (percent OPAQUE), NOT a theme key.
+// DOCK_OPACITY_MIN..DOCK_OPACITY_MAX (dock_opacity.h), default DOCK_OPACITY_DEFAULT.
 // Owned here because the glass composite is its only consumer; main.c drives
 // the live-apply file and profile.c the persistence.
 //
@@ -1091,7 +1160,16 @@ int text_width_large(const char *text, int scale)
 // actually sweep to a white backdrop instead of trusting the single number
 // that had been quoted for it - not a regression this change introduces, a
 // pre-existing gap this change's own measurement pass happened to expose.
-int g_dock_opacity = 75;
+//
+// (#132) The 70 THAT USED TO LIVE HERE was a hard clamp: a value below it was
+// silently raised back to 70 at render time, which is why the owner reported
+// none of his below-70 opacity requests appeared to do anything. The 4.62:1
+// (Ocean)/4.59:1 (retro_unix flat path) measurements below are still true and
+// still the reason DOCK_OPACITY_WARN in dock_opacity.h is 73, not 0 - they are
+// now a WARNING threshold in Settings, not an enforced floor. Anything down to
+// DOCK_OPACITY_MIN renders exactly as set; contrast below DOCK_OPACITY_WARN is
+// the user's explicit trade-off.
+int g_dock_opacity = DOCK_OPACITY_DEFAULT;
 
 // Set to 1 by render_frame() around the full-frame body, and by nothing else.
 // See the rule above.
@@ -1135,11 +1213,31 @@ static uint8_t  g_gs_fx[MAX_SCREEN_W];
 // to draw first, which is exactly the kind of order-dependent bug this tree
 // has been bitten by before.
 #define GLASS_PANEL_PX   (MAX_SCREEN_W * 40)    // taskbar 36 / xfce panel 30
-#define GLASS_DOCK_PX    (MAX_SCREEN_W * 72)    // xfce dock 64
+// (#123 item 2) Was MAX_SCREEN_W * 72 for a fixed 64px dock. The marble dock's
+// height is a user preference now (44..96, taskbar.c XFCE_DOCK_H_MAX), and
+// glass_render() SILENTLY falls back to a flat tint for any surface whose
+// w*h exceeds its cache slice - so a slice sized for 72 would have made the
+// dock lose its blur, with no error anywhere, for every height above 72. Sized
+// to the ceiling plus the same 8px of slack the old value carried over 64.
+#define GLASS_DOCK_PX    (MAX_SCREEN_W * 104)   // xfce dock, max height 96
 #define GLASS_MENU_PX    (432 * 1080)           // start menu, 420 clamp + slack
+// (#glassmodal) Shared by the confirm/shutdown modal card AND the CPU/RAM/
+// DSK/NET perf pop-out (GLASS_SURF_MODAL, compositor.h) - the two are never
+// open at once in practice, so one slot covers both. Computed worst case:
+// confirm dialog at 200% UI scale is roughly CARD_W=ui_px(360) wide by
+// card_h() tall (grows with wrapped line count, capped at CONFIRM_MAX_LINES)
+// - about 720 x 280 at 2x; the perf pop-out is a fixed, currently-unscaled
+// 252 x 230. 900 x 500 = 450000 covers both with real margin. If this is
+// ever wrong, glass_render()'s own existing guard (w*h > s->cap -> flat tint
+// fallback, never a crash - see the "op > GLASS_BLUR_SKIP_ABOVE || s->tier
+// >= 3 || (int32_t)(w * h) > s->cap" check above) degrades gracefully rather
+// than corrupting anything - verified that guard is still exactly this
+// shape at the time this slot was added.
+#define GLASS_MODAL_PX   (900 * 500)
 static uint32_t g_glass_panel[GLASS_PANEL_PX];
 static uint32_t g_glass_dock [GLASS_DOCK_PX];
 static uint32_t g_glass_menu [GLASS_MENU_PX];
+static uint32_t g_glass_modal[GLASS_MODAL_PX];
 
 typedef struct {
     uint32_t *buf;
@@ -1161,6 +1259,7 @@ static glass_surface_t g_glass[GLASS_SURF_COUNT] = {
     { g_glass_panel, GLASS_PANEL_PX, 0,0,0,0, 0,0,0,0,0, 0, 1, 0,0,0, 0 },
     { g_glass_dock,  GLASS_DOCK_PX,  0,0,0,0, 0,0,0,0,0, 0, 1, 0,0,0, 0 },
     { g_glass_menu,  GLASS_MENU_PX,  0,0,0,0, 0,0,0,0,0, 0, 1, 0,0,0, 0 },
+    { g_glass_modal, GLASS_MODAL_PX, 0,0,0,0, 0,0,0,0,0, 0, 1, 0,0,0, 0 },
 };
 
 void glass_invalidate_all(void)
@@ -1418,8 +1517,16 @@ void glass_render(int32_t x, int32_t y, int32_t w, int32_t h,
     // been checked against one backdrop, not swept. Re-run
     // /tmp/dockgrey_harness.py (or its equivalent) before ever changing either
     // number again; do not hand-recompute this ratio.
-    if (op < 70)  op = 70;              // the derived contrast floor
-    if (op > 100) op = 100;
+    //
+    // (#132) THIS USED TO BE A HARD CLAMP TO 70. The 4.62:1 measurement above
+    // is real and is why DOCK_OPACITY_WARN (dock_opacity.h) is 73, but forcing
+    // every value below it back up to 70 is exactly why the owner's "opacity
+    // below 70%" requests never visibly did anything - this was the one place
+    // that silently won the argument every time. The owner's standing decision
+    // is a warning, not a second clamp: honour anything down to
+    // DOCK_OPACITY_MIN, and let Settings carry the contrast risk in its label.
+    if (op < DOCK_OPACITY_MIN) op = DOCK_OPACITY_MIN;
+    if (op > DOCK_OPACITY_MAX) op = DOCK_OPACITY_MAX;
     // ROUND, do not truncate. op*255/100 truncates: 90% gives 229 where the
     // spec's alpha ladder says 230, because 90*255/100 is 229.5 exactly. The
     // difference is one level and it never threatens the floor, but rounding
@@ -1515,3 +1622,310 @@ void glass_render(int32_t x, int32_t y, int32_t w, int32_t h,
 
     glass_blit(s);
 }
+
+// ============================================================================
+// (#glassmodal) Shared glass/chrome helpers, promoted from taskbar.c where
+// they used to be `static` (~lines 130-195 there, next to xfce_dock_paint_
+// rounded()'s neighbors). Moved here, next to glass_render(), so
+// confirmdialog.c and taskbar.c's draw_perf_popup() can call the SAME
+// functions instead of hand-rolling third copies (CLAUDE.md: improve the
+// shared primitive, do not fork). No behavior change: every existing
+// taskbar.c call site resolves identically, just via compositor.h's
+// prototype instead of a file-local static. CLR_GLASS_TINT, CLR_TASKBAR_BG,
+// g_glass_enable, g_dock_opacity and DOCK_OPACITY_MIN/MAX were already
+// extern-shared globals before this move, so this is mechanical.
+// ============================================================================
+
+// (#123 item 4) THE FLAT-PATH OPACITY FLOOR. See taskbar.c's original
+// comment (still there, this is only the definition move) for the full
+// measurement history: 73 was the smallest value where every flat-lineage
+// theme cleared the WCAG 4.5:1 text floor against a worst-case backdrop; it
+// is no longer an enforced clamp (DOCK_OPACITY_WARN carries the warning in
+// Settings instead), so this only floors to DOCK_OPACITY_MIN/MAX.
+int flat_chrome_alpha(void)
+{
+    int op = g_dock_opacity;
+    if (op < DOCK_OPACITY_MIN) op = DOCK_OPACITY_MIN;
+    if (op > DOCK_OPACITY_MAX) op = DOCK_OPACITY_MAX;
+    return (op * 255 + 50) / 100;   // ROUND, matching glass_render()
+}
+
+// (#745) tb_lighten_argb() stays local to taskbar.c (it is used only by the
+// flat fallback bands below and by nothing this move needs to share); reused
+// here via its taskbar.c definition would create a cross-file static call,
+// so the three-band flat fallback is inlined with the same math instead of
+// importing that helper. Percentage lighten toward white, matching
+// tb_lighten_argb()'s exact formula.
+static uint32_t glass_flat_lighten(uint32_t c, int pct)
+{
+    int r = (int)((c >> 16) & 0xFF), g = (int)((c >> 8) & 0xFF), b = (int)(c & 0xFF);
+    r += (255 - r) * pct / 100;
+    g += (255 - g) * pct / 100;
+    b += (255 - b) * pct / 100;
+    return 0xFF000000u | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+}
+
+void glass_or_flat(int32_t x, int32_t y, int32_t w, int32_t h, int surf)
+{
+    if (g_glass_enable) { glass_render(x, y, w, h, CLR_GLASS_TINT, surf); return; }
+    // Tier 4 (opaque fallback) only: a subtle 3-band top-light gradient
+    // instead of one dead-flat fill, each band a PERCENTAGE lighten of the
+    // theme's own taskbar_bg - see docs/TASKBAR_AND_TRAY.html section 4.
+    int ob = g_draw_blend;
+    g_draw_blend = flat_chrome_alpha();
+    if (h >= 8) {
+        draw_fill_rect(x, y,     w, 4, glass_flat_lighten(CLR_TASKBAR_BG, 10));
+        draw_fill_rect(x, y + 4, w, 4, glass_flat_lighten(CLR_TASKBAR_BG, 4));
+        draw_fill_rect(x, y + 8, w, h - 8, CLR_TASKBAR_BG);
+    } else {
+        draw_fill_rect(x, y, w, h, CLR_TASKBAR_BG);
+    }
+    g_draw_blend = ob;
+}
+
+// One hairline of the surface edge, at alpha 128 when the surface is glass and
+// fully opaque when it is not.
+void glass_edge_h(int32_t x, int32_t y, int32_t w, uint32_t c)
+{
+    int ob = g_draw_blend;
+    if (g_glass_enable) g_draw_blend = 128;
+    draw_hline(x, y, w, c);
+    g_draw_blend = ob;
+}
+void glass_edge_v(int32_t x, int32_t y, int32_t h, uint32_t c)
+{
+    int ob = g_draw_blend;
+    if (g_glass_enable) g_draw_blend = 128;
+    draw_vline(x, y, h, c);
+    g_draw_blend = ob;
+}
+// Inner highlight: white at alpha 26 on a dark material, 140 on a light one.
+void glass_highlight_h(int32_t x, int32_t y, int32_t w)
+{
+    if (!g_glass_enable) return;
+    int ob = g_draw_blend;
+    g_draw_blend = (draw_luminance(CLR_GLASS_TINT) >= 140) ? 140 : 26;
+    draw_hline(x, y, w, 0xFFFFFFFF);
+    g_draw_blend = ob;
+}
+
+// ============================================================================
+// (#glassmodal) AA corner rounding for a FLOATING rect, any corner mask.
+//
+// taskbar.c's xfce_dock_paint_rounded()/xfce_corner_coverage() already prove
+// this technique for a rect flush to the screen edge (only its top two
+// corners are ever rounded there). This generalizes the same capture/paint/
+// restore sequence to all four corners for a panel with no flush edge - the
+// confirm/shutdown modal and the perf pop-out both need that.
+//
+// corner_coverage_aa() is a DELIBERATE small duplication of taskbar.c's
+// xfce_corner_coverage() (same four-line formula), not a shared call,
+// specifically so this file's corner primitive has no new cross-file
+// dependency on taskbar.c while the concurrent chromescale pass is also
+// editing that file's geometry (per this task's scope brief). If the two
+// ever need to change, change both; they are proven identical as of this
+// commit.
+// ============================================================================
+static float corner_coverage_aa(int32_t dist_x, int32_t dist_y, int32_t r)
+{
+    float fdx = (float)(r - dist_x);
+    float fdy = (float)(r - dist_y);
+    float dist = sqrtf(fdx * fdx + fdy * fdy);
+    float cov = 0.5f - (dist - (float)r);
+    if (cov < 0.0f) cov = 0.0f;
+    if (cov > 1.0f) cov = 1.0f;
+    return cov;
+}
+
+// Corner index convention: 0=TL, 1=TR, 2=BL, 3=BR (matches CORNER_TL=1<<0,
+// CORNER_TR=1<<1, CORNER_BL=1<<2, CORNER_BR=1<<3 in compositor.h - checking
+// `mask & (1 << c)` selects the right corner for index c). `right`/`bottom`
+// pick which edge of the panel each corner's box is measured from, so the
+// SAME per-pixel address formula is used in both capture and restore and the
+// two can never disagree about which physical pixel index (xx, yy) means -
+// exactly the discipline xfce_dock_paint_rounded()'s #104 fix comment
+// documents for the two-corner case.
+void draw_round_corners_capture(corner_capture_t *cap, int32_t x, int32_t y,
+                                int32_t w, int32_t h, int32_t r, int mask)
+{
+    if (r > CORNER_CAP_MAXR) r = CORNER_CAP_MAXR;
+    if (r > w / 2) r = w / 2;
+    if (r > h / 2) r = h / 2;
+    if (r < 0) r = 0;
+    cap->x = x; cap->y = y; cap->w = w; cap->h = h; cap->r = r; cap->mask = mask;
+    if (r <= 0) return;
+
+    for (int c = 0; c < 4; c++) {
+        if (!(mask & (1 << c))) continue;
+        int right  = (c == 1 || c == 3);   // TR, BR
+        int bottom = (c == 2 || c == 3);   // BL, BR
+        for (int32_t yy = 0; yy < r; yy++) {
+            int32_t py = bottom ? (y + h - 1 - yy) : (y + yy);
+            for (int32_t xx = 0; xx < r; xx++) {
+                int32_t px = right ? (x + w - 1 - xx) : (x + xx);
+                cap->px[c][yy][xx] = (py >= 0 && py < g_fb_height && px >= 0 && px < g_fb_width)
+                                    ? g_fb[py * g_fb_pitch + px] : 0;
+            }
+        }
+    }
+}
+
+void draw_round_corners_restore(const corner_capture_t *cap)
+{
+    int32_t r = cap->r;
+    if (r <= 0) return;
+    int ob = g_draw_blend;
+    for (int c = 0; c < 4; c++) {
+        if (!(cap->mask & (1 << c))) continue;
+        int right  = (c == 1 || c == 3);
+        int bottom = (c == 2 || c == 3);
+        for (int32_t yy = 0; yy < r; yy++) {
+            int32_t py = bottom ? (cap->y + cap->h - 1 - yy) : (cap->y + yy);
+            if (py < 0 || py >= g_fb_height) continue;
+            for (int32_t xx = 0; xx < r; xx++) {
+                int32_t px = right ? (cap->x + cap->w - 1 - xx) : (cap->x + xx);
+                if (px < 0 || px >= g_fb_width) continue;
+                // xx, yy are already "distance from THIS corner" on both
+                // axes by construction of the px/py formula above, so they
+                // feed corner_coverage_aa() directly - no further mirroring
+                // needed here (unlike the dock's two-corner special case,
+                // there is only one formula for all four corners).
+                float cov = corner_coverage_aa(xx, yy, r);
+                int restore_a = (int)((1.0f - cov) * 255.0f + 0.5f);
+                if (restore_a == 0) continue;
+                g_draw_blend = restore_a;
+                draw_putpixel(px, py, cap->px[c][yy][xx]);
+            }
+        }
+    }
+    g_draw_blend = ob;
+}
+
+// ============================================================================
+// (#73) LOGIN/LOCK SHARED DRAWING PRIMITIVES
+//
+// These three used to live in login.c, next to the compositor's OWN login
+// screen. That screen was deleted in #73: it was dead code that was still
+// wired into the key path and still accumulated typed characters into a
+// plaintext password buffer (see CHANGELOG). Its renderers were NOT dead -
+// draw_bullet() is used by lockscreen.c and elevate.c, draw_button() by
+// confirmdialog.c - so they move HERE, into the shared drawing module every
+// other primitive already lives in, rather than keeping a mostly-empty
+// login.c alive as their host.
+//
+// draw_password_field() did NOT come with them: it had zero callers (both
+// credential surfaces use lock_draw_pill()) and it was the dead layer's own
+// password renderer. Deleted with the rest of it.
+// ============================================================================
+
+// Draw a single bullet dot representing one masked password character.
+// cx, cy is the center of the dot.
+// #566: shared with lockscreen.c (prototyped in compositor.h) - not static.
+void draw_bullet(int32_t cx, int32_t cy)
+{
+    draw_circle_filled(cx, cy, 4, CLR_LOGIN_TEXT);
+}
+
+// Draw a button rectangle with centered text.
+// #566: shared with lockscreen.c (prototyped in compositor.h) - not static.
+void draw_button(int32_t x, int32_t y, int32_t w, int32_t h,
+                 const char *label, uint32_t bg)
+{
+    draw_rounded_rect(x, y, w, h, 4, bg);
+    draw_rect_outline(x, y, w, h, CLR_LOGIN_BORDER);
+    int lw = text_width(label);
+    draw_text(x + (w - lw) / 2, y + (h - FONT_CHAR_H) / 2, label, CLR_LOGIN_TEXT);
+}
+
+// #745 identity dot palette: reused VERBATIM from Settings'
+// avatar_palette (userland/apps/settings/main.c users_refresh()), same 8
+// hexes, same uid%8 indexing (section 8.2 of the design doc) - kept as an
+// independent literal copy rather than a shared header because the two
+// apps are separate binaries on separate toolkits (draw.c vs the gui_*
+// handle-based one) with no common color-token module between them; a
+// mismatch here would only ever be cosmetic (which of 8 hues), never a
+// correctness bug, and grep is the check that keeps them in sync.
+static const uint32_t g_avatar_id_palette[8] = {
+    0xFF569CD6, 0xFF66BB66, 0xFFCC8844, 0xFFAA66CC,
+    0xFFCC6666, 0xFF44AAAA, 0xFF888888, 0xFFBBAA44
+};
+
+// Draw the user avatar: an antialiased "glass" disc (#745 port of
+// docs/LOGIN_AVATARS_AND_PROFILE.html) with the user's initial inside.
+//
+// GLASS, HONESTLY: the real glass_render() backdrop blur cannot reach a 64px
+// circle (no circular mask primitive, no spare cache surface, and its own
+// bleed would wash a disc this small to near-flat anyway - design doc
+// section 4) and in any case this panel is a flat opaque fill, not glass, so
+// there is no backdrop behind the avatar to blur. This draws a translucent
+// tint fill plus a soft highlight patch (upper-left) and shade patch
+// (lower-right), the two patches sized/offset so they stay fully inside the
+// fill disc - no circular clip needed. It reads as a lit, translucent
+// material; it does not claim to show blurred content, because there is none
+// to show.
+//
+// CONTRAST BY CONSTRUCTION: the fill is now the SAME token in every state
+// (CLR_LOGIN_AVATAR_FILL) - the old code swapped to a blue fill on
+// "selected", which put the fixed-color initial at 2.71:1, under the 4.5:1
+// text floor (design doc section 3). Selection is communicated by the ring
+// alone, which is why `state` only ever changes the ring here.
+//
+// #566: shared with lockscreen.c (prototyped in compositor.h) - not static.
+// (lockscreen.c does not currently call it - #745 removed its own avatar
+// disc as a considered "username only" decision - but the prototype stays
+// shared in case that decision is revisited.)
+void draw_avatar(int32_t cx, int32_t cy, const char *username, unsigned int uid, int state)
+{
+    float r = (float)(LOGIN_AVATAR_SIZE / 2);
+
+    // Base glass fill, uniform across all states.
+    draw_circle_filled_aa(cx, cy, r, CLR_LOGIN_AVATAR_FILL, 255);
+    // Soft highlight patch, upper-left (specular glint).
+    draw_circle_filled_aa(cx - (int32_t)(r * 0.30f), cy - (int32_t)(r * 0.32f),
+                          r * 0.50f, CLR_LOGIN_AVATAR_HI, 90);
+    // Soft shade patch, lower-right.
+    draw_circle_filled_aa(cx + (int32_t)(r * 0.30f), cy + (int32_t)(r * 0.32f),
+                          r * 0.45f, CLR_LOGIN_AVATAR_SHADE, 80);
+
+    // Ring: the only state-dependent boundary.
+    uint32_t ring_color;
+    float stroke;
+    if (state == AVATAR_ST_SELECTED) {
+        ring_color = CLR_LOGIN_AVATAR_RING_SEL;
+        stroke = 3.0f;
+        // 1px soft outer glow (design doc 7.1).
+        draw_circle_ring_aa(cx, cy, r + 4.5f, 2.0f, CLR_LOGIN_AVATAR_RING_SEL, 45);
+    } else if (state == AVATAR_ST_HOVER) {
+        ring_color = CLR_LOGIN_AVATAR_RING_HOVER;
+        stroke = 2.0f;
+    } else {
+        ring_color = CLR_LOGIN_AVATAR_RING;
+        stroke = 2.0f;
+    }
+    draw_circle_ring_aa(cx, cy, r + stroke * 0.5f, stroke, ring_color, 255);
+
+    // Identity dot (decorative only - design doc section 7.3, exempt from the
+    // 3:1 boundary floor: removing it changes nothing about which account is
+    // which). 12px, 2px panel-color border, bottom-right.
+    int32_t dot_r = 6;
+    int32_t dot_cx = cx + (int32_t)(r * 0.74f);
+    int32_t dot_cy = cy + (int32_t)(r * 0.74f);
+    draw_circle_filled_aa(dot_cx, dot_cy, (float)(dot_r + 2), CLR_LOGIN_PANEL, 255);
+    draw_circle_filled_aa(dot_cx, dot_cy, (float)dot_r, g_avatar_id_palette[uid % 8], 255);
+
+    // Draw the first letter of the username, scaled up, centered. One ink,
+    // every state (5.58:1 against the fill - design doc 7.2) - no longer
+    // needs to change with the fill because the fill no longer changes.
+    char letter[2] = { username[0], '\0' };
+    if (letter[0] >= 'a' && letter[0] <= 'z') {
+        letter[0] -= 32; // uppercase
+    }
+    int lw = text_width_large(letter, 2);
+    // #uiscale: this positions a draw_char_large() BITMAP glyph (raw 16px
+    // cell x explicit scale=2), not TTF text, so it uses the raw constant -
+    // see the FONT_CHAR_H comment in compositor.h. The avatar initial itself
+    // does not grow with the UI scale factor (known limitation, draw_char_large
+    // has no scale-factor awareness); it stays a crisp fixed-size bitmap glyph.
+    draw_text_large(cx - lw / 2, cy - FONT_CHAR_H_RAW, letter, CLR_LOGIN_TEXT, 2);
+}
+

@@ -237,6 +237,12 @@ typedef enum {
     // record (#697: a new event logged itself as "INFO UNKNOWN" for exactly
     // this reason).
     AUDIT_AI_INJECTION,
+    // #fdguard: a cross-process file-descriptor access, or an attach to a
+    // /dev/pts terminal the caller does not own, was REFUSED. Appended per
+    // the append-only rule above so no historical ordinal is relabelled.
+    // Ordinal 13; the name and severity tables in rustkern.rs carry the
+    // matching arm (a new event without one logs as INFO UNKNOWN, #697).
+    AUDIT_IO_BOUNDARY,
 } audit_event_t;
 
 /**

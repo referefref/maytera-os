@@ -13,7 +13,7 @@
 //     terminates the transfer. Every wait is BOUNDED (xhci_delay_ms, 1ms/iter)
 //     so a silent printer can never block on the full xHCI timeout.
 //
-// M3D Micro command reference (from the M33-Fio project):
+// M3D Micro command reference (from the M33-Fio project, the build server:<workspace>):
 //   Bootloader (single characters):  'S' = dump the 0x301-byte EEPROM (ends in
 //     '\r'); firmwareVersion is the little-endian u32 at offset 0x00, the
 //     serial number is ASCII near the end.  'Q' = leave the bootloader and run
@@ -21,6 +21,7 @@
 //   Firmware (iMe = ASCII RepRap gcode with a line number + XOR checksum):
 //     "N0 M110*<chk>\n" resets the line number, "N1 G28*<chk>\n" homes, etc.
 #include "usb_cdc_acm.h"
+#include "usb_net.h"   // #155: do not re-claim a slot the USB NIC already owns
 #include "dev.h"
 #include "../serial.h"
 #include "../string.h"
@@ -179,6 +180,30 @@ static int cfg_find_acm_iface(uint8_t *cfg, int total) {
 int usb_cdc_acm_probe(xhci_controller_t *xhc, int slot_id, int speed,
                       uint16_t vid, uint16_t pid, uint8_t *cfg, int total) {
     if (g_cdc.active) return 0;   // one serial port supported
+
+    // #155: DO NOT RE-CLAIM A SLOT THAT IS ALREADY A NETWORK INTERFACE.
+    //
+    // A multi-function gadget can expose a CDC-ECM function in one configuration
+    // and a CDC-ACM function in ANOTHER (QEMU's usb-net, 0525:a4a2, does exactly
+    // this). usb_net_probe() runs first and attaches the ECM function; this
+    // driver then found its own function in a different configuration on the
+    // SAME slot and issued SET_CONFIGURATION for it, which switches the device
+    // AWAY from the configuration the NIC is using and configures endpoints that
+    // are, on this gadget, literally the same addresses (bulk-in 0x82,
+    // bulk-out 0x02). The NIC then never receives a single frame.
+    //
+    // blame.md recorded this as "QEMU's usb-net is hijacked by the CDC-ACM
+    // driver, so you cannot get a real ECM round-trip in a VM" and treated it as
+    // an environment limitation. It is not: it is ours, and it is a general
+    // one-device-two-drivers bug that would do the same thing to a real combo
+    // dongle. First claim wins, and a network interface outranks a spare serial
+    // port on the same physical device.
+    if (usb_eth_present() && g_usbnet.slot_id == slot_id) {
+        kprintf("[CDC-ACM] %04x:%04x slot %d is already the %s network "
+                "interface; not claiming it as a serial port (#155)\n",
+                vid, pid, slot_id, usb_eth_name());
+        return 0;
+    }
 
     int comm_if = cfg_find_acm_iface(cfg, total);
     if (comm_if < 0) return 0;    // not a CDC-ACM device

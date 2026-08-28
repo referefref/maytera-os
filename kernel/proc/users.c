@@ -9,6 +9,7 @@
 #include "../fs/fat.h"
 #include "../fs/perms.h"
 #include "../fs/bootlog.h"
+#include "../fs/cfgread.h"     // #192: is this read outcome worth a log line?
 #include "../crypto/crypto.h"
 #include "../crypto/csprng.h"
 
@@ -264,26 +265,72 @@ static int verify_against_record(const char *password, const char *username,
 // sti() (main.c), so there is no scheduler yet and no proc_sleep(); the
 // backoff is a plain io_wait() spin, matching the style already used
 // elsewhere in this early-boot window (see main.c's spinner delays).
-// Non-static: shared with gui/login.c via the prototype in fs/fat.h (#307).
+// #192: BUT ABSENCE IS NOT A FAILED READ, AND IT USED TO BE REPORTED AS ONE.
+// A directory lookup that misses is DETERMINISTIC: asking again cannot change
+// the answer, and asking again with a ~900,000-iteration io_wait() backoff
+// between attempts burns real time for nothing. Worse, it said the wrong thing:
+// "/CONFIG/TZ.CFG: read FAILED/empty ... giving up" for a timezone the user has
+// simply not chosen yet, three lines at a time, restarted every 2 seconds by
+// gui/clock.c's refresh, forever - 125 lines of one 3634-line capture, and a
+// real boot failure was misdiagnosed because the evidence had scrolled away.
+// The same shape hit /CONFIG/PASSWD, /CONFIG/SHADOW and /CONFIG/GROUP, whose
+// absence is equally correct on a virgin image since #568 removed the default
+// accounts.
+//
+// So CLASSIFY FIRST. fat_exists() is the right question and it is ROUTING-
+// CORRECT: it consults the ext2 root first and then the FAT ESP, exactly as
+// fat_read_file() does. (The comment in users_init() below that says fat_exists
+// "only consults the FAT ESP" is STALE - that gap was fixed in the same #568/#99
+// work; it is corrected there.) A miss means ABSENT: return at once, and let
+// rustkern/cfgread.rs decide whether it is worth a line. It is: exactly one,
+// per path, per boot. A hit means the file is THERE and would not read, which
+// is the genuine #307 fault: retry as before, and stay LOUD.
+//
+// Non-static: shared with gui/login.c and proc/syscall.c via the prototype in
+// fs/fat.h (#307).
 void *fat_read_file_retry(fat_fs_t *fs, const char *path, uint32_t *size_out) {
     const int max_attempts = 3;
     for (int attempt = 1; attempt <= max_attempts; attempt++) {
         uint32_t size = 0;
         void *data = fat_read_file(fs, path, &size);
         if (data && size > 0) {
-            if (attempt > 1) {
-                bootlog_write("[USERS] %s: read OK on attempt %d/%d (%u bytes)",
-                              path, attempt, max_attempts, size);
-            } else {
-                bootlog_write("[USERS] %s: read OK (%u bytes)", path, size);
+            // One line the FIRST time each file reads, or when it recovers.
+            // Not one per read: this helper also serves per-syscall readers.
+            if (cfgread_report_rs(path, -1, CFG_OUTCOME_OK) == CFG_LOG_NOTE) {
+                bootlog_write("[CFG] %s: read OK (%u bytes%s)", path, size,
+                              attempt > 1 ? ", after a retry" : "");
             }
             *size_out = size;
             return data;
         }
         if (data) kfree(data);  // zero-size result: free before retrying
-        bootlog_write("[USERS] %s: read FAILED/empty on attempt %d/%d%s",
-                      path, attempt, max_attempts,
-                      attempt < max_attempts ? " - retrying" : " - giving up");
+
+        if (fat_exists(fs, path) != 1) {
+            // ABSENT: normal for an unconfigured setting, and retrying a
+            // deterministic lookup miss cannot help. NO retry, NO backoff.
+            if (cfgread_report_rs(path, -1, CFG_OUTCOME_ABSENT) == CFG_LOG_NOTE) {
+                // Wording matters here: this helper serves files whose
+                // absence means DIFFERENT things (no accounts, no autologin, no
+                // wallpaper, no timezone), and #568 deliberately ships NO
+                // default credentials, so promising "built-in defaults" would be
+                // a comforting lie for the very file that most needs the truth.
+                bootlog_write("[CFG] %s: not present; continuing without it "
+                              "(normal until this is configured)", path);
+            }
+            *size_out = 0;
+            return NULL;
+        }
+
+        // PRESENT and unreadable: the #307 case. Loud, and worth another go.
+        int act = cfgread_report_rs(path, -1, CFG_OUTCOME_IOERR);
+        if (act == CFG_LOG_WARN) {
+            bootlog_write("[CFG] %s: PRESENT but read FAILED on attempt %d/%d%s",
+                          path, attempt, max_attempts,
+                          attempt < max_attempts ? " - retrying" : " - giving up");
+        } else if (act == CFG_LOG_SUPPRESSED) {
+            bootlog_write("[CFG] %s: further read failures will not be logged "
+                          "until it reads successfully again", path);
+        }
         if (attempt < max_attempts) {
             for (volatile uint32_t d = 0; d < 300000u * (uint32_t)attempt; d++) { io_wait(); }
         }
@@ -625,15 +672,18 @@ void users_init(void) {
     // Load the on-disk user database. Detect "do accounts exist?" by actually
     // LOADING (load_passwd/load_shadow/load_groups go through fat_read_file_retry,
     // which routes to the ext2 root volume when ext2 is the root fs), NOT via
-    // fat_exists(): fat_exists() only consults the FAT ESP and never sees
-    // /CONFIG on an ext2 root, so it always reported "absent" there (#568). That
-    // gap used to be masked by create_defaults() silently recreating root/admin
-    // in RAM; once #568 drops the default-credential fallback, relying on
-    // fat_exists() would wrongly force first-boot on a fully provisioned golden.
-    // Load-then-count is correct on BOTH a FAT-ESP root and an ext2 root.
-    // (Latent fat_exists()/ext2 mismatch flagged to the fs owner; fixing it in
-    // the fat driver would benefit every caller, but this local fix is enough
-    // for the account DB.)
+    // a bare existence test. Load-then-count is correct on BOTH a FAT-ESP root
+    // and an ext2 root.
+    //
+    // CORRECTED 2026-08-22 (#192): the paragraph that used to be here said
+    // "fat_exists() only consults the FAT ESP and never sees /CONFIG on an ext2
+    // root, so it always reported absent there". That was true when it was
+    // written and is NOT true now - fat_exists() (fs/fat.c) has mirrored
+    // fat_read_file()'s ext2-first-then-ESP dispatch since the #568/#99 work,
+    // and its own comment says so. The stale warning mattered: #192 needs
+    // exactly that routing-correct existence test to tell "absent" from "would
+    // not read", and a doc that says the primitive is broken is a doc that
+    // makes the next person hand-roll a private copy of it.
     load_passwd();
     load_shadow();
     load_groups();
@@ -979,7 +1029,24 @@ int user_set_nologin(const char *username) {
 int users_password_check(const char *username, const char *password) {
     if (!password) return PW_ERR_EMPTY;
     uint32_t plen = (uint32_t)strlen(password);
-    uint32_t ulen = (username && username[0]) ? (uint32_t)strlen(username) : 0;
+
+    // #218: the contains-username rule (PW_ERR_CONTAINS_USERNAME) exists to stop
+    // a password being built out of the account's OWN per-machine identity:
+    // "alice" must not be able to pick "alice1234". "root", though, is not a
+    // per-machine secret identity; it is the fixed, universally-known reserved
+    // name of uid 0. Applying the SUBSTRING form of the rule to it rejected any
+    // strong passphrase that merely CONTAINED the token (e.g. a root password of
+    // "MyTreeHasDeepRoots99"), which pushed the owner toward a WORSE password -
+    // exactly the nonsense #218 reports. The only cases the rule was meant to
+    // stop for root - "root", "toor", "rootroot" - are already refused at THIS
+    // SAME chokepoint by the min-length (8), low-variety (>=4 distinct) and
+    // breached-list rules, so nothing is lost by dropping the identity rule for
+    // root. Every OTHER rule still applies to the root password. No non-root
+    // account can be named "root" (user_create and the wizard both reserve it),
+    // so this special case touches only uid 0. NOT applied to human accounts:
+    // their contains-username rule is a legitimate per-machine check and stays.
+    int reserved_root = (username && strcmp(username, "root") == 0);
+    uint32_t ulen = (!reserved_root && username && username[0]) ? (uint32_t)strlen(username) : 0;
     return (int)pw_policy_check_rs((const uint8_t *)password, plen,
                                    ulen ? (const uint8_t *)username : (const uint8_t *)0,
                                    ulen);
@@ -1339,8 +1406,35 @@ void users_make_home_skeleton(const char *home, uint32_t uid, uint32_t gid) {
     // The count is now derived from the array. It was the literal 6, which is
     // the shape of bug where adding an entry compiles, runs, and silently does
     // nothing.
+    //
+    // #221b: GAMES and GAMES/NETHACK. A DOS game writes its save next to its
+    // executable, and /DOS/<GAME> is root-owned 0755, so a non-root session
+    // could not save at all (see the #221b note in fs/perms.c). The game's own
+    // config can point elsewhere, but only at a directory that ALREADY EXISTS:
+    // NetHack calls fopen(), never mkdir(), so a missing save directory is
+    // indistinguishable to it from an unwritable one. This function runs on
+    // every login as well as at account creation, so the directory appears for
+    // accounts that predate this change too, not only for new ones.
+    //
+    // The nested entry works because "GAMES" is created first: fat_mkdir on
+    // "<home>/GAMES/NETHACK" needs its parent to exist, and array order is what
+    // guarantees it. Keep GAMES before GAMES/NETHACK.
+    //
+    // #rawrite: GAMES/RA. Red Alert differs from the two above in that nothing
+    // in the GAME can be pointed at this directory: it has no config file
+    // naming a save path and no typed-path requester, and it ignores the
+    // current directory it was launched with (measured under a DOSBox-X
+    // reference run, 2026-08-27: it wrote its swap file and rewrote
+    // REDALERT.INI into the EXECUTABLE's directory and left the launch CWD
+    // empty). So this directory is not somewhere the game is asked to write,
+    // it is where dos/int21svc.c's overlay REDIRECTS the writes it makes to
+    // /DOS/RA. Created here, with the other two, so it exists for accounts
+    // that predate the change as well as for new ones; dos_overlay_prepare()
+    // creates it on demand too, and both paths set the same 0750.
     static const char *subs[] = { "DESKTOP", "DOCUMENT", "DOWNLOAD", "PICTURES",
-                                  "MUSIC", "VIDEOS", "APPS", "CONFIG" };
+                                  "MUSIC", "VIDEOS", "APPS", "CONFIG",
+                                  "GAMES", "GAMES/NETHACK", "GAMES/SIMCITY",
+                                  "GAMES/RA" };
     for (unsigned i = 0; i < sizeof(subs) / sizeof(subs[0]); i++) {
         int m = 0;
         for (; home[m] && m < 120; m++) path[m] = home[m];

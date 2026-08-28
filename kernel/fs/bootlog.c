@@ -94,6 +94,7 @@
 // (151,826 blk_write() calls = 1,062,742 sectors). A change that halves the
 // bytes but keeps a 2-second cadence is worth almost nothing.
 static void bootlog_flush_failed(const char *path, int rc);
+static void bootlog_write_esp_map(void);
 
 #include "bootlog.h"
 #include "ext2.h"
@@ -104,6 +105,7 @@ static void bootlog_flush_failed(const char *path, int rc);
 #include <stdarg.h>
 
 static void bootlog_append_raw(const char *s, uint32_t len);
+static void bl_fault_drain_into_buf(void);
 
 static uint32_t g_persist_failures = 0;
 static int      g_last_persist_rc  = 0;
@@ -197,18 +199,116 @@ static int bootlog_persist(const char *path, const char *buf, uint32_t len,
     return rc;
 }
 
-static void bootlog_append_raw(const char *s, uint32_t len) {
-    if (len == 0) return;
-    if (g_bootlog_len + len >= BOOTLOG_BUF_CAP) {
-        if (!g_bootlog_full_warned) {
-            g_bootlog_full_warned = 1;
-            kprintf("[BOOTLOG] in-RAM buffer full (%u bytes); further lines are serial-only\n",
-                    (unsigned)BOOTLOG_BUF_CAP);
-        }
+// ===========================================================================
+// #134 THE ONE APPENDER for every breadcrumb sink in this file.
+// ===========================================================================
+// There were THREE copies of this function (bootlog / usblog / audiolog),
+// identical apart from which buffer they wrote, and all three shared one
+// defect: on reaching the cap they dropped every further line and said so with
+// kprintf() ONLY. On the iMac14,4, which has no serial console, that is
+// silence: the exact trap blame.md has recorded since #130.
+//
+// THE CAP IS NOT THEORETICAL. Measured on golden 1909 in a VM: the #135
+// port-flap diagnostics cost ~1.5 KB of /BOOTLOG.TXT per disconnect+replug
+// cycle (PORTSC was/now + PORTCTX + re-scan + detach + teardown + the whole
+// re-enumeration). The owner's root port 4 flaps by itself every ~3 s, so the
+// 96 KB buffer fills in MINUTES; from that moment g_bootlog_len stops growing,
+// bootlog_persist() sees "nothing new to say" and returns 0, and /BOOTLOG.TXT
+// is FROZEN at that byte for the rest of the session while the serial-only
+// warning goes nowhere. #134 was reported at 6:50 uptime, i.e. long after the
+// log had quietly stopped recording. That is why the freeze left no trace.
+//
+// TWO fixes, in this one place, for all three sinks:
+//
+//   1. NEVER STOP SILENTLY. The last BL_TRUNC_RESERVE bytes of every buffer are
+//      held back for a truncation notice, so a file pulled off the stick ENDS
+//      with a line that says it was truncated, instead of simply stopping
+//      mid-session and looking exactly like a machine that died there.
+//
+//   2. NEVER REACH THE CAP ON AN APPEND-CAPABLE SINK. bootlog_persist() already
+//      writes only the delta on ext2 (#748), so bytes already on the medium do
+//      not need to stay in RAM. Dropping that persisted prefix turns the buffer
+//      into a sliding window over the UNPERSISTED tail and the cap stops being
+//      a countdown. BL_KEEP_PERSISTED bytes of the prefix are deliberately
+//      RETAINED so *persisted stays > 0: bootlog_persist() reads *persisted == 0
+//      as "first write, REPLACE the whole file", so compacting to zero would
+//      truncate /BOOTLOG.TXT to its own tail. On FAT (the #348 single-partition
+//      live USB) every flush is a whole-file rewrite, so the prefix is still
+//      needed and compaction is correctly skipped there: that path keeps
+//      exactly its old behaviour plus the notice from (1).
+#define BL_TRUNC_RESERVE  192u
+#define BL_KEEP_PERSISTED 512u
+
+static uint64_t g_bl_dropped_bytes = 0;   // across all sinks, for reporting
+
+// Set once a sink's RAM buffer has been compacted, i.e. once it no longer holds
+// the whole file. Passed to bootlog_persist() as buf_full is, to suppress the
+// whole-file replace fallback that would otherwise destroy the earlier content.
+static int g_bootlog_compacted  = 0;
+static int g_usblog_compacted   = 0;
+static int g_audiolog_compacted = 0;
+
+uint64_t bootlog_dropped_bytes(void) { return g_bl_dropped_bytes; }
+
+static void bl_append(char *buf, uint32_t cap, uint32_t *len, uint32_t *persisted,
+                      int *truncated, int *compacted, const char *name,
+                      const char *path, const char *s, uint32_t slen) {
+    if (slen == 0 || slen >= cap) return;
+
+    if (*len + slen + BL_TRUNC_RESERVE < cap) {
+        memcpy(buf + *len, s, slen);
+        *len += slen;
         return;
     }
-    memcpy(g_bootlog_buf + g_bootlog_len, s, len);
-    g_bootlog_len += len;
+
+    // Reclaim the prefix that is already on the medium, if this sink appends.
+    if (persisted && *persisted > BL_KEEP_PERSISTED && g_bootlog_armed &&
+        g_bootlog_fs && fat_path_on_ext2(g_bootlog_fs, path)) {
+        uint32_t drop = *persisted - BL_KEEP_PERSISTED;
+        if (drop > *len) drop = *len;
+        if (drop) {
+            memmove(buf, buf + drop, *len - drop);
+            *len       -= drop;
+            *persisted -= drop;
+            // ONCE THIS HAPPENS THE RAM BUFFER IS NO LONGER THE WHOLE FILE, so
+            // bootlog_persist()'s repair fallback (a whole-file fat_write_file
+            // replace when an ext2 append fails) would TRUNCATE /BOOTLOG.TXT to
+            // the retained window. That fallback is already suppressed for the
+            // buffer-full case for exactly this reason; compaction has the same
+            // semantics, so it sets the same suppression. The failure is then
+            // reported instead of silently destroying the evidence, which is
+            // the whole point of the file.
+            *compacted = 1;
+        }
+        if (*len + slen + BL_TRUNC_RESERVE < cap) {
+            memcpy(buf + *len, s, slen);
+            *len += slen;
+            return;
+        }
+    }
+
+    // No room even after compaction: say so IN the file, exactly once.
+    g_bl_dropped_bytes += slen;
+    if (!*truncated) {
+        *truncated = 1;
+        char note[BL_TRUNC_RESERVE];
+        int n = snprintf(note, sizeof(note),
+                         "[%s] *** IN-RAM BUFFER FULL (%u bytes). THIS FILE IS "
+                         "TRUNCATED HERE - the machine did NOT stop at this "
+                         "line. Further lines are serial-only. ***\n",
+                         name, (unsigned)cap);
+        if (n > 0 && (uint32_t)n < cap - *len) {
+            memcpy(buf + *len, note, (uint32_t)n);
+            *len += (uint32_t)n;
+        }
+        kprintf("[%s] in-RAM buffer full (%u bytes); further lines are serial-only\n",
+                name, (unsigned)cap);
+    }
+}
+
+static void bootlog_append_raw(const char *s, uint32_t len) {
+    bl_append(g_bootlog_buf, BOOTLOG_BUF_CAP, &g_bootlog_len, &g_bootlog_persisted,
+              &g_bootlog_full_warned, &g_bootlog_compacted, "BOOTLOG", BOOTLOG_PATH, s, len);
 }
 
 int bootlog_is_armed(void) {
@@ -301,7 +401,112 @@ uint64_t g_bootlog_noblock_ra = 0;
 void bootlog_defer_begin(void) { g_bl_defer++; }
 void bootlog_defer_end(void)   { if (g_bl_defer > 0) g_bl_defer--; }
 
+// ===========================================================================
+// #134 FAULT-CONTEXT LOGGING: a lock-free ring a later safe context flushes.
+// ===========================================================================
+// WHY bootlog_write() CANNOT BE CALLED FROM A FAULT HANDLER, and why this is
+// not a style preference. cpu/idt.c's exception_fatal() was DELIBERATELY
+// converted to kprintf_nolock() in 240dc9f (#130) because a core that faults
+// while holding g_console_lock re-enters the handler, calls kprintf(), and
+// blocks on a lock it already owns with interrupts off. MEASURED: four CPUs
+// spinning at spinlock.h:251 on g_console_lock, desktop never reached, not one
+// line of output. bootlog_write() would reintroduce that deadlock and add two
+// more of its own: it calls kprintf() (the console lock), and its flush enters
+// fat/ext2 -> blk_write -> usb_msc_transport, which takes the MSC command lock
+// and can park - from a context that must never park, on the very device the
+// faulting thread may already have been inside.
+//
+// So the fault path gets its OWN sink with exactly three properties:
+//   - NO LOCK. Space is reserved with a compare-and-swap on g_fault_len. A CAS
+//     loop makes unconditional progress; it is not a wait, so there is nothing
+//     for it to deadlock against.
+//   - NO ALLOCATION and NO FILESYSTEM. The text is formatted into a stack
+//     buffer and memcpy'd into a static ring. Nothing reaches the medium here.
+//   - MIRRORED WITH kprintf_nolock(), the lock-free console writer 240dc9f
+//     already chose for this context, so a developer with a serial cable sees
+//     the same line at the same instant.
+//
+// A LATER SAFE CONTEXT FLUSHES IT. bootlog_write() drains the ring into the
+// ordinary /BOOTLOG.TXT buffer on its next call, and bootlog_heartbeat() (a
+// normal kernel thread, every 2 s) calls bootlog_fault_flush() so a fault is
+// on disk within about two seconds even if nothing else logs.
+//
+// KNOWN AND DELIBERATE LIMIT, do not read more into this than it does: for a
+// KERNEL-mode fault the CPU halts inside the handler, so no safe context ever
+// runs and this ring dies with it. That case is already covered by
+// panic_log_write() -> /boot/PANIC.TXT (#418), which is a raw unlocked
+// single-sector write and is the only thing that CAN work there. What this
+// closes is the USER-mode fault (the #153 "app launches and instantly dies"
+// shape), where the kernel keeps running and, until now, left no record on a
+// machine with no serial port.
+#define BL_FAULT_CAP  2048u
+static char              g_fault_buf[BL_FAULT_CAP];
+static volatile uint32_t g_fault_len  = 0;
+static volatile uint32_t g_fault_lost = 0;
+uint32_t bootlog_fault_lost(void) { return g_fault_lost; }
+
+void bootlog_fault_write(const char *fmt, ...) {
+    char line[BOOTLOG_LINE_MAX];
+    va_list args;
+    va_start(args, fmt);
+    int n = vsnprintf(line, sizeof(line), fmt, args);
+    va_end(args);
+    if (n < 0) return;
+    if ((uint32_t)n >= sizeof(line)) n = (int)sizeof(line) - 1;
+    line[n] = '\n';
+    uint32_t need = (uint32_t)n + 1;
+
+    // Lock-free reservation, and deliberately LOOP-FREE: one atomic add claims
+    // the space or overshoots the ring, and an overshoot is simply recorded as
+    // lost. A retry loop here would be a hand-rolled wait in a fault handler,
+    // which is the one place that must never wait for anything - and the
+    // concurrency lint is right to reject it. g_fault_len is allowed to run
+    // past the cap; the drain clamps it and resets it to zero.
+    uint32_t off = __sync_fetch_and_add(&g_fault_len, need);
+    if (off + need <= BL_FAULT_CAP) memcpy(g_fault_buf + off, line, need);
+    else __sync_fetch_and_add(&g_fault_lost, need);
+
+    // The lock-free console writer 240dc9f already chose for this context.
+    kprintf_nolock("[FAULTLOG] %s", line);
+}
+
+// Move whatever a fault context recorded into the ordinary /BOOTLOG.TXT RAM
+// buffer. Safe contexts only; does NOT touch the medium (the caller's own
+// bootlog_write() persists the whole accumulated delta straight afterwards).
+// NUL bytes are skipped: a reservation whose memcpy had not landed yet reads as
+// zeros, and a text log should not carry them.
+static void bl_fault_drain_into_buf(void) {
+    if (!g_fault_len) return;
+    uint32_t n = __sync_lock_test_and_set(&g_fault_len, 0);
+    if (n > BL_FAULT_CAP) n = BL_FAULT_CAP;
+    uint32_t start = 0;
+    for (uint32_t i = 0; i < n; i++) {
+        if (g_fault_buf[i] == '\0') {
+            if (i > start) bootlog_append_raw(g_fault_buf + start, i - start);
+            start = i + 1;
+        }
+    }
+    if (n > start) bootlog_append_raw(g_fault_buf + start, n - start);
+}
+
+int bootlog_fault_flush(void) {
+    if (!g_fault_len) return 0;
+    uint32_t lost = g_fault_lost;
+    bl_fault_drain_into_buf();
+    // Reuses bootlog_write() wholesale, so the fault text inherits every guard
+    // (defer / in-persist / no-block) and every durability property the normal
+    // path has, and costs ONE extra line rather than a second write path.
+    return bootlog_write("[BOOTLOG] the [FAULTLOG] line(s) above were recorded from a "
+                         "FAULT context (no lock, no filesystem) and flushed here%s",
+                         lost ? " - SOME WERE LOST, the fault ring overflowed" : "");
+}
+
+
 int bootlog_write(const char *fmt, ...) {
+    // #134: carry anything a fault context left in the lock-free ring down with
+    // this line, so it costs no extra device write.
+    bl_fault_drain_into_buf();
+
     char line[BOOTLOG_LINE_MAX];
     va_list args;
     va_start(args, fmt);
@@ -366,7 +571,8 @@ int bootlog_write(const char *fmt, ...) {
         }
         g_bl_in_persist++;
         int _rc = bootlog_persist(BOOTLOG_PATH, g_bootlog_buf, g_bootlog_len,
-                                  &g_bootlog_persisted, g_bootlog_full_warned);
+                                  &g_bootlog_persisted,
+                                  g_bootlog_full_warned || g_bootlog_compacted);
         g_bl_in_persist--;
         if (_rc != 0) { bootlog_flush_failed(BOOTLOG_PATH, _rc); return _rc; }
     }
@@ -469,6 +675,11 @@ uint32_t bootlog_heartbeat_ring(const char **out) {
 
 void bootlog_heartbeat(const char *line) {
     if (!line) return;
+    // #134: the heartbeat is an ordinary kernel thread with interrupts on, and
+    // it runs every 2 s whatever else the machine is doing. That makes it the
+    // right safe context to get a fault record onto the medium promptly when
+    // nothing else happens to log.
+    if (g_fault_len) (void)bootlog_fault_flush();
     uint32_t n = (uint32_t)strlen(line);
     if (n > HB_RING_CAP - 2) n = HB_RING_CAP - 2;
 
@@ -566,17 +777,8 @@ static int      g_usblog_full_warned = 0;
 static uint32_t g_usblog_persisted = 0;   // #748: bytes already on the medium
 
 static void usblog_append_raw(const char *s, uint32_t len) {
-    if (len == 0) return;
-    if (g_usblog_len + len >= USBLOG_BUF_CAP) {
-        if (!g_usblog_full_warned) {
-            g_usblog_full_warned = 1;
-            kprintf("[USBLOG] in-RAM buffer full (%u bytes); further lines are serial-only\n",
-                    (unsigned)USBLOG_BUF_CAP);
-        }
-        return;
-    }
-    memcpy(g_usblog_buf + g_usblog_len, s, len);
-    g_usblog_len += len;
+    bl_append(g_usblog_buf, USBLOG_BUF_CAP, &g_usblog_len, &g_usblog_persisted,
+              &g_usblog_full_warned, &g_usblog_compacted, "USBLOG", USBLOG_PATH, s, len);
 }
 
 void usblog_write(const char *fmt, ...) {
@@ -596,7 +798,8 @@ void usblog_write(const char *fmt, ...) {
 
     if (g_bootlog_armed && g_bootlog_fs) {
         { int _rc = bootlog_persist(USBLOG_PATH, g_usblog_buf, g_usblog_len,
-                                    &g_usblog_persisted, g_usblog_full_warned);
+                                    &g_usblog_persisted,
+                                    g_usblog_full_warned || g_usblog_compacted);
           if (_rc != 0) bootlog_flush_failed(USBLOG_PATH, _rc); }
     }
 }
@@ -627,17 +830,8 @@ static uint32_t g_audiolog_persisted = 0;   // #748: bytes already on the medium
 static int      g_audiolog_defer = 0;
 
 static void audiolog_append_raw(const char *s, uint32_t len) {
-    if (len == 0) return;
-    if (g_audiolog_len + len >= AUDIOLOG_BUF_CAP) {
-        if (!g_audiolog_full_warned) {
-            g_audiolog_full_warned = 1;
-            kprintf("[AUDIOLOG] in-RAM buffer full (%u bytes); further lines are serial-only\n",
-                    (unsigned)AUDIOLOG_BUF_CAP);
-        }
-        return;
-    }
-    memcpy(g_audiolog_buf + g_audiolog_len, s, len);
-    g_audiolog_len += len;
+    bl_append(g_audiolog_buf, AUDIOLOG_BUF_CAP, &g_audiolog_len, &g_audiolog_persisted,
+              &g_audiolog_full_warned, &g_audiolog_compacted, "AUDIOLOG", AUDIOLOG_PATH, s, len);
 }
 
 void audiolog_write(const char *fmt, ...) {
@@ -657,7 +851,8 @@ void audiolog_write(const char *fmt, ...) {
 
     if (!g_audiolog_defer && g_bootlog_armed && g_bootlog_fs) {
         { int _rc = bootlog_persist(AUDIOLOG_PATH, g_audiolog_buf, g_audiolog_len,
-                                    &g_audiolog_persisted, g_audiolog_full_warned);
+                                    &g_audiolog_persisted,
+                                    g_audiolog_full_warned || g_audiolog_compacted);
           if (_rc != 0) bootlog_flush_failed(AUDIOLOG_PATH, _rc); }
     }
 }
@@ -672,7 +867,8 @@ void audiolog_end_batch(void) {
         // the batch still costs ONE write and it is now an append rather than a
         // rewrite of the whole report.
         { int _rc = bootlog_persist(AUDIOLOG_PATH, g_audiolog_buf, g_audiolog_len,
-                                    &g_audiolog_persisted, g_audiolog_full_warned);
+                                    &g_audiolog_persisted,
+                                    g_audiolog_full_warned || g_audiolog_compacted);
           if (_rc != 0) bootlog_flush_failed(AUDIOLOG_PATH, _rc); }
     }
 }
@@ -685,18 +881,76 @@ void bootlog_arm(fat_fs_t *fs) {
     // root-mount probing, etc.) in one shot; bootlog_write() stays live from
     // here on.
     { int _rc = bootlog_persist(BOOTLOG_PATH, g_bootlog_buf, g_bootlog_len,
-                                &g_bootlog_persisted, g_bootlog_full_warned);
+                                &g_bootlog_persisted,
+                                g_bootlog_full_warned || g_bootlog_compacted);
       if (_rc != 0) bootlog_flush_failed(BOOTLOG_PATH, _rc); }
     // Same one-shot flush for the USB descriptor log accumulated so far (all of
     // xHCI/HID enumeration happens before any filesystem exists).
     { int _rc = bootlog_persist(USBLOG_PATH, g_usblog_buf, g_usblog_len,
-                                &g_usblog_persisted, g_usblog_full_warned);
+                                &g_usblog_persisted,
+                                g_usblog_full_warned || g_usblog_compacted);
       if (_rc != 0) bootlog_flush_failed(USBLOG_PATH, _rc); }
     // #71 / Cirrus: flush the HD Audio diagnostic accumulated during audio_init
     // (codec probe happens well before the FAT root is writable).
     { int _rc = bootlog_persist(AUDIOLOG_PATH, g_audiolog_buf, g_audiolog_len,
-                                &g_audiolog_persisted, g_audiolog_full_warned);
+                                &g_audiolog_persisted,
+                                g_audiolog_full_warned || g_audiolog_compacted);
       if (_rc != 0) bootlog_flush_failed(AUDIOLOG_PATH, _rc); }
     kprintf("[BOOTLOG] armed: /BOOTLOG.TXT (%u bytes) + /USBLOG.TXT (%u bytes) + /AUDIOLOG.TXT (%u bytes) now live\n",
             (unsigned)g_bootlog_len, (unsigned)g_usblog_len, (unsigned)g_audiolog_len);
+    bootlog_write_esp_map();
+}
+
+// ===========================================================================
+// #307: THE BREADCRUMB THAT SAYS WHICH PARTITION THE EVIDENCE IS ON.
+// ===========================================================================
+// On a two-partition golden the FAT ESP is NOT the root the kernel reads and
+// writes. fat_path_on_ext2() (fs/fat.c) routes every "/" path to the ext2 root
+// EXCEPT "/boot/..." and "/EFI/...", so /BOOTLOG.TXT, /USBLOG.TXT,
+// /AUDIOLOG.TXT, /NETCFG.TXT and /CONFIG/... all live on PARTITION 2, and a
+// file dropped at the root of the FAT ESP is never read by anything.
+//
+// THIS COST A WHOLE MISDIAGNOSIS (2026-08-25). An investigation into the
+// owner's iMac14,4 inspected partition 1 of his boot stick, found no
+// /BOOTLOG.TXT, and concluded from that absence that the kernel had never
+// mounted the filesystem, which in turn "explained" the wrong IP and the
+// unresponsive desktop. Every step of that was wrong: the kernel had mounted
+// fine and had written 268 KB of /BOOTLOG.TXT to partition 2, and the wrong IP
+// was a /NETCFG.TXT that had been placed on partition 1 where nothing reads it.
+// A VM boot of the same golden reproduces the "missing" file exactly, so the
+// absence was never evidence of anything.
+//
+// The durable fix is not a longer checklist, it is a note in the place the
+// person is already looking. /boot/ is one of the two ESP-exempt prefixes, so
+// this file lands on the FAT partition, next to kernel.elf, where anyone who
+// mounts the stick on another machine will see it. It is written once per boot,
+// costs one small FAT write, and reads nothing back.
+//
+// Kept in C: this is three statements inside an existing C function, using this
+// file's own static state (g_bootlog_fs) and the C FAT API. A Rust boundary
+// here would be a larger FFI surface than the change itself.
+static void bootlog_write_esp_map(void) {
+    if (!g_bootlog_armed || !g_bootlog_fs) return;
+    static const char map[] =
+        "MayteraOS: WHERE THE LOGS AND CONFIG FILES ACTUALLY ARE\n"
+        "\n"
+        "This is PARTITION 1, the FAT ESP. It holds boot assets ONLY:\n"
+        "  /boot/kernel.elf  /EFI/BOOT/BOOTX64.EFI  /KERNEL.ELF  /BOOT.BMP\n"
+        "  /FONT.TTF  /FONTS/  /BUILDINFO.TXT  /ROOTEXT2\n"
+        "  /boot/STAGE.TXT and /boot/PANIC.TXT (crash breadcrumbs)\n"
+        "  /boot/LOGS.TXT (this file)\n"
+        "\n"
+        "EVERY OTHER \"/\" PATH THE KERNEL READS OR WRITES IS ON PARTITION 2\n"
+        "(the ext2 root). That includes:\n"
+        "  /BOOTLOG.TXT   /USBLOG.TXT   /AUDIOLOG.TXT   /HEARTBEAT.TXT\n"
+        "  /NETCFG.TXT    /CONFIG/...   /APPS/...       /HOME/...\n"
+        "\n"
+        "A FILE DROPPED AT THE ROOT OF THIS FAT PARTITION IS NEVER READ BY THE\n"
+        "KERNEL. To supply a static IP, or to read the boot log, mount\n"
+        "PARTITION 2, not this one.\n"
+        "\n"
+        "Absence of /BOOTLOG.TXT here is NORMAL and proves nothing.\n";
+    int rc = fat_write_file(g_bootlog_fs, "/boot/LOGS.TXT", map, sizeof(map) - 1);
+    if (rc != 0)
+        kprintf("[BOOTLOG] /boot/LOGS.TXT partition-map note not written (rc=%d)\n", rc);
 }

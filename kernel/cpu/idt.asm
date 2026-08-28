@@ -31,6 +31,9 @@ global irq8, irq9, irq10, irq11, irq12, irq13, irq14, irq15
 global isr128
 global irq_smp_wake
 global irq_hda_msi
+global irq_xhci_msi
+global irq_tick_redundant
+global irq_ap_tick
 
 ; idt_load - Load the IDT
 ; Argument: RDI = pointer to IDT descriptor
@@ -132,6 +135,42 @@ irq_smp_wake:
 irq_hda_msi:
     push qword 0        ; Dummy error code
     push qword 0x50     ; Interrupt number
+    jmp isr_common
+
+; #139: xHCI MSI vector (0x51 / 81, XHCI_MSI_VECTOR in drivers/xhci.h). Same
+; shape as the HDA vector directly above: Local-APIC delivered, so it needs its
+; own gate rather than one of the legacy IRQ0-15 macros, and its C handler
+; EOIs with lapic_eoi() not pic_send_eoi(). A vector needs BOTH this gate
+; (here + cpu/idt.c) and a registered C handler (xhci_setup_interrupt); the
+; irq_tick_redundant note below records what happens when only one is present.
+irq_xhci_msi:
+    push qword 0        ; Dummy error code
+    push qword 0x51     ; Interrupt number
+    jmp isr_common
+
+; #745 (#62): the REDUNDANT tick source (Local APIC timer), vector 0x41.
+; A vector needs BOTH an IDT GATE (here + cpu/idt.c) and a registered C handler
+; (idt_register_handler in cpu/isr.c). Registering only the handler leaves the
+; gate absent, and the first interrupt on that vector raises #GP with error
+; code (vector << 3) | 2 | 1 = 0x20b - which is exactly what the first boot of
+; this change did, at the instant interrupts were enabled.
+irq_tick_redundant:
+    push qword 0        ; Dummy error code
+    push qword 0x41     ; Interrupt number
+    jmp isr_common
+
+; #169: the PER-CORE AP PREEMPTION TICK (Local APIC timer), vector 0x42.
+; Deliberately a DIFFERENT vector from 0x41 rather than a branch inside the
+; redundant tick's handler: 0x41 synthesises global timer_ticks, which an AP
+; must never do, and a single handler that decided which job to do by asking
+; which core it was on would be one edit away from doing the wrong one. Two
+; jobs, two vectors, two handlers - the same reasoning cpu/isr.c records for
+; why the PIT and LAPIC ticks do not share a body (they need different EOIs).
+; Both halves of the wiring are needed here too: this gate (+ cpu/idt.c) AND
+; idt_register_handler(0x42, ...) in cpu/isr.c.
+irq_ap_tick:
+    push qword 0        ; Dummy error code
+    push qword 0x42     ; Interrupt number
     jmp isr_common
 
 ; Common ISR handler

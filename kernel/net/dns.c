@@ -72,6 +72,10 @@ typedef struct {
 
 // DNS state
 static uint32_t dns_server = 0;     // DNS server IP (host byte order)
+// #786: 1 once an EXPLICIT choice (static config file, or the user in
+// Settings) has selected the resolver. A DHCP lease may fill an UNPINNED
+// resolver but must never overrule a pinned one.
+static int dns_server_pinned = 0;
 static dns_cache_entry_t dns_cache[DNS_CACHE_SIZE];
 
 // Cache statistics
@@ -474,10 +478,38 @@ void dns_init(void) {
 }
 
 void dns_set_server(uint32_t server_ip) {
+    // #786: an explicit choice, so PIN it. See dns.h for why a DHCP lease must
+    // not be allowed to overrule this.
+    int changed = (dns_server != server_ip);
+    dns_server = server_ip;
+    dns_server_pinned = 1;
+    uint8_t *ip = (uint8_t *)&server_ip;
+    kprintf("[DNS] server set to %d.%d.%d.%d (explicit, pinned)\n",
+            ip[3], ip[2], ip[1], ip[0]);
+    // Flush cached answers from the PREVIOUS resolver. Changing resolver is an
+    // act of distrust in the old one: keeping its answers would make a live
+    // change look like it had not taken effect for up to a TTL, which is
+    // exactly the "did it apply?" ambiguity this ticket exists to remove.
+    if (changed) dns_cache_clear();
+}
+
+void dns_set_server_dhcp(uint32_t server_ip) {
+    if (server_ip == 0) return;             // lease offered no resolver
+    if (dns_server_pinned) {                // an explicit choice wins
+        uint8_t *ip = (uint8_t *)&server_ip;
+        kprintf("[DNS] ignoring DHCP-offered %d.%d.%d.%d: resolver is pinned\n",
+                ip[3], ip[2], ip[1], ip[0]);
+        return;
+    }
+    int changed = (dns_server != server_ip);
     dns_server = server_ip;
     uint8_t *ip = (uint8_t *)&server_ip;
-    kprintf("[DNS] server set to %d.%d.%d.%d\n", ip[3], ip[2], ip[1], ip[0]);
+    kprintf("[DNS] server set to %d.%d.%d.%d (from DHCP lease)\n",
+            ip[3], ip[2], ip[1], ip[0]);
+    if (changed) dns_cache_clear();
 }
+
+int dns_server_is_pinned(void) { return dns_server_pinned; }
 
 uint32_t dns_get_server(void) { return dns_server; }
 

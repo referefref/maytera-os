@@ -4,7 +4,7 @@ Status: PARTIALLY IMPLEMENTED. Sections 1.1 (no default credentials in a
 shipping image) + 4.1 step 2 (first-boot create-account flow) are implemented in
 `kernel/proc/users.c` (`users_create_first_admin`, `users_count_active`, the
 `MAYTERA_SHIP_DEFAULT_ACCOUNTS`-gated `create_defaults`) and `kernel/gui/login.c`
-(`LOGIN_STATE_CREATE_ACCOUNT`), verified on VM 2410 build 855 (#568). The initial
+(`LOGIN_STATE_CREATE_ACCOUNT`), verified on VM <vmid> build 855 (#568). The initial
 administrator is created as uid 0 via the #566 PBKDF2 path; a fresh install with no
 accounts on disk forces creation, while an internal image that ships accounts +
 `/CONFIG/LOGIN.CFG autologin=<user>` still boots straight to the desktop. Other
@@ -527,8 +527,8 @@ not a bug fix.
   visibly ticking clock, under all conditions - project experience
   specifically warns that "a single screendump of a wedged UI looks alive"
   (project memory: "verify liveness: 2 screendumps + clock") and that GUI
-  automation in this codebase is unreliable enough
-  (`docs` / project memory on #334/#440) that any future verification of a
+  automation should be corroborated (see docs/GUI_TEST_INPUT.md: #334 is the
+  WORKING deterministic testinput channel, COM1, ACKd) so that verification of a
   shipped lock screen should capture two screenshots with a visible clock
   between them, not one. This is a verification-methodology note as much as
   a design one - flagged in Section 6.
@@ -670,8 +670,10 @@ a new kernel-level multi-session concept.
 
 ## 6. Verification plan (once built)
 
-Per this project's own hard-won lessons: mouse-driven compositor panels are
-not reliably drivable headlessly (#334/#440), so verification of the actual
+Mouse-driven compositor panels ARE drivable headlessly via the #334 testinput
+channel (COM1, deterministic, ACKd; see docs/GUI_TEST_INPUT.md). This passage
+previously claimed the opposite, which is FALSE and has misled several passes.
+For belt-and-braces liveness, verification of the actual
 shipped login/lock screen should be:
 
 - Two screenshots with a visibly different clock reading between them (not

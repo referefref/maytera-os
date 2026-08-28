@@ -310,8 +310,68 @@ int64_t sys_kill(int pid, int signo) {
     if (pid <= 0) return -1;  // broadcasts not supported yet
     process_t *tgt = proc_get((uint32_t)pid);
     if (!tgt) return -1;
-    if (signo == 0) return 0;  // POSIX existence probe
+    if (signo == 0) return 0;  // POSIX existence probe (a zombie DOES exist)
+    // #161: A ZOMBIE HAS ALREADY EXITED. Raising a signal on it did exactly
+    // nothing (there is no Ring 3 left to deliver to, and sig_deliverable is
+    // only ever consulted on a return path that corpse will never take) and
+    // this returned 0, i.e. SUCCESS. Task Manager's Kill and the dock's Force
+    // Quit both took that 0 at face value, so the owner clicked Kill on a
+    // zombie AssaultCube and the button reported success while nothing
+    // happened - the "silently does nothing" class this project keeps
+    // reproducing. -ESRCH is the truth: there is no process to signal, only a
+    // corpse waiting for its parent to reap it. The UI can now say so.
+    if (tgt->state == PROC_STATE_ZOMBIE) return -3;  // -ESRCH
     sig_raise(tgt, signo);
+    return 0;
+}
+
+// #161: ASYNCHRONOUS TERMINATION POINT - the reason Force Quit did not work on
+// a LIVE, BUSY app.
+//
+// Until this ticket, signal delivery had exactly ONE site: syscall.asm:135
+// calls syscall_check_return_work() on the way out of a syscall. Nothing runs
+// return_work_handler() on the IRETQ return from an interrupt. So a Ring 3
+// process that is not making syscalls - a game or a media player grinding
+// through a frame, or anything wedged in a loop of its own - carried a pending
+// SIGKILL forever, and SIGKILL is precisely the signal whose whole contract is
+// that it does NOT depend on the target cooperating.
+//
+// This is the predicate the interrupt return path (cpu/idt.c) consults. It
+// answers ONE question: is the signal the syscall path would deliver next a
+// signal that terminates the process outright, needing no user stack frame?
+// If so the caller can act on it from an asynchronous context, because
+// terminating requires nothing of the victim.
+//
+// It deliberately reuses BOTH existing authorities rather than restating them:
+// sig_deliverable() for what is unblocked (including the SIGKILL/SIGSTOP
+// unmaskable rule) and default_action() for what "default" means per signal.
+// It also honours the same LOWEST-numbered-first choice return_work_handler()
+// makes, and bails the moment that lowest signal needs a handler frame, so the
+// two paths can never disagree about which signal is next.
+//
+// WHY THIS IS C AND NOT RUST (2026-07-16 rule): it is not new logic. It is a
+// second CALL SITE for the selection this file already performs, and the only
+// way to express it in rustkern/ would be to copy default_action()'s table and
+// sig_deliverable()'s mask rule across the FFI - forking the shared primitive,
+// which is the thing the reuse rule forbids. The decision stays where its two
+// inputs are defined.
+//
+// Returns the signal number to terminate on, or 0 for "nothing to do here".
+int sig_async_terminate_pending(void) {
+    process_t *p = proc_current();
+    if (!p) return 0;
+    if (!(p->return_work & RETURN_WORK_SIGPENDING)) return 0;
+    uint64_t deliverable = sig_deliverable(p);
+    if (!deliverable) return 0;
+    for (int signo = 1; signo <= NSIG; signo++) {
+        if (!(deliverable & (1ULL << (signo - 1)))) continue;
+        // Lowest deliverable signal wins, exactly as return_work_handler does.
+        // If IT needs a user stack frame, we do nothing at all and let the
+        // syscall path handle the whole queue in order.
+        if (p->sig_handlers[signo - 1] != SIG_DFL) return 0;
+        if (default_action(signo) != 0) return 0;
+        return signo;
+    }
     return 0;
 }
 

@@ -195,7 +195,7 @@ int main(int argc, char *argv[]) {
     // ----------------------------------------------------------------------
     //
     // CREATE A NEW NAME rather than overwrite an existing file. Measured on the
-    // first run of this probe (golden 1743, VM 2790, autologin=root): the
+    // first run of this probe (golden 1743, VM <vmid>, autologin=root): the
     // earlier version wrote 7 bytes over /CONFIG/PASSWD and over /BOOT.BMP, and
     // at uid 0 both SUCCEEDED, so the probe destroyed the account database and
     // the boot splash of the image it was measuring. The very next assertion

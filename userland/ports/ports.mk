@@ -51,6 +51,14 @@ MPORTS_CFLAGS = -ffreestanding \
 MPORTS_INCLUDE = -I$(MPORTS_OUT)/include
 MPORTS_LIBDIR  = $(MPORTS_OUT)/lib
 
+# Upstream translation units a port installed for a CONSUMER to compile
+# (`install_sources=` in the manifest). The one user today is userland/apps/lua,
+# which compiles Lua's own src/lua.c - the interpreter main(), which cannot live
+# inside liblua.a - out of here rather than out of the versioned scratch tree
+# ports/.work/, whose path carries the upstream version and which
+# `mports.sh clean` deletes.
+MPORTS_SRCDIR  = $(MPORTS_OUT)/src
+
 # The Ring 3 PIE link profile.
 MPORTS_LDFLAGS = -pie --no-dynamic-linker -z notext -nostdlib \
                  -z max-page-size=0x1000 -T $(USERLAND_DIR)/user-pie.ld

@@ -159,6 +159,12 @@ typedef struct {
     uint8_t  acpi_enable_val;    // Value to write to smi_cmd to enable ACPI mode
     uint8_t  sci_int;            // SCI interrupt (legacy IRQ line)
     bool     sci_armed;          // Power-button SCI handler installed + armed
+    // #ASUSKBD: parse_fadt() locates and CHECKSUM-VALIDATES the DSDT and then
+    // throws the pointer away in a function local, so no other subsystem could
+    // ever look at it. Keep it. The checksum walk has already touched every
+    // byte in [addr, addr+len), which is what makes a later scan safe.
+    uint64_t dsdt_addr;          // 0 if absent or checksum-invalid
+    uint32_t dsdt_len;           // full table length INCLUDING the 36-byte header
 } acpi_state_t;
 
 // Initialize ACPI subsystem
@@ -190,5 +196,17 @@ uint8_t acpi_get_revision(void);
 // Find an ACPI table by signature
 // Returns pointer to table header, or NULL if not found
 acpi_sdt_header_t *acpi_find_table(const char *signature);
+
+// #ASUSKBD: hand out the DSDT that parse_fadt() already found and validated.
+// The DSDT is NOT an RSDT/XSDT entry, so acpi_find_table("DSDT") cannot and
+// does not find it; it is reachable only through the FADT. Returns 1 and fills
+// both outputs, or 0 if there is no validated DSDT.
+int acpi_get_dsdt(uint64_t *base, uint32_t *len);
+
+// #ASUSKBD: iterate the SSDTs. acpi_find_table() returns the FIRST match only,
+// so it cannot reach the second and subsequent SSDTs, and real firmware ships
+// several. index 0,1,2... until it returns 0. Each table is checksum-validated
+// before being returned, exactly as acpi_find_table() does.
+int acpi_get_ssdt(int index, uint64_t *base, uint32_t *len);
 
 #endif // ACPI_H

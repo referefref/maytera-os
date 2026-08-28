@@ -127,7 +127,7 @@ static void load_registry(void) {
     add_app("Settings",      "/APPS/SETTINGS",  "System",     1);
     add_app("Task Manager",  "/APPS/taskmgr",   "System",     1);
     add_app("Task Switcher", "/APPS/WINSWTCH",  "System",     1);
-    add_app("App Store",     "/APPS/APPSTORE",  "System",     1);
+    add_app("App Repo",      "/APPS/APPSTORE",  "System",     1);
     add_app("Help",          "/APPS/help",      "System",     1);
     add_app("Python",        "/APPS/PYTHON.ELF","Development",1);
     add_app("DOOM",          "/GAMES/DOOM/DOOM.ELF",  "Games",      1);

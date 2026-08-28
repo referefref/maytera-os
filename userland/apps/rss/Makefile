@@ -21,15 +21,36 @@ LIBC = $(LIBC_DIR)/libc.a
 # --- USERLAND Rust feed parser --------------------------------------------
 # Toolchain PINNED via rust-toolchain.toml (channel 1.97.0, target
 # x86_64-unknown-none). The version gate below FAILS the build on drift.
-# Code/relocation model overrides match the C app ABI (-mcmodel=large,
-# -fno-pic, linked at 0x80000000); default small model overflows R_X86_64_32S.
+#
+# CORRECTED 2026-08-16 (#153, found by grepping the fleet for the exact
+# pattern ticket #89 fixed in arena/Makefile, after that same pattern turned
+# out to have been left unfixed in taskmanager/Makefile too - see blame.md).
+# The comment this replaced ("matches the C app ABI: -mcmodel=large,
+# -fno-pic, linked at 0x80000000") was STALE: CFLAGS above is -fPIE and
+# LDFLAGS is -pie, not -fno-pic/static, so that rationale had already stopped
+# being true (the #640 PIE fleet conversion) without this file being updated.
+# -C code-model=large + -C relocation-model=pic together are actively BROKEN
+# on this toolchain: rustc's large-model+PIC codegen calls every extern
+# function - malloc/realloc included, and this file calls both directly for
+# its GlobalAlloc impl, plus every Vec<u8>/Vec<(Vec<u8>,Vec<u8>)> growth the
+# parser does - through a per-callsite computed GOT-base register that this
+# ld resolves to a WRONG delta, jumping into garbage. Same mechanism as #89
+# (arena) and #153 (taskmgr, where it was confirmed by disassembly: the
+# broken movabs-landmark call sequence became an ordinary
+# `call *offset(%rip)` once code-model=large was dropped). RSS's parser
+# allocates via Vec on essentially every parsed tag, so this was not a
+# latent risk - it means Feeds page-faulted on the first real feed it tried
+# to parse. Default (small) code model + relocation-model=pic gives ordinary
+# GOT-relative calls instead, which the loader's R_X86_64_RELATIVE fixups
+# resolve correctly; this crate is nowhere near the small model's +-2GB
+# reach limit.
 RUSTC            = rustc
 RUST_PIN_VERSION = 1.97.0
 RUST_SRC         = rss_rs.rs
 RUST_LIB         = librss_rs.a
 RUSTFLAGS = --edition 2021 --crate-type staticlib --target x86_64-unknown-none \
             -C opt-level=2 -C panic=abort \
-            -C code-model=large -C relocation-model=pic
+            -C relocation-model=pic
 
 all: $(TARGET)
 

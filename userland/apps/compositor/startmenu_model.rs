@@ -34,9 +34,17 @@
 // FRAGMENT GRAMMAR (one directive per line; '#' and blank lines ignored):
 //   category: <Label> [| expanded] [| id=<catid>]
 //   item: <Name> | <exec path or @sentinel> [| id=<itemid>] [| icon=<name>]
-//         [| type=native|win16|dos]
+//         [| type=native|win16|dos] [| mode=auto|real|pm]
 //   rename: <id> | <New Name>
 //   hide: <id>
+//
+// (#845) `mode=` is only meaningful when `type=win16`: "auto" (the default,
+// same as omitting the field) lets the kernel derive real-vs-protected from
+// the NE header at load time (ne.c's win16_decide_pmode()); "real"/"pm" force
+// it explicitly, an explicit override always winning over the derived
+// answer. This is the SAME per-app config both Win16 launch paths (Start
+// menu and the /CONFIG/WIN16PM.RUN boot autolauncher) resolve through, so a
+// fragment's choice here is what a menu click AND the autolauncher agree on.
 //
 // IDENTITY: an item/category's id is its explicit `id=` field, else a slug of
 // its path (item) or label (category) - lowercase, non [a-z0-9] runs folded
@@ -90,6 +98,15 @@
 #![no_std]
 
 extern crate alloc;
+
+// #220 instance 1: THE splitter for "which part of a launch line is the
+// binary". include!()d rather than duplicated so the compositor and
+// tools/launchline/conformance.sh's host harness compile the same source text.
+// See launchline.rs for the whole story; the short version is that the
+// existence check below used to hand the WHOLE field to access(), so any entry
+// with an argument (the Stunts entry, since #172) was stat()ing a string that
+// is not a file and was silently dropped.
+include!("launchline.rs");
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -172,6 +189,13 @@ extern "C" {
     // sentinel, which is exempt), 0 otherwise. Never blocks longer than one
     // access() syscall (#426).
     fn sm_c_path_exists(path_ptr: *const u8, path_len: u32) -> i32;
+    // #220 instance 3: report an item the existence check is about to DROP, so
+    // a configured-and-shipped-but-unreachable entry stops being invisible.
+    // Every drop here used to be silent, which is why the Stunts entry could be
+    // missing from the Start menu for the whole life of #172 with nothing
+    // anywhere saying a word about it. C owns the rate-limiting (the rebuild
+    // runs about once a second); this side just reports the fact.
+    fn sm_c_note_drop(name_ptr: *const u8, name_len: u32, bin_ptr: *const u8, bin_len: u32);
     // Emits one category in final display order, then (via sm_c_add_item)
     // every surviving item that belongs to it, before the next
     // sm_c_add_category call. C owns slot assignment/bounds (MAX_CATEGORIES);
@@ -189,6 +213,7 @@ extern "C" {
         icon_ptr: *const u8,
         icon_len: u32,
         launch_type: i32,
+        win16_mode: i32,
     );
 }
 
@@ -207,6 +232,7 @@ struct ItemRec {
     path: String,
     icon: String,
     launch_type: i32,
+    win16_mode: i32,   // (#845) -1=auto, 0=force real, 1=force protected
     hidden: bool,
 }
 
@@ -281,6 +307,20 @@ fn sm_type_from_str(s: &str) -> i32 {
     }
 }
 
+// (#845) Per-app Win16 execution mode override, only meaningful when
+// type=win16. -1 (auto) lets the kernel derive the mode from the NE header
+// (ne.c's win16_decide_pmode()); "real"/"pm" force it explicitly, an explicit
+// override always winning over the derived answer. Same "never guess"
+// philosophy as sm_type_from_str: an unrecognized or absent value is auto,
+// not a silent force.
+fn sm_mode_from_str(s: &str) -> i32 {
+    match s {
+        "real" => 0,
+        "pm" | "protected" => 1,
+        _ => -1,
+    }
+}
+
 fn process_category_line(rest: &str, m: &mut Model, current_cat: &mut Option<String>) {
     let mut parts = rest.split('|');
     let label = match parts.next() {
@@ -334,12 +374,14 @@ fn process_item_line(rest: &str, m: &mut Model, current_cat: &Option<String>) {
     let mut explicit_id: Option<String> = None;
     let mut icon = String::new();
     let mut launch_type = 0i32;
+    let mut win16_mode = -1i32;
     for field in parts {
         let (k, v) = split_field(field);
         match k {
             "id" if !v.is_empty() => explicit_id = Some(slugify(v)),
             "icon" => icon = String::from(v),
             "type" => launch_type = sm_type_from_str(v),
+            "mode" => win16_mode = sm_mode_from_str(v),
             _ => {}
         }
     }
@@ -350,6 +392,7 @@ fn process_item_line(rest: &str, m: &mut Model, current_cat: &Option<String>) {
         existing.path = String::from(path);
         existing.icon = icon;
         existing.launch_type = launch_type;
+        existing.win16_mode = win16_mode;
         existing.hidden = false;
     } else {
         m.items.push(ItemRec {
@@ -359,6 +402,7 @@ fn process_item_line(rest: &str, m: &mut Model, current_cat: &Option<String>) {
             path: String::from(path),
             icon,
             launch_type,
+            win16_mode,
             hidden: false,
         });
     }
@@ -406,6 +450,7 @@ fn process_hide_line(rest: &str, m: &mut Model) {
             path: String::new(),
             icon: String::new(),
             launch_type: 0,
+            win16_mode: -1,   // (#845) tombstone entry, never launched
             hidden: true,
         });
     }
@@ -421,6 +466,92 @@ pub extern "C" fn sm_model_reset() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// THE PER-FRAGMENT PARSE STATE, HOISTED OUT OF THE PARSE LOOP, AND WHY.
+//
+// `current_cat` (the category a bare `item:` line attaches to) was a LOCAL in
+// sm_model_add_fragment(). That is a small-looking detail with a large
+// consequence: because the state lived inside one call, the caller had to hand
+// the WHOLE fragment file over in ONE buffer, and startmenu.c's buffer was a
+// static char[8192] filled by a single sys_read(). A fragment larger than that
+// lost every item past byte 8191, silently: the parser never saw those lines,
+// so the "dropped" count that #220 added could not report them either.
+//
+// That is not hypothetical. build/assets/startmenu/system.d/03-games.MENU
+// crossed 8191 bytes on 2026-08-23 and the four items at its end - Rogue,
+// Rogue (DOS), Discworld II and Pyro! (floppy) - stopped existing. The owner
+// reported Discworld II missing from the Start menu; the CD volume was mounted,
+// the fragment line was on disk and correct, and the item had simply been read
+// off the end of a buffer.
+//
+// Holding it here instead lets a fragment be fed ONE LINE AT A TIME
+// (sm_model_frag_begin / sm_model_frag_line / sm_model_frag_end), so the caller
+// streams the file through a small fixed chunk buffer and there is NO
+// whole-file size limit anywhere to outgrow. sm_model_add_fragment() below is
+// kept as a thin wrapper over the same three calls, so there is still exactly
+// ONE implementation of the parse.
+//
+// Single-threaded by the same argument as MODEL above: one call path, the
+// compositor's draw/poll thread, never concurrent.
+static mut FRAG_CAT: Option<String> = None;
+
+fn frag_cat() -> &'static mut Option<String> {
+    // SAFETY: same single-call-path argument as model(); the raw-pointer form
+    // satisfies the 2024-edition static-mut-references lint.
+    unsafe { &mut *core::ptr::addr_of_mut!(FRAG_CAT) }
+}
+
+/// Begin one fragment. Resets the per-fragment category scope, which is what
+/// makes a bare `item:` before any `category:` a dropped item in THIS fragment
+/// rather than an item attached to the previous fragment's last category.
+#[no_mangle]
+pub extern "C" fn sm_model_frag_begin() {
+    *frag_cat() = None;
+}
+
+/// Feed ONE line of the fragment currently open. `text_ptr` need not be
+/// NUL-terminated and need not be a whole line's worth of anything else: the
+/// caller has already split on newlines. Invalid UTF-8 is replaced (lossy),
+/// never a reason to abort the rebuild over one malformed line.
+///
+/// # Safety
+/// `text_ptr` must be valid for `text_len` bytes for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn sm_model_frag_line(text_ptr: *const u8, text_len: u32) {
+    if text_ptr.is_null() || text_len == 0 {
+        return;
+    }
+    let bytes = core::slice::from_raw_parts(text_ptr, text_len as usize);
+    let text = String::from_utf8_lossy(bytes);
+    let line = text.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return;
+    }
+    let m = model();
+    let cc = frag_cat();
+    if let Some(rest) = line.strip_prefix("category:") {
+        process_category_line(rest, m, cc);
+    } else if let Some(rest) = line.strip_prefix("item:") {
+        process_item_line(rest, m, &*cc);
+    } else if let Some(rest) = line.strip_prefix("rename:") {
+        process_rename_line(rest, m);
+    } else if let Some(rest) = line.strip_prefix("hide:") {
+        process_hide_line(rest, m);
+    }
+    // Any other directive keyword is ignored rather than treated as an
+    // error - a newer fragment format understood by a future compositor
+    // build degrades gracefully on an older one instead of losing the
+    // whole fragment.
+}
+
+/// End the fragment opened by sm_model_frag_begin(). Dropping the category
+/// scope here rather than only at the next begin() means a caller that begins a
+/// fragment and then fails part-way cannot leak that scope into the next one.
+#[no_mangle]
+pub extern "C" fn sm_model_frag_end() {
+    *frag_cat() = None;
+}
+
 /// Feed one whole fragment file's text. Layer (system vs. user) is not
 /// distinguished here - the CALLER's feed order across fragments (system,
 /// filename-sorted, then user, filename-sorted) is what gives the system
@@ -428,6 +559,10 @@ pub extern "C" fn sm_model_reset() {
 /// layer its "processed last, wins collisions" precedence. `text_ptr` need
 /// not be NUL-terminated; invalid UTF-8 bytes are replaced (lossy), never a
 /// reason to abort the whole rebuild over one malformed fragment.
+///
+/// Retained as a WRAPPER over begin/line/end so that the streaming caller and
+/// any whole-buffer caller share one parse, and so this entry point keeps
+/// working for anything that already has the text in hand (the harness does).
 ///
 /// # Safety
 /// `text_ptr` must be valid for `text_len` bytes for the duration of this
@@ -439,27 +574,11 @@ pub unsafe extern "C" fn sm_model_add_fragment(text_ptr: *const u8, text_len: u3
     }
     let bytes = core::slice::from_raw_parts(text_ptr, text_len as usize);
     let text = String::from_utf8_lossy(bytes);
-    let m = model();
-    let mut current_cat: Option<String> = None; // resets at every fragment's start
+    sm_model_frag_begin();
     for raw_line in text.lines() {
-        let line = raw_line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("category:") {
-            process_category_line(rest, m, &mut current_cat);
-        } else if let Some(rest) = line.strip_prefix("item:") {
-            process_item_line(rest, m, &current_cat);
-        } else if let Some(rest) = line.strip_prefix("rename:") {
-            process_rename_line(rest, m);
-        } else if let Some(rest) = line.strip_prefix("hide:") {
-            process_hide_line(rest, m);
-        }
-        // Any other directive keyword is ignored rather than treated as an
-        // error - a newer fragment format understood by a future compositor
-        // build degrades gracefully on an older one instead of losing the
-        // whole fragment.
+        sm_model_frag_line(raw_line.as_ptr(), raw_line.len() as u32);
     }
+    sm_model_frag_end();
 }
 
 /// Run the existence check and emit the final merged menu via
@@ -489,8 +608,27 @@ pub extern "C" fn sm_model_finish() -> i32 {
             if it.path.starts_with('@') {
                 return true; // pseudo-action sentinel: never disk-checked
             }
-            let pb = it.path.as_bytes();
-            unsafe { sm_c_path_exists(pb.as_ptr(), pb.len() as u32) != 0 }
+            // #220: the field is a LAUNCH LINE, not a bare path. Check the
+            // BINARY. Handing the whole line to access() is what made the
+            // Stunts entry ("/DOS/STUNTS/LOAD.EXE /u MCGA") invisible while
+            // /DOS/STUNTS/LOAD.EXE was sitting on the ext2 root. The full,
+            // UNSPLIT line still travels to the launcher (sm_c_add_item below
+            // passes it.path verbatim) because the kernel splits it again on
+            // its side; splitting for the CHECK must never become splitting
+            // for the LAUNCH, or the argument would be lost.
+            let bin = launch_binary(&it.path);
+            if bin.is_empty() {
+                return false;   // no resolvable target at all
+            }
+            let pb = bin.as_bytes();
+            let alive = unsafe { sm_c_path_exists(pb.as_ptr(), pb.len() as u32) != 0 };
+            if !alive {
+                let nb = it.name.as_bytes();
+                unsafe {
+                    sm_c_note_drop(nb.as_ptr(), nb.len() as u32, pb.as_ptr(), pb.len() as u32);
+                }
+            }
+            alive
         });
         if cat_items.is_empty() {
             continue; // no empty collapsible category headers
@@ -512,6 +650,7 @@ pub extern "C" fn sm_model_finish() -> i32 {
                     ib.as_ptr(),
                     ib.len() as u32,
                     it.launch_type,
+                    it.win16_mode,
                 );
             }
             emitted += 1;

@@ -6,9 +6,9 @@ This test runner manages automated testing of MayteraOS on Proxmox VMs.
 It controls the VM via qm commands and communicates with the OS via serial port.
 
 Usage:
-    ./test_runner.py --vm 1002 --suite syscall
-    ./test_runner.py --vm 1002 --suite all
-    ./test_runner.py --vm 1002 --test test_exit
+    ./test_runner.py --vm <vmid> --suite syscall
+    ./test_runner.py --vm <vmid> --suite all
+    ./test_runner.py --vm <vmid> --test test_exit
 """
 
 import argparse

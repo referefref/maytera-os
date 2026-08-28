@@ -1,74 +1,238 @@
-// main.c - MayteraOS "Install to Disk" (#306)
+// main.c - MayteraOS "Install to Disk" (#306, restyled #appstyle)
 //
-// Built strictly from the per-element spec tables in
-// docs/INSTALLER_UI_DESIGN.html (five 640x480 screens: intro, disk
-// selection, destructive confirmation, progress, done/failure). Every color,
-// coordinate and behavior below traces to a row in one of that document's
-// tables; nothing here is invented chrome.
+// A LINEAR, STEPPED, ONE-TIME, HIGH-STAKES FLOW - which is the same thing the
+// first-boot wizard is, so it is now built the same way.
+//
+// WHAT CHANGED AND WHY (#appstyle). This app previously drew a 640x480 Motif
+// dialog from twenty-three hardcoded colour literals, with a comment stating
+// that it "intentionally does NOT follow the live system theme ... for
+// predictability". Two things were wrong with that:
+//
+//   1. It predates the contrast primitives. "Predictable" was achievable in
+//      2026-01 only by pinning hex, because there was no gui_ensure_contrast()
+//      to guarantee a derived colour cleared a floor. There is now, so the
+//      choice today is between a themed window that is GUARANTEED readable and
+//      a fixed slate-blue one that clashes with all 14 shipped themes.
+//   2. The first-boot wizard pins its palette for a REAL reason that does not
+//      apply here: it runs before a theme has been chosen. This app runs inside
+//      a themed desktop, launched from a themed desktop's menu.
+//
+// So the split is: the wizard's GEOMETRY, TYPE SCALE, CHROME and INTERACTION
+// GRAMMAR are adopted exactly; the PALETTE is derived from the active theme.
+// docs/UI_STYLE_GUIDE.md and the published restyle spec carry the tables.
+//
+// GEOMETRY, mirrored from userland/apps/setup/main.rs (CARD_W/CARD_H/CARD_PAD/
+// HDR_H at 1285-1290 there) so the two windows are literally the same object:
+//
+//     window / card   688 x 616, NOCHROME, shadowed, centred on the framebuffer
+//     CARD_PAD 24, HDR_H 48  ->  body origin (24, 72)
+//     body canvas     640 x 480; header strip is body y -48..0; footer 480..520
+//     step counter    centred, body y -40, size 24, accent
+//     page title      (32, 24)  size 20 bold
+//     page subtitle   (32, 54)  size 14
+//     Back button     (32, 440, 88, 28)
+//     primary button  (468, 440, 140, 28)
+//     step dots       pitch 24, centred on body x 320, cy 500
+//     focus ring      2px accent, drawn inward at (x-4, y-4, w+8, h+8)
+//
+// THREE DELIBERATE DIVERGENCES FROM THE WIZARD, stated here because each one
+// looks like a mistake if you diff the two files:
+//
+//   NO GLASS. setup/main.rs composites a real software box-blur of the
+//   wallpaper behind its card (three separable passes, per-pixel backdrop
+//   sampling for every one of ~30 alpha blends, plus unshared copies of the
+//   compositor's shadow and gradient constants). That is ~400 lines to
+//   replicate in C inside a destructive installer for cosmetic parity. This
+//   card is an opaque theme surface with the same radius, edge and shadow. If
+//   the glass is ever factored out of setup into libc, this app inherits it.
+//
+//   THE CIRCLES ARE DRAWN CORRECTLY HERE, WHICH MEANS THEY DO NOT MATCH THE
+//   WIZARD'S ARGUMENTS. gui_fill_circle_aa(h, x, y, d, ...) takes a TOP-LEFT
+//   and a DIAMETER (gui.c:812 forwards straight to gui_fill_rounded_aa with
+//   w=h=d, r=d/2). Every call in setup/main.rs passes a centre and a radius, so
+//   its radios, step dots, mask bullets and status discs render as small blobs
+//   offset down and right of where the author meant. This file calls it as
+//   documented and sizes the dots to match what the wizard VISUALLY produces
+//   (7px active, 6px inactive), not what its arguments claim.
+//
+//   SHARED WIDGETS, EVEN WHERE THE WIZARD HAND-ROLLS. gui_button() and
+//   gui_progress() are imported by setup/main.rs and called only from dead
+//   code; it hand-rolls both. Copying a documented piece of debt is not
+//   "following the design" - the design is the layout and the type. Buttons
+//   keep the wizard's rects and get the theme's own rendering. The disk list is
+//   a gui_list_t, which is also how its scrollbar became real: the old one was
+//   PAINTED, with no drag handler, no page handler, and no EVENT_MOUSE_SCROLL
+//   case anywhere in this file.
 //
 // ENGINE REALITY NOTE (read before touching the progress screen). The kernel
 // exposes exactly two syscalls for this: SYS_INST_ENUM (365, non-destructive
-// enumeration) and SYS_INST_INSTALL (366, DESTRUCTIVE, root-only). The design
-// spec's progress screen assumes a live percent/stage feed, but
-// installer_do_install_target() in kernel/gui/installer.c reports progress
-// ONLY to kprintf (kernel serial log) - there is no syscall, shared memory,
-// or callback path back to Ring 3 while the call is in flight, and it BLOCKS
-// the calling thread until the clone finishes. So: a background pthread
-// makes the single blocking inst_install() call while the main GUI thread
-// keeps pumping window events, and the percent/stage text shown is a
-// time-estimated approximation (scaled off the target's sector count),
-// capped at 95% until the real syscall returns, at which point we go
-// straight to the real success/failure result. It never claims 100%/
-// "Complete." before the engine has genuinely finished, and it never gets
-// stuck: the one number that matters (did the install actually succeed) is
-// always the syscall's real return code, never guessed.
-//
-// NOCHROME: this window carries no compositor decoration (win_set_nochrome);
-// the app draws its own 20px titlebar and close box. See docs/UI_STYLE_GUIDE.md
-// and userland/apps/aichat|musicplayer for the established NOCHROME idiom.
+// enumeration) and SYS_INST_INSTALL (366, DESTRUCTIVE, root-only).
+// installer_do_install_target() in kernel/gui/installer.c reports progress ONLY
+// to kprintf (kernel serial log) - there is no syscall, shared memory, or
+// callback path back to Ring 3 while the call is in flight, and it BLOCKS the
+// calling thread until the clone finishes. So: a background pthread makes the
+// single blocking inst_install() call while the main GUI thread keeps pumping
+// window events, and the percent/stage shown is a time-estimated approximation
+// (scaled off the target's sector count), capped at 95% until the real syscall
+// returns. It never claims 100%/"Complete." before the engine has genuinely
+// finished, and it never gets stuck: the one number that matters (did the
+// install actually succeed) is always the syscall's real return code.
 
 #include "maytera.h"
 #include "gui.h"
+#include "gui_style.h"
+#include "gui_list.h"
+#include "theme.h"
 #include "pthread.h"
 
 // ---------------------------------------------------------------------------
-// Geometry (fixed 640x480, never resizes; see spec section 11)
+// Geometry. Body-local unless a name says WIN_.
 // ---------------------------------------------------------------------------
-#define WIN_W 640
-#define WIN_H 480
+#define WIN_W       688
+#define WIN_H       616
+#define CARD_PAD    24
+#define HDR_H       48
+#define ORG_X       CARD_PAD
+#define ORG_Y       (CARD_PAD + HDR_H)
+#define BODY_W      640
+#define BODY_H      480
+#define FOOT_Y      440
+#define BTN_H       28
+#define DOT_Y       500
+#define DOT_PITCH   24
+#define CONTENT_X   32
+#define CONTENT_W   576
+
+// Type scale. SIZE UNITS, not CSS px: kernel/gui/ttf.c scales with
+// stbtt_ScaleForPixelHeight(), which maps ascent-descent (not the em square)
+// onto the number, so one unit is 0.859 em px on the shipped DejaVu Sans and
+// TY_BODY renders at em 12.03px. Reading 12 off a mockup ships everything 14%
+// small; that has already happened once in this tree.
+#define TY_STEP     24
+#define TY_HEADING  20
+#define TY_TITLE    16
+#define TY_BODY     14
+#define TY_CAPTION  11
 
 // ---------------------------------------------------------------------------
-// Colors - literal hex from spec section 1. This app intentionally does NOT
-// follow the live system theme: it is a destructive, security-relevant
-// dialog and the spec's own callout is explicit that it inherits the
-// Settings/Files retro-unix chrome language regardless of what theme is
-// active elsewhere, for predictability. Every value below is transcribed
-// from the design doc's color table, not derived from gui_pal()/theme.h.
+// Palette, derived once from the active theme.
+//
+// Every field is walked to a WCAG floor by the shared contrast primitives
+// rather than eyeballed: text to 4.5:1 against the surface it lands on,
+// boundaries to the 3:1 non-text floor (asked at GUI_AIM_NONTEXT so a theme
+// edit or a rounding difference cannot push it back under). That is what buys
+// back the "predictability" the old hardcoded palette was reaching for, without
+// buying it by ignoring the user's theme.
 // ---------------------------------------------------------------------------
-#define C_BASE_BG        0x00AEB2C3
-#define C_BASE_FG        0x00000000
-#define C_ACCENT         0x004B6983
-#define C_ACCENT_SEC     0x008B8682
-#define C_TITLE_TEXT     0x00FFFFFF
-#define C_BORDER_LIGHT   0x00DCDAD5
-#define C_BORDER_DARK    0x00565248
-#define C_BORDER_OUTLINE 0x00000000
-#define C_BTN_BG         0x00C0C0C0
-#define C_BTN_HOVER      0x00D0D0D0
-#define C_BTN_PRESSED    0x00A0A0A0
-#define C_BTN_HI         0x00FFFFFF
-#define C_BTN_SH         0x00808080
-#define C_BTN_OUTER_SH   0x00404040
-#define C_INPUT_BG       0x00FFFFFF
-#define C_SEL_BG         0x004B6983
-#define C_SEL_FG         0x00FFFFFF
-#define C_ERROR          0x00CC0000
-#define C_SUCCESS        0x004E9A06
-#define C_DISABLED_FG    0x00808080
-#define C_DISABLED_BG    0x00D4D4D4
-#define C_ROW_HOVER      0x00ECECEC
-#define C_DANGER_HI      0x00E33B2E
-#define C_DANGER_SH      0x008C0000
+typedef struct {
+    uint32_t card;        // the wizard card's own fill
+    uint32_t inner;       // a card-on-card fill (list, target panel, chips)
+    uint32_t edge;        // resting boundary on `card`
+    uint32_t ink;         // primary text on `card`
+    uint32_t dim;         // secondary text on `card`
+    uint32_t ink_inner;   // primary text on `inner`
+    uint32_t dim_inner;   // secondary text on `inner`
+    uint32_t accent;      // step counter, focus, selection, progress fill (on `card`)
+    uint32_t accent_inner;// the same role when it lands on `inner`
+    uint32_t on_accent;
+    uint32_t danger;      // the destructive tokens, on `card`
+    uint32_t danger_soft; // a danger-toned fill (pills, callouts)
+    uint32_t danger_ink;  // danger text ON danger_soft
+    uint32_t success;
+    uint32_t disabled;    // disabled ink
+    int      radius;      // GUI_RADIUS, clamped
+    int      dark;
+} pal_t;
+static pal_t T;
+
+static uint32_t mix_pct(uint32_t base, uint32_t over, int pct) {
+    return gui_mix(base, over, (pct * 255) / 100);
+}
+static int is_dark(uint32_t c) {
+    return (((c >> 16 & 255) * 30 + (c >> 8 & 255) * 59 + (c & 255) * 11) / 100) < 128;
+}
+
+static void build_palette(void) {
+    // Read the ACTIVE theme's decor family first. Skipping this is how an app
+    // ends up rounded and shadowed on top of a beveled retro theme.
+    gui_style_sync_from_theme();
+
+    uint32_t wb  = theme_color(THEME_COLOR_WINDOW_BG);
+    uint32_t acc = theme_color(THEME_COLOR_ACCENT);
+    if (!acc) acc = 0x00336666;
+    T.dark = is_dark(wb);
+
+    // Same two seed greys Files uses (fp_content / fp_field), tinted 5-6% toward
+    // the accent so the window belongs to the theme rather than merely sitting
+    // in front of it.
+    T.card  = mix_pct(T.dark ? 0x00262A30 : 0x00F5F6F8, acc, 5);
+    T.inner = T.dark ? 0x00333A45 : 0x00FFFFFF;
+
+    T.ink       = gui_ink_on(T.card);
+    T.ink_inner = gui_ink_on(T.inner);
+    // Dim = 5/8 toward the ink (Files' bias, which exists because a 50/50
+    // average measured 3.26:1 on retro_unix), then guaranteed at the text floor.
+    {
+        uint32_t k = T.ink, b = T.card;
+        uint32_t d = ((((k >> 16 & 255) * 5 + (b >> 16 & 255) * 3) / 8) << 16) |
+                     ((((k >> 8  & 255) * 5 + (b >> 8  & 255) * 3) / 8) << 8)  |
+                      (((k       & 255) * 5 + (b       & 255) * 3) / 8);
+        T.dim = gui_ensure_contrast(d, T.card, GUI_FLOOR_TEXT);
+        k = T.ink_inner; b = T.inner;
+        d = ((((k >> 16 & 255) * 5 + (b >> 16 & 255) * 3) / 8) << 16) |
+            ((((k >> 8  & 255) * 5 + (b >> 8  & 255) * 3) / 8) << 8)  |
+             (((k       & 255) * 5 + (b       & 255) * 3) / 8);
+        T.dim_inner = gui_ensure_contrast(d, T.inner, GUI_FLOOR_TEXT);
+    }
+    // The accent carries the step counter and the "you are here" dot, which are
+    // TEXT and a MARK respectively, on `card`. It has to clear the text floor,
+    // and on four shipped themes the raw accent does not.
+    // ONE ROLE, TWO SURFACES, TWO COLOURS. A colour walked to a floor is only
+    // guaranteed against the background it was walked against, and every field
+    // below that appears twice does so because this window has two surfaces.
+    // MEASURED on Modern Dark with a single `accent`: the step counter (on
+    // `card`) cleared 4.58:1 while the SAME ink on the "WHAT HAPPENS" card
+    // measured 3.82:1, and a single `danger` put "CURRENT BOOT DEVICE" at
+    // 3.47:1 on its own pill. Both are the identical mistake, one surface apart.
+    T.accent       = gui_ensure_contrast(acc, T.card,  GUI_FLOOR_TEXT);
+    T.accent_inner = gui_ensure_contrast(acc, T.inner, GUI_FLOOR_TEXT);
+    // gui_ink_on() picks black or white off one luminance threshold, which is a
+    // guess. On Modern Dark's #0A84FF that guess MEASURED 3.20:1 in the sibling
+    // app's selected row. On accent discs here it carries a numeral and a check
+    // mark, so walk it to the text floor against the fill it actually lands on.
+    T.on_accent = gui_ensure_contrast(gui_ink_on(acc), acc, GUI_FLOOR_TEXT);
+    T.edge      = gui_ensure_contrast2(theme_color(THEME_COLOR_WINDOW_BORDER) ?
+                                       theme_color(THEME_COLOR_WINDOW_BORDER) : acc,
+                                       T.card, T.inner, GUI_AIM_NONTEXT);
+    {
+        uint32_t e = theme_color(THEME_COLOR_ERROR);   if (!e) e = 0x00CC0000;
+        uint32_t g = theme_color(THEME_COLOR_SUCCESS); if (!g) g = 0x00006600;
+        T.danger      = gui_ensure_contrast(e, T.card, GUI_FLOOR_TEXT);
+        T.danger_soft = mix_pct(T.card, e, T.dark ? 24 : 12);
+        T.danger_ink  = gui_ensure_contrast(e, T.danger_soft, GUI_FLOOR_TEXT);
+        T.success     = gui_ensure_contrast(g, T.card, GUI_FLOOR_TEXT);
+    }
+    // Disabled ink lands on the LIST fill (T.inner), not on the card, and it is
+    // held to the 3:1 non-text floor rather than 4.5:1 for the same reason
+    // gui_button()'s disabled label is: WCAG exempts a disabled control, and
+    // lifting it to full text contrast would delete the difference between
+    // "you can choose this disk" and "you cannot", which is the entire job of
+    // the state on this screen.
+    T.disabled = gui_ensure_contrast(mix_pct(T.inner, T.ink, 45), T.inner,
+                                     GUI_FLOOR_NONTEXT);
+
+    T.radius = GUI_RADIUS;
+    if (T.radius < 0)  T.radius = 0;
+    if (T.radius > 16) T.radius = 16;
+
+    gui_palette_t p;
+    p.surface = T.card; p.surface_raised = T.inner;
+    p.ink = T.ink; p.ink_dim = T.dim;
+    p.accent = acc; p.accent_hover = gui_lighten(acc, 24);
+    p.border = T.edge; p.field_bg = T.inner; p.field_border = T.edge;
+    p.track = mix_pct(T.card, acc, 20);
+    gui_set_palette(&p);
+}
 
 // ---------------------------------------------------------------------------
 // Screens
@@ -113,16 +277,17 @@ static int g_running = 1;
 static int g_focus = 0;
 static int g_hover_row = -1;   // hovered disk-list row (mouse), or -1
 
-// Screen 2 list scroll (first visible row index), for the rare >4-disk case.
-static int g_list_scroll = 0;
-#define ROW_H       68
-#define LIST_X      8
-#define LIST_Y      112
-#define LIST_W      624
-#define LIST_H      280
-#define ROW_X       12
-#define ROW_W       616
-#define LIST_VISIBLE_ROWS (LIST_H / ROW_H)   // 4
+// Screen 2 disk list. gui_list_t owns the geometry AND the input, which is how
+// the scrollbar stopped being decoration: the previous code painted a thumb
+// with gui_draw_scrollbar_v() and had no drag handler, no page handler, and no
+// EVENT_MOUSE_SCROLL case anywhere in the file, so with more than four disks
+// the list was keyboard-only and the scrollbar was a picture of a control.
+static gui_list_t g_list;
+#define ROW_H       76
+#define LIST_X      (CONTENT_X)
+#define LIST_Y      92
+#define LIST_W      (CONTENT_W)
+#define LIST_H      306          // 1 + 4*76 + 1
 
 // Screen 3 confirm field
 static textfield_t g_tf;
@@ -172,157 +337,185 @@ static const char *bus_word(int kind) {
     return "disk";
 }
 
-// Greedy word-wrap into caller-supplied line buffers, measured with the real
-// TTF metrics (gui_ttf_width), so layout holds even if wording changes.
-#define WRAP_LINE_MAX 160
-static int wrap_text(const char *s, int maxw, int size, char lines[][WRAP_LINE_MAX], int maxlines) {
-    int nlines = 0;
-    int i = 0, n = (int)strlen(s);
-    while (i < n && nlines < maxlines) {
-        int start = i, last_space = -1, len = 0;
-        char buf[WRAP_LINE_MAX]; buf[0] = '\0';
-        while (i < n) {
-            int j = i;
-            while (j < n && s[j] != ' ') j++;
-            int wordlen = j - start >= WRAP_LINE_MAX ? WRAP_LINE_MAX - 1 : j - start;
-            char trial[WRAP_LINE_MAX];
-            int tlen = j - start; if (tlen > WRAP_LINE_MAX - 1) tlen = WRAP_LINE_MAX - 1;
-            memcpy(trial, s + start, (size_t)tlen); trial[tlen] = '\0';
-            (void)wordlen;
-            if (gui_ttf_width(trial, size) > maxw && len > 0) break;
-            memcpy(buf, s + start, (size_t)tlen); buf[tlen] = '\0';
-            len = tlen;
-            if (j < n && s[j] == ' ') { last_space = j; i = j + 1; }
-            else { i = j; break; }
-            (void)last_space;
-        }
-        strncpy(lines[nlines], buf, WRAP_LINE_MAX - 1); lines[nlines][WRAP_LINE_MAX - 1] = '\0';
-        nlines++;
-        start = start; // silence unused in some paths
-    }
-    return nlines;
-}
+// Word-wrap. gui_wrap_text_ttf() is the SHARED greedy wrapper (it measures with
+// the real glyph metrics, hard-breaks a word wider than the box so it can never
+// escape, and ellipsizes what is left once max_lines is reached). The private
+// 24-line implementation that used to live here had two dead locals and a
+// no-op self-assignment; deleting it is the point of having a shared one.
+#define WRAP_LINE_MAX GUI_WRAP_COL
 
 // ---------------------------------------------------------------------------
-// Text drawing helpers (face 0 = system default DejaVu Sans; the kernel
-// renderer resolves FONT_STYLE_BOLD to the real enrolled DejaVu Sans Bold
-// face rather than synthetic emboldening - see userland/apps/settings/main.c
-// draw_section_header()'s comment, and spec section 2's "real Bold face").
+// Text. Face 0 = the system default DejaVu Sans; the kernel renderer resolves
+// FONT_STYLE_BOLD to the REAL enrolled DejaVu Sans Bold face rather than
+// synthesising it, so bold here is an outline, not a smear.
+//
+// EVERY x/y BELOW IS BODY-LOCAL. The (ORG_X, ORG_Y) translation is applied
+// exactly ONCE, here, the same discipline setup/main.rs uses (body_to_win at
+// its line 1410). Applying it at the call sites instead is how a page ends up
+// shifted by (24, 72) in one place and not another.
 // ---------------------------------------------------------------------------
 static void ttext(int x, int y, const char *s, uint32_t color, int size, int bold) {
-    win_draw_text_ttf_ex(g_win, x, y, s, 0, size, bold ? FONT_STYLE_BOLD : 0, color);
+    win_draw_text_ttf_ex(g_win, ORG_X + x, ORG_Y + y, s, 0, size,
+                         bold ? FONT_STYLE_BOLD : 0, color);
+}
+// Bold measures ONE PIXEL PER GLYPH wider than gui_ttf_width() reports, because
+// the renderer's bold is applied after measurement. Centring or right-aligning
+// a bold run on the unadjusted width overflows the box; this is the one place
+// that correction lives.
+static int tw_of(const char *s, int size, int bold) {
+    int w = gui_ttf_width(s, size);
+    if (bold) { int n = 0; while (s[n]) n++; w += n; }
+    return w;
 }
 static void ttext_centered(int x, int y, int w, const char *s, uint32_t color, int size, int bold) {
-    int tw = gui_ttf_width(s, size);
-    int tx = x + (w - tw) / 2; if (tx < x) tx = x;
-    win_draw_text_ttf_ex(g_win, tx, y, s, 0, size, bold ? FONT_STYLE_BOLD : 0, color);
+    int tx = x + (w - tw_of(s, size, bold)) / 2; if (tx < x) tx = x;
+    ttext(tx, y, s, color, size, bold);
 }
 static void ttext_right(int x, int y, int w, const char *s, uint32_t color, int size, int bold) {
-    int tw = gui_ttf_width(s, size);
-    int tx = x + w - tw; if (tx < x) tx = x;
-    win_draw_text_ttf_ex(g_win, tx, y, s, 0, size, bold ? FONT_STYLE_BOLD : 0, color);
+    int tx = x + w - tw_of(s, size, bold); if (tx < x) tx = x;
+    ttext(tx, y, s, color, size, bold);
 }
-
-// ---------------------------------------------------------------------------
-// Bevel primitives
-// ---------------------------------------------------------------------------
-static void sunken(int x, int y, int w, int h, uint32_t fill, uint32_t dark, uint32_t light) {
-    win_draw_rect(g_win, x, y, w, h, fill);
-    win_draw_rect(g_win, x, y, w, 1, dark);          // top
-    win_draw_rect(g_win, x, y, 1, h, dark);          // left
-    win_draw_rect(g_win, x, y + h - 1, w, 1, light); // bottom
-    win_draw_rect(g_win, x + w - 1, y, 1, h, light); // right
+static void bfill(int x, int y, int w, int h, uint32_t c) {
+    win_draw_rect(g_win, ORG_X + x, ORG_Y + y, w, h, c);
 }
-#define sunken_panel(x,y,w,h) sunken((x),(y),(w),(h), C_BTN_BG,  C_BORDER_DARK, C_BORDER_LIGHT)
-#define sunken_white(x,y,w,h) sunken((x),(y),(w),(h), C_INPUT_BG, C_BTN_SH,     C_INPUT_BG)
-
-enum { BTN_NORMAL = 0, BTN_HOVER, BTN_PRESSED, BTN_DISABLED };
-
-// Motif push button, style guide 6.1 / spec section 4.1.
-static void draw_button(int x, int y, int w, int h, const char *label, int state,
-                         int is_default, int is_danger, int has_focus) {
-    uint32_t fill, hi, sh, text_color;
-    if (state == BTN_DISABLED) {
-        fill = is_danger ? C_DISABLED_BG : C_BTN_BG;
-        win_draw_rect(g_win, x, y, w, h, fill);
-        win_draw_rect(g_win, x, y, w, 1, C_DISABLED_FG);
-        win_draw_rect(g_win, x, y, 1, h, C_DISABLED_FG);
-        win_draw_rect(g_win, x, y + h - 1, w, 1, C_DISABLED_FG);
-        win_draw_rect(g_win, x + w - 1, y, 1, h, C_DISABLED_FG);
-        ttext_centered(x, y + (h - 14) / 2, w, label, C_DISABLED_FG, 14, is_danger);
-        return;
+// Inward frame: four rects, entirely inside (x,y,w,h). An outward border on a
+// card edge is what produces the stray-pixel fringe the style engine spent #612
+// removing.
+static void bframe(int x, int y, int w, int h, int t, uint32_t c) {
+    for (int i = 0; i < t; i++) {
+        bfill(x + i, y + i, w - 2 * i, 1, c);
+        bfill(x + i, y + h - 1 - i, w - 2 * i, 1, c);
+        bfill(x + i, y + i, 1, h - 2 * i, c);
+        bfill(x + w - 1 - i, y + i, 1, h - 2 * i, c);
     }
-    if (is_danger) { fill = C_ERROR; hi = C_DANGER_HI; sh = C_DANGER_SH; text_color = C_SEL_FG; }
-    else {
-        fill = (state == BTN_HOVER) ? C_BTN_HOVER : (state == BTN_PRESSED) ? C_BTN_PRESSED : C_BTN_BG;
-        hi = C_BTN_HI; sh = C_BTN_SH; text_color = C_BASE_FG;
-    }
-    win_draw_rect(g_win, x, y, w, h, fill);
-    if (state == BTN_PRESSED) {
-        win_draw_rect(g_win, x, y, w, 1, sh);
-        win_draw_rect(g_win, x, y, 1, h, sh);
-        win_draw_rect(g_win, x, y + h - 1, w, 1, hi);
-        win_draw_rect(g_win, x + w - 1, y, 1, h, hi);
-    } else {
-        win_draw_rect(g_win, x, y, w, 1, hi);
-        win_draw_rect(g_win, x, y, 1, h, hi);
-        win_draw_rect(g_win, x, y + h - 1, w, 1, sh);
-        win_draw_rect(g_win, x + w - 1, y, 1, h, sh);
-        win_draw_rect(g_win, x + w, y + 1, 1, h, C_BTN_OUTER_SH);
-        win_draw_rect(g_win, x + 1, y + h, w, 1, C_BTN_OUTER_SH);
-    }
-    ttext_centered(x, y + (h - 14) / 2, w, label, text_color, 14, is_danger);
-    if (is_default) {
-        win_draw_rect(g_win, x - 2, y - 2, w + 4, 1, C_ACCENT);
-        win_draw_rect(g_win, x - 2, y + h + 1, w + 4, 1, C_ACCENT);
-        win_draw_rect(g_win, x - 2, y - 2, 1, h + 4, C_ACCENT);
-        win_draw_rect(g_win, x + w + 1, y - 2, 1, h + 4, C_ACCENT);
-    }
-    if (has_focus) {
-        // 1px dotted focus ring, inset 3px. No dotted-line primitive exists,
-        // so this is a dashed rect of 1px-on/1px-off segments (spec 4.1's own
-        // fallback instruction), never a solid ring (would look like the
-        // default-action marker above).
-        int fx = x + 3, fy = y + 3, fw = w - 6, fh = h - 6;
-        for (int i = 0; i < fw; i += 2) win_draw_rect(g_win, fx + i, fy, 1, 1, C_BASE_FG);
-        for (int i = 0; i < fw; i += 2) win_draw_rect(g_win, fx + i, fy + fh - 1, 1, 1, C_BASE_FG);
-        for (int i = 0; i < fh; i += 2) win_draw_rect(g_win, fx, fy + i, 1, 1, C_BASE_FG);
-        for (int i = 0; i < fh; i += 2) win_draw_rect(g_win, fx + fw - 1, fy + i, 1, 1, C_BASE_FG);
-    }
+}
+static void bround(int x, int y, int w, int h, int r, uint32_t fill, uint32_t bg) {
+    gui_fill_rounded_aa(g_win, ORG_X + x, ORG_Y + y, w, h, r, fill, bg);
+}
+// (cx, cy) is the CENTRE. gui_fill_circle_aa() takes a TOP-LEFT and a DIAMETER
+// (gui.c:812); setup/main.rs passes centre+radius to it and therefore draws
+// every one of its circles offset down-right of where it meant to. This wrapper
+// is why that bug cannot be reproduced here.
+static void bcircle(int cx, int cy, int d, uint32_t fill, uint32_t bg) {
+    gui_fill_circle_aa(g_win, ORG_X + cx - d / 2, ORG_Y + cy - d / 2, d, fill, bg);
+}
+static void bring(int cx, int cy, int d, int t, uint32_t col, uint32_t bg) {
+    bcircle(cx, cy, d, col, bg);
+    bcircle(cx, cy, d - 2 * t, bg, col);
+}
+// The wizard's focus ring, verbatim: 2px accent, 2px clear of the control.
+static void focus_ring(int x, int y, int w, int h) {
+    bframe(x - 4, y - 4, w + 8, h + 8, 2, T.accent);
+}
+// A drawn check mark, centred on (cx, cy). The shipped face has no check glyph
+// and "OK" set at TY_CAPTION overflows a 14px disc, which is what the first
+// build of this screen shipped: two letters spilling past the circle they were
+// meant to sit inside. gui_thick_line() is the shared stroke primitive.
+static void check_mark(int cx, int cy, int d, uint32_t col) {
+    int a = d / 4;                      // arm scale
+    gui_thick_line(g_win, ORG_X + cx - a - 1, ORG_Y + cy,
+                          ORG_X + cx - 1,     ORG_Y + cy + a,     d > 20 ? 4 : 2, col);
+    gui_thick_line(g_win, ORG_X + cx - 1,     ORG_Y + cy + a,
+                          ORG_X + cx + a + 1, ORG_Y + cy - a,     d > 20 ? 4 : 2, col);
 }
 
 static int pt_in(int px, int py, int x, int y, int w, int h) {
     return px >= x && px < x + w && py >= y && py < y + h;
 }
+// Window-local -> body-local, applied once, in the event loop.
+static int b_x(int wx) { return wx - ORG_X; }
+static int b_y(int wy) { return wy - ORG_Y; }
 
 // ---------------------------------------------------------------------------
-// Chrome (self-drawn titlebar + close box; every screen)
+// Card + shared chrome
 // ---------------------------------------------------------------------------
-static void draw_chrome(int closebox_enabled) {
-    win_draw_rect(g_win, 0, 0, WIN_W, WIN_H, C_BASE_BG);
-    win_draw_rect(g_win, 0, 0, WIN_W, 20, C_ACCENT);
-    ttext(8, 2, "Install to Disk", C_TITLE_TEXT, 16, 0);
-    if (closebox_enabled) {
-        win_draw_rect(g_win, 616, 2, 16, 16, C_BTN_BG);
-        win_draw_rect(g_win, 616, 2, 16, 1, C_BTN_HI);
-        win_draw_rect(g_win, 616, 2, 1, 16, C_BTN_HI);
-        win_draw_rect(g_win, 616, 17, 16, 1, C_BTN_SH);
-        win_draw_rect(g_win, 631, 2, 1, 16, C_BTN_SH);
-        ttext_centered(616, 5, 16, "X", C_BASE_FG, 10, 1);
-    } else {
-        win_draw_rect(g_win, 616, 2, 16, 16, C_DISABLED_BG);
-        win_draw_rect(g_win, 616, 2, 16, 1, C_DISABLED_FG);
-        win_draw_rect(g_win, 616, 2, 1, 16, C_DISABLED_FG);
-        win_draw_rect(g_win, 616, 17, 16, 1, C_DISABLED_FG);
-        win_draw_rect(g_win, 631, 2, 1, 16, C_DISABLED_FG);
-        ttext_centered(616, 5, 16, "X", C_DISABLED_FG, 10, 1);
+// Which of the five screens carries a step counter and a dot. The Applying and
+// Done pages carry NEITHER, matching setup/main.rs (PG_APPLY and PG_DONE are
+// absent from its STEP_PAGES table): once the destructive work has started,
+// "step 4 of 5" invites a user to think there is a step 5 they could still get
+// to, and there is not.
+#define NSTEPS 3
+static int step_of(int screen) {
+    switch (screen) {
+        case SCR_INTRO:   return 1;
+        case SCR_DISKS:   return 2;
+        case SCR_CONFIRM: return 3;
+        default:          return 0;    // no counter, no dots
     }
-    win_draw_rect(g_win, 0, 20, WIN_W, 1, C_BORDER_OUTLINE);
-    win_draw_rect(g_win, 8, 436, 624, 1, C_BORDER_DARK);
-    win_draw_rect(g_win, 8, 437, 624, 1, C_BORDER_LIGHT);
 }
 
-static int closebox_hit(int mx, int my) { return pt_in(mx, my, 616, 2, 16, 16); }
+static void draw_card(void) {
+    // The card IS the window (NOCHROME), so the whole surface is ours.
+    if (T.radius > 0) {
+        // The AA edge blends toward what is BEHIND the window. There is no
+        // framebuffer read-back in this renderer, so the honest answer is the
+        // card's own colour: a rounded card on an unknown desktop cannot know
+        // its backdrop, and guessing a light grey is how the App Store got a
+        // white fringe on a dark theme (#612).
+        gui_fill_rounded_aa(g_win, 0, 0, WIN_W, WIN_H, T.radius, T.card, T.card);
+        gui_rounded_border(g_win, 0, 0, WIN_W, WIN_H, T.radius, T.edge);
+    } else {
+        win_draw_rect(g_win, 0, 0, WIN_W, WIN_H, T.card);
+        uint32_t sh, hi;
+        gui_bevel_pair(T.card, &sh, &hi);
+        win_draw_rect(g_win, 0, 0, WIN_W, 1, hi);
+        win_draw_rect(g_win, 0, 0, 1, WIN_H, hi);
+        win_draw_rect(g_win, 0, WIN_H - 1, WIN_W, 1, sh);
+        win_draw_rect(g_win, WIN_W - 1, 0, 1, WIN_H, sh);
+    }
+}
+
+static void draw_dots(int step) {
+    int span = (NSTEPS - 1) * DOT_PITCH;
+    int x0 = BODY_W / 2 - span / 2;
+    uint32_t off = mix_pct(T.card, T.ink, 40);
+    for (int k = 0; k < NSTEPS; k++) {
+        int cx = x0 + k * DOT_PITCH;
+        if (k == step - 1) bcircle(cx, DOT_Y, 7, T.accent, T.card);
+        else               bcircle(cx, DOT_Y, 6, off,      T.card);
+    }
+}
+
+// title/subtitle pair + counter + dots. subtitle may be NULL.
+static void draw_head(const char *title, const char *subtitle) {
+    int step = step_of(g_screen);
+    if (step) {
+        char buf[32];
+        snprintf(buf, sizeof buf, "Step %d of %d", step, NSTEPS);
+        ttext_centered(0, -40, BODY_W, buf, T.accent, TY_STEP, 0);
+        draw_dots(step);
+    }
+    ttext(CONTENT_X, 24, title, T.ink, TY_HEADING, 1);
+    if (subtitle) {
+        char lines[2][WRAP_LINE_MAX];
+        int n = gui_wrap_text_ttf(subtitle, TY_BODY, CONTENT_W, 2, lines);
+        for (int i = 0; i < n; i++)
+            ttext(CONTENT_X, 54 + i * 20, lines[i], T.dim, TY_BODY, 0);
+    }
+}
+
+// Footer. `back` is the left control (NULL hides it); `act` the right one.
+// Both rects are the wizard's, and BOTH the draw and the hit-test read them
+// from these two macros, so they cannot disagree.
+#define BACK_X 32
+#define BACK_W 88
+static int g_act_x = 468, g_act_w = 140;
+static void draw_footer(const char *back, const char *act,
+                        gui_btn_variant_t act_var, int act_enabled,
+                        int act_x, int act_w) {
+    g_act_x = act_x; g_act_w = act_w;
+    if (back) {
+        gui_button(g_win, ORG_X + BACK_X, ORG_Y + FOOT_Y, BACK_W, BTN_H, back,
+                   GUI_BTN_SECONDARY, g_focus == 1 ? GUI_ST_FOCUS : GUI_ST_NORMAL);
+        if (g_focus == 1) focus_ring(BACK_X, FOOT_Y, BACK_W, BTN_H);
+    }
+    if (act) {
+        gui_button(g_win, ORG_X + act_x, ORG_Y + FOOT_Y, act_w, BTN_H, act, act_var,
+                   !act_enabled ? GUI_ST_DISABLED
+                                : (g_focus == 2 ? GUI_ST_FOCUS : GUI_ST_NORMAL));
+        if (g_focus == 2 && act_enabled) focus_ring(act_x, FOOT_Y, act_w, BTN_H);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Disk enumeration + classification (section 3, 6.1)
@@ -367,177 +560,307 @@ static void enumerate_disks(void) {
         g_nrows++;
     }
     g_selected = -1;
-    g_list_scroll = 0;
+    gui_list_config(&g_list, ORG_X + LIST_X, ORG_Y + LIST_Y, LIST_W, LIST_H, ROW_H, g_nrows);
 }
 
 // ---------------------------------------------------------------------------
-// Screen 1: Intro
+// Screen 1: Before you begin
 // ---------------------------------------------------------------------------
 static void draw_intro(void) {
-    draw_chrome(1);
-    ttext(8, 28, "Install MayteraOS to Disk", C_BASE_FG, 20, 1);
+    draw_card();
+    draw_head("Before you begin",
+              "This copies MayteraOS onto an internal disk so this computer can start on "
+              "its own, without the USB stick.");
 
-    char lines[4][WRAP_LINE_MAX];
-    int nl = wrap_text("This installs MayteraOS onto an internal disk so this computer can start "
-                        "MayteraOS on its own, without the USB stick.", 624, 14, lines, 4);
-    for (int i = 0; i < nl; i++) ttext(8, 64 + i * 20, lines[i], C_BASE_FG, 14, 0);
+    // What is about to happen, as three consequences rather than two
+    // paragraphs. A numbered list is honest here: this IS an ordered sequence,
+    // which is the only thing that licenses numbered markers.
+    int cx = CONTENT_X, cy = 112, cw = CONTENT_W, ch = 156;
+    bround(cx, cy, cw, ch, T.radius, T.inner, T.card);
+    bframe(cx, cy, cw, ch, 1, T.edge);
+    ttext(cx + 16, cy + 14, "WHAT HAPPENS", T.accent_inner, TY_CAPTION, 1);
 
-    nl = wrap_text("The installer erases the disk you choose in the next step and copies the full "
-                    "system onto it. Choose the destination disk carefully: everything currently "
-                    "stored on it will be permanently lost.", 624, 14, lines, 4);
-    for (int i = 0; i < nl; i++) ttext(8, 112 + i * 20, lines[i], C_BASE_FG, 14, 0);
+    static const char *steps[3] = {
+        "You choose a destination disk. The disk MayteraOS is running from is listed "
+        "but can never be chosen.",
+        "That disk is erased: its partition table and every file on it are replaced.",
+        "MayteraOS is copied onto it and made bootable."
+    };
+    int iy = cy + 40;
+    for (int i = 0; i < 3; i++) {
+        bcircle(cx + 24, iy + 7, 16, T.accent, T.inner);
+        char n[4]; snprintf(n, sizeof n, "%d", i + 1);
+        // Centre on the DISC's centre, and on the type's own line box, not on a
+        // guessed offset: TY_CAPTION's ink is TY_CAPTION tall by definition.
+        ttext_centered(cx + 16, iy + 7 - TY_CAPTION / 2, 16, n, T.on_accent, TY_CAPTION, 1);
+        char lines[2][WRAP_LINE_MAX];
+        int nl = gui_wrap_text_ttf(steps[i], TY_BODY, cw - 60, 2, lines);
+        for (int k = 0; k < nl; k++)
+            ttext(cx + 44, iy + k * 18, lines[k], T.ink_inner, TY_BODY, 0);
+        iy += (nl > 1) ? 40 : 34;
+    }
 
-    sunken_panel(8, 184, 624, 72);
-    ttext(24, 196, "Note:", C_BASE_FG, 14, 1);
-    nl = wrap_text("The next screen lists the disks this computer can see. The disk MayteraOS is "
-                    "running from right now is always shown but can never be selected.", 592, 14, lines, 4);
-    for (int i = 0; i < nl; i++) ttext(24, 216 + i * 20, lines[i], C_BASE_FG, 14, 0);
+    // The one thing a nervous user needs, as a callout rather than a footnote.
+    int wy = 292;
+    bround(CONTENT_X, wy, CONTENT_W, 46, T.radius, T.danger_soft, T.card);
+    bframe(CONTENT_X, wy, CONTENT_W, 46, 1, T.danger);
+    bcircle(CONTENT_X + 20, wy + 23, 14, T.danger, T.danger_soft);
+    ttext_centered(CONTENT_X + 13, wy + 17, 14, "!", T.on_accent, TY_CAPTION, 1);
+    ttext(CONTENT_X + 40, wy + 16,
+          "Nothing is written to any disk until you confirm on step 3.",
+          gui_ensure_contrast(T.ink, T.danger_soft, GUI_FLOOR_TEXT), TY_BODY, 0);
 
-    ttext(8, 408, "Installing requires root privileges.", C_BASE_FG, 11, 0);
-
-    draw_button(8, 448, 88, 24, "Quit", g_focus == 0 ? BTN_HOVER : BTN_NORMAL, 0, 0, g_focus == 0);
-    draw_button(536, 448, 96, 24, "Next >", g_focus == 1 ? BTN_HOVER : BTN_NORMAL, 1, 0, g_focus == 1);
+    ttext(CONTENT_X, 356, "Installing requires the root account.", T.dim, TY_CAPTION, 0);
+    draw_footer("Quit", "Continue", GUI_BTN_PRIMARY, 1, 468, 140);
 }
 
 // ---------------------------------------------------------------------------
-// Screen 2: Disk selection
+// Screen 2: Choose a disk
 // ---------------------------------------------------------------------------
-static void draw_row(int ry, disk_row_t *r, int idx) {
+static void draw_row(int ry, disk_row_t *r, int idx, int rw) {
     int selected = (idx == g_selected);
-    int hover = (idx == g_hover_row) && r->selectable && !selected;
-    uint32_t bg = r->is_boot || r->too_small ? C_DISABLED_BG
-                : selected ? C_SEL_BG
-                : hover ? C_ROW_HOVER
-                : C_INPUT_BG;
-    int h = ROW_H;
-    win_draw_rect(g_win, ROW_X, ry, ROW_W, h, bg);
+    int hover    = (idx == g_hover_row) && r->selectable && !selected;
+    int dis      = r->is_boot || r->too_small;
 
-    int icx = ROW_X + 16, icy = ry + 27;
-    if (r->is_boot || r->too_small) {
-        gui_draw_rect_outline(g_win, icx, icy, 14, 14, C_DISABLED_FG);
-    } else if (selected) {
-        gui_fill_circle_aa(g_win, icx, icy, 14, C_SEL_FG, bg);
-        gui_fill_circle_aa(g_win, icx + 2, icy + 2, 10, C_SEL_BG, C_SEL_FG);
-        gui_fill_circle_aa(g_win, icx + 3, icy + 3, 8, C_SEL_FG, C_SEL_BG);
-    } else {
-        gui_fill_circle_aa(g_win, icx, icy, 14, C_ACCENT_SEC, bg);
-        gui_fill_circle_aa(g_win, icx + 2, icy + 2, 10, bg, C_ACCENT_SEC);
+    if (selected) {
+        // A 12% accent wash plus a 3px rail, NOT a solid accent fill. A solid
+        // fill puts the row's secondary line (the model string) on the accent,
+        // where it measured unreadable on four shipped themes; the wash keeps
+        // both lines on a near-surface ground and lets the rail carry the
+        // "this one" signal.
+        bfill(LIST_X + 1, ry, rw, ROW_H, mix_pct(T.inner, T.accent, 12));
+        bfill(LIST_X + 1, ry, 3, ROW_H, T.accent);
+    } else if (hover) {
+        bfill(LIST_X + 1, ry, rw, ROW_H, mix_pct(T.inner, T.ink, 6));
     }
 
-    uint32_t text_c = (r->is_boot || r->too_small) ? C_DISABLED_FG : selected ? C_SEL_FG : C_BASE_FG;
-    ttext(ROW_X + 48, ry + 14, r->name, text_c, 14, 1);
-    ttext(ROW_X + 48, ry + 36, r->subtitle, text_c, 11, 0);
-    ttext_right(ROW_X + 456, ry + 14, 160, r->capstr, text_c, 14, selected);
-    if (r->is_boot) ttext(ROW_X + 48, ry + 50, "CURRENT BOOT DEVICE - cannot be selected", C_BASE_FG, 11, 1);
-    else if (r->too_small) ttext(ROW_X + 48, ry + 50, "TOO SMALL TO INSTALL", C_BASE_FG, 11, 1);
+    uint32_t ink  = dis ? T.disabled : T.ink_inner;
+    uint32_t dim  = dis ? T.disabled : T.dim_inner;
+    uint32_t bgc  = selected ? mix_pct(T.inner, T.accent, 12)
+                  : hover    ? mix_pct(T.inner, T.ink, 6) : T.inner;
+
+    int rcx = LIST_X + 31, rcy = ry + 38;
+    if (selected)      { bring(rcx, rcy, 16, 2, T.accent, bgc); bcircle(rcx, rcy, 8, T.accent, bgc); }
+    else if (dis)      { bring(rcx, rcy, 16, 2, T.disabled, bgc); }
+    else               { bring(rcx, rcy, 16, 2, T.edge, bgc); }
+
+    ttext(LIST_X + 56, ry + 16, r->name, ink, TY_TITLE, 1);
+    ttext(LIST_X + 56, ry + 40, r->subtitle, dim, TY_CAPTION, 0);
+    // Capacities right-align so digit places stack (style guide 4.5).
+    ttext_right(LIST_X, ry + 16, rw - 16, r->capstr, ink, TY_TITLE, selected);
+
+    // An ineligible row states WHY as a labelled pill, not as the only
+    // full-strength black sentence on an otherwise greyed row, which is what
+    // the old layout did and which made the warning the loudest thing in a
+    // control the user cannot use.
+    if (r->is_boot || r->too_small) {
+        const char *msg = r->is_boot ? "CURRENT BOOT DEVICE" : "TOO SMALL (needs 4 GB)";
+        uint32_t pf = r->is_boot ? T.danger_soft : mix_pct(T.inner, T.ink, 10);
+        uint32_t pt = r->is_boot ? T.danger_ink   : T.disabled;
+        int pw = tw_of(msg, TY_CAPTION, 1) + 12;
+        bround(LIST_X + 56, ry + 54, pw, 16, 3, pf, bgc);
+        ttext(LIST_X + 62, ry + 56, msg, pt, TY_CAPTION, 1);
+    }
 }
 
 static void draw_disks(void) {
-    draw_chrome(1);
-    ttext(8, 28, "Choose a Disk", C_BASE_FG, 20, 1);
-    ttext(8, 64, "Select the disk to install MayteraOS on. Everything on the selected disk will be erased.",
-          C_BASE_FG, 14, 0);
+    draw_card();
+    draw_head("Choose a disk",
+              "Everything on the disk you choose will be erased.");
 
-    sunken_white(LIST_X, LIST_Y, LIST_W, LIST_H);
+    gui_list_config(&g_list, ORG_X + LIST_X, ORG_Y + LIST_Y, LIST_W, LIST_H,
+                    ROW_H, g_nrows);
 
-    int visible = LIST_VISIBLE_ROWS;
-    for (int vi = 0; vi < visible; vi++) {
-        int idx = g_list_scroll + vi;
-        if (idx >= g_nrows) break;
-        int ry = LIST_Y + 4 + vi * ROW_H;
-        draw_row(ry, &g_rows[idx], idx);
-        if (vi < visible - 1 && idx + 1 < g_nrows) win_draw_rect(g_win, ROW_X, ry + ROW_H, ROW_W, 1, C_BTN_BG);
+    bround(LIST_X, LIST_Y, LIST_W, LIST_H, T.radius, T.inner, T.card);
+    bframe(LIST_X, LIST_Y, LIST_W, LIST_H, 1, T.edge);
+
+    int first = gui_list_first(&g_list), span = gui_list_span(&g_list);
+    int rw = gui_list_row_w(&g_list);
+    for (int i = first; i < first + span && i < g_nrows; i++) {
+        int wry;
+        if (!gui_list_row_y(&g_list, i, &wry)) continue;   // never draw off-box
+        int ry = b_y(wry);
+        draw_row(ry, &g_rows[i], i, rw);
+        if (i + 1 < g_nrows) bfill(LIST_X + 1, ry + ROW_H, rw, 1, T.edge);
     }
-    if (g_nrows > visible) {
-        int total = g_nrows * ROW_H;
-        int thumb = (LIST_H - 8) * visible / g_nrows; if (thumb < 20) thumb = 20;
-        int maxscroll = g_nrows - visible;
-        int pos = maxscroll > 0 ? (LIST_H - 8 - thumb) * g_list_scroll / maxscroll : 0;
-        gui_draw_scrollbar_v(g_win, LIST_X + LIST_W - 16, LIST_Y + 4, LIST_H - 8, pos, thumb, C_BTN_BG);
-        (void)total;
-    }
+    if (g_nrows == 0)
+        ttext_centered(LIST_X, LIST_Y + LIST_H / 2 - 8, LIST_W,
+                       "No disks were found.", T.dim_inner, TY_BODY, 0);
+    // The scrollbar is gui_scroll's, drawn by gui_list, and therefore real.
+    gui_scroll_draw_on(g_win, &g_list.scroll, T.inner);
 
-    int next_enabled = g_selected >= 0;
-    draw_button(8, 448, 88, 24, "< Back", g_focus == 1 ? BTN_HOVER : BTN_NORMAL, 0, 0, g_focus == 1);
-    draw_button(536, 448, 96, 24, "Next >", next_enabled ? (g_focus == 2 ? BTN_HOVER : BTN_NORMAL) : BTN_DISABLED,
-                next_enabled, 0, g_focus == 2 && next_enabled);
+    if (g_focus == 0) focus_ring(LIST_X, LIST_Y, LIST_W, LIST_H);
+
+    ttext(CONTENT_X, 408, "Up and Down choose a disk.    Enter continues.",
+          T.dim, TY_CAPTION, 0);
+    draw_footer("Back", "Continue", GUI_BTN_PRIMARY, g_selected >= 0, 468, 140);
 }
 
 // ---------------------------------------------------------------------------
-// Screen 3: Confirmation
+// Screen 3: Confirm
 // ---------------------------------------------------------------------------
+#define TF_X 244
+#define TF_Y 314
+#define TF_W 240
+#define TF_H 28
+
 static void draw_confirm(void) {
-    draw_chrome(1);
-    win_draw_rect(g_win, 8, 26, 4, 30, C_ERROR);
-    ttext(20, 28, "Confirm Disk Erase", C_BASE_FG, 20, 1);
-    ttext(8, 60, "This is the last step before anything is written. Read this carefully.", C_BASE_FG, 14, 0);
+    draw_card();
+    draw_head("Confirm the disk to erase",
+              "This is the last step before anything is written to the disk.");
 
     disk_row_t *r = &g_rows[g_confirm_row];
-    sunken_white(8, 92, 624, 150);
-    ttext(16, 104, r->name, C_BASE_FG, 16, 1);
-    ttext(16, 128, r->subtitle, C_BASE_FG, 14, 0);
+    int cx = CONTENT_X, cy = 92, cw = CONTENT_W, ch = 108;
+    bround(cx, cy, cw, ch, T.radius, T.inner, T.card);
+    bframe(cx, cy, cw, ch, 2, T.danger);
+    ttext(cx + 16, cy + 16, r->name, T.ink_inner, TY_HEADING, 1);
+    ttext(cx + 16, cy + 46, r->subtitle, T.dim_inner, TY_CAPTION, 0);
     char capline[80], sectstr[24];
-    commafmt_u64(r->t.sectors, sectstr, sizeof(sectstr));
-    snprintf(capline, sizeof(capline), "%s (%s sectors)", r->capstr, sectstr);
-    ttext(16, 150, capline, C_BASE_FG, 14, 0);
-    win_draw_rect(g_win, 16, 174, 592, 1, C_BTN_BG);
-    ttext(16, 182, "- All partitions and files on this disk will be permanently erased.", C_BASE_FG, 14, 0);
-    ttext(16, 202, "- This cannot be undone once installation begins.", C_BASE_FG, 14, 0);
-    ttext(16, 222, "- The disk MayteraOS is running from now (the USB stick) is not touched.", C_BASE_FG, 14, 0);
-
-    ttext(8, 254, "Type the disk name shown above to confirm you have the right disk:", C_BASE_FG, 14, 1);
-    sunken_white(8, 276, 220, 24);
-    ttext(16, 280, r->name, C_BASE_FG, 14, 1);
-
-    sunken_white(8, 308, 300, 22);
-    if (g_tf.len == 0) {
-        ttext(12, 311, "Type here", C_ACCENT_SEC, 14, 0);
-    } else {
-        ttext(12, 311, g_tf_buf, C_BASE_FG, 14, 0);
-    }
-    if (g_focus == 0) {
-        char pre[64]; int cl = g_tf.cursor; if (cl > 63) cl = 63;
-        memcpy(pre, g_tf_buf, (size_t)cl); pre[cl] = '\0';
-        int cx = 12 + gui_ttf_width(pre, 14);
-        win_draw_rect(g_win, cx, 310, 1, 18, C_BASE_FG);
+    commafmt_u64(r->t.sectors, sectstr, sizeof sectstr);
+    snprintf(capline, sizeof capline, "%s   (%s sectors)", r->capstr, sectstr);
+    ttext(cx + 16, cy + 66, capline, T.dim_inner, TY_CAPTION, 0);
+    {
+        const char *pill = "WILL BE ERASED";
+        int pw = tw_of(pill, TY_CAPTION, 1) + 16;
+        bround(cx + cw - 16 - pw, cy + 14, pw, 20, 3, T.danger_soft, T.inner);
+        ttext(cx + cw - 8 - pw, cy + 17, pill, T.danger_ink, TY_CAPTION, 1);
     }
 
-    if (g_tf_match) ttext(8, 334, "Confirmed - button enabled below.", C_SUCCESS, 11, 1);
-    else            ttext(8, 334, "Waiting for match.", C_BASE_FG, 11, 0);
+    static const char *bl[3] = {
+        "All partitions and files on this disk are permanently erased.",
+        "This cannot be undone once installation begins.",
+        "The USB stick you are running from is not touched."
+    };
+    for (int i = 0; i < 3; i++) {
+        bcircle(CONTENT_X + 6, 216 + i * 22 + 7, 5, i < 2 ? T.danger : T.dim, T.card);
+        ttext(CONTENT_X + 20, 216 + i * 22, bl[i], i < 2 ? T.ink : T.dim, TY_BODY, 0);
+    }
 
-    draw_button(8, 448, 88, 24, "< Back", g_focus == 1 ? BTN_HOVER : BTN_NORMAL, 0, 0, g_focus == 1);
-    draw_button(368, 448, 264, 24, "Erase and Install",
-                g_tf_match ? (g_focus == 2 ? BTN_HOVER : BTN_NORMAL) : BTN_DISABLED,
-                0, 1, g_focus == 2 && g_tf_match);
+    ttext(CONTENT_X, 296, "TYPE THE DISK NAME TO CONFIRM", T.accent, TY_CAPTION, 1);
+    bround(CONTENT_X, 314, 196, TF_H, T.radius ? 4 : 0, mix_pct(T.card, T.ink, 7), T.card);
+    bframe(CONTENT_X, 314, 196, TF_H, 1, T.edge);
+    ttext(CONTENT_X + 10, 314 + (TF_H - TY_BODY) / 2, r->name, T.ink, TY_BODY, 1);
+
+    // The SHARED caret-aware TTF field: caret, selection, clipboard and undo,
+    // and a caret measured with the width function that agrees with the
+    // renderer drawing the glyphs beside it.
+    gui_textfield_tf(g_win, ORG_X + TF_X, ORG_Y + TF_Y, TF_W, TF_H,
+                     g_tf_buf, g_tf.len, g_tf.cursor, g_tf.sel_anchor,
+                     g_focus == 0, "type it here");
+    if (g_focus == 0) focus_ring(TF_X, TF_Y, TF_W, TF_H);
+
+    if (g_tf_match) {
+        bcircle(CONTENT_X + 508, 328, 16, T.success, T.card);
+        check_mark(CONTENT_X + 508, 328, 16, gui_ink_on(T.success));
+    }
+    ttext(CONTENT_X, 352,
+          g_tf_match ? "Match confirmed. The button below is now enabled."
+                     : "The button below stays disabled until this matches exactly.",
+          g_tf_match ? T.success : T.dim, TY_CAPTION, 0);
+
+    draw_footer("Back", "Erase and install", GUI_BTN_DANGER, g_tf_match, 388, 220);
 }
 
 // ---------------------------------------------------------------------------
-// Screen 4: Progress
+// Screen 4: Installing.  No step counter, no dots (see step_of()).
 // ---------------------------------------------------------------------------
+static const char *g_stage_name[5] = {
+    "Writing the partition table",
+    "Copying the boot partition",
+    "Copying system files",
+    "Flushing disk caches",
+    "Verifying the copy"
+};
+static int stage_of_pct(int pct) {
+    if (pct < 15) return 0;
+    if (pct < 35) return 1;
+    if (pct < 80) return 2;
+    if (pct < 95) return 3;
+    return 4;
+}
+
 static void draw_progress(void) {
-    draw_chrome(0);
-    ttext(8, 28, "Installing MayteraOS", C_BASE_FG, 20, 1);
+    draw_card();
+    ttext_centered(0, 92, BODY_W, "PLEASE WAIT", T.accent, TY_CAPTION, 1);
+    ttext_centered(0, 114, BODY_W, "Installing MayteraOS", T.ink, TY_HEADING, 1);
 
     disk_row_t *r = &g_rows[g_confirm_row];
-    char tgt[128];
-    if (r->have_model) snprintf(tgt, sizeof(tgt), "Target: %s - %s (%s)", r->name, r->subtitle, r->capstr);
-    else                snprintf(tgt, sizeof(tgt), "Target: %s - %s", r->name, r->subtitle);
-    ttext(8, 60, tgt, C_BASE_FG, 11, 0);
+    char tgt[144];
+    if (r->have_model) snprintf(tgt, sizeof tgt, "%s - %s (%s)", r->name, r->subtitle, r->capstr);
+    else               snprintf(tgt, sizeof tgt, "%s - %s", r->name, r->subtitle);
+    ttext_centered(0, 148, BODY_W, tgt, T.dim, TY_CAPTION, 0);
 
-    char pctstr[8]; snprintf(pctstr, sizeof(pctstr), "%d%%", g_progress_pct);
-    ttext_centered(270, 148, 100, pctstr, C_BASE_FG, 20, 1);
+    gui_progress(g_win, ORG_X + 170, ORG_Y + 188, 300, 8, g_progress_pct);
+    char pct[8]; snprintf(pct, sizeof pct, "%d%%", g_progress_pct);
+    ttext_centered(0, 206, BODY_W, pct, T.dim, TY_CAPTION, 0);
 
-    sunken_panel(8, 180, 624, 28);
-    int filled = (g_progress_pct + 4) / 5; if (filled > 20) filled = 20; if (filled < 0) filled = 0;
-    for (int n = 0; n < 20; n++) {
-        int sx = 21 + n * 30;
-        if (n < filled) { win_draw_rect(g_win, sx, 184, 28, 20, C_ACCENT); gui_draw_rect_outline(g_win, sx, 184, 28, 20, C_BORDER_DARK); }
-        else            { win_draw_rect(g_win, sx, 184, 28, 20, C_BTN_BG); gui_draw_rect_outline(g_win, sx, 184, 28, 20, 0x00A0A0A0); }
+    int cur = stage_of_pct(g_progress_pct);
+    for (int i = 0; i < 5; i++) {
+        int y = 244 + i * 26;
+        if (i < cur)       { bcircle(206, y + 7, 16, T.accent, T.card);
+                             check_mark(206, y + 7, 16, T.on_accent); }
+        else if (i == cur) { bring(206, y + 7, 14, 2, T.accent, T.card);
+                             bcircle(206, y + 7, 6, T.accent, T.card); }
+        else               { bring(206, y + 7, 14, 2, T.edge, T.card); }
+        ttext(230, y, g_stage_name[i],
+              i > cur ? T.dim : T.ink, TY_BODY, i == cur);
     }
 
-    ttext_centered(8, 220, 624, g_progress_msg, C_BASE_FG, 14, 0);
-    ttext_centered(8, 400, 624, "Do not power off the computer or remove the installation media. This cannot be cancelled.",
-                   C_ERROR, 11, 1);
+    ttext_centered(0, 416, BODY_W,
+        "Do not power off the computer or remove the installation media.",
+        T.danger, TY_CAPTION, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Screen 5: Done.  No step counter, no dots.
+// ---------------------------------------------------------------------------
+static void draw_done(void) {
+    draw_card();
+    uint32_t col = g_done_success ? T.success : T.danger;
+    bcircle(320, 128, 64, col, T.card);
+    // The mark is drawn, not typed: there is no reliable check glyph in the
+    // shipped face and a "v" would read as a letter at this size.
+    if (g_done_success) {
+        gui_thick_line(g_win, ORG_X + 306, ORG_Y + 130, ORG_X + 316, ORG_Y + 142, 4, T.on_accent);
+        gui_thick_line(g_win, ORG_X + 316, ORG_Y + 142, ORG_X + 338, ORG_Y + 112, 4, T.on_accent);
+    } else {
+        gui_thick_line(g_win, ORG_X + 306, ORG_Y + 114, ORG_X + 334, ORG_Y + 142, 4, T.on_accent);
+        gui_thick_line(g_win, ORG_X + 306, ORG_Y + 142, ORG_X + 334, ORG_Y + 114, 4, T.on_accent);
+    }
+
+    ttext_centered(0, 190, BODY_W,
+        g_done_success ? "Installation complete" : "Installation failed",
+        T.ink, TY_HEADING, 1);
+
+    disk_row_t *r = &g_rows[g_confirm_row];
+    if (g_done_success) {
+        char l1[112];
+        snprintf(l1, sizeof l1, "MayteraOS is installed on %s.", r->name);
+        ttext_centered(0, 228, BODY_W, l1, T.dim, TY_BODY, 0);
+        ttext_centered(0, 250, BODY_W,
+            "Remove the USB stick and restart to boot from the internal disk.",
+            T.dim, TY_BODY, 0);
+        unsigned long total_s = (g_install_done_ms - g_install_start_ms) / 1000;
+        unsigned long mm = total_s / 60, ss = total_s % 60;
+        char fin[96];
+        snprintf(fin, sizeof fin, "Finished in %lu minute%s %lu second%s.",
+                 mm, mm == 1 ? "" : "s", ss, ss == 1 ? "" : "s");
+        ttext_centered(0, 288, BODY_W, fin, T.dim, TY_CAPTION, 0);
+    } else {
+        char lines[3][WRAP_LINE_MAX];
+        int nl = gui_wrap_text_ttf(
+            "The disk may be left in an incomplete state. Choose a different disk, "
+            "or check this one, and try again.", TY_BODY, 480, 3, lines);
+        for (int i = 0; i < nl; i++)
+            ttext_centered(80, 228 + i * 20, 480, lines[i], T.dim, TY_BODY, 0);
+        int ew = tw_of(g_done_errmsg, TY_CAPTION, 0) + 24;
+        if (ew > 480) ew = 480;
+        bround(320 - ew / 2, 296, ew, 24, 3, T.danger_soft, T.card);
+        ttext_centered(320 - ew / 2, 302, ew, g_done_errmsg, T.danger_ink, TY_CAPTION, 0);
+    }
+
+    draw_footer("Close", g_done_success ? "Restart now" : "Try again",
+                GUI_BTN_PRIMARY, 1, 468, 140);
 }
 
 static void progress_tick(void) {
@@ -587,50 +910,6 @@ static void progress_tick(void) {
     else if (pct < 35) snprintf(g_progress_msg, sizeof(g_progress_msg), "Copying boot partition... (2 of 5)");
     else if (pct < 80) snprintf(g_progress_msg, sizeof(g_progress_msg), "Copying system files... (3 of 5)");
     else               snprintf(g_progress_msg, sizeof(g_progress_msg), "Flushing disk caches... (4 of 5)");
-}
-
-// ---------------------------------------------------------------------------
-// Screen 5: Done
-// ---------------------------------------------------------------------------
-static void draw_done(void) {
-    draw_chrome(1);
-    int cx = 292 + 28, cy = 82 + 28;
-    uint32_t icolor = g_done_success ? C_SUCCESS : C_ERROR;
-    gui_fill_circle_aa(g_win, 292, 82, 56, icolor, C_BASE_BG);
-    if (g_done_success) {
-        gui_thick_line(g_win, cx - 11, cy + 1, cx - 3, cy + 9, 3, C_SEL_FG);
-        gui_thick_line(g_win, cx - 3, cy + 9, cx + 12, cy - 10, 3, C_SEL_FG);
-    } else {
-        gui_thick_line(g_win, cx - 12, cy - 12, cx + 12, cy + 12, 3, C_SEL_FG);
-        gui_thick_line(g_win, cx - 12, cy + 12, cx + 12, cy - 12, 3, C_SEL_FG);
-    }
-
-    ttext_centered(8, 150, 624, g_done_success ? "Installation Complete" : "Installation Failed", C_BASE_FG, 20, 1);
-
-    disk_row_t *r = &g_rows[g_confirm_row];
-    char lines[4][WRAP_LINE_MAX]; int nl;
-    if (g_done_success) {
-        char l1[96]; snprintf(l1, sizeof(l1), "MayteraOS is installed on %s.", r->name);
-        ttext_centered(70, 190, 500, l1, C_BASE_FG, 14, 0);
-        ttext_centered(70, 210, 500, "Remove the USB stick and restart this computer to boot from the internal disk.",
-                       C_BASE_FG, 14, 0);
-        unsigned long total_s = (g_install_done_ms - g_install_start_ms) / 1000;
-        unsigned long mm = total_s / 60, ss = total_s % 60;
-        char fin[80];
-        snprintf(fin, sizeof(fin), "Finished in %lu minute%s %lu second%s.",
-                 mm, mm == 1 ? "" : "s", ss, ss == 1 ? "" : "s");
-        ttext_centered(8, 256, 624, fin, C_BASE_FG, 11, 0);
-    } else {
-        nl = wrap_text("The disk may be left in an incomplete state. Choose a different disk, or check the disk, and try again.",
-                        500, 14, lines, 4);
-        for (int i = 0; i < nl; i++) ttext_centered(70, 190 + i * 20, 500, lines[i], C_BASE_FG, 14, 0);
-        sunken_white(170, 240, 300, 24);
-        ttext_centered(170, 245, 300, g_done_errmsg, C_ERROR, 12, 0);
-    }
-
-    draw_button(8, 448, 88, 24, "Close", g_focus == 0 ? BTN_HOVER : BTN_NORMAL, 0, 0, g_focus == 0);
-    draw_button(368, 448, 264, 24, g_done_success ? "Restart Now" : "Try Again",
-                g_focus == 1 ? BTN_HOVER : BTN_NORMAL, 1, 0, g_focus == 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -711,28 +990,68 @@ static void activate_done(int which) {
     else { if (g_done_success) reboot(); else goto_disks(); }
 }
 
+// Move the selection to the next SELECTABLE row and scroll it into view.
+// gui_list owns the viewport, so scrolling is gui_list_move_sel's job and this
+// function only has to skip the rows that cannot be chosen.
 static void move_list_selection(int dir) {
     if (g_nrows == 0) return;
     int idx = g_selected;
-    if (idx < 0) idx = 0;
+    if (idx < 0) idx = dir > 0 ? -1 : g_nrows;
     for (int step = 0; step < g_nrows; step++) {
         idx += dir;
         if (idx < 0) idx = g_nrows - 1;
         if (idx >= g_nrows) idx = 0;
-        if (g_rows[idx].selectable) { g_selected = idx; break; }
+        if (g_rows[idx].selectable) {
+            int cur = g_selected < 0 ? idx : g_selected;
+            g_selected = cur;
+            gui_list_move_sel(&g_list, &g_selected, idx - cur);
+            g_selected = idx;
+            return;
+        }
     }
-    if (g_selected >= 0) {
-        if (g_selected < g_list_scroll) g_list_scroll = g_selected;
-        if (g_selected >= g_list_scroll + LIST_VISIBLE_ROWS) g_list_scroll = g_selected - LIST_VISIBLE_ROWS + 1;
+}
+
+// ---------------------------------------------------------------------------
+// Input
+//
+// FOCUS MODEL, one table, used by both the keyboard and the pointer:
+//   screen        focus 0            focus 1        focus 2
+//   INTRO         (unused)           Quit           Continue
+//   DISKS         the disk list      Back           Continue
+//   CONFIRM       the type-to-confirm field  Back   Erase and install
+//   PROGRESS      no controls at all
+//   DONE          (unused)           Close          Restart now / Try again
+// Focus renders as GUI_ST_FOCUS plus the wizard's 2px ring - NOT as hover,
+// which is what the old code did and which made a keyboard user's position
+// indistinguishable from a mouse hovering somewhere else.
+// ---------------------------------------------------------------------------
+static int focus_count(void) {
+    switch (g_screen) {
+        case SCR_INTRO:    return 3;   /* 0 unused, cycles 1<->2 via the +1 below */
+        case SCR_DISKS:    return 3;
+        case SCR_CONFIRM:  return 3;
+        case SCR_DONE:     return 3;
+        default:           return 0;
     }
+}
+static int focus_first(void) { return (g_screen == SCR_INTRO || g_screen == SCR_DONE) ? 1 : 0; }
+
+static void focus_next(int dir) {
+    int n = focus_count(); if (n <= 0) return;
+    int lo = focus_first(), span = n - lo;
+    int cur = g_focus < lo ? lo : g_focus;
+    g_focus = lo + ((cur - lo + dir + span) % span);
 }
 
 static void handle_key(gui_event_t *ev) {
     char c = ev->key_char;
     uint32_t kc = ev->keycode;
+    if (g_screen == SCR_PROGRESS) return;   // no controls, by design
 
-    if (g_screen == SCR_CONFIRM && g_focus == 0) {
-        if (c == '\t') { g_focus = 1; redraw(); return; }
+    // The confirm field owns every printable key while it has focus, so typing
+    // a disk name that contains a space cannot be swallowed as "activate".
+    if (g_screen == SCR_CONFIRM && g_focus == 0 && c != '\t' && c != 27) {
+        if (c == '\r' || c == '\n') { if (g_tf_match) activate_confirm(2); return; }
         if (tf_handle_key(&g_tf, ev)) {
             g_tf_match = (strcmp(g_tf_buf, g_rows[g_confirm_row].name) == 0) && g_tf.len > 0;
             redraw();
@@ -740,27 +1059,31 @@ static void handle_key(gui_event_t *ev) {
         return;
     }
 
-    if (c == '\t') {
-        int nfocus = (g_screen == SCR_INTRO) ? 2 : (g_screen == SCR_DISKS) ? 3
-                   : (g_screen == SCR_CONFIRM) ? 3 : (g_screen == SCR_DONE) ? 2 : 1;
-        if (g_screen == SCR_PROGRESS) return;
-        g_focus = (g_focus + 1) % nfocus;
-        redraw();
+    if (c == 27) {   // Esc always retreats one step; it never destroys anything
+        switch (g_screen) {
+            case SCR_INTRO:   do_quit(); break;
+            case SCR_DISKS:   goto_intro(); break;
+            case SCR_CONFIRM: goto_disks(); break;
+            case SCR_DONE:    do_quit(); break;
+            default: break;
+        }
         return;
     }
+    if (c == '\t') { focus_next(1); redraw(); return; }
 
     if (g_screen == SCR_DISKS && g_focus == 0) {
-        if (kc == 0x80) { move_list_selection(-1); redraw(); return; }   // Up
-        if (kc == 0x81) { move_list_selection(1);  redraw(); return; }   // Down
+        if (kc == GUI_KEY_UP)   { move_list_selection(-1); redraw(); return; }
+        if (kc == GUI_KEY_DOWN) { move_list_selection(1);  redraw(); return; }
+        if (gui_list_key(&g_list, kc)) { redraw(); return; }
     }
 
-    int is_enter = (c == '\r' || c == '\n' || kc == 0x1C);
+    int is_enter = (c == '\r' || c == '\n');
     int is_space = (c == ' ');
     if (is_enter || is_space) {
         switch (g_screen) {
-            case SCR_INTRO:   activate_intro(g_focus);   break;
+            case SCR_INTRO:   activate_intro(g_focus); break;
             case SCR_DISKS:
-                if (g_focus == 0) { if (is_enter) activate_disks(2); }
+                if (g_focus == 0) { if (is_enter && g_selected >= 0) activate_disks(2); }
                 else activate_disks(g_focus);
                 break;
             case SCR_CONFIRM: activate_confirm(g_focus); break;
@@ -770,54 +1093,74 @@ static void handle_key(gui_event_t *ev) {
     }
 }
 
-static void handle_click(int mx, int my) {
-    if (closebox_hit(mx, my)) {
-        if (g_screen != SCR_PROGRESS) do_quit();
+static void handle_click(int wmx, int wmy) {
+    if (g_screen == SCR_PROGRESS) return;
+    int mx = b_x(wmx), my = b_y(wmy);
+
+    // Footer first: both rects come from the same two variables the draw used.
+    if (my >= FOOT_Y && my < FOOT_Y + BTN_H) {
+        if (pt_in(mx, my, BACK_X, FOOT_Y, BACK_W, BTN_H)) {
+            g_focus = 1;
+            switch (g_screen) {
+                case SCR_INTRO:   activate_intro(1); break;
+                case SCR_DISKS:   activate_disks(1); break;
+                case SCR_CONFIRM: activate_confirm(1); break;
+                case SCR_DONE:    activate_done(0); break;
+                default: break;
+            }
+            return;
+        }
+        if (pt_in(mx, my, g_act_x, FOOT_Y, g_act_w, BTN_H)) {
+            g_focus = 2;
+            switch (g_screen) {
+                case SCR_INTRO:   activate_intro(1); break;
+                case SCR_DISKS:   if (g_selected >= 0) activate_disks(2); break;
+                case SCR_CONFIRM: if (g_tf_match) activate_confirm(2); break;
+                case SCR_DONE:    activate_done(1); break;
+                default: break;
+            }
+            return;
+        }
         return;
     }
-    switch (g_screen) {
-        case SCR_INTRO:
-            if (pt_in(mx, my, 8, 448, 88, 24)) { g_focus = 0; activate_intro(0); }
-            else if (pt_in(mx, my, 536, 448, 96, 24)) { g_focus = 1; activate_intro(1); }
-            break;
-        case SCR_DISKS: {
-            for (int vi = 0; vi < LIST_VISIBLE_ROWS; vi++) {
-                int idx = g_list_scroll + vi;
-                if (idx >= g_nrows) break;
-                int ry = LIST_Y + 4 + vi * ROW_H;
-                if (pt_in(mx, my, ROW_X, ry, ROW_W, ROW_H) && g_rows[idx].selectable) {
-                    g_selected = idx; g_focus = 0; redraw(); return;
-                }
-            }
-            if (pt_in(mx, my, 8, 448, 88, 24)) { g_focus = 1; activate_disks(1); }
-            else if (pt_in(mx, my, 536, 448, 96, 24) && g_selected >= 0) { g_focus = 2; activate_disks(2); }
-            break;
+
+    if (g_screen == SCR_DISKS) {
+        int hit = gui_list_press(&g_list, wmx, wmy);
+        if (hit >= 0 && hit < g_nrows && g_rows[hit].selectable) {
+            g_selected = hit; g_focus = 0; redraw();
+        } else if (hit >= 0) {
+            g_focus = 0; redraw();          // a click on a disabled row still focuses the list
         }
-        case SCR_CONFIRM:
-            if (pt_in(mx, my, 8, 308, 300, 22)) { g_focus = 0; redraw(); }
-            else if (pt_in(mx, my, 8, 448, 88, 24)) { g_focus = 1; activate_confirm(1); }
-            else if (pt_in(mx, my, 368, 448, 264, 24) && g_tf_match) { g_focus = 2; activate_confirm(2); }
-            break;
-        case SCR_DONE:
-            if (pt_in(mx, my, 8, 448, 88, 24)) { g_focus = 0; activate_done(0); }
-            else if (pt_in(mx, my, 368, 448, 264, 24)) { g_focus = 1; activate_done(1); }
-            break;
-        default: break;
+        return;
+    }
+    if (g_screen == SCR_CONFIRM) {
+        if (pt_in(mx, my, TF_X, TF_Y, TF_W, TF_H)) {
+            g_focus = 0;
+            // Caret to the clicked glyph. Measured with gui_ttf_render_width()
+            // because that is the width function that agrees with the renderer
+            // drawing the text (gui_ttf_width() adds kerning the drawer does
+            // not apply, so the caret would drift on kerned pairs).
+            int rel = mx - (TF_X + 8), best = 0;
+            for (int i = 0; i <= g_tf.len; i++) {
+                char pre[64];
+                int n = i < 63 ? i : 63;
+                for (int k = 0; k < n; k++) pre[k] = g_tf_buf[k];
+                pre[n] = 0;
+                if (gui_ttf_render_width(pre, TY_BODY) <= rel) best = i; else break;
+            }
+            tf_set_caret(&g_tf, best);
+            redraw();
+        }
+        return;
     }
 }
 
-static void handle_move(int mx, int my) {
-    int changed = 0;
-    if (g_screen == SCR_DISKS) {
-        int newhover = -1;
-        for (int vi = 0; vi < LIST_VISIBLE_ROWS; vi++) {
-            int idx = g_list_scroll + vi;
-            if (idx >= g_nrows) break;
-            int ry = LIST_Y + 4 + vi * ROW_H;
-            if (pt_in(mx, my, ROW_X, ry, ROW_W, ROW_H)) { newhover = idx; break; }
-        }
-        if (newhover != g_hover_row) { g_hover_row = newhover; changed = 1; }
-    }
+static void handle_move(int wmx, int wmy) {
+    if (g_screen != SCR_DISKS) return;
+    int changed = gui_list_motion(&g_list, wmx, wmy);
+    int newhover = gui_list_row_at(&g_list, wmx, wmy);
+    if (newhover >= g_nrows) newhover = -1;
+    if (newhover != g_hover_row) { g_hover_row = newhover; changed = 1; }
     if (changed) redraw();
 }
 
@@ -827,10 +1170,12 @@ static void handle_move(int mx, int my) {
 int main(int argc, char *argv[]) {
     (void)argc; (void)argv;
 
+    build_palette();
+
     int win_x = 80, win_y = 40;
     fb_info_t fi;
     if (fb_info(&fi) == 0 && fi.width > 0 && fi.height > 0) {
-        win_x = ((int)fi.width - WIN_W) / 2;
+        win_x = ((int)fi.width  - WIN_W) / 2;
         win_y = ((int)fi.height - 36 - WIN_H) / 2;
         if (win_x < 0) win_x = 0;
         if (win_y < 0) win_y = 0;
@@ -838,9 +1183,14 @@ int main(int argc, char *argv[]) {
 
     g_win = win_create("Install to Disk", win_x, win_y, WIN_W, WIN_H);
     if (g_win < 0) { printf("[INSTALL] win_create failed\n"); return 1; }
+    // NOCHROME must be set BEFORE the first draw: it is a one-way flag and it
+    // reallocates the content buffer to the full window size. For a nochrome
+    // window the size handed to SYS_WIN_CREATE IS the outer size, so 688x616 of
+    // card is what we get, unlike a chromed window where #184 applies.
     win_set_nochrome(g_win);
+    win_set_shadow(g_win);
 
-    g_focus = 1;
+    g_focus = focus_first();
     redraw();
 
     gui_event_t ev;
@@ -850,11 +1200,9 @@ int main(int argc, char *argv[]) {
         if (g_screen == SCR_PROGRESS) {
             progress_tick();
             redraw();
-            if (et == EVENT_MOUSE_DOWN || et == EVENT_KEY_DOWN || et == EVENT_WINDOW_CLOSE) {
-                // Progress screen has no interactive controls and cannot be
-                // closed: the engine cannot stop once writing starts (see
-                // spec section 8). Every input is deliberately swallowed.
-            }
+            // Every input is deliberately swallowed: the engine cannot stop
+            // once writing starts, so there is nothing an input could mean.
+            (void)et;
             continue;
         }
         if (et == 0) continue;
@@ -865,6 +1213,17 @@ int main(int argc, char *argv[]) {
             case EVENT_MOUSE_MOVE: handle_move(ev.mouse_x, ev.mouse_y); break;
             case EVENT_MOUSE_DOWN:
                 if (ev.mouse_buttons & MOUSE_BUTTON_LEFT) handle_click(ev.mouse_x, ev.mouse_y);
+                break;
+            case EVENT_MOUSE_UP:
+                if (g_screen == SCR_DISKS) gui_list_release(&g_list);
+                break;
+            // (#appstyle) THE WHEEL. There was no case for this event anywhere
+            // in the file, which is half of why the disk list's scrollbar was
+            // decoration.
+            case EVENT_MOUSE_SCROLL:
+                if (g_screen == SCR_DISKS &&
+                    gui_list_wheel(&g_list, ev.mouse_x, ev.mouse_y, ev.scroll_delta))
+                    redraw();
                 break;
             case EVENT_KEY_DOWN: handle_key(&ev); break;
             default: break;

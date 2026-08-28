@@ -231,7 +231,8 @@ int audio_write(audio_stream_t *stream, const void *buffer, uint32_t frames);
 
 // Write audio data (non-blocking)
 // Returns immediately, may write fewer frames than requested
-int audio_write_nonblock(audio_stream_t *stream, const void *buffer, uint32_t frames);
+// #205 pass 2: audio_write_nonblock() was DELETED (zero callers, and a second
+// door onto the single-owner BDL ring). See drivers/audio.c.
 
 // Get number of frames that can be written without blocking
 int audio_avail(audio_stream_t *stream);
@@ -290,6 +291,42 @@ void audio_beep(uint32_t frequency, uint32_t duration_ms);
 // dst_rate: destination sample rate
 // channels: number of channels
 // Returns: number of frames written to dst_data
+// #181: THE SAME 16.16 RESAMPLER AS audio_resample(), WITH THE PHASE CARRIED
+// ACROSS CALLS.
+//
+// audio_resample() restarts at phase zero on every call, which is correct for
+// its callers (they hand it a whole decoded buffer) and wrong for a stream fed
+// in chunks: each chunk would begin by re-emitting the position it had already
+// emitted, so a continuous 11 kHz DMA transfer resampled 1 KB at a time would
+// get a phase discontinuity every 1 KB, and would drift by up to one source
+// frame per chunk against the guest's own idea of how much has played.
+//
+// Added HERE rather than forked into dos/ because the house rule is to improve
+// the shared primitive. audio_resample() itself is untouched, so every existing
+// caller keeps byte-identical behaviour.
+//
+// Integer only (16.16 fixed point): the kernel is built -mno-sse soft-float.
+typedef struct {
+    uint32_t pos_fp;        // 16.16 position inside the virtual array below
+    uint32_t have_prev;     // 0 until the first chunk has been seen
+    int16_t  prev[2];       // last frame of the PREVIOUS chunk
+} audio_resample_state_t;
+
+void audio_resample_stream_init(audio_resample_state_t *st);
+
+// Resample one chunk. The state makes chunk N+1 continue exactly where chunk N
+// stopped, interpolating across the boundary using the carried frame.
+//
+// dst_cap is in FRAMES and is a hard contract, not a hint: if it is too small
+// this returns 0 and leaves the state UNTOUCHED, rather than truncating and
+// silently desynchronising the stream. Size it as
+// (src_frames * dst_rate) / src_rate + 2.
+uint32_t audio_resample_stream(audio_resample_state_t *st,
+                               const int16_t *src, uint32_t src_frames,
+                               uint32_t src_rate,
+                               int16_t *dst, uint32_t dst_cap, uint32_t dst_rate,
+                               uint32_t channels);
+
 uint32_t audio_resample(const int16_t *src_data, uint32_t src_frames, uint32_t src_rate,
                         int16_t *dst_data, uint32_t dst_rate, uint32_t channels);
 

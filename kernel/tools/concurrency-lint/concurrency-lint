@@ -131,6 +131,72 @@ _PURE_DELAY_NOISE_RE = re.compile(
     r"\b(?:break|continue|;)\b|\+\+|--|^\s*$"
 )
 
+# #114 PRIVATE HAND-ROLLED SPINLOCKS.
+#
+# WHY THIS RULE EXISTS, MEASURED. #75 read a live two-core deadlock out of
+# guest memory over QMP (six samples 30 s apart, all identical): mm/pmm.c had
+# its own `volatile int` + test-and-set lock that never touched RFLAGS.IF. A
+# core took it with IF=1 and WITHOUT the Big Kernel Lock, was interrupted, and
+# cpu/idt.c wraps every ISR in bkl_acquire() - so the holder became a BKL
+# WAITER WHILE STILL HOLDING ITS OWN LOCK. A second core inside a SYSCALL
+# (which takes the BKL at entry) then wanted pmm_lock. AB-BA. Both cores spun
+# with IF=1, neither halted, nothing recovered.
+#
+# THE POINT OF THE RULE, NOT THE FIX. mm/heap.c had the IDENTICAL defect and
+# was fixed by #347. mm/pmm.c, IN THE SAME DIRECTORY, was not fixed at the same
+# time, survived for months, and took a bespoke instrument plus a QMP memory
+# dump to find again. Fixing instances does not stop the class; a build-time
+# check does.
+#
+# Kernel-only by construction: RFLAGS.IF and the BKL exist only in Ring 0, so
+# firing this rule on userland would be noise.
+PRIVATE_LOCK_ACQUIRE = [
+    # gcc legacy __sync builtins (the pmm/heap/demand/fat_readahead shape)
+    "__sync_lock_test_and_set",
+    "__sync_bool_compare_and_swap",
+    "__sync_val_compare_and_swap",
+    # gcc __atomic builtins. net/net_perf.c uses __atomic_test_and_set, and a
+    # sweep that greps only for __sync_lock_test_and_set MISSES IT ENTIRELY.
+    # That is exactly the "different builtin survives the targeted grep" hole.
+    "__atomic_test_and_set",
+    "__atomic_exchange",
+    "__atomic_exchange_n",
+    "__atomic_compare_exchange",
+    "__atomic_compare_exchange_n",
+    # our own shared atomics, used to hand-roll a lock rather than to take one
+    "atomic_xchg32", "atomic_xchg64", "atomic_cas32", "atomic_cas64",
+]
+PRIVATE_LOCK_ACQUIRE_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(a) for a in PRIVATE_LOCK_ACQUIRE) + r")\s*\("
+)
+# Raw inline asm that IS the acquire. Matched against the ORIGINAL source, not
+# the comment/string-stripped copy, because these live inside asm string
+# literals which strip_comments_and_strings() blanks out.
+PRIVATE_LOCK_ASM_RE = re.compile(
+    r"xchg[bwlq]?\s|lock\s+cmpxchg|lock\s+bts|lock\s+xchg"
+)
+
+# A loop that parks on the shared wait queue is CORRECTLY routed even though it
+# contains an atomic acquire: that is the fs/fat.c fat_lock() and
+# drivers/usb_msc.c msc_cmd_lock() shape (uncontended CAS fast path, then
+# __wait_prepare + __wait_event_wait_deadline on contention). Deliberately a
+# SEPARATE list from BLOCKING_PRIMITIVES: extending that shared list would
+# change the verdict of the existing rules and re-fingerprint allowlist entries
+# that have nothing to do with #114.
+PARK_PRIMITIVES = BLOCKING_PRIMITIVES + [
+    "__wait_prepare", "__wait_finish", "__wait_event_wait_deadline",
+    "wake_up_all", "wq_may_block",
+]
+
+# Idioms that mask RFLAGS.IF for the duration of the hold. Checked against the
+# RAW source of the enclosing function, because "cli" and "pushfq" only ever
+# appear inside asm string literals.
+IRQMASK_RE = re.compile(
+    r"\bcli\b|pushfq|irqsave|irq_save|irqrestore|save_flags|local_irq"
+    r"|irq_disable|disable_interrupts"
+)
+
+
 RULES = {
     "SPIN_BUSYWAIT": "Empty-bodied busy-wait loop (spins the CPU). Route the "
                      "wait through wait_event()/futex_wait().",
@@ -147,6 +213,23 @@ RULES = {
     "DELAY_SPIN":    "Loop whose body is nothing but hardware delay calls "
                      "(io_wait/pause/udelay). This pegs a core for the whole "
                      "wait. Use wait_event_timeout() once the scheduler is up.",
+    "PRIVATE_SPINLOCK_IRQON":
+                     "Hand-rolled spinlock acquire loop that NEVER MASKS "
+                     "RFLAGS.IF (#114/#75). A holder can be interrupted; "
+                     "cpu/idt.c takes the BKL in every ISR, so the holder "
+                     "becomes a BKL waiter while still holding this lock, and "
+                     "any BKL owner wanting the same lock deadlocks AB-BA with "
+                     "both cores spinning and neither halted. Use the SHARED "
+                     "sync/spinlock.h: spinlock_acquire_irqsave() / "
+                     "spinlock_release_irqrestore(), as mm/pmm.c, fs/blockdev.c, "
+                     "fs/ext2.c and drivers/ata.c already do. If the wait can be "
+                     "long, park on sync/waitq.h instead.",
+    "PRIVATE_SPINLOCK":
+                     "Hand-rolled spinlock acquire loop. It does mask RFLAGS.IF, "
+                     "so it is not the #114/#75 AB-BA shape, but it is still a "
+                     "private copy of a primitive that already exists. Use "
+                     "sync/spinlock.h (spinlock_acquire_irqsave) so there is ONE "
+                     "implementation to fix when the next locking bug lands.",
 }
 
 
@@ -188,6 +271,52 @@ def strip_comments_and_strings(src):
                 i += 1
         else:
             out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def strip_comments_only(src):
+    """#114: blank COMMENTS but PRESERVE string literals, offset-for-offset.
+
+    The asm acquire idioms (xchgl, lock cmpxchg) only ever appear inside asm
+    string literals, which strip_comments_and_strings() blanks out, so they are
+    invisible to the normal scan. Searching the raw source instead would match
+    prose: fs/blockdev.c:133 and exec/x86_16.c both discuss `xchg` in comments.
+    Keeping strings and dropping comments sees the code and not the talk."""
+    out = []
+    i = 0
+    n = len(src)
+    while i < n:
+        two = src[i:i + 2]
+        if two == "//":
+            while i < n and src[i] != "\n":
+                out.append(" ")
+                i += 1
+        elif two == "/*":
+            out.append("  ")
+            i += 2
+            while i < n and src[i:i + 2] != "*/":
+                out.append("\n" if src[i] == "\n" else " ")
+                i += 1
+            if i < n:
+                out.append("  ")
+                i += 2
+        elif src[i] in "\"'":
+            quote = src[i]
+            out.append(src[i])
+            i += 1
+            while i < n and src[i] != quote:
+                if src[i] == "\\" and i + 1 < n:
+                    out.append(src[i:i + 2])
+                    i += 2
+                    continue
+                out.append(src[i])
+                i += 1
+            if i < n:
+                out.append(src[i])
+                i += 1
+        else:
+            out.append(src[i])
             i += 1
     return "".join(out)
 
@@ -376,6 +505,121 @@ def body_is_pure_delay(body):
     return all(c in DELAY_ONLY_CALLS for c in calls)
 
 
+def func_spans(clean):
+    """Return [(start, end, name, body_start, body_end)] for every function
+    definition, using brace matching rather than a regex on the whole body."""
+    spans = []
+    for m in re.finditer(r"(?m)^[A-Za-z_][\w \t\*]*?\b([A-Za-z_]\w*)\s*\(", clean):
+        if m.group(1) in ("if", "for", "while", "switch", "return", "sizeof", "do"):
+            continue
+        popen = m.end() - 1
+        pend = match_paren(clean, popen)
+        if pend < 0:
+            continue
+        j = pend
+        while j < len(clean) and clean[j] in " \t\r\n":
+            j += 1
+        if j >= len(clean) or clean[j] != "{":
+            continue
+        bend = match_paren(clean, j)
+        if bend < 0:
+            continue
+        spans.append((m.start(), bend, m.group(1), j + 1, bend - 1))
+    return spans
+
+
+def enclosing_span(spans, off):
+    """Smallest function span containing off, or None."""
+    best = None
+    for s in spans:
+        if s[0] <= off < s[1]:
+            if best is None or (s[1] - s[0]) < (best[1] - best[0]):
+                best = s
+    return best
+
+
+def body_uses_parking(body):
+    return any(re.search(r"\b" + re.escape(p) + r"\s*\(", body)
+               for p in PARK_PRIMITIVES)
+
+
+def iter_loops(clean):
+    """Yield (hdr_start, cond_text, body_text, hdr_snippet) for every loop,
+    INCLUDING do-while (whose body precedes its condition and which the
+    while/for header scan deliberately skips)."""
+    tails = find_dowhile_tails(clean)
+    for m in LOOP_HDR_RE.finditer(clean):
+        if m.start() in tails:
+            continue
+        cond_open = m.end() - 1
+        cond_end = match_paren(clean, cond_open)
+        if cond_end < 0:
+            continue
+        body, _bs, body_end = extract_loop_body(clean, cond_end)
+        yield (m.start(), clean[cond_open + 1:cond_end - 1], body,
+               clean[m.start():cond_end], body_end + 1)
+    # do { ... } while (cond);
+    for m in re.finditer(r"\bdo\b", clean):
+        i = m.end()
+        while i < len(clean) and clean[i] in " \t\r\n":
+            i += 1
+        if i >= len(clean) or clean[i] != "{":
+            continue
+        bend = match_paren(clean, i)
+        if bend < 0:
+            continue
+        body = clean[i + 1:bend - 1]
+        j = bend
+        while j < len(clean) and clean[j] in " \t\r\n":
+            j += 1
+        if clean[j:j + 5] != "while":
+            continue
+        popen = clean.find("(", j)
+        if popen < 0:
+            continue
+        pend = match_paren(clean, popen)
+        if pend < 0:
+            continue
+        cond = clean[popen + 1:pend - 1]
+        yield (m.start(), cond, body,
+               "do { ... } while (" + normalize(cond) + ")", pend)
+
+
+def find_private_spinlocks(src, clean, relpath, spans):
+    """#114: a loop that RETRIES an atomic lock acquire is a hand-rolled
+    spinlock. Report it, and say whether it masks interrupts, because only the
+    unmasked form is the #75 AB-BA deadlock shape.
+
+    Ring 0 only: RFLAGS.IF and the BKL do not exist in userland."""
+    if not relpath.startswith("kernel" + os.sep) and not relpath.startswith("kernel/"):
+        return []
+    nocomment = strip_comments_only(src)
+    out = []
+    for hdr, cond, body, snippet, loop_end in iter_loops(clean):
+        in_cond = PRIVATE_LOCK_ACQUIRE_RE.search(cond) is not None
+        in_body = PRIVATE_LOCK_ACQUIRE_RE.search(body) is not None
+        # A raw inline-asm acquire (xchg / lock cmpxchg / lock bts) inside the
+        # loop. Judged on the comment-stripped, string-PRESERVING copy: the
+        # instruction lives in an asm string literal, and prose about xchg does
+        # not count. Without this branch a lock written in bare asm walks
+        # straight past the rule; the adversarial probe scored it (none).
+        in_asm = PRIVATE_LOCK_ASM_RE.search(nocomment[hdr:loop_end]) is not None
+        if not (in_cond or in_body or in_asm):
+            continue
+        # Correctly routed: the retry loop parks on the shared wait queue
+        # (fs/fat.c fat_lock, drivers/usb_msc.c msc_cmd_lock).
+        if body_uses_parking(body):
+            continue
+        sp = enclosing_span(spans, hdr)
+        # IF-masking is judged on the RAW text of the enclosing function, since
+        # cli/pushfq only ever appear inside asm string literals.
+        raw = src[sp[0]:sp[1]] if sp else src[max(0, hdr - 400):hdr + 400]
+        masked = IRQMASK_RE.search(raw) is not None
+        rule = "PRIVATE_SPINLOCK" if masked else "PRIVATE_SPINLOCK_IRQON"
+        out.append((hdr, rule, snippet))
+    return out
+
+
 def scan_file(path, relpath):
     try:
         with open(path, "r", errors="replace") as f:
@@ -384,6 +628,7 @@ def scan_file(path, relpath):
         return []
     clean = strip_comments_and_strings(src)
     delay_wrappers = find_delay_wrappers(clean)
+    spans = func_spans(clean)
     hits = []
     seen = set()  # (line, rule) dedupe within a file
 
@@ -399,6 +644,10 @@ def scan_file(path, relpath):
             "snippet": normalize(snippet)[:160],
             "fp": fingerprint(relpath, rule, snippet),
         })
+
+    # --- #114 private hand-rolled spinlocks ---
+    for off, rule, snippet in find_private_spinlocks(src, clean, relpath, spans):
+        add(off, rule, snippet)
 
     # --- loop-based rules ---
     dowhile_tails = find_dowhile_tails(clean)
@@ -617,6 +866,65 @@ void st_delay(void) {
     for (int i = 0; i < 1000; i++) { io_wait(); }
 }
 """,
+    # ---- #114 -------------------------------------------------------------
+    # THE #75 SHAPE VERBATIM: a private lock word, a test-and-set retry loop,
+    # and RFLAGS.IF never touched. This is what mm/pmm.c looked like when it
+    # deadlocked two cores.
+    "PRIVATE_SPINLOCK_IRQON": """
+static volatile int st_lock = 0;
+static void st_acquire(void) {
+    while (__sync_lock_test_and_set(&st_lock, 1)) {
+        __asm__ volatile("pause");
+    }
+}
+""",
+    # The SAME defect wearing a different builtin. net/net_perf.c is written
+    # this way, and the __sync_lock_test_and_set grep that opened #114 did not
+    # report it. If this case ever goes GREEN the rule has been narrowed back
+    # to a single spelling and is worthless.
+    "PRIVATE_SPINLOCK_IRQON_ATOMIC": """
+static volatile unsigned st_lock2 = 0;
+static void st_acquire2(void) {
+    while (__atomic_test_and_set(&st_lock2, __ATOMIC_ACQUIRE)) {
+        __asm__ volatile("pause" ::: "memory");
+    }
+}
+""",
+    # A do-while acquire: the body precedes the condition, which the while/for
+    # header scan skips outright. Without iter_loops() this shape is invisible.
+    "PRIVATE_SPINLOCK_IRQON_DOWHILE": """
+static volatile int st_lock3 = 0;
+static void st_acquire3(void) {
+    do { } while (__sync_lock_test_and_set(&st_lock3, 1));
+}
+""",
+    # Masks IF, so NOT the AB-BA shape, but still a private fourth copy of
+    # sync/spinlock.h. mm/heap.c is exactly this. Must be reported, under the
+    # OTHER rule name.
+    "PRIVATE_SPINLOCK": """
+static volatile int st_lock4 = 0;
+static unsigned long st_acquire4(void) {
+    unsigned long fl;
+    __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl) :: "memory");
+    while (__sync_lock_test_and_set(&st_lock4, 1)) {
+        __asm__ volatile("pause");
+    }
+    return fl;
+}
+""",
+    # A lock written in BARE INLINE ASM, no builtin anywhere. The adversarial
+    # probe scored this (none) on the first cut of the rule because
+    # PRIVATE_LOCK_ASM_RE was defined and never referenced. Pinned here so the
+    # asm branch cannot rot back into a dead constant.
+    "PRIVATE_SPINLOCK_IRQON_ASM": """
+static volatile int st_lock5 = 0;
+static void st_acquire5(void) {
+    int old;
+    do {
+        __asm__ volatile("xchgl %0,%1" : "=r"(old), "+m"(st_lock5) : "0"(1));
+    } while (old);
+}
+""",
     "SLEEP_POLL_VIA_WRAPPER": """
 static void st_dly(int n) { (void)n; proc_sleep(1); }
 void st_wrapped(volatile int *flag) {
@@ -631,6 +939,32 @@ void st_ok(volatile int *flag) {
 }
 void st_ok2(volatile int *flag) {
     while (*flag == 0) { wait_event_timeout(&some_wq, *flag != 0, 100); }
+}
+"""
+# #114 GREEN control 1: the CORRECT fix. Routing a private lock through the
+# shared irqsave spinlock must NOT be flagged, or the rule punishes the very
+# change it is asking for and gets muted.
+SELFTEST_CLEAN_SHARED_SPINLOCK = """
+#include "../sync/spinlock.h"
+static spinlock_t st_lk = SPINLOCK_INIT;
+static uint64_t st_take(void) { return spinlock_acquire_irqsave(&st_lk); }
+static void st_give(uint64_t fl) { spinlock_release_irqrestore(&st_lk, fl); }
+"""
+# #114 GREEN control 2: the fs/fat.c / drivers/usb_msc.c shape. An atomic fast
+# path with a retry loop that PARKS on the shared wait queue is correct, and
+# flagging it would push authors back towards a raw spin.
+SELFTEST_CLEAN_PARKED_ACQUIRE = """
+#include "../sync/waitq.h"
+static volatile int st_busy = 0;
+static void st_park_acquire(void) {
+    if (__sync_lock_test_and_set(&st_busy, 1) == 0) return;
+    for (;;) {
+        wait_queue_entry_t wqe;
+        __wait_prepare(&st_wq, &wqe, 0);
+        if (st_busy) (void)__wait_event_wait_deadline(&wqe, sched_now_ms() + 10);
+        __wait_finish(&st_wq, &wqe);
+        if (__sync_lock_test_and_set(&st_busy, 1) == 0) return;
+    }
 }
 """
 
@@ -653,8 +987,13 @@ def self_test():
             new = [h for h in hits if h["fp"] not in entries]
             red = bool(new) or bool(bad)
             got = ",".join(sorted({h["rule"] for h in new})) or "-"
+            # #114: EXACT rule match, not a substring. `expect_rule in got`
+            # let "PRIVATE_SPINLOCK" be satisfied by a PRIVATE_SPINLOCK_IRQON
+            # hit, so a case could pass while testing the wrong rule. Any
+            # future rule that is a prefix of another had the same hole.
+            rules_seen = {h["rule"] for h in new}
             good = (red == expect_red) and (
-                expect_rule is None or expect_rule in got)
+                expect_rule is None or expect_rule in rules_seen)
             ok = ok and good
             verdict = "PASS" if good else "FAIL"
             state = "RED" if red else "GREEN"
@@ -664,9 +1003,13 @@ def self_test():
               "synthetic spin and GREEN on correct code.")
         for rule, body in SELFTEST_CASES.items():
             want = ("SLEEP_POLL" if rule == "SLEEP_POLL_VIA_WRAPPER" else
-                    "YIELD_SPIN" if rule == "YIELD_SPIN_SCHED" else rule)
+                    "YIELD_SPIN" if rule == "YIELD_SPIN_SCHED" else
+                    "PRIVATE_SPINLOCK_IRQON"
+                    if rule.startswith("PRIVATE_SPINLOCK_IRQON") else rule)
             run(rule, body, True, want)
         run("CLEAN_waitq", SELFTEST_CLEAN, False)
+        run("CLEAN_shared_spinlock", SELFTEST_CLEAN_SHARED_SPINLOCK, False)
+        run("CLEAN_parked_acquire", SELFTEST_CLEAN_PARKED_ACQUIRE, False)
 
         # the allowlist discipline itself must fail closed
         badallow = os.path.join(td, "bad-allowlist.txt")

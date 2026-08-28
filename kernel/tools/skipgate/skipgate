@@ -1,0 +1,303 @@
+#!/usr/bin/env python3
+"""skipgate - FAIL THE BUILD when a self-test can decline to run and say so in a
+line that reads like ordinary boot noise.
+
+WHY THIS EXISTS
+---------------
+kernel/fs/perms.c perms_selftest() printed this on every boot, forever:
+
+    [PERMS-SELFTEST] SKIP traversal vectors (/HOME/ADMIN not 1000:0750)
+
+It reads as "this image is not provisioned yet". It is not. The first-boot
+wizard lets the owner NAME the account and proc/users.c derives the home from
+that name, so an owner called "james" has /HOME/JAMES and NEVER has
+/HOME/ADMIN. MEASURED on golden build 2234: the shipped /CONFIG/PERMS.DB holds
+three entries and /CONFIG/PASSWD is empty, so the vectors could not run before
+provisioning either. The directory-traversal half of the permission model has
+therefore probably never been exercised on any real user's machine, and the
+kernel reported that fact once per boot in a line nobody reads.
+
+That is this project's most-repeated shape: a harness armed by a marker no
+image carries. The concurrency lint that could not fail (#514). The invariant
+gate that was documented but never run (#514). wq_assert_may_block(), described
+as shipped for a month before it was written (#514). img_shadow_selftest() and
+diskimg_boot_harness(), which main.c's own comment records as "compiled, linked
+and CALLED every boot" and returning at their first line because their marker
+files exist on no image. Every one of them passed every check that asks whether
+the code is REACHED, because it is.
+
+THE RULE
+--------
+Inside a function whose name ends in _selftest (or _selftest_worker, or begins
+selftest_), a printed line whose text says SKIP / SKIPPED / "skipping" /
+"not run" / "aborting self-test" must be produced by selftest_notrun().
+
+selftest_notrun() (kernel/security/selftest_registry.h) does two things that a
+bare kprintf cannot:
+
+  * it writes through bootlog_write(), so the line survives into /BOOTLOG.TXT
+    and can be read off a returned stick. The two machines whose evidence
+    matters (the owner's ASUS laptop, the iMac14,4) have NO SERIAL PORT, so a
+    kprintf skip notice produces literally nothing there; and
+  * it REGISTERS the group, so kernel/main.c's end-of-boot
+    selftest_notrun_report() can print one durable summary that says how many
+    self-tests declined. A reader greps for one tag instead of knowing in
+    advance which subsystem went quiet.
+
+A function that genuinely must print its own skip goes in allowlist.txt with
+[LEGIT]/[DEBT]/[LEGACY] and a real justification. A stale entry also fails, so
+the baseline cannot rot into names nobody has looked at since.
+
+WHAT THIS GATE DOES NOT CLAIM
+-----------------------------
+It is a TEXT rule, not a semantic one. It cannot see a self-test that stops
+testing without saying anything at all (img_shadow_selftest's bare `return;`),
+and it cannot see one whose assertions are structurally incapable of failing.
+Those need the RUNTIME half: selftest_ran()/selftest_notrun() counts in
+/BOOTLOG.TXT, where "13 ran, 1 did not" is a number a reader can act on.
+Neither half alone is enough, and neither is claimed to be.
+
+Exit 0 clean, 1 violation, 2 cannot run (fail closed).
+"""
+import os, re, sys, tempfile, shutil
+
+# Functions in scope: the self-tests. Deliberately NOT every function that can
+# print the word SKIP; a gate that fires on ordinary tracing gets switched off,
+# and then it is #514 all over again.
+# NOTE the `selftest_` PREFIX form is deliberately NOT matched. It caught the
+# registry's own selftest_notrun()/selftest_notrun_report(), whose whole job is
+# to say a group did not run: a gate that fires on its own remedy teaches people
+# to switch it off.
+NAME_RE = re.compile(r'^[a-z_0-9]+_selftest(_worker|_start|_report)?$')
+
+# Emit calls whose literal text is examined.
+EMIT_RE = re.compile(r'\b(kprintf|kprintf_nolock|serial_write|gfx_boot_log|bootlog_write|bootlog_fault_write)\s*\(')
+
+# The words that mean "this self-test did not run".
+SKIP_RE = re.compile(r'skip|skipping|skipped|not\s+run|not\s+built|aborting\s+self-?test|no\s+checks',
+                     re.IGNORECASE)
+
+NOTRUN_CALL = 'selftest_notrun'
+VALID_TAGS = ('[LEGIT]', '[DEBT]', '[LEGACY]')
+
+DEF_TAIL = r'\s*\([^;]*\)\s*(\{|$)'
+
+
+def find_defs(root):
+    """-> {name: (relpath, line, body)} for every *_selftest-shaped definition."""
+    out = {}
+    for dirpath, dirnames, files in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in ('tools', 'build', 'obj', '.git')]
+        for f in sorted(files):
+            if not f.endswith('.c'):
+                continue
+            p = os.path.join(dirpath, f)
+            lines = open(p, errors='replace').read().split('\n')
+            for i, line in enumerate(lines):
+                m = re.match(r'^[A-Za-z_][A-Za-z0-9_ \t\*]*?\b([a-z_0-9]+)' + DEF_TAIL, line)
+                if not m:
+                    continue
+                name = m.group(1)
+                if not NAME_RE.match(name):
+                    continue
+                if line.rstrip().endswith(';'):
+                    continue          # a prototype, not a definition
+                # Body: to the first column-0 '}'.
+                body = []
+                for j in range(i, len(lines)):
+                    body.append(lines[j])
+                    if j > i and lines[j].startswith('}'):
+                        break
+                if name not in out:   # first definition wins; duplicates are a
+                    out[name] = (os.path.relpath(p, root), i + 1, '\n'.join(body))
+    return out
+
+
+def emitted_literals(body):
+    """Every string-literal argument text of an emit call in `body`.
+
+    Crude on purpose: it takes the text from the emit call to the end of the
+    logical statement and pulls the double-quoted runs out of it, so an
+    adjacent-literal concatenation across several source lines is seen as one
+    piece of text. That is exactly the shape a long skip message takes.
+    """
+    out = []
+    for m in EMIT_RE.finditer(body):
+        tail = body[m.end():m.end() + 900]
+        # Stop at the statement end so a following call's text is not absorbed.
+        stop = tail.find(';')
+        if stop >= 0:
+            tail = tail[:stop]
+        parts = re.findall(r'"((?:[^"\\]|\\.)*)"', tail)
+        if parts:
+            out.append(' '.join(parts))
+    return out
+
+
+def scan(root):
+    """-> list of (name, loc, offending_text, nskip, nnotrun)."""
+    defs = find_defs(root)
+    if not defs and not os.path.isdir(root):
+        print('skipgate: FAIL-CLOSED: no such tree %s' % root, file=sys.stderr)
+        sys.exit(2)
+    viol = []
+    for name in sorted(defs):
+        rel, ln, body = defs[name]
+        # EVERY skip message emitted by something OTHER than selftest_notrun()
+        # is a violation. Counting notrun calls and comparing totals was the
+        # first attempt and the gate's own UNDERCOUNT fixture caught it going
+        # green: one correctly-registered branch bought silence for a second
+        # branch that still printed its own. The rule is per-message.
+        skips = [t for t in emitted_literals(body) if SKIP_RE.search(t)]
+        if not skips:
+            continue
+        nnotrun = body.count(NOTRUN_CALL + '(')
+        viol.append((name, '%s:%d' % (rel, ln), skips[0][:110], len(skips), nnotrun))
+    return viol, set(v[0] for v in viol)
+
+
+def load_allowlist(path):
+    out = {}
+    if not os.path.isfile(path):
+        return out
+    for n, raw in enumerate(open(path, errors='replace'), 1):
+        line = raw.split('#', 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[1] not in VALID_TAGS or len(parts[2].strip()) < 12:
+            print('skipgate: FAIL-CLOSED: allowlist line %d is not '
+                  '"<name> [LEGIT|DEBT|LEGACY] <real justification>": %s'
+                  % (n, raw.rstrip()), file=sys.stderr)
+            sys.exit(2)
+        out[parts[0]] = (parts[1], parts[2].strip())
+    return out
+
+
+def report(root, allow_path):
+    viol, seen = scan(root)
+    allow = load_allowlist(allow_path)
+    new = [v for v in viol if v[0] not in allow]
+    stale = sorted(set(allow) - seen)
+    if not new and not stale:
+        print('skipgate: OK (%d self-test skip site(s) baselined, 0 new)' % len(allow))
+        return 0
+    for name, loc, text, nskip, nnotrun in new:
+        print('skipgate: VIOLATION %s (%s): %d skip message(s), %d selftest_notrun() '
+              'call(s).' % (name, loc, nskip, nnotrun), file=sys.stderr)
+        print('          first: "%s"' % text, file=sys.stderr)
+    if new:
+        print('', file=sys.stderr)
+        print('  A self-test that declines to run must say so through', file=sys.stderr)
+        print('  selftest_notrun(group, reason) (kernel/security/selftest_registry.h),', file=sys.stderr)
+        print('  not through a kprintf that reads like ordinary boot noise. That', file=sys.stderr)
+        print('  routes the line to /BOOTLOG.TXT (serial is absent on the laptop and', file=sys.stderr)
+        print('  the iMac, which is where the evidence is needed) and registers the', file=sys.stderr)
+        print('  group so the end-of-boot [SELFTEST] summary can count it.', file=sys.stderr)
+        print('  If it genuinely must print its own, add it to', file=sys.stderr)
+        print('  %s with [LEGIT]/[DEBT]/[LEGACY] and why.' % allow_path, file=sys.stderr)
+    for name in stale:
+        print('skipgate: STALE allowlist entry %s: it no longer prints an unregistered'
+              % name, file=sys.stderr)
+        print('          skip message. Delete the line.', file=sys.stderr)
+    return 1
+
+
+# --------------------------------------------------------------------------
+# PROVE IT. A gate nobody has watched go red is indistinguishable from one that
+# is switched off. The fixture is synthetic and self-contained, so the proof
+# does not depend on the state of any real kernel file and cannot go green
+# because somebody happened to fix the function it was written against.
+# --------------------------------------------------------------------------
+RED = '''#include "x.h"
+void widget_selftest(void) {
+    if (!have_widget()) {
+        kprintf("[WIDGET-SELFTEST] SKIP vectors (/HOME/ADMIN not 1000:0750)\\n");
+        return;
+    }
+    check(1);
+}
+void plain_helper(void) { kprintf("SKIP: not a self-test, must not fire\\n"); }
+'''
+GREEN = '''#include "x.h"
+void widget_selftest(void) {
+    if (!have_widget()) {
+        selftest_notrun("widget/vectors",
+                        "no widget exists on this machine, so the vectors did not run");
+        return;
+    }
+    check(1);
+}
+void plain_helper(void) { kprintf("SKIP: not a self-test, must not fire\\n"); }
+'''
+# One notrun call cannot cover two skip messages.
+UNDERCOUNT = '''#include "x.h"
+void widget_selftest(void) {
+    if (!a()) { selftest_notrun("widget/a", "a is absent on this machine"); return; }
+    if (!b()) { kprintf("[WIDGET-SELFTEST] skipping the b vectors\\n"); return; }
+    check(1);
+}
+'''
+
+
+def self_test():
+    ok = True
+    tmp = tempfile.mkdtemp(prefix='skipgate-selftest-')
+    try:
+        cases = (('RED', RED, 1),
+                 ('GREEN', GREEN, 0),
+                 ('UNDERCOUNT', UNDERCOUNT, 1))
+        for label, src, want in cases:
+            open(os.path.join(tmp, 'fixture.c'), 'w').write(src)
+            al = os.path.join(tmp, 'empty.txt')
+            open(al, 'w').write('# empty\n')
+            viol, _ = scan(tmp)
+            got = 1 if [v for v in viol if v[0] not in load_allowlist(al)] else 0
+            good = (got == want)
+            ok = ok and good
+            print('  %-11s fixture: expected %s, gate says %s ... %s'
+                  % (label, 'VIOLATION' if want else 'clean',
+                     'VIOLATION' if got else 'clean', 'PASS' if good else 'FAIL'))
+        # The allowlist must suppress, and a stale entry must fail.
+        open(os.path.join(tmp, 'fixture.c'), 'w').write(RED)
+        al = os.path.join(tmp, 'allow.txt')
+        open(al, 'w').write('widget_selftest [DEBT] fixture, allowlisted on purpose\n')
+        rc = report(tmp, al)
+        print('  allowlisted RED fixture: expected clean, rc=%d ... %s'
+              % (rc, 'PASS' if rc == 0 else 'FAIL'))
+        ok = ok and rc == 0
+        open(al, 'w').write('nobody_selftest [DEBT] this name does not exist any more\n')
+        rc = report(tmp, al)
+        print('  stale allowlist entry: expected VIOLATION, rc=%d ... %s'
+              % (rc, 'PASS' if rc == 1 else 'FAIL'))
+        ok = ok and rc == 1
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print('skipgate --self-test: %s' % ('PASS' if ok else 'FAIL'))
+    return 0 if ok else 1
+
+
+def main():
+    root, allow, st = '.', None, False
+    a = sys.argv[1:]
+    i = 0
+    while i < len(a):
+        if a[i] == '--root':
+            i += 1; root = a[i]
+        elif a[i] == '--allowlist':
+            i += 1; allow = a[i]
+        elif a[i] == '--self-test':
+            st = True
+        else:
+            print('skipgate: unknown argument %s' % a[i], file=sys.stderr)
+            return 2
+        i += 1
+    if st:
+        return self_test()
+    if allow is None:
+        allow = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'allowlist.txt')
+    return report(root, allow)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

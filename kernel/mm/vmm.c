@@ -624,6 +624,65 @@ uint64_t vmm_create_user_space(void) {
     for (int i = 256; i < 512; i++) {
         pml4[i] = current_pml4[i];
     }
+
+    // #125: high-physical MMIO must survive into a user address space.
+    //
+    // The loop above copies the kernel upper half; PML4[0] is deep-copied
+    // below. Entries 1-255 were left EMPTY, which silently assumed that every
+    // device MMIO BAR lives under 512GB physical (i.e. inside PML4[0]).
+    //
+    // That assumption breaks the moment QEMU is given a CPU model reporting
+    // more than ~40 physical address bits (cpu=host on the the build host reports 46).
+    // QEMU then places the 64-bit PCI window near the top of the address
+    // space and the xHCI BAR lands at 0x0000384000000000, which is PML4[112].
+    // Early boot runs on the UEFI page tables, where entry 112 IS present, so
+    // the controller resets, enumerates and serves the root filesystem fine.
+    // The first doorbell write issued while a USER address space is loaded in
+    // CR3 then takes a not-present page fault and panics that CPU, leaving the
+    // rest of the machine alive and 97% idle with the compositor never
+    // presenting a frame (flips=0) - it looks like a hang, not a crash.
+    // Measured: 6/6 boots stalled on cpu=host, 0/12 on kvm64/Haswell-noTSX
+    // where the same BAR lands at 0x800100000 = PML4[0].
+    //
+    // Copy entries 2-255 VERBATIM so they keep the firmware's U/S=0 and stay
+    // unreachable from Ring 3. Entry 0 is deep-copied below; entry 1 is the
+    // user PIE window (0x8000000000) and must NOT inherit an identity map.
+    //
+    // #59 FIX (2026-08-19): this loop's own comment says "the firmware's" -
+    // the source was supposed to be the STABLE boot-time identity map, but it
+    // read `current_pml4_phys`, a SOFTWARE SHADOW that vmm_switch_pml4()
+    // reassigns on every context switch and that therefore reflects whichever
+    // process last ran, not the kernel/firmware. A per-process mapping that
+    // process added to its OWN PML4 slot 2-255 (e.g. the compositor's
+    // sys_fb_map() remap at the fixed vaddr 0x0000600000000000, which lands in
+    // PML4[192]) was indistinguishable from real firmware/MMIO identity state
+    // to this loop, so a Log Out / Switch User relaunch inherited the
+    // DEPARTED compositor's own fb PML4E here - PRESENT, correct physical
+    // chain, but with USER now forced off (this loop's own job). The new
+    // compositor's later sys_fb_map() then found that PML4 slot already
+    // present and reused it (vmm_get_or_create_entry_in only allocates fresh
+    // on a NOT-present slot); its own leaf PTEs came out correctly
+    // USER-writable, but the x86 permission check is the AND of every level
+    // in the walk, so the stale supervisor-only PML4E silently overrode them.
+    // sys_fb_map() had no way to see this - it returned success, and the
+    // fault only showed up on the compositor's first Ring-3 write into the
+    // framebuffer, i.e. its first real frame. Repeated every relaunch, this
+    // is the infinite Log-Out/Switch-User crash-respawn loop.
+    //
+    // g_kernel_cr3 is the fix: set exactly once in vmm_init() from the UEFI
+    // CR3 and never reassigned anywhere else in the tree (grep confirms), so
+    // it is the actual stable firmware/kernel identity table this loop's
+    // comment always claimed to be copying from - already the established
+    // "known-good kernel mapping" reference elsewhere (fb_syscall.c,
+    // crashhandler.c, framebuffer.c). Reading from it instead of the mutable
+    // shadow makes a departed process's own per-process mappings structurally
+    // impossible to inherit here, rather than merely unlikely.
+    uint64_t *fw_pml4 = g_kernel_cr3 ? (uint64_t*)g_kernel_cr3 : current_pml4;
+    for (int i = 2; i < 256; i++) {
+        if (fw_pml4[i] & VMM_FLAG_PRESENT) {
+            pml4[i] = fw_pml4[i] & ~(uint64_t)VMM_FLAG_USER;
+        }
+    }
     
     // CRITICAL: Deep copy PML4[0] with new PDPT to avoid huge page conflicts
     // The kernel's PML4[0] contains a PDPT that has 2MB huge pages at 2GB range
@@ -709,7 +768,17 @@ uint64_t vmm_clone_user_space(uint64_t src_pml4_phys) {
 
     // For now, do a simple deep copy of all user-space pages
     // TODO: Implement copy-on-write for efficiency
+    uint64_t *ref_pml4_c = (uint64_t*)current_pml4_phys;
     for (int i = 0; i < 256; i++) {  // Only user space (lower half)
+        // #125: a BORROWED high-physical MMIO slot must be carried BY VALUE.
+        // Deep-copying it would duplicate the firmware's page tables into the
+        // child and then hand them to the destroy path as if the child owned
+        // them. Keep the shared mapping and keep it out of the ownership walk.
+        if (i >= 2 && ref_pml4_c && (src_pml4[i] & VMM_FLAG_PRESENT) &&
+            src_pml4[i] == ref_pml4_c[i]) {
+            dst_pml4[i] = src_pml4[i];
+            continue;
+        }
         if (src_pml4[i] & VMM_FLAG_PRESENT) {
             // Allocate new PDPT
             uint64_t *src_pdpt = (uint64_t*)(src_pml4[i] & VMM_ADDR_MASK);
@@ -936,6 +1005,18 @@ void vmm_destroy_user_space(uint64_t pml4_phys) {
     // Free user space pages only (lower half, entries 0-255)
     for (int i = 0; i < 256; i++) {
         if (!(pml4[i] & VMM_FLAG_PRESENT)) continue;
+
+        // #125: entries 2-255 are BORROWED verbatim from the reference address
+        // space so that high-physical MMIO (a 64-bit PCI BAR above 512GB) stays
+        // reachable while a user CR3 is loaded. The page tables under them
+        // belong to the FIRMWARE and are shared by every address space. The
+        // "PDPT page is always owned" assumption at the bottom of this loop does
+        // NOT hold for them: freeing those hands 126 live page-table pages back
+        // to the PMM on every process exit. Byte-identical to the reference
+        // means borrowed, so skip the slot whole. PML4[0] is deep-copied (its
+        // value differs) and PML4[1] is the user window (absent in the
+        // reference), so neither is affected.
+        if (i >= 2 && ref_pml4 && pml4[i] == ref_pml4[i]) continue;
 
         uint64_t *pdpt = (uint64_t*)(pml4[i] & VMM_ADDR_MASK);
 
@@ -1606,6 +1687,119 @@ static uint64_t vmm_pat_bits(int idx, int large) {
 // keeps its original type. Returns the number of BYTES actually re-typed, which
 // lets the caller report real coverage instead of assuming 100%.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// #COMPIDLE: SPLIT A PARTIALLY-COVERED LARGE PAGE INSTEAD OF SKIPPING IT.
+//
+// MEASURED on VM <vmid>, golden 2065, before this change:
+//
+//   [PAT] 0xc0000000..0xc03e8000 -> slot 1: 2048 KB re-typed, 1952 KB left as-is
+//   [FB] #642 WC ACTIVE on 0xc0000000..0xc03e8000: 2048 of 4000 KB re-typed (51%)
+//
+// A 1280x800x32 framebuffer is 3.90625 MB. It occupies one WHOLE 2MB granule
+// and 1.90625 MB of a second one. The whole granule is re-typed; the partial
+// one is not, so on real hardware the BOTTOM 49% OF THE SCREEN keeps the
+// firmware's UC type and every pixel written there is still an individual
+// uncached transaction. That is the half of the screen the taskbar, the dock
+// and the clock live in. #642 reported this honestly as a coverage
+// percentage rather than claiming 100%, which is why it was findable at all,
+// but 51% was never the intended outcome: it is an artifact of the
+// allocation-free strategy #642 had to adopt.
+//
+// WHY #642 COULD NOT SPLIT, AND WHY THAT REASON IS GONE. Its own header
+// records that the first version DID split, and page-faulted writing the
+// table it had just allocated, because "pmm_alloc_page() had handed back a
+// paging structure the CPU was actively walking". That is #647, and #647 IS
+// FIXED (commit 6e84468e, "the UEFI page tables CR3 runs on were in the PMM
+// free list"), landing AFTER #642. The constraint that forced the coarse
+// strategy no longer holds.
+//
+// This still does not call the PMM. It does not need to: the number of tables
+// a range can ever need is bounded at FOUR by geometry (only the first and
+// last granule of a contiguous range can be partial, and each can need at
+// most a PD and a PT), so a static pool is both sufficient and immune to
+// whatever the allocator is doing this early in boot. Eight are provided.
+//
+// FAILING SAFE IS EXPLICIT. The MMU walks tables by PHYSICAL address, and
+// this pool is a kernel .bss object addressed virtually. On this OS those are
+// the same number, but that is a property of the boot layout, not a
+// guarantee, so it is CHECKED by walking the very table being edited. If it
+// does not hold, the split is refused and the caller gets exactly today's
+// behaviour: correct mappings, coarser coverage, and a number that says so.
+// ---------------------------------------------------------------------------
+#define VMM_SPLIT_POOL_PAGES 8
+static uint64_t g_split_pool[VMM_SPLIT_POOL_PAGES][512] __attribute__((aligned(4096)));
+static int      g_split_pool_used = 0;
+
+// Resolve va -> pa by walking the SAME table vmm_set_memtype_range is editing,
+// rather than trusting mm/vmm.c's current_pml4_phys shadow (which the
+// scheduler never updates - see blame.md).
+static uint64_t vmm_walk_phys_in(uint64_t *pml4, uint64_t va) {
+    if (!(pml4[VMM_PML4_INDEX(va)] & VMM_FLAG_PRESENT)) return 0;
+    uint64_t *pdpt = (uint64_t *)(pml4[VMM_PML4_INDEX(va)] & VMM_ADDR_MASK);
+    uint64_t e = pdpt[VMM_PDPT_INDEX(va)];
+    if (!(e & VMM_FLAG_PRESENT)) return 0;
+    if (e & VMM_FLAG_HUGE)
+        return (e & VMM_ADDR_MASK & ~(VMM_PAGE_SIZE_1G - 1)) | (va & (VMM_PAGE_SIZE_1G - 1));
+    uint64_t *pd = (uint64_t *)(e & VMM_ADDR_MASK);
+    e = pd[VMM_PD_INDEX(va)];
+    if (!(e & VMM_FLAG_PRESENT)) return 0;
+    if (e & VMM_FLAG_HUGE)
+        return (e & VMM_ADDR_MASK & ~(VMM_PAGE_SIZE_2M - 1)) | (va & (VMM_PAGE_SIZE_2M - 1));
+    uint64_t *pt = (uint64_t *)(e & VMM_ADDR_MASK);
+    e = pt[VMM_PT_INDEX(va)];
+    if (!(e & VMM_FLAG_PRESENT)) return 0;
+    return (e & VMM_ADDR_MASK & ~(VMM_PAGE_SIZE_4K - 1)) | (va & (VMM_PAGE_SIZE_4K - 1));
+}
+
+static uint64_t *vmm_split_take_page(uint64_t *pml4) {
+    if (g_split_pool_used >= VMM_SPLIT_POOL_PAGES) return 0;
+    uint64_t *p = g_split_pool[g_split_pool_used];
+    if (vmm_walk_phys_in(pml4, (uint64_t)p) != (uint64_t)p) return 0;
+    g_split_pool_used++;
+    for (int i = 0; i < 512; i++) p[i] = 0;
+    return p;
+}
+
+// Replace one HUGE leaf with a table of 512 children covering exactly the same
+// physical range with exactly the same permissions and memory type. Returns 1
+// on success, 0 if it refused (caller then behaves exactly as before).
+//
+// THE MEMORY-TYPE BITS MOVE BETWEEN LEVELS and getting that wrong would
+// silently change the cacheability of the region rather than fail loudly: PAT
+// is bit 12 in a 2MB/1GB leaf and bit 7 in a 4KB PTE, while bit 7 in a leaf is
+// the HUGE bit. A 1GB leaf's children are 2MB leaves (PAT stays at bit 12 and
+// HUGE stays set); a 2MB leaf's children are 4KB PTEs (PAT moves to bit 7 and
+// HUGE must be clear, or bit 7 would read as PAT anyway and the entry would
+// still be a leaf).
+static int vmm_split_large_leaf(uint64_t *pml4, uint64_t *entry, int is_1g) {
+    uint64_t e = *entry;
+    uint64_t leaf_sz  = is_1g ? VMM_PAGE_SIZE_1G : VMM_PAGE_SIZE_2M;
+    uint64_t child_sz = is_1g ? VMM_PAGE_SIZE_2M : VMM_PAGE_SIZE_4K;
+    uint64_t base = e & VMM_ADDR_MASK & ~(leaf_sz - 1);
+
+    uint64_t *tbl = vmm_split_take_page(pml4);
+    if (!tbl) return 0;
+
+    uint64_t common = e & (VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE | VMM_FLAG_USER |
+                           VMM_FLAG_PWT | VMM_FLAG_PCD | VMM_FLAG_ACCESSED |
+                           VMM_FLAG_DIRTY | VMM_FLAG_GLOBAL | VMM_FLAG_NX);
+    uint64_t child_extra = is_1g
+        ? (VMM_FLAG_HUGE | (e & VMM_FLAG_PAT_LARGE))
+        : ((e & VMM_FLAG_PAT_LARGE) ? VMM_FLAG_PAT : 0);
+
+    for (int i = 0; i < 512; i++)
+        tbl[i] = (base + (uint64_t)i * child_sz) | common | child_extra;
+
+    // The leaf becomes a TABLE pointer: no HUGE, no PAT, no GLOBAL (none of
+    // those mean anything at a table level), and PWT/PCD deliberately clear
+    // because at a table level they describe the cacheability of the TABLE
+    // PAGE, which is ordinary WB kernel .bss. WRITABLE/USER/NX are carried so
+    // the table level is never MORE restrictive than the children it replaced.
+    *entry = ((uint64_t)tbl & VMM_ADDR_MASK) | VMM_FLAG_PRESENT |
+             (e & (VMM_FLAG_WRITABLE | VMM_FLAG_USER | VMM_FLAG_NX));
+    return 1;
+}
+
 int64_t vmm_set_memtype_range(uint64_t pml4_phys, uint64_t virt_addr,
                               uint64_t size, int pat_index) {
     if (!pml4_phys || !size) return -1;
@@ -1619,6 +1813,7 @@ int64_t vmm_set_memtype_range(uint64_t pml4_phys, uint64_t virt_addr,
     uint64_t bits_4k    = vmm_pat_bits(pat_index, 0);
     uint64_t bits_large = vmm_pat_bits(pat_index, 1);
     uint64_t done = 0, skipped = 0;
+    int      did_split = 0, refused_split = 0;   // #COMPIDLE
 
     // See note (1) above. Interrupts off for the whole walk so that nothing else
     // can run while supervisor write protection is off, and CR0 is restored on
@@ -1659,7 +1854,15 @@ int64_t vmm_set_memtype_range(uint64_t pml4_phys, uint64_t virt_addr,
                 pdpt[pdpt_i] = (pdpt[pdpt_i] & ~VMM_PAT_MASK_LARGE) | bits_large;
                 if (live) vmm_invlpg(g0);
                 done += VMM_PAGE_SIZE_1G;
+            } else if (vmm_split_large_leaf(pml4, &pdpt[pdpt_i], 1)) {
+                // #COMPIDLE: partially covered. Split and re-walk THE SAME va,
+                // which now lands on 2MB children. Cannot loop forever: the
+                // entry is no longer HUGE, and a refused split falls through
+                // to the skip below.
+                did_split = 1;
+                continue;
             } else {
+                refused_split = 1;
                 skipped += (g1 < end ? g1 : end) - va;
             }
             va = g1;
@@ -1682,7 +1885,11 @@ int64_t vmm_set_memtype_range(uint64_t pml4_phys, uint64_t virt_addr,
                 pd[pd_i] = (pd[pd_i] & ~VMM_PAT_MASK_LARGE) | bits_large;
                 if (live) vmm_invlpg(g0);
                 done += VMM_PAGE_SIZE_2M;
+            } else if (vmm_split_large_leaf(pml4, &pd[pd_i], 0)) {
+                did_split = 1;      // #COMPIDLE: see the 1GB case above
+                continue;
             } else {
+                refused_split = 1;
                 skipped += (g1 < end ? g1 : end) - va;
             }
             va = g1;
@@ -1702,10 +1909,27 @@ int64_t vmm_set_memtype_range(uint64_t pml4_phys, uint64_t virt_addr,
         va += VMM_PAGE_SIZE_4K;
     }
 
+    // #COMPIDLE: a split replaces a large TLB entry with a table, and a GLOBAL
+    // large entry survives a plain CR3 reload, so toggling CR4.PGE is the only
+    // flush that is guaranteed to retire it. Boot-time and one-shot; the
+    // per-entry invlpg above is kept for the no-split case.
+    if (did_split) {
+        uint64_t cr4_now;
+        __asm__ volatile("mov %%cr4, %0" : "=r"(cr4_now));
+        if (cr4_now & CR4_PGE_BIT) {
+            __asm__ volatile("mov %0, %%cr4" :: "r"(cr4_now & ~CR4_PGE_BIT) : "memory");
+            __asm__ volatile("mov %0, %%cr4" :: "r"(cr4_now) : "memory");
+        } else {
+            vmm_flush_tlb();
+        }
+    }
+
     VMM_MEMTYPE_UNWIND();
 #undef VMM_MEMTYPE_UNWIND
 
-    kprintf("[PAT] 0x%lx..0x%lx -> slot %d: %lu KB re-typed, %lu KB left as-is\n",
-            start, end, pat_index, done / 1024, skipped / 1024);
+    kprintf("[PAT] 0x%lx..0x%lx -> slot %d: %lu KB re-typed, %lu KB left as-is "
+            "(split=%d refused=%d pool=%d/%d)\n",
+            start, end, pat_index, done / 1024, skipped / 1024,
+            did_split, refused_split, g_split_pool_used, VMM_SPLIT_POOL_PAGES);
     return (int64_t)done;
 }

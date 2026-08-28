@@ -1,0 +1,43 @@
+# skipgate allowlist: self-tests that print their own skip message instead of
+# registering it through selftest_notrun().
+#
+# Format:  <function> [LEGIT|DEBT|LEGACY] <justification>
+#
+# [LEGIT]  printing its own is the right answer here, and the reason is below.
+# [DEBT]   should register; not converted yet, and this says what it would buy.
+# [LEGACY] bulk-baselined and NOT individually reviewed. Treat as backlog.
+#
+# A stale entry (a name that no longer prints an unregistered skip) FAILS the
+# gate, so this list cannot rot into names nobody has looked at.
+#
+# Baselined 2026-08-27 (#PERMSKIP). Every entry below was read; none is
+# [LEGACY]. See kernel/tools/skipgate/README.md for why the gate exists: a
+# self-test that stops testing must be LOUDER than one that passes, and it must
+# be loud in the log that survives a power cycle, because the two machines whose
+# evidence matters have no serial port.
+#
+# NOT on this list, because they were converted:
+#   ext2_selftest             - was the [DEBT] entry here and the biggest one.
+#                               #EXT2SELFTEST retargeted it at the MOUNTED root
+#                               (it used to mount the two-disk dev layout itself
+#                               and abort), replaced its three fixture-pinned
+#                               probes with discovered subjects, and routed every
+#                               did-not-run through selftest_notrun(). Removed
+#                               2026-08-27; leaving it would fail as stale.
+#   perms_selftest            - the defect that caused all of this
+#   path_resolve_e2e_selftest - the ONLY end-to-end proof that chdir() is wired
+#                               into path resolution, armed by a hardcoded list
+#                               of six app names that has already drifted once
+
+# ---- [LEGIT]: the word appears, the meaning does not ----------------------
+sched_smp_selftest  [LEGIT] The match is "idle-skip" inside a printed list of verdict NAMES ("all-equal, mixed, idle-skip, degenerate") on the SUCCESS line. It is not a skip notice. This entry is the honest record of the gate's text-rule limit rather than a reason to loosen the rule for everyone.
+
+# ---- [LEGIT]: developer arms that are not, and never claimed to be, coverage
+blk_stage_selftest  [LEGIT] Compiled only under -DBLKSTAGE_TEST, which kernel/Makefile defines only for `make BLKSTAGETEST=1` and build-golden.sh never passes, so it is not in any shipped kernel at all. Its two skip lines are already bootlog_write() and already say WHY (ATA root has no staging buffer to race). Registering them would add a group to the summary of a build no user runs.
+blk_census_selftest [LEGIT] Gated on BLK122_WINDOWS, which appears in no Makefile and no build script, so the "NOT BUILT" line is a permanent, accurate statement about a probe that deliberately burns a core for 5000us with interrupts off. Arming it by default would be a regression; the line is honest about being off.
+dos4gw_selftest_report [LEGIT] This is the model the rest of the tree should copy, not a violation: it counts its checks, prints SKIPPED with the reason on every arm, and prints "SKIPPED" rather than a pass when checks == 0. Eight matches, all of them the correct behaviour. Converting it would gain nothing it does not already do.
+
+# ---- [DEBT]: these SHOULD register, and here is what it would buy ---------
+ahci_selftest      [DEBT] "AHCI not initialized, skipping" on every machine whose disk is not AHCI, which today is all of them (the ATA driver owns legacy IDE and the golden runs machine type pc/q35 with USB-MSC). Registering it would make "this kernel has never exercised its AHCI path" a fact in /BOOTLOG.TXT rather than a serial line nobody reads. Cheap; deferred only to keep this change's blast radius to the permission model.
+bkl_probe_selftest [DEBT] "SKIPPED (cpu %u out of range)" is a genuine did-not-run. Same argument and same cheapness as ahci_selftest.
+scp_selftest       [DEBT] "SKIPPED (mono clock not calibrated)" is a genuine did-not-run, and whether the monotonic clock calibrated is exactly the sort of per-machine fact that is worth having off a returned stick. Same argument as ahci_selftest.

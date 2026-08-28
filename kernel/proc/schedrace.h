@@ -43,6 +43,32 @@
 typedef enum {
     SR_SITE_AFTER_PUBLISH = 0,  // next claimed, prev queued, before the switch
     SR_SITE_AFTER_BKL_DROP,     // BKL released, before context_switch/start
+    // #745 (#75): inside the physical allocator's critical section. Unlike the
+    // two sites above, interrupts here are NOT off by construction: that is
+    // exactly the property under test. On the unfixed allocator the hold runs
+    // with IF=1, so widening it makes an interrupt land on the holder, which
+    // turns the holder into a Big Kernel Lock waiter and completes the AB-BA
+    // deadlock with a core that holds the BKL and wants pmm_lock. On the fixed
+    // allocator the same widening runs with IF=0 and cannot be interrupted, so
+    // no amount of widening can produce the inversion. The two arms differ in
+    // exactly one thing and the reproducer tells them apart in one boot.
+    SR_SITE_PMM_HOLD,
+    // #75 (enqrace75b): BETWEEN proc_yield() ENQUEUEING A TASK THAT IS STILL
+    // RUNNING AND sched_schedule() ARMING sched_on_cpu ON IT.
+    //
+    // MEASURED, build 1980, 4 vCPU + DOS, 130 s of steady state: proc_yield()
+    // enqueued a task that a core was RUNNING 21317 times, which is 100% of that
+    // call site's enqueues, and sched_rq_pop_locked() popped a running task ZERO
+    // times. The window exists structurally - nothing on the enqueue path can
+    // see a running task, because sched_on_cpu is 0 for the whole of a timeslice
+    // - but at natural timings it is a handful of instructions wide and was
+    // never observed to be entered.
+    //
+    // A probe that has never fired says nothing about the world until it has
+    // been shown capable of firing. This site holds that window open so the
+    // [RUNPOP] counter can be SEEN to move, which is the difference between
+    // "the window is never entered" and "the probe is dead".
+    SR_SITE_YIELD_ENQ,
     SR_SITE_MAX
 } schedrace_site_t;
 

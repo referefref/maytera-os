@@ -123,6 +123,174 @@ unsafe fn mono_pit_latch() -> u16 {
     (hi << 8) | lo
 }
 
+// ---------------------------------------------------------------------------
+// #ASUSDIAG: CALIBRATION MUST NOT BE ABLE TO LOOK LIKE A HANG.
+//
+// The loop below used to be bounded ONLY by a 200,000,000-iteration safety
+// counter. That is a bound, so it was not a hang, but on a machine whose 8254
+// is absent or powered down it is very nearly the same thing. An unclaimed x86
+// I/O port floats to 0xFF, so every latch returns 0xFFFF, `cur <= prev` always
+// holds, the delta is always 0, `counted` never advances, and the loop runs the
+// full safety count at THREE legacy port accesses per iteration. A legacy I/O
+// access on a modern laptop goes out over eSPI at roughly a microsecond, which
+// puts the worst case in the range of MINUTES, spent at main.c:932, which is
+// BEFORE console_init(). Nothing on screen, no serial port on a laptop, no
+// filesystem mounted: a machine that is indistinguishable from dead for several
+// minutes and then carries on. That is the worst diagnostic outcome available.
+//
+// Three changes, in order of how much they matter:
+//
+//  1. PROBE FIRST, CALIBRATE SECOND. mono_pit_probe() decides in microseconds
+//     whether channel 0 is counting at all. A frozen or floating counter is
+//     detected and reported instead of being discovered slowly.
+//  2. A REAL FALLBACK SOURCE. CPUID leaf 0x15 gives the TSC/core-crystal ratio
+//     and leaf 0x16 the base frequency, either of which yields the TSC rate
+//     outright with no timing loop. Before this there was no second source at
+//     all: a dead PIT meant no clock, and every mono_busy_delay_us() then took
+//     its own PIT fallback with its own 200,000,000 cap, so USB enumeration
+//     would effectively never finish.
+//  3. A PLAUSIBILITY BAND. The old code rejected only khz == 0. Ports returning
+//     VARYING garbage rather than a steady 0xFF produce a non-zero but wildly
+//     wrong kHz that every deadline in the kernel then trusts in silence. A
+//     rate outside 200 MHz to 10 GHz is not a measurement, it is noise.
+//
+// The PIT stays the PREFERRED source when it is healthy: it is the reference
+// proven on the real iMac14,4 (#307/#375), and CPUID 0x15/0x16 are Intel-only
+// and absent on the kvm64 CPU model every VM here uses. This adds a fallback
+// and a floor, it does not move the primary.
+
+/// Outcome of mono_pit_probe(). Reported by mono_pit_state_rs() so the boot log
+/// can say WHICH failure this machine has rather than only that timing failed.
+const PIT_COUNTING: u32 = 0;
+const PIT_FROZEN: u32 = 1; // decodes, but the count never changes
+const PIT_FLOATING: u32 = 2; // reads 0xFFFF: nothing is driving the bus
+const PIT_UNPROBED: u32 = 3;
+
+/// Samples taken by the probe. Each is separated by a short pause spin because
+/// channel 0 decrements every ~838ns and three back-to-back port accesses can
+/// be quicker than that, which would make a HEALTHY counter look frozen.
+const MONO_PIT_PROBE_SAMPLES: u32 = 64;
+
+/// Iteration cap on the calibration loop itself, kept as a backstop BELOW the
+/// probe. A healthy calibration exits after roughly 17,000 iterations (50ms of
+/// PIT time at ~3us per latch), so 2,000,000 is about 100x headroom and caps the
+/// worst case at a few seconds rather than a few minutes.
+const MONO_CALIB_MAX_ITERS: u64 = 2_000_000;
+
+/// A derived rate outside this band is noise, not a measurement.
+const MONO_KHZ_MIN: u64 = 200_000; // 200 MHz
+const MONO_KHZ_MAX: u64 = 10_000_000; // 10 GHz
+
+/// How the live rate was derived. Reported by mono_source_rs().
+const SRC_NONE: u32 = 0;
+const SRC_PIT: u32 = 1;
+const SRC_CPUID15: u32 = 2;
+const SRC_CPUID16: u32 = 3;
+
+static MONO_PIT_STATE: AtomicU64 = AtomicU64::new(PIT_UNPROBED as u64);
+static MONO_SOURCE: AtomicU64 = AtomicU64::new(SRC_NONE as u64);
+static MONO_CPUID_KHZ: AtomicU64 = AtomicU64::new(0);
+static MONO_PIT_KHZ: AtomicU64 = AtomicU64::new(0);
+
+/// Is PIT channel 0 actually counting? Returns one of PIT_*.
+///
+/// # Safety: Ring 0 port I/O.
+unsafe fn mono_pit_probe() -> u32 {
+    let first = mono_pit_latch();
+    let mut moved = false;
+    let mut any_not_ff = first != 0xFFFF;
+    let mut i = 0u32;
+    while i < MONO_PIT_PROBE_SAMPLES {
+        let mut d = 0u32;
+        while d < 64 {
+            core::arch::asm!("pause", options(nomem, nostack, preserves_flags));
+            d += 1;
+        }
+        let cur = mono_pit_latch();
+        if cur != first {
+            moved = true;
+        }
+        if cur != 0xFFFF {
+            any_not_ff = true;
+        }
+        i += 1;
+    }
+    if moved {
+        PIT_COUNTING
+    } else if !any_not_ff {
+        PIT_FLOATING
+    } else {
+        PIT_FROZEN
+    }
+}
+
+/// TSC rate in kHz from CPUID, or 0 if the CPU does not report it.
+///
+/// Leaf 0x15 is exact where the firmware fills in the crystal frequency:
+/// tsc_hz = ECX (core crystal Hz) * EBX (numerator) / EAX (denominator).
+/// Leaf 0x16 EAX is the processor BASE frequency in MHz, and on every Intel part
+/// with an invariant TSC the TSC ticks at exactly that base frequency, so this
+/// is the correct number rather than an approximation of the current turbo
+/// clock. Both leaves are Intel-only; AMD and the kvm64 model return zeros,
+/// which the non-zero guards below reject, so this can only ever ADD a source.
+fn mono_tsc_khz_from_cpuid() -> (u64, u32) {
+    // CPUID has no memory operands and is unprivileged, so core exposes
+    // __cpuid_count as a SAFE function on this target. The only correctness
+    // requirement is checking the leaf number against the maximum basic leaf
+    // before use, which every read below does.
+    let max_leaf = core::arch::x86_64::__cpuid_count(0, 0).eax;
+
+    if max_leaf >= 0x15 {
+        let l = core::arch::x86_64::__cpuid_count(0x15, 0);
+        if l.eax != 0 && l.ebx != 0 && l.ecx != 0 {
+            let hz = (l.ecx as u64)
+                .saturating_mul(l.ebx as u64)
+                / (l.eax as u64);
+            let khz = hz / 1000;
+            if (MONO_KHZ_MIN..=MONO_KHZ_MAX).contains(&khz) {
+                return (khz, SRC_CPUID15);
+            }
+        }
+    }
+    if max_leaf >= 0x16 {
+        let l = core::arch::x86_64::__cpuid_count(0x16, 0);
+        let mhz = (l.eax & 0xFFFF) as u64;
+        let khz = mhz.saturating_mul(1000);
+        if (MONO_KHZ_MIN..=MONO_KHZ_MAX).contains(&khz) {
+            return (khz, SRC_CPUID16);
+        }
+    }
+    (0, SRC_NONE)
+}
+
+/// PIT channel 0 probe verdict: 0 counting, 1 frozen, 2 floating, 3 not probed.
+#[no_mangle]
+pub extern "C" fn mono_pit_state_rs() -> u32 {
+    MONO_PIT_STATE.load(Ordering::Relaxed) as u32
+}
+
+/// How the live rate was derived: 0 none, 1 PIT, 2 CPUID leaf 0x15, 3 leaf 0x16.
+#[no_mangle]
+pub extern "C" fn mono_source_rs() -> u32 {
+    MONO_SOURCE.load(Ordering::Relaxed) as u32
+}
+
+/// The CPUID-derived rate in kHz, 0 if the CPU does not report one. Exposed so
+/// the boot log can print BOTH sources side by side: two independent numbers
+/// that agree are evidence, and two that disagree are a finding. A single number
+/// with nothing to check it against is the situation this module was in when a
+/// varying-garbage PIT could hand it a silently wrong clock.
+#[no_mangle]
+pub extern "C" fn mono_cpuid_khz_rs() -> u64 {
+    MONO_CPUID_KHZ.load(Ordering::Relaxed)
+}
+
+/// The PIT-derived rate in kHz, 0 if PIT calibration was not run or failed.
+#[no_mangle]
+pub extern "C" fn mono_pit_khz_rs() -> u64 {
+    MONO_PIT_KHZ.load(Ordering::Relaxed)
+}
+
 /// Calibrate the TSC against PIT channel 0 and start the clock.
 /// Returns the derived TSC rate in kHz, or 0 if calibration failed (in which
 /// case every mono_*() reader reports not-ready and callers keep their old
@@ -138,54 +306,86 @@ pub extern "C" fn mono_init_rs(timer_hz: u32) -> u64 {
         reload = 65535;
     }
 
-    // Calibrate over ~50ms of PIT time: long enough that the per-latch sampling
-    // cost is noise, short enough not to stall boot.
-    let target_counts = (MONO_PIT_INPUT_HZ * 50 / 1000) * MONO_PIT_DEC_PER_CLOCK;
-
-    let mut counted: u64 = 0;
-    // Bounded: a wedged or absent PIT must degrade to "calibration failed",
-    // never to an unbounded hang. Every poll in this kernel is bounded (#426).
-    let mut safety: u64 = 200_000_000;
+    // A second, INDEPENDENT source, obtained with no timing loop at all. Read it
+    // first, so that even a machine whose PIT wastes the whole calibration
+    // budget still ends up with a usable clock rather than none.
+    let (cpuid_khz, cpuid_src) = mono_tsc_khz_from_cpuid();
+    MONO_CPUID_KHZ.store(cpuid_khz, Ordering::SeqCst);
 
     // SAFETY: Ring 0 port I/O against the PIT, which pit_init() has programmed.
-    let khz = unsafe {
-        let t0 = mono_rdtsc();
-        let mut prev = mono_pit_latch();
-        while counted < target_counts && safety > 0 {
-            safety -= 1;
-            core::arch::asm!("pause", options(nomem, nostack, preserves_flags));
-            let cur = mono_pit_latch();
-            // Channel 0 counts down and wraps at `reload`. saturating_sub keeps
-            // a nonsense reading (cur > reload) from underflowing the delta.
-            let delta = if cur <= prev {
-                (prev - cur) as u64
+    let pit_state = unsafe { mono_pit_probe() };
+    MONO_PIT_STATE.store(pit_state as u64, Ordering::SeqCst);
+
+    let mut pit_khz = 0u64;
+    if pit_state == PIT_COUNTING {
+        // Calibrate over ~50ms of PIT time: long enough that the per-latch
+        // sampling cost is noise, short enough not to stall boot.
+        let target_counts = (MONO_PIT_INPUT_HZ * 50 / 1000) * MONO_PIT_DEC_PER_CLOCK;
+        let mut counted: u64 = 0;
+        let mut safety: u64 = MONO_CALIB_MAX_ITERS;
+
+        // SAFETY: Ring 0 port I/O against the PIT, as above.
+        let k = unsafe {
+            let t0 = mono_rdtsc();
+            let mut prev = mono_pit_latch();
+            while counted < target_counts && safety > 0 {
+                safety -= 1;
+                core::arch::asm!("pause", options(nomem, nostack, preserves_flags));
+                let cur = mono_pit_latch();
+                // Channel 0 counts down and wraps at `reload`. saturating_sub
+                // keeps a nonsense reading (cur > reload) from underflowing.
+                let delta = if cur <= prev {
+                    (prev - cur) as u64
+                } else {
+                    (prev as u64) + reload.saturating_sub(cur as u64)
+                };
+                counted += delta;
+                prev = cur;
+            }
+            let t1 = mono_rdtsc();
+
+            if safety == 0 || counted == 0 {
+                0u64
             } else {
-                (prev as u64) + reload.saturating_sub(cur as u64)
-            };
-            counted += delta;
-            prev = cur;
+                let tsc_delta = t1.wrapping_sub(t0);
+                // elapsed_ms = counted / DEC / INPUT_HZ * 1000
+                // khz        = tsc_delta / elapsed_ms
+                //            = tsc_delta * INPUT_HZ * DEC / (counted * 1000)
+                // Worst case is comfortably inside u64, and saturating_mul makes
+                // that structural rather than a comment.
+                let num = tsc_delta
+                    .saturating_mul(MONO_PIT_INPUT_HZ)
+                    .saturating_mul(MONO_PIT_DEC_PER_CLOCK);
+                let den = counted.saturating_mul(1000);
+                if den == 0 {
+                    0u64
+                } else {
+                    num / den
+                }
+            }
+        };
+        // A rate outside the plausibility band is noise, not a measurement. The
+        // old code rejected only zero, so ports returning VARYING garbage rather
+        // than a steady 0xFF produced a wildly wrong but non-zero clock that
+        // every deadline in the kernel then trusted in silence.
+        if (MONO_KHZ_MIN..=MONO_KHZ_MAX).contains(&k) {
+            pit_khz = k;
         }
-        let t1 = mono_rdtsc();
+    }
+    MONO_PIT_KHZ.store(pit_khz, Ordering::SeqCst);
 
-        if safety == 0 || counted == 0 {
-            return 0;
-        }
-
-        let tsc_delta = t1.wrapping_sub(t0);
-        // elapsed_ms = counted / DEC / INPUT_HZ * 1000
-        // khz        = tsc_delta / elapsed_ms
-        //            = tsc_delta * INPUT_HZ * DEC / (counted * 1000)
-        // Worst case ~1.3e8 * 1193182 * 2 ~= 3e14: comfortably inside u64, and
-        // saturating_mul makes that structural rather than a comment.
-        let num = tsc_delta
-            .saturating_mul(MONO_PIT_INPUT_HZ)
-            .saturating_mul(MONO_PIT_DEC_PER_CLOCK);
-        let den = counted.saturating_mul(1000);
-        if den == 0 {
-            return 0;
-        }
-        num / den
+    // The PIT stays PREFERRED when healthy: it is the reference proven on the
+    // real iMac14,4 (#307/#375), and CPUID 0x15/0x16 are Intel-only and absent
+    // on the kvm64 CPU model every VM here uses. CPUID is a floor, not a
+    // replacement.
+    let (khz, src) = if pit_khz != 0 {
+        (pit_khz, SRC_PIT)
+    } else if cpuid_khz != 0 {
+        (cpuid_khz, cpuid_src)
+    } else {
+        (0u64, SRC_NONE)
     };
+    MONO_SOURCE.store(src as u64, Ordering::SeqCst);
 
     if khz == 0 {
         return 0;
@@ -312,6 +512,29 @@ pub extern "C" fn mono_busy_delay_us_rs(us: u64) {
     // Used only before mono_init_rs() has run (or if it failed). Channel 0
     // keeps counting in hardware whether or not interrupts are enabled, so this
     // works arbitrarily early.
+    // #ASUSDIAG: if mono_init_rs() already established that channel 0 is not
+    // counting, this loop cannot ever reach its target and would run its full
+    // safety count at three legacy port accesses per iteration, which is minutes
+    // on a machine whose legacy I/O goes over eSPI. Every caller of this is a
+    // hardware settle delay, so on such a machine the honest thing is a short
+    // bounded pause spin: it does not pretend to be microseconds, but it also
+    // does not turn one xHCI reset step into a multi-minute stall. Callers
+    // already treat this as best-effort; mono_ready_rs() is how a caller asks
+    // whether real time is available.
+    let pit_st = MONO_PIT_STATE.load(Ordering::Relaxed) as u32;
+    if pit_st == PIT_FROZEN || pit_st == PIT_FLOATING {
+        let spins = us.saturating_mul(64).min(4_000_000);
+        let mut i = 0u64;
+        while i < spins {
+            // SAFETY: PAUSE has no operands and no memory effects.
+            unsafe {
+                core::arch::asm!("pause", options(nomem, nostack, preserves_flags));
+            }
+            i += 1;
+        }
+        return;
+    }
+
     let hz = MONO_PIT_FALLBACK_HZ;
     let mut reload = MONO_PIT_INPUT_HZ / hz;
     if reload == 0 || reload > 65535 {

@@ -18,6 +18,7 @@
 #define PROC_FDLAYER_H
 
 #include "../types.h"
+#include "../fs/fat.h"   // #120: fd_legacy_stat_src hands back an open fat_file_t
 
 // ---- moved verbatim from proc/syscall.c ------------------------------------
 // #572 STREAMING file I/O bounds (see the ext2_fd_t comment below).
@@ -50,6 +51,40 @@ int64_t sys_open_k(const char *path, int flags);
 // otherwise report POLLNVAL for a perfectly good open file. All three kinds
 // are regular files, which POSIX says are always ready.
 int fd_legacy_is_open(int fd);
+
+// ---------------------------------------------------------------------------
+// #120: WHAT SYS_FSTAT NEEDS FROM A LEGACY fd, and why it needed anything.
+//
+// MEASURED, not predicted. sys_fstat was written against the per-process VFS
+// table and verified on a booted VM: pipes and /dev/null reported correctly and
+// EVERY regular file returned -9 EBADF. Regular files do not live in
+// proc->fds[]; they live in the three system-wide tables in fdlayer.c, so
+// fd_get() returns NULL for all of them. fd_legacy_is_open() above exists for
+// EXACTLY this reason - #745 hit the same wall wiring up poll(2) - and its
+// comment says so. Reading that comment was cheaper than the boot that found it.
+//
+// TWO SHAPES, because the two families can answer different questions:
+//
+//   FDL_STAT_FAT   the FAT table holds an OPEN fat_file_t and there is no path
+//                  recorded anywhere. The handle is handed back so the caller
+//                  fills from it DIRECTLY, using the same code sys_stat_path
+//                  uses after its own fat_open(). That is why this returns a
+//                  handle rather than a path: re-deriving a path to re-open a
+//                  file we already have open would be both a second directory
+//                  read and a second copy of the fill.
+//   FDL_STAT_PATH  ext2, SMB and NFS all record their path, so the caller
+//                  stats that path through the one shared fill.
+//
+// `live_size_out` is the size the DESCRIPTION knows and the medium does not, or
+// -1 for "nothing more current than the medium". It is set only where a write
+// is buffered, and the expressions are MIRRORED FROM sys_seek() in fdlayer.c so
+// that fstat and lseek(SEEK_END) can never disagree about one fd.
+// ---------------------------------------------------------------------------
+#define FDL_STAT_NONE 0
+#define FDL_STAT_FAT  1
+#define FDL_STAT_PATH 2
+int fd_legacy_stat_src(int fd, const fat_file_t **fat_out,
+                       char *path_out, uint32_t cap, int64_t *live_size_out);
 int64_t sys_readdir_k(int fd, sc_dirent_t *de);
 
 #endif /* PROC_FDLAYER_H */

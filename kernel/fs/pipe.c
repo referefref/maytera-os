@@ -11,10 +11,35 @@
 #include "../mm/heap.h"
 #include "../proc/process.h"
 #include "../sync/waitq.h"   /* #511: block on a wait queue, never poll (#426) */
+#include "../sync/noblock.h" /* #111: degrade instead of parking a no-block context */
+#include "../proc/signal.h"  /* #111: SIGPIPE */
 #include "vfs.h"
 #include "../security/uaccess_smap.h"  // #19/#645: AC bracket on the caller-buffer copy
 
 #define PIPE_BUF_SIZE  65536  /* 64KB ring buffer */
+
+/* #111: negative-errno returns. This kernel has no errno header; the values
+ * are the ones userland/libc/errno.h defines, which is what write(2)'s raw
+ * pass-through in userland/libc/stdlib.c delivers to Ring 3 unchanged. */
+#define PIPE_EPIPE   (-32)   /* EPIPE:  the read end is gone */
+#define PIPE_EINTR    (-4)   /* EINTR:  interrupted, nothing written */
+#define PIPE_EAGAIN  (-11)   /* EAGAIN: would block, and this context may not */
+
+/* #111(a)(b): the write-side decision machine lives in rustkern/pipewr.rs.
+ * Actions and the returned pair are documented there; the numbering is locked
+ * to it by the _Static_assert-style checks in that module's self-test, which
+ * runs at boot. */
+#define PW_COPY   0u
+#define PW_BLOCK  1u
+#define PW_DONE   2u
+#define PW_SHORT  3u
+#define PW_EPIPE  4u
+#define PW_EINTR  5u
+typedef struct { uint32_t action; uint32_t n; } pipe_write_step_t;
+extern pipe_write_step_t pipe_write_step_rs(uint64_t requested, uint64_t done,
+                                            uint32_t ring_size, uint32_t ring_count,
+                                            int32_t readers, int32_t intr);
+extern uint32_t pipe_write_step_selftest_rs(void);
 
 typedef struct pipe_state {
     uint8_t  *buf;
@@ -32,6 +57,16 @@ typedef struct pipe_state {
      * migration plan: the wake is ours, and waiting forever for a writer that
      * never writes is the CORRECT pipe semantic, so there is no timeout. */
     wait_queue_head_t read_wq;
+    /* #111(a): writers park here for "space appeared" or "last reader closed".
+     * Symmetric with read_wq above, and both wake sources are ours and
+     * unconditional, so no wake can be lost and no timeout is needed:
+     *   - pipe_read_fn()      wakes after every read that frees bytes
+     *   - pipe_release_read() wakes ALL when the reader count drops
+     * The SECOND one is what makes the untimed sleep safe rather than a new
+     * hang: without it a writer blocked on a full pipe whose reader then died
+     * would wait forever for space that can never appear. Adding a blocking
+     * write WITHOUT that wake would have traded a CPU burn for a deadlock. */
+    wait_queue_head_t write_wq;
 } pipe_state_t;
 
 /* Forward declarations for file_ops */
@@ -63,9 +98,11 @@ static int pipe_write_poll(file_t *f, int events) {
     pipe_state_t *ps = (pipe_state_t *)f->priv;
     if (!ps) return POLL_ERR;
     int r = 0;
-    /* Writable while the ring has room. pipe_write_fn() never blocks: it
-     * writes what fits and reports it, so "room for at least one byte" is
-     * the honest readiness test. */
+    /* Writable while the ring has room. #111: pipe_write_fn() now BLOCKS when
+     * the ring is full instead of returning a short/zero count, so "room for
+     * at least one byte" is exactly the condition under which a write will
+     * make progress without sleeping. Same test, and now it is also the
+     * condition the write queue is woken on, so poll() and write() agree. */
     if ((events & POLL_OUT) && ps->count < ps->size) r |= POLL_OUT;
     /* No readers left: a write would be a SIGPIPE case. POLL_ERR is what
      * poll(2) callers check before writing. */
@@ -73,18 +110,30 @@ static int pipe_write_poll(file_t *f, int events) {
     return r;
 }
 
-/* The queue a poll(2) waiter parks on. Only the READ end publishes one: it
- * is woken by pipe_write_fn() on every write and by pipe_release_write() on
- * EOF, so both events a reader waits for reach it. The write end has no
- * queue because nothing wakes a blocked writer today (pipe_write_fn does not
- * block), and publishing a queue nobody wakes would be worse than publishing
- * none: poll() would sleep the full timeout believing it had an exact wake,
- * instead of bounding the sleep and re-scanning. */
+/* The queue a poll(2) waiter parks on. The READ end is woken by
+ * pipe_write_fn() on every write and by pipe_release_write() on EOF, so both
+ * events a reader waits for reach it. */
 static struct wait_queue_head *pipe_read_poll_wq(file_t *f, int events) {
     pipe_state_t *ps = (pipe_state_t *)f->priv;
     (void)events;
     if (!ps) return NULL;
     return &ps->read_wq;
+}
+
+/* #111: the WRITE end can now publish a queue too, and this comment used to
+ * say why it could not. The old text was correct at the time and is worth
+ * keeping as the reason this is safe NOW rather than deleting: "publishing a
+ * queue nobody wakes would be worse than publishing none, because poll()
+ * would sleep the full timeout believing it had an exact wake, instead of
+ * bounding the sleep and re-scanning". write_wq has two unconditional wake
+ * sources (see the struct comment), so it is no longer a queue nobody wakes,
+ * and a poll(2) waiter on a write end gets an exact wake instead of a
+ * bounded re-scan. */
+static struct wait_queue_head *pipe_write_poll_wq(file_t *f, int events) {
+    pipe_state_t *ps = (pipe_state_t *)f->priv;
+    (void)events;
+    if (!ps) return NULL;
+    return &ps->write_wq;
 }
 
 static const file_ops_t pipe_read_ops = {
@@ -104,7 +153,7 @@ static const file_ops_t pipe_write_ops = {
     .ioctl   = NULL,
     .release = pipe_release_write,
     .poll    = pipe_write_poll,
-    .poll_wq = NULL,
+    .poll_wq = pipe_write_poll_wq,   /* #111: now a queue with real wakes */
 };
 
 /* Read from the pipe buffer. Blocks until data arrives or the last writer
@@ -146,34 +195,122 @@ static int64_t pipe_read_fn(file_t *f, void *buf, size_t count) {
         }
         uaccess_end(__ac); }
     ps->count -= to_read;
+    /* #111(a): space just appeared, so wake anyone blocked in pipe_write_fn().
+     * Unconditional and done AFTER ps->count is published, exactly mirroring
+     * the reader wake in pipe_write_fn(), so a writer that wakes always
+     * observes the room. wake_up_all because several writers may share the
+     * write end and each re-tests its own condition. */
+    if (to_read > 0) wake_up_all(&ps->write_wq);
     return (int64_t)to_read;
 }
 
-/* Write to the pipe buffer. Returns bytes actually written (may be partial). */
+/* Write to the pipe buffer.
+ *
+ * #111(a)(b). WHAT THIS USED TO DO AND WHY IT WAS WRONG, both halves MEASURED
+ * on golden 1993 before the change:
+ *
+ *   (a) It wrote whatever fitted and returned that count, so a FULL ring
+ *       returned 0. Zero is not a legal blocking-write result for a non-zero
+ *       count, and userland/libc/stdio_file.c's flush_writes() loops on a
+ *       short write, so a producer that outran its consumer span in userland.
+ *       Measured: 4,616,023 zero-returns to push 256 KB through a 64 KB pipe,
+ *       with the producer burning CPU at 97% of the rate of a deliberate busy
+ *       loop. It was not a hang, it was a whole core spent on nothing.
+ *
+ *   (b) With no readers left it returned a bare -1 and raised nothing. A
+ *       producer that CHECKS its write result stopped; one that does not,
+ *       `yes` being the shipped example, looped forever, so `yes | head -1`
+ *       never terminated.
+ *
+ * Both are fixed here, and they had to be fixed TOGETHER: a blocking write
+ * whose reader can vanish without waking it is a permanent deadlock, which
+ * would have been a worse bug than the spin it replaced. The reader-close
+ * wake in pipe_release_read() is the other half of this function.
+ *
+ * Returns bytes written (possibly short, see rule 2 in rustkern/pipewr.rs),
+ * or a negative errno. */
 static int64_t pipe_write_fn(file_t *f, const void *buf, size_t count) {
     pipe_state_t *ps = (pipe_state_t *)f->priv;
-    if (!ps || count == 0) return 0;
-    if (ps->readers <= 0) return -1;  /* Broken pipe: no readers */
+    if (!ps) return -1;
+    if (count == 0) return 0;
 
     const uint8_t *in = (const uint8_t *)buf;
-    uint32_t free_space = ps->size - ps->count;
-    uint32_t to_write = ((uint32_t)count < free_space) ? (uint32_t)count : free_space;
+    uint64_t done = 0;
+    int32_t  intr = 0;
 
-    /* #19/#645: every load comes from the caller's buffer (Ring-3 via
-       sys_write), so the bracket is the copy loop. */
-    {   uaccess_ac_t __ac = uaccess_begin();
-        for (uint32_t i = 0; i < to_write; i++) {
-            ps->buf[ps->write_pos] = in[i];
-            ps->write_pos = (ps->write_pos + 1) % ps->size;
+    /* Not a poll loop: every iteration either COPIES bytes (progress) or
+     * BLOCKS on write_wq (a real sleep with two unconditional wake sources),
+     * and the decision function has no path that returns PW_COPY with n == 0.
+     * There is therefore no state in which this loop spins. */
+    for (;;) {
+        pipe_write_step_t st = pipe_write_step_rs((uint64_t)count, done,
+                                                  ps->size, ps->count,
+                                                  ps->readers, intr);
+        switch (st.action) {
+
+        case PW_DONE:
+        case PW_SHORT:
+            return (int64_t)st.n;
+
+        case PW_EPIPE:
+            /* #111(b). RAISING IS NOT DELIVERING, and this kernel has form:
+             * #161 found SIGKILL was raised but never reached a busy app. It
+             * works here because sys_write returns through syscall.asm's
+             * return-work hook, which is where proc/signal.c actually decides
+             * and takes the action. Default action for SIGPIPE is terminate
+             * (proc/signal.c default_action(): SIGPIPE is not in the ignore
+             * set), giving the conventional 128+13 = 141 exit code. A process
+             * that installed SIG_IGN or a handler survives and gets -EPIPE
+             * back instead, which is the POSIX behaviour and is what stops
+             * this from being an unconditional kill. PROVEN both ways by
+             * userland/apps/pipeprobe CHECK B and CHECK B2. */
+            {   process_t *me = proc_current();
+                if (me) sig_raise(me, SIGPIPE);   }
+            return PIPE_EPIPE;
+
+        case PW_EINTR:
+            return PIPE_EINTR;
+
+        case PW_BLOCK:
+            /* #426/#514: a context that must not block gets the OLD partial
+             * behaviour rather than a park that would deadlock it. This is a
+             * degradation, not a fix, and it is deliberately reported as
+             * EAGAIN (a retryable "would block") rather than 0, so it can
+             * never be confused with the defect above. wq_assert_may_block()
+             * does not catch a plain non-irqsave spinlock (its documented
+             * gap), so this is an explicit check and not a reliance on it. */
+            if (!wq_may_block())
+                return done ? (int64_t)done : PIPE_EAGAIN;
+            {   int rc = wait_event_interruptible(&ps->write_wq,
+                             ps->count < ps->size || ps->readers <= 0);
+                if (rc == WAIT_EINTR) intr = 1;   }
+            break;
+
+        case PW_COPY:
+            /* #19/#645: every load comes from the caller's buffer (Ring-3 via
+               sys_write), so the bracket is the copy loop. */
+            {   uaccess_ac_t __ac = uaccess_begin();
+                for (uint32_t i = 0; i < st.n; i++) {
+                    ps->buf[ps->write_pos] = in[done + i];
+                    ps->write_pos = (ps->write_pos + 1) % ps->size;
+                }
+                uaccess_end(__ac); }
+            ps->count += st.n;
+            done += st.n;
+            /* #511: wake the reader. Unconditional on "we added bytes" and done
+             * AFTER ps->count is published, so a reader that wakes always
+             * observes the data. wake_up_all (not wake_up): more than one
+             * reader may share the read end, and every waiter re-tests its own
+             * condition, so a spurious wake is free. */
+            wake_up_all(&ps->read_wq);
+            break;
+
+        default:
+            /* Unreachable unless the Rust and C action numbering drift apart,
+             * which the boot self-test exists to catch. Fail closed. */
+            return done ? (int64_t)done : -1;
         }
-        uaccess_end(__ac); }
-    ps->count += to_write;
-    /* #511: wake the reader. Unconditional on "we added bytes" and done AFTER
-     * ps->count is published, so a reader that wakes always observes the data.
-     * wake_up_all (not wake_up): more than one reader may share the read end,
-     * and every waiter re-tests its own condition, so a spurious wake is free. */
-    if (to_write > 0) wake_up_all(&ps->read_wq);
-    return (int64_t)to_write;
+    }
 }
 
 static void pipe_maybe_free(pipe_state_t *ps) {
@@ -188,6 +325,16 @@ static int pipe_release_read(file_t *f) {
     pipe_state_t *ps = (pipe_state_t *)f->priv;
     if (!ps) return 0;
     ps->readers--;
+    /* #111(a): THE WAKE THAT MAKES THE BLOCKING WRITE SAFE. A writer parked on
+     * write_wq is waiting for space that a departed reader can never create,
+     * so without this line the blocking write added by #111 would be a
+     * permanent deadlock instead of the CPU burn it replaced. The woken writer
+     * re-tests readers <= 0 and takes the EPIPE or short-count path.
+     *
+     * MUST precede pipe_maybe_free(), which kfree()s ps when the last
+     * reference goes: touching ps->write_wq after that is a use-after-free.
+     * Same ordering, and same reason, as pipe_release_write() below. */
+    wake_up_all(&ps->write_wq);
     pipe_maybe_free(ps);
     return 0;
 }
@@ -226,6 +373,7 @@ int pipe_create(int pipefd[2]) {
      * accidentally valid: SPINLOCK_INIT sets owner_cpu = 0xFFFFFFFF on a
      * debug build, which zero would misread as "CPU 0 holds this lock". */
     wait_queue_head_init(&ps->read_wq);
+    wait_queue_head_init(&ps->write_wq);   /* #111(a): same reasoning */
 
     file_t *rf = file_alloc(&pipe_read_ops, ps, O_RDONLY);
     if (!rf) { kfree(ps->buf); kfree(ps); return -1; }

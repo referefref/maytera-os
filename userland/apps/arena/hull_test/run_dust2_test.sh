@@ -14,7 +14,7 @@
 # required part of the result, not a bonus.
 set -e
 cd "$(dirname "$0")"
-MAP="${1:-./MAP.BSP}"
+MAP="${1:-<workspace>}"
 
 rustc --edition 2021 --crate-type staticlib --target x86_64-unknown-linux-gnu \
       -C panic=abort -C opt-level=2 -o libarena_rs_host.a ../arena_rs.rs

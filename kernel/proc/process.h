@@ -170,8 +170,18 @@ typedef struct process {
     // ---- POSIX-ish additions (Phase 0) ----
 
     // Current working directory, absolute path. Initialized to "/" for
-    // a new process; inherited from parent on fork. Relative paths passed
-    // to sys_open / sys_stat / etc. are resolved against this.
+    // a new process; inherited from parent on fork. Relative paths passed to
+    // sys_open / sys_stat / etc. are resolved against this by
+    // sc_path_from_user() (proc/syscall_path.h) -> path_resolve_cwd_rs().
+    //
+    // #58: UNTIL 2026-08-20 THE SENTENCE ABOVE WAS FALSE. sys_chdir wrote this
+    // field and sys_getcwd read it back, and NOTHING ELSE IN THE KERNEL EVER
+    // LOOKED AT IT, so every relative path resolved against the filesystem
+    // root and silently opened or created the wrong file. Two independent
+    // investigations recorded it (blame.md) before it was fixed. The comment
+    // describing the intent outlived the code implementing it by long enough
+    // for a reader to trust it: do not reintroduce that gap by describing a
+    // consumer that does not exist.
     char cwd[PROC_CWD_MAX];
 
     // If this process is sleeping interruptibly on a wait_queue_head_t
@@ -221,6 +231,26 @@ typedef struct process {
     // terminal's foreground pgrp only.
     uint32_t pgrp;
     uint32_t session;
+
+    // ---- The CONTROLLING TERMINAL, so /dev/tty can exist (#lesspipe) ----
+    //
+    // WHY THIS FIELD IS NEEDED AT ALL. A session had a controlling terminal in
+    // NAME only: the comment above says session 'identifies the session (login
+    // + controlling terminal)', but nothing anywhere recorded WHICH terminal.
+    // The pts binding was a single-shot global (g_tty_bind_pts_idx) consumed by
+    // init_proc() purely to pick which device fds 0/1/2 open, and then thrown
+    // away. Once a process was running there was no way, even in principle, to
+    // ask 'which terminal am I attached to'.
+    //
+    // That is exactly the question a program whose stdin is a PIPE has to ask.
+    // `ls | less` gives the pager a pipe on fd 0, so reading keys from fd 0
+    // consumes the piped DATA and hits EOF immediately. The conventional answer
+    // is /dev/tty, and /dev/tty cannot be implemented without this field.
+    //
+    // -1 = no controlling terminal (the console default). 0..MAX_PTY-1 = the
+    // pty slave index. Inherited by every child, because a pipeline stage must
+    // reach the same terminal its shell was started on.
+    int ctty;
 
     // ---- Phase G: real execve ----
     //
@@ -284,7 +314,37 @@ typedef struct process {
     // permission bit is present. svc_perms is ignored when is_service is 0.
     uint8_t  is_service;
     uint32_t svc_perms;
+    // ---- #83: WHICH CORE IS THIS TASK ON ----
+    // running_cpu is the core CURRENTLY executing this task, or -1 when it is
+    // not executing anywhere. It is published by sched_publish_cpu()
+    // (proc/process.c) at the instant of the switch, inside sched_schedule()'s
+    // #610 cli() region, so the core id it stores was read with IF=0 and cannot
+    // have gone stale between the read and the store. That is the invariant
+    // #130 was written to establish, and it applies here for the same reason:
+    // #130 was a hang whose entire signature was a core-id field reporting
+    // confidently and wrongly. The OUTGOING task is cleared to -1 on the same
+    // switch, so a task that is merely READY, SLEEPING or BLOCKED never keeps
+    // claiming a core.
+    //
+    // It reads -1 for the brief mid-switch window between the publish and the
+    // switch asm having saved the outgoing context. That is deliberate, and it
+    // is the conservative direction: this field must never name a core the task
+    // is not on. The field that makes the mid-switch window SAFE is
+    // sched_on_cpu, not this one. running_cpu is OBSERVABILITY: no correctness
+    // decision may be keyed on it, and none is.
+    //
+    // last_cpu is STICKY: the core that last ran this task, never invalidated.
+    // That is what a placement hint actually wants - sched_rq_push() asks
+    // "where did this last run" about a task that by definition is not running
+    // now - and it is what the pre-#83 merged field was really computing while
+    // calling itself running_cpu. Splitting them is most of this ticket: one
+    // field cannot answer both questions, and the merged one silently answered
+    // the affinity question while every reader that wanted "where is it NOW"
+    // got a core id that nothing ever invalidated. The [WAKEPROBE] diagnostic
+    // in proc/process.c had already drifted to printing it as `last_cpu=`,
+    // which is the tell that the name and the contents had parted company.
     int running_cpu;
+    int last_cpu;
     int migratable;
 
     // ---- #67: SMP context-switch ownership ----
@@ -344,6 +404,21 @@ typedef struct process {
     uint32_t sched_state_at_pop;   // state when a core popped it
     void    *sched_enq_ra;         // return address of add_to_ready_queue's caller
 
+    // #75 (enqrace75b): THE RETURN ADDRESS OF THE CALL THAT ACTUALLY ENQUEUED.
+    // sched_enq_ra above is stamped at funnel ENTRY, BEFORE the refusal test,
+    // and is not cleared when the call is refused, so a refusal overwrites the
+    // address of whatever genuinely queued the task. It names the last CALL and
+    // four campaigns read it as the last ENQUEUE. This one is written only on
+    // the path that reaches a run queue.
+    void    *sched_enq_ra_ok;
+    // #75 (enqrace75b): sched_running_owner() sampled under g_rq_lock at that
+    // enqueue: cpu+1 if some core's current process WAS this task at that
+    // instant, else 0. No other field on the enqueue path answers "is this task
+    // executing" - sched_on_cpu answers "is it mid-switch-OUT", which is a
+    // different question and is 0 for the whole of a task's timeslice.
+    int32_t  enq_running_owner;
+    uint8_t  enq_probe_tag;        // ENQ_PROBE_SELFTEST only: which construction
+
     // ---- #67 pass 2: run-queue membership ----
     // 1 while this PCB is linked into some core's run queue. Set and cleared
     // ONLY under g_rq_lock, and checked by sched_rq_push() before inserting.
@@ -380,7 +455,7 @@ typedef struct process {
     // 64-entry table was full and every further fetch failed to start. See
     // rustkern/procreap.rs for the measured failure. A detached process is
     // NOT a wait()-able child (same treatment as a #430 thread), and its
-    // zombie is reclaimable by reap_orphan_zombies().
+    // zombie is reclaimable by proc_reap_orphans() / reap_orphan_zombies().
     uint8_t   detached;
     uint32_t  tgid;                 // thread-group id (leader pid); 0 = self
     // CLONE_CHILD_CLEARTID: on thread exit, zero *clear_child_tid and
@@ -398,7 +473,33 @@ typedef struct process {
     // context_switch (~1 boot in 9). Keeping the image here removes the
     // carve, the alignment slack and the stash. MUST stay 16-byte aligned:
     // fxsave64/fxrstor64 #GP on a misaligned operand.
-    uint8_t fpu_area[512] __attribute__((aligned(16)));
+    //
+    // #745 local 107: grown from 512/16 to FPU_AREA_SIZE/FPU_AREA_ALIGN so the
+    // SAME field also holds an xsave64 image (512 legacy + 64 header + the
+    // components in XCR0). fxsave64 needs 16-byte alignment, xsave64 needs 64.
+    // The literals are spelled out because process.h deliberately does not
+    // include cpu/sse.h; proc/process.c _Static_asserts they equal
+    // FPU_AREA_SIZE / FPU_AREA_ALIGN where both headers are visible, so the
+    // two can never drift apart silently.
+    uint8_t fpu_area[1024] __attribute__((aligned(64)));
+
+    // #COMPRESPAWN: WHERE THIS PROCESS'S ELF IMAGE ACTUALLY LANDED.
+    //
+    // Every userland binary is now PIE and elf_load_user() randomises its base
+    // within a 1 GB window at 2 MB granularity (exec/elf.c, #640 stage 3). That
+    // means the RIP in a crash report is MEANINGLESS on its own: to turn
+    // "RIP=0x8001ebe772" into a function you must know which of the 512 ASLR
+    // slots this particular run got, and nothing recorded it.
+    //
+    // MEASURED COST, 2026-08-25: diagnosing the owner's compositor page fault
+    // required brute-forcing the slot by hand (the only slot for which
+    // RIP-base lands inside .text was 15). That is not a thing anyone can do
+    // on a machine they cannot attach a debugger to, and it is not a thing
+    // anyone should have to do at all when the loader knew the answer.
+    //
+    // Recorded at spawn, printed by the fault handler. Zero for kernel threads.
+    uint64_t image_base;
+    uint64_t image_end;
 } process_t;
 
 // Snapshot record for SYS_PROC_LIST (Task Manager). Layout MUST match the
@@ -411,7 +512,22 @@ typedef struct {
     uint32_t mem_kb;      // committed user memory (KB)
     uint64_t cpu_ticks;   // total CPU ticks consumed (total_time)
     int32_t  running_cpu; // #279: AP id this proc is pinned to, or -1 (BSP/normal)
+    // #145: PROC_INFO_F_* . Occupies the four bytes of tail padding that were
+    // already there (running_cpu ends at offset 60 and the uint64_t forces an
+    // 8-byte size), so sizeof and every existing field offset are UNCHANGED and
+    // the SYS_PROC_LIST ABI is byte-identical. The _Static_assert below is what
+    // keeps that true if anyone reorders the struct.
+    uint32_t flags;
 } proc_info_t;
+_Static_assert(sizeof(proc_info_t) == 64, "proc_info_t sizeof lock (userland twin + Rust ProcInfo)");
+
+// #145: this row is a per-core IDLE process, i.e. CPU capacity that nothing
+// asked for. It is NOT a consumer and must never be ranked as one. Exported as
+// a kernel-authoritative BIT rather than left to userland string-matching
+// "idle"/"idleN", because a user process may legitimately be called that and
+// this project has been bitten by name-matching before (COMPOSIT vs
+// COMPOSITOR). See proc_snapshot().
+#define PROC_INFO_F_IDLE   0x00000001u
 
 // Base of the user heap (the value p->brk is initialized to on the first
 // sys_brk call). #487: centralized here because per-process memory accounting
@@ -431,17 +547,29 @@ typedef struct {
 int proc_snapshot(proc_info_t *out, int max);
 
 // #446: seed an FXSAVE area with a sane default FPU env (FCW=0x037F,
-// MXCSR=0x1F80). fpu_area_init() takes a raw 16-byte-aligned 512-byte buffer
+// MXCSR=0x1F80). fpu_area_init() takes a raw FPU_AREA_ALIGN-aligned,
+// FPU_AREA_SIZE-byte buffer
 // so threads and per-CPU scratch areas share the one implementation.
 void fpu_area_init(void *area);
 void proc_init_fpu_area(struct process *p);
+
+// #110: capture the CALLER'S LIVE FPU/SSE(/AVX) registers into `area`
+// (FPU_AREA_ALIGN-aligned, FPU_AREA_SIZE bytes), using the same
+// xsave64/fxsave64 selection context_switch uses. fpu_save_live() is the raw
+// asm (proc/context_switch.asm); fpu_capture_live() is the zero-then-save
+// wrapper every caller should use. This is what fork()/clone() give the child,
+// instead of the architectural default fpu_area_init() produces: the child of
+// a fork inherits the parent's floating-point environment.
+extern void fpu_save_live(void *area);   // proc/context_switch.asm
+void fpu_capture_live(void *area);
+void proc_capture_fpu_from_current(struct process *p);
 
 // #446: stamp a proc's kernel stack with its own pid so the scheduler can
 // detect two live procs sharing one kernel stack.
 void proc_stack_tag(struct process *p);
 
 // #446: FXSAVE scratch used when there is no outgoing proc to save into.
-extern uint8_t g_dummy_fpu_area[512];
+extern uint8_t g_dummy_fpu_area[1024];
 
 // #421 phase 5 (AssaultCube port): SMP process-teardown-vs-snapshot race fix.
 //
@@ -473,9 +601,14 @@ extern uint8_t g_dummy_fpu_area[512];
 // bounded VMA free, no allocation that can block), so holding a plain
 // spinlock across them is safe under the "never hold a lock across
 // something that might sleep" rule. This is intentionally a NEW, narrowly
-// scoped lock rather than the existing (dead: zero real callers besides its
-// own accessors) `kernel_lock` BKL in cpu/smp.h, to avoid entangling this
-// fix with a different, untested, much coarser-grained mechanism.
+// scoped lock. It was chosen over the `kernel_lock` that used to sit in
+// cpu/smp.h, which this comment already recorded as dead (zero real callers
+// besides its own accessors); that lock has since been DELETED outright
+// (2026-08-23) for exactly that reason, and it was never the Big Kernel Lock
+// its name and its header comment claimed it was. The real BKL is
+// bkl_acquire()/bkl_release() in cpu/smp.c, and this narrow lock is still the
+// right choice over it: entangling this fix with a much coarser-grained
+// whole-kernel mechanism is what was being avoided.
 //
 // Exposed as two plain functions rather than `extern spinlock_t
 // g_proc_mm_lock` so that process.h (included very widely: fs/, gui/,
@@ -519,7 +652,7 @@ void proc_mm_unlock(void);
 //
 // Verification: reproduced the panic on the pre-refcount tree (crash
 // AssaultCube -> its own recoverable GPF -> a SECOND, fatal kernel GPF at
-// the same proc_mem_account_rs RIP, same throwaway VM 2601, build 910). See
+// the same proc_mem_account_rs RIP, same throwaway VM <vmid>, build 910). See
 // PORT-STATUS.md / CHANGELOG.md for the measured before/after boot logs
 // proving whether mm_users actually closes the gap.
 
@@ -563,6 +696,12 @@ int proc_create_ex(const char *name, void (*entry)(void *), void *arg,
 // #264: reap a specific zombie child by pid (frees its slot). Returns 0 / -1.
 int proc_reap(uint32_t pid);
 
+// #COMPRESPAWN: sweep every ZOMBIE nobody will ever wait for, returning their
+// slots, kernel stacks and address spaces NOW rather than at the next
+// proc_create(). Call this BEFORE allocating for a relaunch, never with
+// g_proc_table_lock held. See the definition in process.c.
+int proc_reap_orphans(void);
+
 /**
  * Terminate the current process
  * @param exit_code Exit code (stored for parent to retrieve)
@@ -599,6 +738,8 @@ void proc_sleep(uint32_t ms);
  * @return      Pointer to current process PCB
  */
 process_t *proc_current(void);
+// #58: cwd of the calling process, or NULL if there is no current process.
+const char *proc_cwd(void);
 
 /**
  * Get process by PID
@@ -635,12 +776,25 @@ bool sched_set_preemption(bool enable);
  * @return          true if enabled
  */
 bool sched_preemption_enabled(void);
+// #171: sticky "the scheduler has started". See the long comment at
+// sched_set_preemption() for why this is NOT the same question.
+bool sched_is_live(void);
 
 /**
  * Handle scheduler timer tick
  * Called from timer interrupt handler
  */
 void sched_tick(void);
+// #169: the PER-CORE scheduler tick, taken on an Application Processor from its
+// own LAPIC timer (vector 0x42, armed by tick_ap_arm() in cpu/isr.c).
+//
+// NOT a variant of sched_tick() and not interchangeable with it. sched_tick()
+// owns GLOBAL state - timer_ticks' consumer sched_ticks, g_sched_tick_samples,
+// the g_cpu_pct aggregate, and the cron/futex/child-exit/mm-watchdog hooks -
+// all of which must be advanced by exactly ONE core or they run N times too
+// fast. sched_tick_ap() touches NONE of them: it does per-core preemption and
+// per-core accounting only. Never call it on the BSP.
+void sched_tick_ap(void);
 
 /**
  * Print process list

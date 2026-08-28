@@ -124,7 +124,9 @@ typedef struct thread {
 
     // #446: per-thread FXSAVE image, same contract as process_t::fpu_area.
     // MUST stay 16-byte aligned (fxsave64/fxrstor64 #GP otherwise).
-    uint8_t fpu_area[512] __attribute__((aligned(16)));
+    // #745 local 107: same size/alignment contract as process_t::fpu_area
+    // (xsave64 needs 64-byte alignment and more than 512 bytes).
+    uint8_t fpu_area[1024] __attribute__((aligned(64)));
 } thread_t;
 
 // ============================================================================

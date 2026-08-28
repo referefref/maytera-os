@@ -6,4 +6,9 @@ item: Image Viewer | /APPS/IMAGEVIEWER | icon=image
 item: Gallery | /APPS/GALLERY | icon=gallery
 item: Media Player | /APPS/MEDIAPLAYER | icon=video
 item: Music Player | /APPS/MUSICPLR | icon=music
+# #183: an SMF player that synthesises through the shared OPL2 FM core
+# (userland/lib/opl2), not a sampled-audio player. The existence check in
+# startmenu_model.rs::sm_model_finish() means that if /APPS/MIDIPLAY is ever
+# missing this entry simply does not render, rather than launching nothing.
+item: MIDI Player | /APPS/MIDIPLAY | icon=music
 item: Snapshot | /APPS/SNAPSHOT | icon=snapshot

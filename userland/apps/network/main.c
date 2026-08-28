@@ -48,7 +48,7 @@ static void init_interfaces(void) {
     interfaces[0].bytes_tx = 24785632;
     
     const char *eth_name = "eth0";
-    const char *eth_mac = "52:54:00:AB:CD:EF";
+    const char *eth_mac = "00:00:5E:00:53:00";
     const char *eth_ip = "192.0.2.1";
     const char *eth_mask = "255.255.255.0";
     const char *eth_gw = "192.0.2.1";

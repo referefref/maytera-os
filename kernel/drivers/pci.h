@@ -38,6 +38,12 @@
 
 // PCI capability IDs
 #define PCI_CAP_ID_MSI      0x05
+// #139: MSI-X. NOT currently programmable by this kernel (pci_enable_msi only
+// knows the MSI layout), but a device that has MSI-X and no MSI is exactly the
+// case that looks like "this controller cannot interrupt" when it can, so the
+// id is named here and reported by xhci_setup_interrupt() rather than being an
+// unexplained 0x11 in a capability dump. QEMU's qemu-xhci is such a device.
+#define PCI_CAP_ID_MSIX     0x11
 
 // PCI command register bits
 #define PCI_CMD_IO          0x0001  // I/O space enable
@@ -186,6 +192,15 @@ void pci_print_devices(void);
 
 // Get total number of discovered PCI devices
 int pci_get_device_count(void);
+
+// ASUS bring-up: how many PCI functions the scan FOUND but could not RECORD,
+// because the internal table (MAX_PCI_DEVICES in pci.c) was full. This used to
+// be a silent `return`, which made every function past the cap invisible to
+// every subsystem with nothing anywhere saying so - the exact evidence you need
+// on unfamiliar hardware, discarded. A non-zero value means the device
+// inventory is INCOMPLETE, so "this machine has no such device" cannot be
+// concluded from it. Zero on every machine that fits under the cap.
+int pci_get_dropped_count(void);
 
 // Get device by index (0 to count-1), returns NULL if out of range
 pci_device_t *pci_get_device(int index);

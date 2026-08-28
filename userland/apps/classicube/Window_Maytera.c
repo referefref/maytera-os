@@ -201,35 +201,44 @@ static cc_bool KeyNeedsSyntheticRelease(unsigned int code) {
 
 /* RELEASE codes as they actually reach userland.
 
-   kernel/proc/syscall.c SYS_INJECT_KEY rewrites the raw byte before queueing:
-     raw 0x90-0x98 -> EVENT_KEY_UP with keycode (raw - 0x10)
-     raw > 0x98    -> EVENT_KEY_UP with keycode (raw & 0x7F)
-   0x95/0x96/0x99/0x9A/0x9B are intercepted as presses first, so the release
-   keycodes that can actually occur are:
+   kernel/proc/syscall.c SYS_INJECT_KEY rewrites the raw byte before queueing.
 
-     0x80..0x83  arrows          (round-trips correctly)
-     0x84        Ctrl release    (raw 0x94, collides with the F5 PRESS code)
-     0x87        LShift release  (raw 0x97, collides with the F10 PRESS code)
-     0x88        RShift release  (raw 0x98, collides with the F1 PRESS code)
-     0x1C        Alt release     (raw 0x9C)
+   #232 UPDATED, AND THE OLD COMMENT'S OWN PREDICTION IS WHY. It used to read:
+   "raw 0x90-0x98 -> EVENT_KEY_UP with keycode (raw - 0x10)", which minted
+   0x84/0x87/0x88 for the Ctrl/LShift/RShift releases - i.e. the PRESS codes of
+   F5, F10 and F1 - and it closed with "if a future kernel starts emitting
+   F-key releases this decode breaks and Ctrl/Shift will latch. Kept as a
+   single function so there is one place to fix."
+
+   The kernel did not start emitting F-key releases; it did the other available
+   thing and REMOVED the collision, by making each modifier release carry its
+   own press code. The consequence for this file is identical either way: the
+   three case labels below had to change or Ctrl/Shift/Alt would latch held
+   forever in ClassiCube, because the release event would arrive with a value
+   no case matched. This is exactly the "one place to fix" the old note set up.
+
+   The release keycodes that can actually occur are now:
+
+     0x80..0x83  arrows          (still press + 0x10, still round-trips)
+     0x99        Ctrl release    (raw 0x94, == GUI_KEY_LCTRL,  the press code)
+     0x95        LShift release  (raw 0x97, == GUI_KEY_LSHIFT, the press code)
+     0x96        RShift release  (raw 0x98, == GUI_KEY_RSHIFT, the press code)
+     0x9A        Alt release     (raw 0x9C, == GUI_KEY_ALT,    the press code)
      0x20..0x7E  ascii release
 
-   The collisions are harmless ONLY because F1/F5/F10 emit no release of their
-   own (scancode_to_ascii[] is 0 for every function key, so isr.c's
-   "printable only" release filter drops them). That is verified, not assumed;
-   if a future kernel starts emitting F-key releases this decode breaks and
-   Ctrl/Shift will latch. Kept as a single function so there is one place to
-   fix. */
+   No F-key press code appears in that list any more, so KeyNeedsSyntheticRelease()
+   above (which claims 0x84-0x8F, the whole F1-F12 press block) can no longer
+   overlap a real release. */
 static int MapReleaseKey(unsigned int code) {
 	switch (code) {
 	case 0x80: return CCKEY_UP;
 	case 0x81: return CCKEY_DOWN;
 	case 0x82: return CCKEY_LEFT;
 	case 0x83: return CCKEY_RIGHT;
-	case 0x84: return CCKEY_LCTRL;
-	case 0x87: return CCKEY_LSHIFT;
-	case 0x88: return CCKEY_RSHIFT;
-	case 0x1C: return CCKEY_LALT;
+	case 0x99: return CCKEY_LCTRL;    /* #232: was 0x84 (== F5 press) */
+	case 0x95: return CCKEY_LSHIFT;   /* #232: was 0x87 (== F10 press) */
+	case 0x96: return CCKEY_RSHIFT;   /* #232: was 0x88 (== F1 press) */
+	case 0x9A: return CCKEY_LALT;     /* #232: was 0x1C */
 	}
 	if (code >= 0x20 && code <= 0x7E) return MapAsciiKey(code);
 	return INPUT_NONE;

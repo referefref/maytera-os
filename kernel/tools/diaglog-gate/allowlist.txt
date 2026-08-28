@@ -1,0 +1,62 @@
+# diaglog-gate allowlist: boot-path diagnostics that reach SERIAL ONLY.
+#
+# Format:  <function> [LEGIT|DEBT|LEGACY] <justification>
+#
+# [LEGIT]  serial-only is the right answer for this one, and the reason is here.
+# [DEBT]   should be durable; not converted yet, and this says what it would buy.
+# [LEGACY] bulk-baselined and NOT individually reviewed. Treat as backlog.
+#
+# A stale entry (a name that is no longer a serial-only boot-path diagnostic)
+# FAILS the gate, so this list cannot rot into names nobody has looked at.
+#
+# Baselined 2026-08-26 (#DIAGLOG). Every entry below was read; none is [LEGACY].
+# The rule this list exists to serve: a diagnostic that only reaches a serial
+# port produces NOTHING on the laptop and iMac targets, which is where the
+# evidence is actually needed. See tools/diaglog-gate/README.md.
+
+# ---- [LEGIT]: never ships, or a developer-console-only build ---------------
+# blk_stage_selftest was here and is NOT any more: it was converted to
+# bootlog_write() so the BLKSTAGE_UNSAFE=1 RED arm non-zero STOLEN= count is
+# readable off a returned stick and not only off a serial cable. The gate
+# stale-entry check is what made removing this line compulsory rather than
+# optional, which is the point of having one.
+
+# ---- [DEBT]: pure-function self-tests -------------------------------------
+# These assert a computation against fixed vectors. A failure is a code bug that
+# reproduces on every machine including a VM with serial, so the laptop is not
+# where you would find out. Cheap to convert; low value in doing so.
+conn_owner_selftest    [DEBT] TCP connection-ownership invariants over fixed inputs; fails identically in QEMU.
+envblock_selftest      [DEBT] environment-block packing over fixed inputs; fails identically in QEMU.
+guestfs_boot_selftest  [DEBT] guest filesystem image parse over a compiled-in fixture.
+kformat_selftest       [DEBT] the printf formatter against fixed vectors; already reported by [FLTREC] which IS durable.
+proc_mem_selftest      [DEBT] process memory accounting arithmetic over fixed inputs.
+procinfo_selftest      [DEBT] /proc-style record formatting over fixed inputs.
+spawn_ident_selftest   [DEBT] spawn identity derivation over fixed inputs.
+tls12_selftest         [DEBT] TLS 1.2 primitives against RFC test vectors.
+tlspool_rust_selftest  [DEBT] TLS session-pool bookkeeping over fixed inputs.
+vfs_path_selftest      [DEBT] VFS path normalisation over fixed inputs.
+smp_selftest           [DEBT] Bluetooth SMP pairing crypto against fixed vectors.
+
+# CONVERTED and therefore NOT on this list any more:
+#   ext2_selftest - its entry claimed "18 lines about the root filesystem". The
+#   target hardware saw TWO, because the function mounted the two-disk dev
+#   layout, failed, and aborted. #EXT2SELFTEST retargeted it at the mounted root
+#   and gave it a BOUNDED durable footprint instead of the 18 the entry feared:
+#   ONE [EXT2-SELFTEST] verdict line carrying the check count, at most six
+#   failure lines, plus whatever selftest_notrun() records, all inside one
+#   bootlog_defer_begin()/end() window, i.e. ONE flush. The per-check detail
+#   stays on serial. That is why it did not need the defer-batching treatment
+#   first: it does not emit 18 lines at all.
+
+# ---- [DEBT]: real machine state, and these ARE worth converting -----------
+# Each of these describes the state of THIS machine, so its value is highest on
+# exactly the hardware that cannot show it. Not converted in the #DIAGLOG pass
+# because /BOOTLOG.TXT is rewritten in FULL on every bootlog_write() (an O(n^2)
+# series over the slow USB-MSC stack, #373), so adding 40+ lines needs the
+# bootlog_defer_begin()/end() batching treatment and a measurement, not a
+# sed. This is a backlog item with a stated cost, not an opinion.
+heap_print_stats [DEBT] kernel heap occupancy at boot; would answer "did this machine boot short of memory" off a returned stick.
+pmm_print_stats  [DEBT] physical memory map totals; same argument as heap_print_stats.
+sched_smp_selftest [DEBT] 8 lines about AP bring-up on THIS machine; core count and which APs answered is machine-specific evidence.
+devlog_dump      [DEBT] device-enumeration replay; overlaps /USBLOG.TXT, which is already durable, so partially covered.
+dlprof_report    [DEBT] one line of demand-load profiling; per-machine timing, would be cheap to convert.

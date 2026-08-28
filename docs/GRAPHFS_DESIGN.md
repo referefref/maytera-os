@@ -1,5 +1,8 @@
 # GraphFS: the storage substrate for contract-based isolation (#711)
 
+> STATUS: DEFERRED — #246 kernel-rust+security, large — journal/fold/blob slices shipped and VM-verified, but versions/gfs_revert/signed-seal/syscall-chokepoint enforcement absent (doc's own §19.6: "no contract is enforced anywhere yet"); new work here must be Rust per the kernel Rust-first policy, current slices are C.
+
+
 Status: DESIGN, plus TWO implemented and VM-VERIFIED vertical slices.
 Slice 1 is the tamper-evident journal (section 18: four tamper detections proven
 RED from Ring 3). Slice 2 is the FOLD (section 19): nodes, edges, contracts,
@@ -707,7 +710,7 @@ deletion with a feature and make the rollback of either harder.
 
 ## 18. Slice 1: what was built, and the evidence it ran
 
-MEASURED on 2026-08-06, kernel build 1713, throwaway VM 2712 (kvm64, USB-MSC
+MEASURED on 2026-08-06, kernel build 1713, throwaway VM <vmid> (kvm64, USB-MSC
 live boot of golden 1025 with this kernel and one test app overlaid; VM and both
 LVs destroyed afterwards).
 
@@ -839,7 +842,7 @@ Stated so a green run is not over-read:
 ## 19. Slice 2: the fold, and the evidence it runs
 
 MEASURED on 2026-08-07, kernel builds 1754 (green), 1755 (deliberately broken)
-and 1756 (restored, green again), throwaway VM 2716 (kvm64, USB-MSC live boot of
+and 1756 (restored, green again), throwaway VM <vmid> (kvm64, USB-MSC live boot of
 golden 1744 with this kernel and one test app overlaid; VM and both LVs destroyed
 afterwards).
 

@@ -129,6 +129,12 @@ int  diskimg_mount_idx(int want, const char *imgpath);
 #define DISKIMG_E_TOOBIG   -12   // not an ISO and too large to be a floppy
 #define DISKIMG_E_NOMEM    -13   // out of heap for the image or its cache
 #define DISKIMG_E_BUSY     -14   // slot state prevented the operation
+// #184: the file IS an ISO 9660 image, and its primary descriptor points its
+// root directory past the end of the file, so there is no directory to read.
+// Distinct from DISKIMG_E_UNKNOWN on purpose: "unrecognised format" for a file
+// that is plainly a recognised format sends the user looking in the wrong
+// place. See iso_root_within_rs() in rustkern/iso9660.rs.
+#define DISKIMG_E_TRUNC    -15   // ISO 9660, but truncated: root dir past EOF
 
 // Compatibility wrapper for the existing letter-based callers (the boot
 // harness). Mounts on that exact letter; returns 0 on success, negative on
@@ -236,8 +242,36 @@ int diskimg_query(int idx, diskimg_info_t *out);
 // neither can block and both are safe from any context that may hold a lock.
 int diskimg_volume_label(char letter, char *out, int cap);
 
-// Total size in bytes of the medium mounted on `letter`, or 0 for none.
-uint64_t diskimg_media_size(char letter);
+// THE MEDIUM'S OWN GEOMETRY, for INT 21h AH=36h (#234e).
+//
+// THIS REPLACED diskimg_media_size(), WHICH IS DELETED RATHER THAN LEFT BESIDE
+// IT. That function answered only "how many bytes", so its one caller had to
+// INVENT a sector size to turn the answer into the four registers DOS wants.
+// It invented 2048-byte sectors, one sector per cluster, for EVERY mounted
+// image, because the only image class anyone had in mind was a CD. A FAT12
+// floppy on A: was therefore described to the guest as a CD-geometry medium: a
+// 720 KB disk came back as 360 clusters of one 2048-byte sector, when the disk
+// itself says 512-byte sectors, two per cluster. The BYTE TOTAL happened to be
+// right, so nothing looked wrong, and a guest that sizes a buffer or a record
+// from CX (bytes per sector) got a number four times too large.
+//
+// Deleting the old accessor is the point, not tidiness. Leaving it would leave
+// a zero-caller function whose whole shape invites the next caller to make the
+// same invention, and this tree has an expensive history of exactly that
+// (e1000_exit_crash_context(), term_mouse_report(), sse_save/sse_restore).
+// One accessor that returns the whole triple cannot be misused that way.
+//
+// The geometry is not a guess for either class: an ISO states 2048 in its
+// primary descriptor and rustkern/iso9660.rs refuses any other value, and a
+// FAT12 image states bytes-per-sector and sectors-per-cluster in the BPB that
+// fat12_parse() already reads at mount time. This hands back what the medium
+// said, so the fiction has nowhere left to live.
+//
+// total_clusters counts the DATA area only, which is what DOS means by a
+// total cluster count. Returns 1 and fills all three on success, 0 if the
+// letter holds no image (outputs untouched).
+int diskimg_geometry(char letter, uint32_t *bytes_per_sector,
+                     uint32_t *sectors_per_cluster, uint32_t *total_clusters);
 
 // ---------------------------------------------------------------------------
 // GENERATION-CHECKED ACCESS (what fat_read / fat_readdir_n use)

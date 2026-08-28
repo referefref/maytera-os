@@ -91,4 +91,16 @@
 #define NAME_MAX     255
 #endif
 
+// POSIX regex limits, added for the musl-regex port (#745 local 97). Both
+// carry musl's own values, which are the POSIX minimums. RE_DUP_MAX is the one
+// to know about: it is what the regex engine enforces on {n,m}, and the port's
+// gnuregex.h uses the same number as its fallback, so grep's DFA prefilter and
+// the matcher cannot disagree about which intervals are legal.
+#ifndef CHARCLASS_NAME_MAX
+#define CHARCLASS_NAME_MAX 14
+#endif
+#ifndef RE_DUP_MAX
+#define RE_DUP_MAX   255
+#endif
+
 #endif // _MAYTERA_LIMITS_H

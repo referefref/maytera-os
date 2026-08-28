@@ -24,11 +24,14 @@
 #include "../../libc/string.h"
 #include "../../libc/userconf.h"   // userhome_root() - home dir with no pwd.h/bool conflict
 
-#define ICONPICK_MAX_ENTRIES 24
-#define ICONPICK_W           340
-#define ICONPICK_TITLE_H     26
-#define ICONPICK_ROW_H       22
-#define ICONPICK_BTN_H       28
+#define ICONPICK_MAX_ENTRIES 24   // a COUNT, not a pixel size - not scaled
+// #uiscale: scaled at the definition (see compositor.h's block comment for
+// the rationale). No compile-time-context use found (grepped for array size/
+// static init).
+#define ICONPICK_W           ui_px(340)
+#define ICONPICK_TITLE_H     ui_px(26)
+#define ICONPICK_ROW_H       ui_px(22)
+#define ICONPICK_BTN_H       ui_px(28)
 
 static bool      g_iconpick_open;
 static char      g_iconpick_target_path[128];
@@ -117,6 +120,25 @@ static void iconpick_rect(int32_t *px, int32_t *py, int32_t *pw, int32_t *ph) {
     *py = (g_fb_height - *ph) / 2;
 }
 
+// #uiscale hit-test fix: list_y/list_h and the Cancel button rect were each
+// duplicated (identical formula, but a duplicate all the same - the same
+// pattern that DOES drift elsewhere in this audit whenever only one copy
+// gets touched later) between iconpicker_render() and
+// iconpicker_handle_mouse(). Shared now.
+static void iconpick_list_rect(int32_t px, int32_t py, int32_t pw, int32_t ph,
+                               int32_t *list_y, int32_t *list_h) {
+    (void)px; (void)pw;
+    *list_y = py + ICONPICK_TITLE_H + ui_px(4);
+    *list_h = ph - ICONPICK_TITLE_H - ICONPICK_BTN_H - ui_px(24);
+}
+static void iconpick_cancel_rect(int32_t px, int32_t py, int32_t pw, int32_t ph,
+                                 int32_t *bx, int32_t *by, int32_t *bw, int32_t *bh) {
+    *bw = ui_px(90);
+    *bh = ICONPICK_BTN_H - ui_px(6);
+    *bx = px + pw - *bw - ui_px(12);
+    *by = py + ph - *bh - ui_px(10);
+}
+
 void iconpicker_render(void) {
     if (!g_iconpick_open) return;
     int32_t px, py, pw, ph;
@@ -135,8 +157,8 @@ void iconpicker_render(void) {
     draw_text(px + 12, py + (ICONPICK_TITLE_H - FONT_CHAR_H) / 2, "Change Icon", CLR_MENU_TEXT);
     draw_hline(px, py + ICONPICK_TITLE_H, pw, CLR_MENU_BORDER);
 
-    int32_t list_y = py + ICONPICK_TITLE_H + 4;
-    int32_t list_h = ph - ICONPICK_TITLE_H - ICONPICK_BTN_H - 24;
+    int32_t list_y, list_h;
+    iconpick_list_rect(px, py, pw, ph, &list_y, &list_h);   // #uiscale: shared with the hit-test
     int rows_vis = list_h / ICONPICK_ROW_H;
     if (rows_vis < 1) rows_vis = 1;
 
@@ -166,9 +188,8 @@ void iconpicker_render(void) {
     }
 
     // Cancel button, bottom-right.
-    int32_t bw = 90, bh = ICONPICK_BTN_H - 6;
-    int32_t bx = px + pw - bw - 12;
-    int32_t by = py + ph - bh - 10;
+    int32_t bx, by, bw, bh;
+    iconpick_cancel_rect(px, py, pw, ph, &bx, &by, &bw, &bh);   // #uiscale: shared with the hit-test
     draw_fill_rect(bx, by, bw, bh, CLR_MENU_ITEM_NORM);
     draw_rect_outline(bx, by, bw, bh, CLR_MENU_BORDER);
     draw_text_centered(bx + bw / 2, by + (bh - FONT_CHAR_H) / 2, "Cancel", CLR_MENU_TEXT);
@@ -179,16 +200,15 @@ bool iconpicker_handle_mouse(int32_t x, int32_t y, bool clicked) {
     int32_t px, py, pw, ph;
     iconpick_rect(&px, &py, &pw, &ph);
 
-    int32_t bw = 90, bh = ICONPICK_BTN_H - 6;
-    int32_t bx = px + pw - bw - 12;
-    int32_t by = py + ph - bh - 10;
+    int32_t bx, by, bw, bh;
+    iconpick_cancel_rect(px, py, pw, ph, &bx, &by, &bw, &bh);   // #uiscale: shared with the draw side
     if (clicked && x >= bx && x < bx + bw && y >= by && y < by + bh) {
         iconpicker_close();
         return true;
     }
 
-    int32_t list_y = py + ICONPICK_TITLE_H + 4;
-    int32_t list_h = ph - ICONPICK_TITLE_H - ICONPICK_BTN_H - 24;
+    int32_t list_y, list_h;
+    iconpick_list_rect(px, py, pw, ph, &list_y, &list_h);   // #uiscale: shared with the draw side
     int rows_vis = list_h / ICONPICK_ROW_H;
     if (rows_vis < 1) rows_vis = 1;
     int shown = g_iconpick_count < rows_vis ? g_iconpick_count : rows_vis;

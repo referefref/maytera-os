@@ -10,15 +10,17 @@
 #include "../../libc/gui_theme.h"    // (#565) file-based theme loader (same as compositor/App Store)
 #include "../../libc/gui_dock.h"     // (#745) THE dock-style name list, shared with the OOBE wizard
 #include "../../libc/theme.h"        // theme_color()/THEME_COLOR_* + get_theme()/set_theme()
+#include "../../libc/uiscale.h"   // the GLOBAL UI scale factor (one value, kernel-owned)
 #include "../../libc/assoc.h"
 #include "../../libc/devinfo.h"      // (#382) real CPU/RAM (SYS_SYSINFO) + PCI (SYS_DEV_PCI_LIST)
 #include "../../libhelp/help_ui.h"   // (#267) help subsystem: tooltips, "?" icon, F1
-#define BT_MOCK_IMPL                 // (#372) this TU owns the Bluetooth mock state
-#include "../../libc/bt_client.h"    // (#372) Bluetooth client API + mock
-#define WIFI_MOCK_IMPL               // (#384) this TU owns the Wi-Fi mock state
-#include "../../libc/wifi_client.h"  // (#384) Wi-Fi client API + mock
+#define BT_STUB_IMPL                 // (#237, was BT_MOCK_IMPL/#372) this TU owns the stub state
+#include "../../libc/bt_client.h"    // (#237) Bluetooth client API + honest stub (no driver)
+#define WIFI_STUB_IMPL               // (#237, was WIFI_MOCK_IMPL/#384) this TU owns the stub state
+#include "../../libc/wifi_client.h"  // (#237) Wi-Fi client API + honest stub (no driver)
 #include "userconf.h"   // #683: per-user preference paths
 #include "../../libc/tz.h"        // #49/#50: THE timezone list, setting and clock
+#include "../../libc/dock_opacity.h"  // #132: shared DOCK_OPACITY_MIN/MAX/DEFAULT/WARN
 
 // #745: the length of an option array, derived FROM the array. Every dropdown
 // count, every "is this index valid" clamp and every option-button count in
@@ -251,9 +253,20 @@ static const char *help_topic_for_panel(int panel) {
     }
 }
 
-// Scroll state for content areas
-static int content_scroll_y = 0;
-static int max_scroll_y = 0;
+// Scroll state for content area (#227). Was a bespoke content_scroll_y/
+// max_scroll_y pair where max_scroll_y was assigned 0 and NEVER anything
+// else, so the wheel handler's clamp always forced the offset back to zero
+// and content_scroll_y itself was never subtracted anywhere in the draw
+// path - below-the-fold controls were permanently unreachable. Replaced
+// with the shared primitive already used for the sidebar (g_side_scroll)
+// and the Credits modal (g_credits_scroll, both userland/libc/gui_scroll.h)
+// instead of inventing a second scrollable-viewport widget.
+static gui_scroll_t g_content_scroll;
+// Recorded at the end of every draw_X_panel(): the panel's true content
+// bottom in the SAME PADDING-relative coordinate space draw_content() reads
+// it back in, so the true content height can be derived after the fact
+// (the scroll offset the draw pass applied cancels out - see draw_content()).
+static int g_content_bottom_y = 0;
 
 // Active dropdown/popup state
 static int active_dropdown = -1;
@@ -263,7 +276,12 @@ static int dropdown_hover_item = -1;
 // Settings State - Appearance
 // =============================================================================
 static int current_theme = 0;       // (#565) index into g_th[]/g_th_names[] (file-based, see th_init())
-static int screensaver_idx = 1;     // 0=Off,1=Starfield,2=Flux,3=Lines,4=Bubbles
+static int screensaver_idx = 21;    // #124: 21 = "Plasma (Classic)" -> kernel id 22.
+                                    // MUST agree with kernel g_screensaver_type (22) and the
+                                    // compositor's g_ss_type (SS_PLASMACLASSIC). Overwritten at
+                                    // startup by the read-only sync from the live kernel value
+                                    // below, so this only shows if that lookup finds nothing.
+                                    // (idx space: 0=Off,1=Starfield,2=Flux,3=Lines,4=Bubbles,...)
 static int screensaver_delay_min = 10;  // (#115/#652) activation delay, minutes; MUST match kernel g_screensaver_delay (600s) and compositor SS_DEFAULT_TIMEOUT
 static const int SS_DELAY_STEPS[] = {1, 2, 5, 10, 15, 20, 30, 45, 60};
 #define SS_DELAY_NSTEPS ((int)(sizeof(SS_DELAY_STEPS)/sizeof(SS_DELAY_STEPS[0])))
@@ -282,28 +300,44 @@ static int icon_size = 1;           // 0=Small, 1=Medium, 2=Large
 static bool animations_enabled = true;
 static int animation_speed = 1;     // 0=Slow, 1=Normal, 2=Fast
 static int transparency_level = 80; // 0-100%
-// (#745) Dock/chrome glass opacity, percent OPAQUE, 70..100. SAME SENSE as
-// transparency_level above: the subsection is titled "Transparency" but it
-// stores OPACITY (transparency_level = get_win_opacity() * 100 / 255), so
-// inverting this one because the heading says Transparency would make the
-// two rows mean opposite things while both looked correct.
+// (#745) Dock/chrome glass opacity, percent OPAQUE, DOCK_OPACITY_MIN..MAX
+// (dock_opacity.h). SAME SENSE as transparency_level above: the subsection is
+// titled "Transparency" but it stores OPACITY (transparency_level =
+// get_win_opacity() * 100 / 255), so inverting this one because the heading
+// says Transparency would make the two rows mean opposite things while both
+// looked correct.
 // (#745 dockgrey, 2026-08-12) Floor 60->70 and default 90->75: see
 // userland/apps/compositor/draw.c glass_render()'s floor comment for why the
 // two moved together (the glass tint got lighter, which trades away
-// low-opacity margin against a bright wallpaper). This copy MUST stay in
-// sync with the compositor's - there is no shared constant ACROSS the two
-// apps, only matching literals (see #745 blame.md: two files that each
-// believe they own the same setting). WITHIN this file, though, every site
-// that used to spell the floor/default as a bare 60/70/75/90 now goes
-// through these two, so this file cannot drift internally the way it did
-// before (#745 task #67 "dockpanel": the click-drag handler for this same
-// slider still clamped to the old 60 floor after the draw-time clamp and
-// the CFG-read clamp had both already moved to 70 - a fourth copy the
-// original dockgrey sweep's `grep -rn "< 60\|>= 60"` missed because it
-// spelled the comparison as a bare `60`, not `< 60`).
-#define DOCK_OPACITY_FLOOR   70   // must match draw.c glass_render()'s floor
-#define DOCK_OPACITY_DEFAULT 75   // must match draw.c's g_dock_opacity init
-static int dock_opacity = DOCK_OPACITY_DEFAULT;   // floor is a contrast derivation
+// low-opacity margin against a bright wallpaper).
+// (#132) THIS FILE USED TO OWN A PRIVATE `#define DOCK_OPACITY_FLOOR 70`,
+// "kept in sync" with the compositor's own copies ACROSS TWO BINARIES only by
+// a comment - exactly the drift this project's blame.md warns about, and
+// exactly why the owner reported none of his below-70 requests appeared to
+// land (task #67 "dockpanel" already found a FOURTH silently-desynced copy of
+// this same 60/70 literal in this file alone). dock_opacity.h is now the ONE
+// definition, included by both this app and the compositor, so there is
+// nothing left to keep in sync. DOCK_OPACITY_MIN is the real enforced floor
+// (15, an implementation floor - see dock_opacity.h for why not 0);
+// DOCK_OPACITY_WARN (73) is only where the UI below starts warning about
+// contrast. Every site in this file that used to spell either number as a
+// bare literal goes through these two, so this file cannot drift internally
+// the way it did before.
+static int dock_opacity = DOCK_OPACITY_DEFAULT;
+// (#123 items 2/3) Marble dock geometry. Every bound here MUST match
+// taskbar.c's XFCE_DOCK_H_MIN/MAX and XFCE_DOCK_ZOOM_MIN/MAX and profile.c's
+// load clamps - four copies of a range in three binaries is exactly the drift
+// this file's own DOCK_OPACITY_FLOOR comment (above) was written about, so the
+// bounds are spelled ONCE here per binary and every site below goes through
+// these names rather than a bare literal.
+#define DOCK_HEIGHT_MIN      44
+#define DOCK_HEIGHT_MAX      96
+#define DOCK_HEIGHT_DEFAULT  59   // must match taskbar.c XFCE_DOCK_H_DEFAULT
+#define DOCK_ZOOM_MIN       100
+#define DOCK_ZOOM_MAX       200
+#define DOCK_ZOOM_DEFAULT   128   // must match taskbar.c XFCE_DOCK_ZOOM_DEFAULT
+static int dock_height = DOCK_HEIGHT_DEFAULT;
+static int dock_zoom   = DOCK_ZOOM_DEFAULT;
 // (#116) 0=Light 1=Dark 2=Glow. SAME index space as the compositor's
 // UIPROFIL.YML curstyle and the kernel's SYS_SET_CURSOR, not a private one.
 // #745: synced FROM the kernel at startup, never pushed INTO it; the only
@@ -358,9 +392,20 @@ static bool night_light = false;
 static int night_light_strength = 50;
 static int night_light_start_hour = 20;
 static int night_light_end_hour = 6;
-static int scaling_factor = 100;    // 100%, 125%, 150%, 175%, 200%
-static int color_temp = 6500;       // Color temperature in Kelvin
-static int gamma_r = 100, gamma_g = 100, gamma_b = 100;  // Gamma per channel
+// #230: Scale/Color Temp/Gamma R/G/B were deleted (docs/SETTINGS_CONTROL_AUDIT.md
+// #224 found no click handler existed for any of them - they could not even be
+// changed by mouse - and no compositor/GPU LUT hook consumes them either way).
+// A control that cannot work is worse than an absent one.
+
+// #745 (local 102): display rotation. rotation_active is what THIS session
+// actually booted with (SYS_GET_ROTATION, read once at startup - see
+// hwinfo_load()-adjacent init below); rotation_idx is the DROPDOWN'S current
+// selection, which starts equal to rotation_active and only diverges once the
+// user picks something different. That divergence IS the "applies after
+// restart" indicator - see draw_display_panel()'s hint - so no separate
+// "pending" boolean is needed.
+static int rotation_active = 0;
+static int rotation_idx = 0;
 
 // Resolution options
 static const char* resolutions[] = {
@@ -390,9 +435,19 @@ static bool ethernet_connected = true;
 static char ip_address[16] = "192.0.2.50";
 static char subnet_mask[16] = "255.255.255.0";
 static char gateway[16] = "192.0.2.1";
+// #786: dns_primary holds what the RESOLVER WILL ACTUALLY QUERY
+// (dns_get_server(), via net_info_t.dns which the kernel now fills from the
+// live resolver instead of guessing). Never the typed text: see net_pull_live().
 static char dns_primary[16] = "8.8.8.8";
-static char dns_secondary[16] = "8.8.4.4";
-static char mac_address[18] = "02:00:00:00:00:01";
+// #786: this was `dns_secondary = "8.8.4.4"`, drawn on the panel as "DNS 2".
+// It was a COMPILE-TIME CONSTANT. There is no secondary resolver anywhere in
+// this OS - kernel/net/dns.c has ONE `dns_server` and no fallback - so the row
+// named a server that could not be queried, was not editable, was never saved
+// and was never read. It is replaced by a fact that exists: what the DHCP
+// lease OFFERED (net_status_t.dns_dhcp), which is exactly the number that
+// makes "why is my DNS not what the panel says" answerable at a glance.
+static char dns_offered[16] = "";
+static char mac_address[18] = "00:00:5E:00:53:00";
 
 // (#382 pass2) Removed vpn_enabled / vpn_protocol: there is no VPN client stack,
 // so the Network panel marks VPN honestly as unavailable instead of a fake toggle.
@@ -403,15 +458,33 @@ static int proxy_type = 0;  // 0=HTTP, 1=SOCKS4, 2=SOCKS5
 static char proxy_host[64] = "";
 static int proxy_port = 8080;
 
-// Firewall (iptables-style: default in/out policy + explicit allow/deny rules)
+// Firewall (#238). THESE ARE A MIRROR OF KERNEL STATE, NOT THE STATE.
+//
+// #223 measured that this panel wrote FWRULES.CFG perfectly and that nothing
+// in the OS read it, because there was no packet filter. #238 built one, and
+// with it a decision that removes the whole class of fault rather than the
+// instance: THE KERNEL OWNS THE POLICY AND THE FILE. There is exactly one
+// parser and one serialiser for /CONFIG/FWRULES.CFG, both in
+// kernel/rustkern/fwfilter.rs, and this app no longer opens that file at all.
+//
+// So everything below is a cache of what SYS_NET_FW last reported, refreshed
+// by fw_pull() and pushed by fw_push(). fw_push() re-reads the kernel's live
+// answer into the same variables afterwards, so what this panel draws is
+// always what is ACTUALLY in force - never what it asked for. An invalid
+// ruleset is refused whole by the kernel, and the mirror then shows the
+// policy that survived, not the one that was rejected.
 static bool firewall_enabled = true;
-static int  fw_pol_in  = 1;     // default inbound policy:  0=Allow, 1=Deny
-static int  fw_pol_out = 0;     // default outbound policy: 0=Allow, 1=Deny
-#define MAX_FW_RULES 12
-typedef struct { int dir; int action; int proto; int port; } fw_rule_t;
-// dir: 0=IN, 1=OUT   action: 0=ALLOW, 1=DENY   proto: 0=TCP, 1=UDP
+static int  fw_pol_in  = 1;     // FW_ACT_ALLOW / FW_ACT_DENY
+static int  fw_pol_out = 0;
+#define MAX_FW_RULES FW_MAX_RULES
+// fw_rule_t itself now comes from libc/syscall.h - the SAME layout the kernel
+// and the Rust filter use, sizeof-locked in all three. The app no longer has
+// a private rule struct that could disagree with the one being enforced.
 static fw_rule_t fw_rules[MAX_FW_RULES];
 static int fw_rule_count = 0;
+static fw_stats_t fw_stats;         // live counters, for the panel and `ctl`
+static int  fw_last_rc = 0;         // last SYS_NET_FW return code
+static int  fw_reload_bad = 0;      // malformed lines reported by a reload
 
 // #743: RECORDING A FAILED SAVE.
 //
@@ -450,100 +523,97 @@ static void save_failed(const char *what) {
 
 static void fw_add(int dir, int action, int proto, int port) {
     if (fw_rule_count >= MAX_FW_RULES) return;
-    fw_rules[fw_rule_count].dir = dir; fw_rules[fw_rule_count].action = action;
-    fw_rules[fw_rule_count].proto = proto; fw_rules[fw_rule_count].port = port;
+    fw_rules[fw_rule_count].dir = (unsigned char)dir;
+    fw_rules[fw_rule_count].action = (unsigned char)action;
+    fw_rules[fw_rule_count].proto = (unsigned char)proto;
+    fw_rules[fw_rule_count].reserved = 0;
+    fw_rules[fw_rule_count].port = (unsigned short)port;
+    fw_rules[fw_rule_count].reserved2 = 0;
     fw_rule_count++;
 }
 
-static void fw_save(void) {
-    char buf[1024]; char *p = buf;
-    const char *e = firewall_enabled ? "on" : "off";
-    while (*e) *p++ = *e++;
-    *p++ = '\n';
-    // "in N" / "out N"
-    p += 0;
-    char hdr[32];
-    int n;
-    n = 0; { const char *s = "pin "; while (*s) hdr[n++] = *s++; } hdr[n++] = '0' + fw_pol_in; hdr[n++] = '\n'; hdr[n] = 0;
-    { const char *s = hdr; while (*s) *p++ = *s++; }
-    n = 0; { const char *s = "pout "; while (*s) hdr[n++] = *s++; } hdr[n++] = '0' + fw_pol_out; hdr[n++] = '\n'; hdr[n] = 0;
-    { const char *s = hdr; while (*s) *p++ = *s++; }
-    for (int i = 0; i < fw_rule_count; i++) {
-        fw_rule_t *r = &fw_rules[i];
-        char line[24]; int li = 0;
-        line[li++] = 'r'; line[li++] = ' ';
-        line[li++] = '0' + r->dir;    line[li++] = ' ';
-        line[li++] = '0' + r->action; line[li++] = ' ';
-        line[li++] = '0' + r->proto;  line[li++] = ' ';
-        char t[8]; int tn = 0; int v = r->port;
-        if (v == 0) t[tn++] = '0';
-        while (v) { t[tn++] = '0' + v % 10; v /= 10; }
-        while (tn) line[li++] = t[--tn];
-        line[li++] = '\n'; line[li] = 0;
-        const char *s = line; while (*s) *p++ = *s++;
-    }
-    // #743: was sys_unlink("FWRULES.CFG") then a bare relative open, so (a) a
-    // failed open left the rules DELETED, and (b) the file landed wherever cwd
-    // pointed. Now a per-user path (#683) and a write that reports failure.
-    int fd = userconf_open_write("FWRULES.CFG");
-    if (userconf_finish_write(fd, buf, (unsigned long)(p - buf)) != 0)
-        save_failed("FWRULES.CFG (firewall rules)");
+// #238: THE ONLY WAY THIS APP TOUCHES THE FIREWALL.
+//
+// No file is opened here. userconf_open_write("FWRULES.CFG") is gone, and so
+// is the hand-rolled text parser that used to read it back: a second parser
+// of a format the kernel also parses is the drift this ticket exists to
+// remove, one level down from the original fault.
+//
+// fw_pull() is also how the panel learns the DEFAULTS on a virgin machine.
+// There is no "seed sensible defaults on first run" block any more, because
+// the kernel already has the compiled-in fail-safe policy in force from the
+// first packet of boot (fwfilter.rs DEFAULT_CFG) and reports it here. Two
+// copies of "the default policy" was itself a description that could
+// disagree; now there is one, and it is the one being enforced.
+static void fw_mirror(const fw_xfer_t *x) {
+    firewall_enabled = x->cfg.enabled ? true : false;
+    fw_pol_in  = x->cfg.pol_in;
+    fw_pol_out = x->cfg.pol_out;
+    fw_rule_count = x->cfg.rule_count;
+    if (fw_rule_count > MAX_FW_RULES) fw_rule_count = MAX_FW_RULES;
+    for (int i = 0; i < fw_rule_count; i++) fw_rules[i] = x->cfg.rules[i];
+    fw_stats = x->stats;
 }
 
-static void fw_load(void) {
-    fw_rule_count = 0;
-    // #743: read the per-user copy, falling back to the legacy relative name so
-    // an existing install keeps its rules on upgrade (the #683 asymmetry).
-    int fd = userconf_open_read("FWRULES.CFG", "FWRULES.CFG");
-    if (fd < 0) {
-        // Sensible defaults: deny inbound by default, allow common services.
-        fw_pol_in = 1; fw_pol_out = 0;
-        fw_add(0, 0, 0, 22);    // allow in  tcp ssh
-        fw_add(0, 0, 0, 2323);  // allow in  tcp remote-control
-        fw_add(1, 0, 0, 80);    // allow out tcp http
-        fw_add(1, 0, 0, 443);   // allow out tcp https
-        fw_add(1, 0, 1, 53);    // allow out udp dns
-        return;
-    }
-    static char b[1024];
-    long got = sys_read(fd, b, sizeof(b) - 1);
-    sys_close(fd);
-    if (got <= 0) return;
-    b[got] = 0;
-    int i = 0;
-    while (b[i]) {
-        // parse one line
-        if (b[i] == 'p' && b[i+1] == 'i' && b[i+2] == 'n') { fw_pol_in = (b[i+4] == '1'); }
-        else if (b[i] == 'p' && b[i+1] == 'o' && b[i+2] == 'u' && b[i+3] == 't') { fw_pol_out = (b[i+5] == '1'); }
-        else if (b[i] == 'r' && b[i+1] == ' ') {
-            int j = i + 2;
-            int dir = b[j] - '0'; j += 2;
-            int act = b[j] - '0'; j += 2;
-            int pro = b[j] - '0'; j += 2;
-            int port = 0;
-            while (b[j] >= '0' && b[j] <= '9') { port = port * 10 + (b[j] - '0'); j++; }
-            fw_add(dir, act, pro, port);
-        }
-        while (b[i] && b[i] != '\n') i++;
-        if (b[i] == '\n') i++;
-    }
+// Read the live policy and counters. Never fails destructively: on refusal the
+// mirror is left as it was and fw_last_rc records why.
+static void fw_pull(void) {
+    fw_xfer_t x;
+    memset(&x, 0, sizeof(x));
+    fw_last_rc = sys_net_fw(FW_OP_GET, &x);
+    if (fw_last_rc == 0) fw_mirror(&x);
+    else setlog("SET: SYS_NET_FW GET refused");
+}
+
+// Push the mirror to the kernel, which validates it, installs it whole or not
+// at all, and persists it. Then re-read what actually took effect.
+//
+// WHY THE READ-BACK MATTERS: -22 means the kernel refused the ruleset and the
+// PREVIOUS policy is still in force, so echoing the requested state into the
+// UI would draw a firewall that is not running. -5 means the policy IS in
+// force but could not be written to disk, which is a different problem with a
+// different fix, and the two must not share one error path.
+static void fw_push(void) {
+    fw_xfer_t x;
+    memset(&x, 0, sizeof(x));
+    x.cfg.version    = FW_CFG_VERSION;
+    x.cfg.enabled    = firewall_enabled ? 1 : 0;
+    x.cfg.pol_in     = (unsigned char)fw_pol_in;
+    x.cfg.pol_out    = (unsigned char)fw_pol_out;
+    x.cfg.rule_count = (unsigned char)fw_rule_count;
+    for (int i = 0; i < fw_rule_count && i < MAX_FW_RULES; i++)
+        x.cfg.rules[i] = fw_rules[i];
+
+    fw_last_rc = sys_net_fw(FW_OP_SET, &x);
+    if (fw_last_rc == 0 || fw_last_rc == -5) fw_mirror(&x);
+    if (fw_last_rc == -22)     save_failed("firewall (ruleset REFUSED; previous policy still in force)");
+    else if (fw_last_rc == -5) save_failed("firewall (policy IS active but was not written to disk)");
+    else if (fw_last_rc != 0)  save_failed("firewall (SYS_NET_FW refused)");
+    if (fw_last_rc != 0) fw_pull();   // show what is really running
+}
+
+// Ask the kernel to re-read /CONFIG/FWRULES.CFG. Exposed through the contract
+// API so a hand-edited or deliberately malformed file can be exercised without
+// a reboot; the kernel reports how many lines it had to ignore.
+static void fw_reload_from_disk(void) {
+    fw_xfer_t x;
+    memset(&x, 0, sizeof(x));
+    fw_last_rc = sys_net_fw(FW_OP_RELOAD, &x);
+    if (fw_last_rc == 0) { fw_mirror(&x); fw_reload_bad = 0; }
+    else setlog("SET: SYS_NET_FW RELOAD found nothing usable");
 }
 
 // =============================================================================
 // Settings State - Keyboard
 // =============================================================================
-static int keyboard_layout = 0;
-static int key_repeat_rate = 30;    // Characters per second
-static int key_repeat_delay = 250;  // Milliseconds
-static bool num_lock = true;
-static bool caps_lock = false;
-static bool scroll_lock = false;
-
-static const char* keyboard_layouts[] = {
-    "US English", "UK English", "German (QWERTZ)", "French (AZERTY)",
-    "Spanish", "Italian", "Portuguese", "Russian", "Japanese", "Korean"
-};
-#define NUM_KEYBOARD_LAYOUTS 10
+// #230: Keyboard Layout, Repeat Rate, Repeat Delay, and the Num/Caps/Scroll
+// Lock checkboxes were deleted (docs/SETTINGS_CONTROL_AUDIT.md #224). None had
+// a real consumer: there is no keymap table to select in the kernel (one
+// hardcoded US scancode table, cpu/isr.c), no PS/2 typematic (0xF3) command is
+// ever sent, no software auto-repeat exists for ordinary USB keys (only
+// consumer/media keys get one, drivers/usb_hid.c HID_CONS_REPEAT_*), and the
+// lock-key vars were not even persisted. The Layout dropdown additionally
+// could not be opened at all (drawn with a literal `false`). See blame.md.
 
 // Keyboard shortcuts
 typedef struct {
@@ -565,15 +635,14 @@ static shortcut_t shortcuts[8] = {
 // =============================================================================
 // Settings State - Mouse/Touchpad
 // =============================================================================
-static int pointer_speed = 50;      // 0-100
-static int double_click_speed = 50; // 0-100 (maps to ms)
-static int scroll_speed = 50;
-static bool natural_scrolling = false;
-static int pointer_size = 1;        // 0=Small, 1=Normal, 2=Large, 3=XLarge
-static bool left_handed = false;
-static bool pointer_trails = false;
-static int pointer_trail_length = 5;
-static bool scroll_inertia = true;
+static int pointer_speed = 50;      // 0-100 (REAL: mouse_scale_delta, kernel/drivers/mouse.c)
+static int double_click_speed = 50; // 0-100 (REAL as of #230: settingscfg_dblclick_ms())
+// #230: Pointer Size, Scroll Speed, Natural Scrolling, Pointer Trails + Trail
+// Length, Scroll Inertia and Left-handed Mode were deleted
+// (docs/SETTINGS_CONTROL_AUDIT.md #224). None had ANY consumer anywhere in the
+// tree: no cursor-trail renderer, no kinetic-scroll implementation, nothing
+// inverts scroll, and mouse button bits pass straight through with no swap.
+// Pointer Size additionally had no click handler at all. See blame.md.
 
 // =============================================================================
 // Modal Dialog State
@@ -585,10 +654,23 @@ static bool scroll_inertia = true;
 #define MODAL_SET_DATETIME    4
 #define MODAL_CREDITS         5
 #define MODAL_SET_NETWORK     6
-#define MODAL_ADD_FWRULE      7
+// #238: MODAL_ADD_FWRULE (7) DELETED. #223 removed its entry point and kept
+// the handling "now unreachable"; this ticket removes the handling too. The
+// number is left unused rather than reassigned so an old saved state cannot
+// land on a different modal.
 #define MODAL_ADD_PRINTER     8   // (#318) name/host/queue/port/default
 #define MODAL_WIFI_PASSWORD   9   // (#384) single password field to join a secured SSID
 #define MODAL_AUTOLOGIN_PW    10  // (#566) confirm password before enabling/disabling autologin
+// (#786) DNS-only, one field. WHY IT HAS TO EXIST SEPARATELY FROM
+// MODAL_SET_NETWORK: "Configure IP..." is drawn ONLY when DHCP is off, so on a
+// DHCP machine - which is most of them - the DNS field was UNREACHABLE. The
+// only way to reach it was to switch DHCP off, and doing that pins the leased
+// address as a STATIC one. That is how a golden ended up hard-wired to
+// 192.0.2.1 and unable to reach any other LAN. Changing your resolver must
+// not cost you your DHCP lease, so this modal writes the resolver and nothing
+// else, and net_persist_netcfg() correspondingly writes a dns-only
+// /CONFIG/NETIP.CFG that leaves DHCP running at the next boot.
+#define MODAL_SET_DNS         11
 #define MODAL_MAX_FIELDS      5
 static int modal_mode = MODAL_NONE;
 static int modal_num_fields = 3;
@@ -606,7 +688,8 @@ static int  modal_active_field = 0;
 static char modal_error[64];
 // Extra status variables
 static int ntp_status = 0;      // 0=idle, 1=synced ok, -1=failed
-static int about_status = 0;    // 0=idle, 1=up-to-date, 2=debug exported
+static int about_status = 0;    // 0=idle, 1=up-to-date, 2=debug exported,
+                                 // 3=update available, 4=check failed, 5=checking (#230)
 static int sound_test_status = 0; // 0=idle, 1=no output, 2=no input
 
 // =============================================================================
@@ -616,9 +699,12 @@ static int sound_test_status = 0; // 0=idle, 1=no output, 2=no input
 // stored setting and is never persisted here: /CONFIG/TZ.CFG holds the zone ID
 // string and tz_index() is the reader. Seeded from tz_index() at startup.
 static int timezone_idx = 0;
-static bool use_24hour = true;
+static bool use_24hour = true;      // REAL as of #230: settingscfg_use24h()
 static bool auto_time = true;
-static int date_format = 0;     // 0=YYYY-MM-DD, 1=MM/DD/YYYY, 2=DD/MM/YYYY
+// #230: Date Format was deleted (docs/SETTINGS_CONTROL_AUDIT.md #224). Nothing
+// in the tree ever formatted a date with it - not even Settings' own date
+// display, which was hardcoded "DD Mon YYYY" regardless of the dropdown's
+// selection. See blame.md.
 static int first_day_of_week = 0;  // 0=Sunday, 1=Monday
 
 // #50: Settings' own 26-entry timezone array USED TO LIVE HERE. It has been
@@ -705,12 +791,12 @@ static int user_count = 3;
 // =============================================================================
 // Settings State - Privacy & Security
 // =============================================================================
-static bool screen_lock_enabled = true;
+static int  screen_lock_enabled = 1;
 static int lock_timeout = 5;        // Minutes (0=Never, 1, 2, 5, 10, 15, 30)
-static bool require_password_wake = true;
-static bool location_services = false;
-static bool diagnostics_enabled = true;
-static bool crash_reports = true;
+static int  require_password_wake = 1;
+static int  location_services = 0;
+static int  diagnostics_enabled = 1;
+static int  crash_reports = 1;
 
 // (#382 pass2) Removed the simulated per-app permission matrix (app_permission_t
 // / app_permissions[]): there is no capability-enforcement backend, so the
@@ -1043,6 +1129,39 @@ static void draw_card(int x, int y, int w, int h) {
     gui_card(window_handle, x, y, w, h);
 }
 
+// #237: the Wi-Fi/Bluetooth panels no longer simulate anything, so the #230
+// "SIMULATION" banner that used to sit here (docs/SETTINGS_CONTROL_AUDIT.md
+// #224, ranked #4 - "the worst shape in the audit: a lie with hardware
+// detection backing it") is gone WITH the fiction it warned about. Both
+// panels used to be userland mocks (WIFI_MOCK_IMPL/BT_MOCK_IMPL) behind a
+// REAL radio-presence probe (g_wifi_present/g_bt_present): on hardware that
+// genuinely has a wireless/BT card, the gate opened and a fabricated
+// successful scan/pair/join rendered with nothing to distinguish it from a
+// real one. A banner that keeps warning about fakery that has been deleted
+// would itself be a small lie, so it goes too - see blame.md #237.
+//
+// What replaced it: draw_wifi_panel()/draw_bluetooth_panel() now distinguish
+// exactly two real conditions - "no adapter" (unchanged from #382) and
+// "adapter present, no driver" (new, #237) - and say only that, precisely.
+// Real association (a driver + WPA-supplicant equivalent) remains a
+// separate, large piece of work (#383), out of scope here per the owner's
+// own instruction.
+
+// Inert (permanently disabled, non-clickable) toggle: used where a REAL
+// hardware adapter was detected but no driver exists to back the switch.
+// Unlike draw_toggle(), this does not call focus_add() (there is nothing to
+// focus) and the caller must NOT register a click hit for it - the control
+// is disabled by construction, not merely painted grey.
+static void draw_toggle_inert(int x, int y, bool on) {
+    gui_toggle(window_handle, x, y, 48, 24, on, GUI_ST_DISABLED);
+}
+
+// Inert (permanently disabled, non-clickable) button - same rule as above:
+// no hit is ever registered for it by the caller.
+static void draw_button_inert(int x, int y, int width, const char *label) {
+    gui_button(window_handle, x, y, width, 30, label, GUI_BTN_SECONDARY, GUI_ST_DISABLED);
+}
+
 // --- Keyboard focus ring: lets Tab/arrows cycle controls and Enter activate
 // them, so the GUI is fully usable (and testable) without a mouse. Controls
 // register their rect during draw; Enter dispatches the existing click handler. ---
@@ -1112,9 +1231,19 @@ static const char *const ICON_SIZE_OPTS[] = {"Small", "Medium", "Large"};
 // same slot/id, a strict superset of the old effect. "Bloom Garden" (§4.1,
 // Fractal Flame) and "Stained Glass" (§4.6, Stained-Glass Warp) are NEW
 // kernel ids (20, 21 - screensaver.c's SS_FLAME/SS_STAINEDGLASS).
-static const char *const SS_OPTS[]        = {"Off", "Starfield", "Flux", "Lines", "Bubbles", "Matrix", "Psychedelic: Plasma", "GL Cube", "GL Matrix", "Psychedelic: Bloom Garden", "Psychedelic: Stained Glass", "Rainbow: Tunnel", "Psychedelic: Kaleidoscope", "Geometric: Platonic Solids", "Geometric: Lorenz Attractor", "Geometric: Mobius Strip", "Geometric: Wave Mesh", "Geometric: Spirograph", "Geometric: Hypercube", "Geometric: Vortex", "Psychedelic: Lava Blobs"};
+// #124: "Plasma (Classic)" (kernel id 22, screensaver.c's SS_PLASMACLASSIC) is
+// the original #282 plasma, restored ALONGSIDE the Reborn one that took over
+// its slot in ff3ca5f. Two entries with the same word in them is the whole
+// point of the ticket, so the labels have to separate them by look, not by
+// number: "Psychedelic: Plasma" is the smooth, bloomed, palette-cycled one;
+// "Plasma (Classic)" is the hard-edged 4px-block HSV one. APPENDED at the end
+// (idx 21) rather than slotted next to its namesake, because screensaver_idx
+// is persisted directly into SETTINGS.CFG and inserting mid-list renumbers
+// every entry after it - which is exactly what #ssredesign did when it pushed
+// the ten GL effects from idx 9-18 to 11-20.
+static const char *const SS_OPTS[]        = {"Off", "Starfield", "Flux", "Lines", "Bubbles", "Matrix", "Psychedelic: Plasma", "GL Cube", "GL Matrix", "Psychedelic: Bloom Garden", "Psychedelic: Stained Glass", "Rainbow: Tunnel", "Psychedelic: Kaleidoscope", "Geometric: Platonic Solids", "Geometric: Lorenz Attractor", "Geometric: Mobius Strip", "Geometric: Wave Mesh", "Geometric: Spirograph", "Geometric: Hypercube", "Geometric: Vortex", "Psychedelic: Lava Blobs", "Plasma (Classic)"};
 static const char *const CURSOR_OPTS[]    = {"Light", "Dark", "Glow"};  // (#116) maps to compositor curstyle 0/1/2
-static const int SS_KERNEL_MAP[]          = {0, 2, 6, 3, 4, 5, 7, 8, 9, 20, 21, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
+static const int SS_KERNEL_MAP[]          = {0, 2, 6, 3, 4, 5, 7, 8, 9, 20, 21, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 22};
                                           // idx -> kernel screensaver id (#319 8=GL Cube 9=GL Matrix; 20/21 are the
                                           // psychedelic-redesign direct-pixel effects, see #ssredesign above; 10-19
                                           // are the #560/#571 GL effects, un-gated and appended - see comment above)
@@ -1134,8 +1263,15 @@ _Static_assert(ARRAY_COUNT(CURSOR_KERNEL_MAP) == ARRAY_COUNT(CURSOR_OPTS),
 #define CURSOR_OPTS_COUNT    ARRAY_COUNT(CURSOR_OPTS)
 #define FONT_SIZE_OPTS_COUNT ARRAY_COUNT(FONT_SIZE_OPTS)
 #define ICON_SIZE_OPTS_COUNT ARRAY_COUNT(ICON_SIZE_OPTS)
-static const char *const DATE_FMT_OPTS[]  = {"YYYY-MM-DD", "MM/DD/YYYY", "DD/MM/YYYY"};
-#define DATE_FMT_OPTS_COUNT  ARRAY_COUNT(DATE_FMT_OPTS)
+// #745 (local 102): display rotation (GPD MicroPC - a physically-rotated
+// panel needs a software rotation, the same fix Linux users on that hardware
+// make with fbcon/xrandr). Index IS the kernel's fb_rotation_t value
+// (video/framebuffer.h FB_ROTATE_NONE=0/_90=1/_180=2/_270=3) - no separate
+// kernel-id map needed, unlike SS_KERNEL_MAP/CURSOR_KERNEL_MAP above, because
+// this dropdown's index space was DEFINED to match the kernel enum rather
+// than growing an already-shipped UI list around it.
+static const char *const ROTATION_OPTS[]  = {"None", "90 deg", "180 deg", "270 deg"};
+#define ROTATION_OPTS_COUNT  ARRAY_COUNT(ROTATION_OPTS)
 // #387 Dock / taskbar layouts, in the compositor's DOCK_* enum order.
 // #745: the names USED to be a private array right here, and a second private
 // array in the first-boot wizard (userland/apps/setup/main.rs). They drifted:
@@ -1180,6 +1316,32 @@ static const char *const DATE_FMT_OPTS[]  = {"YYYY-MM-DD", "MM/DD/YYYY", "DD/MM/
 // and the font dialog) instead of this widget's previous one-off 8px, and
 // the wheel now moves 3 rows per notch (gui_scroll's OS-wide convention,
 // also used by Files) instead of this widget's previous one-off 1 row.
+//
+// #74 FIX (2026-08-20): Up/Down used to call g_dd_on_change() on EVERY
+// highlight move, not just on commit - arrowing from item 1 to item 5
+// applied items 2, 3 and 4 on the way through. That was never cosmetic here:
+// every on_change in this file does a real syscall and/or a real disk write
+// (dock_dd_changed() writes DOCKSTYL.CFG, rotation_dd_changed() has the
+// kernel fat_write_file() /boot/ROTATE.TXT on every call, theme_dd_changed()
+// persists THEME.CFG and can pop a contrast-correction toast, wallpaper/
+// cursor/font/icon-size all fire a live SYS_SET_* syscall). There is no
+// consumer here that wants a free, side-effect-free live preview - every one
+// of them IS the side effect - so the fix is uniform, not a dual
+// on_highlight/on_commit split: Up/Down now only move *g_dd_sel (which also
+// updates the label text drawn behind the closed control, so the user still
+// sees what they are about to choose) and DO NOT call on_change. on_change
+// fires exactly once, on an explicit commit: Enter/Space (arrow-key path) or
+// clicking a row (dropdown_click). Esc, and a click that misses every row
+// (dropdown_click's "committed" is 0), both CANCEL: *g_dd_sel is restored to
+// g_dd_orig (the value at dropdown_open() time) and on_change is not called.
+// Losing window focus (EVENT_WINDOW_BLUR) is not handled anywhere in this
+// file today - it falls through to the default no-op, for every control,
+// not just this one - so #74 did not add a blur handler either. That is
+// safe now by construction rather than by a deliberate choice: a blurred,
+// still-open dropdown just sits on whatever value the last arrow preview
+// left it on, and since that preview no longer calls on_change, nothing has
+// actually been applied yet. Giving blur its own explicit cancel is left as
+// a follow-up, not a regression #74 introduced.
 #define DD_ROW      26
 #define DD_VISIBLE  12   // rows shown before the popup scrolls (a real
                          // scrollbar now, via gui_list/gui_scroll - not a
@@ -1187,26 +1349,26 @@ static const char *const DATE_FMT_OPTS[]  = {"YYYY-MM-DD", "MM/DD/YYYY", "DD/MM/
                          // longer silently hide items).
 static int   g_dd_open = 0, g_dd_x, g_dd_y, g_dd_w, g_dd_count;
 static int  *g_dd_sel = 0;
+static int   g_dd_orig = 0;    // #74: value at open time, for Esc/miss-click cancel
 static const char *const *g_dd_items = 0;
 static void (*g_dd_on_change)(void) = 0;
 static gui_list_t g_dd_list;
 
-// Small refined downward chevron (filled triangle) centred at (cx, cy-top).
+// (#307 follow-up) Both of these are now one-line adapters over the SHARED
+// gui_chevron() in libc (gui_style.h). The bodies used to live here, and the
+// "upward-pointing twin" DID NOT POINT UP: its loop reversed the row ORDER but
+// not the widths, so it emitted {cy:7, cy+1:5, cy+2:3, cy+3:1} - byte for byte
+// what draw_chevron_down() emits. The "more items above" cue has been a DOWN
+// arrow ever since it was written. Calling the shared primitive fixes that by
+// construction rather than by re-deriving the same four rows a third time.
+//
+// The +2 preserves every existing call site's pixels: these two took a TOP-row
+// y, gui_chevron() takes the mark's CENTRE.
 static void draw_chevron_down(int cx, int cy, uint32_t col) {
-    for (int r = 0; r < 4; r++) {
-        int w = 7 - r * 2; if (w < 1) w = 1;
-        win_draw_rect(window_handle, cx - w / 2, cy + r, w, 1, col);
-    }
+    gui_chevron(window_handle, cx, cy + 2, GUI_CHEV_DOWN, col);
 }
-// Upward-pointing twin of draw_chevron_down(), for the "more items above"
-// scroll cue (#560; kept when this widget moved onto gui_list, #512, since
-// gui_scroll_draw()'s plain thumb alone was exactly the affordance gap #560
-// was fixing).
 static void draw_chevron_up(int cx, int cy, uint32_t col) {
-    for (int r = 0; r < 4; r++) {
-        int w = 1 + r * 2;
-        win_draw_rect(window_handle, cx - w / 2, cy + (3 - r), w, 1, col);
-    }
+    gui_chevron(window_handle, cx, cy + 2, GUI_CHEV_UP, col);
 }
 
 static void draw_dropdown_n(int x, int y, int width, const char *value, bool active, int count) {
@@ -1247,6 +1409,7 @@ static void dropdown_open(int x, int y, int w, const char *const *items,
                           int count, int *sel, void (*on_change)(void)) {
     g_dd_open = 1; g_dd_x = x; g_dd_y = y; g_dd_w = w;
     g_dd_items = items; g_dd_count = count; g_dd_sel = sel; g_dd_on_change = on_change;
+    g_dd_orig = *sel;   // #74: remember it so Esc / a miss-click can cancel back to it
     int vis = count < DD_VISIBLE ? count : DD_VISIBLE;
     if (vis < 1) vis = 1;
     // Seed a real, window-size-independent height so gui_scroll_max() is
@@ -1310,10 +1473,21 @@ static void dropdown_render(void) {
     }
 }
 
-// Returns 1 if the click was consumed by an open dropdown.
+// Click while a dropdown is open: click-on-a-row COMMITS it (fires
+// on_change exactly once, #74), same as Enter. A click that lands inside
+// the popup box but not on a real row (the scrollbar gutter, or past the
+// last row) or outside the box entirely is a MISS - same as Esc, it
+// CANCELS: *g_dd_sel is restored to g_dd_orig (whatever arrow-key preview
+// had left it on is discarded) and on_change is not called. Before #74 a
+// miss here already skipped on_change, but it also never undid a preview
+// that arrow keys had already half-applied by calling on_change on every
+// highlight move; now there is no such half-applied state to undo, but the
+// restore is kept so a plain miss-click can never leave the CONTROL'S OWN
+// label showing a value that was never committed.
 static void dropdown_click(int mx, int my) {
     dropdown_refresh();
     int bx = g_dd_list.x, by = g_dd_list.y, bw = g_dd_list.w, bh = g_dd_list.h;
+    int committed = 0;
     if (mx >= bx && mx < bx + bw && my >= by && my < by + bh) {
         int scroll_row = gui_list_first(&g_dd_list);
         int r = (my - (by + 1)) / DD_ROW;
@@ -1321,8 +1495,10 @@ static void dropdown_click(int mx, int my) {
         if (idx >= 0 && idx < g_dd_count) {
             *g_dd_sel = idx;
             if (g_dd_on_change) g_dd_on_change();
+            committed = 1;
         }
     }
+    if (!committed) *g_dd_sel = g_dd_orig;
     g_dd_open = 0;
     draw_all();
 }
@@ -1405,6 +1581,56 @@ static void copy_str(char *dst, const char *src, int max_len) {
 }
 
 // =============================================================================
+// #786: THE ONE place the Network panel learns what the stack is doing.
+// =============================================================================
+// This block used to be copy-pasted at four sites (first paint, panel entry,
+// DHCP toggle, and - the one that mattered - NOT at all after Apply). The
+// Apply path instead copied the TYPED TEXT into these variables, so the card
+// at the top of the page echoed the form rather than reporting the machine.
+// That is what made the owner doubt a correct observation: he changed DNS, the
+// card agreed with him, and nothing resolved differently.
+//
+// One function, called from all four, so the card can only ever show live
+// state. If a field here disagrees with what was typed, that disagreement is
+// the TRUTH and must be visible.
+static void net_pull_live(void) {
+    net_info_t ni;
+    if (get_net_info(&ni, (long)sizeof(ni)) == 0) {
+        copy_str(ip_address,  ni.ip,      sizeof(ip_address));
+        copy_str(gateway,     ni.gateway, sizeof(gateway));
+        copy_str(subnet_mask, ni.netmask, sizeof(subnet_mask));
+        // ni.dns is dns_get_server() as of #786 - the resolver that will
+        // actually be queried, not (as before) whatever DHCP offered with the
+        // gateway substituted in when it offered nothing.
+        copy_str(dns_primary, ni.dns,     sizeof(dns_primary));
+        copy_str(mac_address, ni.mac,     sizeof(mac_address));
+        ethernet_connected = ni.connected;
+    }
+    net_status_t nst;
+    if (sys_net_status(&nst) == 0) {
+        // #144: the DHCP toggle reflects REALITY, not the initializer.
+        dhcp_enabled = !nst.config_static;
+        // #786: what the lease offered, rendered as a fact and not as a
+        // second resolver. 0 is a REAL state ("your DHCP server gave you
+        // none") and is said out loud rather than left blank.
+        if (nst.dns_dhcp == 0) {
+            copy_str(dns_offered, "(none offered)", sizeof(dns_offered));
+        } else {
+            unsigned int v = nst.dns_dhcp;
+            char *o = dns_offered;
+            for (int sh = 24; sh >= 0; sh -= 8) {
+                unsigned int b = (v >> sh) & 0xFF;
+                if (b >= 100) *o++ = (char)('0' + b / 100);
+                if (b >= 10)  *o++ = (char)('0' + (b / 10) % 10);
+                *o++ = (char)('0' + b % 10);
+                if (sh) *o++ = '.';
+            }
+            *o = '\0';
+        }
+    }
+}
+
+// =============================================================================
 // #382: real hardware facts, queried live from the kernel (no fabricated data).
 // Reuses existing read-only syscalls: SYS_SYSINFO (CPUID brand/vendor, logical
 // core count, real PMM RAM, uptime) and SYS_DEV_PCI_LIST (real display / network
@@ -1421,16 +1647,40 @@ static int      g_hwinfo_loaded = 0;
 //   g_bt_present / g_wifi_present - a real Bluetooth / Wi-Fi radio exists.
 // These replace the previous cosmetic dropdowns / mock scan results with
 // honest "not available" states when the hardware is absent.
+//
+// (#237) g_bt_vid/g_bt_pid and g_wifi_vid/g_wifi_did/g_wifi_is_usb are the
+// REAL vendor/device (or vendor/product) id of whichever adapter tripped the
+// presence probe, captured at that same point below - never invented, and 0
+// when no adapter was found. They exist so the "adapter present, no driver"
+// panel state can show something concrete a future driver author can grep
+// a datasheet for, instead of just a bare yes/no.
 static char     g_audio_name[48] = "";
 static int      g_audio_present = 0;
 static int      g_bt_present = 0;
 static int      g_wifi_present = 0;
+static uint16_t g_bt_vid = 0, g_bt_pid = 0;          // USB vendor:product of the BT radio
+static uint16_t g_wifi_vid = 0, g_wifi_did = 0;      // PCI vendor:device, or USB vendor:product
+static int      g_wifi_is_usb = 0;                    // 1 if g_wifi_vid/did are a USB id, not PCI
 
 // Append s onto the NUL-terminated dst, never exceeding cap-1 chars.
 static void hw_append(char *dst, int cap, const char *s) {
     int i = 0; while (dst[i]) i++;
     for (int j = 0; s[j] && i < cap - 1; j++) dst[i++] = s[j];
     dst[i] = '\0';
+}
+
+// (#237) "VVVV:DDDD" real vendor:device (or vendor:product) id, e.g.
+// "14E4:4359". out must hold at least 10 bytes. Same digit layout the
+// Display panel's inline GPU-id block already uses; factored out here so the
+// Wi-Fi/Bluetooth "adapter present, no driver" cards don't triplicate it.
+static void hw_fmt_id(uint16_t vid, uint16_t did, char *out) {
+    static const char hx[] = "0123456789ABCDEF";
+    out[0] = hx[(vid >> 12) & 0xF]; out[1] = hx[(vid >> 8) & 0xF];
+    out[2] = hx[(vid >> 4) & 0xF];  out[3] = hx[vid & 0xF];
+    out[4] = ':';
+    out[5] = hx[(did >> 12) & 0xF]; out[6] = hx[(did >> 8) & 0xF];
+    out[7] = hx[(did >> 4) & 0xF];  out[8] = hx[did & 0xF];
+    out[9] = 0;
 }
 
 // Short human name for a PCI vendor id (best effort; empty string if unknown).
@@ -1525,6 +1775,12 @@ static void hwinfo_load(void) {
         // presence separately so the Wi-Fi panel is honest.
         if (pl[i].class_code == 0x02) {
             if (pl[i].subclass == 0x80) {
+                // (#237) capture the REAL PCI id of the first match only, same
+                // "first wins" rule the GPU/audio/NIC branches already use.
+                if (!g_wifi_present) {
+                    g_wifi_vid = pl[i].vendor_id; g_wifi_did = pl[i].device_id;
+                    g_wifi_is_usb = 0;
+                }
                 g_wifi_present = 1;
             } else if (g_nic_name[0] == 0) {
                 const char *v = pci_vendor_name(pl[i].vendor_id);
@@ -1562,13 +1818,23 @@ static void hwinfo_load(void) {
         if (ul[i].is_controller) continue;
         // Bluetooth radio: USB base class 0xE0 (wireless) / subclass 0x01 (RF) /
         // protocol 0x01 (Bluetooth), or a known BT-dongle vendor (CSR).
-        if (ul[i].dev_class == 0xE0 && ul[i].subclass == 0x01 && ul[i].protocol == 0x01)
+        if (ul[i].dev_class == 0xE0 && ul[i].subclass == 0x01 && ul[i].protocol == 0x01) {
+            if (!g_bt_present) { g_bt_vid = ul[i].vendor_id; g_bt_pid = ul[i].product_id; }
             g_bt_present = 1;
-        if (ul[i].vendor_id == 0x0A12) g_bt_present = 1;   // Cambridge Silicon Radio
+        }
+        if (ul[i].vendor_id == 0x0A12) {   // Cambridge Silicon Radio
+            if (!g_bt_present) { g_bt_vid = ul[i].vendor_id; g_bt_pid = ul[i].product_id; }
+            g_bt_present = 1;
+        }
         // USB Wi-Fi dongle: base class 0xE0 subclass 0x01 but not the BT protocol,
         // or a wireless-controller class device.
-        if (ul[i].dev_class == 0xE0 && ul[i].subclass == 0x01 && ul[i].protocol != 0x01)
+        if (ul[i].dev_class == 0xE0 && ul[i].subclass == 0x01 && ul[i].protocol != 0x01) {
+            if (!g_wifi_present) {
+                g_wifi_vid = ul[i].vendor_id; g_wifi_did = ul[i].product_id;
+                g_wifi_is_usb = 1;
+            }
             g_wifi_present = 1;
+        }
         // USB Ethernet NIC identity (only if no PCI NIC named it already).
         if (g_nic_name[0] == 0) {
             const char *un_name = usb_nic_name(ul[i].vendor_id, ul[i].product_id);
@@ -1904,6 +2170,117 @@ static void do_export_debug(void) {
     syscall1(SYS_CLOSE, fd);
 }
 
+// #230 (docs/SETTINGS_CONTROL_AUDIT.md #224): "Check Updates" used to set
+// about_status=1 and print "System is up to date." having contacted NOTHING.
+// A real update server exists (updates.maytera.net) and userland/apps/otaupd
+// already has a real, signature-verified check against it - this reuses the
+// SAME manifest, the SAME server-base override file and the SAME "build "
+// substring parse of get_version() that otaupd's running_build() uses, so
+// there is one notion of "what build am I / what build is latest", not two.
+// It deliberately does NOT verify the RSA signature (SYS_OTA_VERIFY_SIG) or
+// apply anything: this is a read-only informational check with no SelfUpdate
+// capability, so an unverified "latest build" number is reported as exactly
+// that - information - never acted on. Blocking, user-initiated network call
+// (not on the draw path), same idiom as ext_test_connection()/AI "Test" above.
+#define OTA_SERVER_DEFAULT_S "http://updates.maytera.net"
+static char g_update_msg[128] = {0};
+static void load_ota_server_base(char *out, int cap) {
+    copy_str(out, OTA_SERVER_DEFAULT_S, cap);
+    int fd = sys_open("/CONFIG/OTA_SERVER.CFG", 0 /*O_RDONLY*/);
+    if (fd < 0) return;
+    char b[192]; long n = sys_read(fd, b, sizeof(b) - 1); sys_close(fd);
+    if (n <= 0) return; b[n] = 0;
+    int i = 0; while (b[i] == ' ' || b[i] == '\t') i++;
+    if (b[i] == '#' || b[i] == 0) return;
+    int j = 0; while (b[i] && b[i] != '\n' && b[i] != '\r' && j < cap - 1) out[j++] = b[i++];
+    while (j > 0 && (out[j-1] == '/' || out[j-1] == ' ' || out[j-1] == '\t')) j--;
+    out[j] = 0;
+    if (out[0] == 0) copy_str(out, OTA_SERVER_DEFAULT_S, cap);
+}
+// Same running-build parse as otaupd's running_build(): scan for "build " in
+// the live SYS_GET_VERSION string and read the digits after it.
+static long settings_running_build(void) {
+    char v[64]; v[0] = 0; get_version(v, sizeof(v));
+    for (int i = 0; v[i]; i++) {
+        if (v[i]=='b'&&v[i+1]=='u'&&v[i+2]=='i'&&v[i+3]=='l'&&v[i+4]=='d'&&v[i+5]==' ') {
+            int j = i + 6; long n = 0; int any = 0;
+            while (v[j] >= '0' && v[j] <= '9') { n = n * 10 + (v[j]-'0'); j++; any = 1; }
+            return any ? n : -1;
+        }
+    }
+    return -1;
+}
+// Tiny tolerant scan for one integer JSON field: "latest_secure_build": 1234
+static long jfield_int(const char *o, long n, const char *key) {
+    int kl = my_strlen(key);
+    for (long i = 0; i + kl + 2 < n; i++) {
+        if (o[i] != '"' || strncmp(o + i + 1, key, kl) != 0 || o[i+1+kl] != '"') continue;
+        long j = i + 1 + kl + 1;
+        while (j < n && (o[j] == ' ' || o[j] == ':')) j++;
+        long v = 0; int any = 0;
+        while (j < n && o[j] >= '0' && o[j] <= '9') { v = v*10 + (o[j]-'0'); j++; any = 1; }
+        return any ? v : -1;
+    }
+    return -1;
+}
+static char g_updchk_buf[16384];
+static void check_for_updates(void) {
+    if (!sys_net_is_up()) {
+        copy_str(g_update_msg, "Could not reach the update server: network is down.", sizeof(g_update_msg));
+        about_status = 4;
+        return;
+    }
+    char base[192]; load_ota_server_base(base, sizeof(base));
+    char url[224]; int u = 0;
+    for (const char *q = base; *q && u < 200; q++) url[u++] = *q;
+    for (const char *q = "/security/manifest.json"; *q; q++) url[u++] = *q;
+    url[u] = 0;
+    unsigned int bytes = 0; int status = 0;
+    int r = sys_http_fetch(url, g_updchk_buf, sizeof(g_updchk_buf) - 1, &bytes, &status);
+    if (r < 0 || status != 200 || bytes == 0) {
+        char m[128]; int mi = 0;
+        const char *c = "Could not reach the update server (HTTP ";
+        for (int k = 0; c[k]; k++) m[mi++] = c[k];
+        char nb[12]; gui_itoa(status, nb, sizeof(nb));
+        for (int k = 0; nb[k]; k++) m[mi++] = nb[k];
+        m[mi++] = ')'; m[mi++] = '.'; m[mi] = 0;
+        copy_str(g_update_msg, m, sizeof(g_update_msg));
+        about_status = 4;
+        return;
+    }
+    g_updchk_buf[bytes < sizeof(g_updchk_buf) ? bytes : sizeof(g_updchk_buf) - 1] = 0;
+    long latest = jfield_int(g_updchk_buf, (long)bytes, "latest_secure_build");
+    long running = settings_running_build();
+    if (latest < 0 || running < 0) {
+        copy_str(g_update_msg, "Update check failed: the server's response could not be read.", sizeof(g_update_msg));
+        about_status = 4;
+        return;
+    }
+    if (latest <= running) {
+        char m[64]; int mi = 0;
+        const char *c = "System is up to date (build ";
+        for (int k = 0; c[k]; k++) m[mi++] = c[k];
+        char nb[16]; gui_itoa((int)running, nb, sizeof(nb));
+        for (int k = 0; nb[k]; k++) m[mi++] = nb[k];
+        m[mi++] = ')'; m[mi++] = '.'; m[mi] = 0;
+        copy_str(g_update_msg, m, sizeof(g_update_msg));
+        about_status = 1;
+    } else {
+        char m[96]; int mi = 0;
+        const char *c = "Update available: build ";
+        for (int k = 0; c[k]; k++) m[mi++] = c[k];
+        char nb[16]; gui_itoa((int)latest, nb, sizeof(nb));
+        for (int k = 0; nb[k]; k++) m[mi++] = nb[k];
+        const char *c2 = " (you have build ";
+        for (int k = 0; c2[k]; k++) m[mi++] = c2[k];
+        char rb[16]; gui_itoa((int)running, rb, sizeof(rb));
+        for (int k = 0; rb[k]; k++) m[mi++] = rb[k];
+        m[mi++] = ')'; m[mi++] = '.'; m[mi] = 0;
+        copy_str(g_update_msg, m, sizeof(g_update_msg));
+        about_status = 3;
+    }
+}
+
 // =============================================================================
 // MICO .ICN icon loader + alpha blitter (self-contained, mirrors files app)
 // MICO format: 12-byte header ('MICO' + width u32 LE + height u32 LE), then
@@ -2189,39 +2566,562 @@ static char *sv_putint(char *p, char key, int v) {
     *p++ = '\n';
     return p;
 }
+// =============================================================================
+// Tool contract (#233) - THE table, not a document about the table.
+//
+// SETTINGS_ITEMS[] below is the single description of this app's contract
+// surface, and it is load-bearing three ways at once:
+//
+//   1. settings_save()  walks it to emit /CONFIG/SETTINGS.CFG;
+//   2. settings_load()  walks it to parse the same file back;
+//   3. settings_autosave() derives its change signature from it
+//      (contract_hash), so a newly persisted row is watched the moment it
+//      exists - #231 removed exactly the opposite fault from the widget
+//      serializer, where a hand-maintained hash had silently stopped
+//      watching three settings.
+//
+// So a row cannot be "in the contract but not really persisted", or
+// "persisted but not in the contract": there is one list. The seven
+// hand-written sv_putint() lines this replaces were the second description;
+// tools/pref-reader-lint/READERS.tsv (#230) now lints against THIS table
+// rather than against those lines, so it is a gate on the contract instead
+// of a third description of the same keys.
+//
+// COMPLETENESS is the harder invariant, and here it is GATED, not structural.
+// Settings is 8809 lines of mostly bespoke drawing; unlike Calculator, whose
+// every key already lives in one const table that draw and hit-test share, most
+// of this file's panels still compute controls inline. tools/contract-lint
+// enumerates every *_geom_t / *_layout_t field - which after #227 is the
+// app's own shared draw/hit-test structure, so a control that is drawn AND
+// clickable in a converted panel MUST have a field there - and FAILS the build
+// when a field has no contract row and no justified allowlist entry.
+//
+// That gate is strictly weaker than Calculator's structural guarantee, and it
+// is labelled as weaker in docs/CONTRACT_API.md section 6. The way to make it
+// structural is to finish the #227 conversion: a panel converted to a shared
+// geometry pass gains hit-box-drift immunity AND contract coverage in one
+// move. Seven panels are still on independent arithmetic and are therefore
+// invisible to both.
+// =============================================================================
+#include "../../libc/contract.h"
+
+// Forward declarations for handlers defined later in this file. The contract
+// calls the SAME functions the click handlers call; it never reimplements one.
+// dir_clear_files()/storage_scan() are defined above; no forward declaration needed.
+
+// ---- setters that mirror what the UI's own click handler does ---------------
+
+// Date & Time "Set time automatically". The panel's handler runs an NTP sync
+// on enable (main.c, PANEL_DATETIME case); doing the same here is what makes
+// a contract write equivalent to a click rather than merely similar.
+static int ct_set_auto_time(int v) {
+    auto_time = v;
+    if (auto_time) {
+        long r = ntp_sync();
+        ntp_status = (r == 0) ? 1 : -1;
+    }
+    return 0;
+}
+static int ct_get_auto_time(void) { return auto_time ? 1 : 0; }
+
+// Timezone. The stored setting is /CONFIG/TZ.CFG (libc/tz.c), NOT a key in
+// SETTINGS.CFG - #50 deleted the second copy. timezone_idx is the picker row,
+// and update_timezone_offset() is the same commit path the dropdown uses.
+static int ct_get_tz(void) { return tz_index(); }
+static int ct_set_tz(int v) {
+    if (v < 0 || v >= tz_count()) return -1;
+    timezone_idx = v;
+    update_timezone_offset();
+    return 0;
+}
+
+// Theme. current_theme indexes g_th[] (file-based themes, #565); apply_theme()
+// is the same function the Appearance dropdown calls, and it reaches
+// gui_theme_activate() -> SYS_SET_THEME, which the compositor edge-detects.
+static int ct_get_theme_idx(void) { return current_theme; }
+static int ct_set_theme_idx(int v) {
+    th_init();
+    if (v < 0 || v >= g_th_count) return -1;
+    // Set the SAME variable the dropdown writes, then call the SAME commit
+    // callback it registers (dropdown_open(..., &current_theme,
+    // theme_dd_changed) in the PANEL_APPEARANCE click case). Calling
+    // apply_theme(v) directly, as this did first, applied the colours but left
+    // current_theme stale, so the contract getter kept reporting the old
+    // index. #233's read-back-after-write check caught that on its first live
+    // run and reported note=clamped-or-ignored-by-app instead of echoing the
+    // value it had been asked for, which is the whole reason the check exists.
+    current_theme = v;
+    theme_dd_changed();
+    return 0;
+}
+
+static int ct_get_use24(void)  { return use_24hour ? 1 : 0; }
+static int ct_set_use24(int v) { use_24hour = v ? 1 : 0; return 0; }
+
+// ---- #235: the rows libc/aiclient.c used to describe by itself --------------
+//
+// These seven controls were reachable ONLY from AI chat, through a hardcoded
+// if-else chain in aiclient.c's settings_apply() that called the kernel setters
+// directly and never went near this app. That chain was one of the four
+// partial, mutually disagreeing descriptions of the Settings surface
+// (contract.h "WHAT WAS HERE BEFORE"). It now delegates to
+// /APPS/SETTINGS --contract set, so these rows are what it reaches, and there
+// is one description again.
+//
+// None of them carries a cfgkey: they are LIVE KERNEL state, not SETTINGS.CFG
+// keys. settings_load()/settings_save() correctly do not touch them, and the
+// app re-reads them from the kernel at startup (get_volume(), get_win_opacity(),
+// get_display_fx()), which is why a persisted copy here would be the drift.
+// Each setter writes the SAME variable and calls the SAME kernel setter the
+// panel's own click handler does - the ct_set_theme_idx lesson above, applied
+// before it could bite a second time.
+
+static int ct_get_font_size(void)  { return font_size; }
+static int ct_set_font_size(int v) { font_size = v; set_font_size(v); return 0; }
+
+// Percent OPAQUE, matching the slider's own sense (transparency_level), and the
+// same 0-255 conversion the PANEL_APPEARANCE click case performs.
+static int ct_get_transparency(void)  { return transparency_level; }
+static int ct_set_transparency(int v) {
+    transparency_level = v;
+    set_win_opacity(v * 255 / 100);
+    return 0;
+}
+
+static int ct_get_volume(void)  { return get_volume(); }   // the kernel mixer is the truth
+static int ct_set_volume(int v) { master_volume = v; set_volume(v); return 0; }
+
+static int ct_get_mute(void)  { return sound_muted ? 1 : 0; }
+static int ct_set_mute(int v) { sound_muted = v ? true : false; set_mute(v ? 1 : 0); return 0; }
+
+static int ct_get_brightness(void)  { return brightness; }
+static int ct_set_brightness(int v) { brightness = v; apply_display_fx(); return 0; }
+
+static int ct_get_night_light(void)  { return night_light ? 1 : 0; }
+static int ct_set_night_light(int v) { night_light = v ? true : false; apply_display_fx(); return 0; }
+
+static int ct_get_night_strength(void)  { return night_light_strength; }
+static int ct_set_night_strength(int v) { night_light_strength = v; apply_display_fx(); return 0; }
+
+// Theme NAME, read and written. #235: the name list lives HERE, in g_th_names[],
+// which th_init() enumerates from /THEMES/INDEX.TXT and the Appearance dropdown
+// draws from. It is deliberately not a table anywhere else: libc/aiclient.c used
+// to carry its own ("0=Retro,1=Dark,2=Light,4=Classic,5=Ocean,9=Nord") and that
+// copy was doubly wrong - it went stale the moment the App Store installed a
+// theme, and its numbers were KERNEL theme ids while current_theme indexes
+// g_th[], so the two descriptions did not even share an index space.
+static int ct_get_theme_name(char *out, int ocap) {
+    th_init();
+    int i = current_theme;
+    if (i < 0 || i >= g_th_count) i = 0;
+    strlcpy(out, g_th_names[i] ? g_th_names[i] : "?", (size_t)ocap);
+    return 0;
+}
+
+static int ct_name_eq_ci(const char *a, const char *b) {
+    for (;; a++, b++) {
+        char x = *a, y = *b;
+        if (x >= 'A' && x <= 'Z') x = (char)(x - 'A' + 'a');
+        if (y >= 'A' && y <= 'Z') y = (char)(y - 'A' + 'a');
+        if (x != y) return 0;
+        if (!x) return 1;
+    }
+}
+
+// ---- actions: each one calls the click handler's own body -------------------
+
+// Select a theme by NAME. Present so a caller that knows "Nord" and not "3" can
+// still drive the control, WITHOUT anybody outside this file holding a name
+// table. On a miss it answers with the names that actually exist, so the caller
+// corrects itself from the live list rather than from a stale copy.
+static int ct_act_theme_by_name(const ct_item_t *it, int argc, char **argv,
+                                char *out, int ocap) {
+    (void)it;
+    th_init();
+    if (argc < 1 || !argv[0] || !argv[0][0]) {
+        strlcpy(out, "needs-a-theme-name", (size_t)ocap);
+        return -1;
+    }
+    for (int i = 0; i < g_th_count; i++) {
+        if (g_th_names[i] && ct_name_eq_ci(g_th_names[i], argv[0])) {
+            current_theme = i;
+            theme_dd_changed();            // the dropdown's own commit callback
+            snprintf(out, ocap, "%s index=%d", g_th_names[i], i);
+            return 0;
+        }
+    }
+    int o = 0;
+    o += snprintf(out + o, ocap - o, "no-such-theme available=");
+    for (int i = 0; i < g_th_count && o < ocap - 2; i++)
+        o += snprintf(out + o, ocap - o, i ? "|%s" : "%s", g_th_names[i]);
+    return -1;
+}
+
+static int ct_act_clear(const ct_item_t *it, int argc, char **argv,
+                        char *out, int ocap) {
+    (void)argc; (void)argv;
+    dir_clear_files((const char *)it->ctx);
+    storage_scan();
+    strlcpy(out, "cleared", (size_t)ocap);
+    return 0;
+}
+
+static int ct_act_ntp(const ct_item_t *it, int argc, char **argv,
+                      char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    long r = ntp_sync();
+    ntp_status = (r == 0) ? 1 : -1;
+    strlcpy(out, r == 0 ? "synced" : "sync-failed", (size_t)ocap);
+    return r == 0 ? 0 : -1;
+}
+
+// ---- the table --------------------------------------------------------------
+//
+// cfgkey != 0 means the row IS a /CONFIG/SETTINGS.CFG key. Those seven rows and
+// tools/pref-reader-lint/READERS.tsv must agree exactly, both ways, or
+// repo-guard fails: a key with no proven reader, or a claimed reader for a key
+// nobody writes, are equally dishonest.
+// --- #238 packet filter -----------------------------------------------------
+// Every one of these goes through fw_pull()/fw_push(), i.e. through
+// SYS_NET_FW, i.e. through the same path the panel's own toggles take. There
+// is no second way to change the firewall from this app, which is why a
+// contract row here cannot describe something the UI does differently.
+static int ct_fw_get_enabled(void) { fw_pull(); return firewall_enabled ? 1 : 0; }
+static int ct_fw_set_enabled(int v) {
+    fw_pull();
+    firewall_enabled = v ? true : false;
+    fw_push();
+    return (fw_last_rc == 0) ? 0 : -1;
+}
+static int ct_fw_get_pin(void)  { fw_pull(); return fw_pol_in; }
+static int ct_fw_set_pin(int v) {
+    if (v < 0 || v > 1) return -1;
+    fw_pull(); fw_pol_in = v; fw_push();
+    return (fw_last_rc == 0) ? 0 : -1;
+}
+static int ct_fw_get_pout(void)  { fw_pull(); return fw_pol_out; }
+static int ct_fw_set_pout(int v) {
+    if (v < 0 || v > 1) return -1;
+    fw_pull(); fw_pol_out = v; fw_push();
+    return (fw_last_rc == 0) ? 0 : -1;
+}
+
+static int ct_fw_get_rules(char *out, int ocap) {
+    fw_pull();
+    int n = 0;
+    out[0] = 0;
+    if (fw_rule_count == 0) {
+        snprintf(out, (size_t)ocap, "(none; defaults decide everything)");
+        return 0;
+    }
+    for (int i = 0; i < fw_rule_count && n < ocap - 1; i++) {
+        n += snprintf(out + n, (size_t)(ocap - n), "%s%s/%s/%s/%u",
+                      i ? "," : "",
+                      fw_rules[i].dir == FW_DIR_IN ? "in" : "out",
+                      fw_rules[i].action == FW_ACT_DENY ? "deny" : "allow",
+                      fw_rules[i].proto == FW_PROTO_UDP ? "udp" : "tcp",
+                      (unsigned)fw_rules[i].port);
+    }
+    return 0;
+}
+
+// The counters, as one line. drop_in/drop_out are the numbers that prove the
+// filter is on the packet path; cyc_max is its worst-case cost per packet in
+// TSC cycles, which is what #238 is required to report rather than assert.
+static int ct_fw_get_stats(char *out, int ocap) {
+    fw_pull();
+    unsigned long long avg = fw_stats.calls ? (fw_stats.cyc_tot / fw_stats.calls) : 0;
+    snprintf(out, (size_t)ocap,
+             "calls=%llu ct_hit=%llu new_in=%llu new_out=%llu "
+             "pass_in=%llu pass_out=%llu drop_in=%llu drop_out=%llu "
+             "exempt=%llu unfiltered=%llu malformed=%llu frag=%llu "
+             "ct_used=%u ct_evict=%llu cyc_avg=%llu cyc_max=%llu",
+             (unsigned long long)fw_stats.calls,
+             (unsigned long long)fw_stats.ct_hit,
+             (unsigned long long)fw_stats.new_in,
+             (unsigned long long)fw_stats.new_out,
+             (unsigned long long)fw_stats.pass_in,
+             (unsigned long long)fw_stats.pass_out,
+             (unsigned long long)fw_stats.drop_in,
+             (unsigned long long)fw_stats.drop_out,
+             (unsigned long long)fw_stats.exempt,
+             (unsigned long long)fw_stats.unfiltered,
+             (unsigned long long)fw_stats.malformed,
+             (unsigned long long)fw_stats.frag,
+             (unsigned)fw_stats.ct_used,
+             (unsigned long long)fw_stats.ct_evict,
+             avg, (unsigned long long)fw_stats.cyc_max);
+    return 0;
+}
+
+static int fw_word(const char *w, const char *a, const char *b) {
+    if (strcmp(w, a) == 0) return 0;
+    if (strcmp(w, b) == 0) return 1;
+    return -1;
+}
+
+// add_rule <in|out> <allow|deny> <tcp|udp> <port>
+//
+// Every field is REJECTED rather than coerced if it is not one of the two
+// words or a port in 1..65535. A firewall rule that was silently reinterpreted
+// is the worst possible outcome of a typo, so nothing here guesses.
+static int ct_fw_act_add(const ct_item_t *it, int argc, char **argv,
+                         char *out, int ocap) {
+    (void)it;
+    if (argc < 4) {
+        snprintf(out, (size_t)ocap, "usage: add_rule <in|out> <allow|deny> <tcp|udp> <port>");
+        return -1;
+    }
+    int dir   = fw_word(argv[0], "in", "out");
+    int act   = fw_word(argv[1], "allow", "deny");
+    int proto = fw_word(argv[2], "tcp", "udp");
+    int port  = atoi(argv[3]);
+    if (dir < 0 || act < 0 || proto < 0 || port < 1 || port > 65535) {
+        snprintf(out, (size_t)ocap,
+                 "rejected: dir must be in|out, action allow|deny, proto tcp|udp, port 1..65535");
+        return -1;
+    }
+    fw_pull();
+    if (fw_rule_count >= MAX_FW_RULES) {
+        snprintf(out, (size_t)ocap, "rejected: rule table is full (%d)", MAX_FW_RULES);
+        return -1;
+    }
+    fw_add(dir, act, proto, port);
+    fw_push();
+    if (fw_last_rc != 0) {
+        snprintf(out, (size_t)ocap, "kernel refused the ruleset (rc=%d); "
+                 "previous policy still in force", fw_last_rc);
+        return -1;
+    }
+    snprintf(out, (size_t)ocap, "installed; %d rule(s) now in force", fw_rule_count);
+    return 0;
+}
+
+static int ct_fw_act_clear(const ct_item_t *it, int argc, char **argv,
+                           char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    fw_pull();
+    fw_rule_count = 0;
+    fw_push();
+    if (fw_last_rc != 0) {
+        snprintf(out, (size_t)ocap, "kernel refused (rc=%d)", fw_last_rc);
+        return -1;
+    }
+    snprintf(out, (size_t)ocap,
+             "all explicit rules removed; the two default policies now decide "
+             "every connection");
+    return 0;
+}
+
+static int ct_fw_act_reload(const ct_item_t *it, int argc, char **argv,
+                            char *out, int ocap) {
+    (void)it; (void)argc; (void)argv;
+    fw_reload_from_disk();
+    if (fw_last_rc != 0) {
+        snprintf(out, (size_t)ocap,
+                 "/CONFIG/FWRULES.CFG carried nothing usable (rc=%d); the "
+                 "previous policy is still in force", fw_last_rc);
+        return -1;
+    }
+    snprintf(out, (size_t)ocap, "reloaded; %d rule(s) in force", fw_rule_count);
+    return 0;
+}
+
+static const ct_item_t SETTINGS_ITEMS[] = {
+// --- Firewall (#238): the packet filter, which is real as of this ticket ----
+//
+// GUARDED, not SAFE. Weakening a packet filter is a security decision, and
+// docs/CONTRACT_API.md section 4 is explicit that this gate is in-process and
+// is not a defence against a hostile Ring-3 binary. THE REAL BOUNDARY IS THE
+// SYSCALL: SYS_NET_FW refuses every mutating op from a non-root euid. What the
+// GUARDED class adds here is a consent prompt and a per-call audit entry, and
+// it means a headless caller must have been granted "net.firewall" beforehand
+// rather than being able to mint its own authority.
+//
+// The two read-only rows are SAFE: knowing the policy is not a capability, and
+// a filter whose state cannot be read is a filter nobody can verify.
+{ "firewall.enabled", CT_BOOL, CT_RW, CT_GUARDED, 0, 0, 1, 0,
+  0, ct_fw_get_enabled, ct_fw_set_enabled, 0, 0, 0, "system.network.firewall",
+  "Turn the kernel packet filter on or off; off means every packet passes" },
+{ "firewall.policy_in", CT_ENUM, CT_RW, CT_GUARDED, 0, 0, 1, "Allow|Deny",
+  0, ct_fw_get_pin, ct_fw_set_pin, 0, 0, 0, "system.network.firewall",
+  "Default action for UNSOLICITED inbound connections; replies always pass" },
+{ "firewall.policy_out", CT_ENUM, CT_RW, CT_GUARDED, 0, 0, 1, "Allow|Deny",
+  0, ct_fw_get_pout, ct_fw_set_pout, 0, 0, 0, "system.network.firewall",
+  "Default action for connections this machine opens to somewhere else" },
+{ "firewall.rules", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
+  0, 0, 0, 0, ct_fw_get_rules, 0, 0,
+  "The live rule list read back from the kernel, dir/action/proto/port" },
+{ "firewall.stats", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
+  0, 0, 0, 0, ct_fw_get_stats, 0, 0,
+  "Live filter counters: packets dropped, flows tracked, cost in TSC cycles" },
+{ "firewall.add_rule", CT_ACTION, CT_WRITE, CT_GUARDED, 0, 0, 0, 0,
+  0, 0, 0, ct_fw_act_add, 0, 0, "system.network.firewall",
+  "Add a rule: add_rule <in|out> <allow|deny> <tcp|udp> <port 1..65535>" },
+{ "firewall.clear_rules", CT_ACTION, CT_WRITE, CT_GUARDED, 0, 0, 0, 0,
+  0, 0, 0, ct_fw_act_clear, 0, 0, "system.network.firewall",
+  "Remove every explicit rule, leaving only the two default policies" },
+{ "firewall.reload", CT_ACTION, CT_WRITE, CT_GUARDED, 0, 0, 0, 0,
+  0, 0, 0, ct_fw_act_reload, 0, 0, "system.network.firewall",
+  "Re-read /CONFIG/FWRULES.CFG; reports how many lines it had to ignore" },
+
+
+// --- persisted preferences (the SETTINGS.CFG keys) --------------------------
+{ "clock.use_24hour", CT_BOOL, CT_RW, CT_SAFE, 'h', 0, 1, 0,
+  0, ct_get_use24, ct_set_use24, 0, 0, 0, 0,
+  "24-hour clock; read live by the taskbar clock via libc settingscfg_use24h()" },
+{ "appearance.accent_color", CT_ENUM, CT_RW, CT_SAFE, 'a', 0, 7,
+  "Blue|Green|Orange|Purple|Red|Teal|Pink|Amber",
+  &accent_color_idx, 0, 0, 0, 0, 0, 0,
+  "Accent colour index; recolors this app's own buttons (Settings-scoped, #230)" },
+{ "pointer.cursor_style", CT_ENUM, CT_RW, CT_SAFE, 'c', 0, 2, "Light|Dark|Glow",
+  &cursor_theme, 0, 0, 0, 0, 0, 0,
+  "Pointer glyph; the compositor's cursor_render() reads it every frame" },
+{ "pointer.speed", CT_INT, CT_RW, CT_SAFE, 'p', 0, 100, 0,
+  &pointer_speed, 0, 0, 0, 0, 0, 0,
+  "Mouse sensitivity 0-100; scales every packet in kernel mouse_scale_delta()" },
+{ "pointer.double_click_speed", CT_INT, CT_RW, CT_SAFE, 'k', 0, 100, 0,
+  &double_click_speed, 0, 0, 0, 0, 0, 0,
+  "Double-click speed 0-100; the compositor threshold via settingscfg_dblclick_ms()" },
+{ "screensaver.type", CT_INT, CT_RW, CT_SAFE, 's', 0, 40, 0,
+  &screensaver_idx, 0, 0, 0, 0, 0, 0,
+  "Screensaver index; the compositor calls screensaver_set_type() on change" },
+{ "screensaver.delay_minutes", CT_INT, CT_RW, CT_SAFE, 'z', 1, 120, 0,
+  &screensaver_delay_min, 0, 0, 0, 0, 0, 0,
+  "Idle minutes before the screensaver arms; read live by get_ss_delay()" },
+
+// --- Date & Time panel: all five datetime_geom_t fields ---------------------
+{ "datetime.auto_time", CT_BOOL, CT_RW, CT_SAFE, 0, 0, 1, 0,
+  0, ct_get_auto_time, ct_set_auto_time, 0, 0, 0, 0,
+  "Set time automatically; enabling runs an NTP sync, as the panel's toggle does" },
+{ "datetime.timezone", CT_INT, CT_RW, CT_SAFE, 0, 0, 63, 0,
+  0, ct_get_tz, ct_set_tz, 0, 0, 0, 0,
+  "Timezone row in the shared libc/tz.c ZONES list; commits to /CONFIG/TZ.CFG" },
+{ "datetime.week_start", CT_ENUM, CT_RW, CT_SAFE, 0, 0, 1, "Sunday|Monday",
+  &first_day_of_week, 0, 0, 0, 0, 0, 0,
+  "First day of the week shown in calendars" },
+{ "datetime.sync_now", CT_ACTION, CT_WRITE, CT_SAFE, 0, 0, 0, 0,
+  0, 0, 0, ct_act_ntp, 0, 0, 0,
+  "Run an NTP time sync now; the same call the auto-time toggle makes" },
+{ "datetime.set_clock", CT_ACTION, CT_WRITE, CT_DENIED, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0,
+  "Set the hardware RTC (the Set Date & Time modal). DENIED: see the note below" },
+
+// --- Storage panel: all four storage_geom_t fields --------------------------
+// GUARDED, not SAFE. These delete real files and cannot be undone, and
+// docs/CONTRACT_ARCHITECTURE.md section 7 makes irreversibility the primary
+// axis of risk. A capability token or user consent is required.
+{ "storage.clear_thumbnails", CT_ACTION, CT_WRITE, CT_GUARDED, 0, 0, 0, 0,
+  0, 0, 0, ct_act_clear, 0, CACHE_DIR_THUMBS, "fs.write",
+  "Delete every cached thumbnail; irreversible, so it is capability-gated" },
+{ "storage.clear_app_cache", CT_ACTION, CT_WRITE, CT_GUARDED, 0, 0, 0, 0,
+  0, 0, 0, ct_act_clear, 0, CACHE_DIR_APPS, "fs.write",
+  "Delete the application cache; irreversible, so it is capability-gated" },
+{ "storage.clear_system_cache", CT_ACTION, CT_WRITE, CT_GUARDED, 0, 0, 0, 0,
+  0, 0, 0, ct_act_clear, 0, CACHE_DIR_SYSTEM, "fs.write",
+  "Delete the system cache; irreversible, so it is capability-gated" },
+{ "storage.empty_trash", CT_ACTION, CT_WRITE, CT_GUARDED, 0, 0, 0, 0,
+  0, 0, 0, ct_act_clear, 0, CACHE_DIR_TRASH, "fs.write",
+  "Empty the recycle bin permanently; irreversible, so it is capability-gated" },
+
+// --- Privacy panel: all six privacy_geom_t fields ---------------------------
+{ "privacy.screen_lock", CT_BOOL, CT_RW, CT_SAFE, 0, 0, 1, 0,
+  &screen_lock_enabled, 0, 0, 0, 0, 0, 0,
+  "Enable the idle screen lock; persisted to /CONFIG/PRIVACY.CFG" },
+{ "privacy.lock_timeout_min", CT_INT, CT_RW, CT_SAFE, 0, 0, 60, 0,
+  &lock_timeout, 0, 0, 0, 0, 0, 0,
+  "Idle minutes before locking; 0 means never" },
+{ "privacy.require_password_wake", CT_BOOL, CT_RW, CT_GUARDED, 0, 0, 1, 0,
+  &require_password_wake, 0, 0, 0, 0, 0, "system.settings.write",
+  "Require a password on wake. GUARDED: turning it off weakens login" },
+{ "privacy.location_services", CT_BOOL, CT_RW, CT_SAFE, 0, 0, 1, 0,
+  &location_services, 0, 0, 0, 0, 0, 0,
+  "Allow apps to request location; persisted to /CONFIG/PRIVACY.CFG" },
+{ "privacy.send_diagnostics", CT_BOOL, CT_RW, CT_SAFE, 0, 0, 1, 0,
+  &diagnostics_enabled, 0, 0, 0, 0, 0, 0,
+  "Send anonymous diagnostics; persisted to /CONFIG/PRIVACY.CFG" },
+{ "privacy.crash_reports", CT_BOOL, CT_RW, CT_SAFE, 0, 0, 1, 0,
+  &crash_reports, 0, 0, 0, 0, 0, 0,
+  "Send crash reports; persisted to /CONFIG/PRIVACY.CFG" },
+
+// --- Appearance: the rows that have a real live setter ----------------------
+{ "appearance.theme", CT_INT, CT_RW, CT_SAFE, 0, 0, 31, 0,
+  0, ct_get_theme_idx, ct_set_theme_idx, 0, 0, 0, 0,
+  "Theme index into the file-based theme list; applies live via SYS_SET_THEME" },
+{ "appearance.theme_name", CT_STR, CT_READ, CT_SAFE, 0, 0, 0, 0,
+  0, 0, 0, 0, ct_get_theme_name, 0, 0,
+  "Name of the active theme, from the same g_th_names[] the dropdown draws" },
+{ "appearance.set_theme_by_name", CT_ACTION, CT_WRITE, CT_SAFE, 0, 0, 0, 0,
+  0, 0, 0, ct_act_theme_by_name, 0, 0, 0,
+  "Select a theme by name; answers with the live list of names on a miss" },
+{ "appearance.font_size", CT_ENUM, CT_RW, CT_SAFE, 0, 0, 3, "Small|Medium|Large|XL",
+  0, ct_get_font_size, ct_set_font_size, 0, 0, 0, 0,
+  "UI font size; calls set_font_size(), as the Appearance dropdown does" },
+{ "appearance.window_transparency", CT_INT, CT_RW, CT_SAFE, 0, 5, 100, 0,
+  0, ct_get_transparency, ct_set_transparency, 0, 0, 0, 0,
+  "Window opacity percent (100 = opaque); the same slider the panel draws" },
+
+// --- Sound / Display: live kernel state, no SETTINGS.CFG key ----------------
+{ "sound.master_volume", CT_INT, CT_RW, CT_SAFE, 0, 0, 100, 0,
+  0, ct_get_volume, ct_set_volume, 0, 0, 0, 0,
+  "Master output volume 0-100; reads and writes the real kernel mixer" },
+{ "sound.mute", CT_BOOL, CT_RW, CT_SAFE, 0, 0, 1, 0,
+  0, ct_get_mute, ct_set_mute, 0, 0, 0, 0,
+  "Mute the master output; the same set_mute() the Mute button calls" },
+{ "display.brightness", CT_INT, CT_RW, CT_SAFE, 0, 0, 100, 0,
+  0, ct_get_brightness, ct_set_brightness, 0, 0, 0, 0,
+  "Display brightness 0-100; committed through apply_display_fx()" },
+{ "display.night_light", CT_BOOL, CT_RW, CT_SAFE, 0, 0, 1, 0,
+  0, ct_get_night_light, ct_set_night_light, 0, 0, 0, 0,
+  "Enable the warm night-light tint; committed through apply_display_fx()" },
+{ "display.night_light_strength", CT_INT, CT_RW, CT_SAFE, 0, 0, 100, 0,
+  0, ct_get_night_strength, ct_set_night_strength, 0, 0, 0, 0,
+  "Night-light strength 0-100; only visible while night_light is on" },
+
+// --- Users: declared and refused --------------------------------------------
+// Present on purpose. Enumeration must be honest that the surface exists and
+// is refused; an API that silently omitted it would let a caller conclude
+// Settings cannot change a password, which is false.
+{ "users.change_password", CT_ACTION, CT_WRITE, CT_DENIED, 0, 0, 0, 0,
+  0, 0, 0, 0, 0, 0, 0,
+  "Change an account password. DENIED through this API in every case" },
+};
+
+#define SETTINGS_ITEM_COUNT ((int)(sizeof(SETTINGS_ITEMS)/sizeof(SETTINGS_ITEMS[0])))
+
+static void settings_save(void);
+static void settings_load(void);
+
+static const ct_contract_t SETTINGS_CONTRACT = {
+    "settings", "Settings",
+    "Persisted rows (cfgkey) ARE settings_save()/settings_load(); there is no "
+    "second key list. Coverage of the app's full control surface is PARTIAL "
+    "and gated by tools/contract-lint, not structural - see "
+    "docs/CONTRACT_API.md section 6 for the exact number.",
+    SETTINGS_ITEMS, SETTINGS_ITEM_COUNT,
+    0,                 // no projection: this app's controls are not one table
+    settings_load,
+    settings_save
+};
+
 static void settings_save(void) {
     char buf[512]; char *p = buf;
-    // #50: 't' (the timezone) is DELIBERATELY NOT WRITTEN any more. The timezone
-    // lives in /CONFIG/TZ.CFG, written by tz_set_index(), and a second copy here
-    // is precisely the divergence this ticket removes. The key is still READ
-    // below, once, to migrate an existing install.
-    p = sv_putint(p, 'h', use_24hour ? 1 : 0);
-    p = sv_putint(p, 'd', date_format);
-    p = sv_putint(p, 'a', accent_color_idx);
-    p = sv_putint(p, 'c', cursor_theme);
-    p = sv_putint(p, 'p', pointer_speed);
-    p = sv_putint(p, 'k', double_click_speed);
-    p = sv_putint(p, 's', screensaver_idx);
-    p = sv_putint(p, 'z', screensaver_delay_min);
-    // (#382 pass2) Persist the Keyboard/Mouse/Display preference sliders so they
-    // survive relaunch (they were previously per-launch no-ops). Uppercase keys
-    // to avoid colliding with the lowercase keys above.
-    p = sv_putint(p, 'R', key_repeat_rate);
-    p = sv_putint(p, 'E', key_repeat_delay);
-    p = sv_putint(p, 'Y', keyboard_layout);
-    p = sv_putint(p, 'W', scroll_speed);
-    p = sv_putint(p, 'F', natural_scrolling ? 1 : 0);
-    p = sv_putint(p, 'J', scroll_inertia ? 1 : 0);
-    p = sv_putint(p, 'Q', left_handed ? 1 : 0);
-    p = sv_putint(p, 'X', pointer_trails ? 1 : 0);
-    p = sv_putint(p, 'S', scaling_factor);
-    p = sv_putint(p, 'C', color_temp);
-    p = sv_putint(p, 'U', gamma_r);
-    p = sv_putint(p, 'V', gamma_g);
-    p = sv_putint(p, 'B', gamma_b);
+    // #233: DERIVED from SETTINGS_ITEMS[]. There is no second list of keys.
+    // Adding a row with a cfgkey persists it here, exposes it through the
+    // contract API and brings it under pref-reader-lint, all in one edit;
+    // deleting the row removes all three. The seven hand-written sv_putint()
+    // lines this replaces were the drift surface.
+    // #50: 't' (timezone) is deliberately not written - the zone lives in
+    // /CONFIG/TZ.CFG and a second copy here is the divergence #50 removed. It
+    // is still READ below, once, to migrate an existing install.
+    for (int i = 0; i < SETTINGS_ITEM_COUNT; i++) {
+        const ct_item_t *it = &SETTINGS_ITEMS[i];
+        if (!it->cfgkey) continue;
+        p = sv_putint(p, it->cfgkey, contract_get(it));
+    }
     // #743: was unlink-then-open on a RELATIVE path, so every desktop
-    // preference (font, icon size, screensaver, cursor, dock, gamma, ...) was
-    // deleted by a failed open and otherwise saved to wherever cwd pointed.
+    // preference was deleted by a failed open and otherwise saved to wherever
+    // cwd pointed.
     int fd = userconf_open_write("SETTINGS.CFG");
     if (userconf_finish_write(fd, buf, (unsigned long)(p - buf)) != 0)
         save_failed("SETTINGS.CFG (desktop preferences)");
@@ -2244,30 +3144,17 @@ static void settings_load(void) {
             if (b[i] == '-') { neg = 1; i++; }
             while (b[i] >= '0' && b[i] <= '9') { val = val * 10 + (b[i] - '0'); i++; }
             if (neg) val = -val;
-            switch (key) {
-                case 't': legacy_tz_idx = val; break;   // #50: migration only
-                case 'h': use_24hour = val ? true : false; break;
-                case 'd': date_format = val; break;
-                case 'a': accent_color_idx = val; break;
-                case 'c': cursor_theme = val; break;
-                case 'p': pointer_speed = val; break;
-                case 'k': double_click_speed = val; break;
-                case 's': screensaver_idx = val; break;
-                case 'z': screensaver_delay_min = val; break;
-                case 'R': key_repeat_rate = val; break;
-                case 'E': key_repeat_delay = val; break;
-                case 'Y': keyboard_layout = val; break;
-                case 'W': scroll_speed = val; break;
-                case 'F': natural_scrolling = val ? true : false; break;
-                case 'J': scroll_inertia = val ? true : false; break;
-                case 'Q': left_handed = val ? true : false; break;
-                case 'X': pointer_trails = val ? true : false; break;
-                case 'S': scaling_factor = val; break;
-                case 'C': color_temp = val; break;
-                case 'U': gamma_r = val; break;
-                case 'V': gamma_g = val; break;
-                case 'B': gamma_b = val; break;
+            // #233: DERIVED from SETTINGS_ITEMS[]. A key the table persists
+            // is a key the table parses, by construction.
+            ct_item_t cit;
+            if (key == 't') {
+                legacy_tz_idx = val;          // #50: migration only
+            } else if (contract_by_key(&SETTINGS_CONTRACT, key, &cit)) {
+                contract_put(&cit, val);
             }
+            // Keys from an older build that the table no longer carries
+            // (#230 deleted 14 of them) fall through and are ignored, which
+            // is correct: they name controls that no longer exist.
         }
         while (b[i] && b[i] != '\n') i++;
         if (b[i] == '\n') i++;
@@ -2275,16 +3162,12 @@ static void settings_load(void) {
 }
 static void settings_autosave(void) {
     static int last = -1;
-    // #50: timezone_idx is no longer part of this signature, because it is no
-    // longer part of what settings_save() writes. Leaving it in would trigger a
-    // pointless SETTINGS.CFG rewrite every time the zone changed.
-    int h = (use_24hour?1:0)*13 + date_format*17 + accent_color_idx*23
-          + cursor_theme*29 + pointer_speed*31 + double_click_speed*37
-          + screensaver_idx*41 + screensaver_delay_min*43
-          + key_repeat_rate*47 + key_repeat_delay*53 + keyboard_layout*59
-          + scroll_speed*61 + (natural_scrolling?1:0)*67 + (scroll_inertia?1:0)*71
-          + (left_handed?1:0)*73 + (pointer_trails?1:0)*79 + scaling_factor*83
-          + color_temp*89 + gamma_r*97 + gamma_g*101 + gamma_b*103;
+    // #233: the change signature is DERIVED from SETTINGS_ITEMS[]
+    // (contract_hash walks every persisted row), replacing a hand-written
+    // weighted sum that had to be edited every time a key was added. #231
+    // removed the identical fault from the widget serializer, where the
+    // hand-maintained hash had silently stopped watching three settings.
+    int h = contract_hash(&SETTINGS_CONTRACT);
     if (last == -1) { last = h; return; }
     if (h != last) { last = h; settings_save(); }
 }
@@ -2588,8 +3471,9 @@ static int      s_wp_preview_idx = -2;
 
 static void draw_wallpaper_picker(void) {
     wp_names_init();
-    draw_subsection(WP_DD_X, WP_DD_Y, "Wallpaper");
-    int dy = WP_DD_Y + 25;
+    int wp_y0 = WP_DD_Y - g_content_scroll.offset;   // (#227) content area now scrolls
+    draw_subsection(WP_DD_X, wp_y0, "Wallpaper");
+    int dy = wp_y0 + 25;
     const char *nm = (wallpaper_idx >= 0 && wallpaper_idx < g_wp_count) ? g_wp[wallpaper_idx].name : "";
     draw_dropdown_n(WP_DD_X, dy, WP_DD_W, nm, g_dd_open && g_dd_sel == &wallpaper_idx, g_wp_count);
 
@@ -2605,7 +3489,7 @@ static void draw_wallpaper_picker(void) {
 
 static void draw_appearance_panel(void) {
     int x = CONTENT_X + PADDING;
-    int y = PADDING;
+    int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
     char buf[32];
 
     draw_wallpaper_picker();           // dropdown + single preview, right column
@@ -2652,6 +3536,17 @@ static void draw_appearance_panel(void) {
     for (int i = 0; i < NUM_ACCENT_COLORS; i++) {
         draw_color_box(x + i * 42, y, ACCENT_COLORS[i], i == accent_color_idx);
     }
+    // #230 (docs/SETTINGS_CONTROL_AUDIT.md #224): this DOES apply live and DOES
+    // persist (COL_ACCENT is re-derived from accent_color_idx by apply_theme(),
+    // used throughout this file) - but only within THIS process. Say so, so
+    // "accent color" is not read as a system-wide setting it is not; making it
+    // one would mean threading an accent override through the kernel theme
+    // engine (kernel/gui/themes.c) that every app queries, which is real
+    // future work, not a one-line fix. Fits inside the row's existing 55px
+    // budget below, so PANEL_APPEARANCE's independently-computed font_y
+    // (handle_content_click(), allowlist.tsv DEBT row) does not move.
+    draw_hint_ic(x, y + 32, "CMINUS", theme_color(THEME_COLOR_MUTED),
+                 "Applies to this Settings window only; other apps keep the theme's own accent.");
     y += 55;
 
     // Font settings
@@ -2734,15 +3629,136 @@ static void draw_appearance_panel(void) {
         win_draw_text(window_handle, x + 300, y, tb, COL_TEXT_SECONDARY);
     }
     y += 45;
+    g_content_bottom_y = y;   // (#227)
 }
 
 // =============================================================================
 // Panel: Display
 // =============================================================================
 
+// ===========================================================================
+// ONE DESCRIPTION OF THE DISPLAY PANEL'S VERTICAL LAYOUT.
+//
+// Every offset below used to be written out twice: once as a running `y +=`
+// in draw_display_panel(), and once as a hand-added constant in the
+// PANEL_DISPLAY click handler ("int bright_y = base_y + 299;"). That is the
+// same duplicated-geometry shape as the kernel's eleven copies of the
+// title-bar button x, and it had already failed twice - the file's own
+// comments record the rotation offset being re-measured after Scale content
+// "had grown past it and nobody had re-measured".
+//
+// IT WAS STALE AGAIN WHEN THIS WAS WRITTEN. Walking draw_display_panel()'s
+// own arithmetic puts the Brightness slider at +249:
+//     40 header + 25 Resolution + 30 res row + 16 hint + 24 hint
+//   + 25 Rotation + 34 dropdown + 30 hint + 25 Brightness  =  249
+// while the handler tested +299. The slider was drawn in one place and
+// clicked for 50px lower down: a control that looks live and is not, which is
+// exactly ticket class #208. Night Light's toggle and strength are computed
+// RELATIVE to that constant, so both were displaced with it.
+//
+// So the offsets move here, computed once, and BOTH sides read them. Adding a
+// section can no longer silently break a control below it, which matters
+// immediately: this change adds one.
+// ===========================================================================
+typedef struct {
+    int rotation_dd;     // y of the Rotation dropdown (draws at y-3)
+    int uiscale_dd;      // y of the UI Scale dropdown
+    int brightness;      // y of the Brightness slider
+    int nightlight;      // y of the Night Light toggle
+    int nl_strength;     // y of the Night Light strength slider
+    int card;            // y of the Display Information card
+} display_layout_t;
+
+static display_layout_t display_layout(void) {
+    display_layout_t L;
+    int y = 0;
+    y += 40;                       // section header
+    y += 25;                       // "Resolution" subsection
+    y += 30;                       // resolution + colour depth row
+    y += 16; y += 24;              // two hint lines
+    y += 25;                       // "Rotation" subsection
+    L.rotation_dd = y - 3;         // the draw_dropdown_n(y-3) convention
+    y += 34;
+    y += 30;                       // rotation hint
+    y += 25;                       // "UI Scale" subsection
+    L.uiscale_dd = y - 3;
+    y += 34;
+    // The hint block is four lines, plus a fifth ONLY when the scale is pinned
+    // by the boot-partition file. display_layout() has to know that, or every
+    // control below it moves by 16px in the draw and not in the hit test - the
+    // exact fault this function was written to end.
+    y += 16; y += 16; y += 16; y += 22;   // four hint lines
+    if (ui_scale_src() == UI_SRC_ESP) y += 16;
+    y += 5;
+    y += 25;                       // "Brightness" subsection
+    L.brightness = y;
+    y += 45;
+    y += 25;                       // "Night Light" subsection
+    L.nightlight = y;
+    y += 35;
+    L.nl_strength = y;             // only present while night_light is on
+    if (night_light) y += 35 + 40;
+    y += 5;
+    L.card = y;
+    return L;
+}
+
+// The UI scale steps this machine can actually carry. The list is BUILT from
+// the kernel's own cap (ui_scale_max()) rather than being a fixed array,
+// because a step the display cannot carry is a step that would be clamped on
+// selection - and a control that silently does something other than what it
+// says is worse than one that does not offer the choice. On a 1366x768 panel
+// the list is just "100%"; on 4K it runs to 300%.
+#define UISCALE_MAX_OPTS 9
+static const char *g_uiscale_opts[UISCALE_MAX_OPTS];
+static char        g_uiscale_optbuf[UISCALE_MAX_OPTS][12];
+static int         g_uiscale_pcts[UISCALE_MAX_OPTS];
+static int         g_uiscale_count = 0;
+static int         g_uiscale_idx = 0;
+
+static void uiscale_opts_build(void) {
+    int maxp = ui_scale_max();
+    if (maxp < 100) maxp = 100;
+    int live = ui_scale_pct();
+    g_uiscale_count = 0;
+    for (int p = 100; p <= maxp && g_uiscale_count < UISCALE_MAX_OPTS; p += 25) {
+        char *b = g_uiscale_optbuf[g_uiscale_count];
+        gui_itoa(p, b, 12);
+        int n = my_strlen(b);
+        b[n++] = '%'; b[n] = 0;
+        if (p == 100) { b[n++] = ' '; b[n++] = '('; b[n++] = '1'; b[n++] = 'x'; b[n++] = ')'; b[n] = 0; }
+        g_uiscale_opts[g_uiscale_count] = b;
+        g_uiscale_pcts[g_uiscale_count] = p;
+        if (p == live) g_uiscale_idx = g_uiscale_count;
+        g_uiscale_count++;
+    }
+    if (g_uiscale_count == 0) {
+        copy_str(g_uiscale_optbuf[0], "100% (1x)", 12);
+        g_uiscale_opts[0] = g_uiscale_optbuf[0];
+        g_uiscale_pcts[0] = 100;
+        g_uiscale_count = 1;
+        g_uiscale_idx = 0;
+    }
+}
+
+// Applies LIVE and persists. Live matters: the whole point is that the owner
+// can try 125, 150 and 175 and LOOK at them. A scale setting that needs a
+// reboot to evaluate is a setting nobody tunes.
+//
+// REPORTS WHAT WAS ADOPTED, NOT WHAT WAS ASKED. ui_scale_set() clamps to what
+// the display can carry and returns the value actually in force; showing the
+// requested value instead would be a control that lies about its own state.
+static void uiscale_dd_changed(void) {
+    if (g_uiscale_idx < 0 || g_uiscale_idx >= g_uiscale_count) return;
+    int got = ui_scale_set(g_uiscale_pcts[g_uiscale_idx]);
+    (void)ui_scale_save();
+    for (int i = 0; i < g_uiscale_count; i++)
+        if (g_uiscale_pcts[i] == got) g_uiscale_idx = i;
+}
+
 static void draw_display_panel(void) {
     int x = CONTENT_X + PADDING;
-    int y = PADDING;
+    int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
     char buf[32];
 
     draw_section_header(x, y, "Display");
@@ -2761,8 +3777,17 @@ static void draw_display_panel(void) {
         int have_fi = (fb_info(&fi) == 0);
         if (have_fi) {
             char a[12], b[12];
-            gui_itoa((int)fi.width, a, sizeof(a));
-            gui_itoa((int)fi.height, b, sizeof(b));
+            // THE REAL PANEL GEOMETRY, NOT THIS APP'S LOGICAL CANVAS.
+            // fb_info() answers a scale-transparent app in LOGICAL pixels on
+            // purpose - that is the coordinate system it lays out in - so at
+            // 150% on a 1920x1080 display it says 1280x720. Correct for
+            // layout, and a lie to read on a settings page whose whole job is
+            // to tell the user what their hardware is doing.
+            int pw = 0, ph = 0;
+            ui_scale_fb_phys(&pw, &ph);
+            if (pw <= 0 || ph <= 0) { pw = (int)fi.width; ph = (int)fi.height; }
+            gui_itoa(pw, a, sizeof(a));
+            gui_itoa(ph, b, sizeof(b));
             int k = 0;
             for (int i = 0; a[i]; i++) resbuf[k++] = a[i];
             resbuf[k++] = ' '; resbuf[k++] = 'x'; resbuf[k++] = ' ';
@@ -2792,31 +3817,117 @@ static void draw_display_panel(void) {
     draw_hint(x, y, "be changed while running. Refresh rate is firmware-controlled.");
     y += 24;
 
-    // Scaling
-    draw_label(x, y + 4, "Scale");
-    gui_itoa(scaling_factor, buf, sizeof(buf));
-    int len = my_strlen(buf);
-    buf[len++] = '%'; buf[len] = 0;
-    draw_slider(x + 120, y, 200, scaling_factor - 100, 100, COL_SLIDER_FILL);
-    win_draw_text(window_handle, x + 335, y, buf, COL_TEXT_SECONDARY);
-    y += 50;
+    // Rotation (#745 local 102): for panels physically mounted rotated in
+    // hardware (e.g. the GPD MicroPC, whose panel scans out portrait) - the
+    // same fix Linux users on that class of device make with an fbcon/xrandr
+    // transform. Reboot-to-apply: the kernel decides fb_rotation once, in
+    // fb_init(), before any userland exists (so the boot splash rotates too,
+    // not just the desktop) - see kernel/video/framebuffer.c. There is no
+    // live re-layout of a running desktop's window positions/taskbar/back
+    // buffer size, so this control persists a CHOICE for next boot rather
+    // than pretending to apply immediately and doing nothing.
+    display_layout_t L = display_layout();
+    int y0 = PADDING - g_content_scroll.offset;
+
+    draw_subsection(x, y, "Rotation");
+    y += 25;
+    draw_label(x, y + 4, "Orientation");
+    draw_dropdown_n(x + 120, y0 + L.rotation_dd, 160,
+                  ROTATION_OPTS[OPT_CLAMP(rotation_idx, ROTATION_OPTS)],
+                  g_dd_open && g_dd_sel == &rotation_idx, ROTATION_OPTS_COUNT);
+    y += 34;
+    if (rotation_idx != rotation_active) {
+        draw_hint_ic(x, y, "CMINUS", COL_WARNING,
+                     "Applies after restart - the current session stays as it is.");
+    } else {
+        draw_hint(x, y, "For a panel mounted rotated in hardware (e.g. GPD MicroPC).");
+    }
+    y += 30;
+
+    // ---------------------------------------------------------------------
+    // UI SCALE.
+    //
+    // #230 deleted a "Scale" SLIDER from this exact spot, and was right to:
+    // docs/SETTINGS_CONTROL_AUDIT.md #224 found it had no click handler at
+    // all and nothing consumed its value. This is not that control coming
+    // back. It is a dropdown wired to a factor that reaches TTF type sizes,
+    // widget metrics, window chrome, app content and hit-testing, and it
+    // applies live. The steps offered are built from what this display can
+    // actually carry, so the control cannot offer a choice it would clamp.
+    // ---------------------------------------------------------------------
+    uiscale_opts_build();
+    draw_subsection(x, y, "UI Scale");
+    y += 25;
+    draw_label(x, y + 4, "Interface size");
+    draw_dropdown_n(x + 120, y0 + L.uiscale_dd, 160,
+                  g_uiscale_opts[OPT_CLAMP(g_uiscale_idx, g_uiscale_opts)],
+                  g_dd_open && g_dd_sel == &g_uiscale_idx, g_uiscale_count);
+    y += 34;
+    {
+        // SAY WHERE THE VALUE CAME FROM. A user who can see "the machine chose
+        // this" as distinct from "I chose this" can tell a setting they can
+        // trust from one they are fighting.
+        int src = ui_scale_src();
+        int autop = ui_scale_auto();
+        int lap = ui_scale_laptop();
+        char ab[16]; gui_itoa(autop, ab, sizeof(ab));
+        int an = my_strlen(ab); ab[an++] = '%'; ab[an] = 0;
+        char line[96];
+        line[0] = 0;
+        hw_append(line, sizeof(line),
+                  src == UI_SRC_ESP    ? "PINNED by UISCALE.TXT on the boot disk. " :
+                  src == UI_SRC_USER   ? "Chosen here. " :
+                  src == UI_SRC_CONFIG ? "From /CONFIG/DISPLAY.CFG. " :
+                  src == UI_SRC_AUTO   ? "Detected automatically. " : "Default. ");
+        hw_append(line, sizeof(line), "This display suggests ");
+        hw_append(line, sizeof(line), ab);
+        hw_append(line, sizeof(line), ".");
+        draw_hint(x, y, line);
+        y += 16;
+        // THE PIN IS SAID OUT LOUD. A change made here still applies to the
+        // running session, but the file wins at the next boot, and a control
+        // whose effect quietly evaporates overnight is worse than one that
+        // explains why. The file exists for the case where the UI is too small
+        // to operate, so it has to outrank a saved preference.
+        if (src == UI_SRC_ESP) {
+            draw_hint_ic(x, y, "CMINUS", COL_WARNING,
+                "Delete UISCALE.TXT from the boot partition to choose here.");
+            y += 16;
+        }
+        draw_hint(x, y, lap == 1
+            ? "A battery was detected, so this is treated as a laptop panel."
+            : (lap == 0
+               ? "No battery: treated as a desktop panel at about 96 PPI."
+               : "The firmware could not be asked about a battery."));
+        y += 16;
+        draw_hint(x, y, "Panel size cannot be read, so a 15in and a 22in 1080p screen");
+        y += 16;
+        draw_hint(x, y, "look identical here. Change this if the guess looks wrong.");
+        y += 22;
+    }
+
+    // #230: the Color Temp and Gamma sliders were deleted below for the same
+    // reason the old Scale slider was - no click handler, nothing consuming
+    // the value.
+
+    y += 5;
 
     // Brightness
     draw_subsection(x, y, "Brightness");
     y += 25;
 
     gui_itoa(brightness, buf, sizeof(buf));
-    len = my_strlen(buf);
+    int len = my_strlen(buf);
     buf[len++] = '%'; buf[len] = 0;
-    draw_slider(x, y, 350, brightness, 100, COL_WARNING);
-    win_draw_text(window_handle, x + 370, y, buf, COL_TEXT_SECONDARY);
+    draw_slider(x, y0 + L.brightness, 350, brightness, 100, COL_WARNING);
+    win_draw_text(window_handle, x + 370, y0 + L.brightness, buf, COL_TEXT_SECONDARY);
     y += 45;
 
     // Night light
     draw_subsection(x, y, "Night Light");
     y += 25;
 
-    draw_toggle_labeled(x, y, 300, "Enable Night Light", night_light);
+    draw_toggle_labeled(x, y0 + L.nightlight, 300, "Enable Night Light", night_light);
     y += 35;
 
     if (night_light) {
@@ -2827,7 +3938,7 @@ static void draw_display_panel(void) {
         // (#704) INTENTIONALLY NOT themed: warm-amber is the universal Night
         // Light / Night Shift affordance color across desktop OSes, meant to
         // read as "warmth" regardless of the active theme.
-        draw_slider(x + 120, y, 200, night_light_strength, 100, 0x00FF9933);
+        draw_slider(x + 120, y0 + L.nl_strength, 200, night_light_strength, 100, 0x00FF9933);
         win_draw_text(window_handle, x + 335, y, buf, COL_TEXT_SECONDARY);
         y += 35;
 
@@ -2844,36 +3955,15 @@ static void draw_display_panel(void) {
         y += 40;
     }
 
-    // Color calibration
-    draw_subsection(x, y, "Color Calibration");
-    y += 25;
-
-    draw_label(x, y, "Color Temp");
-    gui_itoa(color_temp, buf, sizeof(buf));
-    len = my_strlen(buf);
-    buf[len++] = 'K'; buf[len] = 0;
-    win_draw_text(window_handle, x + 350, y, buf, COL_TEXT_SECONDARY);
-    draw_slider(x + 100, y, 240, color_temp - 4000, 5000, COL_SLIDER_FILL);
-    y += 35;
-
-    // Gamma controls
-    // (#704) INTENTIONALLY NOT themed: these three fills identify the R/G/B
-    // color channel each slider controls. A theme cannot legitimately
-    // recolor "the red channel slider" to non-red without making the control
-    // unreadable as what it is.
-    draw_label(x, y, "Gamma R");
-    draw_slider(x + 80, y, 100, gamma_r, 150, 0x00FF4444);
-    draw_label(x + 200, y, "G");
-    draw_slider(x + 220, y, 100, gamma_g, 150, 0x0044FF44);
-    draw_label(x + 340, y, "B");
-    draw_slider(x + 360, y, 100, gamma_b, 150, 0x004444FF);
-    y += 35;
-    // (#382 pass2) Honest: Brightness and Night Light ARE applied live (SYS_SET_
-    // DISPLAY_FX). Scale / Color Temp / Gamma have no compositor or GPU LUT hook
-    // in this build, so they are shown for reference and are not applied.
-    draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_MUTED) /* (#704) was hardcoded 0x00A0A0A8 */,
-                 "Scale, Color Temp and Gamma are not applied in this build (no LUT hook).");
-    y += 20;
+    // #230: Color Temp and Gamma R/G/B were deleted here for the same reason
+    // as Scale above - docs/SETTINGS_CONTROL_AUDIT.md #224 found no click
+    // handler existed for any of them, and no compositor/GPU LUT hook
+    // consumes them. (#382 pass2) Honest: Brightness and Night Light ARE
+    // applied live (SYS_SET_DISPLAY_FX); this build has no LUT hook for the
+    // rest, so rather than leave sliders that could never move (Scale/Color
+    // Temp/Gamma) or that moved but did nothing, they are gone until a LUT
+    // hook exists to back them.
+    y += 5;
 
     // Display info card - real adapter (PCI class 0x03) + real framebuffer (#382)
     hwinfo_load();
@@ -2909,6 +3999,7 @@ static void draw_display_panel(void) {
         draw_label_value(x + 15,  y + 55, "PCI ID:", idbuf, 80);
         draw_label_value(x + 250, y + 35, "Buffer:", fbsize_line, 80);
         draw_label_value(x + 250, y + 55, "Depth:", depth_line, 80);
+        g_content_bottom_y = y + 80;   // (#227)
     }
 }
 
@@ -2925,7 +4016,7 @@ static void draw_sound_panel(void) {
     // meter / 10-band sliders.
     hwinfo_load();
     int x = CONTENT_X + PADDING;
-    int y = PADDING;
+    int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
     char buf[32];
 
     draw_section_header(x, y, "Sound");
@@ -2980,15 +4071,59 @@ static void draw_sound_panel(void) {
         draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_MUTED) /* (#704) was hardcoded 0x00A0A0A8 */, "No audio output device present.");
     else if (sound_test_status == 3)
         draw_hint(x, y, "Playing test sound...");
+    g_content_bottom_y = y + 20;   // (#227)
 }
 
 // =============================================================================
 // Panel: Network
 // =============================================================================
 
+// (#227/#223) ONE source of truth for the DHCP toggle, the conditional
+// "Configure IP..." button and the Firewall toggle, consumed by BOTH
+// draw_network_panel() and the PANEL_NETWORK branch of handle_content_click().
+// This REPLACES the previous instance fix, `fw_y = dhcp_y + 120 +
+// (dhcp_enabled ? 0 : 36)`: that ternary happened to be arithmetically
+// correct (it mirrored the "Configure IP..." button's 36px cost), but it was
+// a re-guessed constant that could silently go wrong again the moment a
+// THIRD row was ever inserted between DHCP and Firewall - exactly the class
+// of bug it was patching. This function instead walks the SAME conditional
+// draw_network_panel() walks (whatever is or is not drawn between DHCP and
+// Firewall), so the two structurally cannot diverge.
+typedef struct {
+    int dhcp, cfgip, fw;   // cfgip is -1 when DHCP is on (button not drawn)
+    // (#786) "Set DNS..." occupies the same row as "Configure IP...", and is
+    // drawn INSTEAD of it when DHCP is on. -1 when DHCP is off. Exactly one of
+    // cfgip/dnsbtn is >= 0, so the row cost is unconditional and the geometry
+    // below no longer changes height with the toggle.
+    int dnsbtn;
+    // #238: the two default-policy toggles. They are in the SAME struct as
+    // everything else in this panel, which is what keeps them inside
+    // hitbox-lint's and contract-lint's reach (docs/CONTRACT_API.md 6).
+    int pol_in, pol_out;
+} network_geom_t;
+static void network_geom(network_geom_t *g) {
+    int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
+    y += 40;                  /* section header */
+    y += 125;                 /* connection status card + gap */
+    g->dhcp = y; y += 40;
+    if (!dhcp_enabled) {
+        g->cfgip = y; g->dnsbtn = -1;
+    } else {
+        g->cfgip = -1; g->dnsbtn = y;   // (#786) DNS is reachable on DHCP too
+    }
+    y += 36;
+    y += 25;                  /* "VPN" subsection heading */
+    y += 30;                  /* VPN hint line */
+    y += 25;                  /* "Firewall" subsection heading */
+    g->fw = y; y += 40;
+    g->pol_in  = y; y += 30;
+    g->pol_out = y;
+}
+
 static void draw_network_panel(void) {
     int x = CONTENT_X + PADDING;
-    int y = PADDING;
+    int y = PADDING - g_content_scroll.offset;
+    network_geom_t g; network_geom(&g);
 
     draw_section_header(x, y, "Network");
     y += 40;
@@ -3011,18 +4146,27 @@ static void draw_network_panel(void) {
     draw_label_value(x + 15, y + 80, "MAC:", mac_address, 100);
 
     draw_label_value(x + 280, y + 40, "Gateway:", gateway, 80);
-    draw_label_value(x + 280, y + 60, "DNS 1:", dns_primary, 80);
-    draw_label_value(x + 280, y + 80, "DNS 2:", dns_secondary, 80);
+    // #786: "DNS (live)" is dns_get_server(), the server the resolver will
+    // query. "DHCP offered" is what the lease supplied. They CAN differ - a
+    // static config or a Settings change pins the first and ignores the
+    // second - and when they do, showing only one of them is how a user ends
+    // up debugging a machine that is not doing what the screen says.
+    draw_label_value(x + 280, y + 60, "DNS (live):", dns_primary, 80);
+    draw_label_value(x + 280, y + 80, "DHCP offered:", dns_offered, 80);
 
     y += 125;
 
     // DHCP toggle
-    draw_toggle_labeled(x, y, 300, "Obtain IP automatically (DHCP)", dhcp_enabled);
-    y += 40;
+    draw_toggle_labeled(x, g.dhcp, 300, "Obtain IP automatically (DHCP)", dhcp_enabled);
+    y = g.dhcp + 40;
 
     if (!dhcp_enabled) {
-        draw_button_small(x + 20, y, 160, "Configure IP...", false);
-        y += 36;
+        draw_button_small(x + 20, g.cfgip, 160, "Configure IP...", false);
+        y = g.cfgip + 36;
+    } else {
+        // (#786) On DHCP the address is not yours to set, but the RESOLVER is.
+        draw_button_small(x + 20, g.dnsbtn, 160, "Set DNS...", false);
+        y = g.dnsbtn + 36;
     }
 
     // VPN section. There is no VPN client / tunnel stack in this build, so this
@@ -3035,109 +4179,100 @@ static void draw_network_panel(void) {
                  "VPN is not available (no VPN client in this build).");
     y += 30;
 
-    // Firewall
-    draw_subsection(x, y, "Firewall");
-    y += 25;
+    // Firewall (#238). Every control below now reaches a real packet filter.
+    draw_subsection(x, g.fw - 25, "Firewall");
+    draw_toggle_labeled(x, g.fw, 300, "Enable Firewall", firewall_enabled);
+    // The two default policies, as toggles rather than a bespoke Allow/Deny
+    // widget: "block" == DENY, which is the direction a person thinks in, and
+    // it reuses the shared control instead of inventing a fourth kind of
+    // selector (CLAUDE.md: reuse the existing primitive).
+    draw_toggle_labeled(x, g.pol_in, 300,  "Block unsolicited inbound",
+                        fw_pol_in == FW_ACT_DENY);
+    draw_toggle_labeled(x, g.pol_out, 300, "Block outbound connections",
+                        fw_pol_out == FW_ACT_DENY);
+    y = g.pol_out + 32;
 
-    draw_toggle_labeled(x, y, 300, "Enable Firewall", firewall_enabled);
-    y += 35;
-
-    if (firewall_enabled) {
-        const char *pol[] = {"Allow", "Deny"};
-        draw_label(x + 20, y + 6, "Default Inbound");
-        draw_option_buttons(x + 170, y, pol, ARRAY_COUNT(pol), fw_pol_in);
-        y += 34;
-        draw_label(x + 20, y + 6, "Default Outbound");
-        draw_option_buttons(x + 170, y, pol, ARRAY_COUNT(pol), fw_pol_out);
-        y += 34;
-
-        draw_label(x + 20, y, "Rules");
-        draw_hint(x + 70, y + 3, "click ALLOW / IN / TCP chips to cycle, X to remove");
-        y += 22;
-        for (int i = 0; i < fw_rule_count; i++) {
-            fw_rule_t *r = &fw_rules[i];
-            int rx = x + 20;
-            // (#704) ALLOW/DENY/remove badges: were hardcoded dark green
-            // (0x00207A20) / dark red (0x008A2020) literals, now the theme's
-            // success/error tokens. gui_ink_on() still derives readable text
-            // ink from whatever the token resolves to, so contrast holds
-            // across themes.
-            uint32_t acol = (r->action == 0) ? theme_color(THEME_COLOR_SUCCESS) : theme_color(THEME_COLOR_ERROR);
-            gui_fill_rounded(window_handle, rx, y, 56, 20, 5, acol);
-            gui_text_ttf_centered(window_handle, rx, y, 56, 20, r->action == 0 ? "ALLOW" : "DENY", gui_ink_on(acol), 11);
-            gui_fill_rounded(window_handle, rx + 64, y, 44, 20, 5, COL_BUTTON_BG);
-            gui_text_ttf_centered(window_handle, rx + 64, y, 44, 20, r->dir == 0 ? "IN" : "OUT", COL_TEXT_PRIMARY, 11);
-            gui_fill_rounded(window_handle, rx + 116, y, 44, 20, 5, COL_BUTTON_BG);
-            gui_text_ttf_centered(window_handle, rx + 116, y, 44, 20, r->proto == 0 ? "TCP" : "UDP", COL_TEXT_PRIMARY, 11);
-            char pbuf[8]; gui_itoa(r->port, pbuf, sizeof(pbuf));
-            gui_fill_rounded(window_handle, rx + 168, y, 60, 20, 5, COL_INPUT_BG);
-            gui_text_ttf_centered(window_handle, rx + 168, y, 60, 20, pbuf, COL_TEXT_PRIMARY, 11);
-            {
-                uint32_t rcol = theme_color(THEME_COLOR_ERROR);
-                gui_fill_rounded(window_handle, rx + 240, y, 24, 20, 5, rcol);
-                gui_text_ttf_centered(window_handle, rx + 240, y, 24, 20, "X", gui_ink_on(rcol), 11);
-            }
-            y += 26;
+    // #238: the honest scope statement stays, but it now says what IS true.
+    // #223 put a "this does nothing" note here because there was no filter;
+    // that note is retired, not deleted, because the panel must still be
+    // explicit about what the filter does NOT cover. A control that overstates
+    // its reach is the same defect one size smaller.
+    //
+    // The rule list is READ-ONLY in this panel. Rules are added and removed
+    // through the contract API, and the panel says so rather than drawing an
+    // editor that does not exist - the #223 lesson applied to its own fix.
+    {
+        char line[128];
+        int n = fw_rule_count;
+        if (n == 0) {
+            draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_MUTED),
+                         "No explicit rules: the two default policies above "
+                         "decide every connection.");
+            y += 22;
         }
-        if (fw_rule_count < MAX_FW_RULES)
-            draw_button_small(x + 20, y, 120, "+ Add Rule", true);
+        for (int i = 0; i < n && i < MAX_FW_RULES; i++) {
+            snprintf(line, sizeof(line), "%s  %s  %s  port %u",
+                     fw_rules[i].dir == FW_DIR_IN ? "in " : "out",
+                     fw_rules[i].action == FW_ACT_DENY ? "deny " : "allow",
+                     fw_rules[i].proto == FW_PROTO_UDP ? "udp" : "tcp",
+                     (unsigned)fw_rules[i].port);
+            win_draw_text(window_handle, x + 20, y, line, COL_TEXT_PRIMARY);
+            y += 20;
+        }
+        y += 8;
+
+        // The counters. This is the panel telling the truth about itself: a
+        // firewall that has never dropped anything says so, and one that is
+        // dropping says how much. It is also the fastest way for anyone to
+        // check that the engine is actually on the packet path.
+        snprintf(line, sizeof(line),
+                 "Filtered %llu packets; dropped %llu inbound, %llu outbound; "
+                 "%llu tracked-flow passes.",
+                 (unsigned long long)fw_stats.calls,
+                 (unsigned long long)fw_stats.drop_in,
+                 (unsigned long long)fw_stats.drop_out,
+                 (unsigned long long)fw_stats.ct_hit);
+        win_draw_text_small(window_handle, x, y, line, COL_TEXT_SECONDARY);
+        y += 22;
+
+        draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_MUTED),
+                     "Rules apply to TCP and UDP by destination port. ARP, "
+                     "ICMP (ping) and the DHCP exchange are never filtered. "
+                     "Replies to connections this machine opened always pass. "
+                     "Edit rules with: ctl set settings firewall.add_rule");
+        y += 30;
     }
+    g_content_bottom_y = y;   // (#227)
 }
 
 
 // Panel: Keyboard
 // =============================================================================
 
+// #230 (docs/SETTINGS_CONTROL_AUDIT.md #224): the Keyboard Layout dropdown,
+// Repeat Rate/Delay sliders, Lock Keys checkboxes, "Edit Shortcuts" button and
+// "Test Area" box are ALL DELETED. None had a real consumer: there is no
+// keymap table anywhere but the one hardcoded US scancode table (cpu/isr.c),
+// no PS/2 typematic (0xF3) command is ever sent, no software auto-repeat
+// exists for ordinary keys (only consumer/media keys get one - see
+// drivers/usb_hid.c HID_CONS_REPEAT_*), the lock-key vars were not even
+// persisted, and the Layout dropdown could not even be OPENED (drawn with a
+// literal `false`, no dropdown_open() call anywhere). This panel therefore
+// has NO interactive rows left, so no shared geometry function is needed -
+// draw_keyboard_panel() and handle_content_click() cannot drift apart when
+// there is nothing left to drift.
 static void draw_keyboard_panel(void) {
     int x = CONTENT_X + PADDING;
-    int y = PADDING;
-    char buf[32];
+    int y = PADDING - g_content_scroll.offset;
 
     draw_section_header(x, y, "Keyboard");
     y += 40;
 
-    // Layout
-    draw_subsection(x, y, "Layout");
-    y += 25;
-
-    draw_label(x, y + 4, "Keyboard Layout");
-    draw_dropdown(x + 140, y, 200, keyboard_layouts[keyboard_layout], false);
-    y += 45;
-
-    // Typing settings
-    draw_subsection(x, y, "Typing");
-    y += 25;
-
-    draw_label(x, y, "Repeat Rate");
-    gui_itoa(key_repeat_rate, buf, sizeof(buf));
-    int len = my_strlen(buf);
-    buf[len++] = '/'; buf[len++] = 's'; buf[len] = 0;
-    draw_slider(x + 140, y, 200, key_repeat_rate, 50, COL_SLIDER_FILL);
-    win_draw_text(window_handle, x + 355, y, buf, COL_TEXT_SECONDARY);
-    y += 35;
-
-    draw_label(x, y, "Repeat Delay");
-    gui_itoa(key_repeat_delay, buf, sizeof(buf));
-    len = my_strlen(buf);
-    buf[len++] = 'm'; buf[len++] = 's'; buf[len] = 0;
-    draw_slider(x + 140, y, 200, key_repeat_delay, 500, COL_SLIDER_FILL);
-    win_draw_text(window_handle, x + 355, y, buf, COL_TEXT_SECONDARY);
-    y += 50;
-
-    // Lock indicators
-    draw_subsection(x, y, "Lock Keys");
-    y += 25;
-
-    draw_checkbox(x, y, "Num Lock", num_lock);
-    draw_checkbox(x + 150, y, "Caps Lock", caps_lock);
-    draw_checkbox(x + 300, y, "Scroll Lock", scroll_lock);
-    y += 45;
-
-    // Keyboard shortcuts
+    // Keyboard shortcuts (read-only reference list; not user-editable, so
+    // showing it is not a claim of anything this build cannot do).
     draw_subsection(x, y, "Shortcuts");
     y += 25;
 
-    // Show first 6 shortcuts
     for (int i = 0; i < 6 && i < 8; i++) {
         int row = i / 2;
         int col = i % 2;
@@ -3148,57 +4283,42 @@ static void draw_keyboard_panel(void) {
     }
     y += 85;
 
-    draw_button(x, y, 150, "Edit Shortcuts", false, false);
-    y += 50;
-
-    // Test area
-    draw_subsection(x, y, "Test Area");
-    y += 25;
-
-    win_draw_rect(window_handle, x, y, CONTENT_WIDTH - 2 * PADDING, 40, COL_INPUT_BG);
-    gui_draw_rect_outline(window_handle, x, y, CONTENT_WIDTH - 2 * PADDING, 40, COL_INPUT_BORDER);
-    win_draw_text(window_handle, x + 10, y + 12, "Type here to test keyboard settings...", COL_TEXT_DISABLED);
-    y += 50;
-    // (#382 pass2) Honest: these persist to SETTINGS.CFG but the current build
-    // does not apply repeat rate/delay or layout live to the keyboard driver.
-    draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_MUTED) /* (#704) was hardcoded 0x00A0A0A8 */,
-                 "Repeat rate/delay and layout are saved preferences; not yet applied live.");
+    // #230: layout selection, typematic rate/delay and lock-key indicators
+    // removed - see the comment above draw_keyboard_panel().
+    draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_MUTED),
+                 "Keyboard layout selection, repeat rate/delay and lock-key "
+                 "indicators are not implemented in this build (no keymap "
+                 "table or typematic driver exists) and have been removed "
+                 "until they are.");
+    g_content_bottom_y = y + 32;   // (#227) hint line height (wraps to 2 lines)
 }
 
 // =============================================================================
 // Panel: Mouse/Touchpad
 // =============================================================================
 
-// #745: ONE source of truth for the Mouse panel's row positions, consumed by
-// BOTH draw_mouse_panel() and the PANEL_MOUSE branch of handle_content_click().
-// Those two used to carry independent arithmetic chains down the same column
-// and had ALREADY drifted before this change: the click handler placed Scroll
-// Speed and Natural Scrolling 20px (25px with trails on) above where the draw
-// pass painted them, leaving a 24px toggle with ~4px of live hit box. Inserting
-// the Cursor row by hand would have widened that silently. A shared geometry
-// pass makes the two structurally unable to disagree.
+// #745/#230: ONE source of truth for the Mouse panel's row positions,
+// consumed by BOTH draw_mouse_panel() and the PANEL_MOUSE branch of
+// handle_content_click(). #230 (docs/SETTINGS_CONTROL_AUDIT.md #224) deleted
+// Pointer Size, Pointer Trails + Trail Length, Scroll Speed, Natural
+// Scrolling, Scroll Inertia and Left-handed Mode: none had ANY consumer
+// anywhere in the tree (no cursor-trail renderer, no kinetic-scroll
+// implementation, nothing inverts scroll, mouse button bits pass straight
+// through with no swap), and Pointer Size additionally had no click handler
+// at all. Double-click Speed is now REAL (settingscfg_dblclick_ms(), read by
+// the compositor's double-click detector) instead of a round trip.
 #define MG_SUBSECTION 25   /* vertical cost of one draw_subsection() heading */
 typedef struct {
-    int sens, dbl, psize, trails, traillen, cursor, scrollspd, natural, inertia, lefthand;
+    int sens, dbl, cursor;
 } mouse_geom_t;
 static void mouse_geom(mouse_geom_t *m) {
-    int y = PADDING;
+    int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
     y += 40;                                  /* section header */
     y += MG_SUBSECTION;                       /* "Pointer" */
     m->sens      = y; y += 35;
     m->dbl       = y; y += 45;
-    m->psize     = y; y += 45;
-    m->trails    = y; y += 35;
-    m->traillen  = pointer_trails ? y : -1;   /* -1 = row not present */
-    if (pointer_trails) y += 40;
     y += MG_SUBSECTION;                       /* "Cursor" (#745) */
-    m->cursor    = y; y += 45;
-    y += MG_SUBSECTION;                       /* "Scrolling" */
-    m->scrollspd = y; y += 35;
-    m->natural   = y; y += 55;                /* toggle + its hint line */
-    m->inertia   = y; y += 45;
-    y += MG_SUBSECTION;                       /* "Buttons" */
-    m->lefthand  = y;
+    m->cursor    = y;
 }
 
 static void draw_mouse_panel(void) {
@@ -3221,20 +4341,6 @@ static void draw_mouse_panel(void) {
     draw_slider(x + 160, m.dbl, 230, double_click_speed, 100, COL_SLIDER_FILL);
     win_draw_text(window_handle, x + 405, m.dbl, buf, COL_TEXT_SECONDARY);
 
-    // Pointer appearance
-    draw_label(x, m.psize, "Pointer Size");
-    {
-        const char* ptr_sizes[] = {"Small", "Normal", "Large", "XL"};
-        draw_option_buttons(x + 140, m.psize - 3, ptr_sizes, ARRAY_COUNT(ptr_sizes), pointer_size);
-    }
-
-    draw_toggle_labeled(x, m.trails, 300, "Pointer Trails", pointer_trails);
-
-    if (m.traillen >= 0) {
-        draw_label(x + 20, m.traillen, "Trail Length");
-        draw_slider(x + 140, m.traillen, 150, pointer_trail_length, 10, COL_SLIDER_FILL);
-    }
-
     // Cursor (#745: moved here from Appearance - the pointer's look belongs
     // with the pointer's behaviour, and it is NOT left behind on Appearance).
     // Same shared dropdown widget, same label column and same 140px control
@@ -3248,39 +4354,58 @@ static void draw_mouse_panel(void) {
                         g_dd_open && g_dd_sel == &cursor_theme, CURSOR_OPTS_COUNT);
     }
 
-    // Scrolling
-    draw_subsection(x, m.scrollspd - MG_SUBSECTION, "Scrolling");
-
-    draw_label(x, m.scrollspd, "Scroll Speed");
-    gui_itoa(scroll_speed, buf, sizeof(buf));
-    draw_slider(x + 140, m.scrollspd, 200, scroll_speed, 100, COL_SLIDER_FILL);
-    win_draw_text(window_handle, x + 355, m.scrollspd, buf, COL_TEXT_SECONDARY);
-
-    draw_toggle_labeled(x, m.natural, 300, "Natural Scrolling", natural_scrolling);
-    draw_hint(x, m.natural + 30, "Content moves in the direction of your fingers");
-
-    draw_toggle_labeled(x, m.inertia, 300, "Scroll Inertia", scroll_inertia);
-
-    // Button configuration
-    draw_subsection(x, m.lefthand - MG_SUBSECTION, "Buttons");
-    draw_toggle_labeled(x, m.lefthand, 300, "Left-handed Mode", left_handed);
-    draw_hint(x, m.lefthand + 30, "Swap primary and secondary mouse buttons");
-    // Honest: Mouse Sensitivity IS applied live (set_mouse_speed) and persisted
-    // to UIPROFIL by the compositor. Cursor Style is applied live via
-    // set_cursor() and persisted by the compositor to UIPROFIL.YML's curstyle.
-    // The other controls persist to SETTINGS.CFG but have no live driver
-    // effect yet.
-    draw_hint_ic(x, m.lefthand + 55, "CMINUS", theme_color(THEME_COLOR_MUTED) /* (#704) was hardcoded 0x00A0A0A8 */,
-                 "Saved preferences; Mouse Sensitivity and Cursor Style apply live and persist across reboots.");
+    // #230: Pointer Size, Pointer Trails/Trail Length, Scroll Speed, Natural
+    // Scrolling, Scroll Inertia and Left-handed Mode removed - see the
+    // comment above mouse_geom().
+    int hy = m.cursor + 45;
+    draw_hint_ic(x, hy, "CMINUS", theme_color(THEME_COLOR_MUTED),
+                 "Pointer size, trails, scroll tuning and left-handed mode "
+                 "are not implemented in this build and have been removed "
+                 "until they are.");
+    g_content_bottom_y = hy + 32;   // (#227) hint line height (wraps to 2 lines)
 }
 
 // =============================================================================
 // Panel: Date & Time
 // =============================================================================
 
+// (#227) ONE source of truth for this panel's row positions, consumed by BOTH
+// draw_datetime_panel() and the PANEL_DATETIME branch of handle_content_click().
+// Those two used to carry independent arithmetic chains and had drifted 50px
+// apart starting at Date Format: the click handler's `dfmt_y = fmt_y + 95`
+// chain never accounted for the "Time Zone" subsection heading + dropdown the
+// draw pass inserts in between, so Date Format, Week-starts-on and the "Set
+// Date & Time" button were all unreachable by mouse (docs/SETTINGS_CONTROL_
+// AUDIT.md #224). auto_time and use_24hour were NOT drifted - the shared
+// function reproduces that too, rather than "fixing" rows that were already
+// correct.
+//
+// #230: Date Format is DELETED (its own field with it) - nothing in the tree
+// ever formatted a date with it, not even this panel's own clock card above,
+// which was hardcoded "DD Mon YYYY" regardless of the dropdown's selection.
+// Use 24-hour format is now REAL: settingscfg_use24h() (libc/settingscfg.c)
+// drives both this panel's clock card and the taskbar clock.
+typedef struct {
+    int auto_time, use24, tz, weekstart, setbtn;
+} datetime_geom_t;
+static void datetime_geom(datetime_geom_t *g) {
+    int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
+    y += 40;                 /* section header */
+    y += 115;                /* clock card + gap */
+    g->auto_time = y; y += 10;
+    y += 30;                 /* hint line + NTP status gap */
+    y += 20;
+    g->use24 = y; y += 45;
+    y += 25;                 /* "Time Zone" subsection heading */
+    g->tz = y; y += 50;
+    g->weekstart = y; y += 50;
+    g->setbtn = y;
+}
+
 static void draw_datetime_panel(void) {
     int x = CONTENT_X + PADDING;
-    int y = PADDING;
+    int y = PADDING - g_content_scroll.offset;
+    datetime_geom_t g; datetime_geom(&g);
 
     draw_section_header(x, y, "Date & Time");
     y += 40;
@@ -3299,14 +4424,22 @@ static void draw_datetime_panel(void) {
     int display_h = lt.hour;
     int display_m = lt.min;
 
-    // Format HH:MM:SS
-    char time_str[12];
-    time_str[0] = '0' + display_h / 10; time_str[1] = '0' + display_h % 10;
+    // Format HH:MM:SS (or hh:MM:SS AM/PM). #230: this panel's own clock now
+    // honors "Use 24-hour format" instead of ignoring it - a caller-visible
+    // change from just toggling the switch below, with no reboot/relaunch.
+    int fmt_h = display_h; const char *ampm = "";
+    if (!use_24hour) {
+        ampm = (display_h >= 12) ? " PM" : " AM";
+        fmt_h = display_h % 12; if (fmt_h == 0) fmt_h = 12;
+    }
+    char time_str[16];
+    time_str[0] = '0' + fmt_h / 10; time_str[1] = '0' + fmt_h % 10;
     time_str[2] = ':';
     time_str[3] = '0' + display_m / 10; time_str[4] = '0' + display_m % 10;
     time_str[5] = ':';
     time_str[6] = '0' + rtc_sec / 10;   time_str[7] = '0' + rtc_sec % 10;
     time_str[8] = 0;
+    if (ampm[0]) { int tl = my_strlen(time_str); for (int i2 = 0; ampm[i2]; i2++) time_str[tl++] = ampm[i2]; time_str[tl] = 0; }
 
     // Format "DD Mon YYYY"
     const char *mon_names[] = {"Jan","Feb","Mar","Apr","May","Jun",
@@ -3332,7 +4465,7 @@ static void draw_datetime_panel(void) {
     // Analog clock representation (simple square)
     int cx = x + 400, cy = y + 50;
     char hm_str[8];
-    hm_str[0] = '0' + display_h / 10; hm_str[1] = '0' + display_h % 10;
+    hm_str[0] = '0' + fmt_h / 10; hm_str[1] = '0' + fmt_h % 10;
     hm_str[2] = ':';
     hm_str[3] = '0' + display_m / 10; hm_str[4] = '0' + display_m % 10;
     hm_str[5] = 0;
@@ -3343,8 +4476,8 @@ static void draw_datetime_panel(void) {
     y += 115;
 
     // Auto time toggle
-    draw_toggle_labeled(x, y, 300, "Set time automatically", auto_time);
-    y += 10;
+    draw_toggle_labeled(x, g.auto_time, 300, "Set time automatically", auto_time);
+    y = g.auto_time + 10;
     draw_hint(x, y + 20, "Synchronize with network time servers");
     y += 30;
     // NTP status feedback
@@ -3352,37 +4485,26 @@ static void draw_datetime_panel(void) {
         draw_hint_ic(x + 20, y + 20, "CCHECK", theme_color(THEME_COLOR_SUCCESS), "Time synchronized successfully.");
     else if (ntp_status == -1)
         win_draw_text(window_handle, x + 20, y + 20, "NTP sync failed (no network?).", theme_color(THEME_COLOR_ERROR));
-    y += 20;
 
     // Time format
-    draw_toggle_labeled(x, y, 300, "Use 24-hour format", use_24hour);
-    y += 45;
+    draw_toggle_labeled(x, g.use24, 300, "Use 24-hour format", use_24hour);
 
     // Timezone
-    draw_subsection(x, y, "Time Zone");
-    y += 25;
+    draw_subsection(x, g.tz - 25, "Time Zone");
+    draw_dropdown(x, g.tz, 350, tz_label(timezone_idx), false);
 
-    draw_dropdown(x, y, 350, tz_label(timezone_idx), false);
-    y += 50;
-
-    // Date format
-    draw_subsection(x, y, "Date Format");
-    y += 25;
-
-    draw_dropdown(x, y, 160, DATE_FMT_OPTS[OPT_CLAMP(date_format, DATE_FMT_OPTS)],
-                  g_dd_open && g_dd_sel == &date_format);
-    y += 45;
+    // #230: Date Format deleted here - see the comment above datetime_geom().
 
     // First day of week
-    draw_label(x, y, "Week starts on");
+    draw_label(x, g.weekstart, "Week starts on");
     const char* week_days[] = {"Sunday", "Monday"};
-    draw_option_buttons(x + 140, y - 3, week_days, ARRAY_COUNT(week_days), first_day_of_week);
-    y += 50;
+    draw_option_buttons(x + 140, g.weekstart - 3, week_days, ARRAY_COUNT(week_days), first_day_of_week);
 
     // Manual time setting button
     if (!auto_time) {
-        draw_button(x, y, 160, "Set Date & Time", true, false);
+        draw_button(x, g.setbtn, 160, "Set Date & Time", true, false);
     }
+    g_content_bottom_y = g.setbtn + 40;   // (#227) button height + margin
 }
 
 // =============================================================================
@@ -3417,9 +4539,44 @@ static void draw_avatar_badge(int x, int y, int d, uint32_t fill, uint32_t bg, c
     gui_text_ttf_centered(window_handle, x, y, d, d, letter, ink, fs);
 }
 
+// (#227) ONE source of truth for this panel's interactive rows, consumed by
+// BOTH draw_users_panel() and the PANEL_USERS branch of
+// handle_content_click(). The per-row "Other Users" list and the trailing
+// Add User / Guest toggle rows all depend on user_count, which used to be
+// re-added independently in each place; the two chains had drifted 5px
+// apart on the Add User / Guest rows (docs/SETTINGS_CONTROL_AUDIT.md #224).
+// This walks the exact same user_count/current_user_idx skip-loop
+// draw_users_panel() does, so the two cannot diverge.
+typedef struct {
+    int edit_profile, autologin, chpw, other_row0, adduser, guest;
+} users_geom_t;
+static void users_geom(users_geom_t *g) {
+    int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
+    y += 40;                    /* section header */
+    g->edit_profile = y + 35;   /* current-user card's Edit Profile button */
+    y += 115;                   /* card + gap */
+    y += 25;                    /* "Account Settings" subsection heading */
+    g->autologin = y; y += 10;
+    y += 45;                    /* hint line + advance to Change Password */
+    g->chpw = y; y += 50;
+    y += 25;                    /* "Other Users" subsection heading */
+    g->other_row0 = y;
+    int rows = 0;
+    for (int i = 0; i < user_count; i++) {
+        if (i == current_user_idx) continue;
+        if (users[i].username[0] == 0) continue;
+        rows++;
+    }
+    y += rows * 60;
+    y += 10;
+    g->adduser = y; y += 45;
+    g->guest = y;
+}
+
 static void draw_users_panel(void) {
     int x = CONTENT_X + PADDING;
-    int y = PADDING;
+    int y = PADDING - g_content_scroll.offset;
+    users_geom_t g; users_geom(&g);
 
     draw_section_header(x, y, "Users & Accounts");
     y += 40;
@@ -3441,7 +4598,7 @@ static void draw_users_panel(void) {
     const char* roles[] = {"Administrator", "Standard User", "Guest"};
     win_draw_text(window_handle, x + 90, y + 62, roles[users[current_user_idx].role], COL_TEXT_DISABLED);
 
-    draw_button_small(x + 350, y + 35, 100, "Edit Profile", false);
+    draw_button_small(x + 350, g.edit_profile, 100, "Edit Profile", false);
 
     y += 115;
 
@@ -3467,14 +4624,12 @@ static void draw_users_panel(void) {
             while (u[j] && k < (int)sizeof(al_label) - 1) { al_label[k++] = u[j++]; }
             al_label[k] = '\0';
         }
-        draw_toggle_labeled(x, y, 340, al_label, is_al_cur);
+        draw_toggle_labeled(x, g.autologin, 340, al_label, is_al_cur);
     }
-    y += 10;
-    draw_hint(x, y + 20, "Skips the login screen at boot for this account only.");
-    y += 45;
+    draw_hint(x, g.autologin + 30, "Skips the login screen at boot for this account only.");
 
-    draw_button(x, y, 160, "Change Password", false, false);
-    y += 50;
+    draw_button(x, g.chpw, 160, "Change Password", false, false);
+    y = g.chpw + 50;
 
     // Other users
     draw_subsection(x, y, "Other Users");
@@ -3506,21 +4661,54 @@ static void draw_users_panel(void) {
         y += 60;
     }
 
-    y += 10;
-    draw_button(x, y, 120, "Add User", true, false);
-
-    y += 45;
-    draw_toggle_labeled(x, y, 300, "Enable Guest Account", guest_enabled);
+    draw_button(x, g.adduser, 120, "Add User", true, false);
+    draw_toggle_labeled(x, g.guest, 300, "Enable Guest Account", guest_enabled);
+    g_content_bottom_y = g.guest + 40;   // (#227) toggle height + margin
 }
 
 // =============================================================================
 // Panel: Privacy & Security
 // =============================================================================
 
+// (#227) ONE source of truth for this panel's toggle rows, consumed by BOTH
+// draw_privacy_panel() and the PANEL_PRIVACY branch of handle_content_click().
+// "Require password on wake" carried an X-AXIS bug independent of this y
+// conversion: draw_toggle_labeled(x + 20, y, 280, ...) draws the actual
+// switch at x + 20 + 280 = x + 300 (label_width indent + label_width, the
+// same convention every other 48px-wide toggle switch on this panel uses -
+// see draw_toggle()/draw_toggle_labeled() above), but the click handler
+// tested x + 280..x + 328 - 20px left of the real switch, forgetting the x+20
+// indent. Fixed by testing x + 300..x + 348 like every other toggle here.
+typedef struct {
+    int lock, timeout_dd, reqpw;   // timeout_dd/reqpw are -1 when lock is off
+    int location, diagnostics, crash;
+} privacy_geom_t;
+static void privacy_geom(privacy_geom_t *g) {
+    int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
+    y += 40;                  /* section header */
+    y += 25;                  /* "Screen Lock" subsection heading */
+    g->lock = y; y += 35;
+    if (screen_lock_enabled) {
+        g->timeout_dd = y; y += 40;
+        g->reqpw = y; y += 10;
+        y += 30;               /* hint line */
+    } else {
+        g->timeout_dd = -1;
+        g->reqpw = -1;
+    }
+    y += 25;                  /* "Privacy" subsection heading */
+    g->location = y; y += 10;
+    y += 45;                  /* hint line + advance */
+    g->diagnostics = y; y += 10;
+    y += 45;
+    g->crash = y;
+}
+
 static void draw_privacy_panel(void) {
     int x = CONTENT_X + PADDING;
-    int y = PADDING;
+    int y = PADDING - g_content_scroll.offset;
     char buf[32];
+    privacy_geom_t g; privacy_geom(&g);
 
     draw_section_header(x, y, "Privacy & Security");
     y += 40;
@@ -3529,11 +4717,11 @@ static void draw_privacy_panel(void) {
     draw_subsection(x, y, "Screen Lock");
     y += 25;
 
-    draw_toggle_labeled(x, y, 300, "Enable Screen Lock", screen_lock_enabled);
-    y += 35;
+    draw_toggle_labeled(x, g.lock, 300, "Enable Screen Lock", screen_lock_enabled);
+    y = g.lock + 35;
 
     if (screen_lock_enabled) {
-        draw_label(x + 20, y, "Lock after");
+        draw_label(x + 20, g.timeout_dd, "Lock after");
         const char* timeouts[] = {"Never", "1 min", "2 min", "5 min", "10 min", "15 min", "30 min"};
         int timeout_idx = 0;
         if (lock_timeout == 1) timeout_idx = 1;
@@ -3542,14 +4730,12 @@ static void draw_privacy_panel(void) {
         else if (lock_timeout == 10) timeout_idx = 4;
         else if (lock_timeout == 15) timeout_idx = 5;
         else if (lock_timeout == 30) timeout_idx = 6;
-        draw_dropdown(x + 120, y, 120, timeouts[timeout_idx], false);
-        y += 40;
+        draw_dropdown(x + 120, g.timeout_dd, 120, timeouts[timeout_idx], false);
 
-        draw_toggle_labeled(x + 20, y, 280, "Require password on wake", require_password_wake);
-        y += 10;
-        draw_hint(x + 20, y + 20, "(#566) MayteraOS's lock always requires a password to "
+        draw_toggle_labeled(x + 20, g.reqpw, 280, "Require password on wake", require_password_wake);
+        draw_hint(x + 20, g.reqpw + 30, "(#566) MayteraOS's lock always requires a password to "
                                    "unlock; this toggle has no bypass to disable.");
-        y += 30;
+        y = g.reqpw + 40;
     }
 
     // Privacy. These persist to /CONFIG/PRIVACY.CFG (real stored settings); the
@@ -3557,18 +4743,14 @@ static void draw_privacy_panel(void) {
     draw_subsection(x, y, "Privacy");
     y += 25;
 
-    draw_toggle_labeled(x, y, 300, "Location Services", location_services);
-    y += 10;
-    draw_hint(x, y + 20, "Preference only: no location provider exists in this build.");
-    y += 45;
+    draw_toggle_labeled(x, g.location, 300, "Location Services", location_services);
+    draw_hint(x, g.location + 30, "Preference only: no location provider exists in this build.");
 
-    draw_toggle_labeled(x, y, 300, "Send Diagnostics", diagnostics_enabled);
-    y += 10;
-    draw_hint(x, y + 20, "Preference only: no diagnostics are collected or transmitted.");
-    y += 45;
+    draw_toggle_labeled(x, g.diagnostics, 300, "Send Diagnostics", diagnostics_enabled);
+    draw_hint(x, g.diagnostics + 30, "Preference only: no diagnostics are collected or transmitted.");
 
-    draw_toggle_labeled(x, y, 300, "Send Crash Reports", crash_reports);
-    y += 45;
+    draw_toggle_labeled(x, g.crash, 300, "Send Crash Reports", crash_reports);
+    y = g.crash + 45;
 
     // App permissions: there is no per-app capability enforcement in this build,
     // so instead of a fabricated allow/deny matrix we state that honestly.
@@ -3578,16 +4760,48 @@ static void draw_privacy_panel(void) {
                  "Per-app permission enforcement is not implemented in this build.");
     y += 18;
     draw_hint(x, y, "All apps run with the user's full rights (capability tokens are planned).");
+    g_content_bottom_y = y + 20;   // (#227) hint line height
 }
 
 // =============================================================================
 // Panel: Storage
 // =============================================================================
 
+// (#227) ONE source of truth for the four Cache/Trash button rows, consumed
+// by BOTH draw_storage_panel() and the PANEL_STORAGE branch of
+// handle_content_click(). The handler used to derive `cache_base` from
+// `base_y + 40 + drive_count*80 + 40`, a re-guessed total that landed 17-20px
+// below where the buttons are actually drawn (`y - 3` relative to the label
+// row) - the three "Clear" buttons were live in only a ~7px band of their
+// 24px height, and "Empty Trash" had no overlap at all
+// (docs/SETTINGS_CONTROL_AUDIT.md #224). Each field IS the button's drawn
+// top-left y (the `-3` already applied), so the handler's hit rect can equal
+// the drawn rect exactly rather than re-deriving it.
+typedef struct {
+    int thumb_clear, app_clear, sys_clear, empty_trash;
+} storage_geom_t;
+static void storage_geom(storage_geom_t *g) {
+    int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
+    y += 40;                 /* section header */
+    y += 25;                 /* "Drives" subsection heading */
+    for (int i = 0; i < drive_count; i++) {
+        if (drives[i].name[0] == 0) continue;
+        y += 80;
+    }
+    y += 10;
+    y += 25;                 /* "Cache & Temporary Files" subsection heading */
+    g->thumb_clear = y - 3; y += 30;
+    g->app_clear   = y - 3; y += 30;
+    g->sys_clear   = y - 3; y += 40;
+    y += 25;                 /* "Trash" subsection heading */
+    g->empty_trash = y - 3;
+}
+
 static void draw_storage_panel(void) {
     int x = CONTENT_X + PADDING;
-    int y = PADDING;
+    int y = PADDING - g_content_scroll.offset;
     char buf[32];
+    storage_geom_t g; storage_geom(&g);
 
     draw_section_header(x, y, "Storage");
     y += 40;
@@ -3661,28 +4875,28 @@ static void draw_storage_panel(void) {
     char cache_str[32];
 
     format_size(cache_thumbnails, cache_str, sizeof(cache_str));
-    draw_label_value(x, y, "Thumbnails:", cache_str, 140);
-    draw_button_small(x + 280, y - 3, 60, "Clear", false);
-    y += 30;
+    draw_label_value(x, g.thumb_clear + 3, "Thumbnails:", cache_str, 140);
+    draw_button_small(x + 280, g.thumb_clear, 60, "Clear", false);
+    y = g.thumb_clear + 3 + 30;
 
     format_size(cache_apps, cache_str, sizeof(cache_str));
-    draw_label_value(x, y, "App Cache:", cache_str, 140);
-    draw_button_small(x + 280, y - 3, 60, "Clear", false);
-    y += 30;
+    draw_label_value(x, g.app_clear + 3, "App Cache:", cache_str, 140);
+    draw_button_small(x + 280, g.app_clear, 60, "Clear", false);
+    y = g.app_clear + 3 + 30;
 
     format_size(cache_system, cache_str, sizeof(cache_str));
-    draw_label_value(x, y, "System Cache:", cache_str, 140);
-    draw_button_small(x + 280, y - 3, 60, "Clear", false);
-    y += 40;
+    draw_label_value(x, g.sys_clear + 3, "System Cache:", cache_str, 140);
+    draw_button_small(x + 280, g.sys_clear, 60, "Clear", false);
+    y = g.sys_clear + 3 + 40;
 
     // Trash
     draw_subsection(x, y, "Trash");
     y += 25;
 
     format_size(trash_size, cache_str, sizeof(cache_str));
-    draw_label_value(x, y, "Trash Size:", cache_str, 140);
-    draw_button_small(x + 280, y - 3, 100, "Empty Trash", false);
-    y += 45;
+    draw_label_value(x, g.empty_trash + 3, "Trash Size:", cache_str, 140);
+    draw_button_small(x + 280, g.empty_trash, 100, "Empty Trash", false);
+    y = g.empty_trash + 3 + 45;
 
     // Total summary
     uint64_t total_all = 0, used_all = 0;
@@ -3701,6 +4915,7 @@ static void draw_storage_panel(void) {
     win_draw_text(window_handle, x + 140, y + 17, used_str, COL_TEXT_PRIMARY);
     win_draw_text(window_handle, x + 220, y + 17, "used of", COL_TEXT_DISABLED);
     win_draw_text(window_handle, x + 290, y + 17, total_str, COL_TEXT_PRIMARY);
+    g_content_bottom_y = y + 50;   // (#227) total-storage card height
 }
 
 // =============================================================================
@@ -3748,7 +4963,7 @@ static void defaults_refresh_cache(void) {
 }
 static void draw_defaults_panel(void) {
     int x = CONTENT_X + PADDING;
-    int y = PADDING;
+    int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
     draw_section_header(x, y, "Default Apps");
     y += 36;
     draw_hint(x, y, "Choose which app opens each file type (saved system-wide to /ASSOC.CFG).");
@@ -3768,6 +4983,7 @@ static void draw_defaults_panel(void) {
         }
         y += 40;
     }
+    g_content_bottom_y = y;   // (#227)
 }
 
 // About-tab logo: /MAYLOGO.DAT = u16 w, u16 h (LE), then w*h RGBA bytes
@@ -3963,7 +5179,7 @@ static int draw_about_logo(int dx, int dy_card_top, int card_h) {
 
 static void draw_notifications_panel(void) {
     int x = CONTENT_X + PADDING;
-    int y = PADDING;
+    int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
     char buf[40];
 
     draw_section_header(x, y, "Alerts"); y += 40;
@@ -3985,6 +5201,7 @@ static void draw_notifications_panel(void) {
     draw_hint_ic(x, y, alerts_dnd ? "CMINUS" : "INFO", COL_TEXT_SECONDARY,
                  alerts_dnd ? "Do Not Disturb: toasts hidden, still logged in the bell"
                             : "Toasts slide in top-right, stack, and auto-dismiss");
+    g_content_bottom_y = y + 20;   // (#227)
 }
 
 // (#: Start Menu uplift) Layout, Favorites/Recent visibility, search-focus,
@@ -3994,7 +5211,7 @@ static void draw_notifications_panel(void) {
 // many recents to keep, never the app.
 static void draw_startmenu_panel(void) {
     int x = CONTENT_X + PADDING;
-    int y = PADDING;
+    int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
     char buf[16];
 
     draw_section_header(x, y, "Start Menu"); y += 40;
@@ -4032,6 +5249,7 @@ static void draw_startmenu_panel(void) {
                  "Menu itself (right-click an item to Pin/Unpin) or from Settings > Dock. "
                  "Recent items track automatically as you launch apps. A Grid layout and "
                  "a custom menu screen position are not implemented yet.");
+    g_content_bottom_y = y + 40;   // (#227) multi-line hint
 }
 
 // =============================================================================
@@ -4048,16 +5266,23 @@ static void draw_startmenu_panel(void) {
 // favourites: view, add, remove).
 //
 // ONE WRITER FOR THE FAVOURITES LIST. startmenu.c (compositor) owns
-// /CONFIG/STARTMENU.CFG and is the ONLY thing that ever writes it
-// (sm_save_state()); the dock's own right-click Pin/Unpin (#44) and the
-// wizard's apps page both drive that SAME writer, one straight (same
-// process, direct call), one through a channel (FAVCH.CFG, #745 task #63/
-// P1). Settings is a SEPARATE PROCESS and cannot call sm_save_state()
+// <home>/CONFIG/STARTMENU.CFG (#236: per-user path, was root-owned
+// /CONFIG/STARTMENU.CFG - see startmenu.c's sm_save_state() for why that
+// never reached disk under a uid-1000 session) and is the ONLY thing that
+// ever writes it (sm_save_state()); the dock's own right-click Pin/Unpin
+// (#44) and the wizard's apps page both drive that SAME writer, one straight
+// (same process, direct call), one through a channel (FAVCH.CFG, #745 task
+// #63/P1). Settings is a SEPARATE PROCESS and cannot call sm_save_state()
 // directly, so this panel is a THIRD caller of the SAME FAVCH.CFG channel,
 // never a second writer of STARTMENU.CFG. Read side: this panel parses
 // STARTMENU.CFG's "FAV|<path>" lines directly (read-only) to display what
 // is actually pinned, the same file format sm_save_state() writes, never a
-// second on-disk copy of the list.
+// second on-disk copy of the list. #236: this read went through the SAME
+// userconf per-user resolution as the compositor's own reader, or this panel
+// would show "No apps are pinned" while the taskbar/Start menu correctly show
+// what is pinned - exactly the divergence #236 reported, because this used
+// to read the (permanently empty, for a uid-1000 session) root-owned path
+// while startmenu.c's in-memory list came from FAVCH.CFG live-apply.
 //
 // FAVCH.CFG WAS ADD-ONLY BEFORE THIS CHANGE (dockfav channel, startmenu.c
 // sm_load_favs_channel()): a line was "pin this path if not already
@@ -4098,7 +5323,11 @@ static void draw_startmenu_panel(void) {
 // gate (out of scope to add one for a single int here; if this ever drifts
 // the failure mode is cosmetic - a few pinned apps invisible in this list -
 // not a crash, unlike the PANEL_EXTSVC-class array-length bugs above).
-#define DOCKFAV_MAX 12
+// (#123 item 1) 12 -> 28, per the user's ask. MUST match the compositor's
+// startmenu.c MAX_FAVORITES / taskbar.c XFCE_MAX_FAVS: this app only writes a
+// pin CHANNEL (FAVCH.CFG), the compositor owns the list, so a larger number
+// here would let the user queue pins the compositor then silently drops.
+#define DOCKFAV_MAX 28
 
 // ---- Contents: catalog of pinnable apps, read from the *.MENU fragments ----
 #define DOCKFAV_CATALOG_MAX 80
@@ -4208,7 +5437,11 @@ static int  g_dockfav_cached = 0;
 
 static void dockfav_refresh_pinned(void) {
     g_dockfav_pinned_n = 0;
-    int fd = sys_open("/CONFIG/STARTMENU.CFG", 0);
+    // #236: per-user path first, legacy /CONFIG copy as a migration fallback -
+    // the SAME two-path read startmenu.c's sm_load_state()/
+    // sm_startmenu_cfg_exists() use, so this panel can never disagree with
+    // what the compositor actually has pinned.
+    int fd = userconf_open_read("STARTMENU.CFG", "/CONFIG/STARTMENU.CFG");
     if (fd >= 0) {
         static char buf[4096];
         long n = sys_read(fd, buf, sizeof(buf) - 1);
@@ -4357,27 +5590,73 @@ static void dockfav_add_dd_changed(void) {
 typedef struct {
     int style_y;      // Dock Style dropdown row
     int opacity_y;     // Dock Opacity slider row
+    int height_y;      // (#123) Dock Height slider row
+    int zoom_y;        // (#123) Hover Zoom slider row
     int contents_y;    // "Contents" subsection header
     int hint_y;        // hint line under the subsection header
     int row0_y;         // first pinned-item row
     int row_h;           // pinned-item row height
-    int add_y;            // "Add app" dropdown row (only meaningful if !full && has_candidates)
-    int full;               // dock is at DOCKFAV_MAX: no Add row
-    int has_candidates;      // catalog has at least one un-pinned app: only meaningful if !full
+    int col_w;            // (#123) width of ONE pinned-item column
+    int cols;              // (#123) number of pinned-item columns (1 or 2)
+    int rows;               // (#123) pinned rows actually used (ceil(n/cols))
+    int add_y;               // "Add app" dropdown row (only meaningful if !full && has_candidates)
+    int full;                 // dock is at DOCKFAV_MAX: no Add row
+    int has_candidates;        // catalog has at least one un-pinned app: only meaningful if !full
 } dock_layout_t;
+
+// (#123) Screen y of pinned item `i`, and its column x offset. ONE function,
+// so the draw loop and the Remove-button hit test cannot disagree about which
+// cell an item is in. Column-major (fill column 0 top-to-bottom, then column
+// 1) so the visual order still reads down the page like the old single list.
+static void dock_pin_cell(const dock_layout_t *L, int i, int *cx, int *cy) {
+    int col = (L->cols > 1) ? (i / L->rows) : 0;
+    int row = (L->cols > 1) ? (i % L->rows) : i;
+    if (cx) *cx = col * (L->col_w + 12);
+    if (cy) *cy = L->row0_y + row * L->row_h;
+}
 
 static dock_layout_t dock_panel_layout(void) {
     dock_layout_t L;
-    int y = PADDING + 40;   // after "Dock" section header (y += 40)
+    int y = PADDING + 40 - g_content_scroll.offset;   // (#227) content area now scrolls; after "Dock" section header (y += 40)
     y += 25;                 // after "Behaviour" subsection header (y += 25)
     L.style_y = y; y += 45;
     L.opacity_y = y; y += 45;
+    // (#123) The two new sliders sit at a 40px pitch rather than the 45 the
+    // rows above use. This is not cosmetic: the Settings content area does NOT
+    // scroll (content_scroll_y exists but max_scroll_y is never set to anything
+    // but 0, so the wheel handler clamps every scroll to zero - MEASURED, see
+    // the CHANGELOG entry), so everything this panel draws must fit inside
+    // WIN_HEIGHT or it is simply unreachable. Two extra 45px rows plus a
+    // 28-item pin list did not fit at 1280x800; 40px rows plus the two-column
+    // pin grid below do, with room to spare.
+    L.height_y = y; y += 40;
+    L.zoom_y = y; y += 40;
     y += 12;                  // breathing room before the next subsection
     L.contents_y = y; y += 25;
     L.hint_y = y; y += 24;
     L.row0_y = y;
-    L.row_h = 30;
-    y += g_dockfav_pinned_n * L.row_h;
+    L.row_h = 26;
+    // (#123 item 1) TWO COLUMNS once the list is long enough to need them. At
+    // the old 12-item cap a single 30px column was 360px and always fitted; at
+    // 28 it is 840px, which overflows the window on every supported display.
+    // The threshold is derived from the space actually left, not picked: fill
+    // one column until it would run past the Add row's own space, then split.
+    {
+        int avail = WIN_HEIGHT - L.row0_y - 60;      // leave room for the Add row
+        int per_col = avail / L.row_h;
+        if (per_col < 1) per_col = 1;
+        if (g_dockfav_pinned_n > per_col) {
+            L.cols = 2;
+            L.rows = (g_dockfav_pinned_n + 1) / 2;
+            if (L.rows > per_col) L.rows = per_col;   // still clipped only in the absurd case
+        } else {
+            L.cols = 1;
+            L.rows = g_dockfav_pinned_n;
+        }
+        L.col_w = (L.cols > 1) ? ((CONTENT_WIDTH - 2 * PADDING - 12) / 2)
+                               : (CONTENT_WIDTH - 2 * PADDING);
+    }
+    y += L.rows * L.row_h;
     y += 8;
     L.full = (g_dockfav_pinned_n >= DOCKFAV_MAX);
     L.has_candidates = (g_dockfav_cand_n > 0);
@@ -4392,10 +5671,10 @@ static void draw_dock_panel(void) {
     if (!g_dockfav_cached) dockfav_refresh_all();
     dock_layout_t L = dock_panel_layout();
 
-    draw_section_header(x, PADDING, "Dock");
+    draw_section_header(x, PADDING - g_content_scroll.offset, "Dock");
 
     // ---- Behaviour ----
-    draw_subsection(x, PADDING + 40, "Behaviour");
+    draw_subsection(x, PADDING + 40 - g_content_scroll.offset, "Behaviour");
 
     draw_label(x, L.style_y + 4, "Style");
     draw_dropdown_n(x + 120, L.style_y - 3, 220, DOCK_OPTS[DOCK_CLAMP(dock_style)],
@@ -4403,32 +5682,85 @@ static void draw_dock_panel(void) {
 
     draw_label(x, L.opacity_y + 4, "Opacity");
     {
-        if (dock_opacity < DOCK_OPACITY_FLOOR) dock_opacity = DOCK_OPACITY_FLOOR;
-        if (dock_opacity > 100) dock_opacity = 100;
+        if (dock_opacity < DOCK_OPACITY_MIN) dock_opacity = DOCK_OPACITY_MIN;
+        if (dock_opacity > DOCK_OPACITY_MAX) dock_opacity = DOCK_OPACITY_MAX;
         gui_itoa(dock_opacity, buf, sizeof(buf));
         int len = my_strlen(buf);
         buf[len++] = '%'; buf[len] = 0;
         draw_slider(x + 120, L.opacity_y, 170, dock_opacity, 100, COL_SLIDER_FILL);
-        // The 0..FLOOR span is DISALLOWED, drawn as a hatch (not merely
-        // clamped) so a user who drags into it can see why the knob stops.
+        // (#132) This used to be a DISALLOWED span the knob could not enter at
+        // all (the hatch WAS the clamp, drawn from 0 to the old hard floor).
+        // The owner's standing decision replaced the clamp with a warning: the
+        // knob can now go all the way down to DOCK_OPACITY_MIN, and this hatch
+        // is only a heads-up for the DOCK_OPACITY_WARN..MIN span where chrome
+        // text contrast is no longer guaranteed on every theme - it is drawn,
+        // not enforced, exactly so a user who wants a very transparent dock
+        // can still drag straight through it.
         {
-            int tx = x + 120, tw = 170 * DOCK_OPACITY_FLOOR / 100;
+            int tx = x + 120, tw = 170 * DOCK_OPACITY_WARN / 100;
             for (int i = 0; i < tw; i += 6) {
                 int seg = (tw - i) < 3 ? (tw - i) : 3;
-                win_draw_rect(window_handle, tx + i,     L.opacity_y + 5, seg, 6, 0x00BFC4CC);
+                win_draw_rect(window_handle, tx + i,     L.opacity_y + 5, seg, 6, 0x00E0B34D);
                 int seg2 = (tw - i - 3) < 3 ? (tw - i - 3) : 3;
                 if (seg2 > 0)
-                    win_draw_rect(window_handle, tx + i + 3, L.opacity_y + 5, seg2, 6, 0x00B2B7C0);
+                    win_draw_rect(window_handle, tx + i + 3, L.opacity_y + 5, seg2, 6, 0x00D4A63E);
             }
         }
         win_draw_text(window_handle, x + 300, L.opacity_y, buf, COL_TEXT_SECONDARY);
     }
     {
-        char hb[80];
-        snprintf(hb, sizeof(hb), "Below %d%% chrome labels stop meeting the contrast minimum.",
-                 DOCK_OPACITY_FLOOR);
+        char hb[96];
+        // (#132) Was "Below %d%% chrome labels stop meeting the contrast
+        // minimum" tied to the hard floor - it read as a rule, because it was
+        // one. Now it is a warning about a value the compositor WILL honour:
+        // wording says so explicitly, so a low setting does not look like a
+        // bug when the user goes looking for it (that is the exact complaint
+        // this ticket exists to fix).
+        snprintf(hb, sizeof(hb), "Below %d%%, chrome text contrast is not guaranteed on every theme (value is still applied).",
+                 DOCK_OPACITY_WARN);
         win_draw_text(window_handle, x + 120, L.opacity_y + 22, hb, COL_TEXT_SECONDARY);
     }
+
+    // ---- (#123 items 2/3) Marble dock geometry ----
+    // Both reuse this panel's EXISTING slider idiom (draw_slider + a value
+    // label at x+300), the same one the Opacity row above uses, rather than a
+    // new control. They only affect DOCK_MARBLE, so the panel says so instead
+    // of leaving a user wondering why the Default bar did not move.
+    draw_label(x, L.height_y + 4, "Max height");
+    {
+        if (dock_height < DOCK_HEIGHT_MIN) dock_height = DOCK_HEIGHT_MIN;
+        if (dock_height > DOCK_HEIGHT_MAX) dock_height = DOCK_HEIGHT_MAX;
+        gui_itoa(dock_height, buf, sizeof(buf));
+        int len = my_strlen(buf);
+        buf[len++] = 'p'; buf[len++] = 'x'; buf[len] = 0;
+        draw_slider(x + 120, L.height_y, 170, dock_height - DOCK_HEIGHT_MIN,
+                    DOCK_HEIGHT_MAX - DOCK_HEIGHT_MIN, COL_SLIDER_FILL);
+        win_draw_text(window_handle, x + 300, L.height_y, buf, COL_TEXT_SECONDARY);
+    }
+
+    draw_label(x, L.zoom_y + 4, "Hover zoom");
+    {
+        if (dock_zoom < DOCK_ZOOM_MIN) dock_zoom = DOCK_ZOOM_MIN;
+        if (dock_zoom > DOCK_ZOOM_MAX) dock_zoom = DOCK_ZOOM_MAX;
+        gui_itoa(dock_zoom, buf, sizeof(buf));
+        int len = my_strlen(buf);
+        buf[len++] = '%'; buf[len] = 0;
+        draw_slider(x + 120, L.zoom_y, 170, dock_zoom - DOCK_ZOOM_MIN,
+                    DOCK_ZOOM_MAX - DOCK_ZOOM_MIN, COL_SLIDER_FILL);
+        win_draw_text(window_handle, x + 300, L.zoom_y, buf, COL_TEXT_SECONDARY);
+    }
+    // (#123 auto-scale) The height control is a PREFERRED MAXIMUM, and the user
+    // has to be told, or an auto-scaled dock reads as the slider not working.
+    // The compositor shrinks below this value (never above it) when the pinned
+    // + running item count would make the pane wider than 75% of the screen,
+    // and returns to it when the count drops - see taskbar.c's contract comment
+    // on XFCE_DOCK_WIDTH_BUDGET_PCT.
+    win_draw_text(window_handle, x + 120, L.zoom_y + 20,
+                  "Marble dock only. Height is a maximum: the dock shrinks below it",
+                  COL_TEXT_SECONDARY);
+    win_draw_text(window_handle, x + 120, L.zoom_y + 34,
+                  "when the icons would span more than 75% of the screen.",
+                  COL_TEXT_SECONDARY);
 
     // ---- Contents ----
     draw_subsection(x, L.contents_y, "Contents");
@@ -4438,11 +5770,17 @@ static void draw_dock_panel(void) {
         draw_hint(x, L.hint_y, "Apps pinned to the dock. Drag-to-reorder is not supported yet.");
     }
 
-    for (int i = 0; i < g_dockfav_pinned_n; i++) {
-        int ry = L.row0_y + i * L.row_h;
-        draw_card(x, ry, CONTENT_WIDTH - 2 * PADDING, L.row_h - 4);
-        win_draw_text(window_handle, x + 12, ry + 8, dockfav_name_for_path(g_dockfav_pinned[i]), COL_TEXT_PRIMARY);
-        draw_button_small(x + CONTENT_WIDTH - 2 * PADDING - 82, ry + 1, 74, "Remove", false);
+    // (#123) Column-major grid via dock_pin_cell(), the one geometry function
+    // the click handler below also calls. An item past L.cols*L.rows would be
+    // off the bottom of the window (only reachable on an absurdly short
+    // display), so it is not drawn rather than drawn where it cannot be seen.
+    for (int i = 0; i < g_dockfav_pinned_n && i < L.cols * L.rows; i++) {
+        int cx0 = 0, ry = 0;
+        dock_pin_cell(&L, i, &cx0, &ry);
+        draw_card(x + cx0, ry, L.col_w, L.row_h - 4);
+        win_draw_text(window_handle, x + cx0 + 10, ry + 5,
+                      dockfav_name_for_path(g_dockfav_pinned[i]), COL_TEXT_PRIMARY);
+        draw_button_small(x + cx0 + L.col_w - 76, ry - 1, 70, "Remove", false);
     }
 
     if (L.full) {
@@ -4458,11 +5796,12 @@ static void draw_dock_panel(void) {
                          g_dockfav_dd_items[(g_dockfav_add_sel >= 0 && g_dockfav_add_sel <= g_dockfav_cand_n) ? g_dockfav_add_sel : 0],
                          g_dd_open && g_dd_sel == &g_dockfav_add_sel, g_dockfav_cand_n + 1);
     }
+    g_content_bottom_y = L.add_y + 30;   // (#227)
 }
 
 static void draw_about_panel(void) {
     int x = CONTENT_X + PADDING;
-    int y = PADDING;
+    int y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
 
     draw_section_header(x, y, "About MayteraOS");
     y += 40;
@@ -4605,10 +5944,20 @@ static void draw_about_panel(void) {
     draw_button(x + 145, y, 130, "Export Debug", false, false);
     draw_button(x + 290, y, 100, "Credits", false, false);
     y += 35;
+    // #230: about_status now has real states from an ACTUAL network check
+    // (check_for_updates()) instead of unconditionally printing "up to date"
+    // for a button that contacted nothing. 3=update found, 4=check failed -
+    // both drawn in a way that cannot be confused with a green "you're fine".
     if (about_status == 1)
-        draw_hint_ic(x, y, "CCHECK", theme_color(THEME_COLOR_SUCCESS), "System is up to date.");
+        draw_hint_ic(x, y, "CCHECK", theme_color(THEME_COLOR_SUCCESS), g_update_msg);
     else if (about_status == 2)
         draw_hint(x, y, "Debug info written to /DEBUG.TXT");
+    else if (about_status == 3)
+        draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_WARNING), g_update_msg);
+    else if (about_status == 4)
+        draw_hint_ic(x, y, "CMINUS", theme_color(THEME_COLOR_ERROR), g_update_msg);
+    else if (about_status == 5)
+        draw_hint(x, y, g_update_msg);
     y += 15;
 
     // Legal. (local 71) Three corrections here, all factual:
@@ -4629,6 +5978,7 @@ static void draw_about_panel(void) {
     y += 18;
     win_draw_text(window_handle, x, y,
                   "Includes TinyGL (C) 1997-2021 Fabrice Bellard, Gek (DMHSW), C-Chads", legal);
+    g_content_bottom_y = y + 20;   // (#227)
 }
 
 // =============================================================================
@@ -4706,7 +6056,10 @@ static void prt_fmt_hostport(const prt_cfg_t *p, char *out) {
 }
 
 // Row / button geometry (kept in sync with the click handler).
-#define DEV_ROW_Y0   (PADDING + 50)
+// (#227) content area now scrolls: DEV_ROW_Y0 is read by BOTH the draw pass
+// and the click handler, so applying the offset here keeps them in lockstep
+// exactly like every other shared geometry function in this file.
+#define DEV_ROW_Y0   (PADDING + 50 - g_content_scroll.offset)
 #define DEV_ROW_H    76
 #define DEV_CARD_H   66
 #define DEV_BTN_W    82
@@ -4715,7 +6068,7 @@ static void prt_fmt_hostport(const prt_cfg_t *p, char *out) {
 static void draw_devices_panel(void) {
     printers_seed_once();   // loads the list + seeds the Brother example on first view
     int x  = CONTENT_X + PADDING;
-    int y  = PADDING;
+    int y  = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
     int cw = CONTENT_WIDTH - 2 * PADDING;
 
     draw_section_header(x, y, "Printers & Devices");
@@ -4763,14 +6116,16 @@ static void draw_devices_panel(void) {
     draw_hint(x, y, "Brother HL-L3230CDW: text via CUPS 192.0.2.246/BrotherIPP;");
     y += 20;
     draw_hint(x, y, "direct image via 192.0.2.55 queue /ipp/print (port 631).");
+    g_content_bottom_y = y + 20;   // (#227)
 }
 
 // =============================================================================
-// Panel: Bluetooth (#372)
+// Panel: Bluetooth (#372, honesty pass #237)
 // UI codes against the bt_client.h contract, which mirrors the architect's
-// kernel bt_ctrl.h one-to-one. The backend is a mock until the SYS_BT_* stack
-// lands; swapping it in is a one-line change per function inside bt_client.h and
-// nothing in this panel changes.
+// kernel bt_ctrl.h one-to-one. The backend is an honest stub (no invented
+// devices, no simulated pairing) until the SYS_BT_* stack lands; swapping it
+// in is a one-line change per function inside bt_client.h and nothing in
+// this panel changes.
 // =============================================================================
 
 // Click regions recorded during the draw pass and consumed by the click
@@ -4896,7 +6251,12 @@ static void bt_draw_signal(int x, int y, int rssi) {
 #define BT_CARD_H   54
 #define BT_ROW_STEP 62
 
-static void bt_draw_device_card(int x, int y, int cw, int dev, int paired_section) {
+// (#237) Kept for #383 (the real Bluetooth driver): renders one paired/
+// available device row from REAL data once a driver exists to supply it.
+// Unreachable today - no driver means no devices are ever listed - which is
+// why this is marked unused rather than deleted: it is scaffolding, not
+// dead code left behind by accident.
+__attribute__((unused)) static void bt_draw_device_card(int x, int y, int cw, int dev, int paired_section) {
     bt_device_t *d = &g_bt_dev[dev];
     draw_card(x, y, cw, BT_CARD_H);
     bt_draw_dev_icon(x + 14, y + 16, d->cls, COL_TEXT_PRIMARY);
@@ -4942,7 +6302,7 @@ static void draw_bluetooth_panel(void) {
     bt_hit_reset();
     hwinfo_load();
     int x  = CONTENT_X + PADDING;
-    int y  = PADDING;
+    int y  = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
     int cw = CONTENT_WIDTH - 2 * PADDING;
     int on = bt_is_powered();
 
@@ -4963,87 +6323,61 @@ static void draw_bluetooth_panel(void) {
                               "This system has no Bluetooth radio, and MayteraOS has no Bluetooth stack.",
                               COL_TEXT_SECONDARY, 12);
         g_bt_ndev = 0;
+        g_content_bottom_y = y + ch;   // (#227)
         return;
     }
 
+    // (#237) A real adapter WAS found (g_bt_present, above), but MayteraOS has
+    // no Bluetooth driver/stack to run it - a genuinely different condition
+    // from "no adapter" (nothing to build on) and from a hypothetical "driver
+    // present, scanning" or "driver present, no devices found" (neither of
+    // which can occur: nothing here ever scans). `on` is always false in this
+    // build (bt_is_powered() is a stub), so every control below is drawn with
+    // the shared GUI_ST_DISABLED treatment via draw_toggle_inert()/
+    // draw_button_inert() and NO click hit is registered for any of them -
+    // inert by construction, not merely painted grey. This is the scaffolding
+    // #383's real driver fills in: same sections, same layout, zero invented
+    // data.
+    y += 44;
     int tgx = x + cw - 52, tgy = y - 2;
-    win_draw_text(window_handle, tgx - 34, y + 2, on ? "On" : "Off",
-                  on ? COL_SUCCESS : COL_TEXT_SECONDARY);
-    bt_hit_add(tgx, tgy, 48, 24, BTA_POWER, -1);
-    draw_toggle(tgx, tgy, on);
+    win_draw_text(window_handle, tgx - 34, y + 2, on ? "On" : "Off", COL_TEXT_SECONDARY);
+    draw_toggle_inert(tgx, tgy, on);
     y += 44;
 
-    if (!on) {
-        int ch = 120;
-        draw_card(x, y, cw, ch);
-        bt_draw_rune(x + cw / 2 - 14, y + 20, 28, COL_TEXT_DISABLED);
-        gui_text_ttf_centered(window_handle, x, y + 56, cw, 20,
-                              "Bluetooth is off", COL_TEXT_PRIMARY, 15);
-        gui_text_ttf_centered(window_handle, x, y + 82, cw, 16,
-                              "Turn on Bluetooth to connect keyboards, mice, headphones and more.",
-                              COL_TEXT_SECONDARY, 12);
-        g_bt_ndev = 0;
-        return;
-    }
-
-    // Adapter status card.
-    draw_card(x, y, cw, 48);
-    bt_draw_rune(x + 14, y + 12, 24, COL_ACCENT);
-    win_draw_text(window_handle, x + 48, y + 8, "MayteraOS Bluetooth", COL_TEXT_PRIMARY);
-    g_bt_ndev = bt_get_devices(g_bt_dev, BT_MAX_DEVICES);
     {
-        int nconn = 0;
-        for (int i = 0; i < g_bt_ndev; i++) if (g_bt_dev[i].connected) nconn++;
-        char sb[48]; int k = 0;
-        if (nconn > 0) {
-            for (const char *q = "Connected: "; *q; q++) sb[k++] = *q;
-            sb[k++] = (char)('0' + (nconn > 9 ? 9 : nconn));
-            for (const char *q = " device(s)"; *q; q++) sb[k++] = *q;
-        } else {
-            for (const char *q = "Ready"; *q; q++) sb[k++] = *q;
-        }
-        sb[k] = 0;
-        win_draw_text_small(window_handle, x + 48, y + 28, sb, COL_TEXT_SECONDARY);
+        int ch = 96;
+        draw_card(x, y, cw, ch);
+        bt_draw_rune(x + 14, y + 12, 24, COL_TEXT_DISABLED);
+        win_draw_text(window_handle, x + 48, y + 8, "Bluetooth adapter detected", COL_TEXT_PRIMARY);
+        win_draw_text_small(window_handle, x + 48, y + 28,
+                            "MayteraOS has no Bluetooth driver yet. Pairing and connecting",
+                            COL_TEXT_SECONDARY);
+        win_draw_text_small(window_handle, x + 48, y + 44,
+                            "are not available in this build.", COL_TEXT_SECONDARY);
+        // Real USB vendor:product id of the radio that tripped the presence
+        // probe (hwinfo_load(), captured once, never invented) - concrete
+        // scaffolding for whoever builds the real driver.
+        char idbuf[10]; hw_fmt_id(g_bt_vid, g_bt_pid, idbuf);
+        char idline[32] = "USB "; hw_append(idline, sizeof(idline), idbuf);
+        win_draw_text_small(window_handle, x + 48, y + 64, idline, COL_TEXT_DISABLED);
+        y += ch + 20;
     }
-    y += 60;
 
-    // Scan control row.
-    int scanning = bt_scan_active();
-    bt_hit_add(x, y, 160, 30, BTA_SCAN, -1);
-    draw_button(x, y, 160, scanning ? "Stop scanning" : "Scan for devices", !scanning, false);
-    if (scanning) {
-        bt_draw_spinner(x + 180, y + 15);
-        win_draw_text(window_handle, x + 200, y + 8, "Scanning for devices...", COL_TEXT_SECONDARY);
-    }
+    draw_button_inert(x, y, 160, "Scan for devices");
     y += 44;
 
-    // ---- Paired devices ----
     draw_subsection(x, y, "Paired Devices");
     y += 26;
-    int any_paired = 0;
-    for (int i = 0; i < g_bt_ndev; i++) {
-        if (!g_bt_dev[i].paired) continue;
-        bt_draw_device_card(x, y, cw, i, 1);
-        y += BT_ROW_STEP;
-        any_paired = 1;
-    }
-    if (!any_paired) { draw_hint(x, y, "No paired devices yet. Scan and pair a device below."); y += 26; }
-    y += 8;
+    draw_hint(x, y, "Not available: no Bluetooth driver is installed.");
+    y += 26 + 8;
 
-    // ---- Available devices ----
     draw_subsection(x, y, "Available Devices");
     y += 26;
-    int any_avail = 0;
-    for (int i = 0; i < g_bt_ndev; i++) {
-        if (g_bt_dev[i].paired) continue;
-        bt_draw_device_card(x, y, cw, i, 0);
-        y += BT_ROW_STEP;
-        any_avail = 1;
-    }
-    if (!any_avail) {
-        if (scanning) draw_hint_ic(x, y, "INFO", COL_ACCENT, "Searching for nearby devices...");
-        else          draw_hint(x, y, "Tap \"Scan for devices\" to discover nearby Bluetooth devices.");
-    }
+    draw_hint(x, y, "Not available: no Bluetooth driver is installed.");
+    y += 26;
+
+    g_bt_ndev = 0;
+    g_content_bottom_y = y + 20;   // (#227)
 }
 
 // Does the Bluetooth panel have a live animation (scan or pending op) worth a
@@ -5061,10 +6395,11 @@ static int bt_panel_animating(void) {
 }
 
 // =============================================================================
-// Panel: Wi-Fi (#384)
-// Wired network status shown here is REAL (get_net_info); the Wi-Fi scan/connect
-// is a mock behind wifi_client.h, so swapping in the real Wi-Fi driver later is
-// a one-line change per function. Same structure as the Bluetooth panel.
+// Panel: Wi-Fi (#384, honesty pass #237)
+// Wired network status shown elsewhere (Network tab) is REAL (get_net_info).
+// Wi-Fi scan/connect has no driver (#383 not built) and wifi_client.h is now
+// an honest stub, not a mock: every function returns a fixed "not available"
+// result instead of a fabricated one. Same structure as the Bluetooth panel.
 // =============================================================================
 enum { WFA_NONE = 0, WFA_POWER, WFA_SCAN, WFA_CONNECT, WFA_DISCONNECT, WFA_FORGET };
 typedef struct { int x, y, w, h, action, net; } wf_hit_t;
@@ -5127,7 +6462,12 @@ static int wf_net_pending(const wifi_network_t *w) {
 #define WF_CARD_H   52
 #define WF_ROW_STEP 60
 
-static void wf_draw_net_card(int x, int y, int cw, int idx, int saved_section) {
+// (#237) Kept for #383 (the real Wi-Fi driver): renders one available/saved
+// network row from REAL data once a driver exists to supply it. Unreachable
+// today - no driver means no networks are ever listed - which is why this is
+// marked unused rather than deleted: it is scaffolding, not dead code left
+// behind by accident.
+__attribute__((unused)) static void wf_draw_net_card(int x, int y, int cw, int idx, int saved_section) {
     wifi_network_t *w = &g_wf_net[idx];
     draw_card(x, y, cw, WF_CARD_H);
     wf_draw_signal(x + 14, y + 18, w->signal, COL_ACCENT);
@@ -5172,7 +6512,7 @@ static void draw_wifi_panel(void) {
     wf_hit_reset();
     hwinfo_load();
     int x  = CONTENT_X + PADDING;
-    int y  = PADDING;
+    int y  = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
     int cw = CONTENT_WIDTH - 2 * PADDING;
     int on = wifi_is_powered();
 
@@ -5190,84 +6530,65 @@ static void draw_wifi_panel(void) {
                               "This system has no wireless adapter. Use the Network tab for wired Ethernet.",
                               COL_TEXT_SECONDARY, 12);
         g_wf_nnet = 0;
+        g_content_bottom_y = y + 130;   // (#227)
         return;
     }
 
+    // (#237) A real adapter WAS found (g_wifi_present, above), but MayteraOS
+    // has no Wi-Fi driver to run it - a genuinely different condition from
+    // "no adapter" (nothing to build on) and from a hypothetical "driver
+    // present, scanning" or "driver present, no networks found" (neither of
+    // which can occur: nothing here ever scans). This is exactly the
+    // situation that made the old mock dangerous: the iMac's real wireless
+    // card opened the hardware gate, and a fabricated successful join
+    // rendered behind it with nothing to mark it as fake - see blame.md
+    // #230/#237. `on` is always false in this build (wifi_is_powered() is a
+    // stub), so every control below is drawn with the shared GUI_ST_DISABLED
+    // treatment via draw_toggle_inert()/draw_button_inert() and NO click hit
+    // is registered for any of them - inert by construction, not merely
+    // painted grey. This is the scaffolding #383's real driver fills in:
+    // same sections, same layout, zero invented data.
+    y += 44;
     int tgx = x + cw - 52, tgy = y - 2;
-    win_draw_text(window_handle, tgx - 34, y + 2, on ? "On" : "Off",
-                  on ? COL_SUCCESS : COL_TEXT_SECONDARY);
-    wf_hit_add(tgx, tgy, 48, 24, WFA_POWER, -1);
-    draw_toggle(tgx, tgy, on);
+    win_draw_text(window_handle, tgx - 34, y + 2, on ? "On" : "Off", COL_TEXT_SECONDARY);
+    draw_toggle_inert(tgx, tgy, on);
     y += 44;
 
-    if (!on) {
-        draw_card(x, y, cw, 120);
-        wf_draw_glyph(x + cw / 2 - 12, y + 22, 26, COL_TEXT_DISABLED);
-        gui_text_ttf_centered(window_handle, x, y + 58, cw, 20, "Wi-Fi is off", COL_TEXT_PRIMARY, 15);
-        gui_text_ttf_centered(window_handle, x, y + 84, cw, 16,
-                              "Turn on Wi-Fi to see and join available networks.",
-                              COL_TEXT_SECONDARY, 12);
-        g_wf_nnet = 0;
-        return;
+    {
+        int ch = 96;
+        draw_card(x, y, cw, ch);
+        wf_draw_glyph(x + 16, y + 12, 22, COL_TEXT_DISABLED);
+        win_draw_text(window_handle, x + 48, y + 8, "Wireless adapter detected", COL_TEXT_PRIMARY);
+        win_draw_text_small(window_handle, x + 48, y + 28,
+                            "MayteraOS has no Wi-Fi driver yet. Scanning and joining",
+                            COL_TEXT_SECONDARY);
+        win_draw_text_small(window_handle, x + 48, y + 44,
+                            "a network are not available in this build.", COL_TEXT_SECONDARY);
+        // Real vendor:device (PCI) or vendor:product (USB) id of the adapter
+        // that tripped the presence probe (hwinfo_load(), captured once,
+        // never invented) - concrete scaffolding for whoever builds #383.
+        char idbuf[10]; hw_fmt_id(g_wifi_vid, g_wifi_did, idbuf);
+        char idline[32]; copy_str(idline, g_wifi_is_usb ? "USB " : "PCI ", sizeof(idline));
+        hw_append(idline, sizeof(idline), idbuf);
+        win_draw_text_small(window_handle, x + 48, y + 64, idline, COL_TEXT_DISABLED);
+        y += ch + 20;
     }
 
-    // Status card: current SSID (mock) + REAL IP from the kernel if we have one.
-    draw_card(x, y, cw, 48);
-    wf_draw_glyph(x + 16, y + 14, 22, COL_ACCENT);
-    char cur[WIFI_SSID_MAX];
-    if (wifi_current(cur)) {
-        char line[64]; int k = 0;
-        for (const char *q = "Connected to "; *q; q++) line[k++] = *q;
-        for (int i = 0; cur[i] && k < 60; i++) line[k++] = cur[i];
-        line[k] = 0;
-        win_draw_text(window_handle, x + 48, y + 8, line, COL_TEXT_PRIMARY);
-        // Real network detail (IP) when the wired/kernel net is actually up.
-        net_info_t ni;
-        if (get_net_info(&ni, (long)sizeof(ni)) == 0 && ni.connected)
-            draw_label_value(x + 48, y + 28, "IP:", ni.ip, 28);
-        else
-            win_draw_text_small(window_handle, x + 48, y + 28, "Wi-Fi link (no kernel IP)", COL_TEXT_SECONDARY);
-    } else {
-        win_draw_text(window_handle, x + 48, y + 8, "Not connected", COL_TEXT_PRIMARY);
-        win_draw_text_small(window_handle, x + 48, y + 28, "Select a network below to join.", COL_TEXT_SECONDARY);
-    }
-    y += 60;
-
-    int scanning = wifi_scan_active();
-    wf_hit_add(x, y, 160, 30, WFA_SCAN, -1);
-    draw_button(x, y, 160, scanning ? "Stop scanning" : "Scan for networks", !scanning, false);
-    if (scanning) {
-        bt_draw_spinner(x + 180, y + 15);
-        win_draw_text(window_handle, x + 200, y + 8, "Scanning for networks...", COL_TEXT_SECONDARY);
-    }
+    draw_button_inert(x, y, 160, "Scan for networks");
     y += 44;
-
-    g_wf_nnet = wifi_get_networks(g_wf_net, WIFI_MAX_NETWORKS);
 
     draw_subsection(x, y, "Available Networks");
     y += 26;
-    int any_avail = 0;
-    for (int i = 0; i < g_wf_nnet; i++) {
-        if (g_wf_net[i].saved && !g_wf_net[i].connected) continue;   // saved go below
-        wf_draw_net_card(x, y, cw, i, 0);
-        y += WF_ROW_STEP; any_avail = 1;
-    }
-    if (!any_avail) {
-        if (scanning) draw_hint_ic(x, y, "INFO", COL_ACCENT, "Searching for nearby networks...");
-        else          draw_hint(x, y, "Tap \"Scan for networks\" to find nearby Wi-Fi networks.");
-        y += 26;
-    }
-    y += 8;
+    draw_hint(x, y, "Not available: no Wi-Fi driver is installed.");
+    y += 26 + 8;
 
     draw_subsection(x, y, "Saved Networks");
     y += 26;
-    int any_saved = 0;
-    for (int i = 0; i < g_wf_nnet; i++) {
-        if (!g_wf_net[i].saved || g_wf_net[i].connected) continue;
-        wf_draw_net_card(x, y, cw, i, 1);
-        y += WF_ROW_STEP; any_saved = 1;
-    }
-    if (!any_saved) draw_hint(x, y, "No saved networks. Networks you join are remembered here.");
+    draw_hint(x, y, "Not available: no Wi-Fi driver is installed.");
+    y += 26;
+
+    g_wf_nnet = 0;
+    g_content_bottom_y = y + 20;   // (#227)
 }
 
 static int wifi_panel_animating(void) {
@@ -5315,6 +6636,18 @@ static void draw_content(void) {
         case PANEL_STARTMENU:   draw_startmenu_panel(); break;
         case PANEL_DOCK:        draw_dock_panel(); break;
     }
+
+    // (#227) Compute the panel's true content height, independent of the
+    // scroll offset that was just baked into every y the panel drew at (the
+    // -g_content_scroll.offset term cancels: g_content_bottom_y was captured
+    // in the same shifted coordinate space, so adding the offset back gives
+    // the UNshifted height). gui_scroll_config() re-clamps the current offset
+    // against the new max, so a panel switch or a shrinking window can never
+    // strand the view past the new bottom.
+    int raw_h = g_content_bottom_y + g_content_scroll.offset - PADDING;
+    gui_scroll_config(&g_content_scroll, CONTENT_X, 0, CONTENT_WIDTH, CONTENT_HEIGHT,
+                      raw_h, 40 /* step: ~one control row */);
+    gui_scroll_draw_on(window_handle, &g_content_scroll, COL_CONTENT_BG);
 }
 
 // =============================================================================
@@ -5412,6 +6745,7 @@ static void draw_modal(void) {
     else if (modal_mode == MODAL_SET_DATETIME) title = "Set Date & Time";
     else if (modal_mode == MODAL_CREDITS)    title = "Credits";
     else if (modal_mode == MODAL_SET_NETWORK) title = "Network Configuration";
+    else if (modal_mode == MODAL_SET_DNS)     title = "DNS Server";
     else if (modal_mode == MODAL_ADD_PRINTER) title = "Add Printer";
     else if (modal_mode == MODAL_WIFI_PASSWORD) title = "Connect to Wi-Fi";
     else if (modal_mode == MODAL_AUTOLOGIN_PW) title = "Confirm Password";
@@ -5514,10 +6848,8 @@ static void draw_modal(void) {
         labels[1] = "Subnet Mask:";
         labels[2] = "Gateway:";
         labels[3] = "DNS Server:";
-    } else if (modal_mode == MODAL_ADD_FWRULE) {
-        labels[0] = "Port (e.g. 22):";
-        labels[1] = "Direction (in/out):";
-        labels[2] = "Action (allow/deny):";
+    } else if (modal_mode == MODAL_SET_DNS) {
+        labels[0] = "DNS Server:";
     } else if (modal_mode == MODAL_ADD_PRINTER) {
         labels[0] = "Name:";
         labels[1] = "Host / IP:";
@@ -5607,33 +6939,20 @@ static void draw_modal(void) {
 // Modal Submission
 // =============================================================================
 
-static void net_append_kv(char **pp, const char *key, const char *val) {
-    char *p = *pp;
-    while (*key) *p++ = *key++;
-    *p++ = '=';
-    while (*val) *p++ = *val++;
-    *p++ = '\n';
-    *pp = p;
-}
-
-// Persist the static network configuration to /CONFIG/NETIP.CFG in the exact
-// plain key=value format the kernel parses at boot (net_apply_static_config()
-// in kernel/net/net.c): "ip=...", "mask=...", "gw=...", "dns=..." (mask/gw/dns
-// optional). Written so a static assignment set in the GUI survives a reboot.
-// NOTE (honest caveat): net.c checks /NETCFG.TXT (FAT root) BEFORE this file, so
-// if a /NETCFG.TXT image override is present it still wins at boot.
-static void net_write_cfg(const char *ip, const char *mask,
-                          const char *gw, const char *dns) {
-    char buf[256]; char *p = buf;
-    if (ip   && ip[0])   net_append_kv(&p, "ip",   ip);
-    if (mask && mask[0]) net_append_kv(&p, "mask", mask);
-    if (gw   && gw[0])   net_append_kv(&p, "gw",   gw);
-    if (dns  && dns[0])  net_append_kv(&p, "dns",  dns);
-    // #743: was unlink-then-open. This one could leave a machine with NO static
-    // network configuration at all after a failed save.
-    if (userconf_write_all("/CONFIG/NETIP.CFG", buf, (unsigned long)(p - buf)) != 0)
-        save_failed("NETIP.CFG (static network config)");
-}
+// #786: net_append_kv() / net_write_cfg() DELETED.
+//
+// They formatted /CONFIG/NETIP.CFG and wrote it with userconf_write_all(). The
+// write was REFUSED for every non-root user - /CONFIG is root-owned mode 0711
+// in /CONFIG/PERMS.DB, so sys_open(O_CREAT) under it fails for uid != 0 - and
+// the save_failed() breadcrumb could not be written either, because
+// /SETLOG.TXT is under "/" (root, 0755). Measured on VM <vmid>: click OK, panel
+// updates, no file, no log, no clue.
+//
+// The kernel now writes that file itself (kernel/net/net.c net_persist_netcfg),
+// from inside the same syscalls that APPLY the configuration. That is not just
+// a permissions workaround: it makes "what is running" and "what boots" the
+// same object, and leaves exactly ONE writer of the file instead of two that
+// could format it differently. Do not add a second one back here.
 
 // (#566) See the forward declaration + settings_is_root()/autologin_refresh()
 // near the Users & Accounts globals. Root sets autologin for anyone with no
@@ -5676,7 +6995,12 @@ static void do_modal_submit(void) {
         return;
     }
     if (modal_mode == MODAL_WIFI_PASSWORD) {
-        // (#384) join the pending SSID with the entered key (mock accepts any).
+        // (#384, honesty pass #237) This modal can no longer be reached: no
+        // network row is ever drawn to click "Connect" on (draw_wifi_panel()
+        // shows only the inert scaffolding, #237), so wifi_connect() below is
+        // dead code kept for #383's real driver, not a live path. It now
+        // returns -1 unconditionally (wifi_client.h's honest stub) instead
+        // of the old mock's "accepts any password".
         if (modal_field[0][0] == '\0') { copy_str(modal_error, "Enter the network password", sizeof(modal_error)); return; }
         wifi_connect(g_wf_target, modal_field[0]);
         g_wf_pend_active = 1;
@@ -5791,23 +7115,6 @@ static void do_modal_submit(void) {
         return;
     }
 
-    if (modal_mode == MODAL_ADD_FWRULE) {
-        int port = 0; const char *ps = modal_field[0];
-        while (*ps == ' ') ps++;
-        while (*ps >= '0' && *ps <= '9') { port = port * 10 + (*ps - '0'); ps++; }
-        if (port <= 0 || port > 65535) {
-            const char *msg = "Enter a valid port (1-65535)";
-            int i = 0; while (msg[i] && i < 63) { modal_error[i] = msg[i]; i++; } modal_error[i] = '\0';
-            return;
-        }
-        int dir = (modal_field[1][0] == 'o' || modal_field[1][0] == 'O') ? 1 : 0;
-        int act = (modal_field[2][0] == 'd' || modal_field[2][0] == 'D') ? 1 : 0;
-        fw_add(dir, act, 0 /* TCP */, port);
-        fw_save();
-        modal_mode = MODAL_NONE;
-        draw_all();
-        return;
-    }
 
     if (modal_mode == MODAL_ADD_PRINTER) {
         // Name and Host are required; queue/port default sensibly.
@@ -5843,22 +7150,70 @@ static void do_modal_submit(void) {
         return;
     }
 
+    if (modal_mode == MODAL_SET_DNS) {
+        // (#786) Resolver only. Deliberately does NOT call net_set_static():
+        // the machine keeps its DHCP lease, and net_persist_netcfg() writes a
+        // dns-only /CONFIG/NETIP.CFG so the next boot still runs DHCP.
+        int rc = net_set_dns(modal_field[0]);
+        if (rc == NET_SET_DNS_EINVAL) {
+            const char *msg = "DNS server is not a valid IPv4 address.";
+            int i = 0; while (msg[i] && i < 63) { modal_error[i] = msg[i]; i++; }
+            modal_error[i] = '\0';
+            draw_all();
+            return;   // modal stays open: nothing was applied
+        }
+        // RE-READ the stack, never echo the form. If the kernel took a
+        // different value than was typed, the panel shows the kernel's.
+        net_pull_live();
+        if (rc == NET_SET_DNS_EPERSIST)
+            save_failed("NETIP.CFG (DNS applied live, will revert on reboot)");
+        modal_mode = MODAL_NONE;
+        draw_all();
+        return;
+    }
+
     if (modal_mode == MODAL_SET_NETWORK) {
-        // Live-apply ip/mask/gw to the running interface (kernel SYS_NET_SET_STATIC).
+        // =====================================================================
+        // #786: APPLY, then PERSIST, then RE-READ. All three, in that order.
+        // =====================================================================
+        // What this used to do, and why the owner was right to be suspicious:
+        //
+        //   1. net_set_static(ip, mask, gw)  - real, and it worked.
+        //   2. copy the TYPED TEXT of all FOUR fields into the panel variables.
+        //   3. net_write_cfg(...) - a Ring-3 write of /CONFIG/NETIP.CFG.
+        //
+        // Step 2 is the lie: it made the card at the top of the page agree with
+        // the form no matter what the machine did, and the DNS field had no
+        // apply path AT ALL (net_set_static takes three arguments). Step 3 was
+        // REFUSED for every non-root user, because /CONFIG is root-owned 0711 -
+        // measured on VM <vmid>: after a successful-looking OK the file did not
+        // exist, and the app's own /SETLOG.TXT breadcrumb could not be written
+        // either (it lives under "/", also root-owned), so the failure left no
+        // trace anywhere at all.
+        //
+        // Now: the kernel applies AND persists (net_persist_netcfg runs inside
+        // both syscalls, in Ring 0, where the permission question does not
+        // arise), and this app re-reads the LIVE stack. If what comes back
+        // disagrees with what was typed, the panel shows the disagreement.
         net_set_static(modal_field[0], modal_field[1], modal_field[2]);
-        // Adopt exactly what the user entered as the on-screen truth. The DNS
-        // server has no live-apply syscall yet (net_set_static takes only
-        // ip/mask/gw), so it is persisted below and applied by the kernel on the
-        // next boot via net_apply_static_config(); live DNS apply is a follow-up.
-        copy_str(ip_address,  modal_field[0], sizeof(ip_address));
-        copy_str(subnet_mask, modal_field[1], sizeof(subnet_mask));
-        copy_str(gateway,     modal_field[2], sizeof(gateway));
-        copy_str(dns_primary, modal_field[3], sizeof(dns_primary));
-        // Persist so the static config survives a reboot.
-        net_write_cfg(modal_field[0], modal_field[1], modal_field[2], modal_field[3]);
-        net_info_t ni;
-        if (get_net_info(&ni, (long)sizeof(ni)) == 0)
-            ethernet_connected = ni.connected;
+
+        int dns_rc = NET_SET_DNS_OK;
+        if (modal_field[3][0]) dns_rc = net_set_dns(modal_field[3]);
+
+        // RE-READ, never echo. This is the whole fix in one line.
+        net_pull_live();
+
+        // Report the two outcomes the user must not be left to discover.
+        if (dns_rc == NET_SET_DNS_EINVAL) {
+            const char *msg = "DNS server is not a valid IPv4 address.";
+            int i = 0; while (msg[i] && i < 63) { modal_error[i] = msg[i]; i++; }
+            modal_error[i] = '\0';
+            draw_all();
+            return;   // keep the modal open: nothing about DNS was applied
+        }
+        if (dns_rc == NET_SET_DNS_EPERSIST)
+            save_failed("NETIP.CFG (DNS applied live, will revert on reboot)");
+
         modal_mode = MODAL_NONE;
         draw_all();
         return;
@@ -5981,7 +7336,7 @@ static void handle_sidebar_click(int local_x, int local_y) {
         if (i >= 0) {
             if (current_panel != i) {
                 current_panel = i;
-                content_scroll_y = 0;
+                gui_scroll_set(&g_content_scroll, 0);
                 // (#262) Re-read the Default Apps state once on panel entry (picks
                 // up external /ASSOC.CFG changes) instead of per redraw frame.
                 if (i == PANEL_DEFAULTS) defaults_invalidate_cache();
@@ -5998,15 +7353,7 @@ static void handle_sidebar_click(int local_x, int local_y) {
                 if (i == PANEL_STORAGE) storage_scan();
                 // Populate live network data when switching to Network panel
                 if (i == PANEL_NETWORK) {
-                    net_info_t ni;
-                    if (get_net_info(&ni, (long)sizeof(ni)) == 0) {
-                        copy_str(ip_address,  ni.ip,      sizeof(ip_address));
-                        copy_str(gateway,     ni.gateway, sizeof(gateway));
-                        copy_str(subnet_mask, ni.netmask, sizeof(subnet_mask));
-                        copy_str(dns_primary, ni.dns,     sizeof(dns_primary));
-                        copy_str(mac_address, ni.mac,     sizeof(mac_address));
-                        ethernet_connected = ni.connected;
-                    }
+                    net_pull_live();   // #786: one definition, see above
                 }
                 draw_all();
             }
@@ -6031,6 +7378,12 @@ static void handle_sidebar_hover(int local_x, int local_y) {
 // has already written the new index into the bound variable before calling these).
 static void font_dd_changed(void)      { set_font_size(font_size); }
 static void icon_dd_changed(void)      { set_icon_size(icon_size); }
+// #745 (local 102): persists immediately (matches every other dropdown here -
+// e.g. font_dd_changed above), but this one does NOT take effect until the
+// next boot (kernel/proc/syscall.c SYS_SET_ROTATION comment explains why).
+// rotation_active is untouched, so draw_display_panel()'s "applies after
+// restart" hint keeps showing until the user actually reboots.
+static void rotation_dd_changed(void)  { set_display_rotation(rotation_idx); }
 // #387: publish the chosen dock layout via /DOCKSTYL.CFG; the compositor polls
 // the file and applies + persists it live (no restart).
 static void dock_dd_changed(void) {
@@ -6047,8 +7400,8 @@ static void dock_dd_changed(void) {
 // it live, then persists it into UIPROFIL.YML. Same userconf pair, so the #683
 // per-user path and its legacy-root read fallback both come along unchanged.
 static void dock_opacity_write(void) {
-    if (dock_opacity < DOCK_OPACITY_FLOOR) dock_opacity = DOCK_OPACITY_FLOOR;
-    if (dock_opacity > 100) dock_opacity = 100;
+    if (dock_opacity < DOCK_OPACITY_MIN) dock_opacity = DOCK_OPACITY_MIN;
+    if (dock_opacity > DOCK_OPACITY_MAX) dock_opacity = DOCK_OPACITY_MAX;
     int fd = userconf_open_write("DOCKOPAC.CFG");
     if (fd < 0) { save_failed("DOCKOPAC.CFG"); return; }
     char b[4];
@@ -6058,6 +7411,33 @@ static void dock_opacity_write(void) {
     // #743: the compositor POLLS this file and applies what it finds, so a
     // silently failed write leaves the dock disagreeing with the control.
     if (userconf_finish_write(fd, b, (unsigned long)n) != 0) save_failed("DOCKOPAC.CFG");
+}
+
+// (#123 items 2/3) Publish the marble dock's height and hover-zoom the same way
+// the opacity slider publishes its own value: an ASCII integer in a
+// per-user CFG that the compositor polls (main.c dock_geom_poll), applies live
+// and persists into UIPROFIL.YML. Deliberately NOT a second mechanism - same
+// userconf pair, so the #683 per-user path and its legacy-root read fallback
+// come along unchanged, and #743's "a silently failed write leaves the control
+// disagreeing with the dock" reporting comes along too.
+static void dock_num_write(const char *name, int v) {
+    int fd = userconf_open_write(name);
+    if (fd < 0) { save_failed(name); return; }
+    char b[8];
+    int n = 0;
+    if (v >= 100) { b[n++] = (char)('0' + v / 100); v %= 100; b[n++] = (char)('0' + v / 10); b[n++] = (char)('0' + v % 10); }
+    else          { b[n++] = (char)('0' + v / 10);  b[n++] = (char)('0' + v % 10); }
+    if (userconf_finish_write(fd, b, (unsigned long)n) != 0) save_failed(name);
+}
+static void dock_height_write(void) {
+    if (dock_height < DOCK_HEIGHT_MIN) dock_height = DOCK_HEIGHT_MIN;
+    if (dock_height > DOCK_HEIGHT_MAX) dock_height = DOCK_HEIGHT_MAX;
+    dock_num_write("DOCKHGT.CFG", dock_height);
+}
+static void dock_zoom_write(void) {
+    if (dock_zoom < DOCK_ZOOM_MIN) dock_zoom = DOCK_ZOOM_MIN;
+    if (dock_zoom > DOCK_ZOOM_MAX) dock_zoom = DOCK_ZOOM_MAX;
+    dock_num_write("DOCKZOOM.CFG", dock_zoom);
 }
 
 static int ss_delay_index(void) {
@@ -6175,14 +7555,17 @@ static void ext_test_connection(void){
     else { char m[64]; int mi=0; const char *c="Failed (HTTP "; for(int j=0;c[j];j++) m[mi++]=c[j]; char num[12]; ex_itoa(status,num); for(int j=0;num[j];j++) m[mi++]=num[j]; m[mi++]=')'; m[mi]=0; ex_set_status(m); }
 }
 
-// Field rectangles (kept in sync between draw and click).
+// Field rectangles (kept in sync between draw and click). (#227) content area
+// now scrolls: these already avoided PART A's class of drift by being a
+// shared function both draw and handler call, so applying the offset once
+// here keeps them scroll-consistent too.
 static void ext_field_rect(int idx,int *fx,int *fy,int *fw){
-    int x = CONTENT_X + PADDING, y = PADDING + 40;
+    int x = CONTENT_X + PADDING, y = PADDING + 40 - g_content_scroll.offset;
     *fx = x + 15; *fw = CONTENT_WIDTH - 2*PADDING - 30;
     *fy = y + 28 + idx*52;
 }
-static void ext_btn_test_rect(int *bx,int *by,int *bw){ int x=CONTENT_X+PADDING, y=PADDING+40; *bx=x+15; *by=y+28+3*52+6; *bw=150; }
-static void ext_btn_save_rect(int *bx,int *by,int *bw){ int x=CONTENT_X+PADDING, y=PADDING+40; *bx=x+175; *by=y+28+3*52+6; *bw=110; }
+static void ext_btn_test_rect(int *bx,int *by,int *bw){ int x=CONTENT_X+PADDING, y=PADDING+40-g_content_scroll.offset; *bx=x+15; *by=y+28+3*52+6; *bw=150; }
+static void ext_btn_save_rect(int *bx,int *by,int *bw){ int x=CONTENT_X+PADDING, y=PADDING+40-g_content_scroll.offset; *bx=x+175; *by=y+28+3*52+6; *bw=110; }
 
 // =============================================================================
 // #367 AI Provider (LLM) config - provider-agnostic. Persists /CONFIG/AISVC.CFG,
@@ -6302,7 +7685,7 @@ static void ai_test(void){
     else if(status>0){ char m[64]; int mi=0; const char *c="Provider error (HTTP "; for(int j=0;c[j];j++) m[mi++]=c[j]; char num[12]; ex_itoa(status,num); for(int j=0;num[j];j++) m[mi++]=num[j]; m[mi++]=')'; m[mi]=0; ai_set_status(m); }
     else                                  ai_set_status("No response - check endpoint/network");
 }
-static int  ai_card_y(void){ return PADDING + 40 + 246 + 14; }
+static int  ai_card_y(void){ return PADDING + 40 + 246 + 14 - g_content_scroll.offset; }   // (#227)
 static void ai_field_rect(int idx,int *fx,int *fy,int *fw){ int x=CONTENT_X+PADDING; *fx=x+15; *fw=CONTENT_WIDTH-2*PADDING-30; *fy=ai_card_y()+64+idx*46; }
 static void ai_preset_rect(int *bx,int *by,int *bw){ int x=CONTENT_X+PADDING; *bx=x+15;  *by=ai_card_y()+30; *bw=CONTENT_WIDTH-2*PADDING-30; }
 static void ai_btn_test_rect(int *bx,int *by,int *bw){ int x=CONTENT_X+PADDING; *bx=x+15;  *by=ai_card_y()+64+3*46+6; *bw=130; }
@@ -6310,7 +7693,7 @@ static void ai_btn_save_rect(int *bx,int *by,int *bw){ int x=CONTENT_X+PADDING; 
 
 static void draw_extsvc_panel(void){
     if(!g_ext_loaded) ext_load_cfg();
-    int x = CONTENT_X + PADDING, y = PADDING;
+    int x = CONTENT_X + PADDING, y = PADDING - g_content_scroll.offset;   // (#227) content area now scrolls
     draw_section_header(x, y, "External Services");
     y += 40;
     draw_card(x, y, CONTENT_WIDTH - 2*PADDING, 246);
@@ -6369,7 +7752,9 @@ static void draw_extsvc_panel(void){
     }
     { int abx,aby,abw; ai_btn_test_rect(&abx,&aby,&abw); draw_button(abx,aby,abw,"Test",true,false);
       ai_btn_save_rect(&abx,&aby,&abw); draw_button(abx,aby,abw,"Save",false,false);
-      if(g_ai_status[0]) win_draw_text(window_handle, x+15, aby+42, g_ai_status, COL_TEXT_SECONDARY); }
+      if(g_ai_status[0]) win_draw_text(window_handle, x+15, aby+42, g_ai_status, COL_TEXT_SECONDARY);
+      g_content_bottom_y = aby + 60;   // (#227)
+    }
 }
 
 // Panel key handler: types into the focused field. Returns 1 if consumed.
@@ -6400,7 +7785,12 @@ static int ext_key(int ch,int keycode){
 
 static void handle_content_click(int local_x, int local_y) {
     int x = CONTENT_X + PADDING;
-    int base_y = PADDING;
+    // (#227) ONE line applies the current scroll offset to every hit test in
+    // this function uniformly, converted or not: base_y always matches the
+    // y-origin every draw_X_panel() now draws from (PADDING -
+    // g_content_scroll.offset), so scrolling the content area can never by
+    // itself desynchronize a hit box from what is on screen.
+    int base_y = PADDING - g_content_scroll.offset;
 
     switch (current_panel) {
         case PANEL_EXTSVC: {
@@ -6627,20 +8017,50 @@ static void handle_content_click(int local_x, int local_y) {
             if (local_y >= L.opacity_y - 4 && local_y < L.opacity_y + 18 &&
                 local_x >= x + 120 && local_x < x + 120 + 170) {
                 int pct = ((local_x - (x + 120)) * 100) / 170;
-                if (pct < DOCK_OPACITY_FLOOR) pct = DOCK_OPACITY_FLOOR;
-                if (pct > 100) pct = 100;
+                if (pct < DOCK_OPACITY_MIN) pct = DOCK_OPACITY_MIN;
+                if (pct > DOCK_OPACITY_MAX) pct = DOCK_OPACITY_MAX;
                 pct = ((pct + 2) / 5) * 5;    // snap to 5 on release
-                if (pct < DOCK_OPACITY_FLOOR) pct = DOCK_OPACITY_FLOOR;
-                if (pct > 100) pct = 100;
+                if (pct < DOCK_OPACITY_MIN) pct = DOCK_OPACITY_MIN;
+                if (pct > DOCK_OPACITY_MAX) pct = DOCK_OPACITY_MAX;
                 dock_opacity = pct;
                 dock_opacity_write();
                 draw_all();
                 return;
             }
 
-            for (int i = 0; i < g_dockfav_pinned_n; i++) {
-                int ry = L.row0_y + i * L.row_h;
-                int bx = x + CONTENT_WIDTH - 2 * PADDING - 82, by = ry + 1, bw = 74;
+            if (local_y >= L.height_y - 4 && local_y < L.height_y + 18 &&
+                local_x >= x + 120 && local_x < x + 120 + 170) {
+                int span = DOCK_HEIGHT_MAX - DOCK_HEIGHT_MIN;
+                int v = ((local_x - (x + 120)) * span) / 170 + DOCK_HEIGHT_MIN;
+                if (v < DOCK_HEIGHT_MIN) v = DOCK_HEIGHT_MIN;
+                if (v > DOCK_HEIGHT_MAX) v = DOCK_HEIGHT_MAX;
+                dock_height = v;
+                dock_height_write();
+                draw_all();
+                return;
+            }
+
+            if (local_y >= L.zoom_y - 4 && local_y < L.zoom_y + 18 &&
+                local_x >= x + 120 && local_x < x + 120 + 170) {
+                int span = DOCK_ZOOM_MAX - DOCK_ZOOM_MIN;
+                int v = ((local_x - (x + 120)) * span) / 170 + DOCK_ZOOM_MIN;
+                v = ((v + 2) / 5) * 5;    // snap to 5%, same idiom as Opacity
+                if (v < DOCK_ZOOM_MIN) v = DOCK_ZOOM_MIN;
+                if (v > DOCK_ZOOM_MAX) v = DOCK_ZOOM_MAX;
+                dock_zoom = v;
+                dock_zoom_write();
+                draw_all();
+                return;
+            }
+
+            // (#123) Remove buttons, addressed through the SAME dock_pin_cell()
+            // the draw loop uses. The old chain recomputed `ry` and the button x
+            // independently; with a two-column grid that second chain is exactly
+            // the hit-box drift this panel's own header comment warns about.
+            for (int i = 0; i < g_dockfav_pinned_n && i < L.cols * L.rows; i++) {
+                int cx0 = 0, ry = 0;
+                dock_pin_cell(&L, i, &cx0, &ry);
+                int bx = x + cx0 + L.col_w - 76, by = ry - 1, bw = 70;
                 if (local_x >= bx && local_x < bx + bw && local_y >= by && local_y < by + 24) {
                     dockfav_remove(g_dockfav_pinned[i]);
                     draw_all(); return;
@@ -6742,7 +8162,7 @@ static void handle_content_click(int local_x, int local_y) {
             // Wallpaper dropdown (right column, mirrors the other
             // setting dropdowns above rather than a per-cell thumbnail grid).
             {
-                int wp_dy = WP_DD_Y + 25;
+                int wp_dy = WP_DD_Y - g_content_scroll.offset + 25;   // (#227) scroll-aware
                 if (local_y >= wp_dy && local_y < wp_dy + 28 &&
                     local_x >= WP_DD_X && local_x < WP_DD_X + WP_DD_W) {
                     wp_names_init();
@@ -6771,8 +8191,46 @@ static void handle_content_click(int local_x, int local_y) {
         }
 
         case PANEL_DISPLAY: {
-            // Brightness slider
-            int bright_y = base_y + 130;
+            // Rotation dropdown (#745 local 102). y matches draw_display_
+            // panel()'s cumulative offset at the "Rotation" subsection: 40
+            // (header) + 25 (Resolution subsection) + 30 (res/depth row) + 16
+            // + 24 (two hint lines) + 25 (Rotation subsection) - 3 (the
+            // draw_dropdown_n y-3 convention every other dropdown here uses)
+            // = 157.
+            // EVERY offset here now comes from display_layout(), the same
+            // function draw_display_panel() draws from. The hand-added
+            // constants that used to live here had drifted 50px out of step
+            // with the drawing (see the comment on display_layout()).
+            display_layout_t L = display_layout();
+            int rot_y = base_y + L.rotation_dd;
+            if (local_y >= rot_y && local_y < rot_y + 28 &&
+                local_x >= x + 120 && local_x < x + 120 + 160) {
+                dropdown_open(x + 120, rot_y, 160, ROTATION_OPTS, ROTATION_OPTS_COUNT,
+                              &rotation_idx, rotation_dd_changed);
+                draw_all(); return;
+            }
+
+            // UI scale dropdown.
+            int uis_y = base_y + L.uiscale_dd;
+            if (local_y >= uis_y && local_y < uis_y + 28 &&
+                local_x >= x + 120 && local_x < x + 120 + 160) {
+                uiscale_opts_build();
+                dropdown_open(x + 120, uis_y, 160, g_uiscale_opts, g_uiscale_count,
+                              &g_uiscale_idx, uiscale_dd_changed);
+                draw_all(); return;
+            }
+
+            // Brightness slider. #745 (local 102): recomputed from
+            // draw_display_panel()'s actual cumulative y (40+25+30+16+24+25
+            // (new Rotation subsection)+34+30+50+25 = 299) - the OLD "+130"
+            // predates this ticket and was already stale before the Rotation
+            // section was added (traced against draw_display_panel() as it
+            // stood pre-#102: true position was +210, not +130 - Scale/hint
+            // content had grown past it and nobody had re-measured). night
+            // light toggle/strength below are computed RELATIVE to bright_y
+            // (+70, +35) and those relative offsets were already correct, so
+            // fixing this one constant fixes the whole PANEL_DISPLAY chain.
+            int bright_y = base_y + L.brightness;
             if (local_y >= bright_y && local_y < bright_y + 16 &&
                 local_x >= x && local_x < x + 350) {
                 brightness = ((local_x - x) * 100) / 350;
@@ -6783,7 +8241,7 @@ static void handle_content_click(int local_x, int local_y) {
             }
 
             // Night light toggle
-            int nl_y = bright_y + 70;
+            int nl_y = base_y + L.nightlight;
             if (local_y >= nl_y && local_y < nl_y + 24 &&
                 local_x >= x + 300 && local_x < x + 348) {
                 night_light = !night_light;
@@ -6793,7 +8251,7 @@ static void handle_content_click(int local_x, int local_y) {
 
             // Night light strength slider (only when enabled)
             if (night_light) {
-                int nls_y = nl_y + 35;
+                int nls_y = base_y + L.nl_strength;
                 if (local_y >= nls_y && local_y < nls_y + 16 &&
                     local_x >= x + 120 && local_x < x + 320) {
                     night_light_strength = ((local_x - x - 120) * 100) / 200;
@@ -6853,148 +8311,99 @@ static void handle_content_click(int local_x, int local_y) {
         }
 
         case PANEL_NETWORK: {
+            // (#227/#223) network_geom() WALKS the same conditional
+            // draw_network_panel() walks (whether "Configure IP..." is drawn
+            // between DHCP and Firewall), rather than re-deriving a fixed
+            // offset by hand. This replaces the previous instance fix - a
+            // ternary that mirrored the 36px cost of that button but could
+            // not survive a future row being inserted between DHCP and
+            // Firewall without silently going stale again the same way.
+            network_geom_t g; network_geom(&g);
+
             // DHCP toggle
-            int dhcp_y = base_y + 165;
-            if (local_y >= dhcp_y && local_y < dhcp_y + 24 &&
+            if (local_y >= g.dhcp && local_y < g.dhcp + 24 &&
                 local_x >= x + 300 && local_x < x + 348) {
                 dhcp_enabled = !dhcp_enabled;
                 if (dhcp_enabled) {
-                    net_dhcp();   // acquire a lease
-                    net_info_t ni;
-                    if (get_net_info(&ni, (long)sizeof(ni)) == 0) {
-                        copy_str(ip_address,  ni.ip,      sizeof(ip_address));
-                        copy_str(gateway,     ni.gateway, sizeof(gateway));
-                        copy_str(subnet_mask, ni.netmask, sizeof(subnet_mask));
-                        copy_str(dns_primary, ni.dns,     sizeof(dns_primary));
-                        ethernet_connected = ni.connected;
-                    }
+                    net_dhcp();        // acquire a lease
+                    net_pull_live();   // #786
                 }
                 draw_all();
                 return;
             }
 
-            // Configure IP button (only shown when DHCP is off)
-            if (!dhcp_enabled) {
-                int cfg_y = dhcp_y + 40;
-                if (local_y >= cfg_y && local_y < cfg_y + 28 &&
-                    local_x >= x + 20 && local_x < x + 180) {
-                    modal_mode = MODAL_SET_NETWORK;
-                    modal_num_fields = 4;
-                    copy_to_modal_field(0, ip_address);
-                    copy_to_modal_field(1, subnet_mask);
-                    copy_to_modal_field(2, gateway);
-                    copy_to_modal_field(3, dns_primary);
-                    modal_active_field = 0;
-                    modal_error[0] = '\0';
-                    draw_all();
-                    return;
-                }
+            // (#786) "Set DNS..." - present only when DHCP is ON, in the same
+            // row "Configure IP..." occupies when it is off.
+            if (g.dnsbtn >= 0 &&
+                local_y >= g.dnsbtn && local_y < g.dnsbtn + 28 &&
+                local_x >= x + 20 && local_x < x + 180) {
+                modal_mode = MODAL_SET_DNS;
+                modal_num_fields = 1;
+                copy_to_modal_field(0, dns_primary);
+                modal_active_field = 0;
+                modal_error[0] = '\0';
+                draw_all();
+                return;
+            }
+
+            // Configure IP button (only present when DHCP is off; g.cfgip is
+            // -1 otherwise, matching mouse_geom()'s traillen convention)
+            if (g.cfgip >= 0 &&
+                local_y >= g.cfgip && local_y < g.cfgip + 28 &&
+                local_x >= x + 20 && local_x < x + 180) {
+                modal_mode = MODAL_SET_NETWORK;
+                modal_num_fields = 4;
+                copy_to_modal_field(0, ip_address);
+                copy_to_modal_field(1, subnet_mask);
+                copy_to_modal_field(2, gateway);
+                copy_to_modal_field(3, dns_primary);
+                modal_active_field = 0;
+                modal_error[0] = '\0';
+                draw_all();
+                return;
             }
 
             // VPN is now an honest "not available" note (no toggle).
 
-            // Firewall toggle. VPN block is a fixed 55px (subsection + hint), so
-            // the firewall row sits 120px below the DHCP toggle.
-            int fw_y = dhcp_y + 120;
-            if (local_y >= fw_y && local_y < fw_y + 24 &&
+            // Firewall (#238). Each of the three now calls fw_push(), which
+            // installs the policy in the kernel, persists it, and re-reads
+            // what actually took effect before the panel is redrawn. A click
+            // that the kernel refuses therefore leaves the toggle showing the
+            // policy that is running, not the one that was asked for.
+            if (local_y >= g.fw && local_y < g.fw + 24 &&
                 local_x >= x + 300 && local_x < x + 348) {
                 firewall_enabled = !firewall_enabled;
+                fw_push();
+                draw_all();
+                return;
+            }
+            if (local_y >= g.pol_in && local_y < g.pol_in + 24 &&
+                local_x >= x + 300 && local_x < x + 348) {
+                fw_pol_in = (fw_pol_in == FW_ACT_DENY) ? FW_ACT_ALLOW : FW_ACT_DENY;
+                fw_push();
+                draw_all();
+                return;
+            }
+            if (local_y >= g.pol_out && local_y < g.pol_out + 24 &&
+                local_x >= x + 300 && local_x < x + 348) {
+                fw_pol_out = (fw_pol_out == FW_ACT_DENY) ? FW_ACT_ALLOW : FW_ACT_DENY;
+                fw_push();
                 draw_all();
                 return;
             }
 
-            // Firewall rules (iptables-style) when enabled
-            if (firewall_enabled) {
-                int fc = fw_y + 35;
-                if (local_y >= fc && local_y < fc + 28) {            // default inbound
-                    for (int i = 0; i < 2; i++)
-                        if (local_x >= x + 170 + i*90 && local_x < x + 170 + i*90 + 82) {
-                            fw_pol_in = i; fw_save(); draw_all(); return;
-                        }
-                }
-                if (local_y >= fc + 34 && local_y < fc + 34 + 28) {  // default outbound
-                    for (int i = 0; i < 2; i++)
-                        if (local_x >= x + 170 + i*90 && local_x < x + 170 + i*90 + 82) {
-                            fw_pol_out = i; fw_save(); draw_all(); return;
-                        }
-                }
-                int rules_y = fc + 90;
-                for (int i = 0; i < fw_rule_count; i++) {
-                    int ry = rules_y + i * 26;
-                    if (local_y >= ry && local_y < ry + 20) {
-                        if (local_x >= x + 20  && local_x < x + 76)  { fw_rules[i].action ^= 1; fw_save(); draw_all(); return; }
-                        if (local_x >= x + 84  && local_x < x + 128) { fw_rules[i].dir    ^= 1; fw_save(); draw_all(); return; }
-                        if (local_x >= x + 136 && local_x < x + 180) { fw_rules[i].proto  ^= 1; fw_save(); draw_all(); return; }
-                        if (local_x >= x + 260 && local_x < x + 284) {
-                            for (int k = i; k < fw_rule_count - 1; k++) fw_rules[k] = fw_rules[k+1];
-                            fw_rule_count--; fw_save(); draw_all(); return;
-                        }
-                    }
-                }
-                if (fw_rule_count < MAX_FW_RULES) {
-                    int add_y = rules_y + fw_rule_count * 26;
-                    if (local_y >= add_y && local_y < add_y + 24 &&
-                        local_x >= x + 20 && local_x < x + 140) {
-                        modal_mode = MODAL_ADD_FWRULE;
-                        modal_num_fields = 3;
-                        copy_to_modal_field(0, "");
-                        copy_to_modal_field(1, "in");
-                        copy_to_modal_field(2, "allow");
-                        modal_active_field = 0;
-                        modal_error[0] = '\0';
-                        draw_all();
-                        return;
-                    }
-                }
-            }
+            // The per-rule editor is still not drawn here (see
+            // draw_network_panel): rules are edited through the contract API,
+            // and the panel says so. A hit-test for a control that is not
+            // drawn is exactly what #223 removed and it is not coming back.
             break;
         }
 
 
-        case PANEL_KEYBOARD: {
-            // Repeat rate slider
-            int rate_y = base_y + 130;
-            if (local_y >= rate_y && local_y < rate_y + 16 &&
-                local_x >= x + 140 && local_x < x + 340) {
-                key_repeat_rate = ((local_x - x - 140) * 50) / 200;
-                if (key_repeat_rate < 1) key_repeat_rate = 1;
-                if (key_repeat_rate > 50) key_repeat_rate = 50;
-                draw_all();
-                return;
-            }
-
-            // Repeat delay slider
-            int delay_y = rate_y + 35;
-            if (local_y >= delay_y && local_y < delay_y + 16 &&
-                local_x >= x + 140 && local_x < x + 340) {
-                key_repeat_delay = ((local_x - x - 140) * 500) / 200;
-                if (key_repeat_delay < 50) key_repeat_delay = 50;
-                if (key_repeat_delay > 500) key_repeat_delay = 500;
-                draw_all();
-                return;
-            }
-
-            // Lock key checkboxes
-            int lock_y = delay_y + 75;
-            if (local_y >= lock_y && local_y < lock_y + 18) {
-                if (local_x >= x && local_x < x + 100) {
-                    num_lock = !num_lock;
-                    draw_all();
-                    return;
-                }
-                if (local_x >= x + 150 && local_x < x + 280) {
-                    caps_lock = !caps_lock;
-                    draw_all();
-                    return;
-                }
-                if (local_x >= x + 300 && local_x < x + 440) {
-                    scroll_lock = !scroll_lock;
-                    draw_all();
-                    return;
-                }
-            }
+        case PANEL_KEYBOARD:
+            // #230: no interactive rows left in this panel - see the comment
+            // above draw_keyboard_panel(). Nothing to hit-test.
             break;
-        }
 
         case PANEL_MOUSE: {
             // #745: every hit box below comes from the SAME mouse_geom() the
@@ -7012,7 +8421,15 @@ static void handle_content_click(int local_x, int local_y) {
                 return;
             }
 
-            // Double-click speed slider
+            // Double-click speed slider. #230: now a REAL setting - the
+            // compositor's double-click detector reads this back via
+            // settingscfg_dblclick_ms() (libc/settingscfg.c) instead of a
+            // hardcoded 500ms constant, once settings_autosave() (called
+            // every main-loop iteration, same as every other slider here)
+            // notices the value changed and writes it. No explicit save call
+            // here - adding one would double-write on every drag frame,
+            // since settings_autosave() has its own independent change-hash
+            // and would not know a direct settings_save() call already ran.
             if (local_y >= m.dbl && local_y < m.dbl + 16 &&
                 local_x >= x + 160 && local_x < x + 390) {
                 double_click_speed = ((local_x - x - 160) * 100) / 230;
@@ -7020,24 +8437,6 @@ static void handle_content_click(int local_x, int local_y) {
                 if (double_click_speed > 100) double_click_speed = 100;
                 draw_all();
                 return;
-            }
-
-            // Pointer trails toggle
-            if (local_y >= m.trails && local_y < m.trails + 24 &&
-                local_x >= x + 300 && local_x < x + 348) {
-                pointer_trails = !pointer_trails;
-                draw_all();
-                return;
-            }
-
-            // Trail length slider (only present when pointer_trails is on)
-            if (m.traillen >= 0 &&
-                local_y >= m.traillen && local_y < m.traillen + 16 &&
-                local_x >= x + 140 && local_x < x + 290) {
-                pointer_trail_length = ((local_x - x - 140) * 10) / 150;
-                if (pointer_trail_length < 1) pointer_trail_length = 1;
-                if (pointer_trail_length > 10) pointer_trail_length = 10;
-                draw_all(); return;
             }
 
             // Cursor style dropdown (#745: moved here from Appearance).
@@ -7049,45 +8448,21 @@ static void handle_content_click(int local_x, int local_y) {
                 draw_all(); return;
             }
 
-            // Scroll speed slider
-            if (local_y >= m.scrollspd && local_y < m.scrollspd + 16 &&
-                local_x >= x + 140 && local_x < x + 340) {
-                scroll_speed = ((local_x - x - 140) * 100) / 200;
-                if (scroll_speed < 0) scroll_speed = 0;
-                if (scroll_speed > 100) scroll_speed = 100;
-                draw_all(); return;
-            }
-
-            // Natural scrolling toggle
-            if (local_y >= m.natural && local_y < m.natural + 24 &&
-                local_x >= x + 300 && local_x < x + 348) {
-                natural_scrolling = !natural_scrolling;
-                draw_all();
-                return;
-            }
-
-            // Scroll inertia toggle
-            if (local_y >= m.inertia && local_y < m.inertia + 24 &&
-                local_x >= x + 300 && local_x < x + 348) {
-                scroll_inertia = !scroll_inertia;
-                draw_all();
-                return;
-            }
-
-            // Left-handed toggle
-            if (local_y >= m.lefthand && local_y < m.lefthand + 24 &&
-                local_x >= x + 300 && local_x < x + 348) {
-                left_handed = !left_handed;
-                draw_all();
-                return;
-            }
+            // #230: Pointer Size, Pointer Trails/Trail Length, Scroll Speed,
+            // Natural Scrolling, Scroll Inertia and Left-handed Mode removed -
+            // see the comment above mouse_geom(). Nothing to hit-test.
             break;
         }
 
         case PANEL_DATETIME: {
+            // (#227) every hit box below comes from the SAME datetime_geom()
+            // the draw pass uses, so a control and its hit box cannot drift
+            // apart again. This replaces an independent `base_y + <literal>`
+            // chain that had drifted 50px starting at Date Format.
+            datetime_geom_t g; datetime_geom(&g);
+
             // Auto time toggle (with NTP sync on enable)
-            int auto_y = base_y + 155;
-            if (local_y >= auto_y && local_y < auto_y + 24 &&
+            if (local_y >= g.auto_time && local_y < g.auto_time + 24 &&
                 local_x >= x + 300 && local_x < x + 348) {
                 auto_time = !auto_time;
                 if (auto_time) {
@@ -7098,9 +8473,12 @@ static void handle_content_click(int local_x, int local_y) {
                 return;
             }
 
-            // 24-hour toggle
-            int fmt_y = auto_y + 60;
-            if (local_y >= fmt_y && local_y < fmt_y + 24 &&
+            // 24-hour toggle. #230: now REAL - settingscfg_use24h() (libc/
+            // settingscfg.c) drives the taskbar clock too, once
+            // settings_autosave() (every main-loop iteration) notices the
+            // change and writes it - no explicit save call needed here, see
+            // the same note on the double-click slider above.
+            if (local_y >= g.use24 && local_y < g.use24 + 24 &&
                 local_x >= x + 300 && local_x < x + 348) {
                 use_24hour = !use_24hour;
                 draw_all();
@@ -7108,25 +8486,18 @@ static void handle_content_click(int local_x, int local_y) {
             }
 
             // Timezone dropdown: open a scrollable list (current item highlighted)
-            int tz_y = fmt_y + 70;
-            if (local_y >= tz_y && local_y < tz_y + 28 &&
+            if (local_y >= g.tz && local_y < g.tz + 28 &&
                 local_x >= x && local_x < x + 350) {
-                dropdown_open(x, tz_y, 350, tz_labels(), tz_count(),
+                dropdown_open(x, g.tz, 350, tz_labels(), tz_count(),
                               &timezone_idx, update_timezone_offset);
                 draw_all(); return;
             }
 
-            // Date format dropdown
-            int dfmt_y = fmt_y + 95;
-            if (local_y >= dfmt_y && local_y < dfmt_y + 28 &&
-                local_x >= x && local_x < x + 160) {
-                dropdown_open(x, dfmt_y, 160, DATE_FMT_OPTS, DATE_FMT_OPTS_COUNT, &date_format, 0);
-                draw_all(); return;
-            }
+            // #230: Date Format dropdown deleted - see the comment above
+            // datetime_geom().
 
             // Week start buttons
-            int week_y = dfmt_y + 45;
-            if (local_y >= week_y && local_y < week_y + 28) {
+            if (local_y >= g.weekstart && local_y < g.weekstart + 28) {
                 for (int i = 0; i < 2; i++) {
                     if (local_x >= x + 140 + i * 90 && local_x < x + 140 + i * 90 + 82) {
                         first_day_of_week = i;
@@ -7138,8 +8509,7 @@ static void handle_content_click(int local_x, int local_y) {
 
             // Set Date & Time button (only when auto_time is off)
             if (!auto_time) {
-                int setdt_y = week_y + 50;
-                if (local_y >= setdt_y && local_y < setdt_y + 30 &&
+                if (local_y >= g.setbtn && local_y < g.setbtn + 30 &&
                     local_x >= x && local_x < x + 160) {
                     modal_mode = MODAL_SET_DATETIME;
                     modal_num_fields = 2;
@@ -7162,9 +8532,14 @@ static void handle_content_click(int local_x, int local_y) {
         }
 
         case PANEL_USERS: {
+            // (#227) every hit box below comes from the SAME users_geom()
+            // the draw pass uses, so a control and its hit box cannot drift
+            // apart again (previous drift: a uniform 5px on Add User/Guest,
+            // both of which depend on user_count).
+            users_geom_t g; users_geom(&g);
+
             // Edit Profile button (inside current user card)
-            int ep_y = base_y + 75;
-            if (local_y >= ep_y && local_y < ep_y + 30 &&
+            if (local_y >= g.edit_profile && local_y < g.edit_profile + 30 &&
                 local_x >= x + 350 && local_x < x + 450) {
                 modal_mode = MODAL_EDIT_PROFILE;
                 modal_num_fields = 2;
@@ -7180,8 +8555,7 @@ static void handle_content_click(int local_x, int local_y) {
             // Auto-login toggle (#566: real, targets the CURRENT user's own
             // account - always allowed, but a non-root session still needs
             // that account's password, collected via MODAL_AUTOLOGIN_PW).
-            int al_y = base_y + 180;
-            if (local_y >= al_y && local_y < al_y + 24 &&
+            if (local_y >= g.autologin && local_y < g.autologin + 24 &&
                 local_x >= x + 340 && local_x < x + 388) {
                 int is_al_cur = (autologin_user[0] &&
                                  strcmp(autologin_user, users[current_user_idx].username) == 0);
@@ -7189,9 +8563,8 @@ static void handle_content_click(int local_x, int local_y) {
                 return;
             }
 
-            // Change Password button (al_y + 10 for y+=10 after toggle + 45 for hint = al_y+55)
-            int chpw_y = al_y + 55;
-            if (local_y >= chpw_y && local_y < chpw_y + 30 &&
+            // Change Password button
+            if (local_y >= g.chpw && local_y < g.chpw + 30 &&
                 local_x >= x && local_x < x + 160) {
                 modal_mode = MODAL_CHANGE_PASSWORD;
                 modal_field[0][0] = modal_field[1][0] = modal_field[2][0] = '\0';
@@ -7204,10 +8577,10 @@ static void handle_content_click(int local_x, int local_y) {
             }
 
             // Per-user "Remove" buttons (+ root-only Auto-login toggle) in the
-            // Other Users list. Mirrors the row layout in draw_users_panel
-            // (rows from base_y+310, 60px pitch).
+            // Other Users list. row_y comes from g.other_row0, the SAME
+            // starting point draw_users_panel()'s loop uses.
             {
-                int row_y = base_y + 310;
+                int row_y = g.other_row0;
                 for (int i = 0; i < user_count; i++) {
                     if (i == current_user_idx) continue;
                     if (users[i].username[0] == 0) continue;
@@ -7238,8 +8611,7 @@ static void handle_content_click(int local_x, int local_y) {
             }
 
             // Add User button (after other-users list)
-            int adduser_btn_y = al_y + 140 + (user_count - 1) * 60;
-            if (local_y >= adduser_btn_y && local_y < adduser_btn_y + 30 &&
+            if (local_y >= g.adduser && local_y < g.adduser + 30 &&
                 local_x >= x && local_x < x + 120) {
                 modal_mode = MODAL_ADD_USER;
                 modal_num_fields = 3;
@@ -7252,8 +8624,7 @@ static void handle_content_click(int local_x, int local_y) {
             }
 
             // Guest enabled toggle (position varies based on user count)
-            int guest_y = al_y + 180 + (user_count - 1) * 60;
-            if (local_y >= guest_y && local_y < guest_y + 24 &&
+            if (local_y >= g.guest && local_y < g.guest + 24 &&
                 local_x >= x + 300 && local_x < x + 348) {
                 guest_enabled = !guest_enabled;
                 draw_all();
@@ -7263,10 +8634,16 @@ static void handle_content_click(int local_x, int local_y) {
         }
 
         case PANEL_PRIVACY: {
+            // (#227) every hit box below comes from the SAME privacy_geom()
+            // the draw pass uses. This also fixes "Require password on wake",
+            // which was 20px off ON THE X AXIS: the toggle actually draws at
+            // x+300..x+348 (draw_toggle_labeled(x+20, y, 280, ...) => switch
+            // at x+20+280 = x+300), not the x+280..x+328 the old test used.
             // Every change persists to /CONFIG/PRIVACY.CFG (real stored setting).
+            privacy_geom_t g; privacy_geom(&g);
+
             // Screen lock toggle
-            int lock_y = base_y + 65;
-            if (local_y >= lock_y && local_y < lock_y + 24 &&
+            if (local_y >= g.lock && local_y < g.lock + 24 &&
                 local_x >= x + 300 && local_x < x + 348) {
                 screen_lock_enabled = !screen_lock_enabled;
                 privacy_save();
@@ -7275,8 +8652,7 @@ static void handle_content_click(int local_x, int local_y) {
             }
 
             // Location services toggle
-            int loc_y = lock_y + (screen_lock_enabled ? 115 : 35) + 25;
-            if (local_y >= loc_y && local_y < loc_y + 24 &&
+            if (local_y >= g.location && local_y < g.location + 24 &&
                 local_x >= x + 300 && local_x < x + 348) {
                 location_services = !location_services;
                 privacy_save();
@@ -7285,8 +8661,7 @@ static void handle_content_click(int local_x, int local_y) {
             }
 
             // Diagnostics toggle
-            int diag_y = loc_y + 55;
-            if (local_y >= diag_y && local_y < diag_y + 24 &&
+            if (local_y >= g.diagnostics && local_y < g.diagnostics + 24 &&
                 local_x >= x + 300 && local_x < x + 348) {
                 diagnostics_enabled = !diagnostics_enabled;
                 privacy_save();
@@ -7294,10 +8669,8 @@ static void handle_content_click(int local_x, int local_y) {
                 return;
             }
 
-            // Crash reports toggle (Diagnostics now has an honest hint line, so
-            // Crash sits 55px below Diagnostics: 10px gap + 45px advance.)
-            int crash_y = diag_y + 55;
-            if (local_y >= crash_y && local_y < crash_y + 24 &&
+            // Crash reports toggle
+            if (local_y >= g.crash && local_y < g.crash + 24 &&
                 local_x >= x + 300 && local_x < x + 348) {
                 crash_reports = !crash_reports;
                 privacy_save();
@@ -7305,57 +8678,60 @@ static void handle_content_click(int local_x, int local_y) {
                 return;
             }
 
-            // Screen lock timeout dropdown (cycle values when clicked)
-            if (screen_lock_enabled) {
-                int timeout_dd_y = lock_y + 35;
-                if (local_y >= timeout_dd_y && local_y < timeout_dd_y + 28 &&
-                    local_x >= x + 120 && local_x < x + 240) {
-                    int vals[] = {0, 1, 2, 5, 10, 15, 30};
-                    int ci = 0;
-                    for (int ii = 0; ii < 7; ii++) {
-                        if (vals[ii] == lock_timeout) { ci = ii; break; }
-                    }
-                    lock_timeout = vals[(ci + 1) % 7];
-                    privacy_save();
-                    draw_all(); return;
+            // Screen lock timeout dropdown (cycle values when clicked; only
+            // present when screen_lock_enabled - g.timeout_dd is -1 otherwise)
+            if (g.timeout_dd >= 0 &&
+                local_y >= g.timeout_dd && local_y < g.timeout_dd + 28 &&
+                local_x >= x + 120 && local_x < x + 240) {
+                int vals[] = {0, 1, 2, 5, 10, 15, 30};
+                int ci = 0;
+                for (int ii = 0; ii < 7; ii++) {
+                    if (vals[ii] == lock_timeout) { ci = ii; break; }
                 }
-                // Require password on wake toggle
-                int rpw_y = lock_y + 75;
-                if (local_y >= rpw_y && local_y < rpw_y + 24 &&
-                    local_x >= x + 280 && local_x < x + 328) {
-                    require_password_wake = !require_password_wake;
-                    privacy_save();
-                    draw_all(); return;
-                }
+                lock_timeout = vals[(ci + 1) % 7];
+                privacy_save();
+                draw_all(); return;
+            }
+            // Require password on wake toggle (only present when
+            // screen_lock_enabled; g.reqpw is -1 otherwise). Real switch is
+            // x+300..x+348 (see the case comment above for the x+20 indent
+            // this used to miss).
+            if (g.reqpw >= 0 &&
+                local_y >= g.reqpw && local_y < g.reqpw + 24 &&
+                local_x >= x + 300 && local_x < x + 348) {
+                require_password_wake = !require_password_wake;
+                privacy_save();
+                draw_all(); return;
             }
             break;
         }
 
         case PANEL_STORAGE: {
-            // Cache and trash clear buttons
-            // drive_count drives each take 80px; cache section starts after
-            int cache_base = base_y + 40 + drive_count * 80 + 40;
+            // (#227) every hit box below comes from the SAME storage_geom()
+            // the draw pass uses. The old `cache_base = base_y + 40 +
+            // drive_count*80 + 40` re-derivation landed 17-20px below the
+            // buttons' actual drawn position (they draw at `label_y - 3`),
+            // leaving the three "Clear" buttons live in only a ~7px band and
+            // "Empty Trash" fully unreachable.
+            storage_geom_t g; storage_geom(&g);
 
             // Thumbnails clear (unlinks real files, then rescans)
-            if (local_y >= cache_base && local_y < cache_base + 24 &&
+            if (local_y >= g.thumb_clear && local_y < g.thumb_clear + 24 &&
                 local_x >= x + 280 && local_x < x + 340) {
                 dir_clear_files(CACHE_DIR_THUMBS); storage_scan(); draw_all(); return;
             }
             // App cache clear
-            int ca_y = cache_base + 30;
-            if (local_y >= ca_y && local_y < ca_y + 24 &&
+            if (local_y >= g.app_clear && local_y < g.app_clear + 24 &&
                 local_x >= x + 280 && local_x < x + 340) {
                 dir_clear_files(CACHE_DIR_APPS); storage_scan(); draw_all(); return;
             }
             // System cache clear
-            int cs_y = ca_y + 30;
-            if (local_y >= cs_y && local_y < cs_y + 24 &&
+            if (local_y >= g.sys_clear && local_y < g.sys_clear + 24 &&
                 local_x >= x + 280 && local_x < x + 340) {
                 dir_clear_files(CACHE_DIR_SYSTEM); storage_scan(); draw_all(); return;
             }
             // Empty Trash
-            int trash_btn_y = cs_y + 55;
-            if (local_y >= trash_btn_y && local_y < trash_btn_y + 24 &&
+            if (local_y >= g.empty_trash && local_y < g.empty_trash + 24 &&
                 local_x >= x + 280 && local_x < x + 380) {
                 dir_clear_files(CACHE_DIR_TRASH); storage_scan(); draw_all(); return;
             }
@@ -7391,9 +8767,18 @@ static void handle_content_click(int local_x, int local_y) {
             int about_btn_y = g_about_btn_y;
             if (about_btn_y > 0 &&
                 local_y >= about_btn_y && local_y < about_btn_y + 30) {
-                // Check Updates
+                // Check Updates. #230: real network check (check_for_updates()),
+                // not a fabricated "up to date". Draw the transitional state
+                // first so the click has visible feedback before the blocking
+                // HTTP call (which can take a few seconds on a slow/absent
+                // network) returns.
                 if (local_x >= x && local_x < x + 130) {
-                    about_status = 1; draw_all(); return;
+                    about_status = 5;
+                    copy_str(g_update_msg, "Checking for updates...", sizeof(g_update_msg));
+                    draw_all();
+                    check_for_updates();
+                    draw_all();
+                    return;
                 }
                 // Export Debug
                 if (local_x >= x + 145 && local_x < x + 275) {
@@ -7475,7 +8860,8 @@ static void write_setvals(void) {
     sv_kvi("brightness_pct", brightness);
     sv_kvi("night_light", night_light);
     sv_kvi("night_light_strength", night_light_strength);
-    sv_kvi("scaling_pct", scaling_factor);
+    // #230: scaling_factor deleted along with the Scale slider (no click
+    // handler had ever existed for it - see draw_display_panel()).
 
     // ---- Sound ----
     sv_raw("\n[Sound]\n");
@@ -7496,6 +8882,14 @@ static void write_setvals(void) {
     sv_kvs("mac_address", mac_address);
     sv_kvi("dhcp_enabled", dhcp_enabled);
     sv_kvi("firewall_enabled", firewall_enabled);
+    // #238: the self-report now carries what the KERNEL says, so a reader of
+    // /SETVALS.TXT can see displayed-vs-enforced rather than displayed-only.
+    sv_kvi("fw_policy_in_deny", fw_pol_in == FW_ACT_DENY);
+    sv_kvi("fw_policy_out_deny", fw_pol_out == FW_ACT_DENY);
+    sv_kvi("fw_rule_count", fw_rule_count);
+    sv_kvi("fw_dropped_in", (int)fw_stats.drop_in);
+    sv_kvi("fw_dropped_out", (int)fw_stats.drop_out);
+    sv_kvi("fw_last_rc", fw_last_rc);
 
     // ---- Storage ----
     sv_raw("\n[Storage]\n");
@@ -7539,6 +8933,8 @@ static void write_setvals(void) {
     sv_kvi("wallpaper_idx", wallpaper_idx);
     sv_kvi("transparency_pct", transparency_level);
     sv_kvi("dock_opacity_pct", dock_opacity);   // #745
+    sv_kvi("dock_height_px",   dock_height);    // #123
+    sv_kvi("dock_zoom_pct",    dock_zoom);      // #123
 
     // ---- Users ----
     sv_raw("\n[Users]\n");
@@ -7579,11 +8975,28 @@ static void write_setvals(void) {
 // =============================================================================
 
 int main(int argc, char **argv) {
+    // #233: answer a contract invocation BEFORE any window exists, so the API
+    // is usable from a headless harness and from the AI tool loop with no
+    // compositor. th_init() runs first because appearance.theme resolves
+    // against the enumerated theme list; wp_init() is not needed for any
+    // contract row and is skipped on this path.
+    if (contract_is_invocation(argc, argv)) {
+        th_init();
+        return contract_cli(argc, argv, &SETTINGS_CONTRACT);
+    }
     (void)argc;
     (void)argv;
 
     wp_init();   // #517: enumerate wallpapers from the image (shared with compositor)
     th_init();   // #565: enumerate themes from /THEMES/INDEX.TXT
+
+    // #745 (local 102): what rotation THIS session actually booted with.
+    // rotation_idx starts equal to it; the dropdown only moves rotation_idx
+    // away from rotation_active, which is what drives the "applies after
+    // restart" hint in draw_display_panel().
+    rotation_active = get_display_rotation();
+    if (rotation_active < 0 || rotation_active > 3) rotation_active = 0;
+    rotation_idx = rotation_active;
 
     // #3: startup breadcrumbs. If the next iMac boot fails to show the Settings
     // window, /SETLOG.TXT will end at the last step reached.
@@ -7719,8 +9132,33 @@ int main(int argc, char **argv) {
                 for (long i = 0; i < n && b[i] >= '0' && b[i] <= '9'; i++) {
                     v = v * 10 + (b[i] - '0'); any = 1;
                 }
-                if (any && v >= DOCK_OPACITY_FLOOR && v <= 100) dock_opacity = v;
+                if (any && v >= DOCK_OPACITY_MIN && v <= DOCK_OPACITY_MAX) dock_opacity = v;
             }
+        }
+    }
+    // (#123) Same read-back for the two geometry preferences, for the same
+    // reason: the compositor seeds these CFGs from UIPROFIL.YML at startup, so
+    // reading them here is what makes the sliders open showing what the dock is
+    // ACTUALLY running rather than this app's compiled-in default (which would
+    // make the first click of the slider jump the dock).
+    {
+        struct { const char *nm; const char *legacy; int lo; int hi; int *dst; } G[2] = {
+            { "DOCKHGT.CFG",  "/DOCKHGT.CFG",  DOCK_HEIGHT_MIN, DOCK_HEIGHT_MAX, &dock_height },
+            { "DOCKZOOM.CFG", "/DOCKZOOM.CFG", DOCK_ZOOM_MIN,   DOCK_ZOOM_MAX,   &dock_zoom   },
+        };
+        for (int gi = 0; gi < 2; gi++) {
+            int fd = userconf_open_read(G[gi].nm, G[gi].legacy);
+            if (fd < 0) continue;
+            char b[8];
+            long n = sys_read(fd, b, sizeof(b) - 1);
+            sys_close(fd);
+            if (n <= 0) continue;
+            b[n] = 0;
+            int v = 0, any = 0;
+            for (long i = 0; i < n && b[i] >= '0' && b[i] <= '9'; i++) {
+                v = v * 10 + (b[i] - '0'); any = 1;
+            }
+            if (any && v >= G[gi].lo && v <= G[gi].hi) *G[gi].dst = v;
         }
     }
     if (cursor_theme < 0 || cursor_theme > 2) cursor_theme = 0;
@@ -7745,7 +9183,11 @@ int main(int argc, char **argv) {
         for (int i = 0; i < SS_OPTS_COUNT; i++) {
             if (SS_KERNEL_MAP[i] == kss) { found = i; break; }
         }
-        screensaver_idx = (found >= 0) ? found : 1;   // 1=Starfield if unmapped
+        // #124: the unmapped fallback now points at the same default the
+        // kernel and the compositor use (Plasma (Classic), idx 21), rather
+        // than a third answer. A fallback that disagrees with the real
+        // default shows the user a saver the system is not running.
+        screensaver_idx = (found >= 0) ? found : 21;   // 21=Plasma (Classic) if unmapped
     }
     {
         int kdelay = get_ss_delay();
@@ -7766,17 +9208,10 @@ int main(int argc, char **argv) {
 
     // Populate initial network data
     setlog("SET: net probe begin");
-    {
-        net_info_t ni;
-        if (get_net_info(&ni, (long)sizeof(ni)) == 0) {
-            copy_str(ip_address,  ni.ip,      sizeof(ip_address));
-            copy_str(gateway,     ni.gateway, sizeof(gateway));
-            copy_str(subnet_mask, ni.netmask, sizeof(subnet_mask));
-            copy_str(dns_primary, ni.dns,     sizeof(dns_primary));
-            copy_str(mac_address, ni.mac,     sizeof(mac_address));
-            ethernet_connected = ni.connected;
-        }
-    }
+    // #786: one definition (net_pull_live), so the FIRST paint cannot drift
+    // from the panel-entry paint the way two copies of this block could. #144's
+    // config_static -> dhcp_enabled fix is inside it.
+    net_pull_live();
     setlog("SET: net probe done");
 
     // Read live kernel state so sliders/values reflect reality on first open
@@ -7816,9 +9251,11 @@ int main(int argc, char **argv) {
     users_refresh();
     setlog("SET: users_refresh done");
 
-    // Load firewall rules (or seed sensible defaults on first run).
-    fw_load();
-    setlog("SET: fw_load done");
+    // #238: read the LIVE packet-filter policy out of the kernel. No file is
+    // opened and no default is seeded here: the kernel already holds the
+    // policy in force, including its compiled-in fail-safe on a virgin image.
+    fw_pull();
+    setlog("SET: fw_pull done");
 
     // Sync the wallpaper selector with the compositor's current background.
     {
@@ -7913,11 +9350,12 @@ int main(int argc, char **argv) {
             }
         }
 
-        // (#372/#384) Advance the Bluetooth / Wi-Fi mock state machines at ~10Hz
-        // REGARDLESS of event flow. The compositor issues periodic EVENT_REDRAWs,
-        // so win_get_event rarely times out; ticking only in the timeout branch
-        // stalls the scan/pair/connect animations. Time-throttle so a busy event
-        // stream does not over-tick.
+        // (#372/#384, honesty pass #237) bt_tick()/wifi_tick() are now no-ops
+        // and bt_panel_animating()/wifi_panel_animating() always return 0 (no
+        // driver -> nothing ever scans, pairs or connects, so nothing ever
+        // animates). Left in place rather than deleted: it is the real
+        // per-panel poll seam a future driver's animation would tick through,
+        // and removing it would be one more thing to re-add for #383.
         {
             static unsigned long last_conn_tick = 0;
             unsigned long nowc = uptime_ms();
@@ -8008,27 +9446,42 @@ int main(int argc, char **argv) {
                     help_ui_open_topic(HELP_FILE, help_topic_for_panel(current_panel));
                     break;
                 }
-                // (#261) When a dropdown is OPEN, arrow keys navigate ITS list (live
-                // preview via on_change, like clicking), and Enter/Space/Esc close it.
-                // Previously Up/Down moved the focus ring instead, so list keys did nothing.
+                // (#261, revised #74) When a dropdown is OPEN, arrow keys navigate
+                // ITS list. Up/Down used to call on_change on every highlight move
+                // ("live preview"), but every on_change here is a real syscall
+                // and/or a real disk write (see the #74 comment above dropdown_open),
+                // so passing through option 2 on the way from 1 to 5 used to APPLY
+                // option 2. Up/Down now only move *g_dd_sel (which still updates the
+                // label drawn behind the closed control) and reveal it in the
+                // scrolled popup - no on_change call, so browsing is now a real
+                // preview instead of four unwanted applies. Enter/Space COMMIT
+                // (fire on_change exactly once, for whatever is currently
+                // highlighted) and close. Esc CANCELS: restores *g_dd_sel to
+                // g_dd_orig (the value dropdown_open() captured) and closes without
+                // ever calling on_change.
                 if (g_dd_open && g_dd_sel) {
-                    if (event.keycode == 0x80) {                 // Up
+                    if (event.keycode == 0x80) {                 // Up: preview only
                         dropdown_refresh();
                         if (*g_dd_sel > 0) (*g_dd_sel)--;
                         gui_scroll_reveal(&g_dd_list.scroll, *g_dd_sel * DD_ROW, DD_ROW);
-                        if (g_dd_on_change) g_dd_on_change();
                         draw_all(); break;
                     }
-                    if (event.keycode == 0x81) {                 // Down
+                    if (event.keycode == 0x81) {                 // Down: preview only
                         dropdown_refresh();
                         if (*g_dd_sel < g_dd_count - 1) (*g_dd_sel)++;
                         gui_scroll_reveal(&g_dd_list.scroll, *g_dd_sel * DD_ROW, DD_ROW);
-                        if (g_dd_on_change) g_dd_on_change();
                         draw_all(); break;
                     }
                     if (event.key_char == '\r' || event.key_char == '\n' ||
-                        event.key_char == ' ' || event.key_char == 27) {  // commit/close
-                        g_dd_open = 0; draw_all(); break;
+                        event.key_char == ' ') {                 // commit
+                        if (g_dd_on_change) g_dd_on_change();
+                        g_dd_open = 0;
+                        draw_all(); break;
+                    }
+                    if (event.key_char == 27) {                  // Esc: cancel
+                        *g_dd_sel = g_dd_orig;
+                        g_dd_open = 0;
+                        draw_all(); break;
                     }
                 }
                 if (event.key_char == 27) {  // ESC
@@ -8059,19 +9512,30 @@ int main(int argc, char **argv) {
                         draw_all();
                     }
                 } else if (event.keycode == GUI_KEY_LEFT) {   // previous panel
-                    if (current_panel > 0) { current_panel--; content_scroll_y = 0; g_focus_idx = 0; sidebar_reveal_current(); draw_all(); }
+                    if (current_panel > 0) { current_panel--; gui_scroll_set(&g_content_scroll, 0); g_focus_idx = 0; sidebar_reveal_current(); draw_all(); }
                 } else if (event.keycode == GUI_KEY_RIGHT) {  // next panel
-                    if (current_panel < PANEL_COUNT - 1) { current_panel++; content_scroll_y = 0; g_focus_idx = 0; sidebar_reveal_current(); draw_all(); }
+                    if (current_panel < PANEL_COUNT - 1) { current_panel++; gui_scroll_set(&g_content_scroll, 0); g_focus_idx = 0; sidebar_reveal_current(); draw_all(); }
                 } else if (event.keycode == GUI_KEY_HOME) {
-                    current_panel = 0; content_scroll_y = 0; g_focus_idx = 0; sidebar_reveal_current(); draw_all();
+                    current_panel = 0; gui_scroll_set(&g_content_scroll, 0); g_focus_idx = 0; sidebar_reveal_current(); draw_all();
                 } else if (event.keycode == GUI_KEY_END) {
-                    current_panel = PANEL_COUNT - 1; content_scroll_y = 0; g_focus_idx = 0; sidebar_reveal_current(); draw_all();
+                    current_panel = PANEL_COUNT - 1; gui_scroll_set(&g_content_scroll, 0); g_focus_idx = 0; sidebar_reveal_current(); draw_all();
                 } else if (event.keycode == GUI_KEY_PGUP || event.keycode == GUI_KEY_PGDN) {
-                    // Page the sidebar list itself. This is the keyboard-only
-                    // route to a panel that is scrolled out of view, which is the
-                    // ONLY route wherever the pointer's wheel is unavailable (the
+                    // (#227) Context-sensitive: before this fix the content
+                    // area had NO keyboard scroll route at all (this branch
+                    // only ever paged the sidebar), so a control below the
+                    // fold was unreachable without a mouse wheel. When the
+                    // keyboard focus ring is currently sitting on a CONTENT
+                    // control (not a sidebar row), page the content instead;
+                    // otherwise keep the existing sidebar-paging behaviour -
+                    // the keyboard-only route to a panel scrolled out of
+                    // view wherever the pointer's wheel is unavailable (the
                     // Magic Mouse on the iMac, #438) or the mouse is dead.
-                    if (gui_scroll_key(&g_side_scroll, event.keycode)) draw_all();
+                    if (g_focus_on && g_focus_n > 0 && g_focus_idx < g_focus_n &&
+                        !g_focus[g_focus_idx].sidebar) {
+                        if (gui_scroll_key(&g_content_scroll, event.keycode)) draw_all();
+                    } else {
+                        if (gui_scroll_key(&g_side_scroll, event.keycode)) draw_all();
+                    }
                 }
                 break;
 
@@ -8249,10 +9713,12 @@ int main(int argc, char **argv) {
                     // cannot drift out of agreement with every other list.
                     if (gui_scroll_wheel(&g_side_scroll, event.scroll_delta)) draw_all();
                 } else {
-                    content_scroll_y -= event.scroll_delta * 30;
-                    if (content_scroll_y < 0) content_scroll_y = 0;
-                    if (content_scroll_y > max_scroll_y) content_scroll_y = max_scroll_y;
-                    draw_all();
+                    // (#227) Same shared primitive, same convention as the
+                    // sidebar above - this used to be a hand-rolled
+                    // content_scroll_y/max_scroll_y pair where max_scroll_y
+                    // was never assigned anything but 0, so every scroll
+                    // clamped straight back to zero.
+                    if (gui_scroll_wheel(&g_content_scroll, event.scroll_delta)) draw_all();
                 }
                 break;
             }

@@ -43,6 +43,14 @@ extern int daylight;
 extern char *tzname[2];
 void tzset(void);
 
+// clock(): ISO C puts this in <time.h>. This libc had it declared ONLY in
+// <stdlib.h>, so any translation unit that included <time.h> and called clock()
+// - which is what the C standard tells it to do - got an implicit declaration.
+// Lua 5.4's ltablib.c is exactly that TU. The definition is unchanged and still
+// lives in time.c; clock_t is `long`, so this declaration is the same type as
+// the <stdlib.h> one and the two can coexist.
+clock_t clock(void);
+
 time_t time(time_t *t);
 double difftime(time_t end, time_t start);
 struct tm *gmtime(const time_t *timep);

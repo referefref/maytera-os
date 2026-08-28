@@ -15,19 +15,19 @@ The test framework provides:
 
 ```bash
 # Run all tests
-./run_all_tests.py --vm 1002
+./run_all_tests.py --vm <vmid>
 
 # Run specific test suite
-./run_all_tests.py --vm 1002 --suite syscall
+./run_all_tests.py --vm <vmid> --suite syscall
 
 # Generate HTML report
-./run_all_tests.py --vm 1002 --html-report
+./run_all_tests.py --vm <vmid> --html-report
 
 # List available tests
 ./run_all_tests.py --list
 
 # Skip stress tests (faster)
-./run_all_tests.py --vm 1002 --skip-stress
+./run_all_tests.py --vm <vmid> --skip-stress
 ```
 
 ## Test Suites
@@ -211,7 +211,7 @@ socat UNIX-CONNECT:/var/run/qemu-server/1002.serial0 STDIO
 
 ```bash
 # CI script example
-./run_all_tests.py --vm 1002 --output results.json --html-report
+./run_all_tests.py --vm <vmid> --output results.json --html-report
 if [ $? -ne 0 ]; then
     echo "Tests failed!"
     exit 1

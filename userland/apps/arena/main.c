@@ -406,7 +406,7 @@ static void build_cmd(World *w) {
     if (held_mv('w', 0x11)) w->cmd.fwd  += 1;      /* set-1: W=0x11             */
     if (held_mv('s', 0x1F)) w->cmd.fwd  -= 1;      /*        S=0x1F             */
     if (held_mv('a', 0x1E)) w->cmd.side -= 1;      /*        A=0x1E             */
-    /* #484 ROOT CAUSE (found by live instrumentation, VM2491, 2026-07-16):
+    /* #484 ROOT CAUSE (found by live instrumentation, VM <vmid>, 2026-07-16):
      * D's PS/2 set-1 fallback scancode is 0x20 - which is ALSO the ASCII code
      * for space (jump). key_set()/key_is_down() store both the ASCII code and
      * any scancode fallback in the SAME g_keys[256]/g_key_rel[256] arrays by

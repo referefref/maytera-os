@@ -21,9 +21,14 @@ hardware and in virtual machines.
 
 ![MayteraOS desktop](screenshots/desktop-clean.png)
 
-**This repository: version 1.95.0, kernel build 1862.** The most recent
-published binary release is `v1.95.0-b851`, which is older than the source
-here. See Releases below.
+**This repository: version 2.0.2, kernel build 2246.** The build number is
+stamped by the build system rather than stored in the source, so
+`kernel/version.h` in this tree reads `2213`. Treat that as a floor, not as a
+contradiction: the image built from this exact source is stamped 2246, and the
+build system takes `max(build-state, version.h) + 1`. Where this README says
+"fixed in build 2246", the checkable form is the source files named beside each
+fix. The most recent published binary release is `v1.95.0-b851`, which is much
+older than the source here. See Releases below.
 
 ## Screenshots
 
@@ -128,6 +133,35 @@ separately rather than summarised as "hardened".
   `admin`/`admin` as the defaults. It no longer does: autologin ships disabled,
   and the file documents the real first-boot flow. An image staged from this
   tree stops and asks you to create an account.
+
+**Fixed in kernel build 2246: three Ring-3 privilege-boundary holes.** Each one
+let a user process reach state it did not own, each was demonstrated with a
+working proof before it was fixed, and each fix is the Rust module named beside
+it. If you are running anything older than build 2246, these are live:
+
+- **Cross-process legacy file descriptors** (`kernel/rustkern/fdown.rs`,
+  `kernel/proc/fdlayer.c`). The legacy descriptor table was reachable across
+  process boundaries, so one process could read a file another process had
+  open. Proven at descriptor 259. Descriptors now carry an owner and ownership
+  is checked on every access.
+- **`/dev/pts/N` attach by a non-owner** (`kernel/rustkern/ptsown.rs`,
+  `kernel/drivers/pty.c`). Any process could attach to a pseudo terminal
+  belonging to another user and read its input and output. Attach now requires
+  ownership.
+- **`sys_win_blit()` gave Ring 3 an arbitrary kernel read**
+  (`kernel/rustkern/winblit.rs`, `kernel/proc/syscall.c`). The blit source
+  pointer was taken from userland and used unvalidated, so a Ring-3 process
+  could name a kernel address and have its contents painted into a window it
+  could then read back. Proven by painting kernel text into a visible window
+  with the pixel colour predicted in advance. Every row is now copied through
+  `copy_from_user()`.
+
+**Known regression in this snapshot, stated rather than left to be found.** The
+`sys_win_blit()` fix above introduced a scaling fault: full-screen and maximised
+windows scale incorrectly. It is a rendering defect with no security
+consequence, and a fix is in progress and will land as a follow-up commit. The
+security fix is worth shipping ahead of it; the cosmetic cost is not worth
+hiding.
 
 **Explicitly NOT implemented. Do not assume otherwise:**
 

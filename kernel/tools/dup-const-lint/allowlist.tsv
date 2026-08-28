@@ -1,0 +1,121 @@
+# allowlist.tsv (#222) - divergences that are NOT going to be fixed by making
+# them one value, and WHY.
+#
+# Columns, tab separated:  name <TAB> status <TAB> justification
+#
+# STATUS is one of, and the lint refuses anything else:
+#   [LEGIT]   the two names really are two different quantities. This is not a
+#             bug, it is a name collision, and the entry says so.
+#   [DEBT]    it IS one quantity and the copies HAVE drifted. Known, judged not
+#             worth the blast radius of fixing right now, and the reason states
+#             the concrete consequence so the next person can judge it too.
+#   [LEGACY]  bulk-baselined at #222 and not individually reasoned. There are
+#             deliberately NONE of these: every row below was looked at. The
+#             status exists so that "nobody actually checked" stays available as
+#             an honest thing to write, rather than being disguised as [LEGIT].
+#
+# The justification is not decoration. The lint REFUSES a row with a status it
+# does not know and REFUSES a row whose reason is under 25 characters, exactly
+# as kernel/tools/concurrency-lint/allowlist.txt does, because an entry with no
+# reason is a silencer rather than a decision.
+#
+# A row naming something that no longer diverges FAILS. An allowlist that
+# describes things that are not there has stopped describing the things that
+# are.
+#
+# THIS FILE ONLY SILENCES RULE A (a header disagreeing with something else).
+# Rule B is not gating and needs no entries; rule C lives in contracts.tsv.
+
+# ---- keycodes: FOUR encodings that share one name prefix --------------------
+# kernel/drivers/keyboard.h  = raw PS/2 set-1 scancodes (KEY_F1 0x3B).
+# kernel/cpu/isr.h + isr.c   = the kernel's COOKED virtual keycodes, 0x80+,
+#                              which is what an app actually receives.
+# kernel/drivers/virtio/virtio_input.h = Linux evdev codes, fixed by the
+#                              virtio-input spec (KEY_F1 59); we do not get to
+#                              choose these.
+# userland/apps/arena/main.c = ASCII for ESC and TAB.
+# Four layers, four encodings, one prefix. Renaming them would be an improvement
+# and is not this ticket. NOTE the cooked-vs-scancode pair is the exact fault of
+# #188/#191 (six apps matched scancodes and their arrow keys had never worked),
+# and build/keycode-gate.sh already holds the USERLAND side to one source of
+# truth in userland/libc/keys.{h,rs}. These rows cover the KERNEL side only.
+KEY_ALT	[LEGIT]	PS/2 scancode 0x38 vs the kernel's cooked virtual keycode 0x9A. Two encodings of one physical key, both correct in their own layer.
+KEY_DELETE	[LEGIT]	PS/2 scancode 0x53 vs evdev 111 from the virtio-input spec. The evdev number is fixed by the device protocol and cannot be changed to match.
+KEY_DOWN	[LEGIT]	PS/2 0x50, cooked 0x81, evdev 108. Three layers of one arrow key; isr.c and isr.h agree with each other, which is the pair that matters.
+KEY_ESC	[LEGIT]	evdev 1 vs ASCII 0x1B in the arena app. Different alphabets entirely, not a drifted copy of one number.
+KEY_F1	[LEGIT]	PS/2 0x3B, cooked 0x88, evdev 59. Function-key row, same three-encoding split as the arrows.
+KEY_F2	[LEGIT]	PS/2 0x3C, cooked 0x89, evdev 60. Function-key row, same three-encoding split as the arrows.
+KEY_F3	[LEGIT]	PS/2 0x3D, cooked 0x8B, evdev 61. Function-key row, same three-encoding split as the arrows.
+KEY_F4	[LEGIT]	PS/2 0x3E, cooked 0x8C, evdev 62. Function-key row, same three-encoding split as the arrows.
+KEY_F5	[LEGIT]	PS/2 0x3F, cooked 0x84, evdev 63. Function-key row, same three-encoding split as the arrows.
+KEY_F6	[LEGIT]	PS/2 0x40, cooked 0x8A, evdev 64. isr.c and isr.h agree on 0x8A, which is the copy pair that could actually hurt.
+KEY_F7	[LEGIT]	PS/2 0x41, cooked 0x8D, evdev 65. Function-key row, same three-encoding split as the arrows.
+KEY_F8	[LEGIT]	PS/2 0x42, cooked 0x8E, evdev 66. Function-key row, same three-encoding split as the arrows.
+KEY_F9	[LEGIT]	PS/2 0x43, cooked 0x8F, evdev 67. Function-key row, same three-encoding split as the arrows.
+KEY_F10	[LEGIT]	PS/2 0x44, cooked 0x87, evdev 68. Function-key row, same three-encoding split as the arrows.
+KEY_F11	[LEGIT]	PS/2 0x57, cooked 0x85 in both isr.c and isr.h, evdev 87. The two kernel copies agree.
+KEY_F12	[LEGIT]	PS/2 0x58, cooked 0x86 in both isr.c and isr.h, evdev 88. The two kernel copies agree.
+KEY_HOME	[LEGIT]	PS/2 scancode 0x47 vs the kernel's cooked keycode 0x100 (#243). The scancode IS 0x47 and 0x47 is also ASCII 'G'; that collision is precisely why the cooked value had to leave the byte. Two layers, both correct in their own.
+KEY_END	[LEGIT]	PS/2 scancode 0x4F vs the kernel's cooked keycode 0x101 (#243). Same split as KEY_HOME; 0x4F is also ASCII 'O'.
+KEY_PGUP	[LEGIT]	PS/2 scancode 0x49 vs the kernel's cooked keycode 0x102 (#243). Same split as KEY_HOME; 0x49 is also ASCII 'I', which is what made PgUp enter INSERT mode in vi.
+KEY_LEFT	[LEGIT]	PS/2 0x4B, cooked 0x82, evdev 105. The cooked value is the one apps see; see build/keycode-gate.sh for the userland half of this.
+KEY_RIGHT	[LEGIT]	PS/2 0x4D, cooked 0x83, evdev 106. The cooked value is the one apps see; see build/keycode-gate.sh for the userland half of this.
+KEY_UP	[LEGIT]	PS/2 0x48, cooked 0x80, evdev 103. The cooked value is the one apps see; see build/keycode-gate.sh for the userland half of this.
+KEY_LSHIFT	[LEGIT]	PS/2 scancode 0x2A vs the kernel's cooked virtual keycode 0x95. Two encodings of one physical key.
+KEY_RSHIFT	[LEGIT]	PS/2 scancode 0x36 vs the kernel's cooked virtual keycode 0x96. Two encodings of one physical key.
+KEY_TAB	[LEGIT]	PS/2 0x0F, evdev 15, and ASCII 0x09 in the arena app. Three alphabets, none of them a stale copy of another.
+
+# ---- name collisions between unrelated subsystems ---------------------------
+R_OK	[LEGIT]	POSIX access() read-permission bit (4) in libc, fs/perms.h and guestfs.rs, versus a LOCAL success code (0) in rustkern/fetchown.rs whose siblings are R_NOSLOT and R_NOTOWNER. Same three letters, unrelated meanings.
+EFAULT	[LEGIT]	errno 14 in libc versus -14 in rustkern/argtab.rs, which returns NEGATIVE errno values to the syscall boundary by kernel convention. Same number, opposite sign, both deliberate.
+MAX_GROUPS	[LEGIT]	32 user groups in kernel/proc/users.h versus 65536 ext2 BLOCK groups in rustkern/ext2fsck.rs. Two entirely different things called groups.
+MAX_USERS	[LEGIT]	32 system accounts in kernel/proc/users.h versus 64 IRC channel nicks in the irc app. Unrelated limits in unrelated binaries.
+MAX_APPS	[LEGIT]	16 registered kernel GUI apps in gui/window.h versus 192 launcher entries in the launcher app. Unrelated limits.
+MAX_HIST	[LEGIT]	1024 chess plies, 24 Files navigation entries, 40 compositor notifications. Three unrelated histories in three binaries.
+MAX_ITEMS	[LEGIT]	RSS articles, arena entities, Files rows, recycle-bin entries. Four unrelated collection caps in four binaries.
+MAX_SPAWNS	[LEGIT]	32 spawn points in the arena game header versus 64 in its own hull_test harness, which deliberately oversizes to stress the loader.
+ICON_SIZE	[LEGIT]	24px kernel icon cell in gui/icons.h versus the Files app's own 16px list icon. Different widgets in different binaries.
+
+# ---- real drift, judged, not fixed here -------------------------------------
+NCCS	[DEBT]	CONSEQUENCE STATED: kernel/drivers/tty.h says 20 and userland/libc/termios.h says 32, and BOTH declare struct termios with cc_t c_cc[NCCS] and identical field order, so the two sides disagree on the struct SIZE (48 vs 60 bytes). tty.c memcpys sizeof(kernel struct) and validates the user access at that length, so tcgetattr() leaves the tail of the userland struct untouched and TCSETS reads the userland c_cc tail as c_ispeed/c_ospeed. Not memory-unsafe in either direction, but the baud fields are wrong. POSIX and Linux both use 32; the kernel is the side that is wrong. Fixing it changes a syscall ABI and wants a boot test, so it is a ticket, not a drive-by.
+NSIG	[DEBT]	kernel/proc/signal.h 64 versus userland/libc/signal.h 32. The kernel is the larger side, which is the safe direction for a sigset copy, but userland cannot express signals 33-64 and silently truncates any mask it builds. Same ABI-change caution as NCCS.
+THEME_NAME_LEN	[DEBT]	kernel/gui/theme.h 64 and kernel/gui/themes.h 32, both used to size a char name[] in a DIFFERENT struct in the same kernel. Each translation unit is internally consistent today (theme_parser.c includes theme.h, themes.c includes themes.h), so nothing overflows now; it becomes a 32-byte overflow the moment a theme.h struct is written by code that sees themes.h. Two theme systems in one kernel is the underlying problem.
+USER_STACK_TOP	[DEBT]	kernel/mm/vmm.h says 0xBFFF0000, which is correct for the 2-3GB user window; process.c:6242 carries an #ifndef fallback of 0x00007FFFFFFFE000ULL, an address that is not mapped at all. The #ifndef means vmm.h wins wherever it is included first, so it is a landmine rather than a live fault, but a fallback that differs from the real value is the worst possible fallback.
+JPEG_MAX_WIDTH	[DEBT]	kernel/media/jpeg.h 16384 versus kernel/gui/jpeg.c 4096. TWO JPEG decode paths in the kernel with different accepted-size ceilings, so whether an image loads depends on which decoder the caller reached. The twin-decoder problem, not the constant.
+JPEG_MAX_HEIGHT	[DEBT]	Same pair as JPEG_MAX_WIDTH: 16384 in kernel/media/jpeg.h, 4096 in kernel/gui/jpeg.c.
+SSH_MAX_SESSIONS	[DEBT]	kernel/net/ssh/ssh.h 8, which sizes ssh_session_t *sessions[8]; ssh2_server.c defines its own 4 and uses it for g_sess_pids[] and the tcp_listen backlog. Two session limits in one subsystem; the server accepts 4 where the header advertises 8.
+SS_MAX_STARS	[DEBT]	compositor.h 1600 versus kernel/gui/screensaver.h 300. The kernel screensaver is the pre-compositor fallback; the userland one is what ships. Same shape as the two Task Managers.
+SS_MAX_BUBBLES	[DEBT]	compositor.h 10 versus kernel/gui/screensaver.h 30. Same dead-kernel-fallback pair as SS_MAX_STARS.
+DESKTOP_ICON_MAX	[DEBT]	kernel/gui/desktop.h 16 versus compositor.h 32. The kernel desktop is the pre-compositor fallback; the shipping desktop is the compositor's.
+GFS_REL_CONFIG_FOR	[DEBT]	kernel/fs/graphfs/fold.h defines it as the integer relation id 4 while node.h defines the SAME NAME as the string "config_for". One is the on-disk id, the other its label, and they share a macro name inside one subsystem, so including both headers is a redefinition. Rename one.
+GFS_REL_DERIVED_FROM	[DEBT]	Same fault as GFS_REL_CONFIG_FOR: integer 3 in fold.h, string "derived_from" in node.h, one name for an id and its label.
+PATH_MAX	[DEBT]	1024 in libc/limits.h and libc/sys/param.h, 4096 in argtab.rs and the vendored compat headers, 255 in rustkern/dos4gw.rs, 512 in the msh app. argtab.rs is the one that matters: it is the length the kernel validates a user path pointer against, and it is 4x the libc buffer, so libc's own limit is the only thing keeping a path inside its buffer.
+NAME_MAX	[DEBT]	255 everywhere except rustkern/elevate.rs, which uses 64 for its own argument buffer. Not a filename limit there, but it borrowed the name of one.
+SYS_MAX	[DEBT]	399 in kernel/proc/syscall.h versus 215 in the vendored userland/apps/python/port/src-kernel/syscall.h, which is a snapshot of the header from when the port was made. kernel/tools/syscall-number-lint deliberately skips SYS_MAX for this same reason. The whole vendored header is stale, not just this line.
+COLOR_ORANGE	[DEBT]	0x00FF8800 in kernel/gui/colors.h versus 0x00FF8C00 in userland/libc/gui.h. Cosmetic, four units of green apart, but it is two palettes claiming to be one.
+
+# ---- the terminal palette: one RGB set, two alpha conventions ---------------
+# kernel/gui/terminal.h writes 0xFFRRGGBB (opaque) and userland/libc/gui.h
+# writes 0x00RRGGBB (alpha zero) for the SAME sixteen colours plus the
+# background. The RGB halves are identical in every one of the seventeen.
+# MEASURED: the userland copies have ZERO users - nothing under userland/
+# references any TERM_COLOR_*. So this is a dead, alpha-stripped clone of the
+# kernel palette rather than a live divergence, and the risk is that the first
+# app to use one passes alpha 0 into a compositing path that honours it.
+TERM_COLOR_BLACK	[DEBT]	0xFF000000 kernel vs 0x00000000 libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
+TERM_COLOR_RED	[DEBT]	0xFFAA0000 kernel vs 0x00AA0000 libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
+TERM_COLOR_GREEN	[DEBT]	0xFF00AA00 kernel vs 0x0000AA00 libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
+TERM_COLOR_YELLOW	[DEBT]	0xFFAAAA00 kernel vs 0x00AAAA00 libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
+TERM_COLOR_BLUE	[DEBT]	0xFF0000AA kernel vs 0x000000AA libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
+TERM_COLOR_MAGENTA	[DEBT]	0xFFAA00AA kernel vs 0x00AA00AA libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
+TERM_COLOR_CYAN	[DEBT]	0xFF00AAAA kernel vs 0x0000AAAA libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
+TERM_COLOR_WHITE	[DEBT]	0xFFAAAAAA kernel vs 0x00AAAAAA libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
+TERM_COLOR_BRIGHT_BLACK	[DEBT]	0xFF555555 kernel vs 0x00555555 libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
+TERM_COLOR_BRIGHT_RED	[DEBT]	0xFFFF5555 kernel vs 0x00FF5555 libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
+TERM_COLOR_BRIGHT_GREEN	[DEBT]	0xFF55FF55 kernel vs 0x0055FF55 libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
+TERM_COLOR_BRIGHT_YELLOW	[DEBT]	0xFFFFFF55 kernel vs 0x00FFFF55 libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
+TERM_COLOR_BRIGHT_BLUE	[DEBT]	0xFF5555FF kernel vs 0x005555FF libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
+TERM_COLOR_BRIGHT_MAGENTA	[DEBT]	0xFFFF55FF kernel vs 0x00FF55FF libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
+TERM_COLOR_BRIGHT_CYAN	[DEBT]	0xFF55FFFF kernel vs 0x0055FFFF libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
+TERM_COLOR_BRIGHT_WHITE	[DEBT]	0xFFFFFFFF kernel vs 0x00FFFFFF libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.
+TERM_BG_COLOR	[DEBT]	0xFF1E1E1E kernel vs 0x001E1E1E libc: same RGB, alpha byte dropped. Dead copy in libc, zero users measured at #222.

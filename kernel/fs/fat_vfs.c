@@ -84,6 +84,24 @@ static int64_t fat_file_seek(file_t *f, int64_t offset, int whence) {
     return fat_seek(fp, pos);
 }
 
+// #120: THE LIVE SIZE, and the reason sys_fstat() does not stat the path.
+//
+// While this description owns the write buffer, the bytes are in g_wbuf and the
+// FAT directory entry still records the size the file had at open (0 for a file
+// just created). A path stat would report that stale value, so the caller of a
+// write()-then-fstat() sequence would see the OLD size and believe it.
+// fat_file_seek() already answers SEEK_END from g_wbuf_len for exactly this
+// reason; this op gives the same truth without moving the file position.
+static int64_t fat_file_size(file_t *f) {
+    fat_file_t *fp = (fat_file_t *)f->priv;
+    if (f == g_wbuf_owner) return (int64_t)g_wbuf_len;
+    if (!fp) return -1;
+    // A FAT directory has no meaningful byte length; sc_stat_fill reports 0 for
+    // one and this must not contradict it.
+    if (fp->is_dir || (fp->attr & FAT_ATTR_DIRECTORY)) return 0;
+    return (int64_t)fp->file_size;
+}
+
 // #695 Phase 1: THE FAT flush, and the only one. An fd that does NOT own the
 // write buffer went straight to fat_write() -> blk_write(), which is
 // write-through, so there is genuinely nothing pending for it and 0 is the
@@ -130,6 +148,7 @@ static const file_ops_t fat_file_ops = {
     .read    = fat_file_read,
     .write   = fat_file_write,
     .seek    = fat_file_seek,
+    .size    = fat_file_size,
     .ioctl   = NULL,
     .flush   = fat_file_flush,
     .release = fat_file_release,

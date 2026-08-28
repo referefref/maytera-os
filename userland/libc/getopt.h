@@ -23,7 +23,10 @@
 //
 // By default operands are PERMUTED to the end of argv, so "prog file -v" sees
 // -v, which is what nearly every ported tool expects. POSIXLY_CORRECT is not
-// consulted: MayteraOS processes have no environment block worth speaking of.
+// consulted. That used to be because MayteraOS had no environment at all;
+// since #112 it has one, so this is now a plain design choice: permuting is
+// what the ported tools in this tree expect, and one env var quietly changing
+// argument parsing for all of them is a worse default than none.
 // Use a leading '+' in optstring if you need strict POSIX ordering.
 //
 // RESTARTING A SCAN: set optind to 0 or 1 before the next call. That is the

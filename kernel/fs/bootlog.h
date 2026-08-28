@@ -117,6 +117,25 @@ void audiolog_write(const char *fmt, ...);
 // buffer; only the device flush is skipped, and the next call from a safe
 // context carries the accumulated delta down. Nesting is counted, so
 // begin/end pairs may nest. ALWAYS pair them on every return path.
+// #134 FAULT-CONTEXT ONLY. Records a line with NO lock, NO allocation and NO
+// filesystem access, mirroring to kprintf_nolock(); a later safe context
+// flushes it to /BOOTLOG.TXT. Use this and NOT bootlog_write() from an
+// exception handler, an ISR, or anywhere holding the console lock:
+// bootlog_write() calls kprintf() (which takes g_console_lock, the exact
+// deadlock 240dc9f fixed) and its flush enters the storage stack. See the
+// block comment in bootlog.c for what it does and does not cover (a KERNEL
+// -mode fault halts the CPU, so /boot/PANIC.TXT remains that case's record).
+void bootlog_fault_write(const char *fmt, ...);
+// Drain the fault ring into /BOOTLOG.TXT. SAFE CONTEXTS ONLY (it calls
+// bootlog_write). Called from bootlog_heartbeat(); a caller that has just
+// survived a fault may call it to get the record down immediately.
+int  bootlog_fault_flush(void);
+// Bytes a fault context could not record because the ring was full, and bytes
+// any sink dropped because its RAM buffer was full. Both are zero on a healthy
+// boot; non-zero means the on-disk breadcrumb files are incomplete.
+uint32_t bootlog_fault_lost(void);
+uint64_t bootlog_dropped_bytes(void);
+
 void bootlog_defer_begin(void);
 void bootlog_defer_end(void);
 

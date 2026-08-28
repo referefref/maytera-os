@@ -90,7 +90,13 @@ const ACCESS_MASK: i32 = R_OK | W_OK | X_OK;
 // Slot identifiers. MUST match the GUESTFS_SLOT_* defines in fs/guestfs.h.
 pub const SLOT_DOS: u32 = 0;
 pub const SLOT_WIN16: u32 = 1;
-const NSLOTS: usize = 2;
+// #740: a DOS/4GW guest reaching DOS through the DPMI 0300h bridge is a
+// THIRD guest lineage. It gets its own slot rather than borrowing the DOS
+// one, because the gate logs and counts per slot: sharing would attribute a
+// DPMI guest's accesses to "dos" in the enforcement report, which is exactly
+// the identity confusion #708 exists to remove.
+pub const SLOT_DPMI: u32 = 2;
+const NSLOTS: usize = 3;
 
 // Arm kinds. MUST match PROC_AS_* in proc/process.h; they are passed straight
 // through to the #692 resolver so there is ONE identity vocabulary in the
@@ -376,6 +382,39 @@ pub unsafe extern "C" fn guestfs_selftest_rs() -> u32 {
             fails |= 128;
         }
     }
+    // 9. (#rawrite) THE GAME EXECUTABLE IS READABLE AND NOT WRITABLE.
+    //
+    // This is the property the per-user write overlay exists to preserve, and
+    // it is asserted here rather than argued in a comment, because the
+    // tempting fix for "the game cannot save" is a 0777 row on the install
+    // directory and that row would make this case go GREEN-to-RED at the next
+    // boot instead of being discovered by a user.
+    //
+    // Both halves matter and they are separate assertions. READABLE, or the
+    // game cannot be loaded at all. NOT WRITABLE, because a user who can
+    // rewrite /DOS/RA/GAME.DAT hands the next user a different program.
+    //
+    // The path does not have to exist for this to be meaningful: perms_check()
+    // is a policy lookup over /CONFIG/PERMS.DB, not a stat, so this asserts the
+    // POLICY that governs that path on any image, including one built before
+    // Red Alert was installed. Re-armed as uid 1000 explicitly because case 8
+    // above deliberately leaves the slot closed.
+    let exe = b"/DOS/RA/GAME.DAT\0".as_ptr();
+    unsafe { CREDS[SLOT_DOS as usize] = Cred { armed: 1, uid: 1000, gid: 1000 } };
+    if unsafe { guestfs_check_rs(SLOT_DOS, exe, R_OK) } != 0 {
+        fails |= 1024;
+    }
+    if unsafe { guestfs_check_rs(SLOT_DOS, exe, W_OK) } != E_DENIED {
+        fails |= 2048;
+    }
+    // And the per-user overlay that replaced the row is NOT a hole in the same
+    // wall: it lives under the user's own home, so nothing here grants a DOS
+    // guest write access anywhere under /DOS.
+    if unsafe { guestfs_check_rs(SLOT_DOS, b"/DOS/RA\0".as_ptr(), W_OK) } != E_DENIED {
+        fails |= 4096;
+    }
+    unsafe { guestfs_disarm_rs(SLOT_DOS) };
+
     // 8. A KIND_INVALID arm is refused and leaves the slot CLOSED.
     if unsafe { guestfs_arm_rs(SLOT_DOS, KIND_INVALID, 0) } != E_RESOLVE {
         fails |= 256;

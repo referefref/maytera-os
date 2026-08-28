@@ -118,6 +118,17 @@ struct MaytJob {
 	int reqID;
 	int jobID;    /* kernel job slot from http_fetch_start / http_post_start */
 	int isPost;   /* which family of POLL/READ/CANCEL calls to use */
+
+	/* #800 (owner-requested 2026-08-17): throughput reporting. The owner is
+	 * going to WATCH this download as a measurement of the USB-Ethernet path
+	 * (#155), not just as a progress bar, so the observed rate is logged
+	 * (Platform_Log -> serial / BOOTLOG.TXT), not only shown as a percentage.
+	 * startTime/startBytes are latched once, in StartNextRequest(); the pair
+	 * lets both the periodic log line and the final summary compute an
+	 * average rate without accumulating rounding error across polls. */
+	cc_uint64    startTime;
+	cc_uint64    lastLogTime;
+	unsigned int lastLogBytes;
 };
 static struct MaytJob live[MHTTP_MAX_LIVE];
 static int liveCount;
@@ -316,9 +327,12 @@ static void StartNextRequest(void) {
 	if (req->requestType == REQUEST_TYPE_POST) HttpRequest_Free(req);
 
 	req->progress = HTTP_PROGRESS_MAKING_REQUEST;
-	live[liveCount].reqID  = req->id;
-	live[liveCount].jobID  = id;
-	live[liveCount].isPost = req->requestType == REQUEST_TYPE_POST;
+	live[liveCount].reqID       = req->id;
+	live[liveCount].jobID       = id;
+	live[liveCount].isPost      = req->requestType == REQUEST_TYPE_POST;
+	live[liveCount].startTime   = Stopwatch_Measure();
+	live[liveCount].lastLogTime = live[liveCount].startTime;
+	live[liveCount].lastLogBytes = 0;
 	liveCount++;
 
 	RequestList_Append(&workingReqs, req, false);
@@ -367,6 +381,38 @@ static cc_result ReadBody(struct MaytJob* job, struct HttpRequest* req, cc_uint3
 	return 0;
 }
 
+/* #800 (owner-requested 2026-08-17): observed download rate, logged via
+ * Platform_Log so it lands on serial / BOOTLOG.TXT next to everything else
+ * the owner already reads. This is a real-world datapoint for #155 (the
+ * USB-Ethernet bulk-IN path, measured 2026-08-17 at 374 KB/s vs 7825 KB/s
+ * wired), not just UI polish: logging it is cheaper than instrumenting the
+ * dongle driver directly and needs no changes outside this file. Rate is
+ * computed over the WHOLE transfer so far (bytesNow / elapsed since
+ * startTime), not since the last log line, so a slow start does not make a
+ * later fast patch look faster than the download actually was. */
+static void LogThroughput(struct MaytJob* job, unsigned int bytesNow, cc_bool final) {
+	cc_uint64 now = Stopwatch_Measure();
+	int elapsedMs = Stopwatch_ElapsedMS(job->startTime, now);
+	int kbPerSec, kb;
+
+	if (elapsedMs <= 0) return;
+	kbPerSec = (int)(((cc_uint64)bytesNow * 1000ULL) / (1024ULL * (cc_uint64)elapsedMs));
+	kb       = (int)(bytesNow / 1024);
+
+	if (final) {
+		Platform_Log3("HTTP done: %i KB in %i ms (%i KB/s)", &kb, &elapsedMs, &kbPerSec);
+	} else {
+		/* Throttled to roughly once a second so a fast LAN download does not
+		 * spam the log; a slow one (the expected case on the dongle) still
+		 * gets a steady stream of real numbers instead of one line at the
+		 * end. */
+		if (Stopwatch_ElapsedMS(job->lastLogTime, now) < 1000) return;
+		job->lastLogTime  = now;
+		job->lastLogBytes = bytesNow;
+		Platform_Log3("HTTP progress: %i KB in %i ms so far (%i KB/s)", &kb, &elapsedMs, &kbPerSec);
+	}
+}
+
 static void PollJob(int liveIdx) {
 	struct MaytJob* job = &live[liveIdx];
 	unsigned int len = 0, recv = 0, total = 0;
@@ -396,18 +442,26 @@ static void PollJob(int liveIdx) {
 		if (!job->isPost && http_fetch_progress(job->jobID, NULL, &recv, &total) == 0) {
 			req->contentLength = total;
 			if (total) req->progress = (int)((100ULL * recv) / total);
+			if (recv)  LogThroughput(job, recv, false);
 		}
 		return;
 	}
 
 	if (state == 2) {
-		/* The job ran and failed. Releasing the slot is still required. */
+		/* The job ran and failed. Releasing the slot is still required. Log
+		 * whatever made it across before the failure: on a dead link this is
+		 * usually 0 bytes, and 0 KB in the log is itself useful evidence
+		 * (distinguishes "never connected" from "connected then dropped"). */
+		if (!job->isPost && http_fetch_progress(job->jobID, NULL, &recv, NULL) == 0) {
+			LogThroughput(job, recv, true);
+		}
 		Job_Release(job);
 		FinishWorking(idx, liveIdx, MHTTP_ERR_JOB_FAILED, status);
 		return;
 	}
 
-	/* state == 1: completed. */
+	/* state == 1: completed. len is the final body size. */
+	LogThroughput(job, len, true);
 	res = ReadBody(job, req, len);
 	FinishWorking(idx, liveIdx, res, status);
 }
@@ -490,6 +544,27 @@ void Http_TryCancel(int reqID) {
 /*########################################################################################################################*
 *-----------------------------------------------------Maytera backend-----------------------------------------------------*
 *#########################################################################################################################*/
+/* #800 (owner-requested 2026-08-17), CORRECTED from an earlier pass of this
+ * same fix that got the diagnosis half wrong. This function is NOT dead code:
+ * _HttpBase.h:388 forward-declares it `static` (upstream's own contract -
+ * every HTTP backend, e.g. Http_Worker.c:715, defines a private
+ * HttpBackend_DescribeError that _HttpBase.h's Http_LogError() calls via a
+ * function pointer), and that first declaration is why the linker keeps this
+ * symbol LOCAL even if the `static` keyword is later dropped from the
+ * definition here - removing it here does nothing, the header already fixed
+ * the linkage. Http_LogError() DOES call this, through Logger_FormatWarn ->
+ * Logger_WarnFunc (= Logger_DialogWarn by default), so the friendly strings
+ * below were always reaching a log sink.
+ *
+ * What was ACTUALLY broken: the ON-SCREEN purple error box in the launcher
+ * ("&cError %e when %c" in Launcher_FormatHttpError, Launcher.c) formats
+ * with `%e`, which calls Platform_DescribeError() in Platform_Maytera.c, a
+ * SEPARATE function that only handled `res < 1000` (libc errno) and fell
+ * through to a raw hex code for anything of ours - which is the
+ * "&cError 4D48D0O3 when downloading resources" seen on screen. This
+ * function stays exactly as upstream declared it (static, serving
+ * Http_LogError); MaytHttp_DescribeError() below is the new, genuinely
+ * external entry point Platform_DescribeError() calls. */
 static cc_bool HttpBackend_DescribeError(cc_result res, cc_string* dst) {
 	switch (res) {
 	case MHTTP_ERR_START_REFUSED:
@@ -512,6 +587,15 @@ static cc_bool HttpBackend_DescribeError(cc_result res, cc_string* dst) {
 		return true;
 	}
 	return false;
+}
+
+/* The genuinely external entry point (see the comment on
+ * HttpBackend_DescribeError above for why that one cannot be un-static).
+ * Called from Platform_DescribeError() in Platform_Maytera.c so the
+ * on-screen error text gets the same friendly sentence the log already
+ * did. */
+cc_bool MaytHttp_DescribeError(cc_result res, cc_string* dst) {
+	return HttpBackend_DescribeError(res, dst);
 }
 
 static void HttpBackend_Add(struct HttpRequest* req, cc_uint8 flags) {

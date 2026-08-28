@@ -87,8 +87,34 @@ void dns_rust_selftest(void);
 // Initialize DNS subsystem
 void dns_init(void);
 
-// Set DNS server IP (host byte order)
+// Set DNS server IP (host byte order).
+//
+// #786: this is the EXPLICIT setter, and it PINS the choice: a static config
+// file (net_apply_static_config) or a user acting in Settings both come here,
+// and neither may be silently overwritten by whatever a DHCP server later
+// offers. It also flushes the cache, because answers obtained from the OLD
+// resolver must not survive a deliberate change of resolver (that is the whole
+// reason a user changes it: they do not trust the answers they were getting).
 void dns_set_server(uint32_t server_ip);
+
+// Apply a DHCP-OFFERED resolver (host byte order), option 6 from the lease.
+//
+// #786: for years dhcp_get_dns() latched the offered value, the DHCP bind path
+// even PRINTED it, and NOBODY EVER CALLED dns_set_server() with it. The
+// resolver stayed on dns_init()'s compiled-in 8.8.8.8 on every DHCP machine
+// that has ever booted this kernel, while Settings displayed the offered
+// address as though it were in use. Measured on VM <vmid> / build 2054:
+// `[NETDIAG] ... dhcp=BOUND ... dns=8.8.8.8` with the lease offering
+// 192.0.2.1, and a packet capture of the guest querying 8.8.8.8.
+//
+// It DEFERS to an explicit choice: if dns_set_server() has pinned a resolver,
+// this is a no-op. A lease must never overrule what the user or the machine's
+// own config file asked for.
+void dns_set_server_dhcp(uint32_t server_ip);
+
+// 1 if the resolver was chosen explicitly (config file or user), 0 if it is
+// still the boot default or a DHCP-supplied value.
+int dns_server_is_pinned(void);
 
 // Resolve hostname to IPv4 address (host byte order)
 // Returns 0 on success, negative on error

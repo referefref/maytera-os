@@ -1,7 +1,9 @@
 // process.c - Process and task management implementation
 #include "process.h"
+#include "../fs/bootlog.h"   // #134: persistent process-exit record (owning header)
 #include "schedrace.h"   // #75: SMP context-corruption reproducer
 #include "syscall.h"
+#include "signal.h"      // #161: SIGCHLD / SIG_IGN for the no-cldwait reap rule
 #include "users.h"       // #692: user_entry_t for the gid-follows-uid shim
 #include "procmem.h"      // #487: per-process memory accounting (pulls mm/demand.h)
 #include "../security/validate.h"   // #503: deferred-write validation (clear_child_tid)
@@ -11,6 +13,7 @@
 #include "../mm/pmm.h"
 #include "../cpu/gdt.h"
 #include "../cpu/smp.h"
+#include "../cpu/scprof.h"   // #121: spawn-path phase attribution
 #include "../serial.h"
 #include "../string.h"
 #include "../cpu/isr.h"
@@ -158,7 +161,52 @@ static process_t *remove_from_ready_queue(void);
  */
 extern char kernel_stack_bottom[];   // #446: entry.asm boot stack (64 KB)
 
-static void cleanup_proc_slot(process_t *proc) {
+// #167 / defect (c): DO NOT FREE A KERNEL STACK A CORE IS STILL STANDING ON.
+//
+// proc_exit() sets state = ZOMBIE and calls sched_schedule(). Its own comment
+// is explicit that the task is STILL RUNNING ON ITS KERNEL STACK at that point
+// ("DO NOT free stack here - we are still running on it!"), and it stays there
+// right up to the `mov [rdi], rsp` inside the switch asm. sched_on_cpu is the
+// flag that says exactly this, and the asm clears it once the save is done.
+//
+// On another core, proc_create() calls reap_orphan_zombies(), which sees
+// state == ZOMBIE and calls this function, which kfree()s stack_base. Neither
+// the reaper nor this function consulted sched_on_cpu, so the stack a live core
+// is executing on was handed back to the heap and re-issued.
+//
+// MEASURED, this pass, and it is what the fault looks like from the inside. The
+// #167 exit-churn reproducer (proc/wakeloss.c, ~9,400 sleep-then-exit threads
+// per boot, recycling 64 PCB slots continuously) produced 9 to 28 panics per
+// boot under SCHEDRACE=1, all of them the wild RIP #75 first reported:
+//
+//   [KERNEL PANIC] Invalid Opcode at RIP=0x45  RSP=0x11310638
+//   [rsp+0x00] = 0x44            [rsp+0x28] = 0x5ac460 *   (proc_current)
+//   [rsp+0x30] = "e 0\n[PRO"     [rsp+0x58] = "g, code "
+//   [rsp+0x60] = "0\n[PROC]"     [rsp+0x68] = " 'wlshor"
+//   [rsp+0x70] = "t' (PID "      [rsp+0x78] = "138) exi"
+//
+// The stack being executed from CONTAINS THE TEXT of another thread's exit log
+// line and a "HEAP" tag. It is not a corrupted stack, it is somebody else's
+// memory. The same logs carry "[HEAP] ERROR: kfree() called on invalid pointer",
+// which is the same block coming back a second time.
+//
+// This also explains why proc/schedrace.c's pre-switch validator never fired on
+// any of them: that validator checks the INCOMING context at a switch, and this
+// is the OUTGOING context's stack being freed underneath it. No switch-time
+// check can see it.
+//
+// RETURNS 0 and cleans NOTHING if the task is still on a core, so the caller
+// must not mark the slot UNUSED either; the next reap sweep will take it, by
+// which time sched_on_cpu is clear. Losing one reap cycle costs a slot for a
+// few milliseconds. Freeing a live stack costs the machine.
+volatile uint64_t g_reap_deferred = 0;   // reaps refused because a core was on it
+int g_exit_stack_guard = 1;              // cleared by /NOSTACKGUARD.TXT (control arm)
+
+static int cleanup_proc_slot(process_t *proc) {
+    if (g_exit_stack_guard && proc && proc->sched_on_cpu != 0) {
+        g_reap_deferred++;
+        return 0;
+    }
     // Free kernel stack if allocated.
     // #446: pid 0's stack_base points at the STATIC boot stack in entry.asm,
     // which must never be handed to kfree().
@@ -234,6 +282,7 @@ static void cleanup_proc_slot(process_t *proc) {
     proc->cr3 = 0;
     proc->shares_vm = 0;
     proc->clear_child_tid = NULL;
+    return 1;
 }
 
 // #264: reap a specific zombie child, freeing its slot + resources. Safe on a
@@ -243,7 +292,7 @@ int proc_reap(uint32_t pid) {
     for (int i = 0; i < MAX_PROCESSES; i++) {
         process_t *p = &proc_table[i];
         if (p->state == PROC_STATE_ZOMBIE && p->pid == pid) {
-            cleanup_proc_slot(p);
+            if (!cleanup_proc_slot(p)) continue;   // #167(c): still on a core
             p->state = PROC_STATE_UNUSED;
             return 0;
         }
@@ -265,6 +314,10 @@ typedef struct {
 
 #define PROC_REAP_F_SHARES_VM  (1u << 0)
 #define PROC_REAP_F_DETACHED   (1u << 1)
+// #161: the zombie's PARENT has SIGCHLD set to SIG_IGN, i.e. it has declared
+// (the POSIX way) that it will never wait() for its children. See the flag's
+// use in reap_orphan_zombies() below and the policy in rustkern/procreap.rs.
+#define PROC_REAP_F_NOCLDWAIT  (1u << 2)
 
 _Static_assert(sizeof(proc_reap_ent_t) == 16,
                "proc_reap_ent_t must match ProcReapEnt in rustkern/procreap.rs");
@@ -281,6 +334,11 @@ extern uint32_t proc_reap_selftest_rs(void);
 // - the task 37 fix - detached kernel workers). Returns the count reclaimed.
 // Never touches idle (slot 0) or the current proc.
 static int reap_orphan_zombies(void) {
+    // #745 (local 75) CLASS FIX: the task to SKIP is the one running on
+    // THIS cpu. Through the BSP-published global, a reap running on an AP
+    // protected the BSP's task and left its own caller eligible.
+    process_t *me = proc_current();
+
     proc_reap_ent_t ents[MAX_PROCESSES];
     int skip = -1;
     for (int i = 0; i < MAX_PROCESSES; i++) {
@@ -290,24 +348,104 @@ static int reap_orphan_zombies(void) {
         ents[i].state = (uint32_t)p->state;
         ents[i].flags = (p->shares_vm ? PROC_REAP_F_SHARES_VM : 0u) |
                         (p->detached  ? PROC_REAP_F_DETACHED  : 0u);
-        if (p == current_proc) skip = i;
+        // #161: #745 task 37 fixed this leak for KERNEL WORKERS by marking them
+        // detached, and its brief said to check every other spawner. The Ring 3
+        // spawn path has the identical defect and was not checked: an app
+        // launched from the dock or the start menu is a child of the
+        // COMPOSITOR, which never calls wait() and never exits, so the policy's
+        // "no live parent" rule can never fire and EVERY app the user opens and
+        // closes leaks a permanent zombie slot. The table is 64 entries, so
+        // that is the same slow denial of service the fetch workers caused,
+        // reached by opening and closing apps.
+        //
+        // The mechanism, rather than a per-caller guess: POSIX already has the
+        // declaration this needs. A parent that sets SIGCHLD to SIG_IGN is
+        // saying its children must not become zombies, and wait() is then
+        // required to fail rather than hand back a status. That is exactly the
+        // compositor's situation, it is explicit (no heuristic about whether a
+        // parent "looks like" it will wait), and any future long-lived spawner
+        // opts in with one line. msh, which DOES wait, sets nothing and keeps
+        // POSIX zombie semantics untouched.
+        //
+        // Evaluated only for zombies: this is the one branch that costs a
+        // parent lookup, and a live process's slot is not a candidate anyway.
+        if (p->state == PROC_STATE_ZOMBIE) {
+            process_t *par = proc_get(p->ppid);
+            if (par && par->sig_handlers[SIGCHLD - 1] == SIG_IGN)
+                ents[i].flags |= PROC_REAP_F_NOCLDWAIT;
+        }
+        if (p == me) skip = i;
     }
     uint64_t mask = proc_reap_scan_rs(ents, (uint32_t)MAX_PROCESSES, skip);
     int n = 0;
     for (int i = 1; i < MAX_PROCESSES; i++) {
         if (!(mask & (1ull << i))) continue;
-        cleanup_proc_slot(&proc_table[i]);
+        if (!cleanup_proc_slot(&proc_table[i])) continue;   // #167(c)
         proc_table[i].state = PROC_STATE_UNUSED;
         n++;
     }
     return n;
 }
 
+// #COMPRESPAWN: THE SAME SWEEP, CALLABLE FROM OUTSIDE THIS FILE.
+//
+// reap_orphan_zombies() is static and its only caller is alloc_proc_slot(),
+// which means a dead process's resources come back at the moment the NEXT
+// process is created - and, critically, AFTER anything that caller allocated
+// on the way in. gui/desktop.c's launch_userspace_app() reads the ~1 MB ELF
+// with kmalloc FIRST and calls proc_create_user_as() SECOND, so when the
+// compositor dies and is relaunched, the 1 MB read is asked for while the dead
+// compositor still holds its process slot, its 64 KB kernel stack and its
+// entire ~29 MB address space. The reap it needed had not run yet.
+//
+// This is the ordinary "free before you allocate" rule, and the only reason it
+// was violated is that the reap was invisible from where the allocation
+// happens. Exported rather than duplicated, per the shared-primitive rule.
+//
+// Safe from any ordinary kernel thread: it takes no lock itself and
+// cleanup_proc_slot() kfree()s, so it must NOT be called with
+// g_proc_table_lock held (alloc_proc_slot() calls it before taking the lock,
+// for exactly this reason).
+int proc_reap_orphans(void) {
+    return reap_orphan_zombies();
+}
+
+// #COMPRESPAWN: FAULT-SAFE "which image is running here?" snapshot.
+//
+// cpu/idt.c deliberately does not include proc/process.h, and the exception
+// handler must not dereference anything it has not proved. This reads four
+// scalars from the current PCB and nothing else: no lock, no allocation, no
+// call that can fault. Returns 1 for a Ring-3 process with a recorded image,
+// 0 otherwise (kernel thread, no current process, or a pre-#COMPRESPAWN
+// spawn path that never recorded a base).
+int proc_current_image(uint32_t *pid, uint64_t *base, uint64_t *end,
+                       uint64_t *cr3) {
+    process_t *p = proc_current();
+    if (!p) return 0;
+    if (pid)  *pid  = p->pid;
+    if (base) *base = p->image_base;
+    if (end)  *end  = p->image_end;
+    if (cr3)  *cr3  = p->cr3;
+    return (p->privilege == PRIV_USER && p->image_base != 0) ? 1 : 0;
+}
+
 /**
  * Find a free process slot
  */
 // #446: FXSAVE scratch for switches with no outgoing proc to save.
-uint8_t g_dummy_fpu_area[512] __attribute__((aligned(16)));
+uint8_t g_dummy_fpu_area[1024] __attribute__((aligned(64)));
+
+// #745 local 107: process.h/thread.h spell the size and alignment as literals
+// (they do not include cpu/sse.h). Lock them to the one definition here, where
+// both headers are visible.
+_Static_assert(sizeof(((process_t *)0)->fpu_area) == FPU_AREA_SIZE,
+               "#745 local 107: process_t::fpu_area must be FPU_AREA_SIZE");
+_Static_assert(sizeof(g_dummy_fpu_area) == FPU_AREA_SIZE,
+               "#745 local 107: g_dummy_fpu_area must be FPU_AREA_SIZE");
+_Static_assert(__alignof__(((process_t *)0)->fpu_area) == FPU_AREA_ALIGN,
+               "#745 local 107: process_t::fpu_area must be FPU_AREA_ALIGN aligned");
+_Static_assert(FPU_AREA_SIZE >= 576,
+               "#745 local 107: an xsave64 area is at least 512 legacy + 64 header");
 
 // #446: seed an FXSAVE image with the architectural default FPU environment.
 // An all-zero image is NOT a valid thing to fxrstor64: FCW=0 leaves every x87
@@ -318,12 +456,61 @@ uint8_t g_dummy_fpu_area[512] __attribute__((aligned(16)));
 // therefore ALSO done centrally in init_proc() and alloc_proc_slot() so a
 // future frame builder cannot silently miss it.
 void fpu_area_init(void *area) {
-    memset(area, 0, 512);
+    memset(area, 0, FPU_AREA_SIZE);
     ((fxsave_area_t *)area)->fcw   = 0x037F;
     ((fxsave_area_t *)area)->mxcsr = 0x1F80;
+    // #745 local 107: the 64-byte XSAVE header at offset 512 stays all-zero.
+    // XSTATE_BV = 0 makes xrstor64 load each component's architectural INIT
+    // state (x87 FCW=0x037F, XMM=0, YMM_Hi128=0) instead of reading it out of
+    // the image, which is exactly what a fresh task wants. XCOMP_BV = 0 is
+    // also REQUIRED: bit 63 set would mean the compacted format, which
+    // xrstor64 (as opposed to xrstors) will not accept.
+    //
+    // MXCSR is the exception. xrstor64 loads MXCSR from the legacy area
+    // whenever SSE or AVX is in the restore mask, REGARDLESS of XSTATE_BV, so
+    // the 0x1F80 seeded above is load-bearing for the xsave path too - a
+    // zeroed image would restore MXCSR=0 and unmask every SSE exception,
+    // which is #446 lesson 4 in a new costume.
 }
 
 void proc_init_fpu_area(process_t *p) { fpu_area_init(p->fpu_area); }
+
+// #110: fork()/clone() must hand the child the PARENT'S floating-point state,
+// not a freshly initialized one. POSIX requires the child of fork() to inherit
+// the parent's floating-point environment, and a cloned thread to inherit the
+// creating thread's; the previous code called proc_init_fpu_area(child) on
+// both paths, so every child started with FCW=0x037F / MXCSR=0x1F80 and zeroed
+// XMM/YMM/x87 registers no matter what the parent was doing.
+//
+// WHERE THE PARENT'S STATE ACTUALLY IS. It is NOT in me->fpu_area. That field
+// is written only by context_switch/context_start, i.e. the last time the
+// parent was descheduled, which can be an arbitrary amount of user execution
+// ago. Copying it would swap one wrong answer for another (a stale one).
+// The parent's real state is live in the physical registers: the kernel is
+// built -mno-sse -mno-sse2 and never touches them, and any interrupt that
+// descheduled the parent on the way in restored them on the way back. So the
+// correct source is a LIVE save taken here, in the parent's own syscall
+// context, straight into the child's area.
+//
+// This covers MXCSR and the x87 control word, not just the data registers: a
+// copy that got XMM0-15 but reset the rounding mode or the exception masks
+// would still be wrong, and would still pass a naive register-only test.
+//
+// AVX: fpu_save_live() branches on g_fpu_use_xsave exactly as the context
+// switch does (#107), so on a machine where AVX is enabled the child inherits
+// YMM0-15 in full, and on one where it is not, CR4.OSXSAVE is clear and there
+// is no YMM state in existence to inherit. fork therefore cannot be narrower
+// than the switch, which is the drift this comment exists to prevent.
+void fpu_capture_live(void *area) {
+    // xsave64 ORs into the existing XSTATE_BV and leaves bits outside the RFBM
+    // alone, so a stale header would survive into the image and make the
+    // matching xrstor64 #GP. Zero first. fork/clone are not hot paths; this is
+    // one FPU_AREA_SIZE memset per process creation.
+    memset(area, 0, FPU_AREA_SIZE);
+    fpu_save_live(area);
+}
+
+void proc_capture_fpu_from_current(process_t *p) { fpu_capture_live(p->fpu_area); }
 
 // #446 diagnostics. These are cheap (a few loads on the switch path) and only
 // print when something is already wrong; they exist because #446's fatal
@@ -403,9 +590,10 @@ static void proc_check_switch_target(process_t *p, const char *when) {
         }
     }
     fxsave_area_t *fx = (fxsave_area_t *)p->fpu_area;
-    if (((uint64_t)fx & 15) || (fx->mxcsr & 0xFFFF0000u) || fx->fcw == 0) {
+    if (((uint64_t)fx & (FPU_AREA_ALIGN - 1)) || (fx->mxcsr & 0xFFFF0000u) ||
+        fx->fcw == 0) {
         if (g_schedbug_reports < SCHEDBUG_MAX) { g_schedbug_reports++;
-            kprintf("[SCHEDBUG] %s: pid=%u '%s' invalid FXSAVE area @0x%lx fcw=0x%x mxcsr=0x%x - reseeding\n",
+            kprintf("[SCHEDBUG] %s: pid=%u '%s' invalid FPU area @0x%lx fcw=0x%x mxcsr=0x%x - reseeding\n",
                     when, p->pid, p->name, (uint64_t)fx, fx->fcw, fx->mxcsr); }
         proc_init_fpu_area(p);
     }
@@ -508,6 +696,11 @@ static process_t *alloc_proc_slot(void) {
  * Initialize a process structure
  */
 static void init_proc(process_t *proc, const char *name, process_priority_t prio) {
+    // #745 (local 75) CLASS FIX: the creator is the task running on THIS
+    // cpu. Through the BSP-published global, a process created on an AP
+    // inherited the BSP task's ppid, uid/gid/euid/egid, cwd and pgrp.
+    process_t *creator = proc_current();
+
     // ======================================================================
     // #75 part 3: A memset THAT CLEARS THE FIELD USED FOR MUTUAL EXCLUSION.
     //
@@ -556,7 +749,7 @@ static void init_proc(process_t *proc, const char *name, process_priority_t prio
     // builder runs next.
     fpu_area_init(proc->fpu_area);
     proc->pid = next_pid++;
-    proc->ppid = current_proc ? current_proc->pid : 0;
+    proc->ppid = creator ? creator->pid : 0;
     strncpy(proc->name, name, sizeof(proc->name) - 1);
     proc->state = PROC_STATE_READY;
     proc->priority = prio;
@@ -564,10 +757,10 @@ static void init_proc(process_t *proc, const char *name, process_priority_t prio
     proc->time_slice = TIME_SLICE_TICKS;
     proc->total_time = 0;
     // User identity: kernel processes default to root (0)
-    proc->uid  = current_proc ? current_proc->uid  : 0;
-    proc->gid  = current_proc ? current_proc->gid  : 0;
-    proc->euid = current_proc ? current_proc->euid : 0;
-    proc->egid = current_proc ? current_proc->egid : 0;
+    proc->uid  = creator ? creator->uid  : 0;
+    proc->gid  = creator ? creator->gid  : 0;
+    proc->euid = creator ? creator->euid : 0;
+    proc->egid = creator ? creator->egid : 0;
     proc->cr3 = 0;  // Will be set for user processes
     proc->user_stack_base = 0;
     proc->user_stack_size = 0;
@@ -577,8 +770,8 @@ static void init_proc(process_t *proc, const char *name, process_priority_t prio
 
     // Phase 0: default cwd for a new process is the filesystem root. Fork
     // overrides this by full-structure memcpy from the parent below.
-    if (current_proc && current_proc->cwd[0]) {
-        strncpy(proc->cwd, current_proc->cwd, PROC_CWD_MAX - 1);
+    if (creator && creator->cwd[0]) {
+        strncpy(proc->cwd, creator->cwd, PROC_CWD_MAX - 1);
         proc->cwd[PROC_CWD_MAX - 1] = '\0';
     } else {
         proc->cwd[0] = '/';
@@ -591,13 +784,20 @@ static void init_proc(process_t *proc, const char *name, process_priority_t prio
     // a self-led group in a self-led session. Fork overrides this by the
     // full-structure memcpy below, so these are only used for kernel threads
     // started via proc_create() and for the very first user process.
-    if (current_proc) {
-        proc->pgrp    = current_proc->pgrp ? current_proc->pgrp : proc->pid;
-        proc->session = current_proc->session ? current_proc->session : proc->pid;
+    if (creator) {
+        proc->pgrp    = creator->pgrp ? creator->pgrp : proc->pid;
+        proc->session = creator->session ? creator->session : proc->pid;
     } else {
         proc->pgrp    = proc->pid;
         proc->session = proc->pid;
     }
+
+    // The controlling terminal is inherited exactly like pgrp/session. It has
+    // to be: a pipeline stage is spawned by the SHELL, not by the terminal, so
+    // `less` in `ls | less` learns which pty it is attached to only by
+    // inheritance. The pts binding below OVERRIDES this for a process being
+    // started ON a fresh pty. -1 means the console.
+    proc->ctty = creator ? creator->ctty : -1;
 
     // Phase A2: Pre-open /dev/console on fds 0, 1, 2 (stdin/stdout/stderr).
     // Phase J: if g_tty_bind_pts_idx is >= 0 (set by proc_create_user_tty()
@@ -618,6 +818,11 @@ static void init_proc(process_t *proc, const char *name, process_priority_t prio
         };
         if (g_tty_bind_pts_idx >= 0 && g_tty_bind_pts_idx < 8) {
             dev = s_pts_names_by_idx[g_tty_bind_pts_idx];
+            // RECORD it as well as USE it. Before this line the index was
+            // consumed and forgotten, which is why /dev/tty could not exist:
+            // the one moment the kernel knew which terminal this process
+            // belonged to was also the moment it discarded the fact.
+            proc->ctty = g_tty_bind_pts_idx;
             g_tty_bind_pts_idx = -1;  // consume single-shot binding
         }
         // O_RDONLY=0 for stdin; O_WRONLY=1 for stdout/stderr. PTY slaves
@@ -742,7 +947,12 @@ static inline int sched_eff_prio(const process_t *p) {
 // (SCHEDSTORMPANIC=1 turns the report into a kpanic), exactly as
 // sync/noblock.c does for #426.
 
-#define SCHED_RQ_CPUS          8    // run queues; cores >= this share queue 0
+// #143: this used to be "#define MAYTERA_MAX_CPUS 8", one of FIVE disagreeing
+// answers to "how many CPUs" (see cpu/cpumax.h). It was not just the number of
+// queues: sched_rq_cpu() folds any core id >= it onto queue 0 and
+// sched_rq_set_consumer() ignores any core id >= it, so it was also the real,
+// undocumented cap on which cores could schedule user work at all. There is now
+// one run queue per SUPPORTED cpu, and one definition of that number.
 #define SCHED_RQ_SCAN_MAX     64    // == MAX_PROCESSES: bounds every queue walk
 
 typedef struct {
@@ -751,8 +961,96 @@ typedef struct {
     uint32_t   len;
 } sched_rq_t;
 
-static sched_rq_t g_rq[SCHED_RQ_CPUS];
+static sched_rq_t g_rq[MAYTERA_MAX_CPUS];
 static spinlock_t g_rq_lock = SPINLOCK_INIT;
+
+// ---------------------------------------------------------------------------
+// #130 SIGNATURE-A INSTRUMENT (2026-08-14). DIAGNOSTIC ONLY, not a fix.
+// ---------------------------------------------------------------------------
+// Three hang captures on a 4-vCPU SMP boot showed two cores spinning on this
+// exact lock (RDI = &g_rq_lock) while the other two spun in bkl_take_locked.
+// All four cores were accounted for and none progressing, so the holder of THIS
+// lock had to be one of the BKL spinners. That is INFERENCE. These globals turn
+// it into an identification: they name the owning core and the acquiring line,
+// readable from a wedged guest over QMP.
+//
+// #118 TRAP, deliberately avoided: a tag written OUTSIDE the critical section,
+// or by every path rather than only the winner, names whoever ran LAST instead
+// of whoever HOLDS the lock. #118 lost a cycle to exactly that. So the owner is
+// published only AFTER the acquire returns (only the winner reaches it) and
+// cleared BEFORE the release, so a free lock can never name a stale owner.
+extern uint32_t smp_this_cpu(void);
+volatile int      g_rq_owner_cpu  = -1;
+volatile int      g_rq_owner_line = 0;
+
+// #143 part 2: MEASURE THE LOCK BEFORE RESTRUCTURING IT.
+//
+// The ticket asks for per-queue locking. The prerequisite is a number: how many
+// acquisitions actually collide, and for how long is the lock held. Neither
+// existed. g_rq_acquires (the counter this replaces) was a plain non-atomic ++
+// on a shared word with no reader anywhere in the kernel, so it was neither
+// accurate nor observable: it could not answer the question the ticket is about.
+//
+// These four quantities are what decide the design:
+//
+//   acquires/contended  whether cores collide at all. With the #67 gate OFF -
+//                       the shipping default - only the BSP runs the scheduler,
+//                       so this SHOULD be zero and a non-zero reading is itself
+//                       a finding.
+//   held total          what fraction of wall time the lock is held. This is the
+//                       one that says whether splitting the lock can help: a
+//                       lock held 2% of the time is not a ceiling however many
+//                       cores want it.
+//   held max + line     the longest single hold and WHICH RQ_LOCK() call site
+//                       produced it. sched_rq_push() holds this lock while it
+//                       walks every queue and calls into the Rust placement
+//                       policy, so the critical section is O(ncpu * queue depth)
+//                       with interrupts off. If that dominates, shortening the
+//                       section beats splitting the lock, and it is a far
+//                       smaller change to make on a config that already wedges.
+//
+// #118 TRAP, avoided the same way the owner tag above avoids it: the hold clock
+// starts only AFTER the acquire returns, so only the winner ever writes it, and
+// the elapsed time is computed BEFORE the release. A hold time sampled outside
+// the critical section measures whoever ran last, not whoever held it.
+//
+// #130 INVARIANT: the core id is read once, after irq_save() inside the acquire,
+// and reused at unlock from a variable the lock itself protects. It is never
+// re-read across a point where interrupts could have been enabled.
+static spin_acct_t g_rq_acct = SPIN_ACCT_INIT;
+static volatile uint64_t g_rq_held_us     = 0;   // total us held, all cores
+static volatile uint64_t g_rq_held_max    = 0;   // longest single hold, us
+static volatile int      g_rq_held_max_ln = 0;   // RQ_LOCK() line that held it
+static volatile int      g_rq_held_max_cpu = -1;
+// Written only by the lock holder, read only by the lock holder. Protected by
+// g_rq_lock itself, which is why they need no atomics.
+static uint64_t g_rq_hold_t0  = 0;
+static int      g_rq_hold_cpu = -1;
+
+static inline uint64_t rq_lock_at(int line) {
+    uint64_t f = spinlock_acquire_irqsave_acct(&g_rq_lock, &g_rq_acct);
+    int c = (int)smp_this_cpu();
+    g_rq_owner_cpu  = c;
+    g_rq_owner_line = line;
+    g_rq_hold_cpu   = c;
+    g_rq_hold_t0    = mono_us();
+    return f;
+}
+static inline void rq_unlock(uint64_t f) {
+    uint64_t t0 = g_rq_hold_t0;
+    uint64_t held = t0 ? (mono_us() - t0) : 0;
+    g_rq_held_us += held;
+    if (held > g_rq_held_max) {
+        g_rq_held_max     = held;
+        g_rq_held_max_ln  = g_rq_owner_line;
+        g_rq_held_max_cpu = g_rq_hold_cpu;
+    }
+    g_rq_hold_t0    = 0;
+    g_rq_owner_line = 0;
+    g_rq_owner_cpu  = -1;
+    spinlock_release_irqrestore(&g_rq_lock, f);
+}
+#define RQ_LOCK() rq_lock_at(__LINE__)
 
 // #67: WHICH CORES ACTUALLY CONSUME THEIR RUN QUEUE. Bit N set means core N is
 // driving sched_schedule() and will pop its own queue.
@@ -773,7 +1071,7 @@ static spinlock_t g_rq_lock = SPINLOCK_INIT;
 // fallback is the single global proc_table[0], so two cores reaching it at once
 // would run one process on one kernel stack - the same class of bug as the
 // half-saved handoff, just arrived at from the other direction.
-volatile uint32_t g_rq_consumers = 1u;
+volatile cpumask_t g_rq_consumers = 1u;
 
 // #75 part 4: HAS proc_init() RUN YET.
 //
@@ -822,7 +1120,7 @@ volatile int g_proc_init_done = 0;
 // at the moment it is popped.
 // ===========================================================================
 static inline uint32_t sched_rq_cpu(void);   // defined below
-static process_t *volatile g_sel[SCHED_RQ_CPUS];
+static process_t *volatile g_sel[MAYTERA_MAX_CPUS];
 
 // #75: CLEAR IT ON EVERY PATH OUT. g_sel was set after the pop and cleared only
 // at the END of sched_schedule() and on the abandon path - not on its early
@@ -866,7 +1164,7 @@ static process_t *volatile g_sel[SCHED_RQ_CPUS];
 // IRETQ'd to Ring 3 re-enters on its next timer tick (<= 4 ms at 250 Hz). Both
 // paths are covered by construction rather than by inspection.
 #define SCHED_DEFER_MAX 4
-static process_t *volatile g_defer[SCHED_RQ_CPUS][SCHED_DEFER_MAX];
+static process_t *volatile g_defer[MAYTERA_MAX_CPUS][SCHED_DEFER_MAX];
 
 // #75 EVIDENCE 2. The deferred-enqueue design routes every enqueue through
 // add_to_ready_queue(), which refuses a task that is still executing. The
@@ -882,7 +1180,236 @@ static process_t *volatile g_defer[SCHED_RQ_CPUS][SCHED_DEFER_MAX];
 volatile uint64_t g_enq_refused   = 0;   // funnel deferred a still-executing task
 volatile uint64_t g_enq_allowed   = 0;   // funnel allowed one anyway (no defer room)
 volatile uint64_t g_enq_sidedoor  = 0;   // reached sched_rq_push() outside the funnel
-static uint8_t volatile g_in_funnel[SCHED_RQ_CPUS];
+static uint8_t volatile g_in_funnel[MAYTERA_MAX_CPUS];
+
+// ===========================================================================
+// #167: THE DEFER TABLE RECORDS THAT AN ENQUEUE IS OWED, NOT WHAT WAS OWED.
+//
+// sched_defer_enqueue() stores a bare process_t*. sched_drain_deferred() then
+// has to reconstruct, from p->state alone, whether the owed enqueue is still
+// wanted - and p->state is a different variable that any of 167 writers can
+// change in between. That reconstruction is wrong in BOTH directions:
+//
+//   LOST WAKE (the (b) half of this ticket). Every caller of
+//   add_to_ready_queue() pre-sets state = READY before calling, EXCEPT
+//   proc_wake(), which relies on the funnel to perform the transition (its own
+//   comment says so: "add_to_ready_queue sets state = READY as a side effect").
+//   The funnel's #75 defer path returns BEFORE that assignment. So a wake that
+//   lands on a task in the window between sched_self_block() and the context
+//   switch is deferred with the task still marked BLOCKED/SLEEPING, and the
+//   drain's `if (p->state == PROC_STATE_READY)` then silently DROPS it. The
+//   task ends up BLOCKED, wait_entry=0, wake_time=0, rq_queued=0, rq_wanted=0,
+//   on no queue and claimed by no core: exactly the state sync/waitq.c
+//   describes under #610 as "It is gone", and exactly the state #165 captured
+//   twice for pid 21 'audioinit'.
+//
+//   SPURIOUS ENQUEUE (the (c) half). The mirror image: if the state is READY
+//   at drain time for a task that is in fact executing, the drain queues a
+//   RUNNING task and a second core can switch into its live kernel stack.
+//
+// These counters separate the two and are readable out of a HUNG guest over
+// QMP, which the serial log is not (#307: the iMac has no serial at all, and
+// under the GUI the console is silent). g_enqlost_* keeps the FIRST offender's
+// identity for the same reason.
+// ===========================================================================
+volatile uint64_t g_enq_lost      = 0;   // drain dropped an owed WAKE: lost wakeup
+volatile uint64_t g_enq_dropped   = 0;   // drain dropped an owed requeue (legitimate)
+volatile uint64_t g_enq_wakefix   = 0;   // funnel performed the deferred transition
+volatile uint32_t g_enqlost_pid   = 0;
+volatile uint32_t g_enqlost_state = 0;   // state at the drain that dropped it
+volatile uint32_t g_enqlost_atenq = 0;   // state the funnel saw when it deferred
+volatile uint64_t g_enqlost_ra    = 0;   // return address of that funnel call
+
+// ===========================================================================
+// #167: IS THE DEADLINE ACTUALLY EXPIRED, BY THE CLOCK THE SWEEP CONSULTS?
+//
+// #165 captured every timed sleeper 16+ seconds past its deadline and still
+// SLEEPING, and left the reason open. The question underneath it is more basic
+// than "which path is missing": it is whether the sweep's own clock agrees that
+// the deadline has passed at all. blame.md's timer-ticks-is-not-a-wall-clock
+// entry is the prior - under KVM a starved vCPU gets its missed PIT ticks
+// re-injected in a BURST, so a tick-derived deadline can be reached late,
+// early, or in a jump - and #483/#499 moved these deadlines onto mono_ms() for
+// exactly that reason. If sched_now_ms() and sched_ticks disagree, nothing
+// downstream matters.
+//
+// So the sweep now publishes, every pass, the four numbers that settle it, all
+// readable out of a HUNG guest over QMP with no serial console:
+//   g_sweep_n        did the sweep run at all, and how often
+//   g_sweep_now      the exact `now` it computed (sched_now_ms(), ms)
+//   g_sweep_minleft  the EARLIEST deadline it looked at and chose NOT to wake
+//   g_sweep_left     how many sleepers it left asleep on that pass
+// g_sweep_now > g_sweep_minleft with the task still SLEEPING is a contradiction
+// that can only mean the sweep is not reaching that entry. g_sweep_now BELOW
+// the deadlines means the clock is behind and the deadline arithmetic is the
+// bug. The two are no longer confusable, which they were in every #165 capture.
+// ===========================================================================
+volatile uint64_t g_sweep_n       = 0;   // wake_sleeping_procs() invocations
+volatile uint64_t g_sweep_now     = 0;   // last sched_now_ms() it computed, ms
+volatile uint64_t g_sweep_ticks   = 0;   // sched_ticks AT THAT SAME INSTANT
+volatile uint64_t g_sweep_woke    = 0;   // sleepers woken, cumulative
+volatile uint64_t g_sweep_minleft = 0;   // earliest deadline left asleep, ms
+volatile uint32_t g_sweep_left    = 0;   // sleepers left asleep, last pass
+
+// #167 GATE. One binary, both arms: default ON, cleared for a boot by dropping
+// an empty /NOWAKEFIX.TXT on the ESP (main.c). #165's own control arm was
+// weakened by needing two builds; the #67 gate's file design does not have that
+// problem and is reused here deliberately.
+int g_wake_defer_fix = 1;
+
+// ===========================================================================
+// #75 (enqrace75): THE SELECTION PIN GUARDS AGAINST EXIT BUT NOT AGAINST
+// ENQUEUE.
+//
+// sched_pinned is set under g_rq_lock by sched_rq_pop_locked() and released
+// inside the switch asm. It marks the window between a core POPPING a task and
+// that core having SWITCHED to it. In that window the task is, by construction:
+//     rq_queued   == 0   (the pop unlinked it)
+//     sched_on_cpu == 0  (that flag is armed on the OUTGOING task, never the
+//                         incoming one - see the store at the `prev` site)
+//     sched_pinned != 0
+// So every guard the enqueue path actually consults reads "this task is idle
+// and queueable", and the one field that says otherwise is consulted by NOBODY
+// on that path. Measured, not argued: the only readers of sched_pinned are the
+// exit path's pin-wait, the switch asm's release, and four diagnostics.
+// add_to_ready_queue() tests is_idle and sched_on_cpu; sched_rq_push() tests
+// rq_queued. Neither tests sched_pinned.
+//
+// WHY THIS MATCHES THE FORENSICS AND THE EARLIER GUESSES DID NOT. The captured
+// failure reads "popped 'condrain' pid=16 which is already RUNNING (on_cpu=0)"
+// with FORENSICS "pinned=2" while the corruption was detected ON CPU 3. on_cpu
+// is ZERO, which no still-executing story explains, and pinned names a
+// DIFFERENT core from the one that faulted. Both are exactly what this window
+// produces: cpu1 had selected the task, a third party put it back in a queue,
+// cpu3 popped it and switched into a stack cpu1 was about to run on.
+//
+// WHY THE TEST MUST BE HERE AND NOT IN add_to_ready_queue(). The pin is set
+// under the run-queue lock. A test in the funnel would be outside that lock and
+// would reintroduce exactly the check-then-act window it is meant to close.
+// This is the only point that is serialised against the pop.
+volatile uint64_t g_enq_pinned = 0;   // enqueues attempted on a SELECTED task
+
+// ===========================================================================
+// #75 (enqrace75b): NOTHING ON THE ENQUEUE PATH ASKS WHETHER THE TASK IS
+// RUNNING, BECAUSE sched_on_cpu DOES NOT ANSWER THAT QUESTION.
+//
+// sched_on_cpu is written in exactly four places and every one of them is a
+// LEAVING event:
+//     sched_self_block()    arms it, then writes SLEEPING/BLOCKED
+//     sched_schedule()      arms it on the OUTGOING task (`prev`)
+//     context_switch.asm    clears it once the outgoing context is saved
+//     sched_self_running()  clears it when a task decides not to block
+// It is NEVER armed on an incoming task: sched_schedule() writes
+// `next->state = PROC_STATE_RUNNING` and switches, and next->sched_on_cpu stays
+// 0 for the entire time that task is executing.
+//
+// So `sched_on_cpu != 0` means "mid-switch-out, or has announced it is about to
+// block". It does not mean "running". One comment in this file already says so
+// exactly ("sched_on_cpu covers only the mid-switch window, not 'is running
+// right now'"), while add_to_ready_queue()'s refusal test, whose own comment
+// reads "REFUSE TO QUEUE A TASK THAT IS STILL EXECUTING", is consulted
+// everywhere else as if it meant the opposite. A task in the middle of its
+// timeslice presents on_cpu == 0, sched_pinned == 0 and rq_queued == 0 to every
+// guard on the enqueue path: precisely the "QUEUEABLE candidate" shape that the
+// WAKEPROBE2 complement reported and that has never been examined.
+//
+// THE MISSING PREDICATE, and it is a direct question with a direct answer: a
+// task is executing iff some core's per-cpu current_process points at it.
+// smp_set_current() already maintains that at every switch, and sched_rq_push()
+// ALREADY READS IT, three lines below where the enqueue is decided, to work out
+// what it would be preempting. Nothing has to be inferred from a flag.
+//
+// These counters are a CENSUS, deliberately not a one-shot. A single sample
+// cannot separate "this happens on one path" from "this happens on every path",
+// which is exactly the error [WAKEPROBE] made.
+volatile uint64_t g_enq_ok            = 0;  // enqueues that reached a run queue
+volatile uint64_t g_enq_running       = 0;  //  ...of a task a core was RUNNING
+volatile uint64_t g_enq_running_self  = 0;  //  ...running on the enqueueing core
+volatile uint64_t g_enq_running_other = 0;  //  ...running on a different core
+volatile uint64_t g_wake_cand_busy    = 0;  // wake sweep: the [WAKEPROBE] class
+volatile uint64_t g_wake_cand_free    = 0;  // wake sweep: the [WAKEPROBE2] class
+
+// #75 (enqrace75b): PER CALL SITE, BECAUSE "THE FORENSICS NAME THIS SITE" IS
+// PARTLY A MEASUREMENT OF CALL FREQUENCY.
+//
+// wake_sleeping_procs() runs on every sched_schedule() on every core and walks
+// the whole process table, so it is by a wide margin the most frequent caller of
+// the funnel and wins the last-stamp race by default. This table keeps CALLS and
+// ENQUEUES apart per return address, and records how many of each site's
+// enqueues put a RUNNING task into a queue.
+//
+// It is also the validation harness for the running-owner probe. A probe that
+// fires at every site, or at no site, discriminates nothing; this table shows
+// which it is at n in the thousands rather than at n = 1.
+//
+// PRECISION, STATED PLAINLY: the CALL counter is incremented in the funnel
+// OUTSIDE any lock, so concurrent cores can lose increments and can duplicate
+// one address into two slots. It is a lower bound and a shape, never an exact
+// count. The `ok` and `run` counters are incremented inside sched_rq_push()
+// under g_rq_lock and are exact for the address they are filed under.
+#define ENQ_RA_SLOTS 16
+static void     *volatile g_enqra_addr[ENQ_RA_SLOTS];
+static volatile uint64_t  g_enqra_call[ENQ_RA_SLOTS];
+static volatile uint64_t  g_enqra_ok[ENQ_RA_SLOTS];
+static volatile uint64_t  g_enqra_run[ENQ_RA_SLOTS];
+volatile uint64_t g_enqra_over = 0;   // sites that did not fit in the table
+
+// #75 (enqrace75b): THE POP-SIDE COMPLEMENT. An enqueue of a running task is
+// the PRECONDITION for the #75 corruption, not the corruption: the task is only
+// in danger if another core POPS it while it is still executing. That is a
+// question about the pop, so it is asked at the pop.
+//
+// g_pop_running counts pops of a task some core is currently running.
+// g_pop_running_other counts the subset where that core is NOT the popping one,
+// which is two cores holding one task and one kernel stack: the state #75 has
+// been chasing. The same-core subset is benign and expected - sched_schedule()
+// pops on the core whose `cur` it may hand back, and takes the `next == cur`
+// branch without switching.
+//
+// The report is emitted from sched_smp_report(), OUTSIDE g_rq_lock. A kprintf
+// under the hottest lock in the scheduler is how the #67 pass-6 instrument
+// became the fault it was measuring.
+static int32_t sched_running_owner(const process_t *p);   // defined below
+volatile uint64_t g_pop_running       = 0;
+volatile uint64_t g_pop_running_other = 0;
+// #75 (enqrace75b): the denominator. A probe that reads 0 is indistinguishable
+// from a probe that is never reached, which is the trap this ticket has hit
+// four times, so the number of pops it was reached on is printed beside it.
+volatile uint64_t g_pop_total         = 0;
+// #75 (enqrace75b): 1 while this core is between proc_yield()'s enqueue of a
+// still-running task and sched_schedule() arming sched_on_cpu on it, i.e. while
+// this core is holding the window open. Read at every pop to find out whether
+// the two sides can be concurrent AT ALL.
+volatile uint8_t  g_yield_gap[MAYTERA_MAX_CPUS];
+volatile uint64_t g_pop_in_gap        = 0;   // pops taken while another core was in its gap
+volatile uint64_t g_gap_opened        = 0;   // windows opened, the other denominator
+static volatile uint32_t g_poprun_pid, g_poprun_owner, g_poprun_cpu, g_poprun_state;
+static volatile void    *g_poprun_ra;
+static volatile int      g_poprun_pending = 0;
+static int               g_poprun_reported = 0;
+
+static int enq_ra_slot(void *ra) {
+    for (int i = 0; i < ENQ_RA_SLOTS; i++) {
+        if (g_enqra_addr[i] == ra) return i;
+        if (g_enqra_addr[i] == 0) { g_enqra_addr[i] = ra; return i; }
+    }
+    return -1;
+}
+
+// #75 GATE 1. One binary, both arms (the /NOWAKEFIX.TXT design, reused).
+// Default ON; cleared for a boot by dropping /NOPINFIX.TXT on the ESP.
+int g_enq_pin_fix = 1;
+
+// #75 GATE 2, an INDEPENDENT defect found while reading this path.
+// sched_on_cpu is documented as, and DECODED as, (cpu id + 1):
+// add_to_ready_queue() computes `owner = sched_on_cpu - 1` and uses it to index
+// the per-core defer table. The store on the outgoing task in sched_schedule()
+// wrote a LITERAL 1 regardless of which core was running, so on cores 1..N
+// every deferred enqueue from the voluntary-yield requeue was filed against
+// CORE 0. With SCHED_DEFER_MAX == 4 and only core 0 draining core 0's table,
+// all four cores' owed enqueues contend for four slots. Gated separately so it
+// cannot confound the pin experiment. Default ON; /NOCPUFIX.TXT disables.
+int g_enq_cpu_fix = 1;
 
 // ===========================================================================
 // #75 FINAL: "I AM ABOUT TO STOP RUNNING" IS ONE OPERATION, NOT TWO.
@@ -949,7 +1476,7 @@ void sched_self_block(void *vp, uint32_t new_state) {
     // and frame 0 is the wait-path caller of this funnel, which is what is wanted.
     sched_note_mutator(p, new_state, __builtin_return_address(0), (void *)0);
     uint32_t cpu = sched_rq_cpu();
-    if (cpu < SCHED_RQ_CPUS) p->sched_on_cpu = (int32_t)cpu + 1;
+    if (cpu < MAYTERA_MAX_CPUS) p->sched_on_cpu = (int32_t)cpu + 1;
     __asm__ volatile("" ::: "memory");   // arm is visible before the state write
     p->state = (process_state_t)new_state;
 }
@@ -973,24 +1500,83 @@ void sched_self_running(void *vp) {
 
 // Owed enqueues for tasks that have now left the CPU. Called at scheduler entry.
 static void sched_drain_deferred(uint32_t cpu) {
-    if (cpu >= SCHED_RQ_CPUS) return;
+    if (cpu >= MAYTERA_MAX_CPUS) return;
     for (uint32_t i = 0; i < SCHED_DEFER_MAX; i++) {
         process_t *p = g_defer[cpu][i];
         if (!p) continue;
         // Still on a core? Leave it owed; we will be back.
         if (p->sched_on_cpu != 0) continue;
+        // #75: or still SELECTED by a core that has not switched to it yet.
+        // Paying here would put a task back in a queue while another core is
+        // between its pop and its switch, which is the window this ticket is
+        // about. Same "leave it owed" treatment, same guarantee it is paid.
+        if (g_enq_pin_fix && p->sched_pinned != 0) continue;
         g_defer[cpu][i] = 0;
         p->rq_wanted = 0;
         // Only queue it if it still wants to run. A task that blocked or exited
         // after we deferred it must not be resurrected.
-        if (p->state == PROC_STATE_READY) add_to_ready_queue(p);
+        if (p->state == PROC_STATE_READY) { add_to_ready_queue(p); continue; }
+
+        // #167 INSTRUMENT. We are about to drop an owed enqueue. Whether that
+        // is correct depends entirely on what the funnel was asked to do, and
+        // sched_state_at_enq records exactly that (it is written by
+        // add_to_ready_queue() BEFORE anything overwrites the state).
+        //
+        //   at_enq = BLOCKED or SLEEPING  -> the caller was proc_wake(), i.e.
+        //       this WAS a wake, and dropping it deletes the task from the
+        //       scheduler for ever. That is the (b) failure.
+        //   at_enq = RUNNING or READY     -> the caller was a requeue and the
+        //       task has since blocked or exited on purpose. Dropping is right.
+        //
+        // CAVEAT, stated because #165 lost days to instruments that were
+        // confidently wrong: sched_state_at_enq is overwritten by any LATER
+        // add_to_ready_queue() call on the same task, so between the defer and
+        // this drain it can be re-stamped. It is a strong hint, not a proof, and
+        // the counters below should be read together with g_enq_refused.
+        if (p->sched_state_at_enq == (uint32_t)PROC_STATE_BLOCKED ||
+            p->sched_state_at_enq == (uint32_t)PROC_STATE_SLEEPING) {
+            g_enq_lost++;
+            if (g_enqlost_pid == 0) {
+                g_enqlost_pid   = p->pid;
+                g_enqlost_state = (uint32_t)p->state;
+                g_enqlost_atenq = p->sched_state_at_enq;
+                g_enqlost_ra    = (uint64_t)p->sched_enq_ra;
+            }
+            static int lost_warned = 0;
+            if (!lost_warned) {
+                lost_warned = 1;
+                static const char *st[6] = { "UNUSED", "READY", "RUNNING",
+                                             "SLEEPING", "BLOCKED", "ZOMBIE" };
+                uint32_t s_now = (uint32_t)p->state, s_enq = p->sched_state_at_enq;
+                kprintf("[ENQLOST] #167: dropped an OWED WAKE for '%s' pid=%u: "
+                        "state at defer=%s(%u), state now=%s(%u), drain_cpu=%u, "
+                        "enq_ra=0x%lx. This task is now on no queue and no core; "
+                        "nothing can wake it again.\n",
+                        p->name, p->pid,
+                        s_enq < 6 ? st[s_enq] : "?", s_enq,
+                        s_now < 6 ? st[s_now] : "?", s_now,
+                        cpu, (unsigned long)(uint64_t)p->sched_enq_ra);
+            }
+            // #167 FIX, arm 2 of 2. The transition belongs at the funnel (see
+            // add_to_ready_queue), so with the fix ON this branch is dead. It is
+            // kept as a BACKSTOP for any future caller that reaches the funnel
+            // without pre-setting READY: recovering a lost task is strictly
+            // better than deleting it, and the counter still records that it
+            // happened rather than hiding it.
+            if (g_wake_defer_fix) {
+                p->state = PROC_STATE_READY;
+                add_to_ready_queue(p);
+            }
+            continue;
+        }
+        g_enq_dropped++;
     }
 }
 
 // Record an owed enqueue. Returns 1 if taken, 0 if there was no room (in which
 // case the caller must fall back to enqueuing directly).
 static int sched_defer_enqueue(uint32_t cpu, process_t *p) {
-    if (cpu >= SCHED_RQ_CPUS || !p) return 0;
+    if (cpu >= MAYTERA_MAX_CPUS || !p) return 0;
     for (uint32_t i = 0; i < SCHED_DEFER_MAX; i++) {
         if (g_defer[cpu][i] == p) { p->rq_wanted = 1; return 1; }
         if (!g_defer[cpu][i]) { g_defer[cpu][i] = p; p->rq_wanted = 1; return 1; }
@@ -1000,9 +1586,9 @@ static int sched_defer_enqueue(uint32_t cpu, process_t *p) {
 
 #define SCHED_SEL_CLEAR() do { \
     uint32_t __sc = sched_rq_cpu(); \
-    if (__sc < SCHED_RQ_CPUS) g_sel[__sc] = 0; \
+    if (__sc < MAYTERA_MAX_CPUS) g_sel[__sc] = 0; \
 } while (0)
-static uint32_t            g_sel_state[SCHED_RQ_CPUS];
+static uint32_t            g_sel_state[MAYTERA_MAX_CPUS];
 volatile uint64_t g_sel_exit_hits = 0;   // exits that raced a selection
 volatile uint64_t g_sel_run_hits  = 0;   // pops that returned a RUNNING task
 
@@ -1059,8 +1645,28 @@ void sched_note_exit(void *vp) {
     process_t *p = (process_t *)vp;
     if (!p) return;
     uint32_t me = sched_rq_cpu();
-    for (uint32_t c = 0; c < SCHED_RQ_CPUS; c++) {
+    for (uint32_t c = 0; c < MAYTERA_MAX_CPUS; c++) {
         if (g_sel[c] != p) continue;
+        // #167: THE SAME-CORE CASE IS NOT A RACE, AND IT WAS THE ONLY CASE THAT
+        // EVER FIRED. g_sel[c] is set when core c POPS a task and is cleared at
+        // core c's NEXT entry to sched_schedule(), not when the switch
+        // completes. So a task that core c popped, switched to, and is now
+        // RUNNING still reads g_sel[c] == p for its whole timeslice - and when
+        // it exits, c == me and this test matched.
+        //
+        // MEASURED across #165's 55 boots: every one of the 14 CANDIDATE 2
+        // lines is 'audioinit' with "state at pop=1, now=2", i.e. popped READY
+        // and now RUNNING, which IS the benign shape - and they appear in runs
+        // that BOOTED FINE (arm-gateon run01/02/06/07, arm-stall run05/07,
+        // arm-base run10) as well as in the two that panicked. A detector that
+        // fires just as often on healthy boots has no discriminating power, and
+        // #165's conclusion that both panics were "CANDIDATE 2 on audioinit
+        // exiting" therefore rests on a signal that is present either way.
+        //
+        // A core cannot be about to switch INTO a task while it is executing
+        // that task's exit path. Skip self; the cross-core case, which is the
+        // one the probe was built for, is unaffected and has never fired.
+        if (c == me) continue;
         g_sel_exit_hits++;
         static int warned = 0;
         if (!warned) {
@@ -1091,14 +1697,14 @@ void sched_note_exit(void *vp) {
 // Slot 0 is the existing pid-0 idle and is unchanged. Each AP allocates its own
 // in sched_ap_enter(). A NULL slot means "this core has no idle process", and
 // the scheduler REFUSES to switch rather than falling back to somebody else's.
-static process_t *g_cpu_idle[SCHED_RQ_CPUS];
+static process_t *g_cpu_idle[MAYTERA_MAX_CPUS];
 
 // #67 pass 2: cross-core preemption. Set by sched_request_resched() when a
 // process is placed on a core that is running something it outranks; consumed
 // by that core's own sched_tick(). Bounded by one tick (4 ms at 250 Hz), which
 // is why the IPI is also sent: it wakes a HALTED core immediately instead of
 // leaving it asleep until its next timer interrupt.
-static volatile uint8_t g_need_resched[SCHED_RQ_CPUS];
+static volatile uint8_t g_need_resched[MAYTERA_MAX_CPUS];
 
 // Defined below; needed here so the resched poke can tell self from remote and
 // so the AP idle-loop work hint can size its scan.
@@ -1106,7 +1712,7 @@ static inline uint32_t sched_rq_cpu(void);
 static inline uint32_t sched_rq_ncpu(void);
 
 void sched_request_resched(uint32_t cpu) {
-    if (cpu >= SCHED_RQ_CPUS) return;
+    if (cpu >= MAYTERA_MAX_CPUS) return;
     g_need_resched[cpu] = 1;
     if (cpu != sched_rq_cpu()) {
         // #67 pass 8: DIRECTED. Broadcasting here interrupted every core on
@@ -1133,25 +1739,70 @@ void sched_request_resched(uint32_t cpu) {
 // lock by sched_rq_push(), which also sends the wake IPI, so this core is woken
 // again and re-reads it. It is never the only thing keeping a queue drained -
 // the timer tick on the BSP and the steal path both reach it too.
+// #167: AN OWED ENQUEUE IS WORK, AND ONLY THIS CORE CAN PAY IT.
+//
+// sched_drain_deferred() is reachable from exactly one place, sched_schedule(),
+// and on an AP sched_schedule() is reached from sched_ap_enter()'s loop ONLY
+// when sched_rq_has_work() says so - and that function looks at run-queue
+// LENGTHS and knows nothing about the defer table. So an AP holding an owed
+// enqueue, with nothing in any run queue, takes its "cli; re-check; sti; hlt"
+// and never pays it. The task is runnable, wants a core, and is referenced by
+// exactly one core that has just decided it has nothing to do.
+//
+// This is a SECOND lost-wake shape in the same table and it is NOT the one that
+// deleted audioinit: there the owed entry is reached and discarded because the
+// transition was missing, here it is never reached at all. A capture tells them
+// apart in one field - a STRANDED task reads rq_wanted=1, a DROPPED one reads
+// rq_wanted=0, and #165's audioinit read 0. It also matters more AFTER the
+// transition fix than before it: previously a wake in this position was thrown
+// away by the drain anyway, so the strand had nothing left to lose.
+//
+// ONLY PAYABLE entries count. An entry whose task is still executing somewhere
+// cannot be paid yet, and reporting it as work would turn the idle loop into a
+// spin on something it is not allowed to do. And no IPI is needed to wake this
+// core: an entry becomes payable exactly when the owning core's own switch asm
+// clears sched_on_cpu, which happens while that core is executing, before it
+// next re-tests this function.
+static int sched_defer_payable(uint32_t cpu) {
+    if (cpu >= MAYTERA_MAX_CPUS) return 0;
+    for (uint32_t i = 0; i < SCHED_DEFER_MAX; i++) {
+        process_t *p = g_defer[cpu][i];
+        if (p && p->sched_on_cpu == 0 &&
+            !(g_enq_pin_fix && p->sched_pinned != 0)) return 1;   // #75
+    }
+    return 0;
+}
+// How many times an owed enqueue was the ONLY reason this core did not halt.
+// Zero means the strand is theoretical on this workload; non-zero means a task
+// would have been left runnable-but-unreachable that many times.
+volatile uint64_t g_defer_strand = 0;
+
 static inline int sched_rq_has_work(uint32_t cpu) {
-    if (cpu < SCHED_RQ_CPUS && g_rq[cpu].len) return 1;
+    if (cpu < MAYTERA_MAX_CPUS && g_rq[cpu].len) return 1;
+    if (g_wake_defer_fix && sched_defer_payable(cpu)) { g_defer_strand++; return 1; }
     // Nothing local: is there anything anywhere worth stealing? Same hint
     // semantics; the steal itself re-checks under the lock.
     uint32_t n = sched_rq_ncpu();
-    for (uint32_t i = 0; i < n && i < SCHED_RQ_CPUS; i++)
+    for (uint32_t i = 0; i < n && i < MAYTERA_MAX_CPUS; i++)
         if (i != cpu && g_rq[i].len) return 1;
     return 0;
 }
 
 // This core's idle process, or NULL before it has one.
 static inline process_t *sched_idle_for_cpu(uint32_t cpu) {
-    if (cpu >= SCHED_RQ_CPUS) return g_cpu_idle[0];
+    if (cpu >= MAYTERA_MAX_CPUS) return g_cpu_idle[0];
     return g_cpu_idle[cpu];
 }
 void sched_rq_set_consumer(uint32_t cpu, int on) {
-    if (cpu >= SCHED_RQ_CPUS) return;
-    if (on) g_rq_consumers |= (1u << cpu);
-    else    g_rq_consumers &= ~(1u << cpu);
+    if (cpu >= MAYTERA_MAX_CPUS) return;
+    // #143: CPUMASK_BIT, not (1u << cpu). The old shift was of a uint32 and was
+    // correct only because the guard above happened to be 8. Nothing connected
+    // the guard to the mask width, so raising the cap past 32 would have been
+    // silent UB: x86 masks the shift count, so core 32 would have aliased onto
+    // core 0 and stranded its work with no log line. cpu/cpumax.h now fails the
+    // build instead.
+    if (on) g_rq_consumers |= CPUMASK_BIT(cpu);
+    else    g_rq_consumers &= ~CPUMASK_BIT(cpu);
 }
 
 // --- Rust policy seam (rustkern/schedwatch.rs) ------------------------------
@@ -1188,11 +1839,80 @@ extern uint32_t sched_watch_selftest_rs(void);
 #define SCHED_STORM_PER_TICK       80
 #define SCHED_STORM_REPORT_GAP   1000   // ticks between repeat reports per core
 
-static uint64_t g_sw_count[SCHED_RQ_CPUS];      // total switches by this core
-static uint64_t g_sw_win_sw[SCHED_RQ_CPUS];     // count at window open
-static uint64_t g_sw_win_tick[SCHED_RQ_CPUS];   // tick at window open
-static uint64_t g_sw_last_report[SCHED_RQ_CPUS];
-static uint64_t g_core_busy[SCHED_RQ_CPUS];     // ticks running a non-idle proc
+static uint64_t g_sw_count[MAYTERA_MAX_CPUS];      // total switches by this core
+static uint64_t g_sw_win_sw[MAYTERA_MAX_CPUS];     // count at window open
+static uint64_t g_sw_win_tick[MAYTERA_MAX_CPUS];   // tick at window open
+static uint64_t g_sw_last_report[MAYTERA_MAX_CPUS];
+static uint64_t g_core_busy[MAYTERA_MAX_CPUS];     // ticks running a non-idle proc
+// #169: how many PREEMPTION TICKS each Application Processor has actually
+// taken. This exists because "the timer is armed" and "the timer fires" are
+// different claims and this project has repeatedly shipped the first while
+// believing the second. A counter that stays at 0 on a core says the LVT write
+// went nowhere; the [APTICK] line below is the only way to tell that apart from
+// a core that simply had nothing to run.
+
+// #169 FFI to rustkern/aptick.rs. The bit values are duplicated here because C
+// cannot see Rust consts; they are checked by the APTICK bit self-test in
+// main.c, which asks the Rust side for the same masks it returns.
+#define APTICK_BUSY     (1u << 0)
+#define APTICK_ACK_RESC (1u << 1)
+#define APTICK_CHARGE   (1u << 2)
+#define APTICK_SETSLICE (1u << 3)
+#define APTICK_SCHED    (1u << 4)
+extern uint32_t ap_tick_decide_rs(uint32_t preempt_enabled, uint32_t has_cur,
+                                  uint32_t is_idle, uint32_t need_resched,
+                                  uint32_t slice, uint32_t *out_slice);
+
+// #169: PROVE THE C AND RUST SIDES AGREE ON THE BIT VALUES.
+//
+// The APTICK_* masks above are DUPLICATED from rustkern/aptick.rs, because C
+// cannot see a Rust `const`. A duplicated constant that drifts does not fail to
+// build and does not fail to link: it silently makes the scheduler act on the
+// wrong bit, e.g. charge CPU time where it meant to preempt. This project has
+// paid for exactly that shape (blame.md: a differential ran green because both
+// arms shared the wrong constant), so the agreement is MEASURED on the live
+// build rather than assumed from two files that look alike.
+//
+// Six cases, each with one unambiguous right answer, run once. Prints PASS with
+// the count or FAIL with the first disagreement. Cheap: six calls to a leaf
+// function, at the moment the first AP becomes a scheduler consumer.
+void aptick_selftest(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    struct { uint32_t pe, cur, idle, nr, slice, want_act, want_slice; } v[] = {
+        // no current process on this core: nothing to do at all
+        { 1, 0, 0, 0, 0, 0u, 0u },
+        // this core's idle process, nothing pending: account nothing, switch nothing
+        { 1, 1, 1, 0, 4, 0u, 0u },
+        // running, slice left: charge it and decrement, do NOT switch
+        { 1, 1, 0, 0, 2, APTICK_BUSY|APTICK_CHARGE|APTICK_SETSLICE, 1u },
+        // running, last tick of the slice: decrement to 0 and switch
+        { 1, 1, 0, 0, 1, APTICK_BUSY|APTICK_CHARGE|APTICK_SETSLICE|APTICK_SCHED, 0u },
+        // cross-core preemption request: expire the slice, ack it, switch
+        { 1, 1, 0, 1, 5, APTICK_BUSY|APTICK_ACK_RESC|APTICK_CHARGE|
+                         APTICK_SETSLICE|APTICK_SCHED, 0u },
+        // preemption globally disabled: still count the core busy, never switch
+        { 0, 1, 0, 0, 5, APTICK_BUSY, 0u },
+    };
+    for (unsigned i = 0; i < sizeof(v)/sizeof(v[0]); i++) {
+        uint32_t ns = 0xDEADu;
+        uint32_t got = ap_tick_decide_rs(v[i].pe, v[i].cur, v[i].idle,
+                                         v[i].nr, v[i].slice, &ns);
+        int slice_ok = (got & APTICK_SETSLICE) ? (ns == v[i].want_slice)
+                                               : (ns == 0xDEADu);
+        if (got != v[i].want_act || !slice_ok) {
+            kprintf("[APTICK] *** SELFTEST FAIL case %u: act=0x%x want 0x%x, "
+                    "slice=%u. The C APTICK_* masks and rustkern/aptick.rs "
+                    "DISAGREE; AP preemption is acting on the wrong bits. ***\n",
+                    i, got, v[i].want_act, ns);
+            return;
+        }
+    }
+    kprintf("[APTICK] selftest PASS: 6/6 cases, C masks == rustkern/aptick.rs\n");
+}static volatile uint64_t g_ap_ticks[MAYTERA_MAX_CPUS];
+// How many of those ticks ended in a preemption (slice expired -> switch).
+static volatile uint64_t g_ap_preempts[MAYTERA_MAX_CPUS];
 volatile uint64_t g_sched_storms = 0;           // storms observed, all cores
 
 // Which run queue this core uses. Falls back to 0 before per-cpu data is live,
@@ -1211,7 +1931,7 @@ static inline uint32_t sched_rq_cpu(void) {
     extern uint32_t smp_get_online_count(void);
     uint32_t online = smp_get_online_count();
     if (online == 0) online = 1;
-    if (c >= online || c >= SCHED_RQ_CPUS) return 0;
+    if (c >= online || c >= MAYTERA_MAX_CPUS) return 0;
     return c;
 }
 
@@ -1222,7 +1942,7 @@ static inline uint32_t sched_rq_ncpu(void) {
     if (!g_smp_user_sched) return 1;
     uint32_t n = smp_get_cpu_count();
     if (n < 1) n = 1;
-    return (n > SCHED_RQ_CPUS) ? SCHED_RQ_CPUS : n;
+    return (n > MAYTERA_MAX_CPUS) ? MAYTERA_MAX_CPUS : n;
 }
 
 // Priority-ordered insert into queue `cpu`. Caller must hold g_rq_lock.
@@ -1315,8 +2035,65 @@ static process_t *sched_rq_pop_locked(uint32_t cpu) {
             // up on it), exit must not tear it down. Taken under the run-queue
             // lock so the pin is published before the task is reachable by
             // anything else.
-            c->sched_pinned = (int32_t)cpu + 1;
+            // #75 (enqrace75) CORRECTED. This was `cpu + 1`, where `cpu` is
+            // the QUEUE THIS ENTRY WAS TAKEN FROM. On the steal path
+            // sched_rq_pop() calls this as sched_rq_pop_locked(victim), so a
+            // stolen task recorded the VICTIM's core id and not the core that
+            // had actually selected it and was about to run it.
+            //
+            // The field is documented as "cpu id + 1 from the instant a core
+            // POPS this task off a run queue until IT has switched to it", and
+            // the core that switches to it is the one calling this, always.
+            //
+            // THIS MATTERS BEYOND TIDINESS: it is the field the #75 forensics
+            // have been read through. The capture that motivated this ticket
+            // shows FORENSICS "pinned=2" while the corruption was detected ON
+            // CPU 3, which reads as two different cores holding one task. It is
+            // not: it is ONE core (3) stealing from core 1's queue and stamping
+            // core 1's id. Any inference of the form "pinned names a different
+            // core from the faulting one, therefore two cores held it" is
+            // unsound on every stolen task, and the steal path is precisely the
+            // cross-core case the ticket is about.
+            c->sched_pinned = (int32_t)sched_rq_cpu() + 1;
             c->sched_state_at_pop = (uint32_t)c->state;   // #75
+            // #75 (enqrace75b): IS THIS TASK EXECUTING ON A CORE RIGHT NOW?
+            // The pop already refuses c->sched_on_cpu != 0, and that flag is 0
+            // for the whole of a task's timeslice, so this check is not
+            // redundant with the one above it - it is the one the loop above
+            // was believed to be making.
+            //
+            // Note also that the existing [SCHED75] CANDIDATE 1 probe cannot
+            // see this class: it tests next->state == PROC_STATE_RUNNING, and
+            // proc_yield() sets state = READY BEFORE enqueueing, so a task
+            // queued while running presents state READY at the pop.
+            g_pop_total++;
+            {   // #75 (enqrace75b): is ANOTHER core holding the yield window
+                // open at this instant? Separates "the hole is unreachable
+                // because the kernel is serialised" from "the cores do overlap
+                // and the task is simply on a queue nobody looked at".
+                uint32_t __pn = sched_rq_ncpu();
+                if (__pn > MAYTERA_MAX_CPUS) __pn = MAYTERA_MAX_CPUS;
+                uint32_t __self = sched_rq_cpu();
+                for (uint32_t __i = 0; __i < __pn; __i++)
+                    if (__i != __self && g_yield_gap[__i]) { g_pop_in_gap++; break; }
+            }
+            {
+                int32_t __pro = sched_running_owner(c);
+                if (__pro != 0) {
+                    g_pop_running++;
+                    if ((uint32_t)(__pro - 1) != sched_rq_cpu()) {
+                        g_pop_running_other++;
+                        if (!g_poprun_reported && !g_poprun_pending) {
+                            g_poprun_pid   = c->pid;
+                            g_poprun_owner = (uint32_t)(__pro - 1);
+                            g_poprun_cpu   = sched_rq_cpu();
+                            g_poprun_state = (uint32_t)c->state;
+                            g_poprun_ra    = c->sched_enq_ra_ok;
+                            g_poprun_pending = 1;
+                        }
+                    }
+                }
+            }
             return c;
         }
         prev = c;
@@ -1352,16 +2129,16 @@ static process_t *sched_rq_pop_locked(uint32_t cpu) {
 void sched_rq_remove(void *vp) {
     process_t *p = (process_t *)vp;
     if (!p) return;
-    uint64_t fl = spinlock_acquire_irqsave(&g_rq_lock);
+    uint64_t fl = RQ_LOCK();
     if (p->rq_queued) {
         // It can only be on one queue, but scan all of them: the entry may have
         // been placed by a different core than the one exiting it, and a
         // mis-tracked rq_queued must not leave a dangling node behind.
-        for (uint32_t c = 0; c < SCHED_RQ_CPUS; c++)
+        for (uint32_t c = 0; c < MAYTERA_MAX_CPUS; c++)
             if (sched_rq_unlink_locked(c, p)) break;
     }
     p->rq_queued = 0;
-    spinlock_release_irqrestore(&g_rq_lock, fl);
+    rq_unlock(fl);
 }
 
 // Place a newly-runnable process on a run queue, PRIORITY-AWARE.
@@ -1374,9 +2151,36 @@ void sched_rq_remove(void *vp) {
 // (rustkern/schedwatch.rs) now prefers an idle core, then PREEMPTS a core
 // running something the arrival outranks, and only then queues by shortest WAIT
 // (entries that outrank it), not shortest queue.
+// #75 (enqrace75b): WHAT IS CORE i RUNNING? The one canonical form.
+//
+// `smp_cpu_current(i)` with a `current_proc` fallback for the BSP existed as
+// three hand-copied instances in this file (the sched_rq_push placement loop,
+// the [CPUOBS] report, and now this). With AP user scheduling off, cpu0's
+// per-cpu slot can be unset and current_proc is the authoritative answer for the
+// BSP, so the fallback is not optional and a fourth copy that forgot it would
+// silently report cpu0 as idle. Two of the three copies are replaced below.
+static inline process_t *sched_core_running(uint32_t i) {
+    process_t *r = (process_t *)smp_cpu_current(i);
+    if (!r && i == 0) r = current_proc;
+    return r;
+}
+
+// #75 (enqrace75b): IS THIS TASK EXECUTING ON A CORE RIGHT NOW?
+// Returns cpu+1 if some core's current process is `p`, else 0. See the census
+// block above for why no field already on the enqueue path answers this, and
+// why sched_on_cpu is not that field.
+static int32_t sched_running_owner(const process_t *p) {
+    if (!p) return 0;
+    uint32_t n = sched_rq_ncpu();
+    if (n > MAYTERA_MAX_CPUS) n = MAYTERA_MAX_CPUS;
+    for (uint32_t i = 0; i < n; i++)
+        if ((const process_t *)sched_core_running(i) == p) return (int32_t)i + 1;
+    return 0;
+}
+
 static void sched_rq_push(process_t *proc) {
     uint32_t n = sched_rq_ncpu();
-    sched_core_state_t cs[SCHED_RQ_CPUS];
+    sched_core_state_t cs[MAYTERA_MAX_CPUS];
     int32_t prio = (int32_t)sched_eff_prio(proc);
 
     proc->next = NULL;
@@ -1385,9 +2189,14 @@ static void sched_rq_push(process_t *proc) {
 
     // #75 evidence: did this call arrive through add_to_ready_queue()?
     { uint32_t __fc = sched_rq_cpu();
-      uint8_t viaf = (__fc < SCHED_RQ_CPUS) ? g_in_funnel[__fc] : 1;
+      uint8_t viaf = (__fc < MAYTERA_MAX_CPUS) ? g_in_funnel[__fc] : 1;
       proc->enq_route = viaf ? 1 : 2;
       if (!viaf) {
+          // #75 (enqrace75b): a side-door caller never passed the funnel, so it
+          // never stamped sched_enq_ra_ok. Stamp it here or this enqueue would
+          // be filed under whatever the funnel last saw, which is the exact
+          // confusion this field exists to end.
+          proc->sched_enq_ra_ok = __builtin_return_address(0);
           g_enq_sidedoor++;
           static int warned_side = 0;
           if (!warned_side) { warned_side = 1;
@@ -1398,15 +2207,93 @@ static void sched_rq_push(process_t *proc) {
                     (unsigned long)(uint64_t)__builtin_return_address(0)); }
       } }
 
-    uint64_t fl = spinlock_acquire_irqsave(&g_rq_lock);
+    uint64_t fl = RQ_LOCK();
 
     // Already linked into a queue: a second insert would splice one PCB into two
     // lists through a single `next` pointer. See process_t::rq_queued.
-    if (proc->rq_queued) { spinlock_release_irqrestore(&g_rq_lock, fl); return; }
+    if (proc->rq_queued) { rq_unlock(fl); return; }
+
+    // #75: IS A CORE ALREADY COMMITTED TO RUNNING THIS TASK? Read under the
+    // run-queue lock, which is the lock the pin is SET under, so this is
+    // serialised against sched_rq_pop_locked() rather than racing it.
+    // The report is emitted AFTER the unlock: a kprintf inside the run-queue
+    // lock would be a long hold on the hottest lock in the scheduler, which is
+    // the #67-pass-6 mistake of letting the instrument become the fault.
+    {
+        int32_t __pin = proc->sched_pinned;
+        if (__pin != 0) {
+            g_enq_pinned++;
+            uint32_t __pst = (uint32_t)proc->state;
+            int32_t  __poc = proc->sched_on_cpu;
+            static int warned_pin = 0;
+            int __report = 0;
+            if (!warned_pin) { warned_pin = 1; __report = 1; }
+            rq_unlock(fl);
+            if (__report) {
+                kprintf("[PINENQ] #75: '%s' pid=%u ENQUEUED while SELECTED by "
+                        "cpu%d (this_cpu=%u state=%u on_cpu=%d rq_queued=0 "
+                        "enq_ra=0x%lx). A task between pop and switch is in no "
+                        "queue and must not be put back into one.\n",
+                        proc->name, proc->pid, (int)(__pin - 1), sched_rq_cpu(),
+                        __pst, __poc,
+                        (unsigned long)(uint64_t)proc->sched_enq_ra);
+            }
+            if (g_enq_pin_fix) {
+                // Owe it to the core that holds the pin. That core releases the
+                // pin inside its own switch asm and drains on its next
+                // scheduler entry, so the wake is paid, not dropped.
+                //
+                // This is only sound because the pin now records the core that
+                // TOOK the task. Before the correction in sched_rq_pop_locked()
+                // a stolen task named the victim's core here, so the debt would
+                // have been filed against a core that never releases the pin and
+                // may not drain for a long time - a strand, i.e. the #167 defect
+                // reintroduced by a fix for #75. Noted because this patch
+                // ORIGINALLY HAD THAT BUG and it was found by reading the pop,
+                // not by any test: no arm distinguishes the two.
+                if (sched_defer_enqueue((uint32_t)(__pin - 1), proc)) {
+                    g_enq_refused++;
+                    return;
+                }
+                // No room to defer. Falling through queues a selected task,
+                // which is the very thing under test, so it is counted on the
+                // SAME counter #84 reads rather than hidden.
+                g_enq_allowed++;
+                proc->enq_allowed_hot = 1;
+            }
+            fl = RQ_LOCK();
+            if (proc->rq_queued) { rq_unlock(fl); return; }
+        }
+    }
+
+    // #75 (enqrace75b) THE PROBE. Under g_rq_lock, on the path that is about to
+    // INSERT, ask the question no guard here asks: is this task executing on a
+    // core at this instant? Recorded, NOT acted on. This pass is instruments;
+    // nothing is refused on the strength of a number that has not been shown to
+    // mean what it is read as meaning.
+    //
+    // The report is emitted AFTER the unlock. A kprintf inside the run-queue
+    // lock is about 87 us per character of THRE polling on the hottest lock in
+    // the scheduler, which is how the #67 pass-6 instrument became the fault.
+    int32_t  __ro    = sched_running_owner(proc);
+    uint32_t __mecpu = sched_rq_cpu();
+    int      __rslot = enq_ra_slot(proc->sched_enq_ra_ok);
+    int      __rrep  = 0;
+    proc->enq_running_owner = __ro;
+    g_enq_ok++;
+    if (__rslot >= 0) g_enqra_ok[__rslot]++; else g_enqra_over++;
+    if (__ro != 0) {
+        g_enq_running++;
+        if ((uint32_t)(__ro - 1) == __mecpu) g_enq_running_self++;
+        else                                 g_enq_running_other++;
+        if (__rslot >= 0) g_enqra_run[__rslot]++;
+        static int warned_run_enq = 0;
+        if (!warned_run_enq) { warned_run_enq = 1; __rrep = 1; }
+    }
 
     for (uint32_t i = 0; i < n; i++) {
         cs[i].queue_len = g_rq[i].len;
-        cs[i].flags     = (g_rq_consumers & (1u << i)) ? SCHED_CORE_CONSUMER : 0u;
+        cs[i].flags     = (g_rq_consumers & CPUMASK_BIT(i)) ? SCHED_CORE_CONSUMER : 0u;
         // How many queued entries OUTRANK the arrival: what it would actually
         // wait behind. Bounded by SCHED_RQ_SCAN_MAX like every other walk here.
         uint32_t above = 0, guard = 0;
@@ -1415,21 +2302,38 @@ static void sched_rq_push(process_t *proc) {
         cs[i].above_len = above;
         // What is running there. An idle core reports SCHED_PRIO_NONE so it
         // compares as preemptible against every real priority.
-        process_t *run = (process_t *)smp_cpu_current(i);
-        if (!run && i == 0) run = current_proc;
+        process_t *run = sched_core_running(i);   // #75 (enqrace75b): one form
         cs[i].cur_prio = (!run || run->is_idle) ? SCHED_PRIO_NONE
                                                 : (int32_t)sched_eff_prio(run);
     }
 
-    uint32_t prev_cpu = (proc->running_cpu >= 0) ? (uint32_t)proc->running_cpu : n;
+    // #83: the STICKY field. This asks "where did this task last run" about a
+    // task that is being enqueued, i.e. one that is by definition not running,
+    // so the live running_cpu would be -1 here every time and the hint would be
+    // dead code. This line is why last_cpu has to exist separately.
+    uint32_t prev_cpu = (proc->last_cpu >= 0) ? (uint32_t)proc->last_cpu : n;
     int r = sched_place_rs(cs, n, prio, prev_cpu);
     int target_was_idle = 0;
     int preempt = 0;
     uint32_t target;
     if (r < 0) {
-        // No eligible core. Queue 0 is the BSP, always a consumer, so falling
-        // back there can strand nothing.
+        // No eligible core: fall back to queue 0, the BSP.
+        //
+        // #130 (2026-08-14): THE COMMENT THAT USED TO BE HERE WAS WRONG, AND THE
+        // BUG WAS THE MISSING LINE BELOW. It read "Queue 0 is the BSP, always a
+        // consumer, so falling back there can strand nothing", and on that basis
+        // this branch left target_was_idle at 0. But being a scheduler CONSUMER
+        // is not the same as being AWAKE: sched_schedule()'s no_ready path puts a
+        // core into "sti; hlt". So a task placed here while cpu0 was halted was
+        // never woken, because the wake below is gated on target_was_idle.
+        //
+        // MEASURED, 4-vCPU throwaway VM, repeatedly: "[SCHEDCORE] cpu0=0%/0csw/3q
+        // cpu1=0%/0csw/0q cpu2=0%/0csw/0q cpu3=0%/0csw/0q consumers=0xf storms=0
+        // bkl=1001/0c/0s" - three tasks queued on cpu0, ZERO context switches on
+        // any core, all four cores registered as consumers, and the BKL showing
+        // zero contention and zero spins. Not a deadlock: a lost wakeup.
         target = 0;
+        target_was_idle = (cs[0].cur_prio == SCHED_PRIO_NONE);
     } else {
         preempt = (r & SCHED_PLACE_PREEMPT) ? 1 : 0;
         target  = (uint32_t)(r & 0xFF);
@@ -1437,7 +2341,19 @@ static void sched_rq_push(process_t *proc) {
         target_was_idle = (cs[target].cur_prio == SCHED_PRIO_NONE);
     }
     sched_rq_insert_locked(target, proc);
-    spinlock_release_irqrestore(&g_rq_lock, fl);
+    rq_unlock(fl);
+
+    // #75 (enqrace75b): first enqueue of a task that a core was RUNNING.
+    if (__rrep) {
+        kprintf("[RUNENQ] #75: '%s' pid=%u ENQUEUED while cpu%d was RUNNING it "
+                "(this_cpu=%u state_at_enq=%u on_cpu=%d pinned=%d rq_wanted=%u "
+                "enq_ra_ok=0x%lx). sched_on_cpu is 0 for a running task, so no "
+                "guard on this path refused it.\n",
+                proc->name, proc->pid, (int)(__ro - 1), __mecpu,
+                proc->sched_state_at_enq, proc->sched_on_cpu, proc->sched_pinned,
+                (unsigned)proc->rq_wanted,
+                (unsigned long)(uint64_t)proc->sched_enq_ra_ok);
+    }
 
     // #67 pass 3: wake ONLY when it can achieve something. The first version
     // broadcast a wake IPI on every remote placement. Every IPI runs an ISR on
@@ -1460,16 +2376,16 @@ static process_t *sched_rq_pop(void) {
     uint32_t n = sched_rq_ncpu();
     if (cpu >= n) cpu = 0;
 
-    uint64_t fl = spinlock_acquire_irqsave(&g_rq_lock);
+    uint64_t fl = RQ_LOCK();
     process_t *p = sched_rq_pop_locked(cpu);
     if (!p && n > 1) {
-        sched_core_state_t cs[SCHED_RQ_CPUS];
-        int32_t top[SCHED_RQ_CPUS];
+        sched_core_state_t cs[MAYTERA_MAX_CPUS];
+        int32_t top[MAYTERA_MAX_CPUS];
         for (uint32_t i = 0; i < n; i++) {
             cs[i].queue_len = g_rq[i].len;
             cs[i].above_len = 0;
             cs[i].cur_prio  = SCHED_PRIO_NONE;
-            cs[i].flags     = (g_rq_consumers & (1u << i)) ? SCHED_CORE_CONSUMER : 0u;
+            cs[i].flags     = (g_rq_consumers & CPUMASK_BIT(i)) ? SCHED_CORE_CONSUMER : 0u;
             top[i] = g_rq[i].head ? (int32_t)sched_eff_prio(g_rq[i].head) : SCHED_PRIO_NONE;
         }
         // Take the HIGHEST-PRIORITY waiting process in the system, not one off
@@ -1477,8 +2393,16 @@ static process_t *sched_rq_pop(void) {
         int victim = sched_steal_rs(cs, n, cpu, top);
         if (victim >= 0 && (uint32_t)victim < n) p = sched_rq_pop_locked((uint32_t)victim);
     }
-    spinlock_release_irqrestore(&g_rq_lock, fl);
-    if (p) p->running_cpu = (int)cpu;
+    rq_unlock(fl);
+    // #83: THE POP DELIBERATELY PUBLISHES NOTHING. This line used to be
+    // `p->running_cpu = (int)cpu`, and it was the ONLY write to the field in
+    // the whole kernel. Being popped off a run queue is not the same event as
+    // being run: the caller may still bail out before switching (the corrupted
+    // IRET-frame path in sched_schedule() does exactly that), and nothing here
+    // or anywhere else ever invalidated the value afterwards, so a task carried
+    // the core that last picked it up for the rest of its life. Both fields are
+    // now published together by sched_publish_cpu(), at the switch.
+    (void)cpu;
     return p;
 }
 
@@ -1489,9 +2413,45 @@ static process_t *sched_rq_pop(void) {
 // "heartbeat dead, no panic". A storm is now a LOUD, ADDRESSED serial line
 // naming the core, the rate and the process, and under `make SCHEDSTORMPANIC=1`
 // a kpanic, because a panic with state is strictly better than a hang.
+// ===========================================================================
+// #83: PUBLISH WHICH CORE THIS TASK IS ON. The single writer of running_cpu.
+//
+// Called from sched_schedule() immediately before each of the four switch
+// invocations, i.e. at the last point on every path where the core is
+// COMMITTED to the switch. Placing it here rather than earlier is deliberate:
+// sched_schedule() has an exit between selecting `next` and switching to it
+// (the corrupted-IRET-frame bail-out), and a publish before that point would
+// leave `next` claiming a core it never reached.
+//
+// `cpu` MUST be read by the caller inside sched_schedule()'s cli() region and
+// passed straight in. That is the #130 invariant: a core id is valid only while
+// interrupts are masked and must never be carried across an sti. #130 was a
+// hang caused by exactly that mistake one level down, in the BKL acquire, and
+// the reason the parameter is not read from smp_this_cpu() in here is so the
+// read and the store are visibly in the same masked region at the call site.
+//
+// Ordering note. prev is cleared BEFORE the switch asm has saved its context,
+// so for that window prev reports -1 while it is in fact still executing.
+// Conservative on purpose: this field may under-claim but must never name a
+// core a task is not on. The mid-switch window is made SAFE by sched_on_cpu
+// (cleared inside the switch asm), which is a different field with a different
+// job, and nothing keys a correctness decision on running_cpu.
+// ===========================================================================
+extern void sched_cpuobs_note_rs(uint32_t pid, int32_t from_cpu, uint32_t to_cpu);
+
+static inline void sched_publish_cpu(process_t *prev, process_t *next, uint32_t cpu) {
+    if (prev) prev->running_cpu = -1;
+    if (next) {
+        int32_t from = (int32_t)next->last_cpu;
+        next->running_cpu = (int)cpu;
+        next->last_cpu    = (int)cpu;
+        sched_cpuobs_note_rs(next->pid, from, cpu);
+    }
+}
+
 static void sched_storm_note(uint32_t cpu, const process_t *cur, const process_t *next) {
     extern volatile uint64_t timer_ticks;
-    if (cpu >= SCHED_RQ_CPUS) cpu = 0;
+    if (cpu >= MAYTERA_MAX_CPUS) cpu = 0;
     uint64_t t = timer_ticks;
     g_sw_count[cpu]++;
 
@@ -1544,51 +2504,133 @@ static void sched_storm_note(uint32_t cpu, const process_t *cur, const process_t
 // cores at half load - which is the ambiguity that produced this ticket. This
 // prints the per-core split on the serial console so the answer is a number the
 // Proxmox graph can be checked against. Called from sched_tick().
+// #118: must equal BKLSITE_N in cpu/smp.c and BKLSITE_MAX in rustkern/bklsite.rs.
+// A guessed constant does not fail loudly, so it is named once here and checked
+// against the table's real extent by the Rust side (bklsite_top rejects n > MAX).
+#define BKLSITE_REPORT_N 48u
+
+// #169: PROOF THE AP PREEMPTION TICK IS LIVE, printed by the BSP.
+//
+// Reported separately from [SCHEDCORE] rather than folded into it: that line is
+// already 512 bytes with a documented truncation history at 12 cores (#143), and
+// a diagnostic that proves a mechanism works must not be the field that gets
+// dropped. Fixed shape, greppable: [APTICK] cpu1=T/P ... where T is ticks taken
+// in this window and P is how many expired a slice and switched.
+//
+// cpu0 is deliberately absent: the BSP does not take this tick, and printing a
+// permanent 0 for it would read as "armed but never fires", which is exactly
+// the failure this line exists to detect on the APs.
+static void sched_aptick_report(uint64_t window) {
+    static uint64_t last_t[MAYTERA_MAX_CPUS], last_p[MAYTERA_MAX_CPUS];
+    uint32_t n = sched_rq_ncpu();
+    if (n <= 1) return;                 // single core: nothing to say
+    char line[256];
+    int o = 0;
+    uint64_t total = 0;
+    o += snprintf(line + o, sizeof(line) - (size_t)o, "[APTICK]");
+    for (uint32_t i = 1; i < n && i < MAYTERA_MAX_CPUS; i++) {
+        uint64_t t = g_ap_ticks[i]    - last_t[i];  last_t[i] = g_ap_ticks[i];
+        uint64_t p = g_ap_preempts[i] - last_p[i];  last_p[i] = g_ap_preempts[i];
+        total += t;
+        if (o >= (int)sizeof(line) - 32) continue;
+        o += snprintf(line + o, sizeof(line) - (size_t)o, " cpu%u=%lu/%lu",
+                      i, (unsigned long)t, (unsigned long)p);
+    }
+    // The window is in BSP ticks and the AP timer is armed at the SAME rate, so
+    // a healthy AP reads close to the window. Saying so in the line means the
+    // reader does not have to know that to judge it.
+    o += snprintf(line + o, sizeof(line) - (size_t)o,
+                  " (ticks/preempts per %lu-tick window)", (unsigned long)window);
+    if (total == 0)
+        o += snprintf(line + o, sizeof(line) - (size_t)o,
+                      " *** NO AP TOOK A TICK: preemption on the APs is "
+                      "COOPERATIVE ONLY (#169) ***");
+    kprintf("%s\n", line);
+}
+
 static void sched_smp_report(void) {
-    static uint64_t last = 0, last_busy[SCHED_RQ_CPUS], last_sw[SCHED_RQ_CPUS];
+    static uint64_t last = 0, last_busy[MAYTERA_MAX_CPUS], last_sw[MAYTERA_MAX_CPUS];
     if ((sched_ticks - last) < 1000) return;      // ~4 s at 250 Hz
     uint64_t window = sched_ticks - last;
     last = sched_ticks;
 
     uint32_t n = sched_rq_ncpu();
-    uint64_t busy[SCHED_RQ_CPUS];
-    uint32_t pct[SCHED_RQ_CPUS];
+    uint64_t busy[MAYTERA_MAX_CPUS];
+    uint32_t pct[MAYTERA_MAX_CPUS];
     for (uint32_t i = 0; i < n; i++) {
         busy[i] = g_core_busy[i] - last_busy[i];
         last_busy[i] = g_core_busy[i];
     }
-    if (sched_core_pct_rs(busy, n, window, pct, SCHED_RQ_CPUS) != 0) return;
+    if (sched_core_pct_rs(busy, n, window, pct, MAYTERA_MAX_CPUS) != 0) return;
+    sched_aptick_report(window);   // #169: before the early return below
 
     // One line, fixed shape, greppable: [SCHEDCORE] cpu0=NN%/SW ...
-    char line[192];
+    //
+    // #143: THIS BUFFER SILENTLY TRUNCATED. At 192 bytes it held about ten
+    // per-core fields, which was invisible while the cap was 8 and became
+    // reachable the moment #143 raised it to 32. MEASURED on a 12-vCPU boot
+    // before this fix: the line stopped after cpu9 with no indication, so two
+    // real cores were missing from the one diagnostic that exists to show
+    // per-core behaviour, and nothing said so.
+    //
+    // Two changes, and the second matters more than the first. The buffer is
+    // bigger, AND the truncation is now VISIBLE: a report that quietly stops
+    // early cannot be told apart from a machine that has fewer cores, which is
+    // precisely the silent-guard trap this project keeps paying for. The loop
+    // still refuses to overrun; it just says so afterwards.
+    char line[512];
     int o = 0;
+    uint32_t shown = 0;
     o += snprintf(line + o, sizeof(line) - (size_t)o, "[SCHEDCORE]");
-    for (uint32_t i = 0; i < n && o < (int)sizeof(line) - 32; i++) {
+    for (uint32_t i = 0; i < n; i++) {
         uint64_t sw = g_sw_count[i] - last_sw[i];
         last_sw[i] = g_sw_count[i];
+        // Every core's counter is consumed even if its field does not fit, so a
+        // truncated line never corrupts the NEXT window's deltas.
+        if (o >= (int)sizeof(line) - 40) continue;
         o += snprintf(line + o, sizeof(line) - (size_t)o, " cpu%u=%u%%/%lucsw/%uq",
                        i, pct[i], (unsigned long)sw, g_rq[i].len);
+        shown++;
     }
+    if (shown < n && o < (int)sizeof(line) - 24)
+        o += snprintf(line + o, sizeof(line) - (size_t)o, " +%u-more", n - shown);
     // #67 pass 3: BKL contention per window. "contended" is how many kernel
     // entries had to WAIT for the whole-kernel lock; "spins" is how many pause()
     // iterations were burned doing so. If those are large next to the switch
     // counts, the BKL is the ceiling and narrowing it is part of this task.
-    extern volatile uint64_t g_bkl_acq_pc[], g_bkl_con_pc[], g_bkl_spin_pc[];
-    extern volatile uint64_t g_bkl_hold_max[], g_bkl_hold_sum[], g_bkl_long[];
-    extern volatile uint32_t g_bkl_hold_reason[];
-    extern volatile uint32_t g_bkl_hold_cpu, g_bkl_hold_from_switch;
-    static uint64_t lb_acq, lb_con, lb_spin, lb_hsum;
-    uint64_t acq = 0, con = 0, spin = 0, hsum = 0, hmax = 0, lng = 0; uint32_t hres = 0;
-    for (uint32_t i = 0; i < n && i < SCHED_RQ_CPUS; i++) {
-        acq += g_bkl_acq_pc[i]; con += g_bkl_con_pc[i]; spin += g_bkl_spin_pc[i];
-        hsum += g_bkl_hold_sum[i]; lng += g_bkl_long[i];
-        if (g_bkl_hold_max[i] > hmax) { hmax = g_bkl_hold_max[i]; hres = g_bkl_hold_reason[i]; }
-        g_bkl_hold_max[i] = 0;   // per-window maximum
-    }
-    static uint64_t lb_long; uint64_t d_long = lng - lb_long; lb_long = lng;
-    uint64_t d_acq = acq - lb_acq, d_con = con - lb_con, d_spin = spin - lb_spin,
-             d_hsum = hsum - lb_hsum;
-    lb_acq = acq; lb_con = con; lb_spin = spin; lb_hsum = hsum;
+    //
+    // #166 THIS LOOP WAS THE BUG. It read:
+    //
+    //     for (uint32_t i = 0; i < n && i < MAYTERA_MAX_CPUS; i++) {
+    //         acq += g_bkl_acq_pc[i]; ... g_bkl_hold_max[i] = 0;
+    //
+    // with `n = sched_rq_ncpu()` (bounded by MAYTERA_MAX_CPUS = 32) over arrays
+    // that cpu/smp.c sized with its own BKL_STAT_CPUS = 8. On a 12-vCPU boot
+    // that is a four-element out-of-bounds READ of six counter arrays and an
+    // out-of-bounds WRITE of zero into a seventh. See cpu/smp.c's BKL_STAT_CPUS
+    // comment for the measured .bss aliasing and for the exact arithmetic that
+    // turns it into `held=18446743107341936826us`.
+    //
+    // The summation is now in the file that DECLARES the arrays and is bounded
+    // by sizeof() of one of them; this function no longer supplies a CPU count
+    // at all, because a caller that cannot state a count cannot state a wrong
+    // one. The window arithmetic and the invariants are in
+    // rustkern/bklstat.rs.
+    bkl_totals_t bt;
+    bkl_stat_totals(&bt);
+    static uint64_t lb_bkl_us;
+    uint64_t now_bkl_us = mono_us();
+    // 0 on the first window means "unknown length"; bklstat.rs withholds the
+    // duration-based verdicts rather than judging against a made-up number.
+    uint64_t d_bkl_us = lb_bkl_us ? (now_bkl_us - lb_bkl_us) : 0;
+    lb_bkl_us = now_bkl_us;
+    bkl_window_t bw;
+    { extern int g_smp_bkl_full;
+      (void)bkl_window_rs(&bt, d_bkl_us, n, g_smp_bkl_full, &bw); }
+    uint64_t d_acq  = bw.acquires,   d_con  = bw.contended,
+             d_spin = bw.spins,      d_hsum = bw.held_us,
+             d_long = bw.long_holds, hmax   = bw.max_us;
+    uint32_t hres = bw.max_reason;
     // held=<total us the lock was held this window> maxhold=<longest single
     // hold>@<reason>. Reason 0x1NN = interrupt vector NN, 0x2NN = syscall NN.
     // #67 pass 6: DROP THE GIANT LOCK ACROSS THE PRINT.
@@ -1626,23 +2668,300 @@ static void sched_smp_report(void) {
     static uint64_t lb_pw, lb_pt;
     uint64_t d_pw = g_pin_waits - lb_pw, d_pt = g_pin_timeouts - lb_pt;
     lb_pw = g_pin_waits; lb_pt = g_pin_timeouts;
-    kprintf("%s consumers=0x%x storms=%lu bkl=%lu/%luc/%lus held=%luus "
-              "maxhold=%luus@0x%x/cpu%u/sw%u long=%lu pin=%lu/%luto\n", line, g_rq_consumers,
+    // #166: cpu%u is now bw.max_cpu, the ARRAY INDEX that recorded this
+    // window's longest hold, not the old g_bkl_hold_cpu global. That global has
+    // one writer and no invalidator, so it named whichever core last set a new
+    // maximum at any point since boot - the exact defect #83 found in
+    // running_cpu. Same for sw%u.
+    kprintf("%s consumers=0x%llx storms=%lu bkl=%lu/%luc/%lus rec=%lu held=%luus "
+              "maxhold=%luus@0x%x/cpu%u/sw%u long=%lu pin=%lu/%luto bklcpus=%u\n",
+              line, (unsigned long long)g_rq_consumers,
               (unsigned long)g_sched_storms, (unsigned long)d_acq,
               (unsigned long)d_con, (unsigned long)d_spin,
+              (unsigned long)bw.recursive,
               (unsigned long)d_hsum, (unsigned long)hmax, hres,
-              g_bkl_hold_cpu, g_bkl_hold_from_switch, (unsigned long)d_long,
-              (unsigned long)d_pw, (unsigned long)d_pt);
+              bw.max_cpu, bw.max_from_switch, (unsigned long)d_long,
+              (unsigned long)d_pw, (unsigned long)d_pt, bw.ncpu);
+    // #166: THE VERDICT, ON ITS OWN LINE, WITH THE RAW NUMBERS BESIDE IT.
+    //
+    // Not a clamp. A clamped display of a broken counter is strictly worse than
+    // an obviously broken one, because it looks trustworthy and the next person
+    // sizes real work from it. If an invariant fails, the numbers above are
+    // printed exactly as computed and THIS line says which invariant and how
+    // many windows have failed since boot.
+    //
+    // It is printed on EVERY window, not only on failure. A check that only
+    // speaks when it has something to say cannot be told apart from one that is
+    // not running - the silent-guard trap this project has paid for repeatedly
+    // (see the pin= counters above, and #69/#83/#167).
+    { uint64_t nbad = bkl_window_bad_rs();
+      if (bw.flags)
+        kprintf("[BKLSTAT] BROKEN flags=0x%x badwindows=%lu (numbers above are "
+                "RAW and NOT clamped; see rustkern/bklstat.rs) ncpu=%u win=%luus\n",
+                bw.flags, (unsigned long)nbad, bw.ncpu, (unsigned long)d_bkl_us);
+      else
+        kprintf("[BKLSTAT] ok flags=0 badwindows=%lu ncpu=%u win=%luus\n",
+                (unsigned long)nbad, bw.ncpu, (unsigned long)d_bkl_us); }
+
+    // #75 (enqrace75b) THE ENQUEUE CENSUS. Per call site: funnel CALLS /
+    // enqueues that reached a run queue / how many of those enqueued a task a
+    // core was RUNNING at that instant.
+    //
+    // Printed on EVERY window and not only when a number is non-zero. A probe
+    // that only speaks when it has something to say cannot be told apart from a
+    // probe that is not running - the trap this file already records against the
+    // pin= counters, against #167 and against #69/#83.
+    { char l2[768]; int p2 = 0;
+      p2 += snprintf(l2 + p2, sizeof(l2) - (size_t)p2,
+                     "[ENQCENSUS] enq=%lu run=%lu(self=%lu other=%lu) "
+                     "pop_run=%lu(other=%lu)/%lu popingap=%lu gaps=%lu "
+                     "refused=%lu allowed=%lu sidedoor=%lu pinenq=%lu "
+                     "wakecand=%lu/%lu(busy/free) over=%lu |",
+                     (unsigned long)g_enq_ok, (unsigned long)g_enq_running,
+                     (unsigned long)g_enq_running_self,
+                     (unsigned long)g_enq_running_other,
+                     (unsigned long)g_pop_running,
+                     (unsigned long)g_pop_running_other,
+                     (unsigned long)g_pop_total,
+                     (unsigned long)g_pop_in_gap,
+                     (unsigned long)g_gap_opened,
+                     (unsigned long)g_enq_refused, (unsigned long)g_enq_allowed,
+                     (unsigned long)g_enq_sidedoor, (unsigned long)g_enq_pinned,
+                     (unsigned long)g_wake_cand_busy,
+                     (unsigned long)g_wake_cand_free,
+                     (unsigned long)g_enqra_over);
+      for (int i = 0; i < ENQ_RA_SLOTS; i++) {
+          if (!g_enqra_addr[i]) continue;
+          if (p2 >= (int)sizeof(l2) - 48) {
+              p2 += snprintf(l2 + p2, sizeof(l2) - (size_t)p2, " +more");
+              break;
+          }
+          p2 += snprintf(l2 + p2, sizeof(l2) - (size_t)p2, " 0x%lx:%lu/%lu/%lu",
+                         (unsigned long)(uint64_t)g_enqra_addr[i],
+                         (unsigned long)g_enqra_call[i],
+                         (unsigned long)g_enqra_ok[i],
+                         (unsigned long)g_enqra_run[i]);
+      }
+      kprintf("%s (site:calls/enq/enq-of-running)\n", l2); }
+
+    // #75 (enqrace75b): the first cross-core pop of a task another core was
+    // RUNNING, printed here because the pop itself holds g_rq_lock.
+    if (g_poprun_pending) {
+        g_poprun_pending = 0;
+        g_poprun_reported = 1;
+        kprintf("[RUNPOP] #75: cpu%u POPPED pid=%u which cpu%u was RUNNING "
+                "(state_at_pop=%u enq_ra_ok=0x%lx). Two cores now hold one task "
+                "and one kernel stack.\n",
+                g_poprun_cpu, g_poprun_pid, g_poprun_owner, g_poprun_state,
+                (unsigned long)(uint64_t)g_poprun_ra);
+    }
+    // #143 part 2: THE RUN-QUEUE LOCK, on its own line and in the same shape as
+    // the BKL line above, so the two are directly comparable. Printed
+    // unconditionally rather than only when it looks bad: a contention
+    // instrument that only speaks up when it has something to say cannot be
+    // told apart from one that is not running, which is the silent-guard trap
+    // this project has hit repeatedly (see the pin= counters above).
+    { extern int rqlock_verdict_rs(uint64_t, uint64_t, uint64_t, uint64_t);
+      extern uint32_t rqlock_contended_pct_rs(uint64_t, uint64_t);
+      extern uint32_t rqlock_held_pct_rs(uint64_t, uint64_t);
+      static uint64_t lr_acq, lr_con, lr_held, lr_us;
+      uint64_t now_us = mono_us();
+      uint64_t d_racq = g_rq_acct.acquires  - lr_acq;
+      uint64_t d_rcon = g_rq_acct.contended - lr_con;
+      uint64_t d_rheld = g_rq_held_us       - lr_held;
+      uint64_t d_rus  = now_us - lr_us;
+      lr_acq = g_rq_acct.acquires; lr_con = g_rq_acct.contended;
+      lr_held = g_rq_held_us;      lr_us = now_us;
+      uint64_t rmax = g_rq_held_max; int rln = g_rq_held_max_ln;
+      int rcpu = g_rq_held_max_cpu;
+      g_rq_held_max = 0;   // per-window maximum, like the BKL one
+      kprintf("[RQLOCK] acq=%lu con=%lu(%u%%) held=%luus(%u%% of %luus) "
+              "maxhold=%luus@process.c:%d/cpu%d verdict=%d queues=%u\n",
+              (unsigned long)d_racq, (unsigned long)d_rcon,
+              rqlock_contended_pct_rs(d_racq, d_rcon),
+              (unsigned long)d_rheld, rqlock_held_pct_rs(d_rheld, d_rus),
+              (unsigned long)d_rus, (unsigned long)rmax, rln, rcpu,
+              rqlock_verdict_rs(d_racq, d_rcon, d_rheld, d_rus), n); }
+
+    // #83 EVIDENCE. Two independent statements, because they fail differently.
+    //
+    // live: what each core's CURRENTLY RUNNING task says its own running_cpu
+    // is, sampled across all cores at one instant. live2=1 means two cores
+    // disagreed in that single sample, which a field stuck at a constant can
+    // never produce however long you watch it. This is the strong form.
+    //
+    // distinct/mig accumulate over the boot: how many different cores have ever
+    // been published, and how many switch-ins moved a task from one core to
+    // another. drops must be 0; non-zero means a core id was out of range and
+    // the other counts are LOW.
+    { extern uint32_t sched_cpuobs_distinct_rs(void);
+      extern uint64_t sched_cpuobs_migrations_rs(void);
+      extern uint64_t sched_cpuobs_switchins_rs(void);
+      extern uint64_t sched_cpuobs_drops_rs(void);
+      extern void sched_cpuobs_last_mig_rs(uint32_t *, int32_t *, int32_t *);
+      extern int sched_cpuobs_live_verdict_rs(const int32_t *, uint32_t);
+      int32_t live[MAYTERA_MAX_CPUS];
+      char lb[224]; int lo = 0;
+      lo += snprintf(lb + lo, sizeof(lb) - (size_t)lo, "[CPUOBS] live:");
+      uint32_t ln = (n < MAYTERA_MAX_CPUS) ? n : MAYTERA_MAX_CPUS;
+      for (uint32_t i = 0; i < ln; i++) {
+          process_t *r = sched_core_running(i);   // #75 (enqrace75b): one form
+          live[i] = r ? (int32_t)r->running_cpu : -1;
+          if (lo < (int)sizeof(lb) - 40)
+              lo += snprintf(lb + lo, sizeof(lb) - (size_t)lo, " cpu%u=%d/%s",
+                             i, live[i], r ? r->name : "-");
+      }
+      uint32_t mpid = 0; int32_t mfrom = -1, mto = -1;
+      sched_cpuobs_last_mig_rs(&mpid, &mfrom, &mto);
+      kprintf("%s live2=%d distinct=%u mig=%lu in=%lu drops=%lu lastmig=pid%u:%d->%d\n",
+              lb, sched_cpuobs_live_verdict_rs(live, ln),
+              sched_cpuobs_distinct_rs(),
+              (unsigned long)sched_cpuobs_migrations_rs(),
+              (unsigned long)sched_cpuobs_switchins_rs(),
+              (unsigned long)sched_cpuobs_drops_rs(),
+              mpid, mfrom, mto); }
+
+    // #118: WHO actually held the lock, ranked two ways.
+    //
+    // The @0xNNN tag on the line above names the last interrupt to fire during
+    // the hold, NOT the holder (see rustkern/bklsite.rs). These return
+    // addresses do name the holder: addr2line them against THIS build's
+    // kernel.elf. gap= is the worst interval between interrupt entries during
+    // that site's worst hold; near the 4 ms tick period means the core was
+    // genuinely executing throughout, near the hold length means it was not
+    // running at all.
+    { typedef struct { uint64_t ra, count, total_us, max_us, max_gap_us, worst_syscall; } bklsite_t;
+      extern bklsite_t g_bkl_sites[]; extern volatile uint64_t g_bklsite_drops;
+      extern uint32_t bklsite_top(const bklsite_t *, uint32_t, int, uint32_t *, uint32_t);
+      uint32_t idx[3], k;
+      // There is deliberately no single "[BKLMAX] ra=..." line. The first pass
+      // had one, reading a global recorded at max-hold time, and it was WRONG in
+      // a way worth writing down: sched_smp_report() zeroes g_bkl_hold_max[] and
+      // then calls bkl_release_all() to drop the lock across its own print, and
+      // that release is itself accounted - against a now-zero maximum, so it
+      // always won and always overwrote the global with the report's own call
+      // site. It printed isr_handler, gap=0, every single time, which looks like
+      // a finding rather than like an instrument eating itself. The per-site
+      // table below cannot have that bug: each site keeps its own maximum.
+      k = bklsite_top(g_bkl_sites, BKLSITE_REPORT_N, 0, idx, 3);
+      for (uint32_t i = 0; i < k; i++) { bklsite_t *e = &g_bkl_sites[idx[i]];
+        if (!e->total_us) break;
+        kprintf("[BKLSITE-TOTAL] #%u ra=0x%lx n=%lu total=%luus max=%luus gap=%luus sc=%lu\n",
+                i, (unsigned long)e->ra, (unsigned long)e->count,
+                (unsigned long)e->total_us, (unsigned long)e->max_us,
+                (unsigned long)e->max_gap_us, (unsigned long)e->worst_syscall); }
+      k = bklsite_top(g_bkl_sites, BKLSITE_REPORT_N, 1, idx, 3);
+      for (uint32_t i = 0; i < k; i++) { bklsite_t *e = &g_bkl_sites[idx[i]];
+        if (!e->max_us) break;
+        kprintf("[BKLSITE-MAX] #%u ra=0x%lx n=%lu total=%luus max=%luus gap=%luus sc=%lu\n",
+                i, (unsigned long)e->ra, (unsigned long)e->count,
+                (unsigned long)e->total_us, (unsigned long)e->max_us,
+                (unsigned long)e->max_gap_us, (unsigned long)e->worst_syscall); }
+      if (g_bklsite_drops)
+        kprintf("[BKLSITE] TABLE FULL, dropped=%lu samples (totals are LOW)\n",
+                (unsigned long)g_bklsite_drops);
+
+    // #143 re-measure: THE SAME HOLD TIME, RANKED BY THE PROCESS THAT HELD IT.
+    //
+    // WHY THIS LINE EXISTS. [BKLSITE-TOTAL] above answers "which call site" with
+    // 99% of all hold time at ONE address (proc/process.c:4220, the scheduler's
+    // bkl_reacquire() after context_switch()). That is not a bug in the table:
+    // proc_wrapper() takes the BKL for a kernel thread's entire life, so the
+    // retake after a switch genuinely does cover the resumed thread's whole
+    // residency. It just means the call site cannot name a holder, for ANY
+    // workload, and #118's rule is to name the holder rather than report an
+    // anonymous duration. The process can.
+    //
+    // Same table type, same Rust ranking, keyed on pid+1. Cumulative since boot,
+    // like [BKLSITE-TOTAL], so a late reader gets the whole run and not a window.
+    { extern bklsite_t g_bkl_pids[]; extern volatile uint64_t g_bklpid_drops;
+      extern const char *sched_pid_name_for_report(uint32_t);
+      k = bklsite_top(g_bkl_pids, BKLSITE_REPORT_N, 0, idx, 3);
+      for (uint32_t i = 0; i < k; i++) { bklsite_t *e = &g_bkl_pids[idx[i]];
+        if (!e->total_us) break;
+        uint32_t pid = (uint32_t)(e->ra - 1);       // key was pid + 1
+        kprintf("[BKLPID-TOTAL] #%u pid=%u name=%s n=%lu total=%luus max=%luus gap=%luus sc=%lu\n",
+                i, pid, sched_pid_name_for_report(pid), (unsigned long)e->count,
+                (unsigned long)e->total_us, (unsigned long)e->max_us,
+                (unsigned long)e->max_gap_us, (unsigned long)e->worst_syscall); }
+      if (g_bklpid_drops)
+        kprintf("[BKLPID] TABLE FULL, dropped=%lu samples (totals are LOW)\n",
+                (unsigned long)g_bklpid_drops); } }
+
+    // #121: WHICH SYSCALL, and what it was doing. The return addresses above
+    // name the acquire in proc/syscall.asm, which every syscall in the kernel
+    // shares; these name the syscall number and split its worst call across
+    // named phases. Printed here, inside the same released-BKL window, so the
+    // report cannot become the hold it is reporting (that is #67 pass 6, and
+    // it has already happened once in this ticket family).
+    { extern void scp_report(void); scp_report(); }
+
     // #75 evidence 2: refusal / allowed / side-door totals.
     { extern volatile uint64_t g_enq_refused, g_enq_allowed, g_enq_sidedoor;
-      static uint64_t lr, la, ls;
-      kprintf("[ENQ] refused=%lu allowed=%lu sidedoor=%lu (window +%lu/+%lu/+%lu)\n",
+      extern volatile uint64_t g_enq_pinned;   // #75
+      extern int g_enq_pin_fix, g_enq_cpu_fix;
+      static uint64_t lr, la, ls, lp;
+      kprintf("[ENQ] refused=%lu allowed=%lu sidedoor=%lu pinned=%lu "
+              "(window +%lu/+%lu/+%lu/+%lu) pinfix=%d cpufix=%d\n",
               (unsigned long)g_enq_refused, (unsigned long)g_enq_allowed,
-              (unsigned long)g_enq_sidedoor,
+              (unsigned long)g_enq_sidedoor, (unsigned long)g_enq_pinned,
               (unsigned long)(g_enq_refused - lr), (unsigned long)(g_enq_allowed - la),
-              (unsigned long)(g_enq_sidedoor - ls));
-      lr = g_enq_refused; la = g_enq_allowed; ls = g_enq_sidedoor; }
+              (unsigned long)(g_enq_sidedoor - ls), (unsigned long)(g_enq_pinned - lp),
+              g_enq_pin_fix, g_enq_cpu_fix);
+      lr = g_enq_refused; la = g_enq_allowed; ls = g_enq_sidedoor; lp = g_enq_pinned; }
+    // #75: halts taken while OWNING the BKL, per site, against halts taken
+    // correctly. A non-zero left-hand number is the wedge mechanism firing.
+    { extern volatile uint64_t g_haltbkl[4], g_haltbkl_ok[4];
+      kprintf("[HALTBKL] owned/total ap=%lu/%lu noidle=%lu/%lu nocur=%lu/%lu "
+              "bsp=%lu/%lu\n",
+              (unsigned long)g_haltbkl[0], (unsigned long)(g_haltbkl[0] + g_haltbkl_ok[0]),
+              (unsigned long)g_haltbkl[1], (unsigned long)(g_haltbkl[1] + g_haltbkl_ok[1]),
+              (unsigned long)g_haltbkl[2], (unsigned long)(g_haltbkl[2] + g_haltbkl_ok[2]),
+              (unsigned long)g_haltbkl[3], (unsigned long)(g_haltbkl[3] + g_haltbkl_ok[3])); }
       bkl_reacquire(__d); }
+}
+
+// ===========================================================================
+// #745 (#75) HALTING WHILE OWNING THE BIG KERNEL LOCK.
+//
+// The measured wedge is one core halted with the BKL held while the other spins
+// in bkl_take_locked(). Nothing can then become runnable, so the halted core is
+// never woken and the machine is dead with both run queues empty.
+//
+// Every site in this kernel that puts a core to sleep is checked here, and each
+// one COUNTS separately, so "which halt" is a measurement rather than an
+// inference. The first few occurrences also print the return address of every
+// outstanding acquire, which is what names the unbalanced one.
+// ===========================================================================
+volatile uint64_t g_haltbkl[4];        // owned the BKL at this halt site
+volatile uint64_t g_haltbkl_ok[4];     // reached this halt site not owning it
+
+static const char *haltbkl_site(uint32_t s) {
+    switch (s) {
+        case 0: return "sched_ap_enter idle loop";
+        case 1: return "sched_schedule no-idle-process halt";
+        case 2: return "sched_schedule next==cur no_ready halt";
+        default: return "idle_process (BSP)";
+    }
+}
+
+// may_print: 0 at sites reached with IF=0, where a kprintf would only queue.
+static void sched_halt_bkl_note(uint32_t site, int may_print) {
+    void *ra[4] = {0,0,0,0}; uint8_t via[4] = {0,0,0,0};
+    uint32_t d = bkl_self_forensics(ra, via, 4);
+    if (site > 3) return;
+    if (!d) { g_haltbkl_ok[site]++; return; }
+    g_haltbkl[site]++;
+    static uint32_t printed[4];
+    if (may_print && printed[site] < 3) {
+        printed[site]++;
+        kprintf("[HALTBKL] cpu %u is about to HALT at %s while OWNING the BKL: "
+                "depth=%u ra0=0x%lx/v%u ra1=0x%lx/v%u ra2=0x%lx/v%u "
+                "(v1=bkl_acquire v2=bkl_reacquire)\n",
+                smp_this_cpu(), haltbkl_site(site), d,
+                (unsigned long)ra[0], via[0], (unsigned long)ra[1], via[1],
+                (unsigned long)ra[2], via[2]);
+    }
 }
 
 // ===========================================================================
@@ -1680,7 +2999,7 @@ void sched_ap_enter(uint32_t cpu) {
         }
         return;
     }
-    if (cpu == 0 || cpu >= SCHED_RQ_CPUS) {
+    if (cpu == 0 || cpu >= MAYTERA_MAX_CPUS) {
         kprintf("[SCHED] AP enter refused for cpu %u (out of range)\n", cpu);
         return;
     }
@@ -1703,7 +3022,8 @@ void sched_ap_enter(uint32_t cpu) {
     idle->is_idle     = 1;   // #75: init_proc's memset cleared it; restore now
     idle->privilege   = PRIV_KERNEL;
     idle->state       = PROC_STATE_RUNNING;
-    idle->running_cpu = (int)cpu;
+    idle->running_cpu = (int)cpu;   // #83: live - it is running, here, now
+    idle->last_cpu    = (int)cpu;   // #83: sticky
     idle->time_slice  = TIME_SLICE_TICKS;
     // The core's boot stack IS this process's kernel stack: we are standing on
     // it. Recorded so proc_check_switch_target() and the TSS logic see a sane
@@ -1712,13 +3032,33 @@ void sched_ap_enter(uint32_t cpu) {
     per_cpu_t *me = smp_get_current_cpu();
     { uint64_t top = me ? me->stack_top : 0;
       if (top) { idle->stack_base = (void *)(top - PROCESS_STACK_SIZE);
-                 idle->stack_size = PROCESS_STACK_SIZE; } }
+                 idle->stack_size = PROCESS_STACK_SIZE;
+                 // #130: TAG IT. Every other stack-owning path calls
+                 // proc_stack_tag() (process.c:2411, 2521, 3971, 4242, 4415);
+                 // this one never did, so the AP idle threads' kernel stacks
+                 // carried tag=0 owner=0 forever and proc_check_switch_target()
+                 // reported "SHARED STACK or deep overflow" on EVERY switch to
+                 // idle1/idle2/idle3.
+                 //
+                 // MEASURED on a 4-vCPU boot: 34 + 28 + 18 = 80 such reports,
+                 // against a SCHEDBUG_MAX budget of 40. The false positives
+                 // EXHAUSTED the detector, so a genuine shared-stack report
+                 // could never be printed. This is a diagnostic-correctness
+                 // fix: it removes the noise so the detector can speak. It is
+                 // NOT itself a fix for the SMP corruption.
+                 //
+                 // SAFE: SMP_STACK_SIZE == PROCESS_STACK_SIZE == 16KB (smp.h:24,
+                 // process.h:25), so (top - PROCESS_STACK_SIZE) is exactly this
+                 // core's own stack_base, and the stack grows DOWN from top, so
+                 // the low 16 bytes are the last memory the core would reach.
+                 proc_stack_tag(idle); } }
 
     g_cpu_idle[cpu] = idle;
     smp_set_current(idle);
     sched_rq_set_consumer(cpu, 1);   // ONLY now may work be placed here
     kprintf("[SCHED] cpu %u is now a scheduler consumer (idle pid %u), "
-            "consumers=0x%x\n", cpu, idle->pid, g_rq_consumers);
+            "consumers=0x%llx\n", cpu, idle->pid, (unsigned long long)g_rq_consumers);
+    aptick_selftest();   // #169: once, on the first AP to get here
 
     // The idle loop.
     //
@@ -1738,13 +3078,15 @@ void sched_ap_enter(uint32_t cpu) {
     // loop and not a spin: the core burns no host CPU while idle, and the wake
     // IPI from sched_rq_push() brings it straight back round.
     //
-    // NOTE, and it is the next piece of work: without a per-core timer this
-    // core's preemption is COOPERATIVE. A process here runs until it blocks,
-    // yields or exits. That is correct for everything that waits on an event
-    // (the compositor, service threads) and wrong for a CPU-bound process,
-    // which will hold this core until it finishes. Arming the LAPIC timer per
-    // core is the fix, and it has to avoid double-counting the global
-    // timer_ticks, which is why it is not folded into this change.
+    // #169, DONE: this core now takes its OWN preemption tick. tick_ap_arm()
+    // (cpu/isr.c) arms this AP's LAPIC timer on vector 0x42 in ap_entry(), and
+    // sched_tick_ap() decrements the running process's slice and preempts it.
+    // The note that used to be here said preemption on an AP was COOPERATIVE
+    // and that a CPU-bound process would hold the core until it finished. That
+    // was correct and it was MEASURED at 837x between two identical Ring-3
+    // workers (#168 Job 1). It also warned that the fix must not double-count
+    // timer_ticks; it does not - sched_tick_ap() touches no global tick state
+    // at all, which is the whole reason it is a separate function.
     while (me && !me->should_halt) {
         // Keep the #279 role: drain kernel jobs first, so making this core a
         // scheduler does not cost the parallel work ring.
@@ -1752,6 +3094,10 @@ void sched_ap_enter(uint32_t cpu) {
         // #67 pass 4: only enter the scheduler when there is plausibly work.
         // See sched_rq_has_work() for why an unlocked hint is sound here.
         if (sched_rq_has_work(cpu)) sched_schedule();
+        // #75: about to halt. Checked HERE, with IF still set, so the report can
+        // reach the wire; nothing between this point and the hlt below takes the
+        // BKL, and the count at the hlt itself (site 0, silent) confirms it.
+        sched_halt_bkl_note(0, 1);
         // #67 pass 11: HALT WITHOUT LOSING A WAKE.
         //
         // This used to be a bare "sti; hlt". sti+hlt is atomic, so a wake IPI
@@ -1795,30 +3141,157 @@ void sched_smp_selftest(void) {
         kprintf("[SCHEDWATCH] selftest OK (storm verdict, placement, steal, "
                 "per-core percent)\n");
     }
+
+    // #83: the same proof for the running_cpu verdicts. These are pure
+    // functions, so they can be PROVEN on this exact build rather than argued
+    // about, and the cases that matter are the ones that would let a BROKEN
+    // field look proven: an all-equal snapshot (exactly what the pre-#83
+    // constant produced) must NOT read as two cores disagreeing.
+    { extern int sched_cpuobs_selftest_rs(void);
+      int cf = sched_cpuobs_selftest_rs();
+      if (cf) kprintf("[CPUOBS] SELFTEST FAILED at check %d - the running_cpu "
+                      "evidence line cannot be trusted on this build\n", cf);
+      else    kprintf("[CPUOBS] selftest OK (live-disagreement verdict: "
+                      "all-equal, mixed, idle-skip, degenerate)\n"); }
+
+    // #143 part 2: the same proof for the run-queue lock verdict. This decides
+    // whether the [RQLOCK] line below is worth reading at all, and every one of
+    // its cases asserts a SPECIFIC classification, including the ones that must
+    // NOT fire: a threshold that reports HOT for everything would make the
+    // whole measurement worthless while looking like it was working.
+    { extern uint32_t rqlock_selftest_rs(void);
+      uint32_t rf = rqlock_selftest_rs();
+      if (rf) kprintf("[RQLOCK] SELFTEST FAILED at check %u - the contention "
+                      "verdict on this build is WRONG; do not size the #143 "
+                      "lock work from its numbers\n", rf);
+      else    kprintf("[RQLOCK] selftest OK (idle, busy-uncontended, hot, "
+                      "below-threshold, saturated, percentages, corrupt-pair)\n"); }
+    // #166: the same proof for the BKL statistics. Every case asserts a
+    // SPECIFIC outcome, including the ones that must NOT fire and including
+    // "nothing moved", because a counter stuck at zero satisfies every other
+    // invariant in that file and would otherwise read as healthy.
+    { uint32_t bf = bkl_stat_selftest_rs();
+      if (bf) kprintf("[BKLSTAT] SELFTEST FAILED at check %u - the BKL window "
+                      "arithmetic on this build is WRONG; do not size any BKL "
+                      "narrowing from its numbers (#166)\n", bf);
+      else    kprintf("[BKLSTAT] selftest OK (healthy, held-underflow, "
+                      "con>acq, maxhold>window, held>capacity, at-capacity-ok, "
+                      "long>acq, stalled, disarmed, first-window, spin-underflow, "
+                      "unknown-window)\n"); }
 }
 
 /**
  * Add a process to the ready queue (priority-based insertion)
  */
 static void add_to_ready_queue(process_t *proc) {
+    // ---------------------------------------------------------------------
+    // #130 (2026-08-15): AN IDLE PROCESS MUST NEVER ENTER THE SHARED QUEUE.
+    // ---------------------------------------------------------------------
+    // The guard for this existed at exactly ONE of this function's callers
+    // (sched_schedule's switch-out path, "#67: never queue an idle proc"). Every
+    // other caller could queue an idle proc, and one did: wake_sleeping_procs()
+    // at process.c:3138 enqueues any PROC_STATE_SLEEPING entry whose deadline
+    // expired, with no is_idle test.
+    //
+    // CAUGHT IN THE ACT by the kernel's own detector:
+    //   [SCHEDRACE] *** CORRUPT CONTEXT DETECTED at pre-switch on cpu 0 ***
+    //   reason 2: incoming task still marked on-cpu (half-saved context)
+    //   FORENSICS 'idle' pid=0: enq=1 pop=1 now=2 queued_by=0x59b0b4 pinned=0
+    //   incoming: 'idle' pid=0 state=2 on_cpu=3 rsp=0x6b6dfc8
+    //                                  stack=[0x6b5e640,0x6b6e640)
+    //   outgoing: ''     pid=0 state=0 on_cpu=1 rsp=0x0 stack=[0x0,0x0)
+    // queued_by resolves to wake_sleeping_procs (process.c:3138). enq=1/pop=1
+    // means pid 0 went THROUGH the shared queue and was popped by another core,
+    // so cpu0 switched to it while cpu3 still held it.
+    //
+    // pid 0 is the BSP desktop/idle context and owns ONE fixed kernel stack.
+    // Two cores running it shred each other's return addresses on that stack.
+    // The result is the repeating wild-RIP fault seen across boots:
+    //   [KERNEL PANIC] Invalid Opcode at RIP=0x45   (twice, identical value)
+    // with the faulting RSP inside pid 0's own stack range both times.
+    //
+    // Fixed HERE, in the shared primitive, rather than by adding a tenth
+    // is_idle test at a tenth call site: this makes it true BY CONSTRUCTION for
+    // every present and future caller. Idle procs are never reached through the
+    // queue anyway - they are dispatched directly via g_cpu_idle[] and the
+    // empty-queue fallback - so refusing them here removes nothing.
+    if (proc && proc->is_idle) return;
+
     // #75: capture the state the caller handed us, BEFORE anything below
     // overwrites it to READY, plus who the caller was. If a task is ever queued
     // in a state that is not queueable, this is where it becomes visible.
     if (proc) {
         proc->sched_state_at_enq = (uint32_t)proc->state;
         proc->sched_enq_ra       = __builtin_return_address(0);
+        // #75 (enqrace75b): count the CALL here and the ENQUEUE in
+        // sched_rq_push(), so a site's refusals are call minus enq rather than
+        // being invisible. See the ENQ_RA_SLOTS block for the precision caveat.
+        int __cslot = enq_ra_slot(proc->sched_enq_ra);
+        if (__cslot >= 0) g_enqra_call[__cslot]++; else g_enqra_over++;
     }
     // #75: REFUSE TO QUEUE A TASK THAT IS STILL EXECUTING. This is the single
     // funnel every enqueue goes through, which is why the check is tractable
     // here and was not tractable at the 167 places that write ->state. The owed
     // enqueue is recorded against the core that is running it and paid when that
     // core next enters the scheduler, by which time the task has left.
-    { uint32_t __fc = sched_rq_cpu(); if (__fc < SCHED_RQ_CPUS) g_in_funnel[__fc] = 1; }
-    if (proc && proc->sched_on_cpu != 0) {
-        uint32_t owner = (uint32_t)proc->sched_on_cpu - 1;
+    { uint32_t __fc = sched_rq_cpu(); if (__fc < MAYTERA_MAX_CPUS) g_in_funnel[__fc] = 1; }
+    // #167: ONE READ, NOT TWO. This tested proc->sched_on_cpu and then re-read
+    // it to compute `owner`. The owning core can clear it to 0 between the two
+    // reads (its switch asm completes), which makes owner = (uint32_t)0 - 1 =
+    // 0xFFFFFFFF, and sched_defer_enqueue() then refuses that out-of-range cpu
+    // and returns 0 - so the funnel falls through, counts g_enq_allowed, and
+    // prints "ALLOWED ... while still executing on cpu4294967295".
+    //
+    // MEASURED, not hypothetical: that exact line, with that exact cpu number,
+    // is in #165's arm-schedrace/run12 serial log, and it is the ONLY time
+    // g_enq_allowed has ever been non-zero in 55 boots. #84 is ticketed on that
+    // counter, so a false increment on it is expensive: it is the one signal
+    // that says the defer table overflowed.
+    //
+    // The fall-through itself was SAFE - owner can only go out of range because
+    // the task stopped executing, and queueing a task that is not executing is
+    // exactly right - so this is a counter-honesty fix, not a corruption fix.
+    // Say which it is, because #84 will be read off this number.
+    int32_t __oc = proc ? proc->sched_on_cpu : 0;
+    if (proc && __oc != 0) {
+        uint32_t owner = (uint32_t)__oc - 1;
         if (sched_defer_enqueue(owner, proc)) {
             g_enq_refused++;
-            { uint32_t __fc = sched_rq_cpu(); if (__fc < SCHED_RQ_CPUS) g_in_funnel[__fc] = 0; }
+            // ===============================================================
+            // #167 FIX, arm 1 of 2. THE QUEUE INSERTION IS DEFERRABLE; THE
+            // STATE TRANSITION IS NOT.
+            //
+            // What #75 has to prevent is a still-executing task appearing in a
+            // RUN QUEUE, where another core can pop it and switch into its live
+            // kernel stack. Deferring the INSERTION achieves that completely.
+            // Deferring the STATE WRITE achieves nothing extra - a task that is
+            // in no queue cannot be found by any core - and it destroys the only
+            // record that a wake ever happened, because sched_drain_deferred()
+            // reconstructs "is this still wanted?" from ->state.
+            //
+            // Restricted to BLOCKED/SLEEPING on purpose. That is precisely the
+            // proc_wake() case, the one caller that does not pre-set READY. A
+            // requeue of a RUNNING/READY task already carries its own
+            // transition and must not be touched here.
+            //
+            // PAIRED WITH sync/waitq.c's __wait_finish(). A task woken this way
+            // may never sleep at all: it can observe its entry unlinked, break
+            // out of __wait_event_wait() and run on with state READY. If nothing
+            // undid that, the next drain would enqueue a RUNNING task, which is
+            // the (c) corruption. __wait_finish()'s #610 un-park now covers
+            // READY for exactly this reason, and sched_self_running()'s
+            // store order (state first, THEN sched_on_cpu = 0) is what makes it
+            // safe: a drain that observes sched_on_cpu == 0 necessarily also
+            // observes state == RUNNING and therefore drops the stale entry.
+            // ===============================================================
+            if (g_wake_defer_fix &&
+                (proc->state == PROC_STATE_BLOCKED ||
+                 proc->state == PROC_STATE_SLEEPING)) {
+                proc->state       = PROC_STATE_READY;
+                proc->ready_since = sched_ticks;   // #254: the wait starts now
+                g_enq_wakefix++;
+            }
+            { uint32_t __fc = sched_rq_cpu(); if (__fc < MAYTERA_MAX_CPUS) g_in_funnel[__fc] = 0; }
             return;
         }
         // No room to defer: we are about to enqueue a task that is STILL
@@ -1833,15 +3306,20 @@ static void add_to_ready_queue(process_t *proc) {
         // rare (SCHED_DEFER_MAX outstanding switches on one core), and losing a
         // runnable task would be worse than the window we are closing.
     }
+    // #75 (enqrace75b): FROM HERE THIS CALL ENQUEUES. Everything above either
+    // returned or fell through deliberately, so this is the last point at which
+    // the caller's return address still describes an enqueue that HAPPENS.
+    if (proc) proc->sched_enq_ra_ok = proc->sched_enq_ra;
+
     {   // #67: per-cpu run queues, only when AP user scheduling is enabled.
         extern int g_smp_user_sched;
         if (g_smp_user_sched) {
             sched_rq_push(proc);
-            { uint32_t __fc = sched_rq_cpu(); if (__fc < SCHED_RQ_CPUS) g_in_funnel[__fc] = 0; }
+            { uint32_t __fc = sched_rq_cpu(); if (__fc < MAYTERA_MAX_CPUS) g_in_funnel[__fc] = 0; }
             return;
         }
     }
-    { uint32_t __fc = sched_rq_cpu(); if (__fc < SCHED_RQ_CPUS) g_in_funnel[__fc] = 0; }
+    { uint32_t __fc = sched_rq_cpu(); if (__fc < MAYTERA_MAX_CPUS) g_in_funnel[__fc] = 0; }
     proc->next = NULL;
     proc->state = PROC_STATE_READY;
     proc->ready_since = sched_ticks;   // #254: when the wait for the CPU began
@@ -1922,7 +3400,7 @@ static void sched_age_rq(uint32_t cpu) {
     uint8_t         sel[SCHED_AGE_SCAN_MAX];
     uint32_t n = 0;
 
-    uint64_t fl = spinlock_acquire_irqsave(&g_rq_lock);
+    uint64_t fl = RQ_LOCK();
     for (process_t *p = g_rq[cpu].head; p && n < SCHED_AGE_SCAN_MAX; p = p->next) {
         nodes[n] = p;
         ents[n].ready_since = p->ready_since;
@@ -1933,7 +3411,7 @@ static void sched_age_rq(uint32_t cpu) {
     if (n < 2 ||
         sched_age_select_rs(ents, n, sched_ticks, SCHED_STARVE_TICKS,
                             SCHED_AGE_MAXPROMOTE, sel, SCHED_AGE_SCAN_MAX) <= 0) {
-        spinlock_release_irqrestore(&g_rq_lock, fl);
+        rq_unlock(fl);
         return;
     }
     for (uint32_t i = 0; i < n; i++) {
@@ -1944,16 +3422,16 @@ static void sched_age_rq(uint32_t cpu) {
         sched_rq_insert_locked(cpu, p);                  // re-sorts by eff prio
         g_sched_promotions++;
     }
-    spinlock_release_irqrestore(&g_rq_lock, fl);
+    rq_unlock(fl);
 }
 
 static void sched_age_ready_queue(void) {
     // #67 pass 2: PER-CORE rate limiter. A single static here would let whichever
     // core happened to sweep first suppress every other core's sweep for the
     // next 100 ms, which silently disables anti-starvation on all but one core.
-    static uint64_t age_last[SCHED_RQ_CPUS];
+    static uint64_t age_last[MAYTERA_MAX_CPUS];
     uint32_t rc = sched_rq_cpu();
-    if (rc >= SCHED_RQ_CPUS) rc = 0;
+    if (rc >= MAYTERA_MAX_CPUS) rc = 0;
     if ((sched_ticks - age_last[rc]) < SCHED_AGE_PERIOD) return;  // the whole hot-path cost
     age_last[rc] = sched_ticks;
     {   // #67
@@ -2026,6 +3504,7 @@ static void idle_process(void *arg) {
         // sequence ran cli() in proc_yield and let hlt return immediately,
         // pegging the host at ~100%). The timer IRQ + sched_tick reschedule us
         // to any process that becomes ready.
+        sched_halt_bkl_note(3, 1);   // #75
         __asm__ volatile("sti; hlt");
     }
 }
@@ -2037,7 +3516,9 @@ static void idle_process(void *arg) {
  */
 static void proc_wrapper(void) {
     // Get current process
-    process_t *proc = current_proc;
+    // #745 (local 75) CLASS FIX: the task being started is THIS cpu's, and
+    // this read decides whose entry_point gets called.
+    process_t *proc = proc_current();
     if (!proc || !proc->entry_point) {
         kprintf("[PROC] Error: invalid process state in wrapper\n");
         proc_exit(-1);
@@ -2171,6 +3652,11 @@ void proc_init(void) {
     // Set up idle process stack
     uint64_t stack_top = (uint64_t)idle->stack_base + PROCESS_STACK_SIZE;
     stack_top &= ~0xF;  // 16-byte align
+    // #151: SysV requires a function to be ENTERED with RSP == 8 (mod 16), as if
+    // it were reached by a CALL from a 16-aligned RSP. context_switch reaches the
+    // entry fn via RET, so without this it starts at RSP == 0 (mod 16) and every
+    // 16-byte-aligned slot the compiler places on its frame is 8 bytes off.
+    stack_top -= 8;
 
     // Set up initial context on stack
     // Layout must match what context_switch pops:
@@ -2247,7 +3733,7 @@ void proc_init(void) {
     // connects back to here.
     {
         uint32_t rc = proc_reap_selftest_rs();
-        if (rc == 0) kprintf("[PROC] procreap selftest OK (9 cases)\n");
+        if (rc == 0) kprintf("[PROC] procreap selftest OK (11 cases)\n");
         else         kprintf("[PROC] procreap selftest FAILED at case %u\n", (unsigned)rc);
     }
 
@@ -2308,6 +3794,11 @@ int proc_create_ex(const char *name, void (*entry)(void *), void *arg,
     // Set up stack
     uint64_t stack_top = (uint64_t)proc->stack_base + stack_size;
     stack_top &= ~0xF;  // 16-byte align
+    // #151: SysV requires a function to be ENTERED with RSP == 8 (mod 16), as if
+    // it were reached by a CALL from a 16-aligned RSP. context_switch reaches the
+    // entry fn via RET, so without this it starts at RSP == 0 (mod 16) and every
+    // 16-byte-aligned slot the compiler places on its frame is 8 bytes off.
+    stack_top -= 8;
 
     // Set up initial context on stack
     // Layout must match what context_switch pops
@@ -2354,25 +3845,41 @@ int proc_create_ex(const char *name, void (*entry)(void *), void *arg,
  * Terminate the current process
  */
 void proc_exit(int exit_code) {
-    current_proc->exit_code = exit_code;
+    // #745 (local 75) CLASS FIX: exit the task running on THIS cpu.
+    // Through the BSP-published global, proc_exit() on an AP zombified the
+    // BSP's task, closed ITS fds and freed ITS windows, and left the real
+    // caller running.
+    process_t *me = proc_current();
 
-    if (!current_proc || current_proc->pid == 0) {
+    if (me) me->exit_code = exit_code;
+
+    if (!me || me->pid == 0) {
         // Can't exit idle process
         kprintf("[PROC] Cannot exit idle process\n");
         return;
     }
 
     kprintf("[PROC] Process '%s' (PID %u) exiting\n",
-            current_proc->name, current_proc->pid);
+            me->name, me->pid);
+    // #134: and to the PERSISTENT log. This line is half of the evidence for a
+    // whole class of real-hardware faults - an app that launches and instantly
+    // dies (#153) - and until now it existed only on serial, which the iMac14,4
+    // does not have. proc_exit() runs as an ordinary thread with interrupts on
+    // (the cli() is further down), so the normal bootlog_write() is correct
+    // here; it also carries its own no-block guard if that ever stops being
+    // true. Process exits are not a high-rate event, so this is one appended
+    // line per exit, not a trace.
+    bootlog_write("[PROC] '%s' (PID %u) exiting, code %d", me->name, me->pid,
+                  me->exit_code);
 
     // #430: CLONE_CHILD_CLEARTID - a thread created via clone() with a
     // clear_child_tid address must, on exit, zero that word (in the still-live
     // shared address space) and futex-wake anyone blocked on it. This is how
     // pthread_join() learns the thread has finished. Done BEFORE cli() so the
     // shared cr3 is active and the write lands on the right page.
-    if (current_proc->clear_child_tid) {
-        uint32_t *ctid = current_proc->clear_child_tid;
-        current_proc->clear_child_tid = NULL;
+    if (me->clear_child_tid) {
+        uint32_t *ctid = me->clear_child_tid;
+        me->clear_child_tid = NULL;
         // #19/#645: `ctid` is a Ring-3 address in the still-live shared address
         // space. This was the unconverted twin of thread.c's exit path; use the
         // SAME canonical primitive it uses rather than a private raw store, so
@@ -2391,7 +3898,7 @@ void proc_exit(int exit_code) {
     cli();
 
     // Phase A1: drop every open file descriptor so reference counts on
-    // struct files are correct. fd_close_all operates on current_proc, and
+    // struct files are correct. fd_close_all operates on the current
     // we are the current process (about to become a zombie). Done under cli.
     extern void fd_close_all(void);
     fd_close_all();
@@ -2399,9 +3906,9 @@ void proc_exit(int exit_code) {
     // Mark as zombie (cleanup will happen later)
     // #75: leave every run queue BEFORE becoming a zombie, so no core can pop
     // this PCB and switch to a stack that is about to be freed.
-    sched_note_exit(current_proc);   // #75: is anyone already committed to us?
-    sched_rq_remove(current_proc);
-    current_proc->state = PROC_STATE_ZOMBIE;
+    sched_note_exit(me);   // #75: is anyone already committed to us?
+    sched_rq_remove(me);
+    me->state = PROC_STATE_ZOMBIE;
 
     // #230: wake any parent parked in proc_wait(). Under cli(), which is fine:
     // wake_up_all() uses spinlock_acquire_irqsave and only marks processes
@@ -2410,7 +3917,7 @@ void proc_exit(int exit_code) {
 
     // Clean up user windows for this process
     extern void cleanup_user_windows_for_process(uint32_t pid);
-    cleanup_user_windows_for_process(current_proc->pid);
+    cleanup_user_windows_for_process(me->pid);
 
     // Tear down any Ring-3 PCM stream this process owned but never closed. The
     // music player force-kills its /APPS/MUSICPLR --play helper with SIGKILL on
@@ -2419,7 +3926,15 @@ void proc_exit(int exit_code) {
     // pump's backstop expired. Only sets flags and wakes the pump (safe under
     // cli(); the pump thread does the actual teardown and frees the ring).
     extern void audio_pcm_proc_exit(uint32_t pid);
-    audio_pcm_proc_exit(current_proc->pid);
+    audio_pcm_proc_exit(me->pid);
+
+    // #205: if THIS was the DOS OPL2 synthesiser (/APPS/FMSYNTH), let the DOS
+    // layer know so it stops reporting an FM chip it can no longer sound. The
+    // flag that said "a synthesiser is running" was set once and cleared never,
+    // so every DOS game after the first in a boot session played its music into
+    // a queue nobody drained. Flag-only, no blocking: this runs under cli().
+    extern void dos_fm_proc_exit(uint32_t pid);
+    dos_fm_proc_exit(me->pid);
 
     // #745 (task #59): release the FRAMEBUFFER ownership latch if this process
     // held it. Switch User and Log Out both end a session by exiting
@@ -2438,7 +3953,44 @@ void proc_exit(int exit_code) {
     // framebuffer from a thread. Same cli()-safe contract as its neighbours:
     // one atomic compare-exchange, no allocation, no block.
     extern void fb_owner_proc_exit(uint32_t pid);
-    fb_owner_proc_exit(current_proc->pid);
+    fb_owner_proc_exit(me->pid);
+
+    // #fdguard: poison any legacy fd slots this process group still owns, so
+    // a future process handed the same pid cannot reach a leaked slot. Only
+    // on a group-leader / ordinary-process exit: a worker thread shares the
+    // leader's tgid and must NOT poison the group's still-open fds. cli()-safe
+    // (one atomic per slot, no block). See proc/fdlayer.c.
+    if (!me->shares_vm) {
+        extern void fdown_proc_exit(uint32_t owner);
+        fdown_proc_exit(me->tgid ? me->tgid : me->pid);
+    }
+
+    // #COMPRESPAWN: TEAR DOWN THE sys_fb_map() WINDOW BEFORE THE ADDRESS SPACE
+    // IS DESTROYED. This is not tidiness; leaving it mapped corrupts the kernel
+    // heap.
+    //
+    // sys_fb_map() (gui/fb_syscall.c) maps the framebuffer BACK BUFFER into the
+    // compositor's address space at 0x0000600000000000 with VMM_USER_RW. The
+    // back buffer is kmalloc_aligned() KERNEL HEAP memory (video/framebuffer.c),
+    // used as a physical address because the kernel runs on the UEFI identity
+    // map. Those PTEs are therefore PRESENT|USER and point at live kernel heap.
+    //
+    // vmm_destroy_user_space() (mm/vmm.c) walks every PML4 slot the reference
+    // address space does not have - and the kernel has no PML4[192], which is
+    // where 0x600000000000 lands - and calls vmm_free_user_page_cow() on every
+    // PRESENT|USER leaf it finds. So on every compositor death the reap handed
+    // ~8 MB of LIVE KERNEL HEAP (1920x1080x4) to the PMM free list while the
+    // heap allocator still considered it allocated. The PMM then reissues those
+    // pages to the next allocation, including the ELF image of the compositor
+    // being relaunched. That is silent, unbounded corruption on precisely the
+    // path a crashed compositor takes.
+    //
+    // Clearing the PTEs here makes the leaves invisible to that walk, so the
+    // generic destroy rule stays generic and the frames stay owned by the heap.
+    // Same cli()-safe contract as the hooks around it: clears PTEs and invlpg,
+    // no allocation, no lock, no block.
+    { extern void fb_unmap_proc_exit(uint32_t pid, uint64_t cr3);
+      fb_unmap_proc_exit(me->pid, me->cr3); }
 
     // #745 (task #36): release any async HTTP job slots this process owned.
     // Without this a process that died mid-fetch left its slot allocated for
@@ -2450,10 +4002,10 @@ void proc_exit(int exit_code) {
     // thread exiting must not take the whole process's downloads with it.
     // Same cli()-safe contract as the two calls above: flags and kfree only,
     // no blocking.
-    if (!current_proc->shares_vm) {
+    if (!me->shares_vm) {
         extern void async_http_proc_exit(uint32_t owner);
-        async_http_proc_exit(current_proc->tgid ? current_proc->tgid
-                                                : current_proc->pid);
+        async_http_proc_exit(me->tgid ? me->tgid
+                                                : me->pid);
     }
 
     // DO NOT free stack here - we are still running on it!
@@ -2472,12 +4024,158 @@ void proc_exit(int exit_code) {
 /**
  * Yield CPU to another process
  */
+#ifdef ENQ_PROBE_SELFTEST
+// ===========================================================================
+// #75 (enqrace75b) PROBE SELF-TEST. `make ENQTEST=1`. NEVER shipped.
+//
+// WHY THIS EXISTS. Three of the fields #75 has reasoned from for four campaigns
+// did not mean what they were read as meaning, and one of the probes could only
+// ever produce the conclusion that was drawn from it: [WAKEPROBE] fires only on
+// (sched_on_cpu != 0 || rq_queued || rq_wanted), so "the candidate is always
+// still executing" was entailed by its own predicate. A probe in that condition
+// is worse than no probe, because it answers confidently.
+//
+// The test for a probe is therefore: CONSTRUCT the state it claims to detect and
+// show it fires, then construct the neighbouring state and show it does not.
+// That is what this does. It runs once, in process context, from proc_yield(),
+// the first place after SMP is up where a real task is executing and can be
+// experimented on.
+//
+// The [PINENQ] guard is the reason this is not optional. It has never fired,
+// across a 180 s SCHEDRACE_US=200 reproducer with roughly 57 s of cumulative
+// window exposure. "Never fired" is only evidence about the world if the probe
+// CAN fire; until then it is equally consistent with a probe that is dead.
+static int g_enqtest_done = 0;
+static void enq_probe_selftest(void) {
+    extern int g_smp_user_sched;
+    if (g_enqtest_done || !g_smp_user_sched) return;
+    process_t *me = proc_current();
+    if (!me || me->is_idle) return;
+    g_enqtest_done = 1;
+
+    // ---- 1. THE PREDICATE --------------------------------------------------
+    // POSITIVE, by construction: this task is executing - it is the one calling.
+    // NEGATIVE, by construction: an UNUSED process slot is not any core's
+    // current. Neither is a sample; both are states we know the answer for.
+    int32_t own_self = sched_running_owner(me);
+    process_t *dead = 0;
+    for (int i = 0; i < MAX_PROCESSES; i++)
+        if (proc_table[i].state == PROC_STATE_UNUSED) { dead = &proc_table[i]; break; }
+    int32_t own_dead = dead ? sched_running_owner(dead) : -1;
+    kprintf("[ENQTEST] predicate sched_running_owner: RUNNING task '%s' -> %d "
+            "(want non-zero), UNUSED slot -> %d (want 0): %s\n",
+            me->name, own_self, own_dead,
+            (own_self != 0 && own_dead == 0) ? "PASS" : "FAIL");
+
+    // ---- 2. THE [PINENQ] PROBE, WHICH HAS NEVER FIRED ----------------------
+    // Construct exactly what it claims to detect: a task carrying a live
+    // selection pin arriving at the enqueue path.
+    //
+    // HAZARD, and why there is almost none. With the pin fix ON this is
+    // hazard-free: sched_rq_push() defers and never inserts, so no task is put
+    // into a queue while pinned. With the fix OFF the entry IS inserted, and the
+    // sched_rq_remove() below takes it straight back out; that leaves a window of
+    // a few instructions, once per boot, in a test-gated build. It is disclosed
+    // rather than hidden because the window is the thing under study.
+    uint64_t p0 = g_enq_pinned;
+    me->enq_probe_tag = 1;
+    me->sched_pinned  = (int32_t)sched_rq_cpu() + 1;
+    me->state         = PROC_STATE_READY;
+    add_to_ready_queue(me);
+    me->sched_pinned  = 0;
+    sched_rq_remove(me);           // no-op when the push correctly deferred
+    me->state         = PROC_STATE_RUNNING;
+    me->enq_probe_tag = 0;
+    kprintf("[ENQTEST] [PINENQ] on a task with a live pin: g_enq_pinned %lu -> "
+            "%lu: %s\n", (unsigned long)p0, (unsigned long)g_enq_pinned,
+            (g_enq_pinned > p0) ? "PASS (the probe fires)"
+                                : "FAIL (the probe is silent on its own state)");
+    kprintf("[ENQTEST] neighbouring state = the whole rest of this boot: every "
+            "other enqueue has sched_pinned == 0, so pinenq= in [ENQCENSUS] must "
+            "stay at %lu.\n", (unsigned long)g_enq_pinned);
+    kprintf("[ENQTEST] [RUNENQ] has no synthetic control and needs none: its "
+            "positive and negative arms are per-call-site in [ENQCENSUS] "
+            "(site:calls/enq/enq-of-running), at n in the thousands.\n");
+}
+#endif
+
 void proc_yield(void) {
+#ifdef ENQ_PROBE_SELFTEST
+    enq_probe_selftest();
+#endif
+    // #745 (local 75) CLASS FIX: yield the task running on THIS cpu.
+    // Through the BSP-published global, an AP-side yield re-queued a task
+    // that was still RUNNING on cpu0, the #421 phase 7 hazard.
+    process_t *me = proc_current();
+
     cli();
 
-    if (current_proc && current_proc->state == PROC_STATE_RUNNING) {
-        current_proc->state = PROC_STATE_READY;
-        add_to_ready_queue(current_proc);
+    // =====================================================================
+    // #174: BOTH STATEMENTS BELOW ARE LOAD-BEARING, AND THEY ARE LOAD-BEARING
+    // FOR TWO DIFFERENT REASONS. DO NOT REMOVE EITHER ONE ALONE.
+    //
+    // #75 measured that this enqueue puts a task a core is RUNNING into a run
+    // queue on 100% of its enqueues, and that no guard on the path refuses it.
+    // That is true, and it reads like a bug to be removed. It is not: it is how
+    // yield works, and each half of this pair defeats a DIFFERENT early return
+    // in sched_schedule(). Both removals were BUILT AND BOOTED at #174 rather
+    // than argued about (build 1989, 4 vCPU + DOS regime, 170-200 s captures,
+    // ENQTEST=1 SCHEDRACE=1 SCHEDRACE_US=200, against 4 clean baseline runs).
+    //
+    // DROP THE ENQUEUE, KEEP state = READY:
+    //   the yielder is left READY, on no queue and owned by no core, because
+    //   sched_schedule()'s own requeue of prev is gated on
+    //   prev->state == PROC_STATE_RUNNING and therefore does not fire. The task
+    //   is gone. MEASURED, 2 of 2 runs: the boot still reaches DESKTOP_READY
+    //   with no panic, no [ENQLOST] and no [SCHEDRACE] corruption, and then the
+    //   machine dies quietly. Framebuffer flips over the run fell from 2695 to
+    //   52-59, host CPU from 2.71 cores to 0.55, and top= went from dos:86 to
+    //   idle:95. gaps= fell from 35170 to 2, i.e. after the first two yields
+    //   nothing was left alive to yield. A does-it-boot test PASSES this.
+    //   Only a liveness metric catches it.
+    //
+    // DROP BOTH, AND LET sched_schedule() REQUEUE prev INSTEAD:
+    //   this does close the #75 hole (run=0, and the prev-requeue site defers
+    //   every one of its 2072 enqueues), and it ran at baseline throughput in
+    //   3 of 4 runs. It is still wrong, for a reason no arm at that n could
+    //   have shown: leaving state at RUNNING re-opens
+    //     if (!preemption_enabled && cur && cur->state == PROC_STATE_RUNNING)
+    //   near the top of sched_schedule(), and the no-idle-process early return
+    //   below it, BOTH of which return without switching. drivers/usb_msc.c
+    //   calls proc_yield() specifically in the !preemption_enabled case
+    //   (msc_cmd_lock_noblock: "if (sched_preemption_enabled()) proc_sleep(1);
+    //   else proc_yield();"), so for that caller yield would become a no-op and
+    //   its loop a 100% spin, which is the #67 pass-12 failure. Writing READY
+    //   first is what makes those early returns unreachable from a yield.
+    //
+    // WHAT THE ENQUEUE BUYS, in the tree's own words (dos/dosexec.c, THE YIELD
+    // DISCIPLINE): "proc_yield() is a HANDOFF, not a wait ... If the ready
+    // queue is empty the scheduler hands the core straight back, so the 38-45%
+    // that used to go to hlt now goes to the guest." Being in the queue is what
+    // makes the yielder a candidate in the very selection it triggers, so an
+    // empty queue takes the next == cur fast path instead of switching to the
+    // idle task and halting until the next timer tick.
+    //
+    // SO WHAT IS THE HOLE WORTH TODAY? Nothing, and that is measured too:
+    // pop_run=0 of 96377 pops and popingap=0 across 35170 deliberately widened
+    // windows. The enqueue and the pop are both inside the BKL, so no other
+    // core can be in them at the same time. This is a landmine for the
+    // BKL-narrowing work (#67/#118), not a live defect. Whoever narrows the BKL
+    // must give the yielder a way to stay a selection candidate WITHOUT sitting
+    // in a queue another core can pop, and must keep a caller that yields with
+    // preemption disabled out of both early returns. Deleting statements from
+    // here is not that fix.
+    // =====================================================================
+    if (me && me->state == PROC_STATE_RUNNING) {
+        me->state = PROC_STATE_READY;
+        add_to_ready_queue(me);
+        { uint32_t __yc = sched_rq_cpu();
+          if (__yc < MAYTERA_MAX_CPUS) { g_yield_gap[__yc] = 1; g_gap_opened++; } }
+        // #75 (enqrace75b): me is now IN A RUN QUEUE AND STILL EXECUTING, and
+        // stays that way until sched_schedule() below arms me->sched_on_cpu.
+        // Under `make SCHEDRACE=1` only, hold that window open so the pop-side
+        // probe can be seen to fire. Never compiled into a shipping kernel.
+        schedrace_delay(SR_SITE_YIELD_ENQ);
     }
 
     sched_schedule(); // Run new process
@@ -2528,7 +4226,16 @@ uint64_t sched_now_ms(void) {
  * Sleep for specified milliseconds
  */
 void proc_sleep(uint32_t ms) {
-    if (!current_proc || ms == 0) return;
+    // #745 (local 75) FIX: resolve the sleeper with the per-cpu accessor,
+    // not the BSP-published global. sched_schedule() only writes that global
+    // when sched_rq_cpu()==0 or the AP gate is off, by design, so on an AP it
+    // named the BSP's task: arming wake_time on it and calling
+    // sched_self_block() on it left the CALLER running and force-slept an
+    // innocent cpu0 task. Measured on an AP: 444 records, caller still
+    // RUNNING 443/443, victim a different task 100%.
+    process_t *me = proc_current();
+
+    if (!me || ms == 0) return;
 
     cli();
 
@@ -2536,8 +4243,8 @@ void proc_sleep(uint32_t ms) {
     // wake_time is now an absolute mono_ms() deadline in MILLISECONDS (see
     // wake_sleeping_procs). Using real elapsed ms means a KVM tick burst can no
     // longer collapse this deadline to ~0 and livelock the scheduler.
-    current_proc->wake_time = sched_now_ms() + (uint64_t)ms;
-    sched_self_block(current_proc, PROC_STATE_SLEEPING);   // #75: one operation
+    me->wake_time = sched_now_ms() + (uint64_t)ms;
+    sched_self_block(me, PROC_STATE_SLEEPING);   // #75: one operation
 
     sched_schedule(); // Run new process
 }
@@ -2641,7 +4348,7 @@ int proc_wait(int pid, int *status) {
                 uint32_t child_pid = child->pid;
                 
                 // Clean up zombie resources
-                cleanup_proc_slot(child);
+                if (cleanup_proc_slot(child))   // #167(c): still on a core
                 child->state = PROC_STATE_UNUSED;
                 
                 return (int)child_pid;
@@ -2677,7 +4384,7 @@ int proc_wait(int pid, int *status) {
 // #230 A/B BENCHMARK. DEBUG ONLY (-DPROCWAIT_BENCH, `make PROCWAITBENCH=1`).
 //
 // STATUS 2026-08-02: BUILT, RUN, AND NOT YET TRUSTWORTHY. On its first run
-// (build 982, VM 2611) it printed 0 ticks for BOTH arms, which is not a result:
+// (build 982, VM <vmid>) it printed 0 ticks for BOTH arms, which is not a result:
 // 0 for the legacy spin is impossible over a real 2-second wait, so the harness
 // did not actually wait - most likely both proc_wait calls returned -1
 // immediately because the freshly proc_create()d kernel thread was not visible
@@ -2713,7 +4420,7 @@ static int proc_wait_legacy_spin(int pid, int *status) {
             if (child->state == PROC_STATE_ZOMBIE) {
                 if (status) *status = child->exit_code;
                 uint32_t cp = child->pid;
-                cleanup_proc_slot(child);
+                if (cleanup_proc_slot(child))   // #167(c): still on a core
                 child->state = PROC_STATE_UNUSED;
                 return (int)cp;
             }
@@ -2843,7 +4550,13 @@ static void wake_sleeping_procs(void) {
     // #483/#499: all deadlines below are absolute mono_ms() values (ms of REAL
     // elapsed time), NOT timer_ticks. Sample the monotonic clock ONCE for the
     // whole sweep so a tick burst cannot make deadlines look expired.
+    //
+    // #167: PUBLISH WHAT THE SWEEP SAW. See the g_sweep_* block above for why
+    // the count alone is not enough and what each number rules out.
+    g_sweep_n++;
     uint64_t now = sched_now_ms();
+    uint64_t __sminleft = ~0ULL;
+    uint32_t __sleft = 0, __swoke = 0;
     for (int i = 0; i < MAX_PROCESSES; i++) {
         // #513: alarm(2) deadline sweep, folded into the table walk that was
         // already happening here rather than adding a second O(MAX_PROCESSES)
@@ -2895,15 +4608,66 @@ static void wake_sleeping_procs(void) {
                                 "pinned=%d\n",
                                 c->name, c->pid, (uint32_t)c->state,
                                 c->sched_on_cpu, (uint32_t)c->rq_queued,
-                                (uint32_t)c->rq_wanted, c->running_cpu,
+                                (uint32_t)c->rq_wanted, c->last_cpu,
                                 sched_rq_cpu(), c->sched_pinned);
                     }
                 }
+                // #75 (enqrace75) CORRECTION TO THE PROBE ABOVE. Its firing
+                // predicate is (on_cpu != 0 || rq_queued || rq_wanted), so it
+                // CANNOT observe a candidate that is none of those - and that
+                // is precisely the candidate whose enqueue SUCCEEDS, because
+                // add_to_ready_queue() only refuses when sched_on_cpu != 0.
+                // The earlier pass read its output as "the candidate is ALWAYS
+                // still executing (on_cpu non-zero in every capture)". That is
+                // true BY CONSTRUCTION of the predicate, not by measurement:
+                // the probe instruments only the cases that are correctly
+                // refused and deferred, and is blind to every case that
+                // actually reaches a run queue. This second one-shot covers the
+                // complement, so the pair is no longer circular.
+                {
+                    process_t *c2 = &proc_table[i];
+                    static int wake_probe2_done = 0;
+                    if (!wake_probe2_done && c2->sched_on_cpu == 0 &&
+                        !c2->rq_queued && !c2->rq_wanted) {
+                        wake_probe2_done = 1;
+                        kprintf("[WAKEPROBE2] '%s' pid=%u: QUEUEABLE candidate "
+                                "state=%u on_cpu=0 queued=0 wanted=0 pinned=%d "
+                                "last_cpu=%d sweep_cpu=%u\n",
+                                c2->name, c2->pid, (uint32_t)c2->state,
+                                c2->sched_pinned, c2->last_cpu, sched_rq_cpu());
+                    }
+                }
+                // #75 (enqrace75b): COUNT BOTH CLASSES ON EVERY SWEEP.
+                // [WAKEPROBE] and [WAKEPROBE2] are one-shots: between them they
+                // sample two events per boot and cannot say whether the queueable
+                // class is one candidate in a thousand or nine hundred of them.
+                // The ratio is the whole point, so it is counted, not sampled.
+                { process_t *cc = &proc_table[i];
+                  if (cc->sched_on_cpu != 0 || cc->rq_queued || cc->rq_wanted)
+                      g_wake_cand_busy++;
+                  else
+                      g_wake_cand_free++; }
                 proc_table[i].state = PROC_STATE_READY;
                 add_to_ready_queue(&proc_table[i]);
+                __swoke++;
+            } else {
+                // #167: NOT expired by THIS clock. Remember the earliest one so
+                // a hung-guest dump can be compared against g_sweep_now without
+                // walking proc_table.
+                __sleft++;
+                if (proc_table[i].wake_time < __sminleft)
+                    __sminleft = proc_table[i].wake_time;
             }
         }
     }
+    // Sampled in the SAME pass, so the pair is simultaneous by construction:
+    // "sched_now_ms() alongside sched_ticks" is only meaningful if the two are
+    // read at one instant, and sched_ticks is static to this file.
+    g_sweep_now     = now;
+    g_sweep_ticks   = sched_ticks;
+    g_sweep_woke   += __swoke;
+    g_sweep_left    = __sleft;
+    g_sweep_minleft = __sminleft;
 }
 
 /**
@@ -2920,8 +4684,10 @@ void proc_set_next_migratable(int v){ g_next_user_migratable = v ? 1 : 0; }
 extern volatile int g_ap_running_user[];
 extern void context_start(uint64_t *old_rsp, uint64_t new_rsp, uint64_t new_cr3, void *old_fpu,
                           volatile int32_t *old_release, volatile int32_t *new_unpin);
+/* #83: running_cpu=-1 below is already correct under the new semantics - a
+   task parked on the migration queue is runnable but running nowhere. */
 void smp_migq_push(void *vp){ process_t *p=(process_t*)vp; spinlock_acquire(&migq_lock); p->state=PROC_STATE_READY; p->running_cpu=-1; p->next=migq_head; migq_head=p; spinlock_release(&migq_lock); { extern void smp_wake_aps(void); smp_wake_aps(); } }
-void *smp_ap_take_migratable(void){ process_t *p=NULL; spinlock_acquire(&migq_lock); if(migq_head){ p=migq_head; migq_head=p->next; p->next=NULL; p->running_cpu=(int)smp_this_cpu(); p->state=PROC_STATE_RUNNING; } spinlock_release(&migq_lock); return p; }
+void *smp_ap_take_migratable(void){ process_t *p=NULL; spinlock_acquire(&migq_lock); if(migq_head){ p=migq_head; migq_head=p->next; p->next=NULL; p->last_cpu=(int)smp_this_cpu(); p->state=PROC_STATE_RUNNING; } spinlock_release(&migq_lock); return p; }
 void smp_ap_run_user(void *vp){ process_t *p=(process_t*)vp; static uint64_t ap_sched_rsp[64]; static uint8_t ap_fpu[64][512] __attribute__((aligned(16))); uint32_t cpu=smp_this_cpu()&63; g_ap_running_user[cpu]=1; sched_rq_set_consumer(cpu,1); kprintf("[SMP] CPU %u now running user proc '%s' (PID %u)\n", cpu, p->name, p->pid); smp_set_current(p); cpu_set_kernel_stack((uint64_t)p->stack_base+p->stack_size); p->total_time=1; context_start(&ap_sched_rsp[cpu], p->rsp, p->cr3, ap_fpu[cpu], (volatile int32_t *)0, &p->sched_pinned); sched_rq_set_consumer(cpu,0); g_ap_running_user[cpu]=0; }
 
 // #421 phase 7: THIS cpu's currently-running process, per-cpu-correct on SMP.
@@ -2948,6 +4714,32 @@ static inline process_t *sched_cpu_current(void) {
         if (p) return p;
     }
     return current_proc;
+}
+
+// #143 re-measure: THE PID OF THE TASK THIS CORE IS RUNNING, FOR BKL ATTRIBUTION.
+//
+// Called from bkl_hold_account() in cpu/smp.c, which runs inside the BKL release
+// path with interrupts masked. It therefore MUST NOT take a lock, and it does
+// not: sched_cpu_current() is a per-cpu array read with a global fallback.
+// Anything added here that can block or spin would be spinning inside the
+// release of the giant lock, which is the deadlock shape #130 spent a ticket on.
+//
+// Returns 0 when there is no current task (very early boot). 0 is a real pid
+// here, not an error code, so the caller keys on pid+1 and the report subtracts
+// it back; a bucket that means "unattributed" and a bucket that means "pid 0"
+// must not share a value (blame.md: NEVER MEASURED and HEALTHY must differ).
+uint32_t sched_cpu_current_pid(void) {
+    process_t *p = sched_cpu_current();
+    return p ? (uint32_t)p->pid : 0;
+}
+
+// Name for a pid, for the [BKLPID] report only. Linear scan of the process
+// table, called at most three times per ~4 s window from the report path.
+const char *sched_pid_name_for_report(uint32_t pid) {
+    for (int i = 0; i < MAX_PROCESSES; i++)
+        if (proc_table[i].state != PROC_STATE_UNUSED && (uint32_t)proc_table[i].pid == pid)
+            return proc_table[i].name;
+    return "(gone)";
 }
 
 void sched_schedule(void) {
@@ -3013,7 +4805,15 @@ void sched_schedule(void) {
     // means any enqueue attempt from this point on, on any core, sees that this
     // task is still executing.
     { uint32_t __ac = sched_rq_cpu();
-      if (cur && __ac < SCHED_RQ_CPUS) cur->sched_on_cpu = (int32_t)__ac + 1; }
+      if (cur && __ac < MAYTERA_MAX_CPUS) cur->sched_on_cpu = (int32_t)__ac + 1;
+      // #75 (enqrace75b): THE WINDOW proc_yield() OPENED CLOSES EXACTLY HERE,
+      // on every path, because this is the store that makes the queued task
+      // ineligible to sched_rq_pop_locked(). Cleared unconditionally rather
+      // than only when this core opened it: a flag that means "currently" and
+      // is cleared only on the path that set it eventually means "at some
+      // point", which is the g_sel defect recorded earlier in this file.
+      { extern volatile uint8_t g_yield_gap[MAYTERA_MAX_CPUS];
+        if (__ac < MAYTERA_MAX_CPUS) g_yield_gap[__ac] = 0; } }
     // #75: pay any enqueues owed from the last time this core switched away.
     sched_drain_deferred(sched_rq_cpu());   // #421 p7: per-cpu, NOT global
     if (!preemption_enabled && cur &&
@@ -3039,7 +4839,7 @@ void sched_schedule(void) {
     // can see it and say whether it is tearing down a task somebody has already
     // picked. Cleared once the switch has happened (or we bail out below).
     { uint32_t __sc = sched_rq_cpu();
-      if (__sc < SCHED_RQ_CPUS && next) {
+      if (__sc < MAYTERA_MAX_CPUS && next) {
           g_sel[__sc] = next;
           g_sel_state[__sc] = (uint32_t)next->state;
           // CANDIDATE 1 probe: a task that is RUNNING has no business being in
@@ -3049,10 +4849,26 @@ void sched_schedule(void) {
               static int warned_run = 0;
               if (!warned_run) {
                   warned_run = 1;
+                  // #167: PRINT WHO QUEUED IT. CANDIDATE 1 fired exactly once
+                  // in #165's 55 boots - in arm-gateon/run05, the stock-kernel
+                  // run that then panicked at the wild RIP #75 first reported -
+                  // and unlike CANDIDATE 2 it did NOT fire on any healthy boot.
+                  // It is the discriminating signal for the (c) half, and the
+                  // one thing it did not say was WHERE the enqueue came from.
+                  // Every field below is already recorded on the task by
+                  // add_to_ready_queue(); printing them costs nothing and turns
+                  // the next occurrence into an address to resolve.
                   kprintf("[SCHED75] CANDIDATE 1: popped '%s' pid=%u which is "
                           "already RUNNING (on_cpu=%d). A running task must not "
-                          "be queued.\n", next->name, next->pid,
-                          next->sched_on_cpu);
+                          "be queued. state_at_enq=%u enq_route=%u "
+                          "allowed_hot=%u enq_ra=0x%lx pinned_by=%d "
+                          "pinenq=%lu\n",
+                          next->name, next->pid, next->sched_on_cpu,
+                          next->sched_state_at_enq, (unsigned)next->enq_route,
+                          (unsigned)next->enq_allowed_hot,
+                          (unsigned long)(uint64_t)next->sched_enq_ra,
+                          (int)(next->sched_pinned - 1),
+                          (unsigned long)g_enq_pinned);
               }
           }
       } }
@@ -3102,6 +4918,7 @@ void sched_schedule(void) {
                 }
                 SCHED_SEL_CLEAR();   // #75
                 if (cur) cur->sched_on_cpu = 0;   /* #75: no switch happened */ 
+                sched_halt_bkl_note(1, 0);        // #75
                 __asm__ volatile("sti; hlt");
                 return;
             }
@@ -3120,6 +4937,7 @@ void sched_schedule(void) {
         cur->time_slice = TIME_SLICE_TICKS;
         cur->state = PROC_STATE_RUNNING;
         if (no_ready) {
+            sched_halt_bkl_note(2, 0);   // #75
             // Nothing else is runnable: HALT the core until the next interrupt
             // instead of busy-returning. pid 0 doubles as the desktop/idle
             // context, so without this the CPU spun at ~100% whenever every
@@ -3146,7 +4964,14 @@ void sched_schedule(void) {
     // asm clears this flag after the save (see proc/context_switch.asm), and
     // sched_rq_pop() refuses any entry whose flag is set. x86 does not reorder
     // stores, so observing 0 implies observing the final rsp.
-    if (prev) prev->sched_on_cpu = 1;
+    // #75: the field is DECODED as (cpu id + 1) by add_to_ready_queue(), which
+    // does `owner = sched_on_cpu - 1` and indexes the per-core defer table with
+    // it. A literal 1 therefore named CORE 0 from every core. See g_enq_cpu_fix.
+    if (prev) {
+        uint32_t __pc = sched_rq_cpu();
+        prev->sched_on_cpu = (g_enq_cpu_fix && __pc < MAYTERA_MAX_CPUS)
+                             ? (int32_t)__pc + 1 : 1;
+    }
     // #67 diagnostic: always on, both gate states. See sched_storm_note().
     sched_storm_note(sched_rq_cpu(), prev, next);
     // #67 pass 2: the per-cpu slot is authoritative once more than one core
@@ -3261,10 +5086,12 @@ void sched_schedule(void) {
         proc_check_switch_target(next, "context_start");
         if (prev && prev->state != PROC_STATE_UNUSED) {
             proc_check_switch_target(prev, "context_start/prev");
-            { uint32_t __bd = bkl_release_all(); schedrace_delay(SR_SITE_AFTER_BKL_DROP); context_start(&prev->rsp, next->rsp, next->cr3, prev->fpu_area, &prev->sched_on_cpu, &next->sched_pinned); bkl_reacquire(__bd); }
+            { sched_publish_cpu(prev, next, sched_rq_cpu());   /* #83, IF=0 here */
+              uint32_t __bd = bkl_release_all(); schedrace_delay(SR_SITE_AFTER_BKL_DROP); context_start(&prev->rsp, next->rsp, next->cr3, prev->fpu_area, &prev->sched_on_cpu, &next->sched_pinned); bkl_reacquire(__bd); }
         } else {
             static uint64_t dummy_rsp;
-            { uint32_t __bd = bkl_release_all(); schedrace_delay(SR_SITE_AFTER_BKL_DROP); context_start(&dummy_rsp, next->rsp, next->cr3, g_dummy_fpu_area, (volatile int32_t *)0, &next->sched_pinned); bkl_reacquire(__bd); }
+            { sched_publish_cpu((process_t *)0, next, sched_rq_cpu());   /* #83: no outgoing task on this path, same as the NULL release pointer */
+              uint32_t __bd = bkl_release_all(); schedrace_delay(SR_SITE_AFTER_BKL_DROP); context_start(&dummy_rsp, next->rsp, next->cr3, g_dummy_fpu_area, (volatile int32_t *)0, &next->sched_pinned); bkl_reacquire(__bd); }
         }
         // kprintf("[SCHED] ERROR: context_start returned! This should never happen!\n");
     } else {
@@ -3289,10 +5116,12 @@ void sched_schedule(void) {
 
         proc_check_switch_target(next, "context_switch");
         if (prev && prev->state != PROC_STATE_UNUSED) {
-            { uint32_t __bd = bkl_release_all(); schedrace_delay(SR_SITE_AFTER_BKL_DROP); context_switch(&prev->rsp, next->rsp, prev->fpu_area, next->fpu_area, &prev->sched_on_cpu, &next->sched_pinned); bkl_reacquire(__bd); }
+            { sched_publish_cpu(prev, next, sched_rq_cpu());   /* #83, IF=0 here */
+              uint32_t __bd = bkl_release_all(); schedrace_delay(SR_SITE_AFTER_BKL_DROP); context_switch(&prev->rsp, next->rsp, prev->fpu_area, next->fpu_area, &prev->sched_on_cpu, &next->sched_pinned); bkl_reacquire(__bd); }
         } else {
             static uint64_t dummy_rsp;
-            { uint32_t __bd = bkl_release_all(); schedrace_delay(SR_SITE_AFTER_BKL_DROP); context_switch(&dummy_rsp, next->rsp, g_dummy_fpu_area, next->fpu_area, (volatile int32_t *)0, &next->sched_pinned); bkl_reacquire(__bd); }
+            { sched_publish_cpu((process_t *)0, next, sched_rq_cpu());   /* #83: no outgoing task on this path */
+              uint32_t __bd = bkl_release_all(); schedrace_delay(SR_SITE_AFTER_BKL_DROP); context_switch(&dummy_rsp, next->rsp, g_dummy_fpu_area, next->fpu_area, (volatile int32_t *)0, &next->sched_pinned); bkl_reacquire(__bd); }
         }
     }
 
@@ -3307,7 +5136,21 @@ void sched_schedule(void) {
  * Timer tick handler for scheduler
  * Called from timer interrupt
  */
+// #745 (#62): how many times sched_tick() has RUN, which is the rate at which
+// per-process CPU time is sampled (`cur->total_time++` below, and the thread
+// equivalent in proc/thread.c). It is NOT the same as timer_ticks once the #62
+// redundant tick source is carrying the system: that source fires at 50 Hz and
+// advances timer_ticks by however many 250 Hz ticks REAL TIME says have
+// elapsed, so timer_ticks keeps correct time while sched_tick runs five times
+// less often. A CPU percentage computed as (process ticks / timer_ticks delta)
+// then under-reports by exactly that ratio - MEASURED on VM <vmid> with IRQ0
+// deliberately masked, where a genuinely idle machine reported top=idle:19
+// instead of idle:98, which is 98/5. The heartbeat's top= field divides by
+// THIS instead, so the percentage is correct under either tick source.
+volatile uint64_t g_sched_tick_samples = 0;
+
 void sched_tick(void) {
+    g_sched_tick_samples++;
     sched_ticks++;
     // #230 BACKSTOP WAKE. proc_child_exit_notify() at every ZOMBIE transition
     // is the precise wake; this is the redundant always-armed one, so a future
@@ -3320,6 +5163,9 @@ void sched_tick(void) {
     { extern void proc_mm_lock_watchdog(void); proc_mm_lock_watchdog(); } // #421 p7
     { extern void cron_tick(void); cron_tick(); }  // #265 scheduler hook
     { extern void futex_tick(void); futex_tick(); } // #430 futex timeout hook
+    // #167: an IRQ-context wake into the block window, so the block/wake race is
+    // reachable at 1 vCPU as well as 4. No-op unless /WAKELOSS.TXT is present.
+    { extern void wakeloss_tick(void); wakeloss_tick(); }
     g_cpu_total_acc++;
     process_t *cur = sched_cpu_current();   // #421 p7: per-cpu, NOT global
     if (!cur || cur->is_idle) g_cpu_idle_acc++;   // #67: per-core idle, not pid 0
@@ -3327,7 +5173,7 @@ void sched_tick(void) {
     // "one core saturated" from "all cores half loaded", which is exactly the
     // reading that opened this ticket.
     { uint32_t __c = sched_rq_cpu();
-      if (cur && !cur->is_idle && __c < SCHED_RQ_CPUS) g_core_busy[__c]++; }
+      if (cur && !cur->is_idle && __c < MAYTERA_MAX_CPUS) g_core_busy[__c]++; }
     // #67 pass 2: one core owns the report; its statics are not shared state.
     if (sched_rq_cpu() == 0) sched_smp_report();
 
@@ -3349,7 +5195,7 @@ void sched_tick(void) {
     // to the normal path, so the preemption happens through the one piece of
     // code that already knows how to do it correctly.
     { uint32_t __rc = sched_rq_cpu();
-      if (__rc < SCHED_RQ_CPUS && g_need_resched[__rc]) {
+      if (__rc < MAYTERA_MAX_CPUS && g_need_resched[__rc]) {
           g_need_resched[__rc] = 0;
           if (cur && !cur->is_idle) cur->time_slice = 0;   // expire it now
       } }
@@ -3399,14 +5245,134 @@ void sched_tick(void) {
     }
 }
 
+// ===========================================================================
+// #169: THE SCHEDULER TICK TAKEN ON AN APPLICATION PROCESSOR.
+//
+// Called from ap_preempt_tick_handler() (cpu/isr.c) on the AP's own LAPIC timer
+// at the same rate as the BSP's PIT tick. See that file for why the PIT stays
+// the global clock and this is a preemption-only tick.
+//
+// WHAT IT DELIBERATELY DOES NOT DO, and why each one would be a bug:
+//   timer_ticks            four writers => the wall clock runs 4x fast and every
+//                          `timer_ticks + N` deadline in the tree fires early.
+//   sched_ticks            the divisor of every rate in sched_smp_report() and
+//                          the base of the #254 starvation bound.
+//   g_sched_tick_samples   the heartbeat's top= divisor; 4x it and every process
+//                          CPU percentage under-reports by 4x.
+//   g_cpu_idle_acc/_total  the aggregate behind g_cpu_pct: mixing four cores'
+//                          samples into a counter that resets every 250 makes
+//                          the taskbar gauge meaningless.
+//   cron_tick, futex_tick, proc_child_exit_notify, proc_mm_lock_watchdog,
+//   wakeloss_tick, sched_smp_report
+//                          once-per-tick GLOBAL hooks. Four callers = four times
+//                          the rate, which for the sweeps is wasted work and for
+//                          anything that counts ticks is simply wrong.
+//
+// The DECISION is rustkern/aptick.rs; everything here is the mutation it
+// authorises, in the order the C side owns.
+//
+// IRQ-CONTEXT RULE (#426): nothing here waits. No lock is taken, no queue is
+// polled. The one call that can block the core is sched_schedule(), which is
+// what the BSP's timer tick already does from the identical context.
+// ===========================================================================
+void sched_tick_ap(void) {
+    uint32_t cpu = sched_rq_cpu();
+    // Never on the BSP. sched_rq_cpu() also returns 0 before per-cpu GS is
+    // final, so this doubles as the "too early to be trusted" guard.
+    if (cpu == 0 || cpu >= MAYTERA_MAX_CPUS) return;
+
+    g_ap_ticks[cpu]++;      // counted FIRST, so "the timer fires" is provable
+                            // even on a core that never has anything to run.
+
+    process_t *cur = sched_cpu_current();
+
+    uint32_t new_slice = 0;
+    uint32_t act = ap_tick_decide_rs(preemption_enabled ? 1u : 0u,
+                                     cur ? 1u : 0u,
+                                     (cur && cur->is_idle) ? 1u : 0u,
+                                     g_need_resched[cpu] ? 1u : 0u,
+                                     cur ? (uint32_t)cur->time_slice : 0u,
+                                     &new_slice);
+
+    if (act & APTICK_BUSY)     g_core_busy[cpu]++;
+    if (act & APTICK_ACK_RESC) g_need_resched[cpu] = 0;
+    if (!cur) return;
+    if (act & APTICK_CHARGE)   cur->total_time++;
+    if (act & APTICK_SETSLICE) cur->time_slice = new_slice;
+    if (act & APTICK_SCHED) {
+        g_ap_preempts[cpu]++;
+        // Does not return to this frame when it switches; the EOI is already
+        // sent (cpu/isr.c), so nothing is owed to the LAPIC from here.
+        sched_schedule();
+    }
+}
+
+// #171: "HAS THE SCHEDULER STARTED" AND "IS PREEMPTION SUPPRESSED RIGHT NOW"
+// ARE DIFFERENT QUESTIONS, AND preemption_enabled ONLY ANSWERS THE SECOND.
+//
+// preemption_enabled is false for two completely unrelated reasons. Before
+// proc_init() it is false because the scheduler has never run and there is
+// nothing to switch to. After that it goes false and true again, for a few
+// microseconds at a time, every time a caller brackets a critical section with
+// sched_set_preemption(false) ... sched_set_preemption(old) - proc_create_user()
+// and the spawn path both do.
+//
+// sync/noblock.c used sched_preemption_enabled() as its proxy for the FIRST
+// question, which is only defensible while exactly one core runs threads. With
+// the #67 gate on, three more cores are running threads that have nothing to do
+// with the BSP's critical section, and they read a global that is momentarily
+// false because of it. MEASURED (#171): 0 to 3 spurious
+// "[WQBLOCK] ... [SCHEDULER-NOT-LIVE]" reports per gate-ON boot and exactly
+// zero per gate-OFF boot, across 17 boots, naming innocent third-party threads
+// ('condrain', 'seclog', and once the Ring-3 'SETUP' process) - never the
+// thread that was inside the critical section. addr2line on the five distinct
+// reported call sites gives console_drain_worker (serial.c:768),
+// sys_win_get_event (proc/syscall.c:6470, i.e. an ordinary Ring-3 app waiting
+// for its next window event), seclog_worker and seclog_pending
+// (security/seclog.c:275,113) and ext2_lock_at (fs/ext2.c:198). Five routine
+// blocking waits, none of them inside a critical section of its own.
+//
+// The window they collide with is not hypothetical either: sys_spawn brackets
+// an ENTIRE ELF LOAD in sched_set_preemption(false) (proc/syscall.c:3258..3325),
+// which is milliseconds, and proc_create_user()/proc_create_ex() bracket their
+// own setup. With the gate off those windows are invisible because the one core
+// that runs threads is the one inside the bracket. With the gate on, three more
+// cores are running ordinary threads straight through them.
+//
+// They are FALSE POSITIVES, and that is a claim about the code rather than an
+// inference from who got named: __wait_prepare() sets PROC_STATE_BLOCKED via
+// sched_self_block() BEFORE __wait_event_wait() calls sched_schedule(), so the
+// "preemption off and the current task is still RUNNING" early return in
+// sched_schedule() is not taken, the waiter really is switched away, and
+// proc_wake() -> add_to_ready_queue() can still reach it. Blocking there is
+// safe. The assertion was reporting a hazard that does not exist.
+//
+// WHY IT MATTERS ENOUGH TO FIX BEFORE THE GATE COULD SHIP. wq_assert_may_block()
+// is the ONLY live runtime guard for the #426 bug class, and #514's whole
+// finding was that a guardrail nobody trusts is a guardrail that is not there.
+// Turning the gate on would put two or three of these in every shipping boot
+// log, and the first thing anyone would learn is to ignore the line.
+//
+// THE FIX IS A STICKY FLAG, not a cleverer read of the volatile one: once the
+// scheduler has been enabled even once, it is live for the rest of the boot.
+// Nothing ever un-starts it.
+static bool sched_ever_live = false;
+
 /**
  * Enable/disable preemption
  */
 bool sched_set_preemption(bool enable) {
     bool old = preemption_enabled;
     preemption_enabled = enable;
+    if (enable) sched_ever_live = true;
     return old;
 }
+
+// #171: the durable "the scheduler exists and can switch" predicate. Distinct
+// from sched_preemption_enabled(), which is the momentary suppressor and which
+// every existing caller (xhci, usb_msc) genuinely wants, because those callers
+// are asking "will proc_sleep() make progress right now", not "may I park".
+bool sched_is_live(void) { return sched_ever_live; }
 
 /**
  * Check if preemption is enabled
@@ -3425,75 +5391,143 @@ bool sched_preemption_enabled(void) {
  */
 
 // ============================================================================
-// setup_user_argv: write argc/argv onto a user-mode stack in a foreign
-// address space (target_cr3).  Returns the new user RSP value.
+// setup_user_stack: write argc/argv/envp onto a user-mode stack in a foreign
+// address space (target_cr3).  Returns the new user RSP value, or 0 on
+// refusal (the caller must abandon the spawn).
 //
 // Uses a temporary CR3 switch to write directly to user virtual addresses.
 // The kernel stack and code are in kernel upper-half mappings (PML4 256-511)
 // which are shared between all address spaces, so they remain valid.
 //
-// Stack layout (what crt0.asm expects):
+// #112: THIS FUNCTION USED TO BE setup_user_argv() AND WROTE NO ENVIRONMENT.
+// It reserved the slot and labelled it "envp terminator (future)", which is
+// why every MayteraOS process started with an empty `environ` and why
+// /APPS/ENV refused NAME=VALUE. The slot is now filled.
+//
+// Stack layout, high address to low (SysV x86-64 initial process stack, and
+// exactly what libc/crt0.S now reads):
 //
 //   High addr:
-//     <string data>        argv strings packed here (null-terminated each)
+//     <env strings>         envc NUL-terminated "NAME=VALUE" strings
+//     <argv strings>        argc NUL-terminated strings
 //     <padding to 8-byte>
-//     NULL                  envp terminator (future)
+//     NULL                  envp terminator
+//     &envp[envc-1] .. &envp[0]
 //     NULL                  argv terminator
-//     &argv[argc-1]         pointers to strings (user-space virtual addrs)
-//     ...
-//     &argv[0]
+//     &argv[argc-1] .. &argv[0]
 //     argc (uint64_t)       <-- RSP points here
 //   Low addr (16-byte aligned)
+//
+// THE ARITHMETIC IS IN RUST (rustkern/envblock.rs), the stores are here. The
+// split is deliberate and is the fsperm.rs / spawnid.rs pattern: the sizes are
+// Ring-3 chosen and a wrapped total is how a 16KB block becomes an 8-byte
+// reservation, so every length computation is a checked_add/checked_mul over
+// there. The stores stay in C because they run inside a foreign-CR3 window
+// with interrupts masked and SMAP AC set, and reimplementing that machinery in
+// Rust would fork a primitive instead of reusing one.
+//
+// `argv` and `envp` are KERNEL arrays of KERNEL strings. Every caller has
+// already bounced them (spawn_impl copies each Ring-3 string into a kernel
+// buffer). This function never dereferences a Ring-3 pointer.
 // ============================================================================
-static uint64_t setup_user_argv(uint64_t target_cr3, uint64_t stack_top,
-                                int argc, char **argv) {
-    if (argc <= 0 || !argv) {
-        // No args: push argc=0, 16-byte align
-        // We still need to write to the user stack, so switch CR3
-        uint64_t sp = (stack_top - 8) & ~0xFULL;
 
-        // Mask interrupts across the foreign-CR3 window (see elf_load_user).
-        uint64_t old_cr3, rflags;
-        __asm__ volatile("pushfq; pop %0" : "=r"(rflags) :: "memory");
-        __asm__ volatile("cli");
-        __asm__ volatile("mov %%cr3, %0" : "=r"(old_cr3));
-        __asm__ volatile("mov %0, %%cr3" : : "r"(target_cr3) : "memory");
+// rustkern/envblock.rs. Keep these in step with the Rust signatures; the
+// symbol names are locked by kernel/rust-symbols.manifest.
+typedef struct {
+    uint64_t sp;
+    uint64_t argv_slots;
+    uint64_t envp_slots;
+    uint64_t argv_strings;
+    uint64_t env_strings;
+    uint64_t total;
+} rs_stack_plan_t;
 
-        // #19/#645: one store to the child's USER stack, so it needs AC.
-        uaccess_ac_t __ac0 = uaccess_begin();
-        *(volatile uint64_t *)sp = 0;  // argc = 0
-        uaccess_end(__ac0);
+extern int32_t user_stack_plan_rs(uint64_t stack_top, uint64_t stack_size,
+                                  uint32_t argc, uint64_t argv_bytes,
+                                  uint32_t envc, uint64_t env_bytes,
+                                  rs_stack_plan_t *out);
+extern int32_t env_entry_len_rs(const uint8_t *p, uint64_t cap);
+extern const uint8_t *env_default_rs(uint32_t idx);
+extern uint32_t envblock_selftest_rs(void);
 
-        __asm__ volatile("mov %0, %%cr3" : : "r"(old_cr3) : "memory");
-        __asm__ volatile("push %0; popfq" : : "r"(rflags) : "cc", "memory");
-        return sp;
+#define SUS_MAX_ENTRIES 64
+#define SUS_ARG_CAP     256    // spawn_impl's per-argument kernel buffer
+#define SUS_ENV_CAP     512    // ENV_MAX_ENTRY in envblock.rs
+
+// Run once at boot so the layout policy is proven LIVE on this build rather
+// than merely compiled in. Loud on purpose: a non-zero mask means the
+// arithmetic that bounds a Ring-3-sized allocation is wrong.
+void envblock_selftest(void) {
+    uint32_t fails = envblock_selftest_rs();
+    if (fails == 0) kprintf("[ENVBLK] stack/env policy self-test PASS (rust)\n");
+    else            kprintf("[ENVBLK] stack/env policy self-test FAIL mask=0x%x\n", fails);
+}
+
+// The environment a process the KERNEL launches starts with. See the
+// ENV_DEFAULTS block in rustkern/envblock.rs for why it is this short and why
+// HOME and USER are deliberately absent. Fills `slots` and returns the count.
+static int env_kernel_defaults(const char **slots, int cap) {
+    int n = 0;
+    while (n < cap) {
+        const uint8_t *e = env_default_rs((uint32_t)n);
+        if (!e) break;
+        slots[n++] = (const char *)e;
     }
+    return n;
+}
 
-    // Clamp argc
-    if (argc > 64) argc = 64;
+static uint64_t setup_user_stack(uint64_t target_cr3, uint64_t stack_top,
+                                 int argc, char **argv,
+                                 int envc, char **envp) {
+    // ---- Phase 1: measure, in kernel memory, before touching the child -----
+    if (argc < 0 || !argv) argc = 0;
+    if (argc > SUS_MAX_ENTRIES) argc = SUS_MAX_ENTRIES;
 
-    // Phase 1: Calculate total string bytes needed
-    uint64_t total_str = 0;
+    uint64_t arg_len[SUS_MAX_ENTRIES];
+    uint64_t argv_bytes = 0;
     for (int i = 0; i < argc; i++) {
-        if (argv[i]) {
-            const char *s = argv[i];
-            int len = 0;
-            while (s[len]) len++;
-            total_str += len + 1;
-        } else {
-            total_str += 1;
-        }
+        const char *s = argv[i] ? argv[i] : "";
+        uint64_t len = 0;
+        while (len < SUS_ARG_CAP - 1 && s[len]) len++;
+        arg_len[i] = len + 1;               // with the NUL
+        argv_bytes += arg_len[i];
     }
 
-    // Strings go at the top of the stack area
-    uint64_t str_area = (stack_top - total_str) & ~0x7ULL;
+    // envc < 0 means "no environment was supplied": use the kernel defaults,
+    // which is what a process the kernel itself launches gets. envc == 0 with
+    // a NULL envp is a DIFFERENT request - a deliberately EMPTY environment,
+    // which is what `env -i` means - and it is honoured as such.
+    const char *defslots[SUS_MAX_ENTRIES];
+    const char **env = (const char **)envp;
+    if (envc < 0) {
+        envc = env_kernel_defaults(defslots, SUS_MAX_ENTRIES);
+        env  = defslots;
+    }
+    if (envc > SUS_MAX_ENTRIES) envc = SUS_MAX_ENTRIES;
+    if (envc > 0 && !env) envc = 0;
 
-    // Pointer array below string data:
-    // argc + argv[0..argc-1] + NULL + NULL(envp)
-    uint64_t ptrs_needed = 1 + argc + 1 + 1;
-    uint64_t sp = (str_area - ptrs_needed * 8) & ~0xFULL;
+    uint64_t env_len[SUS_MAX_ENTRIES];
+    uint64_t env_bytes = 0;
+    for (int i = 0; i < envc; i++) {
+        // A malformed entry REFUSES THE SPAWN. It is not dropped: an entry
+        // with no '=' can never be found by getenv(), so carrying it would
+        // consume a slot and read back as absent, and dropping it silently
+        // would run the child with an environment the caller did not ask for.
+        int32_t n = env_entry_len_rs((const uint8_t *)(env[i] ? env[i] : ""),
+                                     SUS_ENV_CAP);
+        if (n < 0) return 0;
+        env_len[i] = (uint64_t)n;
+        env_bytes += env_len[i];
+    }
 
-    // Phase 2: Switch to target address space and write everything.
+    rs_stack_plan_t plan;
+    if (user_stack_plan_rs(stack_top, USER_STACK_SIZE,
+                           (uint32_t)argc, argv_bytes,
+                           (uint32_t)envc, env_bytes, &plan) != 0) {
+        return 0;
+    }
+
+    // ---- Phase 2: switch to the target address space and write everything --
     // Mask interrupts across the foreign-CR3 window (see elf_load_user): an IRQ
     // handler must never run while CR3 points at the child address space.
     uint64_t old_cr3, rflags;
@@ -3502,41 +5536,40 @@ static uint64_t setup_user_argv(uint64_t target_cr3, uint64_t stack_top,
     __asm__ volatile("mov %%cr3, %0" : "=r"(old_cr3));
     __asm__ volatile("mov %0, %%cr3" : : "r"(target_cr3) : "memory");
 
-    // #19/#645: from here to the matching uaccess_end() every dereference of
-    // `cur`/`sp` is a store to the child's USER stack (U/S=1), which #PFs under
-    // CR4.SMAP without AC. The bracket spans the STORES, not the function: the
-    // size arithmetic above ran before it and the CR3 restore runs after it.
-    // Reads of argv[i] inside are KERNEL memory and are unaffected by AC.
+    // #19/#645: from here to the matching uaccess_end() every dereference of a
+    // plan address is a store to the child's USER stack (U/S=1), which #PFs
+    // under CR4.SMAP without AC. The bracket spans the STORES, not the
+    // function: the size arithmetic above ran before it and the CR3 restore
+    // runs after it. Reads of argv[i]/env[i] inside are KERNEL memory and are
+    // unaffected by AC.
     uaccess_ac_t __ac = uaccess_begin();
 
-    // Write strings and record their user-space addresses
-    uint64_t str_addrs[64];
-    uint64_t cur = str_area;
+    // argc
+    *(volatile uint64_t *)plan.sp = (uint64_t)argc;
+
+    // argv strings, then their pointers
+    uint64_t cur = plan.argv_strings;
     for (int i = 0; i < argc; i++) {
-        str_addrs[i] = cur;
+        *(volatile uint64_t *)(plan.argv_slots + (uint64_t)i * 8) = cur;
         const char *s = argv[i] ? argv[i] : "";
-        while (*s) {
-            *(volatile uint8_t *)cur = (uint8_t)*s;
-            cur++;
-            s++;
-        }
-        *(volatile uint8_t *)cur = 0;  // null terminator
-        cur++;
+        for (uint64_t j = 0; j + 1 < arg_len[i]; j++)
+            *(volatile uint8_t *)(cur + j) = (uint8_t)s[j];
+        *(volatile uint8_t *)(cur + arg_len[i] - 1) = 0;
+        cur += arg_len[i];
     }
+    *(volatile uint64_t *)(plan.argv_slots + (uint64_t)argc * 8) = 0;  // argv NULL
 
-    // Write argc
-    *(volatile uint64_t *)sp = (uint64_t)argc;
-
-    // Write argv pointers
-    for (int i = 0; i < argc; i++) {
-        *(volatile uint64_t *)(sp + 8 + i * 8) = str_addrs[i];
+    // env strings, then their pointers
+    cur = plan.env_strings;
+    for (int i = 0; i < envc; i++) {
+        *(volatile uint64_t *)(plan.envp_slots + (uint64_t)i * 8) = cur;
+        const char *s = env[i] ? env[i] : "";
+        for (uint64_t j = 0; j + 1 < env_len[i]; j++)
+            *(volatile uint8_t *)(cur + j) = (uint8_t)s[j];
+        *(volatile uint8_t *)(cur + env_len[i] - 1) = 0;
+        cur += env_len[i];
     }
-
-    // Write argv NULL terminator
-    *(volatile uint64_t *)(sp + 8 + argc * 8) = 0;
-
-    // Write envp NULL terminator
-    *(volatile uint64_t *)(sp + 8 + (argc + 1) * 8) = 0;
+    *(volatile uint64_t *)(plan.envp_slots + (uint64_t)envc * 8) = 0;  // envp NULL
 
     uaccess_end(__ac);
 
@@ -3544,7 +5577,7 @@ static uint64_t setup_user_argv(uint64_t target_cr3, uint64_t stack_top,
     __asm__ volatile("mov %0, %%cr3" : : "r"(old_cr3) : "memory");
     __asm__ volatile("push %0; popfq" : : "r"(rflags) : "cc", "memory");
 
-    return sp;
+    return plan.sp;
 }
 
 
@@ -3592,7 +5625,19 @@ void spawn_ident_selftest(void) {
 
 int proc_create_user_as(const char *name, void *elf_data, uint64_t elf_size,
                         char **argv, char **envp, proc_ident_t ident) {
-    (void)envp;
+    // #112: envp is a KERNEL array of KERNEL "NAME=VALUE" strings, or NULL.
+    //
+    // NULL and an EMPTY VECTOR are different requests and are answered
+    // differently. NULL means "nobody supplied an environment", which is the
+    // case for every process the KERNEL launches (the compositor from
+    // gui/desktop.c, a service, a cron job): those get the small default block
+    // in rustkern/envblock.rs, so the inheritance tree has a root. A non-NULL
+    // envp whose first element is NULL means "an empty environment on
+    // purpose", which is what "env -i" asks for, and it is honoured.
+    //
+    // Until this ticket the whole parameter was a single (void)envp cast.
+    int envc = -1;
+    if (envp) { envc = 0; while (envp[envc] && envc < 64) envc++; }
 
     // #692: RESOLVE THE IDENTITY FIRST, and abandon the spawn if it cannot be
     // resolved. This runs before anything is allocated, so a refusal costs
@@ -3666,8 +5711,11 @@ int proc_create_user_as(const char *name, void *elf_data, uint64_t elf_size,
 
     // Map user stack pages
     uint64_t stack_pages = USER_STACK_SIZE / VMM_PAGE_SIZE_4K;
-    if (vmm_alloc_user_pages(proc->cr3, proc->user_stack_base, stack_pages,
-                             VMM_USER_RW) != 0) {
+    scp_span_t __sus = scp_begin();   // #121
+    int __usr = vmm_alloc_user_pages(proc->cr3, proc->user_stack_base, stack_pages,
+                                     VMM_USER_RW);
+    scp_end(SCP_VMMSTACK, __sus);
+    if (__usr != 0) {
         kprintf("[PROC] Failed to allocate user stack for %s\n", name);
         LOG_ERROR("[Process] Failed to allocate user stack");
         kfree(proc->stack_base);
@@ -3682,8 +5730,10 @@ int proc_create_user_as(const char *name, void *elf_data, uint64_t elf_size,
     // #640: pass the process name so a loader rejection names the app rather
     // than only an address (the four 0x400000 binaries of #633 were found by
     // measurement, not by anyone reading a log line).
+    scp_span_t __sel = scp_begin();   // #121
     int elf_result = elf_load_user_named(elf_data, elf_size, proc->cr3,
                                          &entry_point, &load_base, &load_end, name);
+    scp_end(SCP_ELFLOAD, __sel);
     if (elf_result != ELF_SUCCESS) {
         kprintf("[PROC] Failed to load ELF for %s: %s\n", name, elf_strerror(elf_result));
         LOG_ERROR("[Process] Failed to load ELF into user space");
@@ -3698,19 +5748,35 @@ int proc_create_user_as(const char *name, void *elf_data, uint64_t elf_size,
     kprintf("[PROC] Loaded ELF: entry=0x%lx, base=0x%lx, end=0x%lx\n",
             entry_point, load_base, load_end);
 
+    // #COMPRESPAWN: keep the base. Under PIE + ASLR this is the ONLY thing that
+    // makes a faulting RIP resolvable to a source line later; see the field's
+    // comment in process.h. It costs two stores on a cold path.
+    proc->image_base = load_base;
+    proc->image_end  = load_end;
+
     // Set up user mode entry point and stack
     proc->user_rip = entry_point;
 
-    // Set up user stack with argc/argv
-    uint64_t user_sp;
-    if (argv) {
-        // Count argc from argv array
-        int argc = 0;
-        while (argv[argc]) argc++;
-        user_sp = setup_user_argv(proc->cr3, USER_STACK_TOP, argc, argv);
-    } else {
-        // No argv: push argc=0
-        user_sp = setup_user_argv(proc->cr3, USER_STACK_TOP, 0, NULL);
+    // Set up user stack with argc/argv/envp
+    int argc = 0;
+    if (argv) { while (argv[argc] && argc < 64) argc++; }
+    uint64_t user_sp = setup_user_stack(proc->cr3, USER_STACK_TOP,
+                                        argc, argv, envc, envp);
+
+    // #112: a refused layout ABANDONS THE SPAWN. setup_user_stack() returns 0
+    // when the environment does not fit its budget or an entry is not
+    // NAME=VALUE. Starting the child anyway would give it RSP 0 and a #PF on
+    // its first instruction, which is a far more confusing failure than a
+    // spawn that did not happen.
+    if (user_sp == 0) {
+        kprintf("[PROC] %s: refused initial stack (argc=%d envc=%d)\n",
+                name, argc, envc);
+        vmm_free_user_pages(proc->cr3, proc->user_stack_base, stack_pages);
+        kfree(proc->stack_base);
+        vmm_destroy_user_space(proc->cr3);
+        proc->state = PROC_STATE_UNUSED;
+        sched_set_preemption(old_preempt);
+        return -1;
     }
 
     proc->user_rsp = user_sp;
@@ -3751,6 +5817,7 @@ int proc_create_user_as(const char *name, void *elf_data, uint64_t elf_size,
     proc->entry_arg = NULL;
 
     proc->running_cpu = -1;
+    proc->last_cpu    = -1;   // #83: never run anywhere yet
     // #421 phase 7: only migrate to an AP if AP user-scheduling is enabled;
     // with it off (the default now, see cpu/smp.c), a migq push would strand the
     // proc (nothing pops it), so route every user proc to the BSP ready queue.
@@ -3860,7 +5927,12 @@ static void fork_child_return(void) {
  * The child receives 0 as return value (via fork_child_return trampoline).
  */
 int proc_fork(void) {
-    if (!current_proc) {
+    // #745 (local 75) CLASS FIX: fork the task running on THIS cpu. Through
+    // the BSP-published global, an AP-side fork copied the BSP task's
+    // process_t, cr3 and kernel stack, and returned that child to the caller.
+    process_t *me = proc_current();
+
+    if (!me) {
         return -1;
     }
 
@@ -3875,11 +5947,11 @@ int proc_fork(void) {
     }
 
     // Copy parent process structure
-    memcpy(child, current_proc, sizeof(process_t));
+    memcpy(child, me, sizeof(process_t));
     { uint64_t __fl = spinlock_acquire_irqsave(&g_proc_table_lock);
       child->pid = next_pid++;   // #75: unlocked RMW on a shared global
       spinlock_release_irqrestore(&g_proc_table_lock, __fl); }
-    child->ppid = current_proc->pid;
+    child->ppid = me->pid;
     child->state = PROC_STATE_READY;
     child->next = NULL;
     // #67: the struct copy above duplicated the parent's ownership flag. The
@@ -3892,6 +5964,7 @@ int proc_fork(void) {
     child->sched_state_at_enq = 0; child->sched_state_at_pop = 0;
     child->sched_enq_ra = 0;   // #75: copied forensics would name the parent
     child->running_cpu = -1;
+    child->last_cpu    = -1;   // #83
     // The parent's wait_entry (if non-NULL) lives on the parent's kernel
     // stack, not the child's, so it is meaningless in the child. Clear it.
     child->wait_entry = NULL;
@@ -3919,12 +5992,12 @@ int proc_fork(void) {
     // metadata so the child can still fault in inherited lazy mmap regions.
     {
         extern void *mm_dup(void *src);
-        child->mm = current_proc->mm ? mm_dup(current_proc->mm) : (void *)0;
+        child->mm = me->mm ? mm_dup(me->mm) : (void *)0;
     }
 
     // Clone address space (copy-on-write share of all user pages)
-    if (current_proc->privilege == PRIV_USER && current_proc->cr3 != 0) {
-        child->cr3 = vmm_clone_user_space_cow(current_proc->cr3);  // #429 COW fork
+    if (me->privilege == PRIV_USER && me->cr3 != 0) {
+        child->cr3 = vmm_clone_user_space_cow(me->cr3);  // #429 COW fork
         if (child->cr3 == 0) {
             child->state = PROC_STATE_UNUSED;
             sched_set_preemption(old_preempt);
@@ -3933,17 +6006,17 @@ int proc_fork(void) {
     }
 
     // Allocate new kernel stack for child
-    child->stack_base = kmalloc(current_proc->stack_size);
+    child->stack_base = kmalloc(me->stack_size);
     if (!child->stack_base) {
         if (child->cr3) vmm_destroy_user_space(child->cr3);
         child->state = PROC_STATE_UNUSED;
         sched_set_preemption(old_preempt);
         return -1;
     }
-    child->stack_size = current_proc->stack_size;
+    child->stack_size = me->stack_size;
 
     // Copy parent's kernel stack (includes the syscall entry frame)
-    memcpy(child->stack_base, current_proc->stack_base, current_proc->stack_size);
+    memcpy(child->stack_base, me->stack_base, me->stack_size);
 
     // Build a synthetic context_switch frame on the child's kernel stack.
     // When the scheduler picks the child and does context_switch(&prev->rsp, child->rsp),
@@ -4009,8 +6082,12 @@ int proc_fork(void) {
     *(uint64_t *)(rf + 128) = (uint64_t)fork_child_return;        // return address
     // #446: no stack carve, no stashed RF pointer; the FXSAVE image lives in
     // child->fpu_area (see process.h).
+    // #110: and it is seeded from the PARENT'S LIVE FPU/SSE(/AVX) registers,
+    // not from the architectural default, so the child inherits the parent's
+    // floating-point environment (MXCSR, x87 control word, XMM/YMM, x87 stack)
+    // as POSIX requires. See fpu_capture_live() above.
     child->rsp = rf;
-    proc_init_fpu_area(child);
+    proc_capture_fpu_from_current(child);
     proc_stack_tag(child);
 
     // Ensure child takes the context_switch path (not context_start/IRET)
@@ -4020,7 +6097,7 @@ int proc_fork(void) {
     add_to_ready_queue(child);
 
     kprintf("[PROC] Forked '%s' (PID %u -> child PID %u)\n",
-            child->name, current_proc->pid, child->pid);
+            child->name, me->pid, child->pid);
 
     sched_set_preemption(old_preempt);
     return child->pid;
@@ -4047,10 +6124,15 @@ int proc_fork(void) {
  */
 int proc_clone(uint32_t flags, void *user_stack, uint32_t *parent_tid,
                uint32_t *child_tid, void *tls) {
+    // #745 (local 75) CLASS FIX: clone the task running on THIS cpu. Through
+    // the BSP-published global, an AP-side pthread_create() made a thread of
+    // the BSP's task, sharing ITS address space and not the caller's.
+    process_t *me = proc_current();
+
     (void)tls;  // CLONE_SETTLS: FS-base switching per task is not wired yet
                 // (pthread_self() uses SYS_GETTID, TSD uses arrays), so a
                 // NULL/zero tls is the only case the current libc exercises.
-    if (!current_proc) return -1;
+    if (!me) return -1;
     // A raw clone with no shared stack is just fork(); route it there.
     if (!(flags & CLONE_VM) || user_stack == NULL) {
         return proc_fork();
@@ -4083,11 +6165,11 @@ int proc_clone(uint32_t flags, void *user_stack, uint32_t *parent_tid,
     }
 
     // Copy parent structure, then fix up the thread-specific fields.
-    memcpy(child, current_proc, sizeof(process_t));
+    memcpy(child, me, sizeof(process_t));
     { uint64_t __fl = spinlock_acquire_irqsave(&g_proc_table_lock);
       child->pid = next_pid++;   // #75: unlocked RMW on a shared global
       spinlock_release_irqrestore(&g_proc_table_lock, __fl); }
-    child->ppid = current_proc->pid;
+    child->ppid = me->pid;
     child->state = PROC_STATE_READY;
     child->next = NULL;
     // #67: the struct copy above duplicated the parent's ownership flag. The
@@ -4100,12 +6182,13 @@ int proc_clone(uint32_t flags, void *user_stack, uint32_t *parent_tid,
     child->sched_state_at_enq = 0; child->sched_state_at_pop = 0;
     child->sched_enq_ra = 0;   // #75: copied forensics would name the parent
     child->running_cpu = -1;
+    child->last_cpu    = -1;   // #83
     child->wait_entry = NULL;
     child->sig_pending = 0;
     child->return_work = 0;
 
     // Thread group: leader is the caller's tgid (or the caller itself).
-    child->tgid = current_proc->tgid ? current_proc->tgid : current_proc->pid;
+    child->tgid = me->tgid ? me->tgid : me->pid;
 
     // Bump refcounts on inherited fds (CLONE_FILES sharing is approximated as
     // fork-style inheritance; adequate for the current libc).
@@ -4116,13 +6199,13 @@ int proc_clone(uint32_t flags, void *user_stack, uint32_t *parent_tid,
 
     // (1) SHARE the address space - do NOT clone it. Mark the child so its
     // cleanup never destroys the shared cr3 or frees the shared user stack.
-    child->cr3 = current_proc->cr3;
+    child->cr3 = me->cr3;
     child->shares_vm = 1;
     child->user_stack_base = 0;   // owned by the leader, not this thread
     child->user_stack_size = 0;
 
     // #421 phase 5 follow-up: child->mm is already the SAME pointer as
-    // current_proc->mm (copied by the memcpy above) - this thread now holds
+    // me->mm (copied by the memcpy above) - this thread now holds
     // its own independent reference to it. Bump the shared mm's refcount so
     // cleanup_proc_slot() (via mm_put(), see demand.h) only actually frees it
     // once every process_t sharing it (leader AND every cloned thread) has
@@ -4140,15 +6223,15 @@ int proc_clone(uint32_t flags, void *user_stack, uint32_t *parent_tid,
 
     // Allocate + copy a fresh kernel stack (the child needs its own kernel
     // stack for syscalls; the copy carries the parent's syscall-entry frame).
-    child->stack_base = kmalloc(current_proc->stack_size);
+    child->stack_base = kmalloc(me->stack_size);
     if (!child->stack_base) {
         child->state = PROC_STATE_UNUSED;
         child->cr3 = 0; child->shares_vm = 0;
         sched_set_preemption(old_preempt);
         return -1;
     }
-    child->stack_size = current_proc->stack_size;
-    memcpy(child->stack_base, current_proc->stack_base, current_proc->stack_size);
+    child->stack_size = me->stack_size;
+    memcpy(child->stack_base, me->stack_base, me->stack_size);
 
     // (2) The copied kernel stack holds a duplicate of the parent's syscall
     // entry frame at its top. syscall.asm pushed, from the very top down:
@@ -4177,8 +6260,12 @@ int proc_clone(uint32_t flags, void *user_stack, uint32_t *parent_tid,
     *(uint64_t *)(rf + 128) = (uint64_t)fork_child_return;        // return address
     // #446: no stack carve, no stashed RF pointer; the FXSAVE image lives in
     // child->fpu_area (see process.h).
+    // #110: and it is seeded from the PARENT'S LIVE FPU/SSE(/AVX) registers,
+    // not from the architectural default, so the child inherits the parent's
+    // floating-point environment (MXCSR, x87 control word, XMM/YMM, x87 stack)
+    // as POSIX requires. See fpu_capture_live() above.
     child->rsp = rf;
-    proc_init_fpu_area(child);
+    proc_capture_fpu_from_current(child);
     proc_stack_tag(child);
 
     // Take the context_switch (not context_start/IRET) path.
@@ -4200,7 +6287,7 @@ int proc_clone(uint32_t flags, void *user_stack, uint32_t *parent_tid,
     add_to_ready_queue(child);
 
     kprintf("[PROC] Cloned thread of '%s' (PID %u -> tid %u) flags=0x%x\n",
-            child->name, current_proc->pid, child->pid, flags);
+            child->name, me->pid, child->pid, flags);
 
     sched_set_preemption(old_preempt);
     return (int)child->pid;
@@ -4401,13 +6488,16 @@ void proc_execve_finalize(void *user_frame) {
  * This is typically called after setting up the stack frame
  */
 void proc_enter_usermode(uint64_t entry_rip, uint64_t user_rsp) {
+    // #745 (local 75) CLASS FIX: the task entering Ring 3 is THIS cpu's.
+    process_t *me = proc_current();
+
     // Set up TSS kernel stack for this process
-    uint64_t kstack = (uint64_t)current_proc->stack_base + current_proc->stack_size;
+    uint64_t kstack = (uint64_t)me->stack_base + me->stack_size;
     cpu_set_kernel_stack(kstack);
 
     // Switch to user address space
-    if (current_proc->cr3 != 0) {
-        vmm_switch_pml4(current_proc->cr3);
+    if (me->cr3 != 0) {
+        vmm_switch_pml4(me->cr3);
     }
 
     // Build IRET frame on stack and execute IRET
@@ -4461,20 +6551,29 @@ void proc_enter_usermode(uint64_t entry_rip, uint64_t user_rsp) {
  * Check if current process is user mode
  */
 bool proc_is_usermode(void) {
-    return current_proc && current_proc->privilege == PRIV_USER;
+    // #745 (local 75) CLASS FIX: the privilege asked about is THIS cpu's.
+    process_t *me = proc_current();
+
+    return me && me->privilege == PRIV_USER;
 }
 
 /**
  * Get current process CR3
  */
 uint64_t proc_get_cr3(void) {
-    return current_proc ? current_proc->cr3 : 0;
+    // #745 (local 75) CLASS FIX: the address space asked about is THIS cpu's.
+    process_t *me = proc_current();
+
+    return me ? me->cr3 : 0;
 }
 
 // Return current process name (for debugging)
 const char *proc_current_name(void) {
-    if (current_process && current_process->name[0])
-        return current_process->name;
+    // #745 (local 75) CLASS FIX: the name asked for is THIS cpu's task.
+    process_t *me = proc_current();
+
+    if (me && me->name[0])
+        return me->name;
     return "kernel";
 }
 
@@ -4521,6 +6620,15 @@ int proc_snapshot(proc_info_t *out, int max) {
         proc_mm_unlock();
         out[n].mem_kb = mem_ok ? mo.working_set_kb : 0;
         out[n].running_cpu = p->running_cpu;
+        // #145: publish the kernel-authoritative idle bit. sched_tick() credits
+        // total_time to WHATEVER is current, idle included, so an idle process
+        // accumulates ~one tick per tick it is on the core. That is correct as
+        // an accounting record (it is what makes cpu_ticks sum to elapsed
+        // capacity) but it made every ranked consumer list in the tree put
+        // "idle" on top on any machine that was not saturated. Ring 3 could not
+        // tell an idle row from a real one except by matching its NAME, so this
+        // exports the flag process_t already carries.
+        out[n].flags = p->is_idle ? PROC_INFO_F_IDLE : 0u;
         n++;
     }
     return n;
@@ -4540,4 +6648,24 @@ uint32_t proc_thread_count(uint32_t pid) {
         if (p->pid == pid || (p->shares_vm && p->tgid == pid)) count++;
     }
     return count ? count : 1;
+}
+
+
+// ===========================================================================
+// #58: the calling process's working directory, or NULL when there is no
+// current process (boot-time and kernel-thread callers).
+//
+// ONE definition, because the alternative is every path syscall writing
+// `(p && p->cwd[0]) ? p->cwd : "/"` for itself, which is how sys_chdir ended
+// up as the only site that knew the rule. NULL rather than "/" so the resolver
+// can tell "no process" from "process at the root": they happen to resolve the
+// same way today, and encoding that coincidence at 15 call sites would hide it.
+//
+// Justified-C, not Rust: this is a one-line read of an existing C struct field
+// through an existing C accessor. A Rust FFI round trip for it would add a
+// second definition of the thing whose single definition is the entire point.
+// ===========================================================================
+const char *proc_cwd(void) {
+    process_t *p = proc_current();
+    return (p && p->cwd[0]) ? p->cwd : (const char *)0;
 }

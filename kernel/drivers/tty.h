@@ -144,6 +144,13 @@ typedef struct tty {
     wait_queue_head_t output_wq;
 
     uint32_t fg_pgrp;          // foreground process group (0 = none)
+    // #745 (local 99): VEOF (^D) on an EMPTY canonical line. tty_commit_line()
+    // commits zero bytes, so a reader blocked in tty_read() woke, saw
+    // input_ring.count still 0, and went straight back to sleep: the EOF was
+    // lost and a foreground pty process could never see end-of-input. This is
+    // the latch that carries it across the wake. Cleared by the read that
+    // reports it, and by TCSETSF's input flush.
+    uint8_t  eof_pending;      // ^D on an empty line: next read() returns 0
     uint32_t session;          // controlling session (0 = none)
 
     int hangup;                // transport gone; read returns 0, write -EIO

@@ -1,0 +1,135 @@
+# mports recipe: Lua 5.4. Recipe number three, per docs/MPORTS.md "Doing the
+# next port".
+#
+# WHY LUA IS THIRD, AND WHY NOT ncurses. ncurses is the other obvious candidate
+# and it was DELIBERATELY not chosen: it needs a terminfo database on the image
+# AND a real interactive tty, and MayteraOS still has no interactive tty for
+# terminal apps (blame.md "#584 vi port: MayteraOS has no interactive tty for
+# terminal apps", and #586 "an interactive TUI in the Terminal needs a real
+# pty"). Porting it now would ship a library nothing on the system can drive.
+# Lua needs no terminal model at all, is MIT, is self-contained ANSI C, and
+# builds as `build=objects` exactly like the two ports before it.
+#
+# Read docs/MPORTS.md for what each key means. Every key here is DATA: there is
+# no lua-specific script anywhere in the tree, and mports.sh has no idea what
+# Lua is.
+
+name=lua
+version=5.4.8
+
+# CLASS A ("pure computation / library: stdio, stdlib, string, math. No process
+# model, no cwd, no sockets"), and that is a measured claim, not a habit. The
+# archive's complete list of external references is libc string/ctype/math,
+# malloc/free, setjmp/longjmp, and the ISO C stdio + time + locale surface
+# (fopen/fread/getc/freopen/tmpfile, time/clock/gmtime/strftime, localeconv).
+# There is no open()/read()/readdir()/stat(), no argv, no socket and no fork
+# anywhere in it: Lua's file layer is <stdio.h>, not POSIX. The `lua`
+# INTERPRETER built on top of this library in userland/apps/lua is a class B
+# CLI tool because it takes argv; the library itself is A.
+class=A
+homepage=https://www.lua.org/
+
+# The official lua.org release tarball. The sha256 below is of THIS file and
+# was MEASURED on the build container with sha256sum, not copied from a web page:
+#   wget -O lua-5.4.8.tar.gz https://www.lua.org/ftp/lua-5.4.8.tar.gz
+#   sha256sum lua-5.4.8.tar.gz
+#   -> 4f18ddae154e793e46eeab727c59ef1c0c0c2b744e7b94219710d76f530629ae  (374,332 bytes)
+# 5.4.8 (21 May 2025) is the newest 5.4.x on https://www.lua.org/ftp/ ; that
+# listing was read at port time rather than assumed.
+source_url=https://www.lua.org/ftp/lua-5.4.8.tar.gz
+tarball=lua-5.4.8.tar.gz
+sha256=4f18ddae154e793e46eeab727c59ef1c0c0c2b744e7b94219710d76f530629ae
+srcdir=lua-5.4.8
+
+# Lua is MIT. The verbatim grant is reproduced in ATTRIBUTION.md, copied out of
+# THIS tarball, not written from memory. The tarball has no LICENSE file: the
+# text lives at the end of src/lua.h and in the "License" section of
+# doc/readme.html, so both are listed. If a future upstream moves either one,
+# mports fails the build rather than shipping an unattributed library.
+licence=MIT
+licence_files=src/lua.h doc/readme.html
+copyleft=none
+
+# THE ADOPTION TEST (owner rule 2): does this library want to USE a platform
+# layer, or to BE one? CONFIRMED BY MEASUREMENT, not assumed. liblua.a was built
+# and `nm -u` gave its complete undefined set; every one of those names is
+# already defined in userland/libc/libc.a (measured with comm(1) against
+# nm --defined-only libc.a: the difference is EMPTY). Lua embeds INTO a host
+# program: the host owns main(), the allocator (lua_newstate takes an alloc
+# function), the process and the event loop, and Lua asks for nothing back. It
+# is the textbook USES case.
+adoption=USES. Measured: nm -u on the built liblua.a lists only libc string/ctype/math, malloc/free, setjmp/longjmp and the ISO C stdio/time/locale surface, and the set difference against libc.a's defined symbols is empty. Lua is designed to be embedded: the HOST owns main(), the process and the allocator (lua_newstate takes the allocator as an argument), and Lua never tries to own any of them.
+
+# `libc` is not a port; it is the shared platform library, built by
+# userland/libc's own Makefile before mports runs. Lua needs no other port.
+# (`needs` is REAL ordering as of local queue 91: see docs/MPORTS.md.)
+needs=libc
+
+# Upstream ships no generated files and no configure: the tarball's own
+# src/Makefile compiles a fixed list with -DLUA_USE_LINUX etc. and nothing else.
+prepare=none
+
+# THE ONE PATCH: the module search paths. Upstream's defaults name /usr/local
+# and "./", neither of which exists on MayteraOS ("./" cannot exist: this OS has
+# no working directory at all). The patch is deliberately confined to the
+# LUA_ROOT / LUA_PATH_DEFAULT / LUA_CPATH_DEFAULT block so a version bump shows
+# one reviewable hunk.
+#
+# HOW A BROKEN PATCH IS CAUGHT, since a config patch adds no symbol for the
+# `symbols` check to require: (1) mports applies the series with `patch -F0`, so
+# a patch whose context has moved FAILS the build rather than landing somewhere
+# else with fuzz; (2) userland/apps/luacheck asserts the exact package.path and
+# package.cpath strings at runtime on the booted machine, so a patch that still
+# applies but no longer MEANS what it did fails the on-device test.
+patches=0001-luaconf-maytera-module-paths.patch
+
+build=objects
+
+# CORE_O + LIB_O from upstream's own src/Makefile, in upstream's order.
+# lua.c and luac.c are NOT here: they are main() programs, not library code.
+sources=src/lapi.c src/lcode.c src/lctype.c src/ldebug.c src/ldo.c src/ldump.c src/lfunc.c src/lgc.c src/llex.c src/lmem.c src/lobject.c src/lopcodes.c src/lparser.c src/lstate.c src/lstring.c src/ltable.c src/ltm.c src/lundump.c src/lvm.c src/lzio.c src/lauxlib.c src/lbaselib.c src/lcorolib.c src/ldblib.c src/liolib.c src/lmathlib.c src/loadlib.c src/loslib.c src/lstrlib.c src/ltablib.c src/lutf8lib.c src/linit.c
+
+exclude=src/lua.c src/luac.c
+exclude_reason=Both are standalone programs with their own main(), and upstream links them as LUA_T/LUAC_T against liblua.a rather than into it. lua.c is the interpreter and is built as a normal userland app in userland/apps/lua, which links THIS archive: that is the point of separating them, so the tree gets a linkable library AND a usable /APPS/LUA binary from one recipe. luac.c is the bytecode compiler; it is not built for MayteraOS because a precompiled chunk is only loadable by a binary with the same LUAC_VERSION, size_t and endianness, so cross-compiling chunks on the build host and running luac on the target are two different features and neither is needed yet. Nothing else in src/ is a program.
+
+# NO -D FLAGS AT ALL, and each omission is a decision:
+#   * NOT -DLUA_USE_LINUX / -DLUA_USE_POSIX. Those would select _longjmp, dlopen
+#     and POSIX file APIs; this target has none of them. Undefined, luaconf.h
+#     takes its generic ISO C branch: setjmp/longjmp, LUA_DL_NONE, fseek/ftell.
+#   * NOT -DLUA_32BITS, and LUA_FLOAT_TYPE / LUA_INT_TYPE are LEFT AT THEIR
+#     DEFAULTS (double / long long). MayteraOS userland is REAL HARDWARE SSE2
+#     float: -mno-sse is a KERNEL-only flag and ports.mk never sets it. Measured
+#     on the built objects rather than assumed: liblua.a's undefined set
+#     contains the ordinary double entry points (sin, cos, pow, fmod, ldexp,
+#     frexp, log2) and NO soft-float libcalls (no __muldf3/__adddf3/__floatdidf
+#     family at all), so Lua numbers are native doubles executed in SSE2. There
+#     is no reason to reach for a fixed-point or integer-only build here.
+#   * NOT -DLUA_USE_C89. It is not needed and would cost snprintf, hex float
+#     literals and the '%a' format.
+# The one thing worth writing down: our <math.h> defines HUGE_VAL and does NOT
+# define HUGE_VALF, which makes luaconf.h take its "float variants are not
+# available" branch. That is CORRECT for this port - it routes every math.h call
+# through the double-precision entry point (sqrt, not sqrtf), which is exactly
+# what LUA_NUMBER=double wants - but it is a coincidence of our libm's header,
+# so if HUGE_VALF is ever added, re-check that lmathlib still links.
+headers=src/lua.h src/luaconf.h src/lualib.h src/lauxlib.h src/lua.hpp
+# THE INTERPRETER MAIN. src/lua.c is excluded from the archive above (it has a
+# main()), but userland/apps/lua compiles it into /APPS/LUA. install_sources
+# puts OUR patched copy at ports/out/src/lua.c so that app has a stable path to
+# compile, instead of reaching into the versioned scratch directory .work/.
+install_sources=src/lua.c src/lprefix.h
+
+lib=liblua.a
+
+# THE ANTI-NO-OP CHECK. mports.sh proves with nm that every one of these is a
+# DEFINED symbol in liblua.a. Each name was read out of the built archive with
+# nm, not from memory - note lua_pcall and lua_tostring are MACROS in lua.h, so
+# the linkable names are lua_pcallk and lua_tolstring, and requiring the macro
+# names would have failed for the right reason but the wrong one.
+#
+# The luaopen_* list is the important half: there is exactly ONE per standard
+# library translation unit (lbaselib, lstrlib, ltablib, lmathlib, liolib,
+# loslib, lcorolib, ldblib, lutf8lib, loadlib), so a `sources` list that lost a
+# file cannot pass. The luaV_/luaY_/luaU_/luaK_/luaZ_/luaH_/luaS_/luaG_/luaF_/
+# luaC_/luaM_/luaO_/luaP_/luaT_ names do the same job for the core files.
+symbols=luaL_newstate luaL_openlibs luaL_loadstring luaL_loadbufferx luaL_loadfilex lua_pcallk lua_tolstring lua_close lua_gc lua_dump lua_getinfo luaopen_base luaopen_string luaopen_table luaopen_math luaopen_io luaopen_os luaopen_coroutine luaopen_debug luaopen_utf8 luaopen_package luaV_execute luaY_parser luaU_undump luaK_code luaZ_fill luaH_new luaS_newlstr luaG_runerror luaF_newLclosure luaC_step luaM_realloc_ luaO_str2num luaP_opmodes luaT_gettmbyobj

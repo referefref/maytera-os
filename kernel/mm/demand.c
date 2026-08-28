@@ -9,6 +9,7 @@
 #include "../string.h"
 #include "../proc/process.h"
 #include "../fs/fat.h"
+#include "../sync/spinlock.h"   // #114: the SHARED irqsave spinlock
 
 #ifndef USER_STACK_SIZE
 #define USER_STACK_SIZE (2 * 1024 * 1024)  // 2MB default
@@ -40,17 +41,44 @@ static uint64_t stat_major_faults = 0;
 static uint64_t stat_cow_faults = 0;
 static uint64_t stat_lazy_allocs = 0;
 
-// Spinlock for COW table
-static volatile int cow_lock = 0;
+// #114 (#75) THE COW TABLE LOCK GOES THROUGH THE SHARED PRIMITIVE.
+//
+// This was a private `volatile int` + __sync_lock_test_and_set spin that never
+// touched RFLAGS.IF: byte for byte the shape that deadlocked two cores in #75
+// (mm/pmm.c) and the shape #347 fixed in mm/heap.c. A holder with IF=1 can be
+// interrupted, and cpu/idt.c wraps every ISR in bkl_acquire(), so it becomes a
+// BKL WAITER WHILE STILL HOLDING THIS LOCK; any BKL owner then wanting the
+// same lock closes an AB-BA cycle in which both cores spin and neither halts.
+//
+// HONEST SCOPE OF THIS CHANGE. Unlike pmm_lock, cow_lock was NOT exposed, and
+// this commit fixes no observed deadlock. Traced at #114, every live taker is
+// already safe for one of two reasons:
+//   * the page-fault path runs with IF=0 (cpu/idt.c:62 registers vector 14 as
+//     IDT_GATE_INTERRUPT, not a trap gate), so it cannot be interrupted; and
+//   * fork (proc/process.c:4062), exit/reap (cleanup_proc_slot) and
+//     brk/munmap (proc/syscall.c:4545,4637) all reach it from a SYSCALL, which
+//     took the BKL at proc/syscall.asm:89.
+// So only the B-half of the inversion exists today. This is REUSE hygiene, not
+// a deadlock fix: it deletes a private copy of a primitive that already lives
+// ten lines below in this same file (mm_lock() -> spinlock_acquire_irqsave on
+// mm->vma_lock), so there is ONE implementation to fix next time.
+//
+// HOLD DURATION: every critical section below is one to three operations on
+// cow_refcount[idx]. Nothing allocates, blocks, does I/O or takes another lock
+// while this is held: the expensive work is deliberately outside it
+// (vmm_free_user_page_cow releases before pmm_free_page, and demand_cow_write
+// releases before pmm_alloc_page and the 4KB copy). Masking interrupts across
+// a hold this short is not a latency concern.
+//
+// LOCK ORDER is unchanged and still mm->vma_lock -> cow_lock (see below).
+static spinlock_t cow_lock = SPINLOCK_INIT;
 
-static void cow_acquire_lock(void) {
-    while (__sync_lock_test_and_set(&cow_lock, 1)) {
-        __asm__ volatile("pause");
-    }
+static uint64_t cow_acquire_lock(void) {
+    return spinlock_acquire_irqsave(&cow_lock);
 }
 
-static void cow_release_lock(void) {
-    __sync_lock_release(&cow_lock);
+static void cow_release_lock(uint64_t flags) {
+    spinlock_release_irqrestore(&cow_lock, flags);
 }
 
 // ============================================
@@ -513,8 +541,12 @@ void vma_free_all(mm_struct_t *mm) {
 // ticket. mm_fault() now refuses VMA_FILE explicitly instead.
 
 int handle_lazy_fault(mm_struct_t *mm, vma_t *vma, uint64_t fault_addr) {
-    extern process_t *current_process;
-    uint64_t pml4 = current_process->cr3;
+    // #745 (local 75) CLASS FIX: the faulting address space belongs to the
+    // task running on THIS cpu. Through the BSP-published global, a fault
+    // taken on an AP walked and edited the BSP task's PML4.
+    extern process_t *proc_current(void);
+    process_t *me = proc_current();
+    uint64_t pml4 = me->cr3;
 
     // Allocate physical page
     uint64_t phys_page = pmm_alloc_page();
@@ -553,8 +585,12 @@ int handle_lazy_fault(mm_struct_t *mm, vma_t *vma, uint64_t fault_addr) {
 }
 
 int handle_cow_fault(mm_struct_t *mm, vma_t *vma, uint64_t fault_addr) {
-    extern process_t *current_process;
-    uint64_t pml4 = current_process->cr3;
+    // #745 (local 75) CLASS FIX: the faulting address space belongs to the
+    // task running on THIS cpu. Through the BSP-published global, a fault
+    // taken on an AP walked and edited the BSP task's PML4.
+    extern process_t *proc_current(void);
+    process_t *me = proc_current();
+    uint64_t pml4 = me->cr3;
 
     uint64_t page_addr = fault_addr & ~(VMM_PAGE_SIZE_4K - 1);
 
@@ -566,11 +602,11 @@ int handle_cow_fault(mm_struct_t *mm, vma_t *vma, uint64_t fault_addr) {
     }
 
     // Check if we're the only reference
-    cow_acquire_lock();
+    uint64_t cowfl = cow_acquire_lock();
     uint32_t page_index = old_phys / VMM_PAGE_SIZE_4K;
     if (page_index < COW_TABLE_SIZE && cow_refcount[page_index] <= 1) {
         // We're the only reference - just make writable
-        cow_release_lock();
+        cow_release_lock(cowfl);
 
         uint64_t flags = VMM_FLAG_PRESENT | VMM_FLAG_USER | VMM_FLAG_WRITABLE;
         // #629: this was the ONE NX site in this file missing the g_nx_enabled
@@ -592,7 +628,7 @@ int handle_cow_fault(mm_struct_t *mm, vma_t *vma, uint64_t fault_addr) {
         stat_cow_faults++;
         return 0;
     }
-    cow_release_lock();
+    cow_release_lock(cowfl);
 
     // Multiple references - need to copy
     uint64_t new_phys = pmm_alloc_page();
@@ -626,8 +662,12 @@ int handle_cow_fault(mm_struct_t *mm, vma_t *vma, uint64_t fault_addr) {
 }
 
 int handle_swap_fault(mm_struct_t *mm, vma_t *vma, uint64_t fault_addr) {
-    extern process_t *current_process;
-    uint64_t pml4 = current_process->cr3;
+    // #745 (local 75) CLASS FIX: the faulting address space belongs to the
+    // task running on THIS cpu. Through the BSP-published global, a fault
+    // taken on an AP walked and edited the BSP task's PML4.
+    extern process_t *proc_current(void);
+    process_t *me = proc_current();
+    uint64_t pml4 = me->cr3;
 
     if (!swap_state.enabled) {
         kprintf("[DEMAND] Swap fault but swap disabled at 0x%lx\n", fault_addr);
@@ -1015,7 +1055,8 @@ int do_munmap(mm_struct_t *mm, uint64_t addr, uint64_t length) {
 // Pages that are NOT present are deliberately left alone: they are lazy, and
 // handle_lazy_fault() will read the (now updated) VMA flags when it faults them
 // in, so the new protection applies there too without touching a PTE here.
-static void vma_reprotect_pages(uint64_t pml4, uint64_t from, uint64_t to,
+static void vma_reprotect_pages(mm_struct_t *mm, uint64_t pml4,
+                                uint64_t from, uint64_t to,
                                 uint32_t vflags) {
     int any_access = (vflags & (VMA_READ | VMA_WRITE | VMA_EXEC)) != 0;
 
@@ -1028,12 +1069,48 @@ static void vma_reprotect_pages(uint64_t pml4, uint64_t from, uint64_t to,
 
         // PROT_NONE has no PTE encoding that keeps the page reachable, so drop
         // the mapping. The VMA stays, and because it now grants no access,
-        // mm_fault() rejects any touch and the process gets SIGSEGV. The frame
-        // is NOT freed: mprotect(PROT_NONE) must not destroy data, and a later
-        // mprotect back to PROT_READ must find it. It becomes reachable again
-        // through the lazy path only after the VMA regains an access bit.
+        // mm_fault() rejects any touch and the process gets SIGSEGV. That half
+        // was always correct and is proven by /APPS/MMTEST subtest (9).
+        //
+        // #404 CORRECTION, and the comment that used to be here was CONFIDENTLY
+        // WRONG IN BOTH DIRECTIONS. It claimed "the frame is NOT freed:
+        // mprotect(PROT_NONE) must not destroy data, and a later mprotect back
+        // to PROT_READ must find it". Neither half held, and nobody had noticed
+        // because do_mprotect() had ZERO CALLERS from the day it was written
+        // until the syscall was wired up: this was unverified code that read
+        // like verified code.
+        //
+        //   * The data was destroyed anyway. vmm_unmap_page_in() zeroes the
+        //     PTE, which is the only record of the physical frame. Nothing
+        //     anywhere remembered it, so a later mprotect back to PROT_READ
+        //     took the lazy path and got a FRESH ZEROED page. The round trip
+        //     silently returned zeros.
+        //   * And the frame LEAKED, permanently. With the PTE zeroed, the frame
+        //     is unreachable, and vma_teardown_pages() skips anything that is
+        //     not PRESENT, so process exit did not reclaim it either. Every
+        //     mprotect(PROT_NONE) burned one page per page until reboot, which
+        //     an unprivileged app can do in a loop.
+        //
+        // So free it, COW-aware, exactly as vma_teardown_pages() does. Every
+        // page reaching this line is already known PRESENT and USER (both are
+        // checked above), so it is genuinely ours to free.
+        //
+        // BEHAVIOUR, STATED PLAINLY BECAUSE IT DIVERGES FROM POSIX:
+        // mprotect(PROT_NONE) now DISCARDS the contents of the range. POSIX
+        // preserves them. This is deliberate, it is documented in the libc
+        // header, and it is the honest version of what the code already did:
+        // the previous behaviour also lost the data, it just leaked the frame
+        // as well. Preserving contents needs the frame parked somewhere the
+        // PTE can no longer hold it (a software-bit "parked" PTE encoding, with
+        // matching cases in vma_teardown_pages() and the fault path) and that
+        // is its own ticket, not a side effect of wiring up a syscall. Nothing
+        // in this tree calls mprotect at all today, so nothing regresses; the
+        // uses this primitive exists for (guard pages, poisoning a freed
+        // region, W^X) do not read the range back.
         if (!any_access) {
             vmm_unmap_page_in(pml4, page);
+            vmm_free_user_page_cow(phys);
+            if (mm && mm->resident_pages) mm->resident_pages--;
             continue;
         }
 
@@ -1131,7 +1208,7 @@ int do_mprotect(mm_struct_t *mm, uint64_t addr, uint64_t length, uint32_t prot) 
 
             vma->flags = (vma->flags & ~(VMA_READ | VMA_WRITE | VMA_EXEC)) | vbits;
             vma->prot  = prot;
-            vma_reprotect_pages(pml4, vma->start, vma->end, vma->flags);
+            vma_reprotect_pages(mm, pml4, vma->start, vma->end, vma->flags);
 
             vma = next;
         }
@@ -1359,36 +1436,36 @@ void cow_page_ref(uint64_t phys_addr) {
     uint32_t page_index = phys_addr / VMM_PAGE_SIZE_4K;
     if (page_index >= COW_TABLE_SIZE) return;
 
-    cow_acquire_lock();
+    uint64_t cowfl = cow_acquire_lock();
     if (cow_refcount[page_index] < 0xFFFF) {
         cow_refcount[page_index]++;
     }
-    cow_release_lock();
+    cow_release_lock(cowfl);
 }
 
 void cow_page_unref(uint64_t phys_addr) {
     uint32_t page_index = phys_addr / VMM_PAGE_SIZE_4K;
     if (page_index >= COW_TABLE_SIZE) return;
 
-    cow_acquire_lock();
+    uint64_t cowfl = cow_acquire_lock();
     if (cow_refcount[page_index] > 0) {
         cow_refcount[page_index]--;
         if (cow_refcount[page_index] == 0) {
-            cow_release_lock();
+            cow_release_lock(cowfl);
             pmm_free_page(phys_addr);
             return;
         }
     }
-    cow_release_lock();
+    cow_release_lock(cowfl);
 }
 
 int cow_page_shared(uint64_t phys_addr) {
     uint32_t page_index = phys_addr / VMM_PAGE_SIZE_4K;
     if (page_index >= COW_TABLE_SIZE) return 0;
 
-    cow_acquire_lock();
+    uint64_t cowfl = cow_acquire_lock();
     int shared = (cow_refcount[page_index] > 1);
-    cow_release_lock();
+    cow_release_lock(cowfl);
     return shared;
 }
 
@@ -1707,25 +1784,25 @@ int cow_trackable(uint64_t phys_addr) {
 void cow_fork_share(uint64_t phys_addr) {
     uint32_t idx = phys_addr / VMM_PAGE_SIZE_4K;
     if (idx >= COW_TABLE_SIZE) return;
-    cow_acquire_lock();
+    uint64_t cowfl = cow_acquire_lock();
     if (cow_refcount[idx] == 0) cow_refcount[idx] = 2;
     else if (cow_refcount[idx] < 0xFFFF) cow_refcount[idx]++;
-    cow_release_lock();
+    cow_release_lock(cowfl);
 }
 
 // COW-aware free of a user leaf page (see demand.h).
 void vmm_free_user_page_cow(uint64_t phys_addr) {
     uint32_t idx = phys_addr / VMM_PAGE_SIZE_4K;
     if (idx < COW_TABLE_SIZE) {
-        cow_acquire_lock();
+        uint64_t cowfl = cow_acquire_lock();
         if (cow_refcount[idx] > 0) {
             cow_refcount[idx]--;
             int last = (cow_refcount[idx] == 0);
-            cow_release_lock();
+            cow_release_lock(cowfl);
             if (last) pmm_free_page(phys_addr);
             return;
         }
-        cow_release_lock();
+        cow_release_lock(cowfl);
     }
     pmm_free_page(phys_addr);
 }
@@ -1741,9 +1818,9 @@ int demand_cow_write(struct process *p, uint64_t page_addr) {
     uint32_t idx = old_phys / VMM_PAGE_SIZE_4K;
 
     int shared = 0;
-    cow_acquire_lock();
+    uint64_t cowfl = cow_acquire_lock();
     if (idx < COW_TABLE_SIZE && cow_refcount[idx] > 1) shared = 1;
-    cow_release_lock();
+    cow_release_lock(cowfl);
 
     uint64_t new_flags = VMM_FLAG_PRESENT | VMM_FLAG_USER | VMM_FLAG_WRITABLE | keep_nx;
 
@@ -1751,9 +1828,9 @@ int demand_cow_write(struct process *p, uint64_t page_addr) {
         // Sole owner: drop the COW bit and re-enable write in place.
         if (vmm_map_page_in(pml4, page_addr, old_phys, new_flags) != 0) return -1;
         if (idx < COW_TABLE_SIZE) {
-            cow_acquire_lock();
+            cowfl = cow_acquire_lock();
             if (cow_refcount[idx] == 1) cow_refcount[idx] = 0;  // now private
-            cow_release_lock();
+            cow_release_lock(cowfl);
         }
         stat_cow_faults++;
         return 0;

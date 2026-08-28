@@ -129,7 +129,7 @@ static int collect_spawns(const char *ents, size_t len) {
 }
 
 int main(int argc, char **argv) {
-    const char *path = argc > 1 ? argv[1] : "MAP.BSP";
+    const char *path = argc > 1 ? argv[1] : "<workspace>";
     long len; uint8_t *buf = read_file(path, &len);
     if (!buf) return 1;
     printf("== REAL de_dust2: %s (%ld bytes) ==\n", path, len);

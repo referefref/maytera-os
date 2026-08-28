@@ -356,3 +356,88 @@ pub unsafe extern "C" fn iso_name_decode_rs(
     d[n] = 0;
     n as i32
 }
+
+/// #184: is the ROOT DIRECTORY EXTENT this descriptor points at actually inside
+/// the image file?
+///
+/// WHY THIS EXISTS, AND WHAT IT IS NOT. `iso_vd_parse_rs()` above answers "are
+/// these 2048 bytes a well-formed volume descriptor". That is a question about
+/// the SECTOR, and it is the only question `iso_probe()` in dos/diskimg.c used
+/// to ask. It is not the same question as "is there a disc here". Measured on
+/// 2026-08-20 (#184): the first 64 KiB of a 607 MiB Discworld II ISO still
+/// contains a perfectly valid PVD at sector 16, so that 64 KiB fragment PROBED
+/// AS AN ISO, mounted with no error, and was presented to the user as
+/// `E: CD-ROM TRUNC.ISO 64 KB ISO 9660 +Joliet` - a disc that reports success
+/// and contains nothing, because its root directory lives at LBA 311051, about
+/// 607 MB past the end of the file. A mount that cannot list its own root is
+/// not a mount, and saying so at mount time is the difference between one clear
+/// refusal and an unbounded number of confusing failures later.
+///
+/// DELIBERATELY THE ROOT EXTENT ONLY, not the descriptor's declared volume size
+/// (offset 80). The root extent is UNAMBIGUOUSLY fatal: if it is past EOF there
+/// is no directory to read and every path lookup on the disc must fail. A short
+/// declared volume size is not: real rips routinely drop trailing padding
+/// sectors and still work for every file that matters, so refusing on that would
+/// reject images that are fine today. dos/diskimg.c logs the declared-size
+/// shortfall instead of refusing on it.
+///
+/// All arithmetic is checked: `root_lba` and `block_size` both come off the
+/// disc, and `root_lba * block_size` overflows a u32 for any lba above 2 Mi
+/// sectors, which is only 4 GB of nominal disc. An overflowed product would
+/// wrap to a small number and pass a naive bound, which is the same "the check
+/// passed because the arithmetic broke" shape as #476.
+///
+/// Returns 1 when the extent fits, 0 when it does not (or the numbers are
+/// unusable). Pure integer logic, no pointers, so there is no unsafe block and
+/// nothing for a caller to get wrong.
+#[no_mangle]
+pub extern "C" fn iso_root_within_rs(
+    root_lba: u32,
+    root_len: u32,
+    block_size: u32,
+    image_size: u64,
+) -> i32 {
+    if block_size == 0 || root_len == 0 || image_size == 0 {
+        return 0;
+    }
+    let base = match (root_lba as u64).checked_mul(block_size as u64) {
+        Some(v) => v,
+        None => return 0,
+    };
+    let end = match base.checked_add(root_len as u64) {
+        Some(v) => v,
+        None => return 0,
+    };
+    if end > image_size {
+        0
+    } else {
+        1
+    }
+}
+
+/// #184: the descriptor's declared volume size in BYTES, or 0 if unusable.
+///
+/// Read here rather than in C for the same reason every other field is: the
+/// numbers are attacker-controlled and the multiply can overflow. This is only
+/// used to LOG a shortfall (see the doc comment above on why a short volume is
+/// not a refusal), so an unusable answer is reported as 0 and the caller says
+/// nothing rather than guessing.
+///
+/// # Safety
+/// `sec` must point to at least `len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn iso_vd_declared_bytes_rs(sec: *const u8, len: u32) -> u64 {
+    if sec.is_null() || len < 190 {
+        return 0;
+    }
+    // SAFETY: caller contract is `len` contiguous readable bytes at `sec`; the
+    // slice spans exactly that and both reads below are inside the 190 bytes
+    // the guard above already proved are present.
+    let s: &[u8] = core::slice::from_raw_parts(sec, len as usize);
+    let blocks = rd32le(s, 80) as u64;   // volume space size, 32-bit both-endian
+    let bs = rd16le(s, 128) as u64;      // logical block size
+    match blocks.checked_mul(bs) {
+        Some(v) => v,
+        None => 0,
+    }
+}

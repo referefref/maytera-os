@@ -1,0 +1,52 @@
+#!/bin/bash
+# mprotect-validate-test/selftest - prove the SYS_MPROTECT argument validator.
+#
+# WHY THIS EXISTS. mprotect_validate_rs() is the privilege boundary for a
+# Ring-3-reachable memory-permission syscall. Its refusals are the whole point,
+# and a guard that has never been watched firing is indistinguishable from one
+# that is absent. The on-VM harness (/APPS/MMTEST subtest 8) proves the guard is
+# WIRED UP and reachable from Ring 3; this proves the LOGIC, including the
+# overflow cases that are awkward to hit exactly from a booted app.
+#
+# It `include!`s the REAL kernel source rather than a copy, so it cannot drift
+# from what ships: if rustkern/mprotect.rs changes, this compiles the change.
+#
+# RED-PROOF. Run with --prove-red to mutate a copy of the validator (drop the
+# W^X refusal) and confirm this test FAILS. A green self-test that has never
+# been seen going red is not evidence.
+set -euo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+KERNEL=$(cd "$HERE/../.." && pwd)
+SRC="$KERNEL/rustkern/mprotect.rs"
+WORK=$(mktemp -d)
+trap 'rm -rf "$WORK"' EXIT
+
+[ -f "$SRC" ] || { echo "mprotect-validate-test: missing $SRC" >&2; exit 1; }
+
+build_and_run() {
+  local rs="$1" label="$2"
+  MPROTECT_RS="$rs" rustc --edition 2021 -O \
+      -o "$WORK/vt" "$HERE/validate_test.rs" 2>"$WORK/cc.log" || {
+    echo "mprotect-validate-test: FAILED to compile ($label)" >&2
+    tail -20 "$WORK/cc.log" >&2
+    return 2
+  }
+  "$WORK/vt"
+}
+
+if [ "${1:-}" = "--prove-red" ]; then
+  echo "=== RED PROOF: removing the W^X refusal from a COPY of the validator ==="
+  sed 's/return MP_E_WX;/return MP_OK;/' "$SRC" > "$WORK/mutant.rs"
+  if build_and_run "$WORK/mutant.rs" mutant >"$WORK/out.log" 2>&1; then
+    echo "mprotect-validate-test: BROKEN - the mutated validator PASSED." >&2
+    echo "  The test cannot detect a removed guard, so its green result is worthless." >&2
+    exit 1
+  fi
+  echo "OK: the mutated validator FAILS the test, as it must:"
+  grep -E "W\\|X|FAILURES" "$WORK/out.log" | head -5
+  echo
+fi
+
+echo "=== the validator AS SHIPPED ==="
+build_and_run "$SRC" shipped

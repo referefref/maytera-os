@@ -4,6 +4,7 @@
 #define ACPI_MADT_H
 
 #include "../types.h"
+#include "../cpu/cpumax.h"
 #include "acpi.h"
 
 // MADT signature
@@ -31,7 +32,8 @@
 #define LAPIC_FLAG_ONLINE_CAPABLE       (1 << 1)
 
 // Maximum supported CPUs
-#define MAX_CPUS                        256
+// #143: was an independent MAX_CPUS 256 here, a fourth answer to "how many
+// CPUs". ONE definition now, in cpu/cpumax.h.
 
 // Maximum I/O APICs
 #define MAX_IO_APICS                    8
@@ -142,7 +144,7 @@ typedef struct {
     // CPU information
     uint32_t cpu_count;                     // Total number of CPUs
     uint32_t enabled_cpu_count;             // Number of enabled CPUs
-    cpu_info_t cpus[MAX_CPUS];              // CPU information array
+    cpu_info_t cpus[MAYTERA_MAX_CPUS];              // CPU information array
     uint32_t bsp_apic_id;                   // BSP APIC ID
     
     // I/O APIC information

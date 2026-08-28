@@ -5,7 +5,7 @@
 # `stable` channel to a newer rustc and change the bytes of the shipped kernel.
 # This file forces the EXACT toolchain regardless of what `stable` points at.
 #
-# When make runs in this directory the rustup shim (/root/.cargo/bin/rustc)
+# When make runs in this directory the rustup shim (<workspace>)
 # reads this file and selects channel 1.97.0, installing it (and the
 # x86_64-unknown-none precompiled `core`) if missing. The Makefile additionally
 # has a hard version gate that FAILS the build if the active rustc is not the

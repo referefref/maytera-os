@@ -232,6 +232,12 @@ static int parse_fadt(acpi_fadt_t *fadt) {
         if (validate_table(dsdt)) {
             kprintf("[ACPI] DSDT found at 0x%lx, length=%u\n",
                     dsdt_addr, dsdt->length);
+            // #ASUSKBD: keep it. validate_table() above has just checksummed
+            // the whole table, i.e. read every byte of [dsdt_addr, +length),
+            // so any later reader is operating on a range already proven
+            // readable. See acpi_get_dsdt().
+            acpi_state.dsdt_addr = dsdt_addr;
+            acpi_state.dsdt_len  = dsdt->length;
             // Parse DSDT for S5 sleep state values
             parse_dsdt_for_s5((uint8_t *)dsdt + sizeof(acpi_sdt_header_t),
                              dsdt->length - sizeof(acpi_sdt_header_t));
@@ -511,11 +517,45 @@ void acpi_shutdown(void) {
     outw(0x4004, 0x3400);   // VirtualBox
 
     kprintf("[ACPI] Shutdown failed, system still running\n");
+
+    // #229: we are STILL RUNNING and the root is still mounted and writable,
+    // but acpi_shutdown_flush() has already recorded in the superblock that
+    // this volume was closed cleanly. Undo that. Otherwise a power cut from
+    // here on would look like a graceful stop and the next boot would skip
+    // the very check that would have caught it, which is the one way this
+    // fix could end up worse than the bug it replaces.
+    { extern void ext2_mark_dirty(void); ext2_mark_dirty(); }
 }
 
 // Reboot the system
 void acpi_reboot(void) {
     kprintf("[ACPI] Initiating system reboot...\n");
+
+    // #229: FLUSH AND MARK THE ROOT CLEAN BEFORE WE RESET.
+    //
+    // This call used to exist only in acpi_shutdown(), so a graceful RESTART
+    // was byte-for-byte indistinguishable from a yanked power lead. MEASURED
+    // on golden 2037 before this change, driving the kernel shell over a
+    // serial-only VM: `reboot` left s_state 0x0 and the next boot logged
+    // "NOT CLEANLY UNMOUNTED" and ran a full check, while `shutdown` left
+    // s_state 0x1 and the next boot logged "cleanly unmounted; skipping
+    // check". Same volume, same boot, one code path apart.
+    //
+    // The cost was not the wasted seconds. It was that the warning fired on
+    // every single boot, so it stopped carrying information, and a genuinely
+    // unclean stop became unreportable.
+    //
+    // It goes HERE, inside acpi_reboot(), and NOT at the call sites, because
+    // there are eight ways to reach a restart (the kernel shell, and SYS_REBOOT
+    // from the Start menu, the lock screen, the login gate, the setup wizard,
+    // the OTA updater and the installer, plus the kernel self-update path) and
+    // a rule that each one must remember to flush first had already been
+    // forgotten in seven of the eight. Only kernel_selfupdate_reboot()
+    // remembered, which is precisely how a per-call-site convention fails.
+    //
+    // Before cli(): the flush writes to the block device and the ext2
+    // superblock write reads itself back to verify (#444).
+    acpi_shutdown_flush();
 
     // Disable interrupts
     cli();
@@ -631,4 +671,57 @@ acpi_sdt_header_t *acpi_find_table(const char *signature) {
     }
 
     return NULL;
+}
+
+// ---------------------------------------------------------------------------
+// #ASUSKBD accessors. See acpi.h for why each of these has to exist.
+// ---------------------------------------------------------------------------
+
+int acpi_get_dsdt(uint64_t *base, uint32_t *len) {
+    if (!acpi_state.initialized || acpi_state.dsdt_addr == 0 ||
+        acpi_state.dsdt_len < sizeof(acpi_sdt_header_t)) {
+        return 0;
+    }
+    if (base) *base = acpi_state.dsdt_addr;
+    if (len)  *len  = acpi_state.dsdt_len;
+    return 1;
+}
+
+int acpi_get_ssdt(int index, uint64_t *base, uint32_t *len) {
+    if (!acpi_state.initialized || index < 0) return 0;
+    int seen = 0;
+
+    if (acpi_state.xsdt) {
+        uint32_t n = (acpi_state.xsdt->header.length -
+                      (uint32_t)sizeof(acpi_sdt_header_t)) / 8;
+        for (uint32_t i = 0; i < n; i++) {
+            acpi_sdt_header_t *h =
+                (acpi_sdt_header_t *)(uintptr_t)acpi_state.xsdt->entries[i];
+            if (!h) continue;
+            if (acpi_memcmp(h->signature, "SSDT", 4) != 0) continue;
+            if (!validate_table(h)) continue;
+            if (seen++ != index) continue;
+            if (base) *base = (uint64_t)(uintptr_t)h;
+            if (len)  *len  = h->length;
+            return 1;
+        }
+        return 0;
+    }
+
+    if (acpi_state.rsdt) {
+        uint32_t n = (acpi_state.rsdt->header.length -
+                      (uint32_t)sizeof(acpi_sdt_header_t)) / 4;
+        for (uint32_t i = 0; i < n; i++) {
+            acpi_sdt_header_t *h =
+                (acpi_sdt_header_t *)(uintptr_t)acpi_state.rsdt->entries[i];
+            if (!h) continue;
+            if (acpi_memcmp(h->signature, "SSDT", 4) != 0) continue;
+            if (!validate_table(h)) continue;
+            if (seen++ != index) continue;
+            if (base) *base = (uint64_t)(uintptr_t)h;
+            if (len)  *len  = h->length;
+            return 1;
+        }
+    }
+    return 0;
 }

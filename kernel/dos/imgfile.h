@@ -25,13 +25,31 @@
 // fat_read_file() already does, so an image under /WINDIR resolves the same way
 // every other file on the root does.
 //
+// #740 adds a THIRD backing that is not a file at all:
+//   BLKDEV -> blk_read() at a raw byte offset on the ROOT BLOCK DEVICE
+// That is what lets a data volume live in the ~122 GB of unpartitioned tail on
+// the boot stick instead of inside the 1.62 GB OS image. It matters that this
+// is a backing kind and not a new layer: an image in the stick's tail is now
+// the same object as an image in a file, so the ISO parser, the 256 KiB cache,
+// the drive-letter placement, the mount generation, the refcount, the read
+// turnstile and the fat_open() redirect are all reused unchanged rather than
+// reimplemented for "the USB case". See rustkern/usbvol.rs for the on-disk
+// contract and why the tail rather than a third GPT partition.
+//
+// The offset is chosen (rustkern/usbvol.rs, USBVOL_BASE) to sit ABOVE the #375
+// TO-RAM window, so fs/blockdev.c serves these reads from the DEVICE and never
+// from the RAM copy of the root. Reading a multi-gigabyte volume through the
+// RAM copy would defeat the entire point: the volume exists precisely because
+// it does not fit in the image, and it would not fit in RAM either.
+//
 // BLOCKING
 // --------
-// Reads go through the ext2 / FAT drivers, which take sleeping locks. An
-// imgfile_t must therefore only be read from a context that may block (a
-// process or kernel thread, interrupts on). Never from an ISR. There is no
-// polling anywhere in here: a cache miss performs one direct filesystem read
-// and returns.
+// Reads go through the ext2 / FAT drivers, which take sleeping locks, or (for
+// the #740 block-device backing) through blk_read(), which on a USB root waits
+// on the MSC transfer. An imgfile_t must therefore only be read from a context
+// that may block (a process or kernel thread, interrupts on). Never from an
+// ISR. There is no polling anywhere in here: a cache miss performs one direct
+// backing read and returns.
 #ifndef DOS_IMGFILE_H
 #define DOS_IMGFILE_H
 
@@ -45,9 +63,33 @@
 #define IMGF_CACHE_SLOTS 32
 #define IMGF_CACHE_BLK   8192u
 
-#define IMGF_KIND_NONE 0
-#define IMGF_KIND_EXT2 1
-#define IMGF_KIND_FAT  2
+#define IMGF_KIND_NONE   0
+#define IMGF_KIND_EXT2   1
+#define IMGF_KIND_FAT    2
+#define IMGF_KIND_BLKDEV 3
+
+// #740: the SYNTHETIC PATH that selects the raw block-device backing.
+//
+//   /@USBVOL:<ch>:<dr>:<base16>:<len16>
+//
+// where <ch>/<dr> are the two-hex-digit ATA channel/drive identity blk_read()
+// wants (ignored on the USB path) and <base16>/<len16> are 16-hex-digit byte
+// offsets into the DEVICE. dos/usbvol.c builds it; nothing else should.
+//
+// A synthetic path rather than a second open() entry point, deliberately. The
+// layer above (dos/diskimg.c) turns a path into a mounted drive and does a
+// great deal on the way (format probe, placement policy, mount generation,
+// refcount, read turnstile). Adding a parallel entry point would mean either
+// duplicating that or threading a new parameter through all of it; a path that
+// imgfile_open() recognises means diskimg.c needs NO change at all and a
+// device-backed mount is the same object as a file-backed one everywhere else
+// in the kernel, including in the Ring-3 diskimg_info_t view, where the path
+// field then says exactly where the bytes come from.
+//
+// It is also shaped to survive drvmap_path_ok_rs(), which diskimg_mount_idx()
+// applies BEFORE opening anything: absolute, no backslash, no control bytes,
+// no ".." component. That check is not bypassed for this path.
+#define IMGF_BLKDEV_PREFIX "/@USBVOL:"
 
 // Opaque to callers except for embedding by value. fat_file_t is included by
 // the .c; the handle is stored as a heap pointer so this header does not have
@@ -56,6 +98,8 @@ typedef struct imgfile {
     int      kind;              // IMGF_KIND_*
     uint32_t ino;               // ext2 inode (IMGF_KIND_EXT2)
     void    *fat;               // fat_file_t * (IMGF_KIND_FAT), kmalloc'd
+    uint64_t base;              // device byte offset (IMGF_KIND_BLKDEV)
+    uint8_t  ch, dr;            // blk_read channel/drive (IMGF_KIND_BLKDEV)
     uint64_t size;              // image size in bytes
     uint8_t *cache;             // IMGF_CACHE_SLOTS * IMGF_CACHE_BLK bytes
     uint64_t tag[IMGF_CACHE_SLOTS];   // cached block index, IMGF_TAG_EMPTY = free

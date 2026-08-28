@@ -5,7 +5,8 @@
 // gui_list.c - MayteraOS shared scrollable listbox primitive.
 // See gui_list.h for the rationale (#512) and the box model.
 #include "gui_list.h"
-#include "syscall.h"   // win_draw_rect / win_draw_text
+#include "syscall.h"   // win_draw_rect / win_draw_text_ttf
+#include "gui_style.h" // GUI_TTF_SIZE: the ACTIVE theme's type.body
 // NOTE: deliberately does NOT include gui.h or theme.h (see gui_scroll.c's
 // note: both define BTN_COLOR_*/DISPLAY_BG and collide). Colors come in as
 // plain uint32_t params from the caller, which already resolved them from
@@ -86,11 +87,28 @@ void gui_list_draw(int win, gui_list_t *l, int sel, uint32_t bg, uint32_t border
         if (!gui_list_row_y(l, idx, &ry)) continue;   // clip: never draw off-box
         char buf[96];
         const char *lbl = label_of ? label_of(ctx, idx, buf, sizeof(buf)) : "";
+        // (#appstyle) ANTIALIASED TRUETYPE AT THE THEME'S type.body, not the
+        // kernel's 8x16 bitmap font.
+        //
+        // This is the same fault gui_menu.c carried until #307, in the same
+        // shape and for the same reason: win_draw_text() is SYS_WIN_DRAW_TEXT,
+        // which walks a 16-byte glyph array and advances cx += 8 with no size
+        // argument anywhere on that path. A SHARED widget drawing with it means
+        // every app that adopts the widget inherits a typeface the rest of the
+        // OS does not use - Terminal's Preferences lists and Disk Images'
+        // picker were both rendering blocky monospace rows inside otherwise
+        // TrueType windows, and neither app could fix it from its own side.
+        //
+        // Centring is on GUI_TTF_SIZE (the size argument IS the ascent-descent
+        // extent, by stbtt_ScaleForPixelHeight's definition), not on the old
+        // hardcoded 16, which was the bitmap cell height and would now sit the
+        // ink one pixel high in a 24px row and two in a 22px one.
+        int ty = ry + (l->row_h - GUI_TTF_SIZE) / 2;
         if (idx == sel) {
             win_draw_rect(win, l->x + 1, ry, rw, l->row_h, sel_bg);
-            win_draw_text(win, l->x + 6, ry + (l->row_h - 16) / 2, lbl, sel_text);
+            win_draw_text_ttf(win, l->x + 6, ty, lbl, GUI_TTF_SIZE, sel_text);
         } else {
-            win_draw_text(win, l->x + 6, ry + (l->row_h - 16) / 2, lbl, text);
+            win_draw_text_ttf(win, l->x + 6, ty, lbl, GUI_TTF_SIZE, text);
         }
     }
     // `bg` is this list's own fill, which is what the gutter sits on; a

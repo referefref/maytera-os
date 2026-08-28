@@ -28,11 +28,14 @@
 #     patches/ is named in `patches` (an unlisted patch is a silent skip);
 #   * every file named in `sources` exists and compiles, and the number of
 #     object files equals the number of sources;
+#   * every port named in `needs` exists as a port directory (or is the
+#     literal `libc`), there is no cycle, and a needed port is BUILT FIRST;
 #   * every symbol named in `symbols` is DEFINED in the resulting archive,
 #     proven with nm. This is the anti-no-op check: an archive that built
 #     cleanly out of the wrong sources, or with the API #ifdef'd away, is the
 #     exact shape of failure that "it compiled" does not catch;
-#   * every header named in `headers` exists and is installed.
+#   * every header named in `headers` exists and is installed, and likewise
+#     every upstream translation unit named in `install_sources`.
 #
 # Unknown keys in a PORT file are FATAL, not ignored, because a typo'd key that
 # is silently dropped is how a guessed constant ships something that runs and
@@ -56,9 +59,11 @@
 #   mports.sh env                       # resolved directories and flags
 #   mports.sh attribution               # run the shared attribution gate
 #   mports.sh --self-test               # prove the refusals actually refuse
+#                                       # (includes the needs= ordering pair,
+#                                       #  proven RED without the edge)
 #
 # ENVIRONMENT
-#   MPORTS_CACHE    tarball cache            (default ./.mports-cache)
+#   MPORTS_CACHE    tarball cache            (default <workspace>)
 #   MPORTS_OFFLINE  1 = never touch the network; a cache miss is fatal and
 #                   prints the exact wget command to run
 #
@@ -68,7 +73,7 @@ set -uo pipefail
 
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PORTS_DIR="$SELF_DIR"
-: "${MPORTS_CACHE:=$PWD/.mports-cache}"
+: "${MPORTS_CACHE:=<workspace>}"
 : "${MPORTS_OFFLINE:=0}"
 WORK="$PORTS_DIR/.work"
 OUT="$PORTS_DIR/out"
@@ -92,8 +97,8 @@ mk_var() {
 # PORT manifest: strict key=value. Every key is whitelisted; an unknown key is
 # fatal. Required keys must be present and non-empty.
 # ---------------------------------------------------------------------------
-PORT_KEYS="name version class licence licence_files homepage source_url tarball sha256 srcdir needs adoption copyleft copyleft_note prepare patches build sources exclude exclude_reason cflags headers lib symbols"
-PORT_REQUIRED="name version class licence licence_files homepage source_url tarball sha256 srcdir adoption copyleft prepare patches build headers lib symbols"
+PORT_KEYS="name version class licence licence_files homepage source_url tarball sha256 srcdir needs adoption copyleft copyleft_note prepare patches build sources exclude exclude_reason cflags headers install_sources lib symbols"
+PORT_REQUIRED="name version class licence licence_files homepage source_url tarball sha256 srcdir needs adoption copyleft prepare patches build headers lib symbols"
 
 # Banned outright in a shipped image (share-alike against our GPLv2 base, and
 # the owner's hard constraint for this programme).
@@ -151,6 +156,24 @@ parse_port() {
     [0-9a-f]*) [ "${#P[sha256]}" = 64 ] || die "$name/PORT: sha256 must be 64 lowercase hex characters" ;;
     *) die "$name/PORT: sha256 must be 64 lowercase hex characters" ;;
   esac
+  # needs: space-separated. Every entry must be either the literal `libc` (the
+  # shared platform library, which is built by userland/libc's own Makefile
+  # before mports runs at all) or the DIRECTORY NAME of another port. An entry
+  # that is neither is FATAL and is named, because the alternative - treating an
+  # unrecognised word as "not a port, therefore no ordering edge" - is exactly
+  # the silent-no-op shape this driver exists to make impossible: a typo'd
+  # dependency would build in the wrong order and fail somewhere else entirely,
+  # or worse, succeed by accident because a previous build left the header in
+  # out/include.
+  local nn
+  for nn in ${P[needs]}; do
+    [ "$nn" = libc ] && continue
+    if [ "$nn" = "$name" ]; then
+      die "$name/PORT: needs names itself"
+    fi
+    [ -f "$PORTS_DIR/$nn/PORT" ] || die "$name/PORT: needs names '$nn', which is neither the literal 'libc' nor a port directory (there is no ports/$nn/PORT). Ports this tree has: $(port_names | tr '\n' ' ')"
+  done
+
   # prepare: `none`, or space-separated SRC:DST pairs relative to srcdir. This
   # is the pre-configure step some upstreams document for a non-autotools
   # build: PCRE2's NON-AUTOTOOLS-BUILD says in so many words "copy or rename
@@ -181,6 +204,50 @@ port_names() {
     [ -f "$d/PORT" ] || continue
     basename "$d"
   done
+}
+
+# ---------------------------------------------------------------------------
+# DEPENDENCY ORDER. `needs=` used to be documentation with nothing behind it,
+# and docs/MPORTS.md said so. It is now real: `build --all` and `build <name>`
+# both build a port's needed ports FIRST, and a dependent port compiles with
+# -I<out>/include so it can actually see the headers its dependency installed.
+#
+# WHY THIS IS NOT COSMETIC. Without it, the order is the order the shell globs
+# the directories, so whether a port builds depends on how its name happens to
+# sort. That is the worst kind of green build: it works until somebody adds a
+# port whose name sorts earlier. The self-test proves it BOTH ways - the same
+# two ports go RED with the edge removed and GREEN with it declared.
+#
+# port_needs runs parse_port in a SUBSHELL on purpose: parse_port populates the
+# single global P, and the caller is usually in the middle of building a
+# DIFFERENT port whose P must not be clobbered.
+port_needs() ( parse_port "$1" >/dev/null; printf '%s' "${P[needs]:-}" )
+
+declare -A ORDER_STATE
+ORDER_OUT=()
+order_visit() {
+  local n="$1" path="$2" d
+  case "${ORDER_STATE[$n]:-0}" in
+    2) return 0 ;;
+    1) die "dependency CYCLE in 'needs': $path -> $n. Ports are built in dependency order; a cycle has no order. Break it in the manifests." ;;
+  esac
+  [ -f "$PORTS_DIR/$n/PORT" ] || die "no manifest at ports/$n/PORT"
+  ORDER_STATE[$n]=1
+  local needs; needs="$(port_needs "$n")" || exit 1
+  for d in $needs; do
+    [ "$d" = libc ] && continue
+    order_visit "$d" "$path -> $n"
+  done
+  ORDER_STATE[$n]=2
+  ORDER_OUT+=("$n")
+}
+
+# Depth-first topological sort of the requested ports plus everything they need.
+resolve_order() {
+  local n
+  unset ORDER_STATE; declare -gA ORDER_STATE
+  ORDER_OUT=()
+  for n in "$@"; do order_visit "$n" "(requested)"; done
 }
 
 # ---------------------------------------------------------------------------
@@ -295,7 +362,12 @@ do_build() {
 
   # --- compile --------------------------------------------------------------
   local cflags; cflags="$(mk_var MPORTS_CFLAGS)"
-  cflags="$cflags ${P[cflags]:-}"
+  # A port that `needs` another port compiles against the headers that one
+  # installed, so the install tree's include dir is on the search path for every
+  # port. It goes AFTER the libc include and before the port's own -D flags; a
+  # port's own sources still resolve their "quoted" includes out of the unpacked
+  # tree first, because the compile runs with cwd = srcdir.
+  cflags="$cflags $(mk_var MPORTS_INCLUDE) ${P[cflags]:-}"
   local obj objs=0 nsrc=0 src
   if [ "${P[build]}" = "script" ]; then
     log "$name: build=script, running ports/$name/build.sh"
@@ -341,6 +413,32 @@ do_build() {
   done
   cp "$libpath" "$OUT/lib/${P[lib]}" || die "$name: cannot install ${P[lib]}"
 
+  # install_sources: upstream .c files that belong to a CONSUMER, not to the
+  # library. The case this exists for is a program upstream ships beside its
+  # library and links against it - Lua's src/lua.c is the interpreter's main(),
+  # excluded from liblua.a on purpose and then compiled by userland/apps/lua.
+  #
+  # WHY NOT JUST REACH INTO .work/. Because .work is scratch: its path contains
+  # the upstream version ("lua-5.4.8"), so every app Makefile pointing at it
+  # would have to be edited on a version bump, and `mports.sh clean` deletes it
+  # while leaving out/ alone. Installing to out/src/ gives a consumer the same
+  # stable contract it already has for out/include and out/lib.
+  #
+  # The file is installed by BASENAME, exactly like headers, and it is copied
+  # AFTER the patch series has run, so a consumer compiles OUR version of it.
+  local isrc ninst=0
+  if [ -n "${P[install_sources]:-}" ] && [ "${P[install_sources]}" != none ]; then
+    mkdir -p "$OUT/src" || die "$name: cannot create $OUT/src"
+    for isrc in ${P[install_sources]}; do
+      [ -f "$s/$isrc" ] || die "$name: install_sources names '$isrc' but it is not in the unpacked tree. Upstream moved it; the manifest is stale."
+      case " ${P[sources]:-} " in
+        *" $isrc "*) die "$name: install_sources names '$isrc', which is ALSO in 'sources'. A translation unit cannot be both inside the archive and handed to a consumer to compile: the consumer would link two copies of every symbol in it." ;;
+      esac
+      cp "$s/$isrc" "$OUT/src/$(basename "$isrc")" || die "$name: cannot install source $isrc"
+      ninst=$((ninst+1))
+    done
+  fi
+
   local bytes; bytes="$(stat -c %s "$OUT/lib/${P[lib]}")"
   {
     echo "port=$name"
@@ -348,15 +446,17 @@ do_build() {
     echo "licence=${P[licence]}"
     echo "tarball=${P[tarball]}"
     echo "sha256=${P[sha256]}"
+    echo "needs=${P[needs]}"
     echo "prepare=${P[prepare]} (copied=$prepared)"
     echo "patches=${P[patches]} (applied=$applied)"
     echo "lib=${P[lib]} bytes=$bytes libsha256=$(sha_of "$OUT/lib/${P[lib]}")"
     echo "headers=${P[headers]}"
+    echo "install_sources=${P[install_sources]:-none} (installed=$ninst)"
     echo "symbols_verified=$oksym/$nsym"
     echo "built=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   } > "$OUT/receipt/$name.txt"
 
-  log "OK $name ${P[version]} -> $OUT/lib/${P[lib]} ($bytes bytes), $(printf '%s' "${P[headers]}" | wc -w) header(s), $oksym/$nsym promised symbols defined, $prepared prepare copy(ies), $applied patch(es) applied"
+  log "OK $name ${P[version]} -> $OUT/lib/${P[lib]} ($bytes bytes), $(printf '%s' "${P[headers]}" | wc -w) header(s), $oksym/$nsym promised symbols defined, $prepared prepare copy(ies), $applied patch(es) applied, $ninst consumer source(s) installed"
 }
 
 do_clean() {
@@ -364,6 +464,7 @@ do_clean() {
   rm -rf "$WORK/$name"
   rm -f "$OUT/lib/${P[lib]}" "$OUT/receipt/$name.txt"
   local h; for h in ${P[headers]}; do rm -f "$OUT/include/$(basename "$h")"; done
+  local i; for i in ${P[install_sources]:-}; do [ "$i" = none ] || rm -f "$OUT/src/$(basename "$i")"; done
   log "$name: cleaned"
 }
 
@@ -431,6 +532,13 @@ EOF
 #include "toy.h"
 int toy_mul(int a, int b) { return a * b; }
 EOF
+  # A header that ONLY the 'zzz' port installs, used by the ordering cases far
+  # below. Nothing else in this self-test ever installs it, so a compile that
+  # finds it proves zzz really was built first.
+  cat > "$tmp/up/toy-1.0/zzzapi.h" <<'EOF'
+/* installed into out/include by the 'zzz' port */
+int toy_add(int a, int b);
+EOF
   echo "Toy licence. Permissive." > "$tmp/up/toy-1.0/LICENSE"
   # A "generated file shipped under a .generic name", i.e. what PCRE2 and
   # friends do for a non-autotools build. The prepare cases below copy it into
@@ -461,6 +569,7 @@ source_url=file://$tmp/toy-1.0.tar.gz
 tarball=toy-1.0.tar.gz
 sha256=$1
 srcdir=toy-1.0
+needs=libc
 adoption=USES the platform; pure computation, no OS surface.
 copyleft=none
 prepare=${5:-none}
@@ -623,7 +732,106 @@ EOF
   write_manifest "$tsha" none "toy_add toy_mul" Toy-Permissive "toyconf.h.generic"
   chk "a prepare entry that is not SRC:DST" RED "is not SRC:DST"
 
-  # 17. back to good, to prove the tree was not left poisoned
+  # --- needs=: ordering that is REAL, proven by making it fail ---------------
+  # Two ports out of the same synthetic upstream:
+  #   zzz  installs zzzapi.h into out/include.
+  #   aaa  is patched so its mul.c does #include <zzzapi.h>, which can ONLY
+  #        resolve through -I out/include, i.e. only if zzz built first.
+  # Directory order is aaa, zzz - the WRONG order - so these two cases are the
+  # whole point: 18 removes the edge and must go RED, 19 declares it and must go
+  # GREEN. A guard shown only succeeding has not been shown to guard.
+  # --- install_sources: consumer translation units --------------------------
+  # 17. a file the tarball does not have
+  write_manifest "$tsha" none "toy_add toy_mul" Toy-Permissive
+  echo "install_sources=ghostmain.c" >> "$tmp/ports/toy/PORT"
+  chk "an install_sources file the tarball does not contain" RED "install_sources names 'ghostmain.c'"
+  # 18. a file that is ALSO in the library's own source list: the consumer would
+  #     end up with two copies of every symbol in it.
+  write_manifest "$tsha" none "toy_add toy_mul" Toy-Permissive
+  echo "install_sources=add.c" >> "$tmp/ports/toy/PORT"
+  chk "an install_sources file that is also in 'sources'" RED "which is ALSO in 'sources'"
+
+  # `build --all` builds every port in the toy tree, including `toy`, whose
+  # manifest the case above deliberately left malformed. Put it back first, or
+  # these cases would go RED for somebody else's reason.
+  write_manifest "$tsha" none "toy_add toy_mul" Toy-Permissive
+  mkdir -p "$tmp/ports/aaa/patches" "$tmp/ports/zzz"
+  cat > "$tmp/ports/aaa/patches/0001-need-zzz-header.patch" <<'EOF'
+--- a/mul.c
++++ b/mul.c
+@@ -1,2 +1,4 @@
+ #include "toy.h"
+ int toy_mul(int a, int b) { return a * b; }
++#include <zzzapi.h>
++int aaa_uses_zzz(void) { return toy_add(1, 2); }
+EOF
+  write_dep_manifest() {  # $1 = port, $2 = needs, $3 = sources, $4 = patches,
+                          # $5 = headers, $6 = lib, $7 = symbols
+    cat > "$tmp/ports/$1/PORT" <<EOF
+name=$1
+version=1.0
+class=A
+licence=Toy-Permissive
+licence_files=LICENSE
+homepage=https://example.invalid/$1
+source_url=file://$tmp/toy-1.0.tar.gz
+tarball=toy-1.0.tar.gz
+sha256=$tsha
+srcdir=toy-1.0
+needs=$2
+adoption=USES the platform; pure computation, no OS surface.
+copyleft=none
+prepare=none
+patches=$4
+build=objects
+sources=$3
+headers=$5
+lib=$6
+symbols=$7
+EOF
+  }
+  run_all() { ( cd "$tmp/ports" && MPORTS_CACHE="$tmp/cache" LIBC_DIR="$real_libc" \
+                  bash mports.sh build --all ) 2>&1; }
+  chk_all() { # $1 desc, $2 expect, $3 needle
+    total=$((total+1))
+    local out rc
+    cp -f "$tmp/toy-1.0.tar.gz" "$tmp/cache/toy-1.0.tar.gz"
+    # A previous case may have left zzzapi.h in out/include, which would let the
+    # WRONG order succeed by accident. That accident is the exact bug this pair
+    # is testing for, so wipe the install tree between the two runs.
+    rm -rf "$tmp/ports/out" "$tmp/ports/.work"
+    out="$(run_all)"; rc=$?
+    if [ "$2" = GREEN ]; then
+      if [ $rc -eq 0 ]; then echo "  [PASS] $total $1 -> GREEN"; pass=$((pass+1));
+      else echo "  [FAIL] $total $1 -> expected GREEN, got RED"; printf '%s\n' "$out" | sed 's/^/         /'; fi
+    else
+      if [ $rc -ne 0 ] && printf '%s' "$out" | grep -qF "$3"; then
+        echo "  [PASS] $total $1 -> RED, and for the right reason"; pass=$((pass+1))
+      elif [ $rc -ne 0 ]; then
+        echo "  [FAIL] $total $1 -> RED but not for '$3'"; printf '%s\n' "$out" | sed 's/^/         /'
+      else
+        echo "  [FAIL] $total $1 -> ACCEPTED (GREEN); the guard does not guard"; printf '%s\n' "$out" | sed 's/^/         /'
+      fi
+    fi
+  }
+  write_dep_manifest zzz libc add.c none zzzapi.h libzzz.a toy_add
+  # 18. THE NEGATIVE: aaa does not declare the edge, so directory order builds it
+  #     first and its <zzzapi.h> is not there yet.
+  write_dep_manifest aaa libc mul.c 0001-need-zzz-header.patch toy.h libaaa.a "toy_mul aaa_uses_zzz"
+  chk_all "two ports built in DIRECTORY order, with the edge NOT declared" RED "zzzapi.h"
+  # 19. THE POSITIVE: same two ports, edge declared, nothing else changed.
+  write_dep_manifest aaa zzz mul.c 0001-need-zzz-header.patch toy.h libaaa.a "toy_mul aaa_uses_zzz"
+  chk_all "the same two ports with needs=zzz declared" GREEN ""
+  # 20. a needs entry that is not a port and is not libc
+  write_dep_manifest aaa ghostport mul.c 0001-need-zzz-header.patch toy.h libaaa.a "toy_mul aaa_uses_zzz"
+  chk_all "a needs entry naming a port that does not exist" RED "which is neither the literal 'libc' nor a port directory"
+  # 21. a dependency cycle has no build order
+  write_dep_manifest aaa zzz mul.c 0001-need-zzz-header.patch toy.h libaaa.a "toy_mul aaa_uses_zzz"
+  write_dep_manifest zzz aaa add.c none zzzapi.h libzzz.a toy_add
+  chk_all "a dependency cycle between two ports" RED "dependency CYCLE"
+  rm -rf "$tmp/ports/aaa" "$tmp/ports/zzz" "$tmp/ports/out" "$tmp/ports/.work"
+
+  # 22. back to good, to prove the tree was not left poisoned
   write_manifest "$tsha" none "toy_add toy_mul" Toy-Permissive
   chk "the corrected port again" GREEN ""
 
@@ -647,7 +855,16 @@ main() {
     env)   do_env ;;
     attribution) do_attribution ;;
     fetch) expand "$@"; for n in "${names[@]}"; do do_fetch "$n"; done ;;
-    build) expand "$@"; for n in "${names[@]}"; do do_build "$n"; done ;;
+    build) expand "$@"
+           # Build in DEPENDENCY order, not in the order the caller typed or the
+           # shell globbed. resolve_order also pulls in ports that were not asked
+           # for but are needed, so `build lua` can never fail on a missing
+           # dependency it was perfectly able to build.
+           resolve_order "${names[@]}"
+           if [ "${#ORDER_OUT[@]}" -ne "${#names[@]}" ]; then
+             log "build order (dependencies first): ${ORDER_OUT[*]}"
+           fi
+           for n in "${ORDER_OUT[@]}"; do do_build "$n"; done ;;
     clean) if [ $# -eq 0 ]; then mapfile -t names < <(port_names); else names=("$@"); fi
            for n in "${names[@]}"; do do_clean "$n"; done; rm -rf "$WORK" ;;
     --self-test) self_test ;;

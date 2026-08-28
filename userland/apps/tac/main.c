@@ -1,81 +1,68 @@
-// tac - concatenate and print files in reverse (line by line)
+// tac - concatenate and print files, last line first
 // Usage: tac [FILE...]
+//
+// #745 (local 108, second batch). TWO SILENT CAPS: a 64 KB whole-file buffer
+// and a 4096-entry line index. Past either one, tac printed a reversed
+// FRAGMENT and exited 0 - and the 64 KB truncation took the END of the file,
+// which is the half tac is asked for.
+//
+// The read and the line index now come from userland/libc/mtool.c, which grows
+// and which fails rather than truncating, so this file has no cap of its own
+// and neither do tail, sort and less.
 #include "stdlib.h"
 #include "stdio.h"
 #include "string.h"
 #include "unistd.h"
-#include "fcntl.h"
-#include "errno.h"
+#include "getopt.h"
+#include "mtool.h"
 
-#define BUF_SIZE 65536
+static int do_one(const char *operand, void *ctx)
+{
+	(void)ctx;
+	int fd = mtool_open_read(operand);
+	if (fd < 0) return 1;
+	size_t len = 0;
+	char *buf = mtool_slurp_fd(fd, &len);
+	mtool_close_read(fd);
+	if (!buf) return 1;
+	if (len == 0) { free(buf); return 0; }
 
-static char buf[BUF_SIZE];
+	size_t nlines = 0;
+	size_t *off = mtool_index_lines(buf, len, &nlines);
+	if (!off) { free(buf); return 1; }
 
-static int tac_fd(int fd) {
-    // Read entire file into buffer
-    int total = 0;
-    long n;
-    while (total < BUF_SIZE - 1) {
-        n = read(fd, buf + total, BUF_SIZE - 1 - total);
-        if (n <= 0) break;
-        total += n;
-    }
-    buf[total] = '\0';
-
-    if (total == 0) return 0;
-
-    // Find all line starts
-    int line_starts[4096];
-    int nlines = 0;
-    line_starts[nlines++] = 0;
-    for (int i = 0; i < total; i++) {
-        if (buf[i] == '\n' && i + 1 < total) {
-            if (nlines < 4096)
-                line_starts[nlines++] = i + 1;
-        }
-    }
-
-    // Print lines in reverse order
-    for (int i = nlines - 1; i >= 0; i--) {
-        int start = line_starts[i];
-        int end = (i + 1 < nlines) ? line_starts[i + 1] : total;
-        write(1, buf + start, end - start);
-        // Ensure each line ends with newline
-        if (end > start && buf[end - 1] != '\n') {
-            write(1, "\n", 1);
-        }
-    }
-    return 0;
+	int rc = 0;
+	for (size_t i = nlines; i > 0; i--) {
+		size_t start = off[i - 1];
+		size_t end = (i < nlines) ? off[i] : len;
+		// Each record carries its OWN separator or none at all, and nothing is
+		// added. MEASURED against GNU tac 9.1 rather than assumed: `printf
+		// 'a\nb' | tac` is "ba\n", not "b\na\n" - the incomplete final record
+		// stays incomplete and simply moves to the front. The tac this replaces
+		// appended a newline here, so it disagreed with tac(1) on every file
+		// that does not end in one.
+		if (mtool_wall(1, buf + start, end - start) != 0) { rc = 1; break; }
+	}
+	if (rc) mtool_warn("write error");
+	free(off);
+	free(buf);
+	return rc;
 }
 
-static int tac_path(const char *path) {
-    char full[512];
-    const char *target = path;
-    if (path[0] != '/' && path[0] != '\0') {
-        char cwd_buf[256];
-        if (!getcwd(cwd_buf, sizeof(cwd_buf))) cwd_buf[0] = 0;
-        int j = 0;
-        for (int i = 0; cwd_buf[i] && j < 510; i++) full[j++] = cwd_buf[i];
-        if (j > 0 && full[j-1] != '/' && j < 511) full[j++] = '/';
-        for (int k = 0; path[k] && j < 511; k++) full[j++] = path[k];
-        full[j] = 0;
-        target = full;
-    }
-    int fd = open(target, O_RDONLY);
-    if (fd < 0) { perror(path); return 1; }
-    int rc = tac_fd(fd);
-    close(fd);
-    return rc;
-}
-
-int main(int argc, char **argv) {
-    if (argc <= 1) return tac_fd(0);
-    int rc = 0;
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-") == 0)
-            rc |= tac_fd(0);
-        else
-            rc |= tac_path(argv[i]);
-    }
-    return rc;
+int main(int argc, char **argv)
+{
+	mtool_setprog(argv[0]);
+	int c;
+	while ((c = getopt(argc, argv, "")) != -1) {
+		char b[4] = { '-', (char)optopt, 0, 0 };
+		(void)c;
+		if (optopt == 'r' || optopt == 's')
+			mtool_refuse("tac -r / -s (a custom or regular-expression separator)",
+			             "only newline-separated records are implemented");
+		if (optopt == 'b')
+			mtool_refuse("tac -b (separator before the record)",
+			             "not implemented");
+		mtool_bad_option(b);
+	}
+	return mtool_each_operand(argc, argv, optind, do_one, NULL, NULL);
 }

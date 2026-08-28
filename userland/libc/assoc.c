@@ -6,6 +6,7 @@
 #include "assoc.h"
 #include "syscall.h"
 #include "string.h"
+#include "unistd.h"   // access() - see assoc_app_for()
 
 #define ASSOC_PATH "/ASSOC.CFG"
 
@@ -67,6 +68,11 @@ static int cfg_lookup(const char *ext, char *out, int outsz) {
             if (!strcmp(key, ext)) {
                 int vk = 0;
                 for (char *v = eq + 1; v < eol && vk < outsz - 1; v++) out[vk++] = *v;
+                // Trim trailing CR/space. A file written on a machine that ends
+                // lines with CRLF would otherwise yield "/APPS/X\r", which no
+                // lookup can resolve and which the existence check below would
+                // then reject for the wrong reason.
+                while (vk > 0 && (out[vk-1] == '\r' || out[vk-1] == ' ' || out[vk-1] == '\t')) vk--;
                 out[vk] = 0;
                 return 1;
             }
@@ -76,9 +82,31 @@ static int cfg_lookup(const char *ext, char *out, int outsz) {
     return 0;
 }
 
+// A CONFIG ENTRY NAMING A FILE THAT IS NOT THERE IS NOT AN ANSWER (#<config-ref>).
+//
+// This function used to consult /ASSOC.CFG first and return whatever it said,
+// unconditionally. The shipped /ASSOC.CFG mapped every image extension to
+// /APPS/IMGVIEW, a binary that has never existed in any build; the correct
+// handler, /APPS/IMAGEVIEWER, was sitting right there in DEFAULTS[] below and
+// could never be reached, because the wrong file beat the right compiled-in
+// answer. Double-clicking any image on any golden gave "Cannot open file".
+//
+// The shipped file is fixed (build/assets/ASSOC.CFG) and a build gate now
+// refuses to ship a config naming a path that is not on the image
+// (build/config-ref-gate.sh), but neither of those helps a machine whose
+// /ASSOC.CFG was written at RUNTIME - by Settings > Default Apps, or by hand,
+// or by an app that has since been uninstalled. So the rule is here, in the
+// resolver, where it holds for every source of the file: a config entry is
+// preferred over the built-in default only if the app it names EXISTS. If it
+// does not, we fall through exactly as if the entry were absent, and the user
+// gets a working open instead of an error.
+//
+// access() is stat(), so this costs one stat per double-click, and only on the
+// extensions that have a config line at all. The alternative price is the one
+// this project already paid: a broken open that looks like a broken file.
 const char *assoc_app_for(const char *filename, char *out, int outsz) {
     char e[8]; ext_of(filename, e, sizeof(e));
-    if (e[0] && cfg_lookup(e, out, outsz)) return out;
+    if (e[0] && cfg_lookup(e, out, outsz) && out[0] && access(out, 0) == 0) return out;
     for (int i = 0; i < NDEF; i++)
         if (!strcmp(e, DEFAULTS[i].ext)) { copy_str(out, outsz, DEFAULTS[i].app); return out; }
     copy_str(out, outsz, "/APPS/editor");

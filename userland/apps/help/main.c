@@ -18,6 +18,7 @@
 #include "../../libc/maytera.h"
 #include "../../libc/gui.h"
 #include "../../libhelp/help.h"
+#include "../../libc/keys.h"   // #243: GUI_KEY_* nav codes
 
 // Route in-window text through the antialiased TTF path, like Settings.
 #define TXT(h, x, y, s, sz, c) win_draw_text_ttf((h), (x), (y), (s), (sz), (c))
@@ -442,9 +443,9 @@ static void handle_key(gui_event_t *e) {
     switch (e->keycode) {
         case 0x81: g_scroll += 40; break;            // Down arrow scroll
         case 0x80: g_scroll -= 40; if (g_scroll < 0) g_scroll = 0; break; // Up
-        case 0x49: g_scroll -= 200; if (g_scroll < 0) g_scroll = 0; break; // PgUp
-        case 0x51: g_scroll += 200; break;           // PgDn
-        case 0x47: g_scroll = 0; break;              // Home
+        case GUI_KEY_PGUP: g_scroll -= 200; if (g_scroll < 0) g_scroll = 0; break;
+        case GUI_KEY_PGDN: g_scroll += 200; break;
+        case GUI_KEY_HOME: g_scroll = 0; break;
         default: break;
     }
 }

@@ -16,6 +16,9 @@
 #include "../sync/waitq.h"     // #609: contenders BLOCK on a wait queue, never spin
 #include "../cpu/mono.h"      // #618: real-time clock for the lock-hold profiler
 #include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
+#include "../security/selftest_registry.h"  // #EXT2SELFTEST: a probe that
+                                            // cannot run must SAY so
+#include "../cpu/wallclock.h"   // #115: the ONE wall clock + calendar converter
 
 // External kernel services.
 extern void  kprintf(const char *fmt, ...);
@@ -113,7 +116,7 @@ static int g_ext2_wq_ready = 0;
 // re-acquired inside its own time slice every single time, before any woken
 // waiter could be scheduled. A waiter was therefore passed over indefinitely.
 //
-// MEASURED on build 969 (serial [SW] instrumentation, throwaway VM 2618, two
+// MEASURED on build 969 (serial [SW] instrumentation, throwaway VM <vmid>, two
 // runs): the kernel heartbeat thread - which writes /HEARTBEAT.TXT, and on an
 // ext2-root system fat_write_file() routes that to the ext2 volume - sat in
 // PROC_STATE_BLOCKED on g_ext2_wq (resolved by symbol from the blocked PCB's
@@ -957,6 +960,44 @@ static int ext2_group_inode_table(const ext2_fs_t *fs, uint32_t group,
     return 0;
 }
 
+// ===========================================================================
+// #115: TIMESTAMP STAMPING ON WRITE.
+//
+// Filling st_mtime from the inode is only half the fix. Before #115 this driver
+// wrote i_atime/i_ctime/i_mtime as ZERO on every file it created (see
+// ext2_create_file_ino / ext2_mkdir_inner), so "read the real mtime" would have
+// returned a real, honestly-read, permanent 0 for every file MayteraOS itself
+// produced - the golden image included. A stat that reports a truthfully-read
+// zero is indistinguishable to the user from the memset zero it replaced.
+//
+// The clock is the CMOS RTC via wallclock_now_unix() (cpu/wallclock.h). It is
+// NOT sys_time(), which returns seconds since BOOT (#113), and NOT timer_ticks,
+// which is not a measure of elapsed time at all (#524).
+//
+// IF THE CLOCK DOES NOT KNOW, WE DO NOT STAMP. wallclock_now_unix() returns 0
+// when the RTC has no plausible date; these helpers then leave the field alone
+// rather than writing an epoch-zero that reads as 1970-01-01. "Unknown" must
+// stay distinguishable from "1 January 1970".
+// ===========================================================================
+static void ext2_stamp_raw_new(uint8_t *ri) {
+    int64_t now = wallclock_now_unix();
+    if (now <= 0) return;              // no clock: leave the fields at 0/unknown
+    uint32_t t = (uint32_t)now;
+    memcpy(ri + 8,  &t, 4);            // i_atime
+    memcpy(ri + 12, &t, 4);            // i_ctime
+    memcpy(ri + 16, &t, 4);            // i_mtime
+}
+
+// Same, for a MODIFICATION of an existing inode: data changed, so i_mtime and
+// i_ctime move and i_atime does not.
+static void ext2_stamp_raw_mtime(uint8_t *ri) {
+    int64_t now = wallclock_now_unix();
+    if (now <= 0) return;
+    uint32_t t = (uint32_t)now;
+    memcpy(ri + 12, &t, 4);            // i_ctime
+    memcpy(ri + 16, &t, 4);            // i_mtime
+}
+
 int ext2_read_inode(uint32_t ino, ext2_inode_t *out) {
     if (!g_ext2.mounted || ino == 0) {
         return -1;
@@ -999,6 +1040,27 @@ int ext2_read_inode(uint32_t ino, ext2_inode_t *out) {
     for (int i = 0; i < 15; i++) {
         out->i_block[i] = rd32(ip + 40 + i * 4);
     }
+    // #115: the rest of the on-disk inode, which this driver read off the disk
+    // into `blk` on every single call and then discarded. The offsets are the
+    // ext2 rev-0/rev-1 inode layout (ext2fs/ext2_fs.h), NOT the field order of
+    // ext2_inode_t; they were checked against a real mke2fs volume, not
+    // remembered - a guessed struct offset does not fail loudly, it ships a
+    // field that reads plausible garbage.
+    //   0  i_mode(16)   2  i_uid(16)    4  i_size(32)     8  i_atime(32)
+    //  12  i_ctime(32) 16  i_mtime(32) 20  i_dtime(32)    24  i_gid(16)
+    //  26  i_links_count(16)           28  i_blocks(32)   40  i_block[15]
+    // 108  i_dir_acl/size_high(32)    120  l_i_uid_high(16) 122 l_i_gid_high(16)
+    out->i_atime       = rd32(ip + 8);
+    out->i_ctime       = rd32(ip + 12);
+    out->i_mtime       = rd32(ip + 16);
+    out->i_dtime       = rd32(ip + 20);
+    out->i_links_count = rd16(ip + 26);
+    out->i_blocks      = rd32(ip + 28);
+    // The high halves live in osd2 and are Linux-specific. They are zero on
+    // every volume this OS creates, and reading them costs nothing, so read
+    // them rather than silently capping ownership at uid 65535.
+    out->i_uid = (uint32_t)rd16(ip + 2)  | ((uint32_t)rd16(ip + 120) << 16);
+    out->i_gid = (uint32_t)rd16(ip + 24) | ((uint32_t)rd16(ip + 122) << 16);
 
     kfree(blk);
     return 0;
@@ -1644,161 +1706,548 @@ uint32_t ext2_resolve_path(const char *path) {
 }
 
 // ---------------------------------------------------------------------------
-// Self-test
+// Self-test  (retargeted 2026-08-27, #EXT2SELFTEST)
 // ---------------------------------------------------------------------------
+//
+// WHAT THIS WAS, AND WHY IT PROVED NOTHING
+//
+// Until this change ext2_selftest() opened with ext2_mount(0, 1, 0): a
+// WHOLE-DISK ext2 volume on the primary IDE slave. That is the two-disk
+// DEVELOPMENT layout. No shipping image has it. The product ships ONE disk
+// carrying a GPT with a FAT ESP and an ext2 root at a non-zero base LBA, and
+// that root is mounted several hundred lines later in main.c by the #365 block.
+//
+// MEASURED 2026-08-27 on golden build 2243 (<workspace>, booted
+// under QEMU over the shipping USB-MSC path). The ENTIRE output of this
+// function was three lines:
+//
+//     [EXT2] === ext2 read-only self-test (ch0, drive1) ===
+//     [EXT2] mount: bad magic 0x45 (expected 0xef53)
+//     [EXT2] mount FAILED (rc=-3). Aborting self-test.
+//
+// None of them reached /BOOTLOG.TXT, so on the two machines whose evidence
+// matters (the owner's ASUS laptop and the iMac14,4, neither of which has a
+// serial port) it produced literally nothing. Its diaglog-gate registration
+// claimed eighteen lines. This is the subsystem whose block-layer write
+// staging destroyed the owner's root filesystem on two machines earlier in the
+// same session, so "the filesystem self-test has never run on the shipping
+// layout" is not a tidy-up.
+//
+// Below the mount, the three read probes were pinned to fixtures that exist
+// only on a hand-made dev image (/this-is-a-long-filename.txt,
+// /big-indirect-test.dat, /subdir/note.md), each guarded by `if (ino) { ... }`
+// with NO else. On a volume without them the function reached
+// "=== self-test complete ===" having asserted nothing whatsoever.
+//
+// WHAT IT IS NOW
+//
+// 1. It tests THE MOUNTED ROOT, whatever that is. It performs no mount of its
+//    own. main.c calls it after the #365 partition mount and after the
+//    /ROOTEXT2 root cutover, so on a shipping image the volume under test is
+//    the volume every app, every config file and every user's home lives on.
+//    If nothing is mounted it says so through selftest_notrun(), which is loud,
+//    durable and counted in the end-of-boot summary, instead of returning.
+//
+// 2. Every probe is DISCOVERED, not named. The read and indirect-block probes
+//    walk the volume looking for a file of the shape they need. A fixture
+//    cannot go missing because there is no fixture, and nothing has to be
+//    declared in an asset manifest to keep this honest.
+//
+// 3. Absence is never silence. Where the volume genuinely cannot supply a
+//    subject (an ext2 root holding no file big enough to reach an indirect
+//    block) that arm calls selftest_notrun() with the reason. There is no path
+//    through this function that asserts nothing and still reads like a pass:
+//    the summary line carries the CHECK COUNT, and zero checks prints NOT-RUN.
+//
+// 4. It is durable and BOUNDED. /BOOTLOG.TXT is rewritten in full on every
+//    bootlog_write() (an O(n^2) series over the slow USB-MSC stack, #373),
+//    which is exactly why the diaglog-gate baseline deferred converting the old
+//    eighteen lines. So the per-check detail stays on serial and only a summary
+//    plus at most E2ST_LOG_FAILS failure lines go to the durable sink, inside
+//    one bootlog_defer_begin()/end() window, i.e. one flush.
+//
+// THE CHECK THAT EARNS ITS PLACE. Check group ext2/backupsb reads the BACKUP
+// superblock in block group 1 and compares five independently-stored fields
+// against the primary. Nothing else in this kernel ever reads that copy, so a
+// divergence between the two is invisible to every other code path, and silent
+// divergence between two on-disk copies of the same fact is precisely the shape
+// of the corruption that ate the root filesystem.
 
-static void ext2_print_text(const char *label, const char *data, uint64_t len) {
-    kprintf("[EXT2] %s (%lu bytes):\n", label, (unsigned long)len);
-    kprintf("[EXT2] ----- begin -----\n");
-    // Print the content. Add an [EXT2] prefix on each new line for grepping.
-    kprintf("[EXT2] ");
-    for (uint64_t i = 0; i < len; i++) {
-        char c = data[i];
-        kprintf("%c", c);
-        if (c == '\n' && i + 1 < len) {
-            kprintf("[EXT2] ");
+#define E2ST_SCAN_MAX   512u    // inode reads the whole subject scan may cost
+#define E2ST_DIRS       8u      // subdirectories of / the scan may descend into
+#define E2ST_LOG_FAILS  6u      // failure lines allowed into /BOOTLOG.TXT
+
+static uint32_t g_e2st_checks;
+static uint32_t g_e2st_fail;
+static uint32_t g_e2st_logged;
+static char     g_e2st_first[96];
+
+// ONE assertion. Counted whether it passes or fails, which is the property the
+// old probes lacked: there is no way to reach the summary without having moved
+// this counter, so "0 checks" is a reportable state rather than a quiet pass.
+static int e2st_check(int ok, const char *what) {
+    g_e2st_checks++;
+    if (ok) {
+        kprintf("[EXT2-SELFTEST]   ok   %s\n", what);
+        return 1;
+    }
+    g_e2st_fail++;
+    kprintf("[EXT2-SELFTEST]   FAIL %s\n", what);
+    if (g_e2st_logged < E2ST_LOG_FAILS) {
+        g_e2st_logged++;
+        bootlog_write("[EXT2-SELFTEST] FAIL %s", what);
+    }
+    if (!g_e2st_first[0]) {
+        strncpy(g_e2st_first, what, sizeof(g_e2st_first) - 1);
+        g_e2st_first[sizeof(g_e2st_first) - 1] = '\0';
+    }
+    return 0;
+}
+
+// ONE bounded walk of the volume that collects BOTH probe subjects at once:
+// the first non-empty regular file (read path) and the largest regular file
+// (indirect-block path). It looks in the root directory and, if the root does
+// not supply what is needed, in up to E2ST_DIRS of the root's subdirectories.
+//
+// Discovery, not fixtures: the old probes named /this-is-a-long-filename.txt,
+// /big-indirect-test.dat and /subdir/note.md, which ship on no image, so on
+// every shipping machine all three did nothing and said nothing. Nothing named
+// here can go missing because nothing is named.
+//
+// Bounded twice over (E2ST_SCAN_MAX inode reads in total, E2ST_DIRS
+// directories) so a huge or corrupt tree cannot turn a boot self-test into a
+// boot delay.
+typedef struct {
+    uint32_t small_ino;  uint64_t small_sz;  char small_nm[80];
+    uint32_t big_ino;    uint64_t big_sz;    char big_nm[80];
+    uint32_t reads;      uint32_t dirs;
+} e2st_subjects_t;
+
+typedef struct { uint32_t ino; char nm[48]; } e2st_dirent_t;
+
+static e2st_subjects_t g_e2st_subj;
+
+// dst = "<dir>/<name>", both bounded. No fixed path is spelled anywhere; this
+// only exists so the log names the file that WAS chosen, which is what makes a
+// discovered subject auditable after the fact.
+static void e2st_join(char *dst, uint32_t cap, const char *dir, const char *name) {
+    uint32_t l = 0;
+    while (dir[l] && l + 1 < cap) { dst[l] = dir[l]; l++; }
+    if (l + 1 < cap) dst[l++] = '/';
+    uint32_t k = 0;
+    while (name[k] && l + 1 < cap) { dst[l++] = name[k++]; }
+    dst[l] = '\0';
+}
+
+static void e2st_scan_dir(uint32_t dir_ino, const char *dir_name,
+                          e2st_subjects_t *s, e2st_dirent_t *subdirs,
+                          uint32_t *nsubdirs, uint32_t subdir_max) {
+    uint32_t pos = 0, ino = 0;
+    uint8_t  type = 0;
+    char nm[256];
+
+    s->dirs++;
+    while (s->reads < E2ST_SCAN_MAX &&
+           ext2_readdir_ino(dir_ino, &pos, nm, (int)sizeof(nm), &ino, &type) == 0) {
+        if (ino == 0) continue;
+        if (type == EXT2_FT_DIR) {
+            if (subdirs && nsubdirs && *nsubdirs < subdir_max) {
+                subdirs[*nsubdirs].ino = ino;
+                strncpy(subdirs[*nsubdirs].nm, nm, sizeof(subdirs[0].nm) - 1);
+                subdirs[*nsubdirs].nm[sizeof(subdirs[0].nm) - 1] = '\0';
+                (*nsubdirs)++;
+            }
+            continue;
+        }
+        if (type != EXT2_FT_REG_FILE) continue;
+        ext2_inode_t in;
+        s->reads++;
+        if (ext2_read_inode(ino, &in) != 0) continue;
+        uint64_t sz = in.i_size;
+        if (sz == 0) continue;
+        if (s->small_ino == 0) {
+            s->small_ino = ino; s->small_sz = sz;
+            e2st_join(s->small_nm, (uint32_t)sizeof(s->small_nm), dir_name, nm);
+        }
+        if (sz > s->big_sz) {
+            s->big_ino = ino; s->big_sz = sz;
+            e2st_join(s->big_nm, (uint32_t)sizeof(s->big_nm), dir_name, nm);
         }
     }
-    if (len == 0 || data[len - 1] != '\n') {
-        kprintf("\n");
+}
+
+static void e2st_find_subjects(e2st_subjects_t *s) {
+    e2st_dirent_t subdirs[E2ST_DIRS];
+    uint32_t nsub = 0;
+
+    memset(s, 0, sizeof(*s));
+    memset(subdirs, 0, sizeof(subdirs));
+    e2st_scan_dir(EXT2_ROOT_INO, "", s, subdirs, &nsub, E2ST_DIRS);
+
+    // Descend only while something is still missing. On a shipping ext2 root
+    // the files big enough to reach an indirect block live under /APPS and
+    // /FONTS, not at the top level, so a root-only scan would have reported
+    // "no subject" on exactly the layout this self-test exists to cover.
+    for (uint32_t i = 0; i < nsub && s->reads < E2ST_SCAN_MAX; i++) {
+        if (s->small_ino != 0 && s->big_sz > (uint64_t)g_ext2.block_size * 12) break;
+        e2st_scan_dir(subdirs[i].ino, subdirs[i].nm, s, 0, 0, 0);
     }
-    kprintf("[EXT2] ----- end -----\n");
+}
+
+// The whole root directory, walked as RAW BLOCKS rather than through
+// ext2_readdir_ino(), because the point is to assert the on-disk record
+// geometry (#476 / #597 shape) that the iterator is built to survive. Fills
+// the four out-params; returns 0 if the inode could not be read.
+static int e2st_walk_root(uint32_t *entries_out, uint32_t *geom_bad_out,
+                          uint32_t *chain_bad_out, uint32_t *dot_bits_out) {
+    ext2_inode_t root;
+    uint32_t entries = 0, geom_bad = 0, chain_bad = 0, dot_bits = 0;
+
+    *entries_out = 0; *geom_bad_out = 0; *chain_bad_out = 0; *dot_bits_out = 0;
+    if (ext2_read_inode(EXT2_ROOT_INO, &root) != 0) return 0;
+
+    uint8_t *blk = (uint8_t *)kmalloc(g_ext2.block_size);
+    if (!blk) return 0;
+
+    uint64_t size = root.i_size;
+    uint32_t logical = 0;
+    for (uint64_t consumed = 0; consumed < size; consumed += g_ext2.block_size, logical++) {
+        uint32_t phys = ext2_bmap(&g_ext2, &root, logical);
+        if (phys == 0 || phys == EXT2_BMAP_ERR ||
+            ext2_read_block(&g_ext2, phys, blk) != 0) {
+            chain_bad++;
+            continue;
+        }
+        uint32_t off = 0;
+        int walked_clean = 1;
+        while (off + 8 <= g_ext2.block_size) {
+            uint32_t e_ino = rd32(blk + off + 0);
+            uint16_t rec   = rd16(blk + off + 4);
+            uint8_t  nlen  = blk[off + 6];
+            // ext2 requires rec_len >= 8, 4-byte aligned, inside the block, and
+            // large enough for its own name. Any of these false means the block
+            // is not walkable, which is the exact over-read #476 fixed.
+            if (rec < 8 || (rec & 3u) != 0 || off + rec > g_ext2.block_size ||
+                off + 8u + nlen > g_ext2.block_size || (uint32_t)8 + nlen > rec) {
+                geom_bad++;
+                walked_clean = 0;
+                break;
+            }
+            if (e_ino != 0) {
+                if (e_ino > g_ext2.inodes_count) geom_bad++;
+                entries++;
+                if (logical == 0) {
+                    if (nlen == 1 && blk[off + 8] == '.' && e_ino == EXT2_ROOT_INO)
+                        dot_bits |= 1u;
+                    if (nlen == 2 && blk[off + 8] == '.' && blk[off + 9] == '.')
+                        dot_bits |= 2u;
+                }
+            }
+            off += rec;
+        }
+        // A well-formed directory block's rec_len chain lands EXACTLY on the
+        // end of the block. Landing short or long means a record was lost or
+        // invented, which no per-entry check can see on its own.
+        if (walked_clean && off != g_ext2.block_size) chain_bad++;
+    }
+    kfree(blk);
+    *entries_out = entries; *geom_bad_out = geom_bad;
+    *chain_bad_out = chain_bad; *dot_bits_out = dot_bits;
+    return 1;
 }
 
 void ext2_selftest(void) {
-    kprintf("[EXT2] === ext2 read-only self-test (ch0, drive1) ===\n");
+    g_e2st_checks = 0; g_e2st_fail = 0; g_e2st_logged = 0; g_e2st_first[0] = '\0';
 
-    int r = ext2_mount(0, 1, 0);   // whole-disk ext2 on the primary IDE slave
-    if (r != 0) {
-        kprintf("[EXT2] mount FAILED (rc=%d). Aborting self-test.\n", r);
+    // One flush for the whole run rather than one per line (#373).
+    bootlog_defer_begin();
+
+    if (!ext2_is_mounted()) {
+        // NOT a silent return, and NOT a kprintf that reads like boot noise.
+        // On an ATA-only or FAT-only machine this is the honest answer and it
+        // belongs in the end-of-boot summary; on a machine that is SUPPOSED to
+        // have an ext2 root it is the loudest thing in the log.
+        selftest_notrun("ext2/root",
+                        "no ext2 volume is mounted at this point in boot, so "
+                        "nothing about the root filesystem was verified");
+        bootlog_defer_end();
         return;
     }
-    kprintf("[EXT2] mount OK\n");
-    kprintf("[EXT2] superblock: block_size=%u inode_size=%u\n",
-            (unsigned)g_ext2.block_size, (unsigned)g_ext2.inode_size);
-    kprintf("[EXT2] superblock: inodes_count=%u blocks_count=%u\n",
-            (unsigned)g_ext2.inodes_count, (unsigned)g_ext2.blocks_count);
-    kprintf("[EXT2] superblock: inodes_per_group=%u blocks_per_group=%u groups=%u\n",
-            (unsigned)g_ext2.inodes_per_group,
-            (unsigned)g_ext2.blocks_per_group,
-            (unsigned)g_ext2.groups_count);
 
-    // List the root directory.
-    kprintf("[EXT2] --- root directory listing (inode 2) ---\n");
+    kprintf("[EXT2-SELFTEST] === ext2 root self-test: ch%u drv%u base_lba=%u "
+            "root=%s ===\n",
+            (unsigned)g_ext2.channel, (unsigned)g_ext2.drive,
+            (unsigned)g_ext2.part_start_lba,
+            g_root_ext2 ? "ext2" : "fat");
+
+    // ---- group: geometry -------------------------------------------------
+    // Cross-checks between fields read from DIFFERENT offsets of the
+    // superblock. A single corrupt field breaks at least one of these.
+    {
+        uint32_t bs = g_ext2.block_size;
+        e2st_check(bs == 1024 || bs == 2048 || bs == 4096, "block_size is 1K/2K/4K");
+        e2st_check(g_ext2.inode_size >= 128 && g_ext2.inode_size <= bs &&
+                   (g_ext2.inode_size & (g_ext2.inode_size - 1)) == 0,
+                   "inode_size is a power of two in [128, block_size]");
+        e2st_check(g_ext2.inodes_count != 0 && g_ext2.blocks_count != 0,
+                   "inodes_count and blocks_count are non-zero");
+        e2st_check(g_ext2.blocks_per_group != 0 && g_ext2.inodes_per_group != 0,
+                   "blocks_per_group and inodes_per_group are non-zero");
+        e2st_check(g_ext2.first_data_block == (bs == 1024 ? 1u : 0u),
+                   "first_data_block matches the block size");
+        e2st_check(g_ext2.inodes_per_group <= g_ext2.inodes_count,
+                   "inodes_per_group <= inodes_count");
+        e2st_check((uint64_t)g_ext2.inodes_per_group * g_ext2.groups_count
+                   >= (uint64_t)g_ext2.inodes_count,
+                   "inodes_per_group * groups covers inodes_count");
+        e2st_check((uint64_t)g_ext2.blocks_per_group * g_ext2.groups_count
+                   >= (uint64_t)(g_ext2.blocks_count - g_ext2.first_data_block),
+                   "blocks_per_group * groups covers blocks_count");
+        e2st_check(g_ext2.bgd_table_block > g_ext2.first_data_block &&
+                   g_ext2.bgd_table_block < g_ext2.blocks_count,
+                   "group descriptor table lies inside the volume");
+        // #365: the field this whole retarget is about. A partition never
+        // begins inside the protective MBR + GPT header + entry array.
+        e2st_check(g_ext2.part_start_lba == 0 || g_ext2.part_start_lba >= 34,
+                   "part_start_lba is 0 (whole disk) or past the GPT header");
+        uint64_t endb = ext2_end_bytes();
+        e2st_check(endb > (uint64_t)g_ext2.part_start_lba * 512,
+                   "volume end lies past the partition base");
+        e2st_check(endb == (uint64_t)g_ext2.part_start_lba * 512 +
+                           (uint64_t)g_ext2.blocks_count * g_ext2.block_size,
+                   "volume end equals base + blocks_count * block_size");
+        selftest_ran("ext2/geometry");
+    }
+
+    // ---- group: backup superblock ---------------------------------------
+    // The one check nothing else in this kernel can make. Block group 1 always
+    // carries a backup superblock (sparse_super or not), and NO other code path
+    // in this tree ever reads it, so a divergence from the primary is invisible
+    // everywhere else. Two on-disk copies of the same fact disagreeing is the
+    // signature of a block-layer write landing where it should not.
+    if (g_ext2.groups_count >= 2) {
+        uint32_t sbblk = g_ext2.first_data_block + g_ext2.blocks_per_group;
+        uint8_t *b = (uint8_t *)kmalloc(g_ext2.block_size);
+        if (!b) {
+            selftest_notrun("ext2/backupsb",
+                            "kmalloc of one block failed, so the backup "
+                            "superblock could not be compared to the primary");
+        } else if (sbblk >= g_ext2.blocks_count ||
+                   ext2_read_block(&g_ext2, sbblk, b) != 0) {
+            selftest_notrun("ext2/backupsb",
+                            "the group-1 backup superblock block could not be "
+                            "read from this volume");
+            kfree(b);
+        } else {
+            e2st_check(rd16(b + 56) == 0xEF53, "backup superblock magic is 0xEF53");
+            e2st_check(rd32(b + 0) == g_ext2.inodes_count,
+                       "backup inodes_count matches the primary");
+            e2st_check(rd32(b + 4) == g_ext2.blocks_count,
+                       "backup blocks_count matches the primary");
+            e2st_check(rd32(b + 32) == g_ext2.blocks_per_group,
+                       "backup blocks_per_group matches the primary");
+            e2st_check(rd32(b + 40) == g_ext2.inodes_per_group,
+                       "backup inodes_per_group matches the primary");
+            kfree(b);
+            selftest_ran("ext2/backupsb");
+        }
+    } else {
+        selftest_notrun("ext2/backupsb",
+                        "this volume has only one block group, so there is no "
+                        "backup superblock to compare the primary against");
+    }
+
+    // ---- group: root inode + directory geometry --------------------------
     {
         ext2_inode_t root;
-        if (ext2_read_inode(EXT2_ROOT_INO, &root) == 0) {
-            uint8_t *blk = (uint8_t *)kmalloc(g_ext2.block_size);
-            if (blk) {
-                uint64_t size = root.i_size;
-                uint64_t consumed = 0;
-                uint32_t logical = 0;
-                while (consumed < size) {
-                    uint32_t phys = ext2_bmap(&g_ext2, &root, logical);
-                    if (phys != 0 && phys != EXT2_BMAP_ERR &&
-                        ext2_read_block(&g_ext2, phys, blk) == 0) {
-                        uint32_t off = 0;
-                        while (off < g_ext2.block_size) {
-                            uint32_t e_ino = rd32(blk + off + 0);
-                            uint16_t rec   = rd16(blk + off + 4);
-                            uint8_t  nlen  = blk[off + 6];
-                            uint8_t  ftype = blk[off + 7];
-                            if (rec == 0) break;
-                            if (e_ino != 0) {
-                                char nm[256];
-                                uint32_t k = 0;
-                                for (; k < nlen && k < sizeof(nm) - 1; k++) {
-                                    nm[k] = (char)blk[off + 8 + k];
-                                }
-                                nm[k] = '\0';
-                                const char *ts = (ftype == EXT2_FT_DIR) ? "dir " :
-                                                 (ftype == EXT2_FT_REG_FILE) ? "file" :
-                                                 "othr";
-                                kprintf("[EXT2]   %s  ino=%u  type=%u(%s)  name='%s'\n",
-                                        ts, (unsigned)e_ino, (unsigned)ftype, ts, nm);
-                            }
-                            off += rec;
-                        }
-                    }
-                    consumed += g_ext2.block_size;
-                    logical  += 1;
-                }
-                kfree(blk);
-            }
+        int got = (ext2_read_inode(EXT2_ROOT_INO, &root) == 0);
+        e2st_check(got, "root inode 2 is readable");
+        if (got) {
+            e2st_check((root.i_mode & 0xF000u) == 0x4000u, "root inode is a directory");
+            e2st_check(root.i_links_count >= 2, "root inode link count >= 2");
+            e2st_check(root.i_size >= g_ext2.block_size &&
+                       (root.i_size % g_ext2.block_size) == 0,
+                       "root directory size is a non-zero multiple of block_size");
+        }
+
+        uint32_t entries = 0, geom_bad = 0, chain_bad = 0, dot_bits = 0;
+        if (e2st_walk_root(&entries, &geom_bad, &chain_bad, &dot_bits)) {
+            kprintf("[EXT2-SELFTEST]   root dir: %u entries, %u bad records, "
+                    "%u bad block chains\n",
+                    (unsigned)entries, (unsigned)geom_bad, (unsigned)chain_bad);
+            e2st_check(geom_bad == 0, "every root directory record is walkable");
+            e2st_check(chain_bad == 0,
+                       "every root directory block's rec_len chain lands on the block end");
+            e2st_check((dot_bits & 1u) != 0, "root directory holds '.' pointing at inode 2");
+            e2st_check((dot_bits & 2u) != 0, "root directory holds '..'");
+            e2st_check(entries >= 1, "root directory is not empty");
+            selftest_ran("ext2/rootdir");
         } else {
-            kprintf("[EXT2]   (failed to read root inode)\n");
+            selftest_notrun("ext2/rootdir",
+                            "the root inode or a scratch block could not be "
+                            "read, so directory record geometry was not checked");
         }
     }
 
-    // Read /this-is-a-long-filename.txt
+    // ---- group: resolver bounds -----------------------------------------
+    // Absence must be PROVABLE, not assumed. A resolver that invents an inode
+    // for a path that is not there is the same defect class as a probe with no
+    // else: it cannot report the thing it exists to report.
     {
-        const char *path = "/this-is-a-long-filename.txt";
-        uint32_t ino = ext2_resolve_path(path);
-        kprintf("[EXT2] resolve '%s' -> inode %u\n", path, (unsigned)ino);
-        if (ino) {
-            uint64_t cap = 4096;
-            char *buf = (char *)kmalloc(cap);
-            if (buf) {
-                int64_t n = ext2_read_file_ino(ino, buf, cap);
-                if (n >= 0) {
-                    ext2_print_text("this-is-a-long-filename.txt", buf, (uint64_t)n);
-                } else {
-                    kprintf("[EXT2] read failed rc=%d\n", (int)n);
-                }
-                kfree(buf);
-            }
-        }
+        e2st_check(ext2_resolve_path("/") == EXT2_ROOT_INO, "'/' resolves to inode 2");
+        e2st_check(ext2_resolve_path("/__maytera_ext2_selftest_absent__") == 0,
+                   "an absent path resolves to 0");
+        e2st_check(ext2_resolve_path("bad-relative-path") == 0,
+                   "a relative path is refused");
+        ext2_inode_t tmp;
+        e2st_check(ext2_read_inode(0, &tmp) != 0, "inode 0 is refused");
+        e2st_check(ext2_read_inode(g_ext2.inodes_count + 1, &tmp) != 0,
+                   "an inode past inodes_count is refused");
+        selftest_ran("ext2/bounds");
     }
 
-    // Read /big-indirect-test.dat (exercises singly/doubly indirect blocks).
+    // ONE walk feeds both remaining groups.
+    e2st_find_subjects(&g_e2st_subj);
+    kprintf("[EXT2-SELFTEST]   subject scan: %u inode read(s) across %u "
+            "director(ies)\n",
+            (unsigned)g_e2st_subj.reads, (unsigned)g_e2st_subj.dirs);
+
+    // ---- group: read path ------------------------------------------------
+    // DISCOVERED subject, not a fixture. The two independent readers
+    // (whole-file and range) must agree byte for byte; a staging or cache bug
+    // that serves one of them stale bytes shows up here and nowhere else at
+    // boot.
     {
-        const char *path = "/big-indirect-test.dat";
-        uint32_t ino = ext2_resolve_path(path);
-        kprintf("[EXT2] resolve '%s' -> inode %u\n", path, (unsigned)ino);
-        if (ino) {
-            uint64_t cap = 64 * 1024;
-            uint8_t *buf = (uint8_t *)kmalloc(cap);
-            if (buf) {
-                int64_t n = ext2_read_file_ino(ino, buf, cap);
-                if (n >= 0) {
-                    uint32_t checksum = 0;
-                    for (int64_t i = 0; i < n; i++) {
-                        checksum = (checksum + buf[i]) & 0xFFFF;
-                    }
-                    kprintf("[EXT2] big-indirect-test.dat: read %lu bytes, "
-                            "checksum(sum mod 65536)=%u\n",
-                            (unsigned long)n, (unsigned)checksum);
-                } else {
-                    kprintf("[EXT2] read failed rc=%d\n", (int)n);
-                }
-                kfree(buf);
+        uint32_t ino = g_e2st_subj.small_ino;
+        uint64_t sz  = g_e2st_subj.small_sz;
+        const char *nm = g_e2st_subj.small_nm;
+        if (!ino) {
+            selftest_notrun("ext2/read",
+                            "this volume holds no regular file with a non-zero "
+                            "size within the scan bound, so no read path was "
+                            "exercised on this boot");
+        } else {
+            uint64_t cap = sz < 4096 ? sz : 4096;
+            uint8_t *a = (uint8_t *)kmalloc((unsigned long)cap);
+            uint8_t *b = (uint8_t *)kmalloc((unsigned long)cap);
+            if (!a || !b) {
+                selftest_notrun("ext2/read",
+                                "kmalloc of two read buffers failed, so the "
+                                "whole-file and range readers were not compared");
             } else {
-                kprintf("[EXT2] kmalloc 64KB failed for big file\n");
-            }
-        }
-    }
-
-    // Read /subdir/note.md
-    {
-        const char *path = "/subdir/note.md";
-        uint32_t ino = ext2_resolve_path(path);
-        kprintf("[EXT2] resolve '%s' -> inode %u\n", path, (unsigned)ino);
-        if (ino) {
-            uint64_t cap = 4096;
-            char *buf = (char *)kmalloc(cap);
-            if (buf) {
-                int64_t n = ext2_read_file_ino(ino, buf, cap);
-                if (n >= 0) {
-                    ext2_print_text("subdir/note.md", buf, (uint64_t)n);
-                } else {
-                    kprintf("[EXT2] read failed rc=%d\n", (int)n);
+                kprintf("[EXT2-SELFTEST]   read subject '%s' ino=%u size=%lu\n",
+                        nm, (unsigned)ino, (unsigned long)sz);
+                int64_t n1 = ext2_read_file_ino(ino, a, cap);
+                e2st_check(n1 == (int64_t)cap,
+                           "whole-file read returns the requested byte count");
+                int64_t n2 = ext2_read_file_range(ino, 0, cap, b);
+                e2st_check(n2 == (int64_t)cap,
+                           "range read returns the requested byte count");
+                int same = (n1 == n2 && n1 > 0);
+                if (same) {
+                    for (int64_t i = 0; i < n1; i++) {
+                        if (a[i] != b[i]) { same = 0; break; }
+                    }
                 }
-                kfree(buf);
+                e2st_check(same, "whole-file and range readers agree byte for byte");
+                // Re-read the same range. Two identical reads of an unchanging
+                // file must be identical; they were not, on the machines that
+                // lost a filesystem to write staging.
+                int64_t n3 = ext2_read_file_range(ino, 0, cap, b);
+                int stable = (n3 == n1);
+                if (stable) {
+                    for (int64_t i = 0; i < n1; i++) {
+                        if (a[i] != b[i]) { stable = 0; break; }
+                    }
+                }
+                e2st_check(stable, "the same range read twice returns the same bytes");
+                e2st_check(ext2_read_file_range(ino, sz, 1, b) == 0,
+                           "a read starting at EOF returns 0 bytes");
+                selftest_ran("ext2/read");
             }
+            if (a) kfree(a);
+            if (b) kfree(b);
         }
     }
 
-    kprintf("[EXT2] === self-test complete ===\n");
+    // ---- group: indirect blocks -----------------------------------------
+    // Replaces /big-indirect-test.dat. Any file larger than 12 blocks reaches
+    // the singly-indirect pointer; the LAST block of the largest file on the
+    // volume usually reaches the doubly-indirect one. Both are discovered.
+    {
+        uint32_t bs = g_ext2.block_size;
+        uint64_t sz  = g_e2st_subj.big_sz;
+        uint32_t ino = (sz > (uint64_t)bs * 12) ? g_e2st_subj.big_ino : 0;
+        const char *nm = g_e2st_subj.big_nm;
+        if (!ino) {
+            // A REPORTED absence, not a silent one: it means this boot did not
+            // exercise indirect block mapping at all.
+            selftest_notrun("ext2/indirect",
+                            "no regular file found within the scan bound exceeds "
+                            "12 blocks, so indirect block mapping was not "
+                            "exercised on this boot");
+        } else {
+            uint8_t *b = (uint8_t *)kmalloc(bs);
+            ext2_inode_t in;
+            if (!b || ext2_read_inode(ino, &in) != 0) {
+                selftest_notrun("ext2/indirect",
+                                "the discovered large file's inode or a scratch "
+                                "block could not be read");
+            } else {
+                kprintf("[EXT2-SELFTEST]   indirect subject '%s' ino=%u size=%lu "
+                        "(%lu blocks)\n", nm, (unsigned)ino, (unsigned long)sz,
+                        (unsigned long)((sz + bs - 1) / bs));
+                uint32_t last_l = (uint32_t)((sz - 1) / bs);
+                uint32_t m12 = ext2_bmap(&g_ext2, &in, 12);
+                uint32_t mlast = ext2_bmap(&g_ext2, &in, last_l);
+                e2st_check(m12 != 0 && m12 != EXT2_BMAP_ERR,
+                           "logical block 12 maps through the singly-indirect pointer");
+                e2st_check(mlast != 0 && mlast != EXT2_BMAP_ERR,
+                           "the file's last logical block maps to a real block");
+                e2st_check(ext2_read_file_range(ino, (uint64_t)bs * 12, bs, b)
+                           == (int64_t)bs,
+                           "a full block read at logical block 12 returns block_size bytes");
+                uint64_t tail_off = (uint64_t)last_l * bs;
+                e2st_check(ext2_read_file_range(ino, tail_off, bs, b)
+                           == (int64_t)(sz - tail_off),
+                           "the tail read returns exactly the remaining bytes");
+                selftest_ran("ext2/indirect");
+            }
+            if (b) kfree(b);
+        }
+    }
+
+    // ---- verdict ---------------------------------------------------------
+    // ONE durable line, and it carries the check count. A run that asserted
+    // nothing cannot print a pass: zero checks is reported as NOT-RUN through
+    // the same register every other declining group uses.
+    if (g_e2st_checks == 0) {
+        selftest_notrun("ext2/root",
+                        "the self-test reached its verdict having made zero "
+                        "assertions about the mounted volume");
+    } else {
+        const char *verdict = (g_e2st_fail == 0) ? "PASS" : "FAIL";
+        kprintf("[EXT2-SELFTEST] %s %u/%u checks (base_lba=%u bs=%u groups=%u root=%s)%s%s\n",
+                verdict, (unsigned)(g_e2st_checks - g_e2st_fail),
+                (unsigned)g_e2st_checks, (unsigned)g_ext2.part_start_lba,
+                (unsigned)g_ext2.block_size, (unsigned)g_ext2.groups_count,
+                g_root_ext2 ? "ext2" : "fat",
+                g_e2st_fail ? " first=" : "", g_e2st_fail ? g_e2st_first : "");
+        bootlog_write("[EXT2-SELFTEST] %s %u/%u checks base_lba=%u bs=%u groups=%u root=%s%s%s",
+                      verdict, (unsigned)(g_e2st_checks - g_e2st_fail),
+                      (unsigned)g_e2st_checks, (unsigned)g_ext2.part_start_lba,
+                      (unsigned)g_ext2.block_size, (unsigned)g_ext2.groups_count,
+                      g_root_ext2 ? "ext2" : "fat",
+                      g_e2st_fail ? " first=" : "", g_e2st_fail ? g_e2st_first : "");
+        if (g_e2st_fail) {
+            // A failing filesystem self-test is a fact the NEXT boot should act
+            // on, so it goes into the superblock the same way a bad directory
+            // record does. #610's boot gate then schedules a full check.
+            ext2_mark_error("ext2 boot self-test reported a failed check");
+        }
+    }
+
+    bootlog_defer_end();
 }
 
 // ===========================================================================
@@ -2921,6 +3370,7 @@ static uint32_t ext2_create_file_ino(ext2_fs_t *fs, uint32_t dir_ino, const char
     uint16_t mode = 0x81A4; memcpy(ri + 0, &mode, 2);
     memcpy(ri + 4, &len, 4);
     uint16_t links = 1; memcpy(ri + 26, &links, 2);
+    ext2_stamp_raw_new(ri);   // #115: was created with all three times zero
     if (ext2_inode_raw(fs, ino, ri, 1) != 0) {   // #695: was discarded
         kfree(ri);
         ext2_free_inode(fs, ino, 0);
@@ -2996,6 +3446,27 @@ int ext2_write_file(const char *path, const void *data, uint32_t len) {
     return r;
 }
 
+// #115: the ext2 half of utime(2). Pass -1 to leave a time unchanged.
+// i_ctime always moves to now, because that is what POSIX says a metadata
+// change does; a utime() that silently left ctime alone would be a second
+// field quietly reporting a stale value, which is the defect class #115 is
+// about. Takes the same ext2_lock() every other public entry point takes.
+int ext2_set_times(uint32_t ino, int64_t atime, int64_t mtime) {
+    if (!g_ext2.mounted || ino == 0) return -1;
+    ext2_lock();
+    uint8_t *ri = (uint8_t *)kmalloc(g_ext2.inode_size);
+    if (!ri) { ext2_unlock(); return -1; }
+    if (ext2_inode_raw(&g_ext2, ino, ri, 0) != 0) { kfree(ri); ext2_unlock(); return -1; }
+    if (atime >= 0) { uint32_t t = (uint32_t)atime; memcpy(ri + 8,  &t, 4); }
+    if (mtime >= 0) { uint32_t t = (uint32_t)mtime; memcpy(ri + 16, &t, 4); }
+    int64_t now = wallclock_now_unix();
+    if (now > 0) { uint32_t t = (uint32_t)now; memcpy(ri + 12, &t, 4); }
+    int rc = ext2_inode_raw(&g_ext2, ino, ri, 1);
+    kfree(ri);
+    ext2_unlock();
+    return rc == 0 ? 0 : -1;
+}
+
 static int ext2_write_file_inner(const char *path, const void *data, uint32_t len) {
     if (!g_ext2.mounted) return -1;
     char base[256];
@@ -3012,6 +3483,7 @@ static int ext2_write_file_inner(const char *path, const void *data, uint32_t le
         if (ext2_inode_raw(&g_ext2, existing, ri, 0) != 0) { kfree(ri); return -3; }
         ext2_truncate_inode(&g_ext2, ri);          // frees old data blocks
         uint32_t sz = len; memcpy(ri + 4, &sz, 4);  // new i_size
+        ext2_stamp_raw_mtime(ri);   // #115: overwrite-in-place is a modification
         int irc = ext2_inode_raw(&g_ext2, existing, ri, 1);   // #695: was discarded
         kfree(ri);
         if (irc != 0) return EXT2_E_IO;
@@ -3078,6 +3550,7 @@ static int ext2_append_file_inner(const char *path, const void *data, uint32_t l
         int src = -1;
         if (ext2_inode_raw(&g_ext2, ino, ri, 0) == 0) {
             memcpy(ri + 4, &size, 4);
+            ext2_stamp_raw_mtime(ri);   // #115
             src = ext2_inode_raw(&g_ext2, ino, ri, 1);   // #695: was discarded
         }
         kfree(ri);
@@ -3162,6 +3635,7 @@ static int ext2_wstream_begin_inner(const char *path, ext2_wstream_t *ws) {
     memset(ri, 0, g_ext2.inode_size);
     uint16_t mode = 0x81A4; memcpy(ri + 0, &mode, 2);   // regular, 0644
     uint16_t links = 1;     memcpy(ri + 26, &links, 2);
+    ext2_stamp_raw_new(ri);   // #115
     int irc = ext2_inode_raw(&g_ext2, ino, ri, 1);   // #695: was discarded
     kfree(ri);
     if (irc != 0) { ext2_free_inode(&g_ext2, ino, 0); return EXT2_E_IO; }
@@ -3242,6 +3716,7 @@ static int ext2_wstream_finish_inner(ext2_wstream_t *ws) {
     uint32_t hi = (uint32_t)(ws->written >> 32);
     memcpy(ri + 4, &lo, 4);      // i_size (low)
     memcpy(ri + 108, &hi, 4);    // i_dir_acl / i_size_high (large_file)
+    ext2_stamp_raw_mtime(ri);    // #115: this is the write that makes it non-empty
     // #695: was discarded. This is the ONLY write that makes a streamed file
     // non-empty. If it does not land, every byte is on disk but i_size stays 0,
     // the file reads back EMPTY, and sys_close() still returned 0.
@@ -3288,6 +3763,7 @@ static int ext2_mkdir_inner(const char *path) {
     uint16_t mode = 0x41ED; memcpy(ri + 0, &mode, 2);
     uint32_t sz = g_ext2.block_size; memcpy(ri + 4, &sz, 4);
     uint16_t links = 2; memcpy(ri + 26, &links, 2);
+    ext2_stamp_raw_new(ri);   // #115
     int irc = ext2_inode_raw(&g_ext2, ino, ri, 1);   // #695: was discarded
     kfree(ri);
     if (irc != 0) { ext2_free_inode(&g_ext2, ino, 1); return EXT2_E_IO; }
@@ -3401,7 +3877,7 @@ static int ext2_readdir_ino_inner(uint32_t dir_ino, uint32_t *pos, char *name_ou
 // ---------------------------------------------------------------------------
 // #618 BATCHED BLOCK FREES: the App Store install freeze.
 //
-// MEASURED (build 972 lock-hold profiler, throwaway VM 2620): the App Store
+// MEASURED (build 972 lock-hold profiler, throwaway VM <vmid>): the App Store
 // finishes an install by deleting its 103,563,185-byte downloaded archive
 // (/STOREDL.TMP). That single sys_unlink held ext2_lock for tens of seconds in
 // ONE acquisition, which is why the FIFO ticket lock of #617 could not help:
@@ -4033,7 +4509,26 @@ void *ext2_read_whole(const char *path, uint32_t *size_out) {
     // interface whose two implementations disagree about termination will keep
     // producing this bug for the next caller, so terminate here too.
     void *buf = (void *)kmalloc((sz ? sz : 1) + 1);
-    if (!buf) return NULL;
+    if (!buf) {
+        // #COMPRESPAWN: THIS WAS A BARE `return NULL` AND IT LIED ABOUT ITSELF.
+        //
+        // fat_read_file() (fs/fat.c) treats NULL from here as "not present on
+        // ext2" and falls through to the FAT ESP, which then reports
+        // "[FAT] fat_read_file: open failed: <path>". So on an ext2-root image
+        // - i.e. every current golden - a KERNEL HEAP EXHAUSTION reading an app
+        // binary presented, in the only log that survives a reboot, as a
+        // MISSING FILE. That is the worst possible mis-report: it points the
+        // reader at the disk image while the real fault is memory pressure.
+        //
+        // One line. It costs nothing on the path that already failed.
+        kprintf("[EXT2] OUT OF MEMORY reading %s: kmalloc(%u) failed. "
+                "This is NOT a missing file; the caller may report it as one.\n",
+                path, (unsigned)(sz + 1));
+        bootlog_write("[EXT2] OOM reading %s (needed %u bytes) - a caller that "
+                      "reports this as a missing file is mis-reporting it",
+                      path, (unsigned)(sz + 1));
+        return NULL;
+    }
     int64_t n = sz ? ext2_read_file_ino(ino, buf, sz) : 0;
     if (n < 0) { kfree(buf); return NULL; }
     // The reader is bounded by sz and the allocation is sz+1, so buf[n] is in
@@ -4176,6 +4671,23 @@ void ext2_mark_clean(void) {
         kprintf("[EXT2] #610: volume marked CLEAN (s_state |= EXT2_VALID_FS)\n");
     } else {
         kprintf("[EXT2] #610: WARNING could not mark volume clean (rc=%d)\n", rc);
+    }
+}
+
+// Public: mark the volume DIRTY again. #229. Needed wherever a clean mark has
+// been written but the volume then turns out to still be mounted and writable:
+// a shutdown that failed to power the machine off, or any future path that
+// flushes speculatively. Marking clean must never outlive the moment the
+// volume actually stops being written, or a power cut after that point would
+// look like a graceful stop and the next boot would skip the check that would
+// have caught it. Idempotent.
+void ext2_mark_dirty(void) {
+    if (!g_ext2.mounted) return;
+    int rc = ext2_sb_set_state(&g_ext2, E2ST_DIRTY, 0);
+    if (rc == 0) {
+        kprintf("[EXT2] #229: volume re-marked DIRTY (still mounted and writable)\n");
+    } else {
+        kprintf("[EXT2] #229: WARNING could not re-mark volume dirty (rc=%d)\n", rc);
     }
 }
 
@@ -4498,7 +5010,14 @@ void ext2_fsck_boot_check(int skip_requested, int bench) {
     char line[128];
     // WHY. A boot that pauses without saying why is how a user learns to fear
     // their own machine.
-    const char *reason = (why & 1u) ? "filesystem was not cleanly unmounted"
+    // #229 WORDING. Until #229 this first line fired on EVERY boot, because
+    // the restart path never marked the volume clean, so the one message that
+    // should mean "something went wrong last time" meant nothing at all. Now
+    // that a graceful stop really is recorded as clean, this line only appears
+    // when the previous session did NOT stop gracefully, and it says so in
+    // those terms rather than in filesystem jargon.
+    const char *reason = (why & 1u) ? "the last session ended without unmounting this filesystem "
+                                      "(power loss, reset, or a crash)"
                        : (why & 2u) ? "an error was recorded on this filesystem"
                                     : "maximum mount count reached";
     uint32_t mb = (uint32_t)(((uint64_t)g_ext2.blocks_count * g_ext2.block_size) >> 20);

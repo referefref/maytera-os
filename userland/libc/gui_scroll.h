@@ -50,17 +50,13 @@
 #define GUI_SCROLL_W       14
 #define GUI_SCROLL_MIN_TH  24   // smallest the thumb is allowed to get
 
-// Keycodes as delivered in gui_event_t.keycode (scancode-derived; see the
-// keyboard driver). These were previously open-coded as magic numbers in every
-// app that handled them.
-#define GUI_KEY_HOME   0x47
-#define GUI_KEY_PGUP   0x49
-#define GUI_KEY_END    0x4F
-#define GUI_KEY_PGDN   0x51
-#define GUI_KEY_UP     0x80
-#define GUI_KEY_DOWN   0x81
-#define GUI_KEY_LEFT   0x82
-#define GUI_KEY_RIGHT  0x83
+// Keycodes as delivered in gui_event_t.keycode. These USED to be declared
+// right here, which made a scrollbar header the de-facto owner of the whole
+// keyboard table, and every app that did not include it open-coded its own
+// copy instead. Six of those copies had the ARROWS wrong (#188, #191). The
+// table now lives in ONE place and this header just re-exports it, so the
+// GUI_KEY_* spelling every existing caller uses is unchanged.
+#include "keys.h"
 
 typedef struct {
     // --- Viewport rect, window-local. Set via gui_scroll_config() each layout.
@@ -155,6 +151,48 @@ void     gui_scroll_colors(int hot, uint32_t surface,
                            uint32_t *track_out, uint32_t *thumb_out);
 uint32_t gui_scroll_thumb_ink(uint32_t thumb, uint32_t track, uint32_t surface);
 uint32_t gui_scroll_hover_ink(uint32_t hover, uint32_t rest_ink,
+                              uint32_t track, uint32_t surface);
+
+// (#96) The TROUGH's own boundary. #745 floored the thumb against both the
+// trough and the surface and explicitly left the trough's fill unrepaired,
+// reasoning that an invisible trough is harmless once the thumb reads on its
+// own. Measured with tools/contrast/scrollbar-contrast.sh, the trough fill is
+// 1.00-1.42:1 against its surface on ALL 14 shipped themes (retro_unix,
+// classic, fluent_dark and high_contrast are exactly 1.00:1: literally the same
+// colour), so a user who is not looking directly at the thumb has no way to
+// tell a region is scrollable at all, which is a real, reported affordance gap
+// independent of thumb legibility (#96).
+// docs/UI_STYLE_GUIDE.md 6.2 calls the retro-unix trough a "Sunken 3D
+// appearance", the same shadow-top/left + highlight-bottom/right convention
+// gui_checkbox()/gui_textfield2() use for their own sunken wells in gui.c.
+// Each side is walked independently toward black/white until it clears
+// GUI_AIM_NONTEXT against `surface`. Where one direction cannot clear the
+// floor at all (only possible when `surface` is already at that extreme,
+// e.g. high_contrast's pure-black window_bg), BOTH sides fall back to the
+// other direction, which degrades to a uniform border -- exactly the
+// "Borders: White 2px" docs/UI_STYLE_GUIDE.md section 9 already specifies
+// for High Contrast mode, not a coincidence.
+// (#117) At the time this comment was written, gui_checkbox()/gui_textfield2()
+// did NOT share this repair: they drew their sunken well with a fixed
+// darken(70)/lighten(80) step regardless of `surface`, measured 1.82:1 and
+// 1.27:1 respectively against retro_unix's window_bg, below GUI_FLOOR_NONTEXT.
+// #117 moved the walk itself into the general-purpose gui_bevel_pair()
+// (gui.c/gui_style.h) and put THIS function, gui_checkbox(), gui_textfield2()
+// and gui_card()/gui_button()'s CLASSIC bevels all on top of it, so there is
+// now one walk instead of four fixed-magnitude copies. This function's own
+// signature and behaviour are unchanged; see gui_scroll.c and gui.c.
+void gui_scroll_trough_bevel(uint32_t surface, uint32_t *shadow_out, uint32_t *highlight_out);
+
+// (#117) The trough BOUNDARY draw, not just its colours: draws the same
+// CLASSIC two-tone bevel / MODERN-FLAT single ring gui_scroll_draw_on() draws
+// around its own trough, at the caller's OWN geometry (x,y,w,h). For the apps
+// that own their scrollbar geometry and call gui_scroll_colors() for colour
+// only (Files' two lists, the browser page bar, the recycle bin): before
+// this they drew colour with no edge at all, so their troughs stayed
+// borderless even after #96 fixed the shared widget's. `track` is the
+// trough's own fill (from gui_scroll_colors()); `surface` is what the gutter
+// sits on, same meaning as gui_scroll_colors()'s `surface` argument.
+void gui_scroll_trough_border(int handle, int x, int y, int w, int h,
                               uint32_t track, uint32_t surface);
 
 // X of the scrollbar gutter (right-aligned inside the viewport). Useful when the

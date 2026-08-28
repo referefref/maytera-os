@@ -14,11 +14,26 @@ volatile uint64_t g_wq_noblock_violations = 0;
 // Detection
 // ---------------------------------------------------------------------------
 
+volatile uint64_t g_wq_block_preempt_off = 0;
+
 uint32_t wq_noblock_reason(void) {
     uint32_t why = 0;
 
     // 1. Scheduler live? Nothing to switch to before this is true.
-    if (!sched_preemption_enabled()) why |= WQ_NB_NO_SCHED;
+    //
+    // #171: this asked sched_preemption_enabled(), which is ALSO the momentary
+    // critical-section suppressor, so with the #67 AP-scheduling gate on it
+    // accused threads on other cores of blocking illegally because the BSP
+    // happened to be inside a sched_set_preemption(false) bracket. It now asks
+    // the sticky "the scheduler has started" flag, which is the condition this
+    // file's header actually describes. See sched_set_preemption() in
+    // proc/process.c for the measurement and for why those reports were false.
+    if (!sched_is_live()) why |= WQ_NB_NO_SCHED;
+    // Counted, deliberately NOT reported: blocking while preemption is
+    // suppressed is legal (the waiter is BLOCKED before sched_schedule() runs,
+    // so it is switched away), but it is worth being able to see how often it
+    // happens without paying for a serial line each time.
+    else if (!sched_preemption_enabled()) g_wq_block_preempt_off++;
 
     // 2. Are we a process? A wait_queue_entry_t needs a process_t to park.
     if (!proc_current()) why |= WQ_NB_NO_PROC;

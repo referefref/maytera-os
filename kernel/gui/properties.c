@@ -357,8 +357,14 @@ void properties_load_file_info(properties_dialog_t *dlg) {
         dlg->file_size = fat_size(&file);
         dlg->attributes = file.attr;
         dlg->is_directory = (file.attr & FAT_ATTR_DIRECTORY) != 0;
-        dlg->mod_date = 0;
-        dlg->mod_time = 0;
+        // #120: these two were HARDCODED ZERO, and properties_format_date()
+        // below turns a zero date into year 1980 + month 0 + day 0. That is
+        // where "Modified: 1980-00-00 00:00" came from - not a broken clock,
+        // not a filesystem that lost the time, just two fields nobody filled.
+        // fat_open() has always had the real values on the handle for a FAT
+        // file, and as of #120 fills them for an ext2 file too.
+        dlg->mod_date = file.mtime_date;
+        dlg->mod_time = file.mtime_time;
         fat_close(&file);
     } else {
         kprintf("[Properties] Failed to open file: %s\n", dlg->filepath);

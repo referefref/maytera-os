@@ -1,5 +1,70 @@
 // intel_gpu.c - Intel Integrated Graphics Driver for MayteraOS
 //
+// ###########################################################################
+// # STATUS 2026-08-23: THIS IS NOT A WORKING DRIVER. DO NOT CALL IT.        #
+// ###########################################################################
+//
+// This file has had ZERO callers since it was written. It was audited on
+// 2026-08-23 (owner prompt: "i didnt think the intel_gpu driver was
+// functional but we should try") and the honest verdict is that it is an
+// UNVALIDATED REGISTER CRIB, not a driver awaiting a wire-up. Per this
+// project's own "zero callers = the feature never runs" and "prose lies,
+// verify the artifact" rules, none of the code below has ever executed on any
+// machine, real or virtual. Four findings, in descending order of severity:
+//
+// 1. intel_find_gpu() DID NOT TERMINATE when the first VGA-class PCI device is
+//    not Intel. PROVEN, not inferred: the loop was extracted verbatim and run
+//    on a host against a 3-device table modelling a QEMU VM (host bridge,
+//    1234:1111 QEMU std VGA, e1000). It spun 20,000,001 times and was still
+//    going when the tripwire fired. The bug: when no LATER VGA device exists,
+//    the inner scan still sets found_current, so the `if (!found_current)
+//    break;` guard never fires and `dev` never changes. Since every QEMU VM
+//    presents a non-Intel adapter, calling intel_gpu_init() would have HUNG
+//    BOOT in every VM, which is very likely why nobody ever finished wiring
+//    this up. FIXED BELOW by deleting the hand-rolled walk in favour of
+//    pci_find_vendor_class(), which already existed in pci.c and does exactly
+//    this job correctly. Reusing it was always the right answer.
+//
+// 2. THE PCH-RELATIVE REGISTER OFFSETS ARE WRONG FOR EVERY GENERATION THIS
+//    FILE CLAIMS TO SUPPORT. On Gen5+ (Ironlake onwards, i.e. all of them) the
+//    display GPIO/GMBUS block moved behind the PCH at +0xC0000, so GMBUS0 is
+//    0xC5100, not the 0x5100 used here; and VGA control moved to CPU_VGACNTRL
+//    0x41000, not the 0x71400 used by intel_disable_vga(). The header even
+//    defines INTEL_REG_VGA_CONTROL 0x41000 and then never uses it. These are
+//    pre-PCH (Gen2-4) offsets. On Haswell 0x5100 lands in the power-gated GT
+//    range, so the EDID path would busy-wait for seconds and always fail. The
+//    pipe/plane offsets (0x70008, 0x70180, 0x7019C, 0x60000) ARE correct for
+//    Haswell, which is what makes the file superficially convincing.
+//
+// 3. FORCEWAKE IS ABSENT ENTIRELY (`grep -ri forcewake kernel/` returns
+//    nothing). On real Haswell the render/blitter register banks are
+//    power-gated: without acquiring forcewake and polling the ACK, reads
+//    return 0 or stale data and writes are silently dropped. Every GT-range
+//    poke below is therefore meaningless on real silicon. QEMU has no power
+//    gating, so this defect is invisible in a VM and surfaces only on the real
+//    iMac, the same shape of bug as the #71 HDA RIRB hang.
+//
+// 4. THE BLT RING BASE IS FED A RAW CPU PHYSICAL ADDRESS. intel_blt_ring_init()
+//    kzalloc_aligned()s a ring and writes its CPU physical address into
+//    BLT_RING_BASE. On Gen6+ that register takes a GGTT GRAPHICS address, and
+//    the pages must first be bound by writing GGTT PTEs with correct cache
+//    bits. Same defect in intel_gpu_set_cursor() (CURABASE). With no IOMMU,
+//    arming a blitter ring at an unbound address points a DMA engine at
+//    whatever happens to be there. This is the one part of the file that is
+//    not merely non-functional but actively unsafe to run.
+//
+// WHAT IS LIVE INSTEAD: drivers/intel_gpu_detect.c + rustkern/intelgpu.rs do
+// identification only (no MMIO of any kind) and ARE called from main.c. That
+// is the safe half of what this file was reaching for.
+//
+// WHAT IT WOULD TAKE to make the rest real is scoped in docs/GPU_ACCEL_SCOPING.md
+// (tier T1/T2): forcewake first, then the fixed GGTT window and cache bits,
+// then eDP panel power and backlight PWM, then a real-hardware display smoke
+// gate, because a bad modeset blanks the only display on the target machine.
+// That is multi-month real-silicon research, and the right move is a Rust
+// rewrite using this file as a register crib, not an incremental repair of it.
+//
+//
 // This driver provides basic display and 2D acceleration support for
 // Intel integrated graphics. It focuses on reliability and compatibility
 // rather than full feature support.
@@ -188,30 +253,23 @@ static intel_gpu_gen_t intel_detect_generation(uint16_t device_id, const char **
 // PCI Detection
 // ============================================================================
 
+// Find the Intel VGA-compatible display controller, or NULL.
+//
+// This was a hand-rolled "find the next VGA device" walk that PROVABLY never
+// terminated when the first VGA-class device was not Intel (finding 1 in the
+// audit block at the top of this file: 20,000,001 iterations and still going
+// on a modelled QEMU device table). It is now one call to the shared primitive
+// pci_find_vendor_class(), which already existed in pci.c and matches vendor +
+// class + subclass in a single bounded pass. The reinvented version was both
+// longer and broken, which is exactly the failure mode the "reuse the existing
+// shared primitives" rule exists to prevent.
+//
+// NOTE: fixing this does NOT make intel_gpu_init() safe to call. See the audit
+// block above; findings 2, 3 and 4 are unaddressed and are the reason this
+// file still has zero callers by design.
 static pci_device_t *intel_find_gpu(void) {
-    // Find VGA-compatible controller
-    pci_device_t *dev = pci_find_class(PCI_CLASS_DISPLAY, PCI_SUBCLASS_VGA);
-
-    while (dev) {
-        if (dev->vendor_id == INTEL_GPU_VENDOR_ID) {
-            return dev;
-        }
-        // Find next VGA device
-        int count = pci_get_device_count();
-        bool found_current = false;
-        for (int i = 0; i < count; i++) {
-            pci_device_t *d = pci_get_device(i);
-            if (found_current && d->class_code == PCI_CLASS_DISPLAY &&
-                d->subclass == PCI_SUBCLASS_VGA) {
-                dev = d;
-                break;
-            }
-            if (d == dev) found_current = true;
-        }
-        if (!found_current) break;
-    }
-
-    return NULL;
+    return pci_find_vendor_class(INTEL_GPU_VENDOR_ID, PCI_CLASS_DISPLAY,
+                                 PCI_SUBCLASS_VGA);
 }
 
 // ============================================================================

@@ -247,8 +247,12 @@ int main(int argc, char **argv) {
             case EVENT_KEY_DOWN:
                 if (ev.key_char == 27) { running = 0; break; }   // ESC
                 // Arrow-key navigation (keycode) as a keyboard fallback.
-                if (ev.keycode == 0x50 || ev.key_char == 'j') { g_sel++; draw_all(); }       // down
-                else if (ev.keycode == 0x48 || ev.key_char == 'k') { g_sel--; draw_all(); }  // up
+                // #191: these were 0x50/0x48, PS/2 scancodes the kernel never
+                // delivers, so only the j/k fallback ever worked; 0x50/0x48
+                // are ASCII 'P'/'H', so shift-P and shift-H moved the
+                // selection instead of the arrows.
+                if (ev.keycode == GUI_KEY_DOWN || ev.key_char == 'j') { g_sel++; draw_all(); }
+                else if (ev.keycode == GUI_KEY_UP || ev.key_char == 'k') { g_sel--; draw_all(); }
                 break;
             case EVENT_MOUSE_SCROLL:
                 g_scroll -= ev.scroll_delta;   // wheel up = scroll up

@@ -1,4 +1,17 @@
-// appstore - MayteraOS App Store (task #402)
+// appstore - MayteraOS App Repo (task #402; renamed from "App Store" #200)
+//
+// NAME SPLIT, stated here so nobody has to guess which name is authoritative.
+// The USER-VISIBLE DISPLAY NAME is "App Repo" (#200, owner request): the window
+// title, the header heading, the Start-menu/desktop/launcher labels and the
+// status sentences below. Everything else deliberately still says appstore:
+// the binary (userland/apps/appstore -> /APPS/APPSTORE), the icon id
+// (icon=appstore), the server side (server/appstore, updates.maytera.net,
+// /APPS/STORE.SRC, the SIGNED manifest that is the install trust anchor), and
+// the comments throughout this tree that name the COMPONENT rather than the
+// label. Renaming the binary would walk into the #196/#517 install-name
+// resolver trap (build-golden.sh invents an install name when its lookups
+// miss - that is how /APPS/ENVPROBE never existed for months) and the server
+// name is covered by a signature. So: DISPLAY = App Repo, COMPONENT = appstore.
 //
 // A modern, comprehensive software store for MayteraOS built on top of the
 // #97 package/update server (the .mpkg repo served over HTTP). It fetches the
@@ -28,6 +41,7 @@
 
 #include "../../libc/maytera.h"
 #include "../../libc/gui.h"
+#include "../../libc/gui_scroll.h"   // (#96) shared scrollbar: this app never had one
 #include "../../libc/syscall.h"
 #include "../../libc/theme.h"
 #include "../../libc/stdlib.h"
@@ -388,6 +402,15 @@ static int  g_search_len = 0;
 static int  g_search_focus = 0;
 static int  g_scroll = 0;           // vertical scroll offset for the content grid
 static int  g_content_h = 0;        // last computed content height (for scroll clamp)
+// (#96) The App Store computed g_content_h and handled the wheel (below) but
+// never drew a scrollbar and never accepted a thumb drag: the shared gui_scroll_t
+// widget was never wired in, so a user with an all-uncached, overflowing list
+// had no on-screen sign that there was more to see. g_scroll stays the single
+// source of truth for the ~15 layout call sites that already read it directly;
+// g_sb is configured from it each draw_all() purely for the widget's geometry,
+// rendering and thumb-drag input, matching the split settings.c's g_side_scroll
+// would use if this app were being written fresh.
+static gui_scroll_t g_sb;
 
 // #B2: content-type filter, orthogonal to the sidebar's Discover/category/etc
 // view and the search box. 0 = all types; else index into TYPE_VALUES below.
@@ -1901,7 +1924,7 @@ static int install_pkg(int idx) {
     // over plain http (STORE.SRC pointing at a LAN dev server, not the
     // https:// production default) deserves to be TOLD its install count did
     // not move, instead of only discoverable by independently checking
-    // /srv/maytera-repo-stats/download_log on the stats server.
+    // <internal server path> on the stats server.
     // #611 left a hole this run MEASURED: it only spoke up when the repo was
     // plain http. With the shipped https repo the POST can still fail (it did:
     // a wp-cyber install over https://updates.maytera.net completed while
@@ -1965,7 +1988,7 @@ static int load_manifest(void) {
         n = http_get_live(murl, (uint8_t *)g_manifest, sizeof(g_manifest) - 1, "Loading catalog");
     }
     if (g_close_requested) return -1;
-    if (n <= 0) { strcpy(g_status, "Couldn't reach the App Store repository"); g_status_kind = 3; return -1; }
+    if (n <= 0) { strcpy(g_status, "Couldn't reach the App Repo server"); g_status_kind = 3; return -1; }
     g_manifest[n] = 0;
 
     // ---- #559: AUTHENTICATE THE MANIFEST BEFORE TRUSTING A SINGLE BYTE OF IT.
@@ -2109,7 +2132,11 @@ static void load_stats(void) {
 #define CONTENT_X  (SIDEBAR_W)
 #define PAD        22
 
-static int content_w(void) { return g_win_w - CONTENT_X - PAD; }
+// (#96) Reserve the scrollbar gutter unconditionally so the grid/detail layout
+// never reflows the instant a list crosses the overflow threshold (the gutter
+// simply sits unused, like Files' and Settings' reserved margins, when nothing
+// needs to scroll: gui_scroll_draw() itself draws nothing in that case).
+static int content_w(void) { return g_win_w - CONTENT_X - PAD - GUI_SCROLL_W - 6; }
 
 // A card in the grid; also used for hit-testing.
 #define CARD_W     288
@@ -2292,7 +2319,7 @@ static void draw_header(void) {
     gui_soft_shadow(g_win, 16, 14, 32, 32, 8, C_panel);
     gui_fill_rounded_aa(g_win, 16, 13, 32, 32, 8, C_accent, C_panel);
     T(24, 20, "M", 20, C_accent_ink);
-    T(58, 12, "App Store", 20, C_ink);
+    T(58, 12, "App Repo", 20, C_ink);
     T(58, 36, "MayteraOS Software", 11, C_ink_dim);
 
     // search box (right)
@@ -2966,8 +2993,8 @@ static void draw_empty_state(int x, int y, int w, int mode) {
     T(icx + (ic - gw) / 2, icy + (ic - gsz) / 2, glyph, gsz, icol);
 
     const char *heading =
-        failed                     ? "Couldn't load the App Store" :
-        loading                    ? "Loading the App Store..." :
+        failed                     ? "Couldn't load the App Repo" :
+        loading                    ? "Loading the App Repo..." :
         g_view == V_UPDATES        ? "Everything is up to date" :
         g_view == V_INSTALLED      ? "Nothing installed yet" :
         g_view == V_SEARCH         ? "No results" :
@@ -3102,6 +3129,27 @@ static void draw_all(void) {
     // mask top + left with header/sidebar
     draw_sidebar();
     draw_header();
+
+    // (#96) Scrollbar. Configured from the g_content_h draw_detail()/draw_content()
+    // just finished computing, and from the same viewport formula clamp_scroll()
+    // already uses (g_win_h - HEADER_H - 20), so gui_scroll_max() and
+    // clamp_scroll()'s `maxs` never disagree. g_scroll remains authoritative;
+    // g_sb.offset is a read-back copy purely for the widget's own geometry math.
+    // Draws nothing when the content fits (thumb_geom() returns early).
+    {
+        int vp_h = g_win_h - HEADER_H - 20;
+        if (vp_h < 0) vp_h = 0;
+        gui_scroll_config(&g_sb, g_win_w - PAD - GUI_SCROLL_W, HEADER_H, GUI_SCROLL_W, vp_h,
+                          g_content_h, CARD_H + CARD_GAP);
+        g_sb.offset = g_scroll;
+        // gui_scroll_draw_on(), not gui_scroll_draw(): C_surface is
+        // theme_color(THEME_COLOR_WINDOW_BG) EXCEPT when that theme value is
+        // unset (setup_palette()'s wbg==0&&ink==0 guard, which substitutes
+        // 0x1E1E1E) - gui_scroll_draw()'s own internal theme_color() call would
+        // not see that substitution and could compute a repair against a
+        // colour nothing on screen is actually painted with.
+        gui_scroll_draw_on(g_win, &g_sb, C_surface);
+    }
 
     // status banner
     if (g_status[0]) {
@@ -3283,7 +3331,7 @@ static void do_action_system(int idx) {
     // could claim "signed" here. The fact rows are app-supplied DISPLAY data;
     // the title, "Installs to" and "Runs as" are the kernel's own chrome and
     // are the parts of that panel a user can rely on.
-    strncpy(req.source, "MayteraOS App Store", sizeof(req.source) - 1);
+    strncpy(req.source, "MayteraOS App Repo", sizeof(req.source) - 1);
 
     long seq = sys_elev_request(&req);
     if (seq <= 0) { elev_status_for(seq, pk->name); draw_all(); return; }
@@ -3354,7 +3402,7 @@ static void handle_click(int mx, int my) {
     // sidebar
     if (mx < SIDEBAR_W) { if (sidebar_click(mx, my)) { draw_all(); } return; }
 
-    // #B3: Retry on the "couldn't load the App Store" empty-state panel.
+    // #B3: Retry on the "couldn't load the App Repo" empty-state panel.
     if (g_retry_hit.active && point_in(mx, my, g_retry_hit.x, g_retry_hit.y, g_retry_hit.w, g_retry_hit.h)) {
         strcpy(g_status, "Retrying..."); g_status_kind = 1; draw_all();
         if (load_manifest() == 0) load_stats();
@@ -3527,7 +3575,7 @@ static void scripted_install(void) {
 
 int main(int argc, char **argv) {
     (void)argc; (void)argv;
-    g_win = win_create("App Store", 60, 40, g_win_w, g_win_h);
+    g_win = win_create("App Repo", 60, 40, g_win_w, g_win_h);
     if (g_win < 0) return 1;
 
     // #745: FIRST, because load_registry(), every destination confinement and
@@ -3577,11 +3625,27 @@ int main(int argc, char **argv) {
                 break;
             case EVENT_MOUSE_MOVE:
                 g_mx = ev.mouse_x; g_my = ev.mouse_y;
+                // (#96) thumb drag / hover. gui_scroll_motion() is a cheap no-op
+                // unless a drag from gui_scroll_press() below is in progress or
+                // the thumb is being hovered, so this costs nothing on the
+                // common path (it already redraws unconditionally for hover
+                // highlighting elsewhere in this handler).
+                if (gui_scroll_motion(&g_sb, g_mx, g_my)) { g_scroll = g_sb.offset; clamp_scroll(); }
                 draw_all();
                 break;
             case EVENT_MOUSE_DOWN:
                 g_mx = ev.mouse_x; g_my = ev.mouse_y;
-                handle_click(ev.mouse_x, ev.mouse_y);
+                // (#96) Scrollbar gutter/thumb first: gui_scroll_press() only
+                // returns 1 for a press inside its own 14px column, so this
+                // cannot steal a click meant for a card, button or sidebar item.
+                if (gui_scroll_press(&g_sb, g_mx, g_my)) {
+                    g_scroll = g_sb.offset; clamp_scroll(); draw_all();
+                } else {
+                    handle_click(ev.mouse_x, ev.mouse_y);
+                }
+                break;
+            case EVENT_MOUSE_UP:
+                gui_scroll_release(&g_sb);
                 break;
             case EVENT_MOUSE_SCROLL:
                 g_scroll -= ev.scroll_delta * 48;

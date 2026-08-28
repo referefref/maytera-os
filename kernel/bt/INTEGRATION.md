@@ -34,8 +34,8 @@ Bluetooth is off.
 
 ## 2. Build serialization rule (the build container)
 
-All main-kernel builds happen in the build container on the build server,
-tree `<BUILD_PATH>/active-code/source/kernel/`. The object
+All main-kernel builds happen in Proxmox the build container on the build server
+(<BUILD_SERVER>), tree `<BUILD_PATH>/active-code/source/kernel/`. The object
 dir is shared, so only ONE `make` may run at a time.
 
 Before building:

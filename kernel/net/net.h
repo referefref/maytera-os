@@ -120,6 +120,30 @@ int net_fetch_probe_take(void);
 // on a fresh DHCP bind, and on a carrier down->up transition.
 void net_clear_fault(void);
 
+// #786: PERSIST the live IPv4 configuration to /CONFIG/NETIP.CFG, the file
+// net_apply_static_config() reads at boot. Returns 0 on success, -1 on a write
+// failure, and -2 when there is no FAT/ext2 root to write to.
+//
+// WHY THE KERNEL OWNS THIS FILE AND RING 3 DOES NOT (the whole point of #786).
+// Settings used to write it itself, and the write SILENTLY FAILED for every
+// non-root user: /CONFIG is root-owned mode 0711 in /CONFIG/PERMS.DB, so
+// sys_open(O_CREAT) on a path under it is refused for uid != 0. Worse, the
+// app's own failure breadcrumb (/SETLOG.TXT) is under "/" (root, 0755) and was
+// refused too, so the failure left NO trace anywhere: the panel updated, the
+// file never appeared, and nothing was logged. Measured on VM <vmid> after a
+// real click on OK in Settings > Network > Configure IP.
+//
+// Persisting from Ring 0, in the SAME syscall that applies the change, makes
+// "what is running" and "what boots" the same thing by construction, and there
+// is exactly ONE writer of the file instead of two that can disagree.
+//
+// IT DOES NOT INVENT A STATIC CONFIG. If the machine is on DHCP it writes ONLY
+// the dns= line, so the next boot still runs DHCP with the chosen resolver.
+// Writing ip=/mask=/gw= from a DHCP lease would pin a borrowed address as a
+// static one, which is precisely the trap that left a golden hard-coded to
+// 192.0.2.1 and unable to reach any other LAN (blame.md 2026, #549 note).
+int net_persist_netcfg(void);
+
 // #381: start the background net worker (USB carrier polling + async DHCP/DAD).
 // Call once after preemption is enabled. See net.c.
 void net_start_worker(void);

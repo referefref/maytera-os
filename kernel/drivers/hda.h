@@ -211,6 +211,28 @@
 #define HDA_VERB_GET_GPIO_DIR       (0xF17 << 8)   // Get GPIO Direction
 #define HDA_VERB_SET_GPIO_DIR       (0x717 << 8)   // Set GPIO Direction
 
+// #152: Digital Converter Control 1 (verb 0x70D / 0xF0D). REQUIRED to enable a
+// converter whose Audio Widget Capabilities report the Digital bit (bit 9): a
+// digital converter's output stays disabled until DigEn (payload bit 0) is set.
+// The real iMac14,4 CS4208 dump (the build host:<workspace>
+// AUDIOLOG-imac-real-cs4208.txt) shows the two internal-speaker DACs nid10/nid11
+// with wcap=0x00046631, i.e. bit 9 SET, so they are digital converters that this
+// driver had never enabled. Sending this to a non-digital converter is a no-op,
+// so it is issued unconditionally-on-the-bit rather than vendor-gated.
+// Get Converter Format: the 4-bit read-back counterpart of SET_CONV_FMT
+// (verb 0xA, payload in bits 15:0). #71: this driver sent SET_CONV_FMT to
+// every route DAC and never once read it back, so a converter silently
+// running a different format from the stream descriptor would have looked
+// identical to a healthy one in every capture taken so far. The rule this
+// file already states for the analogue half ("a verb this driver sends and
+// never reads is not evidence of anything") applies just as hard here.
+#define HDA_VERB_GET_CONV_FMT       (0xA00 << 8)   // Get Converter Format (verb 0xA)
+#define HDA_VERB_GET_DIGI_CONV1     (0xF0D << 8)   // Get Digital Converter Control 1
+#define HDA_VERB_SET_DIGI_CONV1     (0x70D << 8)   // Set Digital Converter Control 1
+#define HDA_DIG1_ENABLE             (1 << 0)       // DigEn: enable digital output
+#define HDA_DIG1_NONAUDIO           (1 << 1)       // Non-audio (leave clear for PCM)
+#define HDA_DIG1_PROFESSIONAL       (1 << 6)       // Professional (leave clear)
+
 // Cirrus Logic HDA codec vendor ID (CS4206/CS4207/CS4208 all report 0x1013).
 #define HDA_VENDOR_CIRRUS           0x1013
 #define HDA_VERB_GET_STREAM         (0xF06 << 8)   // Get Stream Format
@@ -250,12 +272,85 @@
 #define HDA_WIDGET_TYPE_BEEP        (0x7 << 20)  // Beep Generator
 #define HDA_WIDGET_TYPE_VENDOR      (0xF << 20)  // Vendor-defined
 
+// #152: Audio Widget Capabilities bits (HDA spec 7.3.4.6). Previously only the
+// TYPE field (bits 23:20) was ever decoded, so the Digital bit on the iMac's
+// speaker converters went unnoticed for the whole life of this driver.
+#define HDA_WCAP_STEREO             (1 << 0)     // Stereo (0 = mono converter)
+#define HDA_WCAP_IN_AMP             (1 << 1)     // Input amp present
+#define HDA_WCAP_OUT_AMP            (1 << 2)     // Output amp present
+#define HDA_WCAP_FMT_OVERRIDE       (1 << 4)     // Format override
+#define HDA_WCAP_CONN_LIST          (1 << 8)     // Connection list present
+#define HDA_WCAP_DIGITAL            (1 << 9)     // Digital converter
+#define HDA_WCAP_POWER              (1 << 10)    // Power control supported
+
+// #152: Intel PCH host-controller PCI config quirks, mirroring Linux
+// sound/pci/hda/hda_intel.c intel_init_pci(). NEITHER of these lives in MMIO
+// BAR0, so nothing in the existing register-poking path could ever have set
+// them, and neither is needed under QEMU (which is why no VM ever showed the
+// difference). On a real Lynx Point PCH (the iMac14,4's 8086:9c20) they matter:
+//   TCSEL  - PCI-Express Traffic Class Select. Linux forces the low 3 bits to 0
+//            so HDA DMA uses TC0, the only class the chipset guarantees to
+//            service; a non-zero TC can leave stream DMA unserviced.
+//   DEVC   - Device Control. Bit 11 is NO SNOOP ENABLE. With it SET the audio
+//            DMA engine reads the sample buffer WITHOUT snooping the CPU
+//            caches, so the write-back-cached stores this kernel uses to fill
+//            the buffer can sit in L1/L2 and the controller streams stale bytes
+//            (i.e. silence) while LPIB advances perfectly. Linux CLEARS it for
+//            AZX_SNOOP_TYPE_SCH, which is exactly what Lynx Point is.
+#define HDA_PCI_TCSEL               0x44         // Traffic Class Select (byte)
+#define HDA_PCI_TCSEL_MASK          0x07
+#define HDA_PCI_DEVC                0x78         // Device Control (word)
+#define HDA_PCI_DEVC_NOSNOOP        (1 << 11)    // No Snoop Enable
+#define HDA_PCI_VENDOR_INTEL        0x8086
+
 // Pin Configuration
 #define HDA_PIN_OUT_EN              (1 << 6)    // Output Enable
 #define HDA_PIN_IN_EN               (1 << 5)    // Input Enable
+#define HDA_PIN_HP_EN               (1 << 7)    // Headphone drive amp enable
 #define HDA_PIN_VREF_MASK           (7 << 0)    // Voltage Reference
 
+// #71 Pin Capabilities (param 0x0C, HDA spec 7.3.4.9). Only bit 4 (output
+// capable) was ever decoded here, which is why the driver blanket-sent the
+// EAPD verb to pins that do not implement it and could not tell the difference
+// between "EAPD is off" and "this pin has no EAPD". Bit 16 is the ONLY thing
+// that says whether verb 0x70C means anything on a given pin.
+#define HDA_PINCAP_IMP_SENSE        (1u << 0)   // Impedance sense capable
+#define HDA_PINCAP_TRIG_REQ         (1u << 1)   // Trigger required
+#define HDA_PINCAP_PRES_DETECT      (1u << 2)   // Jack presence detect capable
+#define HDA_PINCAP_HP_DRV           (1u << 3)   // Headphone drive capable
+#define HDA_PINCAP_OUT              (1u << 4)   // Output capable
+#define HDA_PINCAP_IN               (1u << 5)   // Input capable
+#define HDA_PINCAP_BALANCED         (1u << 6)   // Balanced I/O pins
+#define HDA_PINCAP_HDMI             (1u << 7)   // HDMI
+#define HDA_PINCAP_VREF_MASK        (0x3Fu << 8)// VRef control
+#define HDA_PINCAP_EAPD             (1u << 16)  // EAPD capable  <-- the gate
+#define HDA_PINCAP_DP               (1u << 24)  // DisplayPort
+#define HDA_PINCAP_HBR              (1u << 27)  // High bit rate
+
+// #71 EAPD/BTL Enable payload (verb 0x70C / 0xF0C, HDA spec 7.3.3.16).
+// EAPD = External Amplifier Power Down: the bit is "amp POWERED", so 0 means
+// the external amplifier is shut down and the machine is silent no matter how
+// perfectly the digital path runs.
+#define HDA_EAPD_BTL                (1u << 0)   // Balanced (BTL) output enable
+#define HDA_EAPD_ENABLE             (1u << 1)   // EAPD: external amplifier ON
+#define HDA_EAPD_LR_SWAP            (1u << 2)   // Left/right swap
+#define HDA_EAPD_MASK               0x07u
+
+// #71 Output/Input Amplifier Capabilities field layout (params 0x12 / 0x0D,
+// HDA spec 7.3.4.10). The gain written by verb 0x300 is an INDEX into this
+// ladder, so index 0 is FULL ATTENUATION - "unmuted at gain 0" is silence.
+#define HDA_AMPCAP_MUTE             (1u << 31)  // Mute capable
+#define HDA_AMPCAP_STEPSIZE(c)      (((c) >> 16) & 0x7F)  // dB per step, 0.25dB units - 1
+#define HDA_AMPCAP_NUMSTEPS(c)      (((c) >> 8)  & 0x7F)  // highest gain index (0 = fixed)
+#define HDA_AMPCAP_OFFSET(c)        (((c))       & 0x7F)  // index that means 0 dB
+
+// hda_set_out_amp_rb() / hda_set_in_amp_rb() result codes.
+#define HDA_AMP_R_ABSENT            (-1)        // widget has no amp: nothing to set
+#define HDA_AMP_R_MISMATCH          0           // written, but readback disagrees
+#define HDA_AMP_R_OK                1           // written and read back correct
+
 // Amplifier Gain/Mute
+
 #define HDA_AMP_MUTE                (1 << 7)    // Mute
 #define HDA_AMP_GAIN_MASK           0x7F        // Gain (0-127)
 #define HDA_AMP_SET_OUTPUT          (1 << 15)   // Set output amp
@@ -404,6 +499,12 @@ typedef struct {
     // State
     bool initialized;
     bool playing;
+    // #205: set once hda_start() has MEASURED a start where SDnCTL.RUN read
+    // back clear but LPIB advanced anyway. From that point on this driver
+    // stops treating that one bit as evidence. Latched, never cleared: a
+    // controller that lies once has forfeited the register for this boot, and
+    // clearing it would let hda_out_stopped() flip back to the lying source.
+    bool run_readback_unreliable;
     uint8_t write_index;
     uint8_t read_index;
 
@@ -420,11 +521,59 @@ typedef struct {
     // also live (useful on hardware where PCI_INTERRUPT_LINE reads 0).
     bool    msi_enabled;
     uint8_t msi_vector;
+
+    // ------------------------------------------------------------------
+    // #189: starve-silence accounting for the cyclic output ring.
+    //
+    // An HDA output stream replays its Buffer Descriptor List forever once
+    // RUN is set; it has no notion of "the data ran out". So when a producer
+    // stops feeding but leaves the stream open, the last ring-full of audio
+    // loops indefinitely (measured: the final 0.743 s of a tune repeating for
+    // 60+ s, which is exactly one lap of this 131072-byte ring at 44.1 kHz).
+    //
+    // These counters are FREE-RUNNING in BDL-slot units, NOT modular. LPIB is
+    // modular, and modular arithmetic cannot distinguish "the producer is 5
+    // slots ahead" from "the DMA has lapped the producer and is 27 slots
+    // behind": that ambiguity IS the bug, so it is resolved once, on entry,
+    // in rustkern/hdastarve.rs.
+    // ------------------------------------------------------------------
+    uint64_t dma_slot;        // free-running slot the DMA engine is reading
+    uint64_t wr_slot;         // free-running slot the producer will fill next
+    uint64_t sil_slot;        // free-running slot the silencer will zero next
+    uint32_t last_dma_slot;   // last modular LPIB slot, for lap detection
+    uint64_t silenced_slots;  // slots zeroed (statistic)
+    uint64_t silence_skips;   // slots given up on because the silencer lagged
+
+    // AUDLEAD: STARVATION ACCOUNTING. hda_state.underruns above counts SDnSTS.FIFOE,
+    // which is the CONTROLLER failing to fetch from memory. A late producer never
+    // trips it, because the ring always holds valid bytes, just not the right
+    // ones. These count the event that actually happens: the DMA reaching a slot
+    // nobody wrote. Without them a buffering change cannot be told from a placebo.
+    uint64_t starve_events;   // times the producer was found already overrun
+    uint64_t starve_slots;    // total slots played that were never written
+    uint64_t lead_min_slots;  // smallest healthy lead seen (slots), UINT64_MAX = none
+    uint64_t lead_obs;        // healthy observations, so lead_min_slots has a denominator
+    bool     starve_armed;    // only account once a producer has actually written
+                              // a whole ring: those HAVE already been replayed,
+                              // so this must never be reported as a clean run
+    bool     loop_mode;       // the ring is a deliberately repeating test tone
+                              // (hda_selftest_tone / SYS_HDA_DBG op 7); the
+                              // silencer must leave it alone or the boot tone
+                              // would cut off after one lap
 } hda_state_t;
 
 // ============================================================================
 // HDA Driver API
 // ============================================================================
+
+// #190: true when the single hardware output stream is NOT running. Read from
+// SDnCTL, not from the playing-shadow (#173). Safe from any context, including
+// inside a wait_event() condition.
+bool hda_out_stopped(void);
+
+// #189: the driver's 64-entry signed sine table (amplitude ~ +/-8192), so a
+// caller that needs a test tone reuses this one instead of copying it.
+const int16_t *hda_sine64_table(void);
 
 // Initialize HDA driver
 int hda_init(void);
@@ -452,6 +601,11 @@ int hda_write(const void *buffer, uint32_t frames);
 
 // Get available write space
 int hda_avail(void);
+// AUDLEAD: starvation accounting. See drivers/hda.c. lead_min_ms is UINT32_MAX
+// when no healthy observation was taken; print that as "no data", never as 0.
+void hda_starve_stats(uint64_t *events, uint64_t *starved_ms,
+                      uint32_t *lead_min_ms, uint64_t *obs);
+uint32_t hda_ring_ms(void);
 
 // Set volume
 void hda_set_volume(uint8_t left, uint8_t right);
@@ -489,6 +643,84 @@ void hda_devlog_scan(void (*emit)(const char *line));
 // descriptor RUN/STS/LPIB) to the supplied callback, one line at a time. Wired
 // to /AUDIOLOG.TXT. Non-destructive: snapshots + restores the live audio state.
 void hda_audiolog_report(void (*emit)(const char *line));
+
+// ============================================================================
+// #71: OUTPUT-DMA LIVENESS PROBE. READ THIS BEFORE TRUSTING ANY LPIB NUMBER.
+// ============================================================================
+//
+// A single LPIB read cannot distinguish a stopped DMA engine from a running
+// one that we happened to look at twice in the same position, and it CERTAINLY
+// cannot distinguish either from "we looked before anything was started". The
+// real iMac14,4 build-1932 /AUDIOLOG.TXT reported RUN=0 LPIB=0 and that was
+// read as the fault; it was in fact guaranteed by where the dump is emitted
+// (drivers/audio.c calls it BETWEEN audio_init() and the calls that start the
+// poll worker, arm the MSI and play the tone). A whole round of analysis went
+// into a number that could not have been anything else.
+//
+// So the only sanctioned way to ask "is output DMA running" is this probe: two
+// LPIB reads separated by a known amount of REAL time (cpu/mono.h mono_us(),
+// TSC-backed, never timer_ticks -- see blame.md), with the RUN bit captured
+// alongside the first read, and the wrap-corrected delta compared against the
+// byte rate the stream format implies. The arithmetic and the verdict live in
+// rustkern/hdadma.rs; only the MMIO and the sleep are here.
+//
+// The verdict values MUST stay in sync with rustkern/hdadma.rs.
+#define HDA_DMA_UNKNOWN      0   // window zero-length, or long enough that a
+                                 // buffer wrap makes the delta ambiguous.
+                                 // Deliberately NOT the same value as RUNNING:
+                                 // "not measured" is not "measured healthy".
+#define HDA_DMA_RUNNING      1   // advanced at ~the format's byte rate: PASS
+#define HDA_DMA_SLOW         2   // advanced, but well under rate (glitching)
+#define HDA_DMA_STALLED      3   // RUN was set and the position did not move
+#define HDA_DMA_NOT_STARTED  4   // RUN was clear; says nothing about the engine
+
+typedef struct {
+    int      measured;    // 0 = this probe has never been run. Check it first.
+    int      verdict;     // HDA_DMA_*
+    uint32_t lpib0;
+    uint32_t lpib1;
+    uint32_t delta;       // wrap-corrected bytes advanced
+    uint64_t expected;    // bytes the format says should have moved
+    uint32_t permille;    // delta as per-mille of expected
+    uint64_t elapsed_us;  // measured with mono_us(), not ticks
+    uint32_t cbl;         // cyclic buffer length at sample time
+    uint32_t ctl;         // SDnCTL as sampled WITH lpib0
+    uint8_t  sts;         // SDnSTS after the window (BCIS/FIFOE/BDLE)
+    int      peak;        // ring peak sample at sample time (-1 = no buffer)
+    int      started_for_probe; // the probe set RUN itself and cleared it after
+    int      busy_gap;    // the tick-driven sleep overshot past one ring lap,
+                          // so the window was re-measured on hda_delay()
+    uint32_t sample_rate;
+    uint32_t channels;
+    uint32_t bits;
+} hda_dma_probe_t;
+
+// Measure the output stream over `gap_ms` of real time WITHOUT touching RUN.
+// Use when the caller already knows the stream is running (e.g. during the
+// boot tone). Returns the verdict, or HDA_DMA_UNKNOWN if HDA never came up.
+int hda_dma_probe(hda_dma_probe_t *p, uint32_t gap_ms);
+
+// Same, but starts the stream first if it was not already running and stops it
+// again afterwards, so the question can be answered on a boot where nothing
+// asked for playback. Whatever is currently in the ring is audible for gap_ms,
+// so keep gap_ms short and only call this from a diagnostic path.
+int hda_dma_probe_auto(hda_dma_probe_t *p, uint32_t gap_ms);
+
+// The most recent probe (from the boot tone or from a diagnostic). Its
+// `measured` field is 0 until one has run.
+const hda_dma_probe_t *hda_last_dma_probe(void);
+
+// #71: the RUNTIME half of the AUDIOLOG dump: interrupt/poll-worker state, the
+// live codec output path with every verb this driver SENDS also READ BACK, the
+// measured DMA verdict, and a plain-English pass/fail block.
+//
+// Split out from hda_audiolog_report() (which is the static widget-graph scan)
+// precisely because of the ordering trap above: the graph scan must run BEFORE
+// the poll worker starts, so it does not race the worker for codec access,
+// while everything in here is meaningless until AFTER the poll worker, the MSI
+// and the tone have had their turn. Call it last.
+void hda_audiolog_runtime_report(void (*emit)(const char *line));
+
 
 // #71 userland audio bring-up debug (SYS_HDA_DBG). See the op table in hda.c.
 // Lets a Ring-3 tool drive the HDA output path (codec verbs, SDnCTL RUN, LPIB,

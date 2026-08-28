@@ -113,15 +113,21 @@
 //   POSIX_SPAWN_SETSCHEDPARAM ENOSYS. Same.
 //   POSIX_SPAWN_SETSID        ENOSYS. The child inherits the caller's session.
 //
-// ENVIRONMENT. envp cannot be honoured, because MayteraOS has NO cross-process
-// environment at all: environ lives in libc's heap (stdlib.c), the kernel
-// spawn carries argv and nothing else, and every process starts with an empty
-// environ that it or its shell repopulates. Passing NULL or environ is
-// accepted, because on this OS both mean the same thing and refusing them
-// would reject every portable caller for a limitation of the OS rather than of
-// this call. Passing a DIFFERENT, deliberately constructed envp returns
-// ENOSYS, because that caller is asking for something specific that will not
-// happen.
+// ENVIRONMENT. HONOURED SINCE #112. This paragraph used to say envp "cannot be
+// honoured, because MayteraOS has NO cross-process environment at all", and
+// that was true of the OS as it then was: proc_create_user_as() did
+// "(void)envp;", setup_user_argv() wrote a NULL where envp belonged, and crt0
+// never looked at it.
+//
+// SYS_SPAWN_ENV (394) carries an environment now, so posix_spawn passes envp
+// through to the child, and the only refusals left are the kernel block's real
+// limits: at most 64 entries, at most 511 bytes each (E2BIG), and every entry
+// must be NAME=VALUE (EINVAL). Neither is ever silently truncated.
+//
+// envp == NULL means INHERIT here, not "empty". POSIX leaves it undefined and
+// glibc treats it as empty; the choice is deliberate and is recorded at the
+// call site in spawn.c. Pass a vector whose first element is NULL for a
+// genuinely empty environment.
 //
 // FILE MODE. The mode argument to addopen() is the one parameter this library
 // knowingly ignores: the kernel's open_redir_file() calls

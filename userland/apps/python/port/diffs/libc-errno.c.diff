@@ -1,5 +1,5 @@
---- a/errno.c
-+++ b/errno.c
+--- <workspace>	2026-07-07 16:27:23.217523651 +0000
++++ <workspace>	2026-07-07 16:36:18.308157175 +0000
 @@ -45,6 +45,19 @@
      [38]  = "Function not implemented",
      [39]  = "Directory not empty",

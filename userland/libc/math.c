@@ -25,7 +25,23 @@ float sqrtf(float x) {
     return r;
 }
 
+// THE `long long` CAST BELOW IS UNDEFINED FOR INFINITY, NaN, AND ANY |x| THAT
+// DOES NOT FIT IN AN int64, and on x86-64 the hardware answer is INT64_MIN.
+// floor() and ceil() had no guard, so floor(inf) returned -9223372036854775808.
+// MEASURED, not theorised: Lua's `5 // 0.0` is floor(5/0.0) = floor(inf), and
+// it printed -9.2233720368548e+18 on MayteraOS against inf on two host Lua
+// builds (userland/apps/luacheck case "arith", local queue 91).
+//
+// The guard is a RANGE test written so that NaN takes it too: every comparison
+// against NaN is false, so !(...) is true and NaN returns unchanged, which is
+// what both functions are specified to do. 2^53 is the point above which every
+// double is already an integer, so returning x unchanged there is not an
+// approximation - it is the exact answer, and it keeps the cast comfortably
+// inside int64 range.
+#define MATH_INT_EXACT 9007199254740992.0   /* 2^53 */
+
 double floor(double x) {
+    if (!(x > -MATH_INT_EXACT && x < MATH_INT_EXACT)) return x;  /* inf, NaN, huge */
     double t = (double)(long long)x;
     if (t > x) t -= 1.0;
     return t;
@@ -33,11 +49,21 @@ double floor(double x) {
 float floorf(float x) { return (float)floor((double)x); }
 
 double ceil(double x) {
+    if (!(x > -MATH_INT_EXACT && x < MATH_INT_EXACT)) return x;  /* inf, NaN, huge */
     double t = (double)(long long)x;
     if (t < x) t += 1.0;
     return t;
 }
 
+// FOUND, NOT FIXED (local queue 91): this carries the SAME undefined cast as
+// floor()/ceil() did, one level down. fmod(inf, 3) computes q = inf, casts it,
+// and returns a large finite number where C requires NaN; and for any |x/y|
+// above 2^63 the answer is garbage rather than merely imprecise. It is left
+// alone here deliberately, because the honest fix is not a guard but a
+// different algorithm (repeated exact scaled subtraction, which is what a real
+// libm does), that is a behaviour change for every existing caller, and NOTHING
+// measured in this pass reaches it: Lua's math.fmod and float `%` were exercised
+// and agree with the host. Fix it with its own test, not as a drive-by.
 double fmod(double x, double y) {
     if (y == 0.0) return 0.0/0.0;
     double q = x / y;

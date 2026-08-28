@@ -25,6 +25,12 @@
 #define SYS_WRITE           13  // Write to file
 #define SYS_SEEK            14  // Seek in file
 #define SYS_STAT            15  // Get file status
+// #120: RECLAIMED. #745 deleted an unimplemented SYS_FSTAT declaration from
+// this number and wrote down that a real kernel fstat should take it back and
+// REPLACE userland's seek-and-fabricate, not sit beside it. That is what 101 is
+// now. Numbered here rather than appended at the end so it stays next to the
+// syscall it shares its implementation with.
+#define SYS_FSTAT          101  // Get file status by descriptor
 #define SYS_MKDIR           16  // Create directory
 #define SYS_RMDIR           17  // Remove directory
 #define SYS_UNLINK          18  // Delete file
@@ -51,6 +57,44 @@
 #define SYS_MMAP            21  // Map memory
 #define SYS_MUNMAP          22  // Unmap memory
 
+// SYS_MPROTECT - change page protection on a mapped range. (#404 / #522)
+//
+// NUMBER CHOICE, stated because a guessed constant does not fail loudly.
+// 23 is taken DELIBERATELY as a GAP, not as the top of the range. Swept
+// 2026-08-23 across every ref in refs/heads + refs/remotes (200+ refs, via
+// `git show <ref>:kernel/proc/syscall.h` and the libc twin): 23 is defined
+// nowhere, on any branch, and has never even been an old SYS_MAX value (the
+// lowest sentinel anywhere in history is 215). It sits immediately after its
+// own family - SYS_BRK 20, SYS_MMAP 21, SYS_MUNMAP 22 - which is where a
+// reader will look for it.
+//
+// Taking a gap rather than the sentinel's value is the tree's written policy
+// and it is a direct product of the #238 collision: two agents each gap-scanned
+// honestly, both took the TOP of the range, and both were right when they
+// looked. A number deep inside the range cannot be reached by a concurrent
+// top-scanning agent. SYS_MAX is deliberately NOT bumped: 23 is far below it
+// and 400 remains a correct sentinel.
+//
+// Note 23 is also the number userland/apps/mmtest/main.c has assumed since
+// #522 wrote that harness against a kernel that did not yet have the syscall,
+// so adopting it makes an existing (previously no-op) call site correct.
+#define SYS_MPROTECT        23  // Change protection of a mapped range
+
+// mprotect refusal codes. Ring 3 sees these as the syscall's return value.
+// They are DISTINCT on purpose: a single -1 for every refusal cannot tell a
+// test which guard fired, and a guard that has never been watched firing is
+// indistinguishable from one that is absent. /APPS/MMTEST subtest (8) asserts
+// each code individually. Mirrored in kernel/rustkern/mprotect.rs (the MP_E_*
+// consts) and locked against drift by proc/syscall_mprotect_lock.c.
+#define MP_OK               0   // accepted
+#define MP_E_PROT_BITS    (-1)  // prot carries bits that are not PROT_READ/WRITE/EXEC
+#define MP_E_LEN          (-2)  // zero length
+#define MP_E_ALIGN        (-3)  // addr is not page-aligned
+#define MP_E_WX           (-4)  // W^X: PROT_WRITE|PROT_EXEC refused
+#define MP_E_OVERFLOW     (-5)  // addr+len wraps the address space
+#define MP_E_RANGE        (-6)  // range is not entirely user memory
+#define MP_E_NOMAP        (-7)  // well-formed, but the range is not fully mapped
+
 // GUI syscalls (MayteraOS specific)
 #define SYS_WIN_CREATE      30  // Create window
 #define SYS_WIN_DESTROY     31  // Destroy window
@@ -67,7 +111,7 @@
 #define SYS_GETCHAR         41  // Read character
 
 // Time
-#define SYS_TIME            50  // Get current time
+#define SYS_TIME            50  // #113: seconds since the UNIX EPOCH (UTC). Was seconds since BOOT.
 #define SYS_CLOCK           51  // Get system clock ticks
 
 // Network
@@ -145,6 +189,7 @@
 #define SYS_WM_MAXIMIZE_WINDOW 260  // toggle maximize/restore of focused window (F11)
 #define SYS_RUN_NEXT_ON_AP 261
 #define SYS_WIN_SET_NOCHROME 262  // #185: mark a window borderless (no chrome)
+#define SYS_WIN_SET_NOCHROME_BG 398  // #216: same, but does not grab keyboard focus
 #define SYS_WIN_SET_SHADOW   376  // #745: opt a window in to the compositor drop shadow
 #define SYS_GET_MOUSE_SCROLL 263  // OS-wide wheel: read+clear kernel scroll delta  // #279: route the next user proc this caller launches onto an application processor
 #define SYS_GET_GLOBAL_MOUSE 264
@@ -443,6 +488,80 @@ int login_mode_configured(void);
 // rustkern/netstat.rs for why this is a new accessor and not a widening of
 // SYS_GET_NET_INFO (146).
 //   SYS_NET_STATUS(net_status_t *out) -> 0, -1 bad ptr, -14 EFAULT
+// ---------------------------------------------------------------------------
+// #238 THE PACKET FILTER.
+//
+//   SYS_NET_FW(int op, fw_xfer_t *xfer) -> 0, or negative on refusal
+//
+// ONE transfer struct for EVERY op (fw_xfer_t = fw_config_t + fw_stats_t,
+// net/firewall.h). That is deliberate: an op-dependent pointer shape cannot be
+// described by a single argtab.rs Desc, and a syscall whose user-pointer
+// contract changes with an argument is one the pointer validator has to be
+// told about twice. One fixed 240-byte read-write buffer, always.
+//
+// Every op fills the WHOLE struct from the live kernel state on the way out,
+// so a caller always sees what is ACTUALLY in force, not what it asked for.
+// That read-back is the same discipline the #233 contract API applies, and for
+// the same reason: a setter that echoes its input cannot report being ignored.
+//
+// FW_OP_GET is unprivileged (knowing the policy is not a capability). The
+// three mutating ops require euid 0.
+//
+// NUMBER CHOICE, stated because a guessed constant does not fail loudly:
+// 399, with SYS_MAX bumped to 400 (the #216 precedent, four lines below the
+// old sentinel note). THIS NUMBER MOVED ONCE, and the reason is the whole
+// lesson: #238 first took 282 as "the bottom of the unused 282-289 block",
+// having checked every branch and found it free. Concurrently #236 took 282
+// by the same reasoning, with its own written proof that 282-289 was free on
+// any branch. Both proofs were true WHEN WRITTEN and both were stale by the
+// time either merged. syscall-number-lint caught it, but only on the first
+// build AFTER the merge - and #238 was interrupted between merging dev and
+// rebuilding, so the collision sat in a committed branch looking green.
+// #236 was already in dev, so #238 is the one that moved.
+// A FREE-NUMBER CHECK IS ONLY VALID AT MERGE TIME. Rebuild after every merge.
+#define SYS_NET_FW                     399
+
+// ---------------------------------------------------------------------------
+// #221 phase 0. SYS_KEY_MODS() -> the LIVE physical modifier bitmask
+// (KEY_MOD_SHIFT/CTRL/ALT/CAPS, kernel/drivers/keymod.h), the same state
+// cpu/isr.c uses to fold case and to turn Ctrl+letter into a control
+// character. No arguments, no pointers, cannot fail.
+//
+// WHY A USERLAND APP NEEDS THIS AT ALL, given that Shift/Ctrl/Alt press AND
+// release already arrive as ordinary keycoded events (MEASURED, see
+// tools/testing/probes/keyprobe.c): tracking those events is EXACT while the
+// window has focus, and that is the whole shortcut case. It goes wrong in
+// exactly one way. The kernel emits NO focus/blur event to an app - grep
+// EVENT_WINDOW_BLUR across kernel/, there is one hit and it is the enum
+// declaration - so if the user holds Shift, clicks another window, and
+// releases it there, the first window never sees the release and believes
+// Shift is held forever. There is no event that can tell it otherwise.
+// libc/gui_mods.c resyncs off this call at a quiescent moment (its own event
+// queue empty), which is the only moment at which a LIVE read cannot
+// contradict an event still sitting in that queue.
+//
+// This is not new state. keyboard_get_modifiers() has existed in cpu/isr.c
+// since the driver was written and had exactly one consumer, the DOS INT 16h
+// shim. This exposes it; it computes nothing.
+//
+// CAPS LOCK is included because it is otherwise INVISIBLE to Ring 3: isr.c
+// toggles caps_lock and pushes NO key event for it, so no amount of event
+// tracking can ever recover it, and without it "the character arrived
+// uppercase" does not imply "Shift was held".
+//
+// NUMBER CHOICE: 400. It WAS the SYS_MAX sentinel value when this was
+// written, and by the time it merged it was a GAP: the cross-window drag work
+// landed 401-406 concurrently and left 400 unused, so SYS_MAX is 407 and needed
+// no bump here. That near-miss is the #238 lesson repeating. Read the
+// #238 note above before assuming a number is free: a free-number check is
+// only valid AT MERGE TIME, so rebuild after every merge.
+//   SYS_KEY_MODS(void) -> uint32 bitmask (never negative)
+#define SYS_KEY_MODS                   400
+#define FW_OP_GET       0   // read policy + counters
+#define FW_OP_SET       1   // install xfer.cfg, persist it, read back
+#define FW_OP_RESET     2   // zero the counters, read back
+#define FW_OP_RELOAD    3   // re-read /CONFIG/FWRULES.CFG, install, read back
+
 #define SYS_NET_STATUS                 371
 //   SYS_NET_PROBE(op, arg) -> see NET_PROBE_* below. NON-BLOCKING: it never
 //   sleeps, so the caller owns the deadline. No pointer args (nothing for
@@ -519,6 +638,38 @@ _Static_assert(sizeof(net_status_t) == 48,
 // (zero callers), still fixed here rather than left for whoever first uses it
 // as a bound and silently loses the top syscall.
 // ===========================================================================
+// #182 (AUDIO 2/3): drain the DOS guest's OPL2 register writes to the Ring-3
+// FM synthesiser.
+//
+//   SYS_DOS_FM_EVENTS(dos_fm_event_t *buf, uint32_t max_events)
+//     ->  n >= 0   events copied
+//     ->  -5       EPERM: another process already latched the queue
+//     ->  -6       ENODEV: no DOS guest holds the chip AND the queue is empty,
+//                  i.e. "you may stop now". This is how /APPS/FMSYNTH exits.
+//
+// NUMBER CHOICE, stated because a guessed constant does not fail loudly.
+// 377 is a GAP, not the top of the range. 374, 375 and 376 are taken
+// (SYS_SET_LOGIN_MODE, SYS_GET_LOGIN_MODE, SYS_WIN_SET_SHADOW) and SYS_MAX is
+// 397. Checked with `git show <branch>:kernel/proc/syscall.h` across every ref
+// in refs/heads on 2026-08-20: 377 appears on seven agent branches ONLY as an
+// old value of the SYS_MAX sentinel, never as a real syscall.
+//
+// Taking a gap rather than the top is deliberate: a concurrent agent
+// gap-scanning for a free number takes the TOP of the range, and 373 was
+// allocated twice exactly that way (see kernel/tools/syscall-number-lint).
+// SYS_MAX is NOT bumped: 377 is below it and it remains a correct sentinel.
+//
+// THE DRAIN IS NON-BLOCKING AND THAT IS NOT AN OVERSIGHT (#426). The consumer
+// is paced by the AUDIO SINK: it blocks in sys_audio_pcm_write's wait queue,
+// which sleeps until the pump has consumed frames, and drains this queue once
+// per audio block on the way round. Making this call block would DEADLOCK the
+// design, because a sustaining note must keep producing samples with no
+// register writes arriving at all; a consumer asleep on the event queue would
+// stop feeding the sink and the note would cut off.
+// ===========================================================================
+#define SYS_DOS_FM_EVENTS              377
+
+// ===========================================================================
 // #745 ELEVATION (proc/elevate.h). Five numbers, allocated in one block after
 // 377 so the syscall-number-lint's "strictly past the top" rule is satisfied
 // once rather than five times.
@@ -543,7 +694,497 @@ _Static_assert(sizeof(net_status_t) == 48,
 // ===========================================================================
 #define SYS_AI_SCAN                    383
 
-#define SYS_MAX                        384
+// ===========================================================================
+// #745 (local 102): display rotation (video/framebuffer.h fb_rotation_t).
+// Reboot-to-apply (see the Settings Display panel hint) - these do NOT touch
+// the running session's fb_rotation, they persist the CHOICE for the next
+// boot's fb_init() to read. No pointer args, so no rustkern/argtab.rs entry
+// needed (same posture as SYS_SET_DISPLAY_FX/SYS_SET_WALLPAPER above).
+//   SYS_SET_ROTATION(int value)  -> 0 on success, -1 if value not in 0..3
+//                                    (0=none 1=90cw 2=180 3=270cw)
+//   SYS_GET_ROTATION()           -> the ACTIVE (this-session) rotation, 0..3
+// ===========================================================================
+#define SYS_SET_ROTATION               384
+#define SYS_GET_ROTATION               385
+
+// (#745 local 109) ftruncate(int fd, long length) -> 0 / -1. Shrink only; a
+// grow is refused rather than silently ignored. See sys_ftruncate in
+// proc/fdlayer.c for why a real one had to exist.
+#define SYS_FTRUNCATE                  386
+// #115 (local 120): utime(2). (const char *path, int64_t atime, int64_t mtime)
+// Times are seconds since the UNIX epoch. Two sentinels, both deliberate:
+//   UTIME_KEEP (-1)  leave this timestamp unchanged.
+//   UTIME_NOW  (-2)  set it from the KERNEL's wall clock (cpu/wallclock.h).
+// UTIME_NOW exists because userland has no correct clock to send: time() and
+// gettimeofday() return SECONDS SINCE BOOT (#113). A `touch` that sent its own
+// time() would stamp files with 1970-01-01 plus the uptime, which is precisely
+// the plausible-looking wrong value this ticket is about. So the caller asks
+// for "now" and the kernel, which does have a calendar, decides what now is.
+// That is why #115 does NOT have to wait for #113.
+#define SYS_UTIME                      387
+
+// perf62 (#62 revalidation): TSC-backed monotonic microseconds since boot
+// (cpu/mono.h mono_us(), NOT timer_ticks). Exists because SYS_UPTIME_MS and
+// SYS_GET_TICKS are BOTH derived from timer_ticks, and blame.md's own
+// "timer-ticks-is-not-a-wall-clock" entry records that KVM replays a
+// starved vCPU's lost tick IRQs in BURSTS, so a tick-derived interval can
+// misreport how much real time actually passed during a stall - exactly the
+// failure mode a frame-interval instrument exists to catch, not fall for.
+// Zero args, read-only, no argtab.rs entry needed: a descriptor-less syscall
+// is simply not pointer-validated, which is correct here (nothing to
+// validate).
+#define SYS_MONO_US                     388
+
+// #158 NATIVE FULLSCREEN. ENTER acts on the CALLER'S OWN focused window only
+// (kernel checks owner_pid == proc_current()->pid against wm_state.focused_
+// window - a background/unfocused process cannot claim or retain the screen).
+// EXIT is unconditional and safe from anywhere (no-op if nothing is
+// fullscreen) - it is the escape hatch F11 and the watchdog both call.
+// RENDER is the compositor's per-frame fast path: blits the fullscreen
+// window's content_presented straight into the back buffer with none of the
+// per-window chrome/corner/widget work SYS_COMPOSITOR_RENDER_WINDOWS does;
+// returns -1 (compositor must fall back to a normal composite) if nothing
+// is validly fullscreen right now. STATUS is a cheap liveness probe for the
+// compositor's watchdog: packs (window id << 32) | content commit sequence,
+// or -1 if nothing is fullscreen - an unchanging sequence over wall-clock
+// time is a wedged app, exactly #157's g_fb_flip_count discriminator shape.
+#define SYS_WM_FULLSCREEN_ENTER         389
+#define SYS_WM_FULLSCREEN_EXIT          390
+#define SYS_WM_FULLSCREEN_RENDER        391
+#define SYS_WM_FULLSCREEN_STATUS        392
+
+// #148 (local 164, 2026-08-18): a window created WITHOUT taking keyboard
+// focus. Before this, sys_win_create() (SYS_WIN_CREATE) unconditionally
+// called wm_focus_window(win) at the end - every window creation stole
+// focus, with no way to opt out. That is a real gap, not a theoretical one:
+// PrintScreen on a normal desktop is specified to open Maytera Snap showing
+// the new capture WITHOUT moving focus away from whatever the user was
+// typing into (the snipping-tool / macOS-screenshot pattern). Same args,
+// same geometry contract as SYS_WIN_CREATE (arg1 title, arg2/3 x/y, arg4/5
+// w/h) - only the focus behavior differs, so a caller converts by changing
+// the syscall number and nothing else. See kernel/gui/window.c
+// window_create_ex() / sys_win_create_bg() and userland/libc/syscall.h
+// win_create_bg().
+#define SYS_WIN_CREATE_BG               393
+
+// #162 (2026-08-19): one packed read of the system volume state, so the
+// compositor learns level, mute and BOTH change counters in a single syscall
+// per frame instead of three. Returns
+//   bits  0..7  level 0-100 | bit 8 muted | bits 16..31 seq | bits 32..47 keyseq
+// where `seq` changes on ANY volume change (tray slider, Settings, media key)
+// and `keyseq` changes only on a MEDIA-KEY change. The compositor mirrors its
+// tray gauge off seq and shows the volume OSD off keyseq, so dragging the tray
+// slider does not pop an OSD on top of the slider the user is looking at.
+// Scalar-only: no user pointer, so no rustkern/argtab.rs descriptor is needed
+// (same as SYS_WM_SET_WORK_AREA / SYS_SET_ROTATION). See drivers/sysvol.h.
+#define SYS_VOL_STATE                   395
+
+// #113: epoch MICROSECONDS (UTC), from cpu/wallclock.h realtime_us_rs().
+// Exists because gettimeofday() needs SUB-SECOND resolution and SYS_TIME can
+// only carry whole seconds. Both come from ONE anchor, so the two fields of a
+// gettimeofday() can never disagree about which second it is - the exact
+// desync #594 had to repair when tv_sec and tv_usec came from two counters.
+// Returns 0 if the RTC has never presented a plausible date; 0 is "unknown",
+// not 1970. Zero args, read-only, no argtab entry needed.
+#define SYS_REALTIME_US                 396
+
+// ============================================================================
+// #112: SPAWN WITH AN ENVIRONMENT.
+//
+// Until this ticket MayteraOS had NO cross-process environment. The two spawn
+// syscalls above carry a path, argv and argc and nothing else, and
+// proc_create_user_as() met its own envp parameter with "(void)envp;", so
+// every process started with an empty `environ` no matter what its parent had
+// set. /APPS/ENV refused NAME=VALUE for exactly that reason and said so.
+//
+// WHY A NEW NUMBER AND NOT AN EXTRA ARGUMENT ON 247. SYS_SPAWN_REDIR already
+// uses all six argument registers (path, argv, argc, infile, outfile, append).
+// An environment is a seventh operand, so it cannot be added there, and
+// widening the ABI is not an option.
+//
+// WHY A REQUEST STRUCT AND NOT A SEVENTH REGISTER. There is no seventh
+// register. Passing one pointer to a fixed-size, version-locked struct means
+// the rustkern/argtab.rs descriptor is a single fixed-length validation, and
+// the next operand this call needs (a file-actions array, see spawn.h's
+// SPAWN_FDACT note) costs a reserved field rather than another syscall number.
+//
+// NUMBER CHOICE, stated because a guessed constant does not fail loudly. 394
+// is a GAP, not the top of the range: it was SYS_MAX's own value before
+// #162/#148 pushed the sentinel to 397, and no branch in the repository -
+// checked with `git show <branch>:kernel/proc/syscall.h` across every
+// agent/* ref on 2026-08-20 - defines a real syscall at 394. Taking a gap
+// rather than the sentinel's value is deliberate: a concurrent agent
+// gap-scanning for a free number takes the TOP of the range, and 373 was
+// allocated twice that way (see kernel/tools/syscall-number-lint).
+//
+// SYS_MAX is deliberately NOT bumped: 394 is below it and it is still a
+// correct sentinel.
+//
+// envc SEMANTICS, and they are not the same request:
+//   envc <  0                "no environment supplied": the child gets the
+//                            kernel default block (rustkern/envblock.rs).
+//   envc == 0                a deliberately EMPTY environment. This is what
+//                            `env -i` means and it is honoured as such.
+//   envc >  0                envp points at envc "NAME=VALUE" strings.
+// An entry that is not NAME=VALUE REFUSES the spawn; it is never dropped.
+// ============================================================================
+typedef struct {
+    const char  *path;      // required, absolute or cwd-relative
+    char       **argv;      // argc entries; may be NULL when argc == 0
+    int32_t      argc;
+    int32_t      envc;      // see the envc semantics above
+    char       **envp;      // envc entries of "NAME=VALUE"
+    const char  *infile;    // NULL = no stdin redirect
+    const char  *outfile;   // NULL = no stdout redirect
+    int32_t      append;    // outfile: append rather than truncate
+    int32_t      reserved;  // MUST be 0; the next operand goes here
+} sc_spawn_req_t;
+#define SYS_SPAWN_ENV                   394
+
+// ============================================================================
+// #236: push the live "Double-click Speed" setting (Settings > Mouse,
+// SETTINGS.CFG 'k' key, read by userland/libc/settingscfg.c) into the ONE
+// kernel-side double-click detector, gui/window.c's title-bar
+// maximize/restore toggle. Before this the kernel used a hardcoded ~0.5s
+// (freq/2) with zero knowledge of the userland preference - one of THREE
+// independent hardcoded double-click detectors found on golden 2016 (the
+// other two were userland: compositor/main.c's dead fallback path and
+// compositor/desktop.c's real desktop-icon path, both fixed the same ticket
+// by reading settingscfg_dblclick_ms() directly). This is precedented by
+// SYS_SET_MOUSE_SPEED (kernel/proc/syscall.h #133/#140): a userland-owned
+// preference pushed into a kernel global via a one-way setter syscall, not a
+// kernel-side file read (Ring 0 has no notion of the session's home
+// directory the way userconf.c's per-user path resolution does).
+//
+//   SYS_SET_DBLCLICK_MS(int ms) -> 0 always (kernel clamps ms to a sane
+//   [100, 3000] range rather than refusing; a caller supplying garbage gets a
+//   clamped detector, not an error to handle).
+//
+// Called from userland/apps/compositor/main.c's dbl_click_threshold_push(),
+// once per frame but gated on an actual change, so this is a rare syscall in
+// practice (SETTINGS.CFG itself is read on a 2s throttle).
+//
+// NUMBER CHOICE, stated because a guessed constant does not fail loudly. 282
+// is a GAP: checked with `git show <ref>:kernel/proc/syscall.h` across every
+// ref in refs/heads on 2026-08-22, nothing in [282,289] is defined as a real
+// syscall on any branch. SYS_MAX is NOT bumped: 282 is well below 399.
+#define SYS_SET_DBLCLICK_MS             282
+int64_t sys_set_dblclick_ms(int ms);
+
+// ============================================================================
+// #229 FIRST-RUN (OOBE) STATE. THE chokepoint; see kernel/rustkern/firstrun.rs
+// for the full argument, including why relaxing /CONFIG was the wrong answer.
+//
+//   SYS_FIRSTRUN(int op) -> per-op result below, or a negative refusal
+//
+// The first-boot wizard is a Ring-3 app running as the session user (uid 1000
+// since #226 removed autologin=root). Every durable thing it did was an
+// open(O_CREAT) under /CONFIG, which is root-owned 0711 because it holds
+// SHADOW, AUTHKEYS, SSHD.CFG and the owner's API keys. Measured on golden
+// 2011: all four writes were refused, the wizard could not complete, and - the
+// part that made it a dead end - neither could its escape hatch, because
+// "Skip to Desktop" was itself one of those writes.
+//
+// So the wizard stops writing /CONFIG and asks the kernel instead, exactly as
+// it already does for its ONE mandatory step (SYS_FIRSTBOOT_ADMIN) and exactly
+// as /CONFIG/LOGIN.CFG is already written from Ring 0 behind
+// login_cfg_authorize(). The set of legal keys is fixed HERE and there is no
+// path from this call to any other name in that directory.
+//
+// TWO OF THE FOUR WERE NEVER CONFIGURATION. SETUPSKIP and SETUPNEW are one-way
+// wizard -> compositor signals meaningful for exactly one boot; storing them on
+// persistent media manufactured a stale-marker bug twice (#136, #203), and the
+// unlink-based cleanups added to fix those were themselves /CONFIG writes and
+// so failed on the same session. They are now two bits of kernel state that
+// start clear because .bss starts clear. The class stops existing.
+//
+// NOT INCLUDED: /CONFIG/NETIP.CFG, the fourth refused write. The Network page
+// is compile-disabled, so an op for it would ship with zero callers. Re-enable
+// the page and add FR_SET_NETIP with a dotted-quad validator; do not reach for
+// open() again.
+//
+// NUMBER CHOICE, stated because a guessed constant does not fail loudly. 397 is
+// a GAP, not the top of the range: SYS_WIN_SET_NOCHROME_BG is 398 and SYS_MAX
+// is 399. Checked with `git show <ref>:kernel/proc/syscall.h` across every ref
+// in refs/heads on 2026-08-22: 397 appears on eighteen agent branches ONLY as
+// an old value of the SYS_MAX sentinel, never as a real syscall. Taking a gap
+// rather than the top is deliberate: a concurrent agent gap-scanning for a free
+// number takes the TOP of the range, and 373 was allocated twice exactly that
+// way (see kernel/tools/syscall-number-lint). SYS_MAX is NOT bumped.
+//
+// AUTHORIZATION. FR_MARK_DONE is the only op that touches a disk and is gated
+// on a fact the kernel checks rather than a claim the caller makes: the machine
+// must already have at least one active account, which is precisely what the
+// marker asserts. HONEST LIMIT: on a machine that has accounts, any Ring-3
+// process may suppress the first-run wizard with it. That is a nuisance, not a
+// privilege boundary, and it is a far smaller surface than write access to the
+// directory holding SHADOW. Every call is logged with the caller's uid. The
+// per-boot ops are ungated: the SKIP bit's whole job is to be an escape hatch
+// that CANNOT FAIL, and a policy in front of it is how it acquires a failure
+// mode.
+// ============================================================================
+#define SYS_FIRSTRUN                    397
+
+// Ops. MIRRORED in kernel/rustkern/firstrun.rs, userland/libc/syscall.h and the
+// private const block of userland/apps/setup/main.rs (a no_std app cannot
+// include this header, which is how a fifth copy went stale once before; see
+// kernel/tools/syscall-number-lint rule 5). firstrun_selftest_rs() asserts
+// these numeric values on every boot.
+#define FR_MARK_DONE       0  // durable: write /CONFIG/SETUPDONE. -> 0, or -2 if no account exists
+#define FR_SKIP_SET        1  // per-boot: the wizard escaped to the desktop. -> 0, always
+#define FR_SKIP_GET        2  // per-boot: -> 1 if escaped this boot, else 0. Non-consuming
+#define FR_SKIP_CLEAR      3  // per-boot: arming a fresh first run (compositor). -> 0
+#define FR_HANDOVER_SET    4  // per-boot: the machine just changed hands. -> 0
+#define FR_HANDOVER_TAKE   5  // per-boot: CONSUMING read of the above. -> 1 once, then 0
+// #OOBEAUTH (2026-08-23): -> 1 iff THIS caller may currently call
+// SYS_FIRSTBOOT_ADMIN as a non-root bootstrap session (a direct child of the
+// compositor, account table still empty), else 0. Never a refusal: the
+// wizard uses this to decide whether to SHOW its account page at all, and a
+// page that is never shown cannot report a failure. See
+// firstboot_bootstrap_ok_rs() in rustkern/firstrun.rs for the predicate and
+// sys_firstboot_admin() in proc/syscall.c for the ONE OTHER place it is
+// evaluated - the two must never disagree.
+#define FR_BOOTSTRAP_QUERY 6
+
+
+// ===========================================================================
+// #250 REMOVABLE VOLUMES (USB hotplug), 283 / 284.
+//
+// The kernel has auto-mounted a hot-plugged USB stick since #418. Nothing in
+// Ring 3 could SEE that it had: the shipping shell and file manager are
+// userland processes, and there was no syscall carrying the volume list, so
+// the drive mounted in silence with no sidebar row, no desktop icon and no
+// way to eject it. These two are that missing surface.
+//
+// Numbers 283 and 284 are taken from the 283-289 GAP below SYS_MAX (400), not
+// from the top of the range, per the SYS_MAX-is-a-sentinel rule above.
+// kernel/tools/syscall-number-lint enforces that these agree with
+// userland/libc/syscall.h and with the Rust argument table.
+#define SYS_VOL_LIST                   283  // (sc_volume_t *buf, int max) -> count written, or -1
+#define SYS_VOL_EJECT                  284  // (int index) -> 0, or -1
+
+// Volume record. MUST match sc_volume_t in userland/libc/syscall.h and
+// ScVolume in kernel/rustkern/hotplug.rs; the size is locked by
+// _Static_assert in proc/syscall.c.
+typedef struct {
+    int32_t  index;          // opaque handle: pass to SYS_VOL_EJECT
+    uint32_t flags;          // MOSVOL_*
+    uint32_t fs_type;        // informational; use fsname for display
+    uint32_t pad;
+    uint64_t total_bytes;
+    uint64_t free_bytes;     // meaningless when MOSVOL_FREE_UNKNOWN is set
+    char     name[64];       // "SanDisk Cruzer Blade"
+    char     mount[32];      // "/USB0" - a real path, browsable when READABLE
+    char     fsname[8];      // "FAT32", "exFAT", ...
+} sc_volume_t;
+
+#define MOSVOL_MOUNTED       0x01  // filesystem is mounted
+#define MOSVOL_REMOVABLE     0x02  // always set today; every entry is USB
+// Files on this volume can actually be OPENED AND READ. Clear means the
+// filesystem is recognised and mounted but its file operations are not
+// implemented (exFAT: fs/exfat.c has mount/unmount/free-space and nothing
+// else). A UI must NOT offer such a volume as browsable; it should say why.
+#define MOSVOL_READABLE      0x04
+// free_bytes is not meaningful. Set on removable FAT volumes, where the
+// whole-FAT free scan is deliberately skipped so that plugging a large stick
+// in does not cost thousands of uncached SCSI reads before it appears.
+#define MOSVOL_FREE_UNKNOWN  0x08
+// #234i. Writes to this volume are refused by the kernel. Set for every
+// mounted disk image (fs/fat.c refuses fat_write on an image-backed handle),
+// so a UI must not offer New / Rename / Delete / Paste there. Whether it is
+// enforced is not the UI's business; whether it is OFFERED is.
+#define MOSVOL_READONLY      0x10
+// #234i. What the volume IS, for the icon and the label. Exactly one of these
+// is set for a disk image and neither for a USB device.
+#define MOSVOL_OPTICAL       0x20  // CD-ROM / ISO 9660 disc image
+#define MOSVOL_FLOPPY        0x40  // floppy disk image
+
+// #234i: how many records SYS_VOL_LIST can ever write. Two producers now feed
+// it: up to HOTPLUG_MAX_DEVICES (8) physical USB volumes and up to
+// DISKIMG_MAX_MOUNTS (8) mounted disk images. A _Static_assert in
+// proc/syscall.c ties this to both, and rustkern/argtab.rs's CAP_VOLUMES must
+// match, or the pointer validator proves fewer bytes than the handler writes.
+#define SC_VOL_MAX           16
+// #234i: the index namespace split. index < SC_VOL_IMAGE_BASE is a USB
+// hot-plug slot; index >= it is SC_VOL_IMAGE_BASE + drive-letter index for a
+// mounted disk image. Mirrored as VOL_INDEX_IMAGE_BASE in
+// rustkern/hotplug.rs, which is what STAMPS the index.
+#define SC_VOL_IMAGE_BASE    1000
+
+// ---------------------------------------------------------------------------
+// #221 terminal notifications phase 1. SYS_WIN_GET_STATE(handle) -> the
+// WIN_STATE_* bitmask (userland/libc/syscall.h) for the CALLER'S OWN window.
+//
+// WHAT IT CLOSES. An app could not discover that it was minimized, and could
+// not discover that it was unfocused either. This kernel emits no focus, blur
+// or minimize event to an app - EVENT_WINDOW_FOCUS and EVENT_WINDOW_BLUR
+// appear exactly once each in the whole tree and it is the enum declaration,
+// which the SYS_KEY_MODS note above already had to work around for the same
+// reason. sys_wm_get_windows() does report `minimized` per window, but an app
+// cannot pick its own row out of that list: sys_win_create() returns the
+// user_windows[] SLOT INDEX and wm_window_info_t.id is the window manager's
+// window id, and nothing maps one to the other. So a window's state was
+// legible to the compositor, the taskbar and any app that enumerates windows,
+// and illegible to the one process that owns it.
+//
+// SCOPE, deliberately narrow: `handle` is validated against the caller's own
+// user_windows[] slot exactly as SYS_WIN_GET_SIZE validates it, so this tells
+// a caller nothing about anybody else's windows that wm_get_windows() did not
+// already tell everybody. No pointer arguments (nothing for argtab.rs to
+// describe), no allocation, no lock, cannot block. Returns -1 for a handle
+// that is not a live window.
+//
+// NUMBER CHOICE: 407, which was the SYS_MAX SENTINEL's own value and is
+// therefore the first genuinely unallocated number, with SYS_MAX bumped to
+// 408 in the same edit. Read the #238 note above before assuming that is
+// still true when you read this: a free-number check is only valid AT MERGE
+// TIME, so this was re-run through tools/syscall-number-lint after the rebase
+// onto dev and before the build.
+//   SYS_WIN_GET_STATE(int handle) -> WIN_STATE_* bitmask, or -1
+#define SYS_WIN_GET_STATE              407
+
+// (#786) Set the LIVE DNS resolver and persist it to /CONFIG/NETIP.CFG in the
+// same call. Body is net_set_dns_rs() in rustkern/netstat.rs, which carries the
+// full account of what was broken and why this is one syscall and not two.
+//
+// NO POINTER ARGUMENTS: the address arrives as a HOST-ORDER u32
+// ((a<<24)|(b<<16)|(c<<8)|d), parsed by the caller, so there is nothing for
+// rustkern/argtab.rs to describe and nothing for syscall_validate_args() to
+// check. Userland mirror + the dotted-quad parser: net_set_dns() in
+// userland/libc/syscall.h.
+//
+//   SYS_NET_SET_DNS(uint32 dns_host_order)
+//     ->  0  applied live AND saved
+//     -> -2  not a usable resolver address (0, 255.255.255.255, 0.x, 127.x)
+//     -> -3  applied LIVE but could NOT be saved: it will revert on reboot.
+//            This is a REPORTABLE outcome, not a rounding error; the caller
+//            must say so rather than showing plain success.
+//
+// NUMBER CHOICE: 408, which was the SYS_MAX SENTINEL's own value and is
+// therefore the first genuinely unallocated number, with SYS_MAX bumped to 409
+// in the same commit (the #216/#221 precedent immediately above). Re-check this
+// after any merge: a free-number check is only valid AT MERGE TIME.
+#define SYS_NET_SET_DNS                408
+
+// The GLOBAL UI SCALE FACTOR (gui/uiscale.h, rustkern/uiscale.rs).
+// ONE number with an opcode rather than eight syscall numbers: these are all
+// facets of one small display setting, and the syscall number space is a
+// scarce shared resource that this file already warns about above.
+// NUMBER CHOICE: 409, the SYS_MAX sentinel's own value and therefore the first
+// genuinely unallocated number, with SYS_MAX bumped to 410 in the same edit.
+#define SYS_UI_SCALE                   409  // (op, arg) -> int; see UISC_* below
+#define UISC_GET     0   // -> live percent (100 = 1x)
+#define UISC_SET     1   // arg = percent -> percent ACTUALLY ADOPTED after clamping
+#define UISC_AUTO    2   // -> what auto-detection said for this display
+#define UISC_MAX     3   // -> the largest percent this framebuffer can carry
+#define UISC_SRC     4   // -> UI_SRC_* : default / auto / config / user
+#define UISC_GEN     5   // -> generation counter, bumped on every change
+#define UISC_SAVE    6   // persist the live value to /CONFIG/DISPLAY.CFG; 0 = ok
+#define UISC_LAPTOP  7   // -> 1 battery declared, 0 none, -1 could not ask
+// ORACLE OPCODES. The arithmetic has to exist in Ring 3 as well: the
+// compositor scales its own chrome and cannot afford a syscall per coordinate.
+// That is a second copy of a formula, which is the exact fault this project
+// keeps paying for, so these three exist to make the copy CHECKABLE instead of
+// merely promised: userland computes a range of values locally, asks the
+// kernel for the same ones through these, and refuses to trust its fast path
+// if they ever disagree. A duplicated formula with a live oracle is a
+// different thing from a duplicated formula with a comment.
+#define UISC_PX      8   // arg = logical  -> physical, by the LIVE factor
+#define UISC_UNPX    9   // arg = physical -> logical,  by the LIVE factor
+#define UISC_SPAN   10   // arg = (origin<<16)|extent (both 16-bit) -> scaled extent
+#define UISC_NATIVE 11   // mark the CALLING process as thinking in real screen
+                         // pixels (the compositor, and nothing else). Call it
+                         // FIRST, before any SYS_FB_INFO: the framebuffer-owner
+                         // backstop is not yet true at that point.
+// The REAL display geometry, ((width << 16) | height), regardless of the
+// caller's scale. SYS_FB_INFO deliberately answers a scale-transparent app in
+// LOGICAL pixels, because that is the coordinate system it draws in - but
+// Settings has to SHOW the user the resolution their panel is actually
+// running at, and "1280 x 720" on a 1920x1080 display is a lie even though it
+// is the right answer to a different question.
+#define UISC_FBPHYS 12
+
+
+// Control-method battery (#battmeter): percentage/state/time-remaining, for
+// the tray meter and Settings. See drivers/battery.h and rustkern/battery.rs.
+// One syscall with an opcode, following SYS_UI_SCALE's precedent (#409)
+// rather than consuming several numbers for one small facet-group.
+// NUMBER CHOICE: 410, the SYS_MAX sentinel's own value and therefore the
+// first genuinely unallocated number, with SYS_MAX bumped to 411 in the
+// same edit. Checked against both kernel/proc/syscall.h and
+// userland/libc/syscall.h at the time of this change: neither used 410.
+#define SYS_BATTERY                    410
+#define BATT_PRESENT   0   // -> 1 battery declared, 0 none, -1 could not ask
+#define BATT_PCT       1   // -> 0-100, or -1 unknown
+#define BATT_STATE     2   // -> BATT_ST_* below, or 0 (unknown)
+#define BATT_MINUTES   3   // -> minutes remaining, or -1 unknown
+#define BATT_GEN       4   // -> generation counter, bumped on every change
+#define BATT_ST_UNKNOWN     0
+#define BATT_ST_DISCHARGING 1
+#define BATT_ST_CHARGING    2
+#define BATT_ST_FULL        3
+
+// (#wizflash) The UNSCALED (1x, theme-file-native) counterpart of
+// SYS_THEME_METRIC. theme_get_metric_by_id() (SYS_THEME_METRIC's handler)
+// already multiplies every TM_PX metric by the current UI scale factor
+// (kernel/gui/themes.c: "THE GLOBAL UI SCALE FACTOR IS APPLIED HERE AND ONLY
+// HERE"), which is correct for a caller about to draw the real value onto the
+// SCREEN. It is WRONG for gui_theme_win_preview() (userland/libc/gui_theme.c):
+// that function draws a MINIATURE 1:1 window crop through the caller's own
+// window, which is itself a scale_on window whose draw syscalls (win_draw_rect
+// et al) ALREADY multiply every coordinate by the same scale factor at the
+// window boundary. Feeding it an already-scaled metric compounds the two
+// multiplies, so at 200% a title bar authored as 20px was measured coming out
+// 80px (2x from SYS_THEME_METRIC, 2x again at the window boundary) instead of
+// the correct 40px, overflowing the fixed preview crop. theme_get_metric_raw()
+// (kernel/gui/themes.c) already existed for exactly this - its own comment
+// names "the theme-preview thumbnail in Settings" as a caller that "would
+// overflow" without it - but was never wired to a syscall, so no Ring 3 caller
+// could actually reach it. This is that wiring: a thin passthrough to the
+// existing, unchanged accessor, not new logic.
+// NUMBER CHOICE: 412, the SYS_MAX sentinel's own value and therefore the first
+// genuinely unallocated number, with SYS_MAX bumped to 413 in the same edit.
+// Checked against both kernel/proc/syscall.h and userland/libc/syscall.h at
+// the time of this change: neither used 412.
+#define SYS_THEME_METRIC_RAW           412
+
+// (#231r) THE 5-BAND GRAPHIC EQUALISER. One syscall with an opcode, the same
+// shape as SYS_UI_SCALE and SYS_BATTERY above and for the same reason:
+// several small facets of one feature, not several syscall numbers.
+//
+// WHY THIS EXISTS AT ALL. #231 (commit 8a5fcee5) removed the tray Sound
+// panel's 5-band EQ, and its reason was exactly right: the faders wrote "a
+// static int g_eq[5] that only the fader itself reads - no EQ syscall exists
+// and it is not even persisted". THIS is that missing syscall. It reaches
+// real per-band DSP (rustkern/pcmeq.rs, applied post-mix in
+// drivers/audio_pcm.c's mix_render), so a fader that moves now changes the
+// PCM the hardware receives. Restoring the faders WITHOUT this would rebuild
+// the defect #231 deleted.
+//
+// NUMBER CHOICE: 413, the SYS_MAX sentinel's own value and therefore the
+// first genuinely unallocated number, with SYS_MAX bumped to 414 in the same
+// edit. Checked against BOTH kernel/proc/syscall.h and
+// userland/libc/syscall.h at the time of this change: neither used 413.
+// SYS_BATTERY=410 and SYS_THEME_METRIC_RAW=412 had both been added days
+// earlier, so a guessed constant would have collided; a guessed syscall
+// number does not fail loudly, it ships a control that renders, moves, and
+// does nothing, which is this exact ticket.
+#define SYS_AUDIO_EQ                   413
+#define AEQ_BANDS     0   // ()          -> number of bands (5)
+#define AEQ_GET       1   // (band)      -> fader 0..100 (50 = flat), -1 bad band
+#define AEQ_SET       2   // (band, pos) -> 0, or -1 bad band. pos clamps to 0..100
+#define AEQ_FREQ      3   // (band)      -> centre/corner frequency in Hz
+#define AEQ_DB10      4   // (band)      -> gain in TENTHS of a dB, signed
+#define AEQ_ACTIVE    5   // ()          -> 1 if any band is off flat
+#define AEQ_RESET     6   // ()          -> every band back to flat
+#define AEQ_LOG       7   // ()          -> write the current EQ to /AUDIOLOG.TXT
+#define AEQ_SELFTEST  8   // ()          -> boot spectral self-test mask, 0 = pass
+// Fader travel and gain range, so Ring 3 does not hardcode its own copy of
+// the mapping the kernel actually applies (kernel/rustkern/pcmeq.rs owns it).
+#define AEQ_POS_FLAT  50
+#define AEQ_RANGE_DB10 120
+
+#define SYS_MAX                        414  // SYS_AUDIO_EQ=413 is the new top, so the sentinel is 414
 
 // ============================================================================
 // Syscall Register Convention (AMD64 System V ABI)
@@ -603,6 +1244,8 @@ int64_t sys_open(const char *path, int flags);
 int64_t sys_fcntl(int fd, int cmd, long arg);  // #359
 int64_t sys_play_wav(const char *path);
 // Ring-3 PCM push (see drivers/audio_pcm.h). Additive; sys_play_wav unchanged.
+// (#182) Drain the DOS guest OPL2 register writes to the Ring-3 FM core.
+int64_t sys_dos_fm_events(void *ubuf, uint32_t max_events);
 int64_t sys_audio_pcm_open(uint32_t rate, uint32_t channels, uint32_t format);
 int64_t sys_audio_pcm_write(int handle, const void *pcm, uint32_t frames);
 int64_t sys_audio_pcm_close(int handle);
@@ -617,6 +1260,9 @@ int64_t sys_read(int fd, void *buf, size_t count);
 int64_t sys_write(int fd, const void *buf, size_t count);
 int64_t sys_seek(int fd, int64_t offset, int whence);
 int64_t sys_stat_path(const char *path, void *ubuf);
+int64_t sys_fstat(int fd, void *ubuf);   // #120
+// #115: set access/modification time. -1 = keep, -2 = kernel's "now".
+int64_t sys_utime(const char *u_path, int64_t atime, int64_t mtime);
 #define SYS_HTTP_FETCH 86
 int64_t sys_http_fetch(const char *url, char *ubuf, uint32_t max_len, uint32_t *ubytes, int *ustatus);
 int64_t sys_http_fetch_start(const char *url);
@@ -638,6 +1284,13 @@ int64_t sys_http_post_cancel(int id);
 int64_t sys_brk(uint64_t addr);
 int64_t sys_mmap(uint64_t addr, uint64_t len, int prot, int flags);
 int64_t sys_munmap(uint64_t addr, uint64_t len);
+// (#404) mprotect. Takes RAW uint64_t, never a pointer type, for the same
+// reason sys_mmap/sys_munmap do: `addr` is an address to be looked up in a page
+// table, NOT memory the kernel dereferences. Casting it to a pointer in the
+// dispatcher would make syscall-ptr-lint discover a user pointer that does not
+// exist and demand an argtab descriptor proving bytes readable, which is the
+// wrong question for this call entirely.
+int64_t sys_mprotect(uint64_t addr, uint64_t len, int prot);
 
 // Console
 int64_t sys_putchar(int c);
@@ -670,9 +1323,13 @@ int64_t sys_readdir(int fd, void *entry_buf);
 
 // Window/Graphics
 int64_t sys_win_create(const char *title, int x, int y, int width, int height);
+// #148 (local 164): see SYS_WIN_CREATE_BG above. Same signature, does not
+// steal keyboard focus.
+int64_t sys_win_create_bg(const char *title, int x, int y, int width, int height);
 // (#745) see SYS_WM_SET_WORK_AREA above
 int64_t sys_wm_set_work_area(int32_t left, int32_t top, int32_t right, int32_t bottom);
 int64_t sys_win_set_nochrome(int handle);
+int64_t sys_win_set_nochrome_bg(int handle);   // #216: nochrome without the focus grab
 int64_t sys_win_destroy(int handle);
 int64_t sys_win_draw_rect(int handle, int x, int y, int w, int h, uint32_t color);
 int64_t sys_win_draw_text(int handle, int x, int y, const char *text, uint32_t color);
@@ -681,6 +1338,8 @@ int64_t sys_win_get_event(int handle, void *event_buf, int timeout);
 int64_t sys_win_invalidate(int handle);
 int64_t sys_wm_force_redraw_all(void);  // (#704)
 int64_t sys_win_get_size(int handle, int *width, int *height);
+// #221: the caller's OWN window's WIN_STATE_* bits. See SYS_WIN_GET_STATE above.
+int64_t sys_win_get_state(int handle);
 
 // User identity
 int64_t sys_getuid(void);
@@ -737,6 +1396,13 @@ int64_t sys_pw_check(const char *username, const char *password);
 int64_t sys_firstboot_admin(const char *username, const char *user_password,
                             const char *root_password);
 
+// #229 first-run state chokepoint. See SYS_FIRSTRUN above and
+// kernel/rustkern/firstrun.rs. Takes no pointer, so there is nothing to bounce.
+int64_t sys_firstrun(int op);
+
+// #238 packet filter control. See SYS_NET_FW above and net/firewall.h.
+int64_t sys_net_fw(int op, void *user);
+
 int64_t sys_adduser(const char *username, uint32_t uid, uint32_t gid,
                     const char *home, const char *shell);
 int64_t sys_set_theme(int theme_id);
@@ -744,6 +1410,7 @@ int64_t sys_get_theme(void);
 int64_t sys_set_volume(int volume);
 int64_t sys_get_volume(void);
 int64_t sys_set_mute(int mute);
+int64_t sys_vol_state(void);   // #162
 int64_t sys_get_disk_total(void);
 int64_t sys_get_disk_free(void);
 int64_t sys_set_mouse_speed(int speed);
@@ -814,5 +1481,100 @@ int64_t sys_print_remove(const char *name);
 int64_t sys_print_image(const char *printer, const char *path);
 int64_t sys_print_screen(const char *printer);
 int64_t sys_bootlog_write(const char *msg);
+
+// Cross-window drag ("docking"). Defined in proc/syscall.c beside
+// user_windows[], because each one proves the caller owns the window handle it
+// is acting for.
+int64_t sys_drag_begin(int win, unsigned int kind, const void *payload,
+                       int plen, const char *label, int llen);
+int64_t sys_drag_peek(void *out);
+int64_t sys_drag_take(int win, void *dst, int cap);
+int64_t sys_drag_accept(int win, unsigned int mask);
+int64_t sys_drag_release(int x, int y);
+int64_t sys_drag_end(void);
+
+
+// ===========================================================================
+// CROSS-WINDOW DRAG ("docking"): SYS_DRAG_* 401-406
+// ===========================================================================
+//
+// The owner asked for Konsole-style docking: drag a terminal tab or pane out
+// into its own window, and back into another one. That is not a terminal
+// feature. It is a WINDOWING feature that did not exist: every drag in the
+// tree (desktop icons, sticky notes, the desktop pet, widget panels, and the
+// kernel WM's own title-bar move/resize) is intra-process or WM-internal, so
+// no drop could ever cross a process boundary.
+//
+// WHY THIS IS SMALL. wm_dispatch_event() already routes every mouse event to
+// window_get_at_point(), the topmost window under the cursor, and there is NO
+// pointer grab anywhere in this window manager. So window B ALREADY receives
+// EVENT_MOUSE_MOVE with the button held the moment the cursor crosses into it,
+// and ALREADY receives EVENT_MOUSE_UP on release. The only thing missing is a
+// shared fact: "a drag is in flight, it carries this kind, and here is who
+// will take it". That is all this protocol adds. There is NO hook in
+// gui/window.c, no change to input routing, and no grab.
+//
+// WHAT RUNS WHEN NOBODY IS DRAGGING: nothing. The session lives in
+// rustkern/dragsess.rs behind one integer, every syscall below returns on that
+// integer test, and the compositor only calls SYS_DRAG_PEEK while a mouse
+// button is physically held.
+//
+// LIVE PTY HAND-OFF IS NOT WHAT THIS DOES, and deliberately so. It was
+// measured on 2026-08-25: this kernel has NO cross-process fd passing (no
+// AF_UNIX, no SCM_RIGHTS; proc->fds[] is per-process and only spawn_impl(),
+// parent -> brand-new child, fds 0-2 only, ever writes another process's
+// table), and ptmx_open() ALWAYS allocates a fresh pair so an existing pty
+// master cannot be reopened. More decisively still, the terminal has no
+// long-lived shell: a pty is created per foreground command and destroyed when
+// it exits, so there is no durable session object to hand over in the first
+// place. The payload here is therefore SERIALIZED STATE (cwd, title,
+// scrollback), not a descriptor. That loses a mid-run foreground command and
+// nothing else, and it is the only honest design available today.
+#define SYS_DRAG_BEGIN    401
+#define SYS_DRAG_PEEK     402
+#define SYS_DRAG_TAKE     403
+#define SYS_DRAG_ACCEPT   404
+#define SYS_DRAG_RELEASE  405
+#define SYS_DRAG_END      406
+
+// Payload kinds. Mirrored in userland/libc/syscall.h and rustkern/dragsess.rs.
+#define DRAG_KIND_TERMTAB 0x1
+#define DRAG_KIND_TEXT    0x2
+#define DRAG_KIND_FILE    0x4
+
+#define DRAG_LABEL_CAP    64
+#define DRAG_PAYLOAD_CAP  4096
+
+// The non-destructive view of the session returned by SYS_DRAG_PEEK.
+//
+// THE PAYLOAD IS NOT IN HERE, ON PURPOSE. The compositor peeks on every frame
+// of every drag so it can draw the ghost that follows the cursor, and a
+// terminal pane payload can contain scrollback: the output of the last command
+// the user ran, which routinely contains secrets. A caption does not justify
+// handing that to the desktop shell. Bytes come only from SYS_DRAG_TAKE, only
+// to the window the KERNEL resolved as the drop target, and only after the
+// button is actually up.
+//
+// Layout is duplicated in userland/libc/syscall.h and mirrored by DragInfo in
+// rustkern/dragsess.rs; all three are locked to the same size by
+// _Static_assert (the wm_window_info_t discipline), so a one-sided edit fails
+// the build instead of silently misreading fields at runtime.
+typedef struct {
+    int32_t  active;        // 1 while a session exists
+    int32_t  src_win;       // window handle that began the drag
+    uint32_t src_pid;       // its owning pid
+    uint32_t kind;          // DRAG_KIND_*
+    int32_t  payload_len;   // bytes available to the resolved target
+    int32_t  released;      // 1 once the button is up and a target is resolved
+    int32_t  drop_x;        // screen coords of the release
+    int32_t  drop_y;
+    int32_t  target_win;    // resolved target handle, or -1 for none
+    int32_t  label_len;
+    uint8_t  label[DRAG_LABEL_CAP];   // short caption for the drag ghost
+} drag_info_t;
+_Static_assert(sizeof(drag_info_t) == 104,
+               "SYS_DRAG_PEEK: drag_info_t layout is duplicated in "
+               "userland/libc/syscall.h and rustkern/dragsess.rs, and its size "
+               "is SZ_DRAG_INFO in rustkern/argtab.rs. Update all four.");
 
 #endif // SYSCALL_H

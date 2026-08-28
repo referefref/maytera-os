@@ -42,9 +42,22 @@ typedef struct {
     int in_dci, out_dci;    // bulk endpoint DCIs
     int in_mps, out_mps;    // bulk endpoint max packet sizes
     uint8_t mac[6];
-    // RX: one permanently outstanding bulk-IN into this DMA buffer.
-    uint8_t *rx_buf;
-    uint32_t rx_buf_len;    // bytes submitted per bulk-IN
+    // RX: a QUEUE of outstanding bulk-IN TDs (#155). rx_ring is rx_slots
+    // contiguous DMA buffers of rx_buf_len bytes each; rx_qlen of them are kept
+    // in flight at all times so the controller ALWAYS has work on the endpoint.
+    // Before #155 there was exactly ONE buffer and ONE TD, re-armed only when
+    // net_poll() happened to reap it, once per ~11.7ms pump tick - a duty cycle
+    // of about 3% and the measured 374 KB/s ceiling on a 100 Mbit link.
+    // rx_buf/rx_buf_len keep their names and meaning: rx_buf is slot 0 of the
+    // ring, so every existing size calculation still reads correctly.
+    uint8_t *rx_buf;        // == rx_ring (slot 0); kept for readability
+    uint32_t rx_buf_len;    // bytes submitted per bulk-IN, per slot
+    uint8_t *rx_ring;       // rx_slots contiguous slots of rx_buf_len bytes
+    int      rx_slots;      // buffers allocated
+    int      rx_qlen;       // TDs kept in flight (1 until the reaper ramps it)
+    uint32_t rx_sub_seq;    // TDs submitted   (buffer index = seq % rx_slots)
+    uint32_t rx_reap_seq;   // TDs reaped      (submit leads reap by rx_qlen)
+    int      rx_resync;     // endpoint error / lost completion: worker restarts
     // TX staging buffer: where usb_eth_send builds a frame + any vendor header
     // before it is copied into the DMA ring below.
     uint8_t *tx_buf;
@@ -99,6 +112,21 @@ int usb_asix_attach(xhci_controller_t *xhc, int slot_id, int speed,
                     uint16_t vid, uint16_t pid, int is179,
                     uint8_t *cfg, int cfg_total);
 // RX-framing parsers (called by the core when a bulk-IN completes)
+// Largest Ethernet frame the RX FIFO and the ASIX de-framer will accept. Lives
+// here (not in usb_ecm.c) because usb_asix.c's split-frame carry buffer must be
+// sized by the same constant that usbnet_fifo_push() validates against.
+#define USBNET_FRAME_MAX   1520
+
+// #362: clear the AX88772 split-frame carry state (call on every bulk-IN
+// pipe restart; a gap in the byte stream makes a half-frame unusable).
+void usb_asix_rx_reset(void);
+
+// #155: start the dedicated bulk-IN reaper thread. Called from
+// net_start_worker() once the scheduler is up AND the USB NIC is the active
+// NIC. Until then RX runs at depth 1 and is serviced inline from net_poll(),
+// which is EXACTLY the pre-#155 behaviour, so the pre-scheduler boot/DHCP path
+// gains no new variables.
+void usb_eth_start_rx_worker(void);
 void usb_asix_rx_fixup(usbnet_dev_t *d, uint8_t *buf, uint32_t len);
 // Lazy PHY link refresh for ASIX parts (no-op for ECM)
 void usb_asix_refresh_link(usbnet_dev_t *d);

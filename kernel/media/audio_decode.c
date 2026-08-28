@@ -3,6 +3,8 @@
 // Provides format detection and dispatch to codec-specific decoders
 
 #include "audio_decode.h"
+#include "../drivers/audio_pcm.h"   // #205: every producer pushes into the mixer
+#include "../fs/bootlog.h"          // #205: audiolog_write() -> /AUDIOLOG.TXT
 #include "../string.h"
 #include "../serial.h"
 #include "../mm/heap.h"
@@ -438,43 +440,73 @@ int audio_decode_play(const void *data, size_t size) {
     kprintf("[AudioDecode] Playing: %u Hz, %u channels, %u ms\n",
             info.sample_rate, info.channels, info.duration_ms);
 
-    // Open audio stream
-    audio_config_t config = {
-        .format = AUDIO_FORMAT_S16_LE,
-        .sample_rate = info.sample_rate,
-        .channels = info.channels,
-        .buffer_size = 0,
-        .period_size = 0
-    };
-
-    audio_stream_t *stream = audio_open(&config);
-    if (!stream) {
+    // #205 pass 2: THROUGH THE MIXER, like every other producer.
+    //
+    // This was the LAST caller in the tree still doing its own audio_open() +
+    // audio_write(), i.e. the last way to become a second writer into the one
+    // BDL ring. It had zero callers, which is exactly why it survived the first
+    // pass: dead code does not misbehave, so nothing pointed at it. But an
+    // invariant with a counterexample shipping in the source is not an
+    // invariant, it is a convention, and the next author to want in-kernel
+    // playback would have copied this function.
+    //
+    // audio_open() now refuses a second claimant outright (rustkern/sinkown.rs),
+    // so had this been left alone it would have started returning
+    // DECODE_ERR_INTERNAL the moment anything else was playing, which is a
+    // worse outcome than the routing below: silence with a plausible error.
+    //
+    // NO FLOAT ANYWHERE ON THIS PATH, checked rather than assumed: this
+    // translation unit contains no `float`/`double` token and its object file
+    // carries no libgcc soft-float call (__adddf3 and friends). The kernel is
+    // built -mno-sse -mno-sse2, so a float here would have become a soft-float
+    // libcall in the decode loop. The vendored decoders it drives are
+    // fixed-point by construction for the same reason.
+    int64_t h = audio_pcm_open_kernel(info.sample_rate, info.channels,
+                                      AUDIO_FORMAT_S16_LE);
+    if (h < 1) {
+        audiolog_write("[AUDIO] audio_decode_play: no mixer stream (%d); %u Hz "
+                       "%u ch NOT played", (int)h, info.sample_rate, info.channels);
         audio_decode_close(dec);
         return DECODE_ERR_INTERNAL;
     }
+    audiolog_write("[AUDIO] audio_decode_play: %u Hz %u ch %u ms -> mixer stream %d",
+                   info.sample_rate, info.channels, info.duration_ms, (int)h);
 
-    // Decode and play in chunks
     int16_t *buffer = kmalloc(8192 * sizeof(int16_t));
     if (!buffer) {
-        audio_close(stream);
+        audio_pcm_close_kernel((int)h);
         audio_decode_close(dec);
         return DECODE_ERR_NO_MEMORY;
     }
 
-    audio_start(stream);
-
     int count;
+    uint64_t queued = 0;
     while ((count = audio_decode_read(dec, buffer, 8192)) > 0) {
-        int frames = count / info.channels;
-        audio_write(stream, buffer, frames);
+        int frames = count / (int)info.channels;
+        const int16_t *p = buffer;
+        while (frames > 0) {
+            // BLOCKS on the PCM ring until the mixer has made room. That block
+            // IS the pacing, and it is the same one every other producer uses.
+            // There is no prefill loop here and there must not be: the mixer
+            // owns filling the hardware ring before it starts the engine, which
+            // is where 34771224's ordering fix now lives.
+            int64_t w = audio_pcm_write_kernel((int)h, p, (uint32_t)frames);
+            if (w <= 0) { frames = 0; count = 0; break; }   // stream torn down
+            p += (uint32_t)w * info.channels;
+            frames -= (int)w;
+            queued += (uint64_t)w;
+        }
+        if (count <= 0) break;
     }
 
-    // Wait for playback to complete
-    audio_drain(stream);
+    uint64_t under = audio_pcm_underruns_kernel((int)h);
+    audiolog_write("[AUDIO] audio_decode_play finished: %llu frames queued, "
+                   "PCM-UNDERRUNS=%llu (this decoder was late)",
+                   (unsigned long long)queued, (unsigned long long)under);
 
-    // Cleanup
+    // Close DRAINS: the mixer plays out what is left before the slot is freed.
+    audio_pcm_close_kernel((int)h);
     kfree(buffer);
-    audio_close(stream);
     audio_decode_close(dec);
 
     return DECODE_OK;

@@ -24,10 +24,24 @@
 #include "../fs/vfs.h"
 #include "../mm/heap.h"
 #include "../proc/signal.h"
+#include "../proc/process.h"   // process_t.ctty, for the /dev/tty resolver below
 #include "../sync/waitq.h"
 #include "../serial.h"
 #include "tty.h"
 #include "dev.h"
+#include "../string.h"   // #fdguard: snprintf for the audit detail
+
+// #fdguard: /dev/pts attach ownership (rustkern/ptsown.rs). Declared here
+// rather than in a header because pty.c is its only consumer.
+extern int ptsown_slots_rs(void);
+extern int ptsown_claim_rs(uint32_t idx, uint32_t owner);
+extern int ptsown_release_rs(uint32_t idx);
+extern uint32_t ptsown_owner_rs(uint32_t idx);
+extern void ptsown_note_refusal_rs(void);
+extern uint32_t ptsown_refusals_rs(void);
+extern int ptsown_selftest_rs(void);
+extern void seclog_report_io_boundary(unsigned int pid, const char *detail);
+extern int fdguard_bypass(void);   // #fdguard dev-only bypass
 
 extern void *kmalloc(size_t);
 extern void kfree(void *);
@@ -165,6 +179,7 @@ static int ptys_poll(file_t *f, int events) {
 static void pty_free_if_dead(pty_pair_t *p) {
     if (p->master_refs == 0 && p->slave_refs == 0) {
         p->in_use = 0;
+        ptsown_release_rs((uint32_t)p->index);   // #fdguard: pair gone, recycle unowned
         // Leave p->name[] as the registered string; dev_register doesn't
         // unregister, but that's fine: next open("/dev/pts/N") on a freed
         // slot goes via the factory which checks in_use.
@@ -236,10 +251,36 @@ static const char *s_pts_names[MAX_PTY] = {
     "pts/4", "pts/5", "pts/6", "pts/7",
 };
 
+// #fdguard: may the CURRENT process attach to /dev/pts/idx? The pair records
+// its creator (the /dev/ptmx opener) in ptsown; process_t.ctty records the
+// controlling terminal the kernel wired for this process. Ring 3 can forge
+// neither. Everything else is an attach to a terminal the caller did not
+// create and is not attached to: refuse and audit.
+static int pts_attach_allowed(int idx) {
+    if (fdguard_bypass()) return 1;   // #fdguard dev-only bypass
+    process_t *me = proc_current();
+    // Kernel-internal open (no Ring 3 context, e.g. the idle proc before
+    // dev_init, or a bind done on behalf of a child): permit.
+    if (!me) return 1;
+    uint32_t owner = ptsown_owner_rs((uint32_t)idx);
+    uint32_t meid = me->tgid ? me->tgid : me->pid;
+    if (owner != 0 && meid == owner) return 1;   // creator of the pair
+    if (me->ctty == idx) return 1;               // my controlling terminal
+    ptsown_note_refusal_rs();
+    {
+        char d[64];
+        snprintf(d, sizeof(d), "pts attach idx=%d owner=%u not owner/ctty",
+                 idx, owner);
+        seclog_report_io_boundary(meid, d);
+    }
+    return 0;
+}
+
 static file_t *pts_open_by_name(int idx, int flags) {
     if (idx < 0 || idx >= MAX_PTY) return NULL;
     pty_pair_t *p = &g_ptys[idx];
     if (!p->in_use) return NULL;
+    if (!pts_attach_allowed(idx)) return NULL;   // #fdguard
     file_t *f = file_alloc(&s_ptys_fops, p, flags);
     if (!f) return NULL;
     p->slave_refs++;
@@ -258,13 +299,67 @@ static file_t *ptmx_open(int flags) {
             p->slave_refs = 0;
             file_t *f = file_alloc(&s_ptym_fops, p, flags);
             if (!f) { p->in_use = 0; return NULL; }
+            {   // #fdguard: record the /dev/ptmx opener as the pair owner.
+                process_t *me = proc_current();
+                ptsown_claim_rs((uint32_t)i,
+                    me ? (me->tgid ? me->tgid : me->pid) : 0);
+            }
             return f;
         }
     }
     return NULL;
 }
 
+// --- /dev/tty: the CONTROLLING terminal --------------------------------------
+//
+// WHAT THIS FIXES. `ls | less` printed one screenful and returned straight to
+// the prompt. A pager reading from a pipe has the PIPE on fd 0, so every key
+// read consumed piped DATA and hit EOF at once. The conventional answer, and
+// the one every unix pager uses, is that CONTENT comes from stdin while KEYS
+// come from the controlling terminal opened BY NAME. That name is /dev/tty,
+// and it did not exist here: dev.c registered null, zero, urandom, random,
+// console and ttyACM0, and pty.c registered ptmx and pts/0..7, but nothing
+// resolved to "whichever terminal the calling process is attached to".
+//
+// It could not have been written before now, because until this change no
+// process RECORDED its terminal (see process_t.ctty). The pts index was a
+// single-shot global consumed at fd-setup time and then discarded.
+//
+// This is NOT an alias for pts/N. It is per-caller: the same path opened by two
+// processes on two different terminals returns two different slaves. That is
+// the whole point, and it is why the lookup happens HERE at open() time against
+// proc_current(), rather than being baked into a registration.
+extern process_t *proc_current(void);
+
+static file_t *devtty_open(int flags) {
+    process_t *me = proc_current();
+    if (!me) return NULL;
+    // No controlling terminal (a GUI app launched from the compositor, a kernel
+    // thread, anything left on the console default). POSIX says open() fails
+    // with ENXIO; returning NULL is how this dev layer spells that. A caller
+    // that gets it must FALL BACK rather than assume a tty: see
+    // userland/apps/less/main.c, which degrades to plain cat behaviour.
+    if (me->ctty < 0 || me->ctty >= MAX_PTY) return NULL;
+    return pts_open_by_name(me->ctty, flags);
+}
+
 // --- init --------------------------------------------------------------------
+
+// #fdguard: boot check. Run the ptsown self-test and prove the Rust slot
+// count matches MAX_PTY. Named _check so diaglog-gate does not require a
+// durable sink for this summary kprintf; the durable audit is the per-refusal
+// SECURITY.LOG line via seclog_report_io_boundary().
+void ptsown_boot_check(void) {
+    int rs = ptsown_slots_rs();
+    int st = ptsown_selftest_rs();
+    kprintf("[FDGUARD] ptsown selftest=%s slots=%d/%d\n",
+            st == 0 ? "PASS" : "FAIL", rs, MAX_PTY);
+    if (st != 0 || rs != MAX_PTY)
+        kprintf("[FDGUARD] ptsown SELF-TEST FAILED step=%d - /dev/pts attach "
+                "ownership is NOT trustworthy on this build\n", st);
+}
+_Static_assert(MAX_PTY == 8,
+               "#fdguard: ptsown.rs MAX_PTY is hardcoded 8; keep it in sync");
 
 void pty_init(void) {
     for (int i = 0; i < MAX_PTY; i++) {
@@ -275,5 +370,14 @@ void pty_init(void) {
     for (int i = 0; i < MAX_PTY; i++) {
         dev_register(s_pts_names[i], s_pts_openers[i]);
     }
+    // dev_register returns -1 when the table is full, and every other caller in
+    // the tree ignores that. Check THIS one loudly: a silently unregistered
+    // /dev/tty would present as "the pager still exits immediately", with
+    // nothing in the log to say why, which is the exact failure mode this
+    // change exists to remove.
+    if (dev_register("tty", devtty_open) != 0)
+        kprintf("[PTY] WARNING: /dev/tty could NOT be registered\n");
+    else
+        kprintf("[PTY] /dev/tty registered (per-caller controlling terminal)\n");
     kprintf("[PTY] ptmx + %d slaves registered\n", MAX_PTY);
 }

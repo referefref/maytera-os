@@ -15,9 +15,12 @@
 // original accordion this replaces.
 //
 // Persistence (two small flat files, same idiom as /APPS.CFG et al.):
-//   /CONFIG/STARTMENU.CFG   - FAV|<exec_path> / RECENT|<exec_path> lines.
-//     Compositor-owned: written immediately on pin/unpin/launch, never touched
-//     by Settings, so a Settings-side rewrite can never race or clobber it.
+//   <home>/CONFIG/STARTMENU.CFG (#236: was /CONFIG/STARTMENU.CFG - see the
+//     "#236 PERSISTENCE" block comment above sm_save_state() below for why
+//     that never reached disk at all) - FAV|<exec_path> / RECENT|<exec_path>
+//     lines. Compositor-owned: written immediately on pin/unpin/launch, never
+//     touched by Settings, so a Settings-side rewrite can never race or
+//     clobber it.
 //   /CONFIG/STARTMENU.PREFS - key=value lines (view/show_fav/show_recent/
 //     recent_count/focus_search/width/icon_size). Written by the Settings app
 //     "Start Menu" panel, polled here on a throttle (startmenu_prefs_poll(),
@@ -25,6 +28,7 @@
 //     without needing the menu to be reopened.
 
 #include "compositor.h"
+#include "confirmdialog.h"   // (86f3cea) the shared system-modal confirm/notice card
 #include "../../libc/syscall.h"
 #include "../../libc/notify.h"
 #define GUI_SCROLL_STDINT_ONLY       // see the note at the top of that header
@@ -36,6 +40,9 @@
                                      // cannot drift away from every other
                                      // scrollbar in the OS the way it just did.
 #include "../../libc/userconf.h"   // #745: <home>/CONFIG/STARTMENU, the per-user app layer
+#include "../../libc/stdio.h"    // printf/snprintf: the #220 rebuild summary is
+                                  // built with snprintf so the same text goes to
+                                  // serial AND to the persistent /BOOTLOG.TXT
 #include "../../libc/string.h"   // memcpy/memset/strcmp/strncpy (was relying on implicit
                                   // declarations before; harmless to include, no types.h pull-in)
 
@@ -50,8 +57,11 @@
 // gui_scroll_draw() also needs a window handle (win_draw_rect), which the
 // compositor never has for itself either way; the scrollbar below is drawn
 // with plain draw.c primitives.
-#define SM_SCROLL_W       14
-#define SM_SCROLL_MIN_TH  24
+// #uiscale: was a bare 1x literal - a 14px scrollbar next to a menu whose
+// every other band scaled would read as an inconsistent, thin afterthought
+// at 200%.
+#define SM_SCROLL_W       ui_px(14)
+#define SM_SCROLL_MIN_TH  ui_px(24)
 typedef struct {
     int offset;        // current scroll offset in px, always in [0, max]
     int content_px;     // total content height in px
@@ -100,10 +110,14 @@ static bool sm_scroll_reveal(sm_scroll_t *s, int top_px, int h_px, int viewport_
 // Keycodes as delivered in gui_event_t.keycode (scancode-derived; same values
 // as userland/libc/gui_scroll.h's GUI_KEY_* - open-coded here rather than
 // including that header, per the bool-conflict note above).
-#define SM_KEY_UP    0x80
-#define SM_KEY_DOWN  0x81
-#define SM_KEY_LEFT  0x82
-#define SM_KEY_RIGHT 0x83
+// #191: these four were a private copy of the arrow table. The values happened
+// to be RIGHT, but a private copy is how the wrong values reached six other
+// apps, so there is now one table (libc/keys.h, already reachable here via
+// gui_scroll.h) and these are aliases, not declarations.
+#define SM_KEY_UP    GUI_KEY_UP
+#define SM_KEY_DOWN  GUI_KEY_DOWN
+#define SM_KEY_LEFT  GUI_KEY_LEFT
+#define SM_KEY_RIGHT GUI_KEY_RIGHT
 
 // ============================================================================
 // Static state
@@ -160,12 +174,140 @@ static bool g_search_focused;   // only the search box receives typed characters
 // Favorites / Recents (persisted to /CONFIG/STARTMENU.CFG). Keyed by the item's
 // exec_path (same identity used by the STARTMENU.YAML "rename:" matcher), not
 // by index, so entries survive category renumbering across a rebuild.
-#define MAX_FAVORITES 12
+// (#123 item 1) 12 -> 28, per the user's ask ("increase the maximum number of
+// dock items on the marble dock from 12 to 28"). MUST stay equal to
+// taskbar.c's XFCE_MAX_FAVS. Raising this ALONE is not enough: see
+// sm_save_state() below, whose 2048-byte buffer was written into without any
+// bound at all and is sized here for the new cap.
+#define MAX_FAVORITES 28
 #define MAX_RECENTS   10
+// Persisted state buffer. Worst case is MAX_FAVORITES lines of "FAV|" + a
+// 127-char path + newline (28 * 132 = 3696) plus MAX_RECENTS lines of
+// "RECENT|" + 127 + newline (10 * 135 = 1350) = 5046 bytes. The old 2048 was
+// already smaller than a full 12-favourite worst case (12*132 + 1350 = 2934)
+// and sm_save_state() copied into it with NO bounds check whatsoever, so a
+// profile with long paths could overrun a static buffer; the reader silently
+// truncated at the same size. Both are sized from the caps above now, and the
+// writer checks (see sm_save_state).
+#define SM_STATE_BUF  ((MAX_FAVORITES * 132) + (MAX_RECENTS * 135) + 256)
+// #223 ROUND 2 INVESTIGATION ONLY (MAYTERA_FAVDEBUG): g_fav_count/g_fav_paths
+// and g_recent_count/g_recent_paths wrapped in canary-guarded structs so a
+// throwaway instrumented build can tell "a real write zeroed g_fav_count"
+// (hypothesis A) apart from "an adjacent buffer overran into it"
+// (hypothesis B) by checking whether the surrounding magic values survive.
+// nm on the compiled startmenu.o (both this dev tree and the exact commit
+// golden 2031 built from, 14585c50, are identical here - no code changed
+// between them) shows g_recent_paths ends EXACTLY where g_fav_count begins
+// (offsets 0x91c0..0x96c0 then 0x96c0), zero padding - i.e. in the shipped
+// layout a one-slot overflow of g_recent_paths would land squarely on
+// g_fav_count. The guard structs below preserve that exact adjacency (same
+// field order, same types) while adding a canary on the outward-facing side
+// of each struct, so a canary break here is diagnostic of the SAME class of
+// bug the un-instrumented layout already has, not an artifact of adding the
+// guard. #define aliases below mean the ~40 other g_fav_count/g_fav_paths/
+// g_recent_count/g_recent_paths references elsewhere in this file need no
+// changes. NOT for the golden: gated on MAYTERA_FAVDEBUG, defined only by
+// `make FAVDEBUG=1`, same throwaway-instrumented-build idiom as
+// MAYTERA_TESTHOOK.
+#ifdef MAYTERA_FAVDEBUG
+#define SM_FAV_CANARY_A 0xFA110001u
+#define SM_FAV_CANARY_B 0xFA110002u
+#define SM_REC_CANARY_A 0x9EC0AA01u
+#define SM_REC_CANARY_B 0x9EC0AA02u
+typedef struct {
+    uint32_t canary_a;               // immediately BEFORE g_recent_count
+    int      recent_count;
+    char     recent_paths[MAX_RECENTS][128];
+    int      fav_count;
+    char     fav_paths[MAX_FAVORITES][128];
+    uint32_t canary_b;                // immediately AFTER g_fav_paths
+} sm_favdebug_state_t;
+static sm_favdebug_state_t g_fdbg = { SM_REC_CANARY_A, 0, {{0}}, 0, {{0}}, SM_FAV_CANARY_B };
+#define g_fav_count     g_fdbg.fav_count
+#define g_fav_paths     g_fdbg.fav_paths
+#define g_recent_count  g_fdbg.recent_count
+#define g_recent_paths  g_fdbg.recent_paths
+
+// Logs only on CHANGE (edge-triggered), never every frame/poll - cheap, no
+// busy-wait (#426). Called from every write site to g_fav_count (tagged) and
+// once a "tick" from startmenu_favs_poll() so a canary break is caught even
+// on a poll where nothing wrote fav_count directly (proves hypothesis B: an
+// overflow from elsewhere, not one of this file's own writers).
+// Same forward-declare idiom used further down this file (see the printf
+// comment near readdir/access below): this TU's compositor.h defines `bool`
+// as int while libc/types.h (pulled in by <stdio.h>) defines it as _Bool, so
+// printf is declared here rather than via #include, same reasoning.
+extern int printf(const char *fmt, ...);
+
+// Live serial (printf, above) is convenient but requires a connection held
+// open for the whole run. #123's own th_log() in testhook.c hit the exact
+// same problem and mirrors to a FILE for guaranteed offline reading after
+// shutdown ("/TESTHOOK.OUT ... can only be read after the VM is shut down
+// and its image mounted, which is useless for a live, paced run - hence the
+// mirror"). Same idiom here, same reasoning, independent file
+// (/FAVDEBUG.OUT) so this investigation's log can never be interleaved with
+// or truncated by testhook's own. Hand-rolled decimal/hex formatting (no
+// snprintf dependency) mirrors testhook.c's own th_int()-style helpers.
+static void sm_favdebug_dec(char *b, int *q, int v) {
+    if (v < 0) { b[(*q)++] = '-'; v = -v; }
+    char t[12]; int n = 0;
+    if (v == 0) t[n++] = '0';
+    while (v > 0) { t[n++] = (char)('0' + (v % 10)); v /= 10; }
+    while (n > 0) b[(*q)++] = t[--n];
+}
+static void sm_favdebug_hex(char *b, int *q, uint32_t v) {
+    static const char *hx = "0123456789abcdef";
+    for (int i = 7; i >= 0; i--) b[(*q)++] = hx[(v >> (i * 4)) & 0xF];
+}
+static void sm_favdebug_file(const char *tag, int old_fav, int old_rec, bool broke) {
+    char b[256]; int q = 0;
+    const char *k;
+    k = broke ? "[FAVDEBUG] *** CANARY BROKEN *** " : "[FAVDEBUG] ";
+    for (; *k; k++) b[q++] = *k;
+    for (const char *z = tag; *z && q < 200; z++) b[q++] = *z;
+    k = " fav="; for (; *k; k++) b[q++] = *k;
+    sm_favdebug_dec(b, &q, old_fav); b[q++] = '-'; b[q++] = '>';
+    sm_favdebug_dec(b, &q, g_fdbg.fav_count);
+    k = " rec="; for (; *k; k++) b[q++] = *k;
+    sm_favdebug_dec(b, &q, old_rec); b[q++] = '-'; b[q++] = '>';
+    sm_favdebug_dec(b, &q, g_fdbg.recent_count);
+    k = " ca="; for (; *k; k++) b[q++] = *k;
+    sm_favdebug_hex(b, &q, g_fdbg.canary_a);
+    k = " cb="; for (; *k; k++) b[q++] = *k;
+    sm_favdebug_hex(b, &q, g_fdbg.canary_b);
+    b[q++] = '\n';
+    int fd = sys_open("/FAVDEBUG.OUT", 0x1 | 0x40 | 0x400);   // O_WRONLY|O_CREAT|O_APPEND
+    if (fd >= 0) { sys_write(fd, b, (unsigned long)q); sys_close(fd); }
+}
+static void sm_favdebug_check(const char *tag) {
+    static int last_fav = -1, last_rec = -1;
+    static int canary_ever_broken = 0;
+    int old_fav = last_fav, old_rec = last_rec;
+    bool changed = (g_fdbg.fav_count != last_fav) || (g_fdbg.recent_count != last_rec);
+    bool broken = (g_fdbg.canary_a != SM_REC_CANARY_A) || (g_fdbg.canary_b != SM_FAV_CANARY_B);
+    if (changed) {
+        printf("[FAVDEBUG] %s: fav_count %d->%d recent_count %d->%d canary_a=%08x canary_b=%08x\n",
+               tag, last_fav, g_fdbg.fav_count, last_rec, g_fdbg.recent_count,
+               g_fdbg.canary_a, g_fdbg.canary_b);
+        sm_favdebug_file(tag, old_fav, old_rec, false);
+        last_fav = g_fdbg.fav_count;
+        last_rec = g_fdbg.recent_count;
+    }
+    if (broken && !canary_ever_broken) {
+        canary_ever_broken = 1;
+        printf("[FAVDEBUG] *** CANARY BROKEN at '%s' *** canary_a=%08x (want %08x) canary_b=%08x (want %08x) fav_count=%d recent_count=%d\n",
+               tag, g_fdbg.canary_a, SM_REC_CANARY_A, g_fdbg.canary_b, SM_FAV_CANARY_B,
+               g_fdbg.fav_count, g_fdbg.recent_count);
+        sm_favdebug_file(tag, old_fav, old_rec, true);
+    }
+}
+#else
 static char g_fav_paths[MAX_FAVORITES][128];
 static int  g_fav_count;
 static char g_recent_paths[MAX_RECENTS][128];   // index 0 = most recent
 static int  g_recent_count;
+#define sm_favdebug_check(tag) do { } while (0)
+#endif
 
 // Prefs (Settings "Start Menu" panel writes /CONFIG/STARTMENU.PREFS; we poll it
 // live). Defaults reproduce the pre-uplift look (Categories view, both new
@@ -175,7 +317,12 @@ static int g_sm_show_fav      = 1;
 static int g_sm_show_recent   = 1;
 static int g_sm_recent_count  = 5;
 static int g_sm_focus_search  = 1;
-static int g_sm_width         = START_MENU_WIDTH;
+// #uiscale: START_MENU_WIDTH is now ui_px(300), a function call, not a
+// compile-time constant, so it cannot initialize a static. 300 here is the
+// raw logical default; sm_prefs_poll() below (line ~828) immediately
+// overwrites it with the scaled START_MENU_WIDTH (or a saved override) on
+// the very first poll, same as every other prefs-backed default in this file.
+static int g_sm_width         = 300;
 static int g_sm_icon_size     = 20;
 
 // Properties popup (right-click -> Properties).
@@ -219,7 +366,7 @@ static void sm_open_flyout(int cat_idx);
 // Append one item to g_menu_items. The item is associated with whichever
 // category was most recently registered, so all of a category's items must be
 // added before the next add_category() call (they must stay contiguous).
-static void add_item_typed(const char *name, icon_id_t icon, const char *path, int launch_type)
+static void add_item_typed(const char *name, icon_id_t icon, const char *path, int launch_type, int win16_mode)
 {
     if (g_total_items >= START_MENU_MAX_ITEMS)
         return;
@@ -233,6 +380,7 @@ static void add_item_typed(const char *name, icon_id_t icon, const char *path, i
     it->is_separator = false;
     it->is_win16     = (launch_type == LAUNCH_WIN16);
     it->launch_type  = launch_type;
+    it->win16_mode   = win16_mode;   // (#845) -1=auto, 0=force real, 1=force protected
 
     // Increment the item_count of the last registered category.
     int last_cat = -1;
@@ -248,12 +396,12 @@ static void add_item_typed(const char *name, icon_id_t icon, const char *path, i
 
 static void add_item_ex(const char *name, icon_id_t icon, const char *path, bool is_win16)
 {
-    add_item_typed(name, icon, path, is_win16 ? LAUNCH_WIN16 : LAUNCH_NATIVE);
+    add_item_typed(name, icon, path, is_win16 ? LAUNCH_WIN16 : LAUNCH_NATIVE, -1);
 }
 
 static void add_item(const char *name, icon_id_t icon, const char *path)
 {
-    add_item_typed(name, icon, path, LAUNCH_NATIVE);
+    add_item_typed(name, icon, path, LAUNCH_NATIVE, -1);
 }
 
 // Register a category. Must be called before add_item() calls for that group.
@@ -354,24 +502,66 @@ static bool sm_is_favorite_idx(int idx) {
 // Persistence: /CONFIG/STARTMENU.CFG (favorites + recents, compositor-owned)
 // ============================================================================
 
+// #236 PERSISTENCE. THIS FUNCTION NEVER REACHED DISK, EVER, ON A UID-1000
+// SESSION - measured on golden 2016: pin a favourite, everything renders
+// correctly in-session on all five dock styles (#231), reboot, and the dock
+// and Start-menu Favorites section are both completely empty. Unmounting the
+// ext2 root confirmed it: no STARTMENU.CFG anywhere on the volume, no file
+// containing "FAV|" at all.
+//
+// ROOT CAUSE: this used to sys_unlink() + sys_open(O_CREAT) directly against
+// /CONFIG, which is root-owned 0711 (it holds SHADOW/AUTHKEYS/SSHD.CFG and the
+// owner's API keys) while the desktop session runs as uid 1000 (#226 removed
+// autologin=root). Both the unlink and the open were refused every time,
+// silently: fd < 0 hit the early `return` below and nothing was ever written.
+// This is the EXACT SAME class of bug #683/#743 already found and fixed for
+// THEME.CFG, AICHAT.CFG, NOTIFY.TXT and DOCKSTYL.CFG (see userconf.c's own
+// header comment) - a per-user preference stored in system configuration that
+// the session cannot write. The fix is the SAME one, not a new kernel
+// chokepoint: STARTMENU.CFG is not security-sensitive (it is a favourites
+// list), so it belongs in the user's own home, exactly like DOCKSTYL.CFG.
+// userconf_open_write() resolves <home>/CONFIG/STARTMENU.CFG (root's own home
+// is "/", so a root session's behaviour is byte-for-byte unchanged), creates
+// <home>/CONFIG if missing, and O_TRUNCs only AFTER a successful open so a
+// refused write can never destroy the previous list the way the old
+// unlink-first idiom could (#743). userconf_finish_write() then does the
+// write+fsync+close discipline #743 documents (a short write, a failed fsync
+// or a failed close are all now real failures instead of being silently
+// discarded).
+//
+// (#123) `end` is a real bound, not decoration: this function used to copy
+// unbounded strings into a fixed static with no check, which is a silent
+// out-of-bounds WRITE into whatever static followed it, not merely a
+// truncation. A line that does not fit is dropped whole (never half-written),
+// so the file always parses.
 static void sm_save_state(void) {
-    static char buf[2048];
+    static char buf[SM_STATE_BUF];
     char *p = buf;
+    char *end = buf + sizeof(buf);
     for (int i = 0; i < g_fav_count; i++) {
-        const char *k = "FAV|"; while (*k) *p++ = *k++;
-        const char *v = g_fav_paths[i]; while (*v) *p++ = *v++;
+        const char *k = "FAV|", *v = g_fav_paths[i];
+        size_t need = 4 + strlen(v) + 1;
+        if ((size_t)(end - p) < need) break;
+        while (*k) *p++ = *k++;
+        while (*v) *p++ = *v++;
         *p++ = '\n';
     }
     for (int i = 0; i < g_recent_count; i++) {
-        const char *k = "RECENT|"; while (*k) *p++ = *k++;
-        const char *v = g_recent_paths[i]; while (*v) *p++ = *v++;
+        const char *k = "RECENT|", *v = g_recent_paths[i];
+        size_t need = 7 + strlen(v) + 1;
+        if ((size_t)(end - p) < need) break;
+        while (*k) *p++ = *k++;
+        while (*v) *p++ = *v++;
         *p++ = '\n';
     }
-    sys_unlink("/CONFIG/STARTMENU.CFG");
-    int fd = sys_open("/CONFIG/STARTMENU.CFG", 0x41 | 0x200 /*O_WRONLY|O_CREAT|O_TRUNC*/);
-    if (fd < 0) return;
-    sys_write(fd, buf, (unsigned long)(p - buf));
-    sys_close(fd);
+    int fd = userconf_open_write("STARTMENU.CFG");
+    if (userconf_finish_write(fd, buf, (unsigned long)(p - buf)) != 0) {
+        // No user-visible toast here (unlike Settings' save_failed()): this
+        // runs on every pin/unpin, including ones the user never sees a
+        // dialog for (the FAVCH.CFG channel, sm_seed_default_favorites()). A
+        // failed save leaves the in-memory list correct for this session; the
+        // next successful save will persist it.
+    }
 }
 
 static char *sm_trim(char *p) {
@@ -382,22 +572,124 @@ static char *sm_trim(char *p) {
     return p;
 }
 
-// Returns true iff /CONFIG/STARTMENU.CFG exists at all, regardless of how
-// many FAV|/RECENT| lines it contains (including zero). This is the ONE
-// signal that lets startmenu_init() tell "a real profile that has never
-// pinned anything, or has deliberately unpinned everything" (file exists,
-// g_fav_count possibly 0) apart from "no profile has ever been saved here"
-// (file absent, e.g. the first-run wizard was skipped and its apps page
-// never wrote FAVCH.CFG - see startmenu_init()'s default-seeding block
-// below). sm_save_state() runs on every favorite add/remove, so the file
-// exists from the FIRST toggle onward, even a toggle that empties the list;
-// only a profile that has NEVER gone through sm_save_state() has no file.
+// #223 ROUND 2 GUARD. This is the fix for the AMPLIFIER, not a fix for the
+// (still not caught live - see blame.md) root cause that zeroes g_fav_count.
+// The round-1 investigation already established the shape of the damage:
+// once g_fav_count reaches 0 by whatever means, sm_record_recent() - which
+// fires on EVERY app launch, not just a favourites action - called the FULL
+// sm_save_state() above, which unconditionally re-serializes whatever
+// g_fav_count/g_fav_paths CURRENTLY hold in memory. If that memory is
+// glitched empty for even one frame, the very next app launch stamps the
+// glitch permanently over the user's real, previously-good favourites file,
+// and a reboot then loads the empty file as if it were genuine. That step
+// (a transient bug becoming unrecoverable data loss) is fixable regardless
+// of whether the transient bug itself is ever pinned down, and this is that
+// fix: a launch/recents-tracking save no longer trusts in-memory favourites
+// state AT ALL. It re-reads the FAV| lines CURRENTLY ON DISK (a file this
+// code path never itself mutates) and re-emits them verbatim, touching only
+// the RECENT| section.
+//
+// A genuine favourites mutation - pin/unpin (startmenu_toggle_favorite_path),
+// the FAVCH.CFG live-apply channel (sm_load_favs_channel), the first-run
+// default seed (sm_seed_default_favorites) - is UNCHANGED: all three still
+// call sm_save_state() directly, which remains the one and only place
+// g_fav_count==0 is ever durably written, and only when one of those three
+// functions put it there. A user who genuinely unpins their last favourite
+// is unaffected: that call goes through startmenu_toggle_favorite_path() ->
+// sm_save_state() exactly as before, and legitimately persists the empty
+// list, because THAT call site has real authority over favourites - unlike
+// a recents-only save, which never does.
+//
+// COST: an app launch now does one extra small file read (STARTMENU.CFG -
+// already read once at every boot by sm_load_state(); same file, same size
+// class, no new I/O pattern, and no per-frame cost since this only runs on
+// sm_record_recent(), which is launch-rate not frame-rate). If that read
+// fails (first-ever save for this profile, or a genuine disk error), this
+// falls back to serializing favourites from memory - the OLD behaviour, not
+// a new gap - which is safe here specifically because a launch/recents event
+// never legitimately empties favourites itself, so a non-corrupted g_fav_count
+// is the only thing that fallback can ever see.
+static void sm_save_recents_only(void) {
+    static char rbuf[SM_STATE_BUF];
+    int rfd = userconf_open_read("STARTMENU.CFG", "/CONFIG/STARTMENU.CFG");
+    long n = (rfd >= 0) ? sys_read(rfd, rbuf, sizeof(rbuf) - 1) : -1;
+    if (rfd >= 0) sys_close(rfd);
+
+    static char buf[SM_STATE_BUF];
+    char *p = buf;
+    char *end = buf + sizeof(buf);
+
+    if (n > 0) {
+        // Re-emit every FAV| line found ON DISK, verbatim - never consulting
+        // g_fav_count/g_fav_paths, so an in-memory glitch cannot reach the
+        // file through this path no matter what shape it takes.
+        rbuf[n] = 0;
+        char *rp = rbuf;
+        while (*rp) {
+            char *line = rp;
+            while (*rp && *rp != '\n') rp++;
+            if (*rp) { *rp = 0; rp++; }
+            char *t = sm_trim(line);
+            if (strncmp(t, "FAV|", 4) == 0) {
+                size_t len = 0; while (t[len]) len++;
+                if ((size_t)(end - p) < len + 1) break;
+                while (*t) *p++ = *t++;
+                *p++ = '\n';
+            }
+        }
+    } else {
+        // No on-disk copy to preserve (first-ever save this profile, or a
+        // real read failure): fall back to serializing memory, same as the
+        // original sm_save_state() always did.
+        for (int i = 0; i < g_fav_count; i++) {
+            const char *k = "FAV|", *v = g_fav_paths[i];
+            size_t need = 4 + strlen(v) + 1;
+            if ((size_t)(end - p) < need) break;
+            while (*k) *p++ = *k++;
+            while (*v) *p++ = *v++;
+            *p++ = '\n';
+        }
+    }
+
+    for (int i = 0; i < g_recent_count; i++) {
+        const char *k = "RECENT|", *v = g_recent_paths[i];
+        size_t need = 7 + strlen(v) + 1;
+        if ((size_t)(end - p) < need) break;
+        while (*k) *p++ = *k++;
+        while (*v) *p++ = *v++;
+        *p++ = '\n';
+    }
+
+    int wfd = userconf_open_write("STARTMENU.CFG");
+    if (userconf_finish_write(wfd, buf, (unsigned long)(p - buf)) != 0) {
+        // Same no-toast reasoning as sm_save_state() above: this runs on
+        // every launch, most of which the user never sees a dialog for.
+    }
+}
+
+// Returns true iff <home>/CONFIG/STARTMENU.CFG (or the pre-#236 legacy
+// /CONFIG/STARTMENU.CFG, read only as a migration fallback - see
+// userconf_open_read()) exists at all, regardless of how many FAV|/RECENT|
+// lines it contains (including zero). This is the ONE signal that lets
+// startmenu_init() tell "a real profile that has never pinned anything, or
+// has deliberately unpinned everything" (file exists, g_fav_count possibly 0)
+// apart from "no profile has ever been saved here" (file absent, e.g. the
+// first-run wizard was skipped and its apps page never wrote FAVCH.CFG - see
+// startmenu_init()'s default-seeding block below). sm_save_state() runs on
+// every favorite add/remove, so the file exists from the FIRST toggle onward,
+// even a toggle that empties the list; only a profile that has NEVER gone
+// through sm_save_state() has no file.
 static bool sm_load_state(void) {
     g_fav_count = 0;
     g_recent_count = 0;
-    int fd = sys_open("/CONFIG/STARTMENU.CFG", 0);
+    sm_favdebug_check("sm_load_state:reset-to-0");
+    // #236: per-user path first (userconf_path("STARTMENU.CFG",...)), falling
+    // back to the pre-#236 root-owned /CONFIG copy so a machine that somehow
+    // already has one (e.g. a session that ran as root before #226) still
+    // sees its old favourites once, rather than appearing to have lost them.
+    int fd = userconf_open_read("STARTMENU.CFG", "/CONFIG/STARTMENU.CFG");
     if (fd < 0) return false;
-    static char buf[2048];
+    static char buf[SM_STATE_BUF];
     long n = sys_read(fd, buf, sizeof(buf) - 1);
     sys_close(fd);
     if (n <= 0) return true;   // file exists (possibly empty/truncated): still "existed"
@@ -424,17 +716,20 @@ static bool sm_load_state(void) {
             }
         }
     }
+    sm_favdebug_check("sm_load_state:done");
     return true;
 }
 
 // #63/#745: default pinned dock set for a profile that has NEVER saved a
-// favorites list at all (STARTMENU.CFG absent - the exact state a skipped
-// first-run wizard leaves behind, since the wizard's apps page is what would
-// otherwise have written it via FAVCH.CFG/sm_load_favs_channel()). Without
-// this, startmenu_get_favorites() legitimately returns 0 (see its own
-// comment: an empty favorites list is a valid, persisted state, not an
-// error), and the Marble dock renders with nothing pinned - reported live by
-// a user who skipped setup and switched to Marble.
+// favorites list at all (STARTMENU.CFG absent - the exact state the wizard's
+// "Skip to Desktop" CORNER control leaves behind: setup/main.rs
+// skip_to_desktop() deliberately writes only /CONFIG/SETUPSKIP and "no apply(),
+// no partial config" - see its own comment - so FAVCH.CFG is never written in
+// that path and this is the ONLY thing that will ever populate the dock for
+// that machine). Without this, startmenu_get_favorites() legitimately returns
+// 0 (see its own comment: an empty favorites list is a valid, persisted
+// state, not an error), and the Marble dock renders with nothing pinned -
+// reported live by a user who skipped setup and switched to Marble.
 //
 // USER-SPECIFIED SET (verbatim from the brief): Files, Browser, Settings,
 // Terminal, App Store, Music Player, Paint. Paths below are copied from the
@@ -442,6 +737,27 @@ static bool sm_load_state(void) {
 // match exactly what g_menu_items[] actually contains; see
 // sm_find_item_by_path()'s own validation below for what happens if one
 // doesn't (skipped, not a dead pin).
+//
+// CALL SITE, CORRECTED 2026-08-18: this used to be called unconditionally
+// from startmenu_init() whenever STARTMENU.CFG was merely absent - which is
+// ALSO true on every ordinary first boot, seconds before the SAME first-boot
+// wizard (setup/main.rs) writes its own, larger FAVCH.CFG selection. The
+// compositor (and therefore startmenu_init()) has to already be running
+// before the wizard can even open its window, so that eager seed always won
+// the race and got saved to disk FIRST; sm_load_favs_channel()'s merge is
+// deliberately ADD-only (shared with the live Settings > Dock panel, which
+// legitimately wants "pin one more app" semantics - see its own comment), so
+// the wizard's later, larger selection could only ADD onto these 7 already-
+// saved entries, and Music Player/Paint above are not both members of the
+// wizard's own candidate list, silently eating slots under MAX_FAVORITES
+// (12). Measured 2026-08-18: with the wizard defaulting to all twelve dock
+// apps (owner decision, same date), this dropped Task Manager - the very
+// last app the channel tried to add once the cap was already spent - on
+// every fresh install. This function is now called from
+// startmenu_favs_poll() instead (below), gated on /CONFIG/SETUPSKIP actually
+// being present, which is true if and only if "Skip to Desktop" really was
+// used and nothing else is ever going to write real favorites - never on a
+// machine where the wizard merely has not finished yet.
 static const char *const SM_DEFAULT_FAVORITES[] = {
     "/APPS/FILES",
     "/APPS/BROWSER",
@@ -474,6 +790,7 @@ static void sm_seed_default_favorites(void) {
         g_fav_paths[g_fav_count][127] = 0;
         g_fav_count++;
     }
+    sm_favdebug_check("sm_seed_default_favorites");
     if (g_fav_count > 0) sm_save_state();
 }
 
@@ -598,7 +915,7 @@ void startmenu_prefs_poll(void) {
 // Favorites" (#44) already uses, so this channel still has exactly one
 // path to sm_save_state(), never a second hand-rolled one.
 //
-// MAX_FAVORITES (12) IS A HARD CAP on ADD lines. If the channel lists more
+// MAX_FAVORITES (28 as of #123, was 12) IS A HARD CAP on ADD lines. If the channel lists more
 // valid, not-yet-pinned paths than there is room for, the excess lines are
 // dropped silently once the list is full - first line in the file wins,
 // matching the file's natural read order. This is a deliberate product
@@ -662,6 +979,7 @@ static void sm_load_favs_channel(void) {
         added = 1;
     }
 
+    sm_favdebug_check("sm_load_favs_channel");
     if (added) sm_save_state();
     if (added) g_needs_redraw = true;
 
@@ -669,6 +987,44 @@ static void sm_load_favs_channel(void) {
         char path[256];
         if (userconf_path("FAVCH.CFG", path, sizeof(path)) == 0) sys_unlink(path);
     }
+}
+
+// True iff /CONFIG/STARTMENU.CFG exists - a cheap existence probe (open+close,
+// no read), deliberately NOT sm_load_state() itself: that function also
+// resets/repopulates g_fav_count/g_recent_count from disk, which is correct
+// exactly once at startmenu_init() but would be wrong to call again from a
+// per-second poll (it would stomp any in-memory pin/unpin made since boot
+// with whatever was last saved). Matches setup_pending_recheck()'s own
+// sys_open/sys_close idiom in main.c for the sibling SETUPDONE/SETUPSKIP
+// checks below, same file-existence style throughout this codebase.
+static bool sm_startmenu_cfg_exists(void) {
+    int fd = userconf_open_read("STARTMENU.CFG", "/CONFIG/STARTMENU.CFG");   // #236
+    if (fd < 0) return false;
+    sys_close(fd);
+    return true;
+}
+
+// True iff the wizard's "Skip to Desktop" escape hatch was used THIS boot.
+// Deliberately re-checked every poll rather than cached: the wizard sets this
+// mid-session, well after this compositor (and startmenu_init()) already
+// started, so there is no single moment before that write where caching "not
+// skipped yet" would stay correct.
+//
+// #236 FIX: this used to be sys_open("/CONFIG/SETUPSKIP", 0), which #229
+// (2026-08-xx, see kernel/proc/syscall.h's SYS_FIRSTRUN block) made
+// permanently stale - SETUPSKIP stopped being a file at all and became one
+// bit of per-boot kernel RAM (FR_SKIP_SET/FR_SKIP_GET), precisely because a
+// uid-1000 wizard could never write /CONFIG either. This probe was never
+// updated to match, so on every "Skip to Desktop" boot since #229 landed,
+// sm_startmenu_cfg_exists() correctly reported "no file yet" but this always
+// returned false too (nothing has written /CONFIG/SETUPSKIP in months), and
+// startmenu_favs_poll()'s fallback default-favourites seed below never fired
+// for a skip-to-desktop machine - an EMPTY dock forever, the same visible
+// symptom as #236's main bug, from a second, independent cause. Fixed by
+// reading the SAME kernel flag the wizard now sets (FR_SKIP_GET, #229),
+// instead of a file nothing writes anymore.
+static bool sm_setupskip_present(void) {
+    return sys_firstrun(FR_SKIP_GET) == 1;
 }
 
 // Called once per compositor frame from main.c, same throttled-poll idiom as
@@ -679,13 +1035,58 @@ void startmenu_favs_poll(void) {
     static int throttle = 0;
     if (++throttle < 30) return;   // ~ once a second at the ~33ms main-loop tick
     throttle = 0;
+    sm_favdebug_check("startmenu_favs_poll:tick");   // #223 rd2: catches a
+    // count change / canary break with NO direct write in this file (proves
+    // hypothesis B if it ever fires with no preceding tagged [FAVDEBUG] line)
     sm_load_favs_channel();
+
+    // 2026-08-18 fix (see sm_seed_default_favorites()'s own comment for the
+    // full race this closes): only fall back to the hardcoded hint-menu
+    // default dock once we know FAVCH.CFG is never coming, i.e. "Skip to
+    // Desktop" was actually used THIS session. Checked here rather than once
+    // at startmenu_init() precisely because SETUPSKIP is written well after
+    // startmenu_init() already ran. static s_tried, not a return-value cache
+    // on sm_seed_default_favorites() itself, because a run that seeds zero
+    // entries (every SM_DEFAULT_FAVORITES path failed validation - a golden
+    // built without one of these apps) must not retry every second forever,
+    // but also never got to call sm_save_state(), so
+    // sm_startmenu_cfg_exists() alone would keep re-triggering it.
+    static bool s_tried = false;
+    if (!s_tried && !sm_startmenu_cfg_exists() && sm_setupskip_present()) {
+        s_tried = true;
+        sm_seed_default_favorites();
+    }
 }
 
 // ============================================================================
 // Recents tracking + launch
 // ============================================================================
 
+// #223 round 3: this function used to shift entries with a per-element
+// strncpy(g_recent_paths[i], g_recent_paths[i-1], 128) loop, ONE ROW AT A
+// TIME, walking from the highest index down to 1. Bisected live (FAVDEBUG
+// checkpoints before/after the loop, then a per-iteration trace) against a
+// CONFIRMED NONZERO g_fav_count baseline (7, via sm_seed_default_favorites):
+// g_fav_count flipped 7->0 INSIDE this loop, specifically on the call where
+// `last` first reaches MAX_RECENTS-1 (i.e. the shift touches the last row,
+// index 9, for the first time), with BOTH canaries still intact afterward -
+// so the write landed exactly on g_fav_count and nowhere past it. Every
+// index used (`found`, `last`) is provably < MAX_RECENTS, so the earlier
+// round-2 static audit's conclusion ("every shift and index is clamped")
+// was WRONG about what that clamp guaranteed: a clamped, in-bounds INDEX
+// does not by itself prove the ROW-WIDTH COPY at that index cannot reach
+// past the array, and reading the loop was not enough to catch that - only
+// driving it with a real >=128-byte path against a live, watched, nonzero
+// counter found it. The exact byte-level mechanism inside the old
+// per-element strncpy loop was not pinned down further (out of budget this
+// round - see blame.md), but the fix does not need it: `memmove()` is the
+// correct, single, well-defined primitive for "shift N whole array rows by
+// one slot" and removes the entire hand-rolled loop this bug lived in,
+// rather than trying to patch the loop's arithmetic and hope the same class
+// of mistake does not recur. Do NOT reorder the g_recent_paths/g_fav_count
+// statics and do NOT insert padding between them to "fix" this - that would
+// hide the same class of bug from ever showing up again if it exists
+// elsewhere in this file, rather than removing it.
 static void sm_record_recent(const char *path) {
     if (path[0] == '@') return;   // skip pseudo-actions (Recycle Bin sentinel)
     int found = -1;
@@ -694,17 +1095,32 @@ static void sm_record_recent(const char *path) {
     }
     if (found == 0) return;   // already the most recent: nothing to do
     if (found > 0) {
-        for (int i = found; i > 0; i--)
-            strncpy(g_recent_paths[i], g_recent_paths[i-1], 128);
+        // Shift rows [0 .. found-1] up into [1 .. found] in one bulk move -
+        // memmove() handles the overlap correctly (this is a shift within a
+        // single contiguous object, source and dest ranges overlap by
+        // construction) and cannot express a per-row length past
+        // sizeof(g_recent_paths[0]) the way a hand-rolled loop could.
+        memmove(&g_recent_paths[1], &g_recent_paths[0],
+                (size_t)found * sizeof(g_recent_paths[0]));
+        sm_favdebug_check("sm_record_recent:after-promote-shift");
     } else {
         int last = (g_recent_count < MAX_RECENTS) ? g_recent_count : MAX_RECENTS - 1;
-        for (int i = last; i > 0; i--)
-            strncpy(g_recent_paths[i], g_recent_paths[i-1], 128);
+        if (last >= MAX_RECENTS) last = MAX_RECENTS - 1;   // defense in depth
+        if (last > 0) {
+            memmove(&g_recent_paths[1], &g_recent_paths[0],
+                    (size_t)last * sizeof(g_recent_paths[0]));
+        }
+        sm_favdebug_check("sm_record_recent:after-insert-shift");
         if (g_recent_count < MAX_RECENTS) g_recent_count++;
+        sm_favdebug_check("sm_record_recent:after-count-increment");
     }
     strncpy(g_recent_paths[0], path, 127);
     g_recent_paths[0][127] = 0;
-    sm_save_state();
+    sm_favdebug_check("sm_record_recent");
+    // #223 rd2: recents-only save (see its own comment) - never trusts
+    // in-memory g_fav_count/g_fav_paths, so a launch can no longer stamp an
+    // in-memory favourites glitch permanently over the on-disk list.
+    sm_save_recents_only();
 }
 
 // Launch item idx the same way a real click always has (native sys_spawn /
@@ -717,7 +1133,7 @@ static void sm_launch_item(int idx) {
     menu_item_t *it = &g_menu_items[idx];
     const char *path = it->exec_path;
     switch (it->launch_type) {
-        case LAUNCH_WIN16: win16_run(path); break;
+        case LAUNCH_WIN16: win16_run_mode(path, it->win16_mode); break;   // (#845)
         case LAUNCH_DOS:   dos_run(path);   break;
         default:
             if (path[0] == '@' && path[1] == 'R') {
@@ -761,9 +1177,81 @@ void startmenu_toggle_favorite_path(const char *path) {
         g_fav_paths[g_fav_count][127] = 0;
         g_fav_count++;
     }
+    sm_favdebug_check("startmenu_toggle_favorite_path");
     sm_save_state();
     g_needs_redraw = true;
 }
+
+#ifdef MAYTERA_TESTHOOK
+// #223 rd2 GUARD VERIFICATION verb support, diagnostic-only. Simulates the
+// EXACT glitch this investigation was chasing (g_fav_count zeroed in memory
+// by some means this session could not catch live) WITHOUT needing to
+// reproduce the real trigger, so the sm_save_recents_only() guard can be
+// proven to close the amplifier independently of ever pinning that trigger
+// down. Only compiled under MAYTERA_TESTHOOK (same gate as testhook.c
+// itself, never in a golden - see that file's own header comment).
+void startmenu_debug_force_fav_zero(void) {
+    g_fav_count = 0;
+}
+
+// #223 rd3: calls the REAL sm_record_recent() with an arbitrary caller-
+// supplied path (may be >=128 bytes) so the round-2 adjacency hypothesis
+// (g_recent_paths ends exactly where g_fav_count begins in .bss, see the
+// SM_STATE_BUF/MAYTERA_FAVDEBUG comment above) can be tested with the exact
+// data shape the hypothesis needs, rather than a scripted open/close repro
+// that only ever produces short paths. Exercises the SAME function every
+// real app launch calls (startmenu_launch_item -> sm_record_recent), not a
+// parallel path. Diagnostic-only, same gate as everything else in this
+// block.
+void startmenu_debug_record_recent(const char *path) {
+    sm_record_recent(path);
+}
+
+// #223 rd3: exercises every branch of sm_record_recent()'s shift/insert
+// logic with paths >=128 bytes in ONE call (a single TESTHOOK.CMD is
+// one-shot and consumed on read, see testhook_poll()'s own comment, so a
+// multi-step scenario has to live in one verb the same way DEMO127 does).
+// Sequence: 11 distinct >=140-byte paths (fills all MAX_RECENTS=10 slots,
+// then forces the "already full" eviction branch on push #11), then a
+// re-push of path #5 (now mid-list) to exercise the found>0 promote-shift
+// branch too, all with maximal-length content. sm_favdebug_check() inside
+// sm_record_recent() logs fav_count/canary on every call when built with
+// FAVDEBUG=1, so a break shows up on serial/FAVDEBUG.OUT without any
+// separate accessor. Diagnostic-only, same gate as everything else here.
+void startmenu_debug_recent_stress(void) {
+    static char p[16][160];
+    for (int i = 0; i < 11; i++) {
+        char *q = p[i];
+        const char *pre = "/STRESS/";
+        while (*pre) *q++ = *pre++;
+        for (int j = 0; j < 140; j++) *q++ = (char)('A' + (i % 26));
+        const char *suf = "/END.TXT";
+        while (*suf) *q++ = *suf++;
+        *q = 0;
+        sm_record_recent(p[i]);
+    }
+    sm_record_recent(p[5]);   // re-push a mid-list long entry: found>0 branch
+}
+
+// #223 rd3b: the coordinator correctly flagged that startmenu_debug_recent_stress()
+// above ran against g_fav_count==0 the whole time (this diagnostic VM never
+// completed OOBE, so sm_seed_default_favorites() was never called) - a test
+// whose subject starts in the failure state cannot detect a transition INTO
+// that state. This wrapper forces a real nonzero baseline FIRST (the same
+// sm_seed_default_favorites() every real profile's first boot calls, 7 items,
+// same as round 2's own live setup), logs it via sm_favdebug_check so the
+// nonzero starting value is on record BEFORE any long path is recorded, then
+// runs the exact same stress sequence as startmenu_debug_recent_stress().
+// Diagnostic-only, same gate as everything else here.
+void startmenu_debug_seed_and_stress(void) {
+    if (g_fav_count == 0) {
+        sm_seed_default_favorites();
+    }
+    sm_favdebug_check("rd3b:baseline-before-stress");
+    startmenu_debug_recent_stress();
+    sm_favdebug_check("rd3b:after-stress");
+}
+#endif
 
 void startmenu_item_toggle_favorite(int item_idx) {
     if (item_idx < 0 || item_idx >= g_total_items) return;
@@ -867,7 +1355,16 @@ void startmenu_apply_icon_overrides(void) {
 // favorites list rather than a currently-rendered menu row).
 void startmenu_launch_path(const char *path, int launch_type) {
     switch (launch_type) {
-        case LAUNCH_WIN16: win16_run(path); break;
+        case LAUNCH_WIN16: {
+            // (#845) No menu_item_t index at this call site (favorites/dock
+            // items carry only path+launch_type) - look the mode back up by
+            // path, same identity sm_find_item_by_path() already uses for
+            // favorites/recents matching. Not found (item no longer in the
+            // live menu) falls back to auto.
+            int wmi = sm_find_item_by_path(path);
+            win16_run_mode(path, wmi >= 0 ? g_menu_items[wmi].win16_mode : -1);
+            break;
+        }
         case LAUNCH_DOS:   dos_run(path);   break;
         default:
             if (path[0] == '@' && path[1] == 'R') {
@@ -976,65 +1473,22 @@ int startmenu_properties_handle_key(int key) {
 
 bool startmenu_power_confirm_open(void) { return g_power_confirm != 0; }
 
-static void sm_confirm_rect(int *px, int *py, int *pw, int *ph) {
-    *pw = 300; *ph = 130;
-    *px = (g_fb_width - *pw) / 2;
-    *py = (g_fb_height - *ph) / 2;
-}
+// ============================================================================
+// (docs/CONFIRM_MODAL_DESIGN.html, 86f3cea) Ported onto confirmdialog.c, the
+// ONE shared system-modal confirm/notice card - this used to be a fifth hand-
+// rolled box (own CLR_MENU_* fills, own button rects, own text) with two real
+// defects the design doc's audit found: no focus concept at all (a bare Enter
+// unconditionally fired the destructive action, whatever the pointer had last
+// hovered) and no input-settle timer (a buffered/fast Enter could chain
+// straight into confirming). confirmdialog.c fixes both, copying elevate.c's
+// already-proven mechanism (initial focus on Cancel for anything destructive,
+// a 250ms settle window) - see confirmdialog.h for the detail. This file now
+// only supplies the per-action content (title/body/variant/labels) and the
+// real actions (poweroff/reboot/exit/lock).
+// ============================================================================
+static confirm_dialog_t g_pc_dialog;
 
-static const char *sm_confirm_title(int action) {
-    switch (action) {
-        case 1: return "Shut Down";
-        case 2: return "Restart";
-        case 3: return "Log Out";
-        case 4: return "Lock Screen";
-        default: return "";
-    }
-}
-
-static const char *sm_confirm_body(int action) {
-    switch (action) {
-        case 1: return "Shut down MayteraOS now?";
-        case 2: return "Restart MayteraOS now?";
-        case 3: return "Log out and return to the login screen?";
-        case 4: return "Lock the screen now?";
-        default: return "";
-    }
-}
-
-void startmenu_power_confirm_render(void) {
-    if (!g_power_confirm) return;
-    int px, py, pw, ph; sm_confirm_rect(&px, &py, &pw, &ph);
-
-    // Dim the desktop behind the dialog (same technique launcher.c uses).
-    g_draw_blend = 130;
-    draw_fill_rect(0, 0, g_fb_width, g_fb_height, 0xFF0B0D12);
-    g_draw_blend = 255;
-
-    draw_fill_rect(px + 3, py + 3, pw, ph, CLR_MENU_SHADOW);
-    draw_fill_rect(px, py, pw, ph, CLR_MENU_BG);
-    draw_rect_outline(px, py, pw, ph, CLR_MENU_BORDER);
-
-    draw_text(px + 16, py + 14, sm_confirm_title(g_power_confirm), CLR_MENU_TEXT);
-    draw_text(px + 16, py + 42, sm_confirm_body(g_power_confirm), readable_ink_dim(CLR_MENU_BG));
-
-    int bw = (pw - 36) / 2, bh = 30;
-    int by = py + ph - bh - 14;
-    int bx1 = px + 12, bx2 = px + 12 + bw + 12;
-
-    draw_fill_rect(bx1, by, bw, bh, CLR_MENU_ITEM_NORM);
-    draw_rect_outline(bx1, by, bw, bh, CLR_MENU_BORDER);
-    draw_text_centered(bx1 + bw / 2, by + (bh - FONT_CHAR_H) / 2, "Cancel", CLR_MENU_TEXT);
-
-    draw_fill_rect(bx2, by, bw, bh, CLR_MENU_ITEM_NORM);
-    draw_rect_outline(bx2, by, bw, bh, CLR_MENU_BORDER);
-    draw_text_centered(bx2 + bw / 2, by + (bh - FONT_CHAR_H) / 2, sm_confirm_title(g_power_confirm), CLR_POWER_RED);
-}
-
-static void sm_power_confirm_yes(void) {
-    int action = g_power_confirm;
-    g_power_confirm = 0;
-    g_needs_redraw = true;
+static void sm_power_confirm_dispatch(int action) {
     switch (action) {
         case 1: poweroff(); break;   // real ACPI/emulator power-off
         case 2: reboot();   break;   // real ACPI reset
@@ -1053,48 +1507,80 @@ static void sm_power_confirm_yes(void) {
     }
 }
 
+// Called from the power-grid click handler below when a power action is
+// picked. Builds the dialog's content and opens it; confirm_dialog_render()
+// (below) draws the scrim + card together every time it runs, same pattern
+// as elevate.c - see confirmdialog.c's confirm_dialog_scrim() comment for why
+// that is safe here (render_frame_body() recomposites from scratch on every
+// real redraw, so there is nothing to double-blend).
+static void startmenu_power_confirm_show(int action) {
+    // Destructive: loses unsaved work. Neutral: does not (design doc 2.2).
+    confirm_variant_t variant = (action == 1 || action == 2) ? CONFIRM_DESTRUCTIVE : CONFIRM_NEUTRAL;
+    const char *title;
+    const char *body;
+    switch (action) {
+        case 1: title = "Shut Down";   body = "Shut down MayteraOS now? Any unsaved work in open apps will be lost."; break;
+        case 2: title = "Restart";     body = "Restart MayteraOS now? Any unsaved work in open apps will be lost.";  break;
+        case 3: title = "Log Out";     body = "Log out and return to the login screen?"; break;
+        case 4: title = "Lock Screen"; body = "Lock the screen now?"; break;
+        default: return;
+    }
+    const char *lines[1] = { body };
+    confirm_dialog_open(&g_pc_dialog, variant, title, lines, 1,
+                        "Cancel", title);
+    g_power_confirm = action;
+    g_needs_redraw = true;
+}
+
+void startmenu_power_confirm_render(void) {
+    if (!g_power_confirm) return;
+    confirm_dialog_render(&g_pc_dialog);
+}
+
 bool startmenu_power_confirm_handle_mouse(int32_t x, int32_t y, bool clicked) {
     if (!g_power_confirm) return false;
-    int px, py, pw, ph; sm_confirm_rect(&px, &py, &pw, &ph);
-    int bw = (pw - 36) / 2, bh = 30;
-    int by = py + ph - bh - 14;
-    int bx1 = px + 12, bx2 = px + 12 + bw + 12;
-    if (clicked) {
-        if (x >= bx1 && x < bx1 + bw && y >= by && y < by + bh) {
-            g_power_confirm = 0; g_needs_redraw = true; return true;
-        }
-        if (x >= bx2 && x < bx2 + bw && y >= by && y < by + bh) {
-            sm_power_confirm_yes(); return true;
-        }
-    }
+    int r = confirm_dialog_handle_mouse(&g_pc_dialog, x, y, clicked);
+    if (r == 1) { g_power_confirm = 0; g_needs_redraw = true; }
+    else if (r == 2) { int action = g_power_confirm; g_power_confirm = 0; g_needs_redraw = true; sm_power_confirm_dispatch(action); }
     return true;   // true modal: swallow every other click while open
 }
 
 int startmenu_power_confirm_handle_key(int key) {
     if (!g_power_confirm) return 0;
-    if (key == 27 /* ESC */) { g_power_confirm = 0; g_needs_redraw = true; return 1; }
-    if (key == '\n' || key == '\r') { sm_power_confirm_yes(); return 1; }
-    return 1;
+    int r = confirm_dialog_handle_key(&g_pc_dialog, key);
+    if (r == 1) { g_power_confirm = 0; g_needs_redraw = true; }
+    else if (r == 2) { int action = g_power_confirm; g_power_confirm = 0; g_needs_redraw = true; sm_power_confirm_dispatch(action); }
+    return 1;   // true modal: swallow every key while open (matches the pre-existing contract)
 }
 
 // ============================================================================
 // Power section layout (2x2 grid: Lock/Log Out on top, Restart/Shut Down below)
 // ============================================================================
 
+// #uiscale BUGFIX (report 3, "the design isn't consistent"): every OTHER
+// band macro in this file's layout (START_MENU_ITEM_H, START_MENU_CAT_H,
+// START_MENU_HEADER_H, START_MENU_SEARCH_H, START_MENU_SEP_H) is a scaled
+// ui_px() theme metric, but this 2x2 power grid at the very bottom of the
+// menu was five bare 1x literals (8, 28, 6, 8, 24). At 200% the panel
+// doubled everywhere above it and the Lock/Log Out/Restart/Shut Down row
+// stayed pinned to its 1x size - the exact "scaled but inconsistent" shape
+// the report describes, and the most visible single instance of it because
+// it sits at the bottom edge where the size mismatch reads as a seam.
+// Byte-identical to the old literals at 100%.
 static int32_t sm_power_section_h(void) {
-    return 8 + 28 * 2 + 6 + 8;   // top pad + 2 rows + inter-row gap + bottom pad
+    return ui_px(8) + ui_px(28) * 2 + ui_px(6) + ui_px(8);   // top pad + 2 rows + inter-row gap + bottom pad
 }
 
 static void sm_power_rects(int32_t mx, int32_t w, int32_t sec_y,
                             int32_t *bw, int32_t *bh,
                             int32_t *row1_y, int32_t *row2_y,
                             int32_t *bx1, int32_t *bx2) {
-    *bw = (w - 24) / 2;
-    *bh = 28;
-    *row1_y = sec_y + 8;
-    *row2_y = *row1_y + *bh + 6;
-    *bx1 = mx + 8;
-    *bx2 = mx + 8 + *bw + 8;
+    *bw = (w - ui_px(24)) / 2;
+    *bh = ui_px(28);
+    *row1_y = sec_y + ui_px(8);
+    *row2_y = *row1_y + *bh + ui_px(6);
+    *bx1 = mx + ui_px(8);
+    *bx2 = mx + ui_px(8) + *bw + ui_px(8);
 }
 
 // ============================================================================
@@ -1282,10 +1768,18 @@ static sm_fly_geom_t sm_flyout_geom(const sm_geom_t *root) {
     (void)wa_x; (void)wa_w;
     int32_t area_top = wa_y + POPUP_EDGE_MARGIN;
     int32_t area_bot = wa_y + wa_h - POPUP_EDGE_MARGIN;
+    // #uiscale (report 3): this file's own top+bottom pad constant (8) was
+    // bare while START_MENU_ITEM_H (everything it pads) is scaled - fixed
+    // here since it is single-sourced in this one geometry function that
+    // both sizes and draws the flyout. (POPUP_EDGE_MARGIN, a SEPARATE
+    // compositor.h-wide constant used just above for the flyout's screen-edge
+    // clamp, is also unscaled and shared by many other popups - out of scope
+    // for this pass, flagged in the report instead of changed blind.)
+    int32_t pad8 = ui_px(8);
     int32_t max_h = area_bot - area_top;
-    if (max_h < START_MENU_ITEM_H + 8) max_h = START_MENU_ITEM_H + 8;
+    if (max_h < START_MENU_ITEM_H + pad8) max_h = START_MENU_ITEM_H + pad8;
 
-    int32_t natural_h = 8 + f.item_count * START_MENU_ITEM_H;   // top+bottom pad
+    int32_t natural_h = pad8 + f.item_count * START_MENU_ITEM_H;   // top+bottom pad
     f.scrollable = natural_h > max_h;
     if (f.scrollable) {
         // Snap the viewport to a WHOLE number of rows. The sm_scroll_t comment
@@ -1296,13 +1790,13 @@ static sm_fly_geom_t sm_flyout_geom(const sm_geom_t *root) {
         // render loop. That is the second half of the reported clipping, and
         // it is the half that appears exactly when a category gains one more
         // item than the viewport can hold.
-        int32_t rows = (max_h - 8) / START_MENU_ITEM_H;
+        int32_t rows = (max_h - pad8) / START_MENU_ITEM_H;
         if (rows < 1) rows = 1;
         f.viewport_h = rows * START_MENU_ITEM_H;
-        f.h = f.viewport_h + 8;
+        f.h = f.viewport_h + pad8;
     } else {
         f.h = natural_h;
-        f.viewport_h = f.h - 8;
+        f.viewport_h = f.h - pad8;
     }
 
     f.y = sm_cathdr_screen_y(g_flyout_cat, root);
@@ -1459,11 +1953,69 @@ extern DIR *opendir(const char *name);
 extern struct sm_dirent *readdir(DIR *dirp);
 extern int closedir(DIR *dirp);
 extern int access(const char *path, int mode);
+// Best-effort serial diagnostics, same idiom as apps/files/main.c's
+// printf("[files] ...") - declared here rather than by including <stdio.h>
+// for the same reason opendir/readdir are: this TU's compositor.h defines
+// `bool` as int, and libc/types.h defines it as _Bool.
+extern int printf(const char *fmt, ...);
 
 // ---- Rust FFI: exported by startmenu_model.rs, called from C -------------
 extern void  sm_model_reset(void);
 extern void  sm_model_add_fragment(const uint8_t *text, uint32_t text_len);
+// Streaming form of the same parse: one fragment fed a LINE at a time, so
+// no caller needs a buffer the size of the whole file. See sm_feed_file().
+extern void  sm_model_frag_begin(void);
+extern void  sm_model_frag_line(const uint8_t *text, uint32_t text_len);
+extern void  sm_model_frag_end(void);
 extern int32_t sm_model_finish(void);
+
+// ---- #220 instance 3: make the load path SAY what it did ------------------
+//
+// The whole Start-menu load path was silent. sm_feed_dir() returns quietly on a
+// missing directory; sm_model_finish() drops an item whose target does not
+// exist without a word (by design - a broken entry must not render - but the
+// DECISION was never reported). So an entry that was authored, shipped, and
+// then dropped looked from the outside exactly like an entry that was never
+// authored at all, and an empty menu looked exactly like a working one. That is
+// the #220 defect shape: something does not ship and nothing says so.
+//
+// It is also why a probe of this area found a serial line reading
+// "MENU.CFG loaded: 2 categories" and could not tell whether it was a lie or a
+// second config format. It was neither: that string is
+// "[StartMenu] STRTMENU.CFG loaded: %d categories", from the KERNEL start menu
+// that #552 (bdead72c) deleted on 2026-07-20, and it survives only as unerased
+// bytes in the FAT free space of the static asset base. No shipping code has
+// printed it since; MEASURED on golden build 2010, a full boot to
+// DESKTOP_READY prints no such line. There is no MENU.CFG reader anywhere in
+// the tree. The lesson recorded in blame.md: a string found in an IMAGE is not
+// evidence of code that RUNS, because deleting a file from FAT does not erase
+// its bytes - the same property that once leaked a credential into a published
+// asset.
+//
+// REPORTED ONLY WHEN IT CHANGES. sm_rust_rebuild() runs about once a second
+// (startmenu_rust_poll()), so an unconditional line would be ~86k lines of
+// serial a day and the one that mattered would be unfindable.
+#define SM_DROP_MAX 16
+static int  g_sm_frag_count;                    // fragments fed this rebuild
+static int  g_sm_drop_n;                        // drops recorded this rebuild
+static int  g_sm_drop_over;                     // drops beyond SM_DROP_MAX
+static char g_sm_drop_name[SM_DROP_MAX][64];
+static char g_sm_drop_bin [SM_DROP_MAX][160];
+static long g_sm_frag_bytes;                    // fragment bytes actually parsed
+static int  g_sm_longline;                      // lines too long for SM_FRAG_LINE
+
+void sm_c_note_drop(const uint8_t *name, uint32_t name_len,
+                    const uint8_t *bin,  uint32_t bin_len)
+{
+    if (g_sm_drop_n >= SM_DROP_MAX) { g_sm_drop_over++; return; }
+    unsigned nn = name_len < sizeof(g_sm_drop_name[0]) - 1
+                ? name_len : (unsigned)sizeof(g_sm_drop_name[0]) - 1;
+    unsigned bn = bin_len  < sizeof(g_sm_drop_bin[0]) - 1
+                ? bin_len  : (unsigned)sizeof(g_sm_drop_bin[0]) - 1;
+    memcpy(g_sm_drop_name[g_sm_drop_n], name, nn); g_sm_drop_name[g_sm_drop_n][nn] = 0;
+    memcpy(g_sm_drop_bin [g_sm_drop_n], bin,  bn); g_sm_drop_bin [g_sm_drop_n][bn] = 0;
+    g_sm_drop_n++;
+}
 
 // ---- Rust FFI: called BY startmenu_model.rs, implemented here ------------
 int32_t sm_c_path_exists(const uint8_t *path, uint32_t path_len)
@@ -1492,7 +2044,7 @@ void sm_c_add_category(const uint8_t *label, uint32_t label_len, int32_t expande
 void sm_c_add_item(const uint8_t *name, uint32_t name_len,
                     const uint8_t *path, uint32_t path_len,
                     const uint8_t *icon, uint32_t icon_len,
-                    int32_t launch_type)
+                    int32_t launch_type, int32_t win16_mode)
 {
     static char nbuf[64], pbuf[160], ibuf[32];
     unsigned nn = name_len < sizeof(nbuf) - 1 ? name_len : (unsigned)sizeof(nbuf) - 1;
@@ -1501,17 +2053,98 @@ void sm_c_add_item(const uint8_t *name, uint32_t name_len,
     memcpy(nbuf, name, nn); nbuf[nn] = 0;
     memcpy(pbuf, path, pn); pbuf[pn] = 0;
     memcpy(ibuf, icon, in); ibuf[in] = 0;
-    add_item_typed(nbuf, sm_icon_by_name(ibuf), pbuf, launch_type);
+    add_item_typed(nbuf, sm_icon_by_name(ibuf), pbuf, launch_type, win16_mode);
 }
 
 // Read every "*.MENU" fragment in `dir`, filename-sorted, feeding each one's
 // full text to the Rust model in order. A missing directory contributes zero
 // fragments and is NOT an error and NOT a signal to fall back to anything -
-// see startmenu_model.rs's "NO FALLBACK, EVER" note. Single-shot sys_open/
-// sys_read per fragment, no loop that can block (#426); fragment counts are
+// see startmenu_model.rs's "NO FALLBACK, EVER" note. Fragment counts are
 // expected in the tens, not thousands, so an insertion sort is plenty.
-#define SM_FRAG_MAX  64
-#define SM_FRAG_NAME 64
+//
+// THE FRAGMENT IS STREAMED, NOT SLURPED, AND THAT IS THE WHOLE POINT.
+//
+// This used to be `static char text[8192]` plus ONE `sys_read(fd, text,
+// sizeof(text) - 1)`, and both halves of that were silently lossy:
+//
+//   * a fragment LARGER than 8191 bytes lost every line past byte 8191, and
+//   * a SHORT read (sys_read is not obliged to return everything in one call)
+//     lost the tail of a fragment of any size.
+//
+// Neither said a word. The parser never saw the missing lines, so the
+// item-level "dropped" reporting #220 added could not report them either: an
+// item that was authored, shipped and then read off the end of a buffer looked
+// exactly like an item nobody ever wrote.
+//
+// MEASURED, not theorised. build/assets/startmenu/system.d/03-games.MENU was
+// 7,960 bytes when the Discworld II entry landed on 2026-08-21 (34 items, all
+// 34 parsed). Comment blocks added on 2026-08-23 and 2026-08-25 took it to
+// 12,982 bytes, and on the golden the owner was running (build 2215) the four
+// items past the cut - Rogue, Rogue (DOS), Discworld II and Pyro! (floppy) -
+// were gone. The Start menu reported "10 fragment(s) read, 74 item(s) shown,
+// 0 dropped" while the fragments on disk declared 78. The owner's report was
+// "discworld ii is not in the start menu"; the CD volume was mounted correctly
+// on E: and DWB.EXE was readable. Nothing was wrong except the buffer.
+//
+// So there is no whole-file buffer any more, and therefore no file-size number
+// anywhere that a future comment block can outgrow. The file is read in fixed
+// chunks and handed to the model one COMPLETE LINE at a time
+// (sm_model_frag_begin / sm_model_frag_line / sm_model_frag_end). The only
+// remaining bound is one LINE, at SM_FRAG_LINE bytes; the longest line in any
+// shipped fragment is under 90, and a line that does overflow is COUNTED and
+// REPORTED rather than truncated into a different, valid-looking directive.
+//
+// #426: the read loop is bounded by EOF (sys_read returning <= 0), not by a
+// condition another context has to satisfy. It is a file read, not a wait.
+#define SM_FRAG_MAX   64
+#define SM_FRAG_NAME  64
+#define SM_FRAG_CHUNK 4096
+#define SM_FRAG_LINE  1024
+
+// Feed ONE fragment file. Returns 1 if it contributed a fragment, 0 if it could
+// not be opened or was empty (neither is an error; see the note above).
+static int sm_feed_file(const char *path)
+{
+    static char chunk[SM_FRAG_CHUNK];
+    static char line[SM_FRAG_LINE];
+
+    int fd = sys_open(path, 0);
+    if (fd < 0) return 0;
+
+    unsigned lp    = 0;   // bytes buffered for the line being assembled
+    int      over  = 0;   // this line overflowed `line`; discard it, do not truncate
+    int      began = 0;
+    long     total = 0;
+
+    for (;;) {
+        long r = sys_read(fd, chunk, sizeof(chunk));
+        if (r <= 0) break;
+        if (!began) { sm_model_frag_begin(); began = 1; }
+        total += r;
+        for (long k = 0; k < r; k++) {
+            char c = chunk[k];
+            if (c == '\n' || c == '\r') {
+                if (over)      { g_sm_longline++; }
+                else if (lp)   { sm_model_frag_line((const uint8_t *)line, lp); }
+                lp = 0; over = 0;
+                continue;
+            }
+            if (lp + 1 >= sizeof(line)) { over = 1; continue; }
+            line[lp++] = c;
+        }
+    }
+    sys_close(fd);
+
+    if (!began) return 0;
+    // A final line with no trailing newline is still a line.
+    if (over)    g_sm_longline++;
+    else if (lp) sm_model_frag_line((const uint8_t *)line, lp);
+    sm_model_frag_end();
+
+    g_sm_frag_bytes += total;
+    return 1;
+}
+
 static void sm_feed_dir(const char *dir)
 {
     DIR *d = opendir(dir);
@@ -1539,19 +2172,14 @@ static void sm_feed_dir(const char *dir)
     }
 
     static char path[192];
-    static char text[8192];
     for (int i = 0; i < n; i++) {
         int di = 0; while (dir[di] && di < 150) { path[di] = dir[di]; di++; }
         path[di++] = '/';
         int fi = 0; while (names[i][fi] && di < 190) path[di++] = names[i][fi++];
         path[di] = 0;
 
-        int fd = sys_open(path, 0);
-        if (fd < 0) continue;
-        long rl = sys_read(fd, text, sizeof(text) - 1);
-        sys_close(fd);
-        if (rl <= 0) continue;
-        sm_model_add_fragment((const uint8_t *)text, (uint32_t)rl);
+        if (sm_feed_file(path))
+            g_sm_frag_count++;   // #220: counted so the summary can report zero
     }
 }
 
@@ -1626,17 +2254,138 @@ static void sm_feed_user_layer(void)
 // here too so this function is a complete, idempotent replacement for the old
 // startmenu_init() hardcoded block - call it and the menu IS whatever the two
 // config layers say, nothing more.
+// Declared here because sm_rust_rebuild() must call it; defined further down
+// with the rest of the Win16 program-group loader.
+static void startmenu_load_win16_groups(void);
+
 static void sm_rust_rebuild(void)
 {
+    sm_favdebug_check("sm_rust_rebuild:before");
     memset(g_categories, 0, sizeof(g_categories));
     memset(g_menu_items,  0, sizeof(g_menu_items));
     g_total_items = 0;
     g_next_cat    = 0;   // no built-in categories reserve a slot any more
+    sm_favdebug_check("sm_rust_rebuild:after-memsets");
+
+    g_sm_frag_count = 0;
+    g_sm_frag_bytes = 0;
+    g_sm_longline   = 0;
+    g_sm_drop_n     = 0;
+    g_sm_drop_over  = 0;
 
     sm_model_reset();
     sm_feed_system_layer();
     sm_feed_user_layer();
-    sm_model_finish();
+    int emitted = sm_model_finish();
+    sm_favdebug_check("sm_rust_rebuild:after-model-finish");
+
+    // #220: report the OUTCOME, and only when it changes (see sm_c_note_drop).
+    //
+    // AND IT GOES TO /BOOTLOG.TXT, NOT ONLY TO SERIAL, because serial is silent
+    // in GUI mode and on the owner's real hardware there is no serial at all.
+    // When "Discworld II is not in the Start menu" came back from a physical
+    // machine, the recovered /BOOTLOG.TXT could say which USB tail volumes had
+    // mounted (it did, correctly, all five) but had NOTHING to say about the
+    // Start menu, so the one question that mattered - was the item dropped, or
+    // never parsed - was unanswerable from the artifact and had to be
+    // reproduced on a VM. Three short lines per boot buy that answer. They are
+    // still emitted ONLY when the numbers change (sm_rust_rebuild() runs about
+    // once a second), so the steady-state cost is zero.
+    //
+    // The three numbers are deliberately separate, because they fail
+    // differently and the difference is the diagnosis:
+    //   fragment(s)/bytes - what the loader actually READ. Zero fragments means
+    //                       the menu is empty BY CONFIG. Fewer bytes than the
+    //                       files hold means the reader lost content.
+    //   item(s) shown     - what survived the merge AND the existence check.
+    //   dropped           - items the existence check REFUSED, each named with
+    //                       its launch target, so "dropped because the path is
+    //                       not on this disk" can never again be confused with
+    //                       "never configured" (#537 says do not render dead
+    //                       items; it does not say do not say so).
+    static int  last_frag = -1, last_emit = -1, last_drop = -1, last_long = -1;
+    static long last_bytes = -1;
+    int dropped = g_sm_drop_n + g_sm_drop_over;
+    if (g_sm_frag_count != last_frag || emitted != last_emit ||
+        dropped != last_drop || g_sm_longline != last_long ||
+        g_sm_frag_bytes != last_bytes) {
+        last_frag  = g_sm_frag_count; last_emit = emitted; last_drop = dropped;
+        last_long  = g_sm_longline;   last_bytes = g_sm_frag_bytes;
+
+        char bl[192];
+        snprintf(bl, sizeof(bl),
+                 "[StartMenu] rebuild: %d fragment(s) read (%ld bytes), %d item(s) shown, %d dropped",
+                 g_sm_frag_count, g_sm_frag_bytes, emitted, dropped);
+        printf("%s\n", bl);
+        sys_bootlog(bl);
+
+        for (int i = 0; i < g_sm_drop_n; i++) {
+            snprintf(bl, sizeof(bl),
+                     "[StartMenu]   DROPPED '%s': launch target '%s' does not exist on this disk",
+                     g_sm_drop_name[i], g_sm_drop_bin[i]);
+            printf("%s\n", bl);
+            sys_bootlog(bl);
+        }
+        if (g_sm_drop_over) {
+            snprintf(bl, sizeof(bl), "[StartMenu]   (+%d more dropped, not listed)", g_sm_drop_over);
+            printf("%s\n", bl);
+            sys_bootlog(bl);
+        }
+        // A line too long for SM_FRAG_LINE is DISCARDED, not truncated: a
+        // truncated "item: X | /path" would be a different, valid-looking
+        // directive. Say so, with a count, so it can never be a silent loss the
+        // way the whole-file truncation this replaces was.
+        if (g_sm_longline) {
+            snprintf(bl, sizeof(bl),
+                     "[StartMenu]   %d fragment line(s) longer than %d bytes were DISCARDED, not truncated",
+                     g_sm_longline, SM_FRAG_LINE);
+            printf("%s\n", bl);
+            sys_bootlog(bl);
+        }
+        if (g_sm_frag_count == 0) {
+            snprintf(bl, sizeof(bl),
+                     "[StartMenu]   no .MENU fragments in either layer: the menu is empty BY CONFIG, not by fallback");
+            printf("%s\n", bl);
+            sys_bootlog(bl);
+        }
+    }
+
+    // THE WIN16 PROGRAM GROUPS HAVE TO BE RE-APPENDED HERE, AND THIS IS THE BUG
+    // THAT MADE THEM INVISIBLE. They are a SECOND producer of categories, fed
+    // from /WIN16GRP.CFG rather than from a .MENU fragment, and startmenu_init()
+    // called their loader exactly once, straight after the first rebuild.
+    //
+    // But startmenu_rust_poll() calls sm_rust_rebuild() UNCONDITIONALLY about
+    // once a second, and the first thing this function does is memset
+    // g_categories and reset g_next_cat. So roughly one second after the
+    // compositor started, every Win16 group was erased and never rebuilt.
+    //
+    // MEASURED on golden build 2021, not deduced: /WIN16GRP.CFG on the image
+    // declares two groups, "Microsoft Entertainment Pack" (8 titles) and
+    // "Microsoft Word 6.0" (/WIN16/WORD6/WINWORD.EXE). NEITHER appears in the
+    // Start menu, which lists only the five fragment categories. The path is
+    // fine: `wc -c /WIN16/WORD6/WINWORD.EXE` in Terminal on that same boot
+    // returns 3482624, so open() on it succeeds.
+    //
+    // TWO CONSEQUENCES, AND THE FIRST ONE INVERTS A CLAIM WORTH CORRECTING.
+    //
+    // 1. The 8 Entertainment Pack titles were reported as appearing TWICE in
+    //    the Start menu, once from 03-games.MENU and once from this group. They
+    //    do not. They appear once, from the fragment. The duplication was a
+    //    reading of this code, not an observation of the running system, and
+    //    the code that would have produced it had already been disabled by the
+    //    poll for as long as the poll has existed.
+    //
+    // 2. Word 6.0 is a WORKING Win16 app that ships on every golden and has NO
+    //    launcher at all. The Start menu is the only way to start a Win16
+    //    binary in the shipping system, and this group was its only entry.
+    //
+    // Re-appending here fixes 2. It is safe against 1 ONLY because the loader
+    // now skips any item a fragment already supplies: without that dedup this
+    // line would create exactly the duplicate category the report predicted.
+    // The two changes belong together, which is why they landed together.
+    startmenu_load_win16_groups();
+    sm_favdebug_check("sm_rust_rebuild:end");
 }
 
 // Throttled poll, same idiom as startmenu_prefs_poll() (~once/second at the
@@ -1702,7 +2451,32 @@ static void startmenu_load_win16_groups(void)
     // Next free category slot is shared (g_next_cat): sm_rust_rebuild() (the
     // two-layer config merge) has already consumed however many categories
     // the system/user fragments produced by the time this runs.
+    // THE 8 ENTERTAINMENT PACK TITLES USED TO APPEAR TWICE IN THE START MENU.
+    // build/assets/startmenu/system.d/03-games.MENU lists Tetris, Chips
+    // Challenge, FreeCell, Golf, JezzBall, TetraVex, Rodent's Revenge and Tut's
+    // Tomb as type=win16, and /WIN16GRP.CFG declares a "Microsoft Entertainment
+    // Pack" group holding the SAME 8 titles with the SAME paths and the SAME
+    // launch verb. Both producers feed g_menu_items[] and share g_next_cat, so
+    // neither overwrote the other: the user got a "Games" category and a second
+    // "Microsoft Entertainment Pack" category listing the same games.
+    //
+    // FIXED HERE, IN THE CODE, RATHER THAN BY DELETING THE 8 FRAGMENT LINES,
+    // because the fragment is the more reliable of the two producers and the
+    // deletion would have been silently unsafe. /WIN16GRP.CFG is written by the
+    // kernel's Win3.x installer and is NOT in build/asset-manifest.sha256, so it
+    // is not a tracked build output: an asset base that ever shipped without it
+    // would leave those 8 games with no launcher at all. Skipping here is safe
+    // in BOTH directions - if the fragment names a title, the group skips it; if
+    // the fragment ever stops naming it, the group supplies it again.
+    //
+    // A GROUP IS NOW CREATED LAZILY, on its first surviving item. Adding the
+    // category up front is what would turn this dedup into an empty "Microsoft
+    // Entertainment Pack" heading, which is a different kind of wrong. Today
+    // that group dedups to nothing and simply does not render, while the
+    // "Microsoft Word 6.0" group in the same file, which no fragment
+    // duplicates, still does.
     bool have_group = false;
+    const char *pending_group = 0;   // group seen, category not created yet
 
     char *p = buf;
     while (*p) {
@@ -1715,10 +2489,10 @@ static void startmenu_load_win16_groups(void)
         if (strncmp(t, "GROUP|", 6) == 0) {
             char *cur  = t + 6;
             char *name = sm_next_field(&cur);
-            if (!name[0]) { have_group = false; continue; }
-            if (g_next_cat >= MAX_CATEGORIES) { have_group = false; continue; }
-            add_category(g_next_cat, name, false);   // collapsed by default
-            g_next_cat++;
+            if (!name[0]) { have_group = false; pending_group = 0; continue; }
+            // Deferred: the category is created by the first item that actually
+            // survives the duplicate and existence checks below.
+            pending_group = name;
             have_group = true;
         } else if (strncmp(t, "ITEM|", 5) == 0) {
             if (!have_group) continue;   // ITEM before any GROUP: skip
@@ -1727,7 +2501,28 @@ static void startmenu_load_win16_groups(void)
             char *path = sm_next_field(&cur);
             // Optional 4th icon field is ignored; all Win16 items use ICON_WIN3X.
             if (!name[0] || !path[0]) continue;
-            add_item_typed(name, ICON_WIN3X, path, LAUNCH_WIN16);
+
+            // Already provided by a .MENU fragment: do not list it twice.
+            if (sm_find_item_by_path(path) >= 0) continue;
+
+            // AND IT MUST ACTUALLY BE ON THE IMAGE. The fragment path
+            // existence-checks every item (startmenu_model.rs::sm_model_finish),
+            // which is the #537 hardening that stopped the menu rendering
+            // launchers for nothing. This producer had no such check, so a
+            // group naming a missing .EXE drew an item that launched nothing.
+            // Same rule, both producers.
+            {   int _fd = sys_open(path, 0);
+                if (_fd < 0) continue;
+                sys_close(_fd);
+            }
+
+            if (pending_group) {
+                if (g_next_cat >= MAX_CATEGORIES) { have_group = false; pending_group = 0; continue; }
+                add_category(g_next_cat, pending_group, false);   // collapsed by default
+                g_next_cat++;
+                pending_group = 0;
+            }
+            add_item_typed(name, ICON_WIN3X, path, LAUNCH_WIN16, -1);   // (#845) auto: no mode field in this legacy format
         }
         // Any other record type is ignored.
     }
@@ -1765,20 +2560,36 @@ void startmenu_init(void)
     // those arrays itself.
     sm_rust_rebuild();
 
-    // #134: Win16 program groups (ProgMan) as extra Start-menu folders. Read
-    // from /WIN16GRP.CFG (written by the ole2c kernel's Win3.x installer). Each
-    // GROUP becomes a collapsible category whose items launch via win16_run().
-    // A separate, already-data-driven source; see its own comment for why it
-    // was not folded into the fragment format above.
-    startmenu_load_win16_groups();
+    // #134's Win16 program groups (ProgMan folders from /WIN16GRP.CFG) used to
+    // be loaded HERE, once, right after the rebuild above. That is exactly what
+    // made them invisible: startmenu_rust_poll() re-runs sm_rust_rebuild() every
+    // second and that function memsets g_categories, so a one-shot load here
+    // survived about one second. The loader is now called from the END of
+    // sm_rust_rebuild() instead, so it runs on every rebuild including this one.
+    // A second call here would be harmless (the dedup would skip every item),
+    // but it would also suggest the one-shot placement was ever sufficient.
 
     // Start-menu uplift: load persisted favorites/recents + Settings prefs.
     // #63/#745: sm_load_state() returning false means STARTMENU.CFG has
     // never been written for this profile at all (not merely "zero
-    // favorites saved") - the skip-the-wizard case. Seed the default pinned
-    // set then, and only then, so a profile that DID save an intentionally
-    // empty list (every default later unpinned by hand) is never re-seeded.
-    if (!sm_load_state()) sm_seed_default_favorites();
+    // favorites saved").
+    //
+    // 2026-08-18: this used to seed SM_DEFAULT_FAVORITES right here,
+    // unconditionally, whenever sm_load_state() found nothing. REMOVED: this
+    // runs on EVERY first-ever boot, before the first-boot wizard (which
+    // needs this same compositor already running) has had any chance to
+    // write its own, larger FAVCH.CFG choice, so the eager seed always won
+    // that race and the wizard's later selection could only ADD onto it -
+    // see sm_seed_default_favorites()'s own comment for the measured bug
+    // this caused. The seed now runs from startmenu_favs_poll() instead,
+    // gated on /CONFIG/SETUPSKIP actually being present (true only once
+    // "Skip to Desktop" has really been used and FAVCH.CFG is never coming),
+    // so a profile that DID save an intentionally empty list (every default
+    // later unpinned by hand) is still never re-seeded: sm_load_state()
+    // having returned true here means STARTMENU.CFG exists, which is exactly
+    // the condition startmenu_favs_poll()'s own check also requires to be
+    // false before it will seed anything.
+    sm_load_state();
     sm_load_prefs();
 }
 
@@ -1806,6 +2617,25 @@ static void sm_draw_scrollbar(const sm_scroll_t *s, int32_t x, int32_t y, int32_
                                                            CLR_MENU_CAT_BG,
                                                            CLR_MENU_BG);
     draw_fill_rect(x, y, SM_SCROLL_W, h, CLR_MENU_CAT_BG);
+    // (#117) was fill-only, no boundary - the same gap #96 fixed for the
+    // shared widget's trough, but this app draws its own geometry and never
+    // inherited it (see gui_scroll_trough_border()'s comment in gui_scroll.h
+    // for the other three apps in the same position). The compositor cannot
+    // reach gui_active_style()/gui_ensure_contrast() (gui_style.h pulls in
+    // libc/types.h, the same bool conflict gui_scroll.h works around with
+    // GUI_SCROLL_STDINT_ONLY above), so this always draws the CLASSIC-style
+    // two-tone bevel rather than replicating the MODERN/FLAT single-ring
+    // branch; measured (tools/contrast/scrollbar-contrast.sh), that bevel's
+    // two sides land on the SAME colour on every shipped theme today (see
+    // the AESTHETIC DECISION note in gui.c's gui_bevel_pair()), so this is
+    // visually equivalent to a single ring regardless.
+    uint32_t sm_shadow, sm_hi;
+    gui_scroll_trough_bevel(CLR_MENU_BG & 0x00FFFFFFu, &sm_shadow, &sm_hi);
+    sm_shadow |= 0xFF000000u; sm_hi |= 0xFF000000u;
+    draw_fill_rect(x, y, SM_SCROLL_W, 1, sm_shadow);
+    draw_fill_rect(x, y, 1, h, sm_shadow);
+    draw_fill_rect(x, y + h - 1, SM_SCROLL_W, 1, sm_hi);
+    draw_fill_rect(x + SM_SCROLL_W - 1, y, 1, h, sm_hi);
     draw_fill_rect(x + 2, ty, SM_SCROLL_W - 4, th, sm_thumb);
 }
 
@@ -1819,11 +2649,11 @@ static void startmenu_render_flyout(const sm_geom_t *root)
     if (f.item_count <= 0) return;
     menu_category_t *cat = &g_categories[g_flyout_cat];
 
-    draw_fill_rect(f.x + 3, f.y + 3, f.w, f.h, CLR_MENU_SHADOW);
+    draw_fill_rect(f.x + ui_px(3), f.y + ui_px(3), f.w, f.h, CLR_MENU_SHADOW);
     draw_fill_rect(f.x, f.y, f.w, f.h, CLR_MENU_BG);
     draw_rect_outline(f.x, f.y, f.w, f.h, CLR_MENU_BORDER);
 
-    int32_t list_y = f.y + 4;
+    int32_t list_y = f.y + ui_px(4);   // #uiscale: matches the other two copies of this literal
     // (#745 follow-up) push/pop, not set/clear: this scrollable list is
     // reachable only while g_start_menu_open (render_frame_idle()'s partial
     // path never runs then, so today set/clear is inert here), but push/pop
@@ -1838,11 +2668,17 @@ static void startmenu_render_flyout(const sm_geom_t *root)
         menu_item_t *it = &g_menu_items[abs_idx];
         uint32_t bg = (g_flyout_hover_item == abs_idx) ? CLR_MENU_ITEM_HOVER : CLR_MENU_BG;
         draw_fill_rect(f.x, iy, f.w, START_MENU_ITEM_H, bg);
-        int32_t isz = g_sm_icon_size;
-        icon_draw_scaled(it->icon_id, f.x + 8, iy + (START_MENU_ITEM_H - isz) / 2, isz, CLR_MENU_TEXT);
-        draw_text(f.x + 8 + isz + 6, iy + (START_MENU_ITEM_H - FONT_CHAR_H) / 2, it->name, CLR_MENU_TEXT);
+        // #uiscale (report 3): g_sm_icon_size is a persisted LOGICAL user
+        // preference (Settings' Start Menu icon-size slider, 14-28) - stored
+        // unscaled, like every other saved size, and must be scaled at the
+        // point of use like any other length. It and its neighbouring gaps
+        // were bare, so every app row's icon stayed pinned to the user's 1x
+        // choice while the row height around it (START_MENU_ITEM_H) grew.
+        int32_t isz = ui_px(g_sm_icon_size);
+        icon_draw_scaled(it->icon_id, f.x + ui_px(8), iy + (START_MENU_ITEM_H - isz) / 2, isz, CLR_MENU_TEXT);
+        draw_text(f.x + ui_px(8) + isz + ui_px(6), iy + (START_MENU_ITEM_H - FONT_CHAR_H) / 2, it->name, CLR_MENU_TEXT);
         if (sm_is_favorite_idx(abs_idx))
-            draw_text(f.x + f.w - START_MENU_PADDING - FONT_CHAR_W - 2,
+            draw_text(f.x + f.w - START_MENU_PADDING - FONT_CHAR_W - ui_px(2),
                       iy + (START_MENU_ITEM_H - FONT_CHAR_H) / 2, "*", CLR_MENU_TEXT);
         iy += START_MENU_ITEM_H;
     }
@@ -1946,9 +2782,28 @@ void startmenu_render(void)
 
     int32_t cy = my;
 
+    // #uiscale hit-test fix: the Settings gear icon used to be drawn at a
+    // 16px literal size (mx+w-PADDING-20, cy+(HEADER_H-16)/2) and hit-tested
+    // against a COMPLETELY SEPARATE 28px literal box (mx+w-PADDING-20-4,
+    // cy+(HEADER_H-16)/2-4) - two independent numbers rather than one drawn
+    // box plus a defined hit-target margin. Shared now: the draw side gets
+    // its exact box from this function, and the hit-test side pads that SAME
+    // box symmetrically by STARTMENU_GEAR_HIT_PAD (a Fitts's-law-friendly
+    // bigger tap target around a small icon, same intent as the original 4px
+    // asymmetric pad, just now derived rather than duplicated).
+    #define STARTMENU_GEAR_ICON_SZ 16
+    #define STARTMENU_GEAR_HIT_PAD 6
+
     // ---- Header: user avatar + name + Settings gear ----
+    // #uiscale (report 3, "the design isn't consistent"): the avatar radius
+    // and its text gap were bare 1x literals sitting inside an already-
+    // scaled START_MENU_HEADER_H band - a 15px avatar reads as noticeably
+    // small once the header around it doubles. No hit-test depends on this
+    // decorative geometry (the header's only interactive element, the gear,
+    // is a separately-boxed hit region below), so it is safe to scale on its
+    // own.
     {
-        int32_t r = 15;
+        int32_t r = ui_px(15);
         int32_t acx = mx + START_MENU_PADDING + r;
         int32_t acy = cy + START_MENU_HEADER_H / 2;
         draw_circle_filled(acx, acy, r, CLR_LOGIN_AVATAR);
@@ -1958,26 +2813,32 @@ void startmenu_render(void)
         if (initial[0] >= 'a' && initial[0] <= 'z') initial[0] = (char)(initial[0] - 32);
         initial[1] = 0;
         draw_text(acx - FONT_CHAR_W / 2, acy - FONT_CHAR_H / 2, initial, sm_ink());
-        draw_text(acx + r + 10, cy + (START_MENU_HEADER_H - FONT_CHAR_H) / 2,
+        draw_text(acx + r + ui_px(10), cy + (START_MENU_HEADER_H - FONT_CHAR_H) / 2,
                   g_login_username[0] ? g_login_username : "User", sm_ink());
 
-        int32_t gx = mx + w - START_MENU_PADDING - 20;
-        int32_t gy = cy + (START_MENU_HEADER_H - 16) / 2;
+        int32_t gs = ui_px(STARTMENU_GEAR_ICON_SZ);
+        int32_t gx = mx + w - START_MENU_PADDING - ui_px(20);
+        int32_t gy = cy + (START_MENU_HEADER_H - gs) / 2;
         // (#745) Both arms now read the material actually on screen: the old
         // hover arm was CLR_MENU_TEXT (the flat, possibly-wrong-for-glass
         // token) while only the resting arm went through the glass-aware
         // sm_dim_ink() - backwards from the usual defect shape, but the same
         // bug: one of the two states was measured against the wrong bg.
         uint32_t gear_ink = g_hover_gear ? sm_ink() : sm_dim_ink();
-        if (!icon_draw_color_tinted(ICON_COG, gx, gy, 16, gear_ink))
-            icon_draw_scaled(ICON_COG, gx, gy, 16, gear_ink);
+        if (!icon_draw_color_tinted(ICON_COG, gx, gy, gs, gear_ink))
+            icon_draw_scaled(ICON_COG, gx, gy, gs, gear_ink);
     }
     cy += START_MENU_HEADER_H;
-    draw_hline(mx + 8, cy, w - 16, CLR_MENU_SEP);
+    draw_hline(mx + ui_px(8), cy, w - ui_px(16), CLR_MENU_SEP);
 
     // ---- Search box ----
+    // #uiscale (report 3): sx/sy/sw/sh's insets and the box's own internal
+    // text padding and caret were bare 1x literals inside the already-scaled
+    // START_MENU_SEARCH_H band, same shape as the avatar above - draw-only,
+    // no hit-test to keep in sync (the hit-test below only checks the band
+    // Y-range, not this box's exact pixels).
     {
-        int32_t sx = mx + 8, sy = cy + 4, sw = w - 16, sh = START_MENU_SEARCH_H - 8;
+        int32_t sx = mx + ui_px(8), sy = cy + ui_px(4), sw = w - ui_px(16), sh = START_MENU_SEARCH_H - ui_px(8);
         draw_fill_rect(sx, sy, sw, sh, CLR_MENU_CAT_BG);
         draw_rect_outline(sx, sy, sw, sh, CLR_MENU_BORDER);
         // (#745) The search box is a real opaque fill (CLR_MENU_CAT_BG, the
@@ -1987,13 +2848,13 @@ void startmenu_render(void)
         uint32_t search_ink = sm_ink_for(CLR_MENU_CAT_BG);
         uint32_t dim = readable_ink_dim(CLR_MENU_CAT_BG);
         if (g_search_len > 0) {
-            draw_text(sx + 8, sy + (sh - FONT_CHAR_H) / 2, g_search, search_ink);
+            draw_text(sx + ui_px(8), sy + (sh - FONT_CHAR_H) / 2, g_search, search_ink);
             if (g_search_focused && ((uptime_ms() / 500) & 1)) {
-                int32_t cxp = sx + 8 + text_width(g_search) + 1;
-                draw_fill_rect(cxp, sy + 3, 2, sh - 6, search_ink);
+                int32_t cxp = sx + ui_px(8) + text_width(g_search) + ui_px(1);
+                draw_fill_rect(cxp, sy + ui_px(3), ui_px(2), sh - ui_px(6), search_ink);
             }
         } else {
-            draw_text(sx + 8, sy + (sh - FONT_CHAR_H) / 2, "Type to search...", dim);
+            draw_text(sx + ui_px(8), sy + (sh - FONT_CHAR_H) / 2, "Type to search...", dim);
         }
     }
     cy += START_MENU_SEARCH_H;
@@ -2032,14 +2893,20 @@ void startmenu_render(void)
                 // to read: it was the only row painting a bg ink was ever
                 // actually right for.
                 uint32_t ink = sm_ink_for(bg);
-                draw_text(mx + START_MENU_PADDING + 4, ry + (rh - FONT_CHAR_H) / 2, cat->label, ink);
+                draw_text(mx + START_MENU_PADDING + ui_px(4), ry + (rh - FONT_CHAR_H) / 2, cat->label, ink);
                 // #563: chevron now always points right (opens a side flyout,
                 // never expands down) while its category is not the open one;
                 // the OPEN category's chevron points right too but highlighted,
                 // matching the cascade convention (no more up/down "v"/">").
+                // #uiscale (report 3): chevron size/inset and the "No
+                // matches"/"Favorites"/etc header labels below all shared this
+                // bare-literal "+4" gap pattern - every row-list text/icon
+                // offset in this switch stayed at its 1x value while
+                // sm_row_h() (the band around it) scaled.
+                int32_t chsz = ui_px(14);
                 if (!icon_draw_color_tinted(ICON_CHEVR,
-                        mx + w - START_MENU_PADDING - 16, ry + (rh - 14) / 2, 14, ink))
-                    draw_text(mx + w - START_MENU_PADDING - FONT_CHAR_W - 2,
+                        mx + w - START_MENU_PADDING - ui_px(16), ry + (rh - chsz) / 2, chsz, ink))
+                    draw_text(mx + w - START_MENU_PADDING - FONT_CHAR_W - ui_px(2),
                               ry + (rh - FONT_CHAR_H) / 2, ">", ink);
                 break;
             }
@@ -2048,29 +2915,32 @@ void startmenu_render(void)
                 uint32_t bg = (g_hover_row == r) ? CLR_MENU_ITEM_HOVER : CLR_MENU_BG;
                 sm_row_fill(mx, ry, w, rh, bg);
                 uint32_t ink = sm_ink_for(bg);   // (#745) see SM_ROW_CATHDR above
-                int32_t isz = g_sm_icon_size;
+                // #uiscale (report 3): see the flyout's identical item row
+                // above - g_sm_icon_size is a persisted LOGICAL preference,
+                // scaled at point of use, not storage.
+                int32_t isz = ui_px(g_sm_icon_size);
                 int32_t icy = ry + (rh - isz) / 2;
-                icon_draw_scaled(it->icon_id, mx + 8, icy, isz, ink);
-                draw_text(mx + 8 + isz + 6, ry + (rh - FONT_CHAR_H) / 2, it->name, ink);
+                icon_draw_scaled(it->icon_id, mx + ui_px(8), icy, isz, ink);
+                draw_text(mx + ui_px(8) + isz + ui_px(6), ry + (rh - FONT_CHAR_H) / 2, it->name, ink);
                 if (sm_is_favorite_idx(row->item_idx))
-                    draw_text(mx + w - START_MENU_PADDING - FONT_CHAR_W - 2,
+                    draw_text(mx + w - START_MENU_PADDING - FONT_CHAR_W - ui_px(2),
                               ry + (rh - FONT_CHAR_H) / 2, "*", ink);
                 break;
             }
             case SM_ROW_NOMATCH:
-                draw_text(mx + START_MENU_PADDING + 4, ry + (rh - FONT_CHAR_H) / 2, "No matches", dim);
+                draw_text(mx + START_MENU_PADDING + ui_px(4), ry + (rh - FONT_CHAR_H) / 2, "No matches", dim);
                 break;
             case SM_ROW_FAVHDR:
-                draw_text(mx + START_MENU_PADDING + 4, ry + (rh - FONT_CHAR_H) / 2, "Favorites", dim);
+                draw_text(mx + START_MENU_PADDING + ui_px(4), ry + (rh - FONT_CHAR_H) / 2, "Favorites", dim);
                 break;
             case SM_ROW_RECHDR:
-                draw_text(mx + START_MENU_PADDING + 4, ry + (rh - FONT_CHAR_H) / 2, "Recent", dim);
+                draw_text(mx + START_MENU_PADDING + ui_px(4), ry + (rh - FONT_CHAR_H) / 2, "Recent", dim);
                 break;
             case SM_ROW_ALLHDR:
-                draw_text(mx + START_MENU_PADDING + 4, ry + (rh - FONT_CHAR_H) / 2, "All Apps", dim);
+                draw_text(mx + START_MENU_PADDING + ui_px(4), ry + (rh - FONT_CHAR_H) / 2, "All Apps", dim);
                 break;
             case SM_ROW_SEARCHHDR:
-                draw_text(mx + START_MENU_PADDING + 4, ry + (rh - FONT_CHAR_H) / 2, "Search Results", dim);
+                draw_text(mx + START_MENU_PADDING + ui_px(4), ry + (rh - FONT_CHAR_H) / 2, "Search Results", dim);
                 break;
             }
             ry += rh;
@@ -2081,7 +2951,7 @@ void startmenu_render(void)
     if (G.scrollable) sm_draw_scrollbar(&g_sm_scroll, mx + w - SM_SCROLL_W, G.rows_y, G.viewport_h);
 
     // ---- Power section (2x2 grid) ----
-    draw_hline(mx + 8, cy, w - 16, CLR_MENU_SEP);
+    draw_hline(mx + ui_px(8), cy, w - ui_px(16), CLR_MENU_SEP);
     int32_t sec_y = cy;
     int32_t sec_h = sm_power_section_h();
     sm_row_fill(mx, sec_y, w, sec_h, CLR_MENU_BG);
@@ -2119,8 +2989,9 @@ void startmenu_render(void)
         uint32_t actual_bg = sm_actual_bg(bg);
         uint32_t ink = readable_ink(actual_bg);
         uint32_t icon_ink = btns[i].danger ? readable_accent(CLR_POWER_RED, actual_bg) : ink;
-        icon_draw_scaled(btns[i].icon, btns[i].x + 4, btns[i].y + (bh - 14) / 2, 14, icon_ink);
-        draw_text(btns[i].x + 22, btns[i].y + (bh - FONT_CHAR_H) / 2, btns[i].label, ink);
+        int32_t pisz = ui_px(14);
+        icon_draw_scaled(btns[i].icon, btns[i].x + ui_px(4), btns[i].y + (bh - pisz) / 2, pisz, icon_ink);
+        draw_text(btns[i].x + ui_px(22), btns[i].y + (bh - FONT_CHAR_H) / 2, btns[i].label, ink);
     }
 
     // #563: the cascading flyout renders LAST (on top of everything else,
@@ -2138,7 +3009,7 @@ static bool sm_flyout_hit(const sm_geom_t *root, int32_t x, int32_t y, bool clic
     if (f.item_count <= 0) return false;
     if (x < f.x || x >= f.x + f.w || y < f.y || y >= f.y + f.h) return false;
 
-    int32_t list_y = f.y + 4;
+    int32_t list_y = f.y + ui_px(4);   // #uiscale: matches the other two copies of this literal
     if (y >= list_y && y < list_y + f.viewport_h) {
         int32_t rel = y - list_y + g_fly_scroll.offset;
         int i = rel / START_MENU_ITEM_H;
@@ -2184,13 +3055,21 @@ bool startmenu_handle_mouse(int32_t x, int32_t y, bool clicked)
 
     // Header: only the gear (Settings) icon is interactive.
     {
-        int32_t gx = mx + w - START_MENU_PADDING - 20 - 4;
-        int32_t gy = cy + (START_MENU_HEADER_H - 16) / 2 - 4;
-        if (x >= gx && x < gx + 28 && y >= gy && y < gy + 28) {
+        // #uiscale hit-test fix: SAME box the draw side computes above
+        // (STARTMENU_GEAR_ICON_SZ at the same mx+w-PADDING-20 offset),
+        // padded symmetrically by STARTMENU_GEAR_HIT_PAD instead of a second
+        // independent literal box - see the #define comment above.
+        int32_t gs = ui_px(STARTMENU_GEAR_ICON_SZ);
+        int32_t pad = ui_px(STARTMENU_GEAR_HIT_PAD);
+        int32_t gx = mx + w - START_MENU_PADDING - ui_px(20) - pad;
+        int32_t gy = cy + (START_MENU_HEADER_H - gs) / 2 - pad;
+        int32_t gspan = gs + 2 * pad;
+        if (x >= gx && x < gx + gspan && y >= gy && y < gy + gspan) {
             g_hover_gear = true;
             if (clicked) {
-                set_settings_tab(17);   // PANEL_STARTMENU - keep in sync with settings/main.c
-                sys_spawn("/APPS/SETTINGS");
+                // #129: settings_open_panel() focuses an already-open Settings
+                // window instead of spawning a duplicate (see compositor.h).
+                settings_open_panel(SETTINGS_PANEL_STARTMENU);
                 g_start_menu_open = false;
                 sm_close_flyout();
                 g_needs_redraw = true;
@@ -2248,10 +3127,9 @@ bool startmenu_handle_mouse(int32_t x, int32_t y, bool clicked)
         if (x >= hits[i].x && x < hits[i].x + bw && y >= hits[i].y && y < hits[i].y + bh) {
             g_hover_power = hits[i].code;
             if (clicked) {
-                g_power_confirm = hits[i].code;
                 g_start_menu_open = false;
                 sm_close_flyout();
-                g_needs_redraw = true;
+                startmenu_power_confirm_show(hits[i].code);   // opens the confirm dialog + one-time scrim
             }
             return true;
         }
@@ -2301,7 +3179,7 @@ bool startmenu_handle_right_click(int32_t x, int32_t y)
     if (g_flyout_cat >= 0) {
         sm_fly_geom_t f = sm_flyout_geom(&G);
         if (f.item_count > 0 && x >= f.x && x < f.x + f.w && y >= f.y && y < f.y + f.h) {
-            int32_t list_y = f.y + 4;
+            int32_t list_y = f.y + ui_px(4);   // #uiscale: matches the other two copies of this literal
             if (y >= list_y && y < list_y + f.viewport_h) {
                 int32_t rel = y - list_y + g_fly_scroll.offset;
                 int i = rel / START_MENU_ITEM_H;
@@ -2508,5 +3386,16 @@ void startmenu_open_category_by_name(const char *label) {
         }
     }
     g_needs_redraw = true;
+}
+
+// (#glassmodal) verification-only: open a power confirm dialog (Shut Down=1,
+// Restart=2, Log Out=3, Lock=4) by action number, bypassing the power-grid
+// icon's mouse hit-test - same "drive by name/index, sidestep hit-testing"
+// philosophy as startmenu_open_category_by_name() above (#334/#440). Calls
+// the exact same static startmenu_power_confirm_show() the real power-grid
+// click handler uses, so this proves the real dialog, not a stand-in. Never
+// shipped: gated identically to every other symbol in this block.
+void startmenu_test_power_confirm(int action) {
+    startmenu_power_confirm_show(action);
 }
 #endif

@@ -21,6 +21,7 @@
 #include "../../libc/gui_theme.h"
 #include "../../libc/gui_style.h"
 #include "rss_rs.h"
+#include "../../libc/keys.h"   // #243: GUI_KEY_* nav codes
 
 // The Mono reader typeface deliberately uses the crisp 8x16 bitmap font, so
 // capture the real bitmap entry point BEFORE the TTF redirect macro below
@@ -1597,8 +1598,8 @@ int main(int argc, char **argv) {
                     if (ev.keycode == 0x01) running = 0;                            // Esc
                     else if (ev.keycode == 0x80) { int v=sel_view_index(); select_item_view(v-1); }  // Up
                     else if (ev.keycode == 0x81) { int v=sel_view_index(); select_item_view(v+1); }  // Down
-                    else if (ev.keycode == 0x49) { int v=sel_view_index(); select_item_view(v-list_rows()); } // PgUp
-                    else if (ev.keycode == 0x51) { int v=sel_view_index(); int n=v+list_rows(); select_item_view(n>=g_item_view_n?g_item_view_n-1:n); }
+                    else if (ev.keycode == GUI_KEY_PGUP) { int v=sel_view_index(); select_item_view(v-list_rows()); }
+                    else if (ev.keycode == GUI_KEY_PGDN) { int v=sel_view_index(); int n=v+list_rows(); select_item_view(n>=g_item_view_n?g_item_view_n-1:n); }
                     else if (ev.key_char=='r' || ev.key_char=='R' || ev.keycode==0x3F) start_fetch();
                     else if (ev.key_char=='a' || ev.key_char=='A') { g_add_mode=1; tf_set_text(&g_add_tf,"https://"); }
                     else if (ev.key_char=='/' ) g_focus = FOCUS_SEARCH;

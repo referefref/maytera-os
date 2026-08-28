@@ -189,15 +189,40 @@ void lapic_send_init(uint32_t apic_id);
 // vector is the page number of the startup code (e.g., 0x08 for 0x8000)
 void lapic_send_startup(uint32_t apic_id, uint8_t vector);
 
-// Wait for IPI delivery to complete
-void lapic_wait_ipi_idle(void);
+// Wait for IPI delivery to complete.
+//
+// BOUNDED (#426): returns 0 when the ICR delivery-status bit cleared, -1 on
+// give-up (the LAPIC window is dead, or the iteration cap tripped). This used
+// to be `void` over an unbounded `while (... & ICR_DS_PENDING) pause();`, which
+// hung the kernel outright on a machine whose xAPIC MMIO window is not decoded,
+// because an undecoded window reads all-ones and therefore has that bit set
+// forever. A caller that is about to write ICR_LOW MUST check the return: doing
+// so while a previous IPI is still pending is architecturally undefined.
+int lapic_wait_ipi_idle(void);
 
 // ============================================================================
 // Local APIC Timer
 // ============================================================================
 
-// Initialize the APIC timer with specified frequency (Hz)
+// Initialize the APIC timer with specified frequency (Hz), on TIMER_VECTOR.
 void lapic_timer_init(uint32_t frequency_hz);
+
+// #745 (#62): same, but on a caller-chosen vector, so a second consumer can
+// own its own IDT entry and therefore its own EOI. lapic_timer_init() is a
+// wrapper over this; there is one implementation, not two.
+// Returns 1 if actually armed, 0 if it could not be (no usable calibration).
+int lapic_timer_init_vec(uint32_t frequency_hz, uint32_t vector);
+
+// #745 (#62): is the Local APIC mapped and software-enabled? Reading LAPIC
+// registers before this is true would fault.
+bool lapic_is_enabled(void);
+
+// #169: calibrated LAPIC timer rate (ticks/sec), 0 if never calibrated.
+uint64_t lapic_timer_rate(void);
+
+// #745 (#62): is an I/O APIC mapped? ioapic_read() returns 0 either way, so a
+// caller that needs to tell "masked" from "absent" must ask this first.
+int ioapic_available(void);
 
 // One-shot timer for specified microseconds
 void lapic_timer_oneshot(uint32_t microseconds);
@@ -253,8 +278,14 @@ bool lapic_is_available(void);
 // Check if x2APIC mode is supported
 bool lapic_x2apic_supported(void);
 
-// Enable x2APIC mode (if supported)
-int lapic_enable_x2apic(void);
+// NOTE (#426, 2026-08-26): there is NO lapic_enable_x2apic(). This declaration
+// existed here with no definition anywhere in the tree, so the first caller to
+// believe it would have got a link error rather than a feature. It is removed
+// rather than implemented, deliberately: lapic_init() now DETECTS x2APIC mode
+// (IA32_APIC_BASE bit 10) and marks the Local APIC unusable, because this kernel
+// has no MSR-based x2APIC driver and transitioning back to xAPIC requires an
+// SDM-mandated disable step that a naive clear-bit-10 would fault on. See the
+// long block in cpu/apic.c's lapic_init() for the full reasoning.
 
 // Get the Local APIC base address
 uint64_t lapic_get_base(void);

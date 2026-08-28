@@ -12,6 +12,7 @@
 #include "../sync/waitq.h"    // #746 fatlock: the canonical blocking primitive
 #include "../sync/noblock.h"  // #746 fatlock: wq_may_block(), the ONE no-block rule
 #include "../security/uaccess_smap.h"  // #19/#645: AC bracket on the caller-buffer copy
+#include "../cpu/wallclock.h"   // #115: the ONE wall clock + calendar converter
 
 // Sector buffer
 static uint8_t sector_buf[512];
@@ -254,6 +255,10 @@ static uint32_t fat_get_free_clusters_inner(fat_fs_t *fs);
 // moved away from its siblings.
 static int      fat_free_cluster_chain(fat_fs_t *fs, uint32_t start_cluster);
 static int      fat_persist_dirent(fat_file_t *file);
+// #745 local 109: fat_truncate_to() walks and re-terminates the cluster chain,
+// so it needs these two the same way the wrappers above need the pair below.
+static uint32_t fat_next_cluster(fat_fs_t *fs, uint32_t cluster);
+static int      fat_set_fat_entry(fat_fs_t *fs, uint32_t cluster, uint32_t value);
 static int      fat_erase_name_entries(fat_fs_t *fs, fat_file_t *dir, const char *name);
 
 // #725: 8.3-ise an ext2 name into the 11-byte padded field of a synthesized
@@ -325,22 +330,47 @@ static int fat_readdir_ext2(fat_file_t *dir, fat_dir_entry_t *entry,
 // MUST run before the ext2 redirect below or the empty folder wins and the
 // mounted disc stays invisible. That ordering is the whole mechanism.
 // ===========================================================================
+// #193: the STRING half moved to rustkern/drvmap.rs (drvmap_windir_split_rs),
+// which is already the authority on what a drive letter means. It was open-
+// coded here, and #193 needed the same decision at the syscall layer too; a
+// second hand-rolled copy of the parse is exactly how the three drive maps
+// drifted apart before #739. New code, so Rust per the standing directive: it
+// is a bounded string compare with no float and no allocation, and it is called
+// once per path syscall, which a plain call is cheap enough for.
+extern int drvmap_windir_split_rs(const unsigned char *path, unsigned int *rel_off);
+
+// #193: does a currently-mounted disk image OWN this path's subtree? The ONE
+// definition, used by fat_open() below AND by path_root_ext2() in
+// proc/syscall_path.h, so the fat layer and the syscall layer cannot disagree
+// about whose file a path is.
+//
+// NON-BLOCKING BY CONSTRUCTION, and it has to be: path_root_ext2() is evaluated
+// on every path syscall, including from contexts that may hold a lock. This
+// does a bounded string compare and one spinlock-protected read of the mount
+// table (diskimg_is_mounted). It performs no I/O, touches no image and cannot
+// sleep. Asking "does the disc CONTAIN this file" here instead would have been
+// an ISO directory read behind a wait-queue turnstile on the world's hottest
+// predicate, which is the #426 shape.
+int path_img_shadows(const char *path) {
+    extern int diskimg_is_mounted(char letter);
+    if (!path) return 0;
+    int li = drvmap_windir_split_rs((const unsigned char *)path, 0);
+    if (li < 0) return 0;
+    return diskimg_is_mounted((char)('A' + li)) ? 1 : 0;
+}
+
 static char fat_img_path(const char *path, const char **rel) {
     extern int diskimg_is_mounted(char letter);
     if (!path) return 0;
-    const char *pfx = "/WINDIR/DRIVE_";
-    int i = 0;
-    while (pfx[i]) { if (path[i] != pfx[i]) return 0; i++; }
-    char letter = path[i];
+    unsigned int roff = 0;
+    int li = drvmap_windir_split_rs((const unsigned char *)path, &roff);
+    if (li < 0) return 0;
+    char letter = (char)('A' + li);
     // #739: ANY letter, not the two hardcoded ones. Which letters may hold an
     // image is rustkern/drvmap.rs's decision, and diskimg_is_mounted() is the
-    // single live answer to "is there a disc in it". Listing letters here again
-    // is how the three copies of the drive map drifted apart in the first place.
-    if (letter < 'A' || letter > 'Z') return 0;
+    // single live answer to "is there a disc in it".
     if (!diskimg_is_mounted(letter)) return 0;
-    const char *r = path + i + 1;
-    while (*r == '/' || *r == '\\') r++;
-    if (rel) *rel = r;
+    if (rel) *rel = path + roff;
     return letter;
 }
 
@@ -422,6 +452,34 @@ int fat_open(fat_fs_t *fs, const char *path, fat_file_t *file) {
             file->attr = file->is_dir ? FAT_ATTR_DIRECTORY : FAT_ATTR_ARCHIVE;
             file->position = 0;
             file->open = 1;
+            // #120: STAMP THE TIMESTAMPS. This branch memset the handle and
+            // then filled size/attr/name and nothing else, so an ext2-backed
+            // fat_file_t came back with mtime_date == mtime_time == 0. Every
+            // consumer that reads those fields therefore rendered the FAT epoch
+            // with a zero month and day, which is the literal source of the
+            // "1980-00-00 00:00" that gui/properties.c has shown for years.
+            //
+            // Fixing it in properties.c would have fixed ONE caller and left
+            // the handle still lying to the next one. The inode has the real
+            // time; converting it here is what makes the handle honest.
+            //
+            // ktime_unix_to_dos_rs (rustkern/ktime.rs, the ONE converter) is
+            // deliberately allowed to REFUSE: it writes nothing and returns -1
+            // for a time outside what a FAT directory entry can represent,
+            // which includes epoch 0. A volume written before #115 has i_mtime
+            // == 0, and 0 stays 0 - "unknown", not 1980-01-01. The fields are
+            // already zero from the memset, so a refusal needs no handling.
+            {   uint16_t d = 0, t = 0;
+                if (ktime_unix_to_dos_rs((int64_t)in.i_mtime, &d, &t) == 0) {
+                    file->mtime_date = d; file->mtime_time = t;
+                }
+                if (ktime_unix_to_dos_rs((int64_t)in.i_ctime, &d, &t) == 0) {
+                    file->ctime_date = d; file->ctime_time = t;
+                }
+                if (ktime_unix_to_dos_rs((int64_t)in.i_atime, &d, &t) == 0) {
+                    file->atime_date = d;
+                }
+            }
             {   // file->name is the basename, as fat_open_inner leaves it
                 const char *b = path, *q = path;
                 for (; *q; q++) if (*q == '/') b = q + 1;
@@ -472,6 +530,9 @@ int fat_read(fat_file_t *file, void *buffer, uint32_t size) {
         file->position += (uint32_t)got;
         return (int)got;
     }
+    // #250: the medium this handle describes has been removed. Fail, rather
+    // than read sectors off whatever occupies that hotplug slot now.
+    if (fat_handle_stale(file)) return -1;
     if (!fat_lock()) return -1;
     int r = fat_read_inner(file, buffer, size); fat_unlock(); return r;
 }
@@ -504,6 +565,7 @@ int fat_readdir_n(fat_file_t *dir, fat_dir_entry_t *entry, char *name_out, size_
         return 0;
     }
     if (dir && dir->open && dir->ext2_ino) return fat_readdir_ext2(dir, entry, name_out, name_cap);
+    if (fat_handle_stale(dir)) return -1;   // #250: medium removed
     if (!fat_lock()) return -1;
     int r = fat_readdir_inner(dir, entry, name_out, name_cap); fat_unlock(); return r;
 }
@@ -612,23 +674,84 @@ int fat_rename(fat_fs_t *fs, const char *old_path, const char *new_path) {
 // to the directory entry. The handle is left usable and positioned at 0.
 // Refuses the two backings that have no FAT cluster chain, for the same reason
 // fat_write() refuses them.
-int fat_truncate(fat_file_t *file) {
+// #745 local 109: THE one FAT truncation primitive. See fat.h for why it had
+// to grow a length argument.
+int fat_truncate_to(fat_file_t *file, uint32_t new_size) {
     if (!file || !file->fs || !file->open) return -1;
     if (file->img_drive) return -1;     // #196 read-only disk image
     if (file->ext2_ino)  return -1;     // #725 ext2-backed handle
     if (file->is_dir)    return -1;
+    // A grow needs bytes written to the medium, not clusters freed. Refusing
+    // is the honest answer; the no-op that returned success is the defect this
+    // is here to end.
+    if (new_size > file->file_size) return -1;
+    if (new_size == file->file_size) return 0;
     if (!fat_lock()) return -1;
+
+    fat_fs_t *fs = file->fs;
+    uint32_t bpc = fs->bytes_per_sector * fs->sectors_per_cluster;
     int rc = 0;
-    if (file->first_cluster >= 2) {
-        if (fat_free_cluster_chain(file->fs, file->first_cluster) != 0) rc = -1;
+
+    if (new_size == 0) {
+        if (file->first_cluster >= 2) {
+            if (fat_free_cluster_chain(fs, file->first_cluster) != 0) rc = -1;
+        }
+        file->first_cluster   = 0;
+        file->current_cluster = 0;
+    } else if (bpc == 0) {
+        rc = -1;                        // unmounted / malformed geometry
+    } else {
+        // Keep exactly the clusters that hold bytes [0, new_size), terminate
+        // the chain there, and free everything after it.
+        uint32_t keep = (new_size + bpc - 1) / bpc;      // always >= 1
+        uint32_t last = file->first_cluster;
+        uint32_t i = 1;
+        while (last >= 2 && i < keep) {
+            last = fat_next_cluster(fs, last);
+            i++;
+        }
+        if (last < 2) {
+            // The chain is SHORTER than the size the directory entry records.
+            // Rewriting the size to match would hide a corrupt file; refuse.
+            rc = -1;
+        } else {
+            uint32_t tail = fat_next_cluster(fs, last);
+            uint32_t eoc  = (fs->fat_type == FAT_TYPE_32) ? FAT32_EOC :
+                            (fs->fat_type == FAT_TYPE_16) ? FAT16_EOC : 0xFFF;
+            if (fat_set_fat_entry(fs, last, eoc) != 0) rc = -1;
+            if (tail >= 2 && fat_free_cluster_chain(fs, tail) != 0) rc = -1;
+        }
     }
-    file->first_cluster   = 0;
-    file->current_cluster = 0;
-    file->file_size       = 0;
-    file->position        = 0;
-    if (fat_persist_dirent(file) != 0) rc = -1;
+
+    if (rc == 0) {
+        file->file_size = new_size;
+        // POSIX: ftruncate does not move the file offset. Re-anchor
+        // current_cluster against the (possibly clamped) position by walking
+        // from the start, exactly as fat_seek does, because the cluster the
+        // handle was parked on may have just been freed.
+        uint32_t pos = (file->position > new_size) ? new_size : file->position;
+        file->current_cluster = file->first_cluster;
+        uint32_t walked = 0;
+        while (bpc && walked + bpc <= pos && file->current_cluster != 0) {
+            walked += bpc;
+            file->current_cluster = fat_next_cluster(fs, file->current_cluster);
+        }
+        file->position = pos;
+        if (fat_persist_dirent(file) != 0) rc = -1;
+    }
     fat_unlock();
     return rc;
+}
+
+int fat_truncate(fat_file_t *file) {
+    if (!file) return -1;
+    if (file->file_size == 0) {
+        // fat_truncate_to() short-circuits a no-change truncate, but the O_TRUNC
+        // caller wants the handle reset even when the file is already empty.
+        file->first_cluster = 0; file->current_cluster = 0; file->position = 0;
+        return 0;
+    }
+    return fat_truncate_to(file, 0);
 }
 
 int fat_write(fat_file_t *file, const void *buffer, uint32_t size) {
@@ -641,6 +764,7 @@ int fat_write(fat_file_t *file, const void *buffer, uint32_t size) {
     // CD-ROM in any case. Refuse rather than corrupt or silently no-op.
     if (file && file->img_drive) return -1;
     if (file && file->ext2_ino) return -1;
+    if (fat_handle_stale(file)) return -1;   // #250: medium removed
     if (!fat_lock()) return -1;
     int r = fat_write_inner(file, buffer, size); fat_unlock(); return r;
 }
@@ -701,6 +825,25 @@ int fat_exists(fat_fs_t *fs, const char *path) {
     // so this is safe when ext2 is not the root). Fall through to the FAT ESP
     // check when the path is not on ext2, or when ext2 does not have it (an
     // ESP-only file), matching fat_read_file's ext2-first-then-FAT fallback.
+    // #193: a mounted disk image owns its drive's subtree, and fat_exists()
+    // cannot borrow fat_open()'s redirect the way fat_read_file() does, because
+    // fat_exists_inner() below only ever sees the FAT ESP. So the image is
+    // asked here, in fat_open()'s order and with fat_open()'s semantics: a
+    // mounted disc is AUTHORITATIVE for its own letter, so a miss is a miss and
+    // does not fall back to the folder underneath. Before this, an existence
+    // test on a file that is on the disc but not in the folder said "absent"
+    // while opening the very same path succeeded.
+    {
+        extern int diskimg_stat(char letter, const char *relpath,
+                               uint64_t *size_out, int *isdir_out);
+        extern int diskimg_is_mounted(char letter);
+        unsigned int roff = 0;
+        int li = drvmap_windir_split_rs((const unsigned char *)path, &roff);
+        if (li >= 0 && diskimg_is_mounted((char)('A' + li))) {
+            uint64_t isz = 0; int isdir = 0;
+            return diskimg_stat((char)('A' + li), path + roff, &isz, &isdir) ? 1 : 0;
+        }
+    }
     if (fat_path_on_ext2(fs, path)) {
         if (ext2_resolve_path(fat_ext2_vol_path(path)) != 0) return 1;
         // not present on ext2: fall through to the FAT ESP check below
@@ -725,9 +868,25 @@ static inline uint8_t drive_to_unit(int drive) {
     return drive & 1;  // 0,2 -> master(0);  1,3 -> slave(1)
 }
 
+// ===========================================================================
+// #250: WHICH BLOCK DEVICE DOES THIS MOUNT READ FROM?
+//
+// ONE answer, asked by every sector operation below, so a removable volume
+// cannot be half-routed. Zero (every mount that predates #250, because both
+// mount paths memset the struct) means the ROOT device and the call is
+// byte-identical to what it was. Non-zero means a hot-plugged USB MSC device,
+// which must NOT go through blk_read/blk_write: those consult a RAM cache
+// keyed by LBA alone, holding sectors of the root device only.
+// ===========================================================================
+static inline int fat_aux_vol(const fat_fs_t *fs) {
+    return fs->usb_vol_p1 ? (int)(fs->usb_vol_p1 - 1) : -1;
+}
+
 // Read sector from partition
 static int fat_read_sector(fat_fs_t *fs, uint32_t sector, void *buffer) {
     uint32_t lba = fs->part_start_lba + sector;
+    int av = fat_aux_vol(fs);
+    if (av >= 0) return blk_read_aux(av, lba, 1, buffer);
     uint8_t channel = drive_to_channel(fs->drive);
     uint8_t unit = drive_to_unit(fs->drive);
     return blk_read(channel, unit, lba, 1, buffer);
@@ -736,6 +895,8 @@ static int fat_read_sector(fat_fs_t *fs, uint32_t sector, void *buffer) {
 // Read multiple sectors
 static int fat_read_sectors(fat_fs_t *fs, uint32_t sector, uint32_t count, void *buffer) {
     uint32_t lba = fs->part_start_lba + sector;
+    int av = fat_aux_vol(fs);
+    if (av >= 0) return blk_read_aux(av, lba, count, buffer);
     uint8_t channel = drive_to_channel(fs->drive);
     uint8_t unit = drive_to_unit(fs->drive);
     return blk_read(channel, unit, lba, count, buffer);
@@ -878,6 +1039,8 @@ static int fat_read_cluster(fat_fs_t *fs, uint32_t cluster, void *buffer) {
 int fat_write_sector(fat_fs_t *fs, uint32_t sector, const void *buffer) {
     fat_cache_invalidate();   // a FAT-region write may change next-cluster links
     uint32_t lba = fs->part_start_lba + sector;
+    int av = fat_aux_vol(fs);   // #250
+    if (av >= 0) return (blk_write_aux(av, lba, 1, buffer) == 1) ? 0 : -1;
     uint8_t channel = drive_to_channel(fs->drive);
     uint8_t unit = drive_to_unit(fs->drive);
     return (blk_write(channel, unit, lba, 1, buffer) == 1) ? 0 : -1;
@@ -887,6 +1050,8 @@ int fat_write_sector(fat_fs_t *fs, uint32_t sector, const void *buffer) {
 static int fat_write_sectors(fat_fs_t *fs, uint32_t sector, uint32_t count, const void *buffer) {
     fat_cache_invalidate();
     uint32_t lba = fs->part_start_lba + sector;
+    int av = fat_aux_vol(fs);   // #250
+    if (av >= 0) return blk_write_aux(av, lba, count, buffer);
     uint8_t channel = drive_to_channel(fs->drive);
     uint8_t unit = drive_to_unit(fs->drive);
     return blk_write(channel, unit, lba, count, buffer);
@@ -1211,7 +1376,16 @@ int fat_mount(int drive, int partition, fat_fs_t *fs) {
     fs->mounted = 1;
     // Count free clusters once at mount time (cached for taskbar gauge)
     fs->free_cluster_count = 0;
-    {
+    // #250: NOT for a hot-plugged volume. This loop walks the WHOLE FAT one
+    // 512-byte sector at a time; on the root device those reads are served
+    // from the TO-RAM copy, but an aux volume has no cache, so every one is a
+    // real SCSI transfer. A 32 GB FAT32 stick has a ~16,000-sector FAT, i.e.
+    // ~16,000 round trips before the drive would appear in the UI. This
+    // project's recorded failure mode is exactly that (#71/#427 unbounded
+    // codec scan, #365 5s-per-empty-port probe), so the removable path
+    // reports free space as UNKNOWN rather than making the user wait. The
+    // volume record carries MOSVOL_FREE_UNKNOWN and the UI says so.
+    if (fs->usb_vol_p1 == 0) {
         uint32_t cur_sec = 0xFFFFFFFF;
         for (uint32_t c = 2; c < fs->cluster_count + 2; c++) {
             uint32_t fo = (fs->fat_type == FAT_TYPE_32) ? c * 4 : c * 2;
@@ -1237,20 +1411,31 @@ int fat_mount(int drive, int partition, fat_fs_t *fs) {
 }
 
 // Mount FAT from a specific LBA offset (for GPT partitions or raw FAT volumes)
-int fat_mount_lba(int drive, uint32_t start_lba, fat_fs_t *fs) {
+//
+// #250: `aux_vol` is -1 for the ROOT block device (every caller before #250,
+// and what fat_mount_lba() still passes) or a USB MSC device index for a
+// hot-plugged volume. `gen` is 0 for a fixed mount and a unique non-zero
+// stamp for a removable one; see the vol_gen comment in fat.h.
+static int fat_mount_lba_inner(int drive, uint32_t start_lba, fat_fs_t *fs,
+                               int aux_vol, uint32_t gen) {
     memset(fs, 0, sizeof(fat_fs_t));
     fs->drive = drive;
     fs->partition = -1;  // Indicates raw LBA mount
     fs->part_start_lba = start_lba;
+    // Set BEFORE the first sector read below, or the boot sector would be read
+    // off the root device and the whole mount would describe the wrong medium.
+    fs->usb_vol_p1 = (aux_vol >= 0) ? (uint32_t)(aux_vol + 1) : 0;
+    fs->vol_gen = gen;
 
     uint8_t channel = drive_to_channel(drive);
     uint8_t unit = drive_to_unit(drive);
 
-    kprintf("[FAT] Mounting from drive %d (channel %d, unit %d), LBA %u\n",
-            drive, channel, unit, start_lba);
+    kprintf("[FAT] Mounting from drive %d (channel %d, unit %d), LBA %u, aux vol %d\n",
+            drive, channel, unit, start_lba, aux_vol);
 
     // Read boot sector directly from specified LBA
-    if (blk_read(channel, unit, start_lba, 1, sector_buf) <= 0) {
+    if ((aux_vol >= 0 ? blk_read_aux(aux_vol, start_lba, 1, sector_buf)
+                      : blk_read(channel, unit, start_lba, 1, sector_buf)) <= 0) {
         kprintf("[FAT] Failed to read boot sector at LBA %u\n", start_lba);
         return -1;
     }
@@ -1337,9 +1522,12 @@ int fat_mount_lba(int drive, uint32_t start_lba, fat_fs_t *fs) {
     }
 
     fs->mounted = 1;
-    // Count free clusters once at mount time (cached for taskbar gauge)
+    // Count free clusters once at mount time (cached for taskbar gauge).
+    // #250: NOT on a removable volume; see the long comment on the identical
+    // guard in fat_mount() above for why (thousands of uncached SCSI reads
+    // between plugging a stick in and it appearing).
     fs->free_cluster_count = 0;
-    {
+    if (fs->usb_vol_p1 == 0) {
         uint32_t cur_sec = 0xFFFFFFFF;
         for (uint32_t c = 2; c < fs->cluster_count + 2; c++) {
             uint32_t fo = (fs->fat_type == FAT_TYPE_32) ? c * 4 : c * 2;
@@ -1355,6 +1543,8 @@ int fat_mount_lba(int drive, uint32_t start_lba, fat_fs_t *fs) {
             if (ev == 0) fs->free_cluster_count++;
         }
         kprintf("[FAT] Free clusters: %u\n", fs->free_cluster_count);
+    } else {
+        kprintf("[FAT] Removable volume: free-cluster scan skipped (bounded hotplug)\n");
     }
 
     kprintf("[FAT] Mounted FAT%d filesystem: %s\n", fs->fat_type, fs->volume_label);
@@ -1362,6 +1552,33 @@ int fat_mount_lba(int drive, uint32_t start_lba, fat_fs_t *fs) {
             fs->cluster_count, fs->sectors_per_cluster * fs->bytes_per_sector);
 
     return 0;
+}
+
+// #250: the two public entry points. Both are thin: fat_mount_lba() is the
+// pre-#250 signature and behaviour exactly (root device, generation 0), and
+// fat_mount_lba_usb() is the removable one. They share ONE body so a fix to
+// BPB parsing can never apply to only one kind of medium.
+int fat_mount_lba(int drive, uint32_t start_lba, fat_fs_t *fs) {
+    return fat_mount_lba_inner(drive, start_lba, fs, -1, 0);
+}
+
+int fat_mount_lba_usb(int usb_index, uint32_t start_lba, uint32_t gen, fat_fs_t *fs) {
+    if (usb_index < 0 || gen == 0 || !fs) return -1;
+    // The whole mount is one sector_buf read-modify-write span, and unlike the
+    // boot-time mount this one runs with the scheduler live and the desktop
+    // using the root filesystem. Without the FAT lock it would race every
+    // other FAT context for the shared global buffer, which is the exact
+    // corruption b103 recorded.
+    if (!fat_lock()) return -1;
+    int r = fat_mount_lba_inner(0, start_lba, fs, usb_index, gen);
+    fat_unlock();
+    return r;
+}
+
+// #250: ONE definition of "this handle's medium is gone". See fat.h.
+int fat_handle_stale(const fat_file_t *file) {
+    if (!file || !file->fs) return 0;
+    return file->vol_gen != file->fs->vol_gen;
 }
 
 // Unmount
@@ -1717,6 +1934,12 @@ static int fat_open_inner(fat_fs_t *fs, const char *path, fat_file_t *file) {
 
     memset(file, 0, sizeof(fat_file_t));
     file->fs = fs;
+    // #250: stamp WHICH medium this handle describes. Zero on every fixed
+    // mount, so fat_handle_stale() is a compare against zero there. On a
+    // removable volume it is what makes a pulled stick fail the handle
+    // instead of serving whatever is in that slot next. Same mechanism and
+    // same reason as img_gen (#739), one struct up.
+    file->vol_gen = fs->vol_gen;
 
     // Handle root directory
     if (path[0] == '/' && path[1] == '\0') {
@@ -1785,9 +2008,56 @@ static int fat_open_inner(fat_fs_t *fs, const char *path, fat_file_t *file) {
     file->open = 1;
     file->dirent_lba = found_lba;
     file->dirent_off = found_off;
+    // #115: the directory entry is already in hand here; carrying its date/time
+    // words costs nothing and saves sys_stat_path() a second read of the same
+    // sector. K1 was not "FAT has no timestamp", it was "nobody carried it".
+    file->mtime_date = entry.modify_date;
+    file->mtime_time = entry.modify_time;
+    file->atime_date = entry.access_date;
+    file->ctime_date = entry.create_date;
+    file->ctime_time = entry.create_time;
     fat_name_to_str(entry.name, file->name);
 
     return 0;
+}
+
+// ===========================================================================
+// #115: FAT TIMESTAMP STAMPING.
+//
+// fat_create_inner() built its short directory entry with memset(0) + name +
+// attr and wrote it. A FAT entry with create_date == 0 is not "1980-01-01", it
+// is UNSTAMPED, and that is what every file MayteraOS has ever written to a FAT
+// volume carries. gui/properties.c has been rendering the consequence to users
+// for its whole life: it decodes those zero words and prints "1980-00-00
+// 00:00", a date with a zeroth day of a zeroth month.
+//
+// So reading the field is only half the ticket. These two helpers are the other
+// half, and they are shared so the create path and the write path cannot drift
+// into stamping differently.
+//
+// IF THE CLOCK DOES NOT KNOW, WE DO NOT STAMP: wallclock_now_unix() returns 0
+// when the RTC has no plausible date and ktime_unix_to_dos_rs() refuses
+// anything outside FAT's 1980..2107 range WITHOUT writing its outputs, so the
+// entry keeps whatever it had. An unstamped entry is honest; a fabricated one
+// is the bug.
+// ===========================================================================
+static void fat_stamp_new_entry(fat_dir_entry_t *de) {
+    uint16_t d = 0, t = 0;
+    if (ktime_unix_to_dos_rs(wallclock_now_unix(), &d, &t) != 0) return;
+    de->create_date = d;
+    de->create_time = t;
+    de->create_time_tenth = 0;
+    de->access_date = d;
+    de->modify_date = d;
+    de->modify_time = t;
+}
+
+static void fat_stamp_modified(fat_dir_entry_t *de) {
+    uint16_t d = 0, t = 0;
+    if (ktime_unix_to_dos_rs(wallclock_now_unix(), &d, &t) != 0) return;
+    de->modify_date = d;
+    de->modify_time = t;
+    de->access_date = d;
 }
 
 // Close file
@@ -1803,6 +2073,14 @@ void fat_close(fat_file_t *file) {
     file->img_drive = 0;
     file->img_rel[0] = 0;
     file->img_gen = 0;
+    // #115: and the cached dirent times, for the same reason - a reused stack
+    // handle must not report the PREVIOUS file's timestamp after a failed
+    // reopen. That is exactly how #725 and #196 shipped.
+    file->mtime_date = 0;
+    file->mtime_time = 0;
+    file->atime_date = 0;
+    file->ctime_date = 0;
+    file->ctime_time = 0;
 }
 
 // Read from file
@@ -1874,6 +2152,7 @@ uint32_t fat_size(fat_file_t *file) {
 // Seek in file
 int fat_seek(fat_file_t *file, uint32_t position) {
     if (!file->open) return -1;
+    if (fat_handle_stale(file)) return -1;   // #250: medium removed
     if (position > file->file_size) position = file->file_size;
     // #725: an ext2-backed handle has no cluster chain to walk; the position IS
     // the state (ext2_read_file_range takes an absolute byte offset). This is
@@ -2215,6 +2494,22 @@ static void fat_list_dir_inner(fat_fs_t *fs, const char *path) {
     fat_close(&dir);
 }
 
+// #192: WHOLE-FILE-READ TRACING, OFF BY DEFAULT. The four narration lines
+// inside fat_read_file() below used to print unconditionally, so every config
+// read, every app launch and every 2-second timezone refresh cost six serial
+// lines. An always-on debugging aid at a chokepoint this hot is one of the ways
+// a boot log becomes something nobody reads, and it is half of the #192 flood.
+// `make FATTRACE=1` turns them back on. The FAILURE lines are NOT gated - they
+// stay on always, and they now carry the path, because the only reason the
+// "opening %s" line was load-bearing was that "open failed" alone did not say
+// what had failed. The disabled form still type-checks its arguments, so a
+// format string cannot rot while the trace is off.
+#ifdef FAT_TRACE_READS
+#define FAT_TRACE(...) kprintf(__VA_ARGS__)
+#else
+#define FAT_TRACE(...) do { if (0) { kprintf(__VA_ARGS__); } } while (0)
+#endif
+
 // Read entire file
 void *fat_read_file(fat_fs_t *fs, const char *path, uint32_t *size_out) {
     extern fat_fs_t g_fat_fs;
@@ -2248,19 +2543,26 @@ void *fat_read_file(fat_fs_t *fs, const char *path, uint32_t *size_out) {
     // "/boot"/"/EFI" (no separator check), so "/bootcfg.txt" would have been
     // read from the FAT ESP while fat_write_file() wrote it to ext2. One
     // predicate now, shared with every other entry point.
-    if (fat_path_on_ext2(fs, path)) {
+    // #193: ...UNLESS a mounted disk image owns this subtree, in which case the
+    // ext2 folder underneath it is not the answer and this must fall through to
+    // fat_open(), which serves the disc. Without this test a whole-file read of
+    // a path present in BOTH the image and the folder returned the FOLDER's
+    // bytes, while the DOS guest's fat_open() on the identical path returned the
+    // IMAGE's. Same class as the #725 defect this comment block describes, one
+    // function over.
+    if (!path_img_shadows(path) && fat_path_on_ext2(fs, path)) {
         uint32_t esz = 0;
         void *eb = ext2_read_whole(fat_ext2_vol_path(path), &esz);
         if (eb) { if (size_out) *size_out = esz; return eb; }
         // not present on ext2: fall through to the FAT read below
     }
     fat_file_t file;
-    kprintf("[FAT] fat_read_file: opening %s\n", path);
+    FAT_TRACE("[FAT] fat_read_file: opening %s\n", path);
     if (fat_open(fs, path, &file) != 0) {
-        kprintf("[FAT] fat_read_file: open failed\n");
+        kprintf("[FAT] fat_read_file: open failed: %s\n", path);
         return NULL;
     }
-    kprintf("[FAT] fat_read_file: opened, is_dir=%d\n", file.is_dir);
+    FAT_TRACE("[FAT] fat_read_file: opened, is_dir=%d\n", file.is_dir);
 
     if (file.is_dir) {
         fat_close(&file);
@@ -2268,21 +2570,22 @@ void *fat_read_file(fat_fs_t *fs, const char *path, uint32_t *size_out) {
     }
 
     uint32_t size = fat_size(&file);
-    kprintf("[FAT] fat_read_file: size=%u bytes, allocating\n", size);
+    FAT_TRACE("[FAT] fat_read_file: size=%u bytes, allocating\n", size);
     void *buffer = kmalloc(size + 1);  // +1 for null terminator
     if (!buffer) {
-        kprintf("[FAT] fat_read_file: kmalloc failed for %u bytes\n", size);
+        kprintf("[FAT] fat_read_file: kmalloc failed for %u bytes: %s\n", size, path);
         fat_close(&file);
         return NULL;
     }
-    kprintf("[FAT] fat_read_file: allocated at %p, reading...\n", buffer);
+    FAT_TRACE("[FAT] fat_read_file: allocated at %p, reading...\n", buffer);
 
     int bytes_read = fat_read(&file, buffer, size);
-    kprintf("[FAT] fat_read_file: read %d bytes\n", bytes_read);
+    FAT_TRACE("[FAT] fat_read_file: read %d bytes\n", bytes_read);
     fat_close(&file);
 
     if (bytes_read != (int)size) {
-        kprintf("[FAT] fat_read_file: read mismatch (%d != %u)\n", bytes_read, size);
+        kprintf("[FAT] fat_read_file: read mismatch (%d != %u): %s\n",
+                bytes_read, size, path);
         kfree(buffer);
         return NULL;
     }
@@ -2445,6 +2748,7 @@ static int fat_create_inner(fat_fs_t *fs, const char *path) {
         str_to_fat_name(filename, se.name);
     }
     se.attr = FAT_ATTR_ARCHIVE;
+    fat_stamp_new_entry(&se);   // #115: was created with all date/time words 0
 
     if (fat_write_entry_set(fs, &parent_dir, filename, &se) != 0) {
         fat_close(&parent_dir);
@@ -2937,6 +3241,9 @@ static int fat_persist_dirent(fat_file_t *file) {
     de->cluster_lo = (uint16_t)(file->first_cluster & 0xFFFF);
     de->cluster_hi = (uint16_t)(file->first_cluster >> 16);
     de->file_size  = file->file_size;
+    fat_stamp_modified(de);   // #115: the contents just changed; so does mtime
+    file->mtime_date = de->modify_date;   // keep the handle consistent with disk
+    file->mtime_time = de->modify_time;
     // #695: was unchecked. Without this the data is on disk but the directory
     // entry still reports the OLD size / cluster, so the bytes are unreachable
     // and the clusters are leaked, while fat_write() returned a healthy count.
@@ -2945,6 +3252,45 @@ static int fat_persist_dirent(fat_file_t *file) {
         return -1;
     }
     return 0;
+}
+
+// #115: the FAT half of utime(2). Pass -1 to leave a time unchanged.
+//
+// FAT has no ctime-equivalent to update (create_date means CREATION, and
+// rewriting it on a utime() would be a lie), and its access field is a DATE
+// with no time-of-day, so an atime set through here lands at midnight. Both are
+// properties of the on-disk format and are documented rather than papered over.
+//
+// Refuses on an ext2-backed or image-backed handle: those are not FAT entries
+// and silently succeeding on them is how a caller ends up believing a timestamp
+// was set when nothing was written (#725 in miniature).
+int fat_set_times(fat_fs_t *fs, const char *path, int64_t atime, int64_t mtime) {
+    if (!fs || !fs->mounted || !path) return -1;
+    fat_file_t f;
+    if (fat_open(fs, path, &f) != 0) return -1;
+    if (f.ext2_ino || f.img_drive || !f.dirent_lba || fs->bytes_per_sector > 512) {
+        fat_close(&f);
+        return -1;
+    }
+    uint32_t lba = f.dirent_lba, off = f.dirent_off;
+    fat_close(&f);
+    if (off + 32 > fs->bytes_per_sector) return -1;
+
+    uint8_t dbuf[512];
+    if (fat_read_sector(fs, lba, dbuf) <= 0) return -1;
+    fat_dir_entry_t *de = (fat_dir_entry_t *)(dbuf + off);
+    if (mtime >= 0) {
+        uint16_t d = 0, t = 0;
+        if (ktime_unix_to_dos_rs(mtime, &d, &t) != 0) return -1;   // out of FAT range
+        de->modify_date = d;
+        de->modify_time = t;
+    }
+    if (atime >= 0) {
+        uint16_t d = 0, t = 0;
+        if (ktime_unix_to_dos_rs(atime, &d, &t) != 0) return -1;
+        de->access_date = d;   // FAT stores no access time-of-day
+    }
+    return (fat_write_sector(fs, lba, dbuf) == 0) ? 0 : -1;
 }
 
 static int fat_write_inner(fat_file_t *file, const void *buffer, uint32_t size) {
@@ -3179,6 +3525,7 @@ static int fat_write_file_inner(fat_fs_t *fs, const char *path, const void *data
                 de->file_size = size;
                 de->cluster_hi = (file.first_cluster >> 16) & 0xFFFF;
                 de->cluster_lo = file.first_cluster & 0xFFFF;
+                fat_stamp_modified(de);   // #115
                 // #695: was unchecked, and this function returns
                 // (written == size) ? 0 : -1, so a failed dirent update
                 // reported SUCCESS while the file reads back as size 0 with its

@@ -1,0 +1,164 @@
+#!/usr/bin/env python3
+# gen_midi_tables.py - #183: GENERATE midi_tables.rs from the formulas.
+#
+# WHY THIS IS GENERATED AND NOT TRANSCRIBED, and it is not a style preference.
+# blame.md (2026-08-20, #182) records that Jeff Lee's AdLib note table, the
+# table every FM MIDI player on the internet copies, gives A440 as F-Number 577.
+# On real hardware that is 437.72 Hz, NINE CENTS FLAT, because every entry in it
+# was computed against a sample rate near 49976 instead of the chip's actual
+# 3579545/72 = 49715.90 Hz. A transcribed table cannot be checked against
+# anything; a generated one is checked against the formula by table-gate.sh, and
+# the formula is checked against measurement by the self-test.
+#
+#   python3 gen_midi_tables.py            -> writes midi_tables.rs beside this
+#   python3 gen_midi_tables.py --stdout   -> writes to stdout (used by the gate)
+#
+# EVERY TABLE HERE HAS AN ANCHOR ASSERTED BELOW. An anchor is a value computed
+# by an independent route: A440 -> F-Number 580 at BLOCK 4 is the value
+# userland/lib/opl2/opl2selftest.rs arrived at separately (A440_FNUM /
+# A440_BLOCK) and measured at 439998 mHz. If this generator and that core ever
+# disagree about A440, one of them is wrong and the build stops here.
+
+import math
+import sys
+
+# The chip's own rate. NOT 49976, NOT 50000. See the header.
+CHIP_CLOCK_HZ = 3579545
+CHIP_CLOCK_DIV = 72
+CHIP_RATE = CHIP_CLOCK_HZ / CHIP_CLOCK_DIV      # 49715.9027...
+
+FNUM_MAX = 1023          # 10 bits
+BLOCK_MAX = 7            # 3 bits
+
+
+def note_hz(n):
+    """Equal temperament, A4 (MIDI 69) = 440 Hz exactly."""
+    return 440.0 * (2.0 ** ((n - 69) / 12.0))
+
+
+def fnum_for(freq, block):
+    """The YM3812 frequency formula solved for F-Number.
+
+    f = FNUM * CHIP_RATE / 2**(20 - BLOCK)
+    """
+    return freq * (2.0 ** (20 - block)) / CHIP_RATE
+
+
+def note_to_fnum_block(n):
+    """Lowest BLOCK whose F-Number still fits in 10 bits.
+
+    Lowest block means largest F-Number means the finest pitch resolution the
+    chip can give that note, which also leaves the most headroom below the
+    10-bit ceiling for a pitch bend to be expressed without a block change.
+    Returns (fnum, block, clamped).
+    """
+    for b in range(0, BLOCK_MAX + 1):
+        f = fnum_for(note_hz(n), b)
+        if f <= FNUM_MAX + 0.5:
+            return (int(round(f)), b, False)
+    # Above the chip's range at every block. Clamp to the top of block 7 and
+    # SAY SO rather than wrapping into a wrong pitch.
+    return (FNUM_MAX, BLOCK_MAX, True)
+
+
+def vel_att(v):
+    """MIDI velocity (or channel volume, or expression) to OPL attenuation.
+
+    The OPL's Total Level field is attenuation in 0.75 dB steps, 6 bits, and
+    attenuations ADD, which is why one curve serves velocity, CC7 and CC11:
+    three attenuations in dB is exactly what "velocity times volume times
+    expression" means in linear amplitude.
+
+    amplitude = v / 127, attenuation_dB = -20 * log10(v / 127).
+    """
+    if v <= 0:
+        return 63
+    a = -20.0 * math.log10(v / 127.0) / 0.75
+    return max(0, min(63, int(round(a))))
+
+
+def bend_ratio(i):
+    """Pitch-bend index (14-bit bend >> 5) to a 16.16 frequency ratio.
+
+    GM default bend range is +/- 2 semitones and that is the ONLY range
+    implemented; RPN 0 (bend range) is not honoured. 512 entries is one step
+    per 1/128 semitone, i.e. 0.78 cents, and index 256 is bend 8192 (centre)
+    which is exactly 1.0 by construction so a file that never bends is never
+    detuned.
+    """
+    bend = i * 32
+    semis = (bend - 8192) * 2.0 / 8192.0
+    return int(round((2.0 ** (semis / 12.0)) * 65536.0))
+
+
+def emit(out):
+    fnums, blocks, clamped = [], [], []
+    for n in range(128):
+        f, b, c = note_to_fnum_block(n)
+        fnums.append(f)
+        blocks.append(b)
+        clamped.append(c)
+
+    max_exact = max(n for n in range(128) if not clamped[n])
+
+    # ---- ANCHORS. Each is an independently-known value. ----
+    assert (fnums[69], blocks[69]) == (580, 4), \
+        "A440 must be F-Number 580 BLOCK 4 (opl2selftest.rs A440_FNUM/A440_BLOCK)"
+    assert (fnums[60], blocks[60]) == (690, 3), "middle C must be 690 / block 3"
+    assert max_exact == 114, \
+        "highest exactly representable note must be 114 (1023 * %.4f / 8192 = %.1f Hz)" % (
+            CHIP_RATE, FNUM_MAX * CHIP_RATE / 8192.0)
+    assert vel_att(127) == 0 and vel_att(0) == 63, "velocity curve endpoints"
+    assert vel_att(64) == 8, "velocity 64 is -5.94 dB, 7.92 steps of 0.75 dB"
+    assert bend_ratio(256) == 65536, "bend centre must be exactly unity"
+    assert bend_ratio(511) == 73528 and bend_ratio(0) == 58386, "bend ends"
+    # Cross-check every note against the frequency it will actually produce.
+    for n in range(115):
+        got = fnums[n] * CHIP_RATE / (2.0 ** (20 - blocks[n]))
+        cents = 1200.0 * math.log2(got / note_hz(n))
+        assert abs(cents) < 12.0, "note %d off by %.2f cents" % (n, cents)
+
+    w = out.write
+    w("// midi_tables.rs - GENERATED by gen_midi_tables.py. DO NOT EDIT.\n")
+    w("//\n")
+    w("// Regenerate and verify with userland/lib/midi/table-gate.sh, which\n")
+    w("// reruns the generator and diffs, and proves itself RED on one altered\n")
+    w("// digit. Every constant below comes from a formula in that script.\n")
+    w("//\n")
+    w("// Chip rate %d/%d = %.4f Hz. A440 = F-Number %d BLOCK %d, which is the\n"
+      % (CHIP_CLOCK_HZ, CHIP_CLOCK_DIV, CHIP_RATE, fnums[69], blocks[69]))
+    w("// same pair userland/lib/opl2 measured at 439998 mHz.\n")
+    w("\n")
+    w("/// Highest MIDI note the YM3812 can express exactly. Above this the\n")
+    w("/// table is CLAMPED to F-Number 1023 BLOCK 7 (%.1f Hz) and the player\n"
+      % (FNUM_MAX * CHIP_RATE / 8192.0))
+    w("/// counts every clamped note-on rather than playing a wrong pitch.\n")
+    w("pub const MIDI_NOTE_MAX_EXACT: u8 = %d;\n\n" % max_exact)
+
+    def arr(name, ty, vals, per):
+        w("pub static %s: [%s; %d] = [\n" % (name, ty, len(vals)))
+        for i in range(0, len(vals), per):
+            w("    " + ", ".join(str(v) for v in vals[i:i + per]) + ",\n")
+        w("];\n\n")
+
+    w("/// MIDI note number to YM3812 F-Number.\n")
+    arr("NOTE_FNUM", "u16", fnums, 12)
+    w("/// MIDI note number to YM3812 BLOCK (octave), 0..7.\n")
+    arr("NOTE_BLOCK", "u8", blocks, 12)
+    w("/// Velocity, CC7 volume and CC11 expression to attenuation in 0.75 dB\n")
+    w("/// steps. Attenuations add, so one curve serves all three.\n")
+    arr("VEL_ATT", "u8", [vel_att(v) for v in range(128)], 16)
+    w("/// Pitch bend (14-bit value >> 5) to a 16.16 frequency ratio over the\n")
+    w("/// GM default +/- 2 semitones. Index 256 is exactly 65536.\n")
+    arr("BEND_RATIO", "u32", [bend_ratio(i) for i in range(512)], 8)
+
+
+if __name__ == "__main__":
+    if "--stdout" in sys.argv:
+        emit(sys.stdout)
+    else:
+        import os
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "midi_tables.rs")
+        with open(p, "w") as f:
+            emit(f)
+        sys.stderr.write("wrote %s\n" % p)

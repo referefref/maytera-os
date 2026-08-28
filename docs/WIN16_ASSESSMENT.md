@@ -1,5 +1,8 @@
 # Win16 (Windows 3.1) Apps on MayteraOS — Feasibility Assessment (#76)
 
+> STATUS: REFUTED (2026-08-22, #242) — this assessment concluded Win16 support was "not worth implementing, won't-do"; a full NE loader + interpreter running Word 6 shipped, the exact opposite conclusion (see docs/WORD6_LOCALHEAP_PLAN.md and CHANGELOG.md's #278 Word 6 pass history).
+
+
 Date: 2026-06-17. Verdict: **not worth implementing now; native ports or a DOS path are far better ROI.**
 
 ## What running a Win16 app actually requires

@@ -42,6 +42,7 @@
 
 #include "compositor.h"
 #include "../../libc/syscall.h"
+#include "../../libc/keys.h"   // #243: THE cooked-code table. See the MK_* note below.
 
 // ---------------------------------------------------------------------------
 // TCP client wrapper constants (mirrors apps/nc/main.c - the only other
@@ -51,19 +52,59 @@
 #define TCP_STATE_ESTABLISHED  4
 #define TCP_ERR_IN_PROGRESS   (-8)
 
-// MayteraOS special-key codes (mirrors kernel/cpu/isr.h KEY_* - not visible to
-// userland headers, so duplicated here; press codes 0x80-0x89, release = +0x10).
-#define MK_UP      0x80
-#define MK_DOWN    0x81
-#define MK_LEFT    0x82
-#define MK_RIGHT   0x83
-#define MK_LCTRL   0x84
-#define MK_F11     0x85
-#define MK_F12     0x86
-#define MK_LSHIFT  0x87
-#define MK_RSHIFT  0x88
-#define MK_ALT     0x89
-#define MK_F6      0x8A
+// #243: THIS BLOCK WAS A PRIVATE COPY OF THE KEYCODE TABLE, AND IT WAS STALE.
+//
+// It read "mirrors kernel/cpu/isr.h KEY_* - not visible to userland headers, so
+// duplicated here; press codes 0x80-0x89, release = +0x10". The header IS
+// visible to userland (libc/keys.h has mirrored it since #191), and four of the
+// eleven values were the PRE-FIX ones isr.h moved away from in the Word 6
+// divergence work:
+//
+//     MK_LCTRL  0x84  ->  isr.h KEY_LCTRL  0x99   (0x84 is KEY_F5)
+//     MK_LSHIFT 0x87  ->  isr.h KEY_LSHIFT 0x95   (0x87 is KEY_F10)
+//     MK_RSHIFT 0x88  ->  isr.h KEY_RSHIFT 0x96   (0x88 is KEY_F1)
+//     MK_ALT    0x89  ->  isr.h KEY_ALT    0x9A   (0x89 is KEY_F2)
+//
+// So over VNC, pressing Ctrl injected F5, Left Shift injected F10 (menu
+// activate), Right Shift injected F1 (help) and Alt injected F2 into whatever
+// app had focus. That is the identical "one byte, two meanings" defect isr.h
+// records fixing on the PS/2 side; this copy simply never heard about it, which
+// is exactly what a duplicated table does. Aliased onto libc/keys.h so there is
+// ONE declaration and this cannot drift again.
+//
+// NOT VERIFIED over a live RFB session: the nav-key work this came out of was
+// verified on the local console. The values are checked against
+// kernel/cpu/isr.h by build/keycode-gate.sh, which is a stronger guarantee than
+// the comment that used to be here, but it is not a VNC test.
+#define MK_UP      GUI_KEY_UP
+#define MK_DOWN    GUI_KEY_DOWN
+#define MK_LEFT    GUI_KEY_LEFT
+#define MK_RIGHT   GUI_KEY_RIGHT
+#define MK_LCTRL   GUI_KEY_LCTRL
+#define MK_F11     GUI_KEY_F11
+#define MK_F12     GUI_KEY_F12
+#define MK_LSHIFT  GUI_KEY_LSHIFT
+#define MK_RSHIFT  GUI_KEY_RSHIFT
+#define MK_ALT     GUI_KEY_ALT
+#define MK_F6      GUI_KEY_F6
+
+// #243: the matching RELEASE code. `press + 0x10` is true for the ARROWS and
+// for nothing else, which is why the modifier releases above were wrong too.
+// Returns 0 when the key has no release code (the nav/editing block is
+// press-only, exactly as on the PS/2 path).
+static int vnc_release_code(int press) {
+    switch (press) {
+        case GUI_KEY_UP:     return GUI_KEY_UP_REL;
+        case GUI_KEY_DOWN:   return GUI_KEY_DOWN_REL;
+        case GUI_KEY_LEFT:   return GUI_KEY_LEFT_REL;
+        case GUI_KEY_RIGHT:  return GUI_KEY_RIGHT_REL;
+        case GUI_KEY_LCTRL:  return GUI_KEY_LCTRL_UP;
+        case GUI_KEY_LSHIFT: return GUI_KEY_LSHIFT_UP;
+        case GUI_KEY_RSHIFT: return GUI_KEY_RSHIFT_UP;
+        case GUI_KEY_ALT:    return GUI_KEY_ALT_UP;
+        default:             return 0;   // F-keys and nav keys: press-only
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Small helpers (no libc string/stdlib dependency - same pattern as
@@ -466,6 +507,19 @@ static void vnc_inject_key(unsigned int keysym, int down) {
             case 0xFFE2: mkey = MK_RSHIFT; is_special = 1; break;
             case 0xFFE3: case 0xFFE4: mkey = MK_LCTRL; is_special = 1; break;
             case 0xFFE9: case 0xFFEA: mkey = MK_ALT;   is_special = 1; break;
+            // #243: the navigation/editing block. Deliberately NOT is_special:
+            // that flag means "emit a release as mkey + 0x10", and these six
+            // are PRESS-ONLY in the kernel too (cpu/isr.c's extended-release
+            // switch has never emitted anything for them), so leaving it 0
+            // makes this path match the PS/2 path exactly. mkey >= 0x100 also
+            // fails the `mkey >= 0x20 && mkey <= 0x7E` printable-release test
+            // below, so no release is forged either way.
+            case 0xFF50: mkey = GUI_KEY_HOME; break;   // Home
+            case 0xFF57: mkey = GUI_KEY_END;  break;   // End
+            case 0xFF55: mkey = GUI_KEY_PGUP; break;   // Prior / Page Up
+            case 0xFF56: mkey = GUI_KEY_PGDN; break;   // Next / Page Down
+            case 0xFF63: mkey = GUI_KEY_INS;  break;   // Insert
+            case 0xFFFF: mkey = GUI_KEY_DEL;  break;   // Delete
             case 0xFFC3: mkey = MK_F6;  is_special = 1; break;
             case 0xFFC8: mkey = MK_F11; is_special = 1; break;
             case 0xFFC9: mkey = MK_F12; is_special = 1; break;
@@ -497,10 +551,31 @@ static void vnc_inject_key(unsigned int keysym, int down) {
     if (down) {
         sys_inject_key(mkey);
     } else if (is_special) {
-        sys_inject_key(mkey + 0x10);
-    } else {
+        // #243: was `mkey + 0x10`, which is the right arithmetic ONLY for the
+        // four arrows. See vnc_release_code() above.
+        int rel = vnc_release_code(mkey);
+        if (rel) sys_inject_key(rel);
+    } else if (mkey >= 0x20 && mkey <= 0x7E) {
         sys_inject_key(mkey | 0x80);
     }
+    // #119: a control-character RELEASE (Tab 0x09, Backspace 0x08, Enter
+    // 0x0D, Escape 0x1B - anything outside 0x20-0x7E and not already handled
+    // as `is_special`) must NOT be forwarded here. `mkey | 0x80` for any of
+    // these lands in 0x80-0x9B, which SYS_INJECT_KEY (kernel/proc/syscall.c)
+    // treats as a PRESS of an unrelated special key: Tab's 0x89 decodes as
+    // KEY_F2, Enter's 0x8D as another F-key, and Escape's 0x9B as KEY_SUPER
+    // (the Super/Start-menu key). The PS/2 hardware path (kernel/cpu/isr.c,
+    // see its own "Only emit release events for printable ASCII" comment)
+    // already carries this exact guard, because it caused Enter to phantom-
+    // launch a terminal (0x8A == KEY_F6) before it was added there. This is
+    // the SECOND of the two sys_inject_key() forward paths - see the
+    // modal_key_grab() comment immediately above - and it never carried the
+    // guard the first one needed years ago. Silently drop instead of
+    // forwarding a release this receiver cannot represent; the compositor's
+    // own keyboard_process_scancode() path drops these releases the same
+    // way, so this makes the two paths agree instead of one of them
+    // occasionally injecting an uncommanded F-key press or Super-key press
+    // into whichever window has focus.
 }
 
 // ---------------------------------------------------------------------------

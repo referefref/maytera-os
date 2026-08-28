@@ -86,6 +86,24 @@ static const uint8_t icon_data_info_circle[72] = {
     0x01,0xFF,0x80, 0x00,0x00,0x00, 0x00,0x00,0x00
 };
 
+// #159 sect 6b: wifi bars + slash, for the desktop-widget offline component
+// (Weather/Crypto/Stocks/Home Assistant). Three concentric arcs opening
+// upward above a dot (the standard wifi glyph), plus a diagonal "off" slash
+// baked into one bitmap rather than composited from a separate overlay -
+// simpler than realigning a slash at every icon_draw_scaled() size. Do NOT
+// reuse ICON_NETWORK for this: it points at icon_data_info_circle above, an
+// info-circle glyph, not a network one.
+static const uint8_t icon_data_wifi_off[72] = {
+    0x00,0x00,0x00, 0x00,0x00,0x07, 0x00,0x00,0x0E,
+    0x00,0x00,0x1C, 0x00,0x00,0x38, 0x00,0x7F,0x70,
+    0x03,0xFF,0xE0, 0x0F,0x81,0xF8, 0x1E,0x03,0xBC,
+    0x38,0x7F,0x0E, 0x71,0xFF,0xC7, 0xE3,0xDD,0xE3,
+    0xC7,0x38,0x71, 0xCC,0x7E,0x19, 0x1C,0xFF,0x9C,
+    0x09,0xC1,0xC8, 0x03,0x80,0xC0, 0x07,0x00,0x00,
+    0x0E,0x1C,0x00, 0x1C,0x1C,0x00, 0x38,0x1C,0x00,
+    0x70,0x00,0x00, 0xE0,0x00,0x00, 0x40,0x00,0x00
+};
+
 static const uint8_t icon_data_image[72] = {
     0x00,0x00,0x00, 0x00,0x00,0x00, 0x00,0x00,0x00,
     0x00,0x00,0x00, 0x7F,0xFF,0xFE, 0x7F,0xFF,0xFE,
@@ -416,6 +434,95 @@ typedef struct {
     int height;
 } icon_t;
 
+// #250: removable USB volume. A 1bpp BUILT-IN glyph and not a .ICN, because
+// .ICN files live in the out-of-git static asset base and build-golden.sh does
+// not regenerate them from the SVGs, so an asset-only icon would simply never
+// ship. This one is compiled into the binary and always renders.
+static const uint8_t icon_data_usbdrive[72] = {
+    0x00, 0x00, 0x00,
+    0x00, 0x7E, 0x00,
+    0x00, 0x42, 0x00,
+    0x00, 0x5A, 0x00,
+    0x00, 0x5A, 0x00,
+    0x00, 0x42, 0x00,
+    0x03, 0xFF, 0xC0,
+    0x03, 0xFF, 0xC0,
+    0x02, 0x00, 0x40,
+    0x02, 0x00, 0x40,
+    0x02, 0x7E, 0x40,
+    0x02, 0x42, 0x40,
+    0x02, 0x42, 0x40,
+    0x02, 0x7E, 0x40,
+    0x02, 0x00, 0x40,
+    0x02, 0x00, 0x40,
+    0x02, 0x00, 0x40,
+    0x02, 0x18, 0x40,
+    0x02, 0x18, 0x40,
+    0x02, 0x00, 0x40,
+    0x03, 0xFF, 0xC0,
+    0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00,
+};
+
+// #234i: the two disk-image volume classes. Built-in 1bpp glyphs for exactly
+// the reason the USB one above gives: an .ICN lives in the out-of-git asset
+// base that build-golden.sh never regenerates, so an asset-only icon would
+// never ship. Authored as a bitmap and pasted, not hand-typed hex.
+static const uint8_t icon_data_cdrom[72] = {
+    0x00, 0x00, 0x00,
+    0x00, 0xFF, 0x00,
+    0x03, 0xFF, 0xC0,
+    0x07, 0x00, 0xE0,
+    0x0E, 0x00, 0x70,
+    0x18, 0x00, 0x18,
+    0x38, 0x00, 0x1C,
+    0x30, 0x3C, 0x0C,
+    0x60, 0xFF, 0x06,
+    0x60, 0xC3, 0x06,
+    0x61, 0x81, 0x86,
+    0x61, 0x81, 0x86,
+    0x61, 0x81, 0x86,
+    0x61, 0x81, 0x86,
+    0x60, 0xC3, 0x06,
+    0x60, 0xFF, 0x06,
+    0x30, 0x3C, 0x0C,
+    0x38, 0x00, 0x1C,
+    0x18, 0x00, 0x18,
+    0x0E, 0x00, 0x70,
+    0x07, 0x00, 0xE0,
+    0x03, 0xFF, 0xC0,
+    0x00, 0xFF, 0x00,
+    0x00, 0x00, 0x00,
+};
+
+static const uint8_t icon_data_floppy[72] = {
+    0x00, 0x00, 0x00,
+    0x7F, 0xFF, 0xFE,
+    0x41, 0x9F, 0x82,
+    0x41, 0x9F, 0x82,
+    0x41, 0x9F, 0x82,
+    0x41, 0x9F, 0x82,
+    0x41, 0x9F, 0x82,
+    0x41, 0x9F, 0x82,
+    0x41, 0xFF, 0x82,
+    0x40, 0x00, 0x02,
+    0x40, 0x00, 0x02,
+    0x40, 0x00, 0x02,
+    0x40, 0x00, 0x02,
+    0x4F, 0xFF, 0xF2,
+    0x48, 0x00, 0x12,
+    0x4B, 0xFF, 0xD2,
+    0x48, 0x00, 0x12,
+    0x4B, 0xFF, 0xD2,
+    0x48, 0x00, 0x12,
+    0x4B, 0xFF, 0xD2,
+    0x48, 0x00, 0x12,
+    0x48, 0x00, 0x12,
+    0x7F, 0xFF, 0xFE,
+    0x00, 0x00, 0x00,
+};
+
 static const icon_t icons[ICON_COUNT] = {
     /* ICON_CATEGORIES    */ { icon_data_categories,  24, 24 },
     /* ICON_TERMINAL      */ { icon_data_terminal,    24, 24 },
@@ -448,6 +555,7 @@ static const icon_t icons[ICON_COUNT] = {
     /* ICON_IRC           */ { icon_data_info_circle, 24, 24 },
     /* ICON_VIDEO         */ { icon_data_music,       24, 24 },
     /* ICON_NETWORK       */ { icon_data_info_circle, 24, 24 },
+    /* ICON_WIFI_OFF      */ { icon_data_wifi_off,    24, 24 },
     /* ICON_SLIDERS       */ { icon_data_cog,         24, 24 },
     /* ICON_CHEVD         */ { icon_data_cog,         24, 24 },
     /* ICON_CHEVR         */ { icon_data_cog,         24, 24 },
@@ -470,6 +578,9 @@ static const icon_t icons[ICON_COUNT] = {
     [ICON_HA_BATTERY]       = { icon_data_ha_battery,       24, 24 },
     [ICON_HA_WARN]          = { icon_data_ha_warn,          24, 24 },
     [ICON_HA_CHECK]         = { icon_data_ha_check,         24, 24 },
+    [ICON_USBDRIVE]         = { icon_data_usbdrive,         24, 24 },   // #250
+    [ICON_CDROM]            = { icon_data_cdrom,            24, 24 },   // #234i
+    [ICON_FLOPPY]           = { icon_data_floppy,           24, 24 },   // #234i
 };
 
 // ============================================================================
@@ -519,6 +630,15 @@ void icon_draw(icon_id_t id, int32_t x, int32_t y, uint32_t color)
 //         = (dst_col * src_w) / size   (integer division)
 // Similarly for rows.
 // ============================================================================
+// #uiscale KNOWN CEILING: `size` already arrives pre-scaled (every caller
+// computes it via ui_px()/DESKTOP_ICON_SIZE/TASKBAR_BTN_SIZE/etc, all of
+// which are UI-scale-aware), so this function needs no change to grow the
+// icon under UI scale - it already does, via nearest-neighbor upscale of the
+// 24x24 1bpp source below. That IS the ceiling: nearest-neighbor holds up
+// fine to roughly 32px and gets visibly blocky above it, same as any
+// nearest-neighbor upscale of a small source. Fine for most chrome glyphs at
+// 125-150% scale; a future higher-fidelity source (vector or a larger
+// pre-rasterized table) would be a separate change.
 void icon_draw_scaled(icon_id_t id, int32_t x, int32_t y, int32_t size, uint32_t color)
 {
     if ((int)id < 0 || id >= ICON_COUNT)
@@ -577,7 +697,17 @@ void icon_draw_scaled(icon_id_t id, int32_t x, int32_t y, int32_t size, uint32_t
 // Shared color-icon library (#66): full-color RGBA icons rasterized from SVG.
 // File format MICO: 'M','I','C','O' + u32 width + u32 height + width*height
 // ARGB (0xAARRGGBB) pixels. Loaded into static slots, alpha-blended on draw.
-// ============================================================================
+//
+// #uiscale KNOWN CEILING: these are 64x64 source raster (COLOR_ICON_DIM), box-
+// filtered on DOWNSCALE by icon_draw_color_tinted()/icon_draw_color_if_present()
+// below. The .ICN files themselves are the out-of-git asset base (not in this
+// repo), so they cannot be re-rasterized at a higher source resolution as
+// part of this task. Requesting them at any size above 64 logical px - which
+// now happens routinely above 100% UI scale, since every caller's `size`
+// argument already scales via ui_px() at ITS call site - upscales a 64x64
+// source and will look soft. This is a real, stated resolution ceiling, not
+// a bug: the color icons still draw at the correct (scaled) SIZE, just with
+// reduced sharpness once that size exceeds 64 physical px.
 #define COLOR_ICON_DIM    64
 #define COLOR_ICON_SLOTS  64  // #562: bumped 28->64, 23 existing + 23 new per-app loads
 

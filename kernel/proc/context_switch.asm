@@ -28,11 +28,40 @@
 section .text
 global context_switch
 global context_start
+global fpu_save_live
+
+; #745 local 107: cpu/sse.c decides, per core, whether this machine saves FPU
+; state with xsave64 (x87 + SSE + AVX) or fxsave64 (x87 + SSE only), and
+; guarantees that AVX is DISABLED (CR4.OSXSAVE clear, so every VEX-encoded
+; instruction #UDs) whenever it is the latter. Both are read RIP-relative.
+extern g_fpu_use_xsave          ; uint8_t : 0 = fxsave64, 1 = xsave64
+extern g_fpu_xcr0               ; uint64_t: the RFBM for xsave64/xrstor64
 
 ; #588/#446 FPU/SSE state model. A switch saves the full FPU/SSE state
 ; (xmm0-15 + MXCSR + x87 control/status/tag + st0-st7) with a single
 ; fxsave64/fxrstor64 pair (#588), replacing the older movdqu-only block which
 ; saved xmm0-15 but NOT MXCSR or x87.
+;
+; #745 local 107 EXTENDS that to AVX, and it is written in assembly for the
+; same reason the rest of this file is: it is the switch primitive itself, and
+; xsave64/xrstor64 take their state-component bitmap in EDX:EAX, which no C
+; expression can spell without the compiler owning those registers at exactly
+; the point the outgoing context is being saved.
+;
+; fxsave64 saves XMM0-15. It DOES NOT save the upper 128 bits of YMM0-15. On a
+; CPU where AVX is enabled, an fxsave64-only switch therefore drops half of
+; every 256-bit register, silently and non-deterministically, with no fault to
+; trace. xsave64/xrstor64 with XCR0 = x87|SSE|AVX save all of it.
+;
+; The branch below is on a byte that is written once per core at boot and read
+; on every switch, so it predicts perfectly; the alternative (patching the
+; instruction stream at boot) buys nothing measurable and would put
+; self-modifying code in the one routine this project has already
+; double-faulted twice.
+;
+; SAFETY OF THE FALLBACK ARM: it is not "save less and hope". cpu/sse.c
+; CLEARS CR4.OSXSAVE whenever g_fpu_use_xsave stays 0, which makes every AVX
+; instruction #UD, so in that arm there is no YMM state in existence to lose.
 ;
 ; #446: the 512-byte FXSAVE image lives in a PER-PROCESS 16-byte-aligned
 ; buffer (process_t::fpu_area / thread_t::fpu_area) passed in as an argument,
@@ -63,8 +92,8 @@ global context_start
 ;                     volatile int32_t *old_release)
 ;   RDI = where to save the outgoing RSP (will point at its saved RFLAGS)
 ;   RSI = RSP to load (points at the incoming proc's saved RFLAGS)
-;   RDX = 16-byte-aligned 512-byte FXSAVE area of the OUTGOING proc
-;   RCX = 16-byte-aligned 512-byte FXSAVE area of the INCOMING proc
+;   RDX = 64-byte-aligned FPU_AREA_SIZE save area of the OUTGOING proc
+;   RCX = 64-byte-aligned FPU_AREA_SIZE save area of the INCOMING proc
 ;   R8  = &outgoing->sched_on_cpu, cleared once the save is complete (#67);
 ;         NULL when there is no outgoing process_t (the dummy_rsp paths)
 ;   R9  = &incoming->sched_pinned, cleared once we have switched to it (#75);
@@ -89,7 +118,23 @@ context_switch:
 
     ; RDX/RCX still hold their argument values here: push writes memory, it
     ; does not modify the pushed register.
-    fxsave64 [rdx]          ; save outgoing FPU/SSE state OFF the stack
+    ;
+    ; Save the outgoing FPU/SSE(/AVX) state OFF the stack. RAX/R10 are
+    ; clobbered freely: they were pushed above, and the matching pops at the
+    ; bottom read the INCOMING task's stack, so nothing here can be observed.
+    ; RDX is dead after this block (the rest of the routine uses only RDI,
+    ; RSI, RCX, R8, R9), which is why xsave64's EDX:EAX bitmap may take it.
+    cmp byte [rel g_fpu_use_xsave], 0
+    je  .cs_fxsave
+    mov r10, rdx            ; r10 = outgoing save area
+    mov rax, [rel g_fpu_xcr0]
+    mov rdx, rax
+    shr rdx, 32             ; EDX:EAX = RFBM
+    xsave64 [r10]
+    jmp .cs_saved
+.cs_fxsave:
+    fxsave64 [rdx]
+.cs_saved:
 
     ; Save the outgoing stack pointer, load the incoming one.
     ; RDX/RCX/R8 still hold their argument values (push writes memory only).
@@ -117,7 +162,18 @@ context_switch:
     mov dword [r9], 0
 .cs_no_unpin:
 
-    fxrstor64 [rcx]         ; restore incoming FPU/SSE state
+    ; Restore the incoming FPU/SSE(/AVX) state. RCX still holds the argument
+    ; our caller passed; RAX/RDX are restored by the pops below.
+    cmp byte [rel g_fpu_use_xsave], 0
+    je  .cs_fxrstor
+    mov rax, [rel g_fpu_xcr0]
+    mov rdx, rax
+    shr rdx, 32             ; EDX:EAX = RFBM
+    xrstor64 [rcx]
+    jmp .cs_restored
+.cs_fxrstor:
+    fxrstor64 [rcx]
+.cs_restored:
 
     ; Clear TF (bit 8) before restoring RFLAGS to avoid a spurious INT 1.
     and qword [rsp], 0xFFFFFFFFFFFFFEFF
@@ -145,7 +201,7 @@ context_switch:
 ;   RDI = where to save the outgoing RSP
 ;   RSI = new stack pointer holding the initial IRET context
 ;   RDX = CR3 for the user address space
-;   RCX = 16-byte-aligned 512-byte FXSAVE area of the OUTGOING proc
+;   RCX = 64-byte-aligned FPU_AREA_SIZE save area of the OUTGOING proc
 ;   R8  = &outgoing->sched_on_cpu, cleared once the save is complete (#67);
 ;         NULL when there is no outgoing process_t. Safe to store AFTER the CR3
 ;         load: it points into the kernel's low-half .bss, which stays mapped in
@@ -172,7 +228,24 @@ context_start:
     ; Save the OLD process FPU/SSE state into its own area (same shape the
     ; context_switch restore side expects). The NEW process needs no restore
     ; here: it enters Ring 3 fresh via IRETQ. Must happen BEFORE the CR3 load.
+    ; Unlike context_switch, RDX is LIVE here: it is the incoming CR3, needed
+    ; by the "mov cr3, rdx" below. xsave64 wants EDX:EAX, so park CR3 in R11
+    ; across the save and put it back. R10/R11/RAX were all pushed above and
+    ; are never read again on this path (context_start never returns; the pops
+    ; at the bottom unwind the INCOMING IRET frame).
+    cmp byte [rel g_fpu_use_xsave], 0
+    je  .cst_fxsave
+    mov r10, rcx            ; r10 = outgoing save area
+    mov r11, rdx            ; r11 = CR3, parked
+    mov rax, [rel g_fpu_xcr0]
+    mov rdx, rax
+    shr rdx, 32             ; EDX:EAX = RFBM
+    xsave64 [r10]
+    mov rdx, r11            ; CR3 back into RDX for the load below
+    jmp .cst_saved
+.cst_fxsave:
     fxsave64 [rcx]
+.cst_saved:
 
     ; Save the outgoing RSP (before the CR3 switch).
     mov [rdi], rsp
@@ -212,3 +285,40 @@ context_start:
     pop r14
     pop r15
     iretq
+
+; ============================================================================
+; #110: fork()/clone() must give the child the PARENT'S FPU state, not a fresh
+; one. The parent's live FPU/SSE(/AVX) registers are NOT in its
+; process_t::fpu_area at that moment: that field only holds whatever was saved
+; the last time the parent was switched OUT, which is stale by an arbitrary
+; amount of user execution. The state that has to be copied is the one sitting
+; in the physical registers right now, so the child's area is filled by a LIVE
+; save taken in the forking parent's own syscall context.
+;
+; This is in assembly for the same reason the switch above is: xsave64 takes
+; its state-component bitmap in EDX:EAX, which no C expression can spell, and
+; keeping the fxsave64-vs-xsave64 selection in ONE file means fork can never
+; drift from what the switch does (that drift is exactly what #110 is: the old
+; code seeded a default image while the switch was already saving AVX).
+;
+; void fpu_save_live(void *area)
+;   RDI = FPU_AREA_ALIGN-aligned, FPU_AREA_SIZE-byte buffer.
+;
+; THE CALLER MUST ZERO `area` FIRST. xsave64 writes
+; XSTATE_BV = (old XSTATE_BV & ~RFBM) | (XINUSE & RFBM), so any stale bit
+; outside the RFBM survives into the image and would make the matching
+; xrstor64 #GP. proc/process.c's fpu_capture_live() does the memset.
+;
+; RAX and RDX are caller-saved in the SysV ABI, so clobbering them for the
+; bitmap needs no save/restore.
+fpu_save_live:
+    cmp byte [rel g_fpu_use_xsave], 0
+    je  .fsl_fxsave
+    mov rax, [rel g_fpu_xcr0]
+    mov rdx, rax
+    shr rdx, 32             ; EDX:EAX = RFBM
+    xsave64 [rdi]
+    ret
+.fsl_fxsave:
+    fxsave64 [rdi]
+    ret

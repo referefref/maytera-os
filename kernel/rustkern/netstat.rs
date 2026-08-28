@@ -134,6 +134,98 @@ extern "C" {
     fn net_probe_tx_c(dest_ip: u32) -> i32;
     fn net_probe_rx_c();
     fn net_dhcp_restart_c() -> i32;
+
+    // #786 - net/dns.c: the EXPLICIT resolver setter (pins the choice and
+    // flushes the cache) and net/net.c's persist-to-/CONFIG/NETIP.CFG.
+    fn dns_set_server(server_ip: u32);
+    fn net_persist_netcfg() -> i32;
+}
+
+// ===========================================================================
+// #786 SYS_NET_SET_DNS - change the LIVE resolver, and make it stick.
+// ===========================================================================
+//
+// WHAT WAS BROKEN, MEASURED, NOT INFERRED (VM <vmid>, golden build 2054):
+//
+//   * Settings > Network > "Configure IP" has a "DNS Server" field. Clicking
+//     OK ran net_set_static() (which takes only ip/mask/gw - there has never
+//     been a DNS syscall) and then copied the TYPED TEXT into the panel's own
+//     variable. The panel then displayed it. Nothing else happened.
+//   * `[NETDIAG] ... dns=` (which reads dns_get_server()) was unchanged after
+//     the click, and a host-side packet capture showed the guest resolving a
+//     fresh hostname through the OLD server. The control was decorative.
+//   * The persist did not happen either: Settings wrote /CONFIG/NETIP.CFG from
+//     Ring 3, and /CONFIG is root-owned 0711, so the open was refused for the
+//     ordinary user the first-boot wizard creates. No file, no error, no log.
+//
+// So this syscall does BOTH halves, in one place, in the kernel:
+//   1. dns_set_server() - live, pinned, cache flushed.
+//   2. net_persist_netcfg() - the same value into the file the boot path reads.
+// A control that applies but does not persist, or persists but does not apply,
+// is the failure this ticket is about; doing them separately is how you get one
+// without the other.
+//
+// SCALAR, NOT A STRING. The argument is a HOST-ORDER u32 ((a<<24)|(b<<16)|
+// (c<<8)|d), parsed in userland. That is deliberate: a pointer argument would
+// need an argtab descriptor, a copy_from_user and a kernel-side dotted-quad
+// parser (a SECOND one - proc/syscall.c already has settings_parse_ip). There
+// is nothing here for syscall_validate_args() to check because there is no
+// pointer, which is the smallest possible attack surface for this operation.
+//
+// PRIVILEGE, STATED HONESTLY AND UNCHANGED: there is no root check here, and
+// there is none on SYS_NET_SET_STATIC (217) either - any Ring-3 process can
+// already reconfigure the machine's live IPv4 stack. This syscall deliberately
+// does not WIDEN that, but it does not narrow it either: adding a root gate
+// here alone would leave the address settable by anyone while the resolver was
+// not, which is an incoherent boundary. Gating the whole net-config family
+// behind the #745 elevation flow is real work and belongs in its own ticket.
+
+/// Reject a resolver address that could not possibly be one. Deliberately
+/// minimal: 0 (means "unconfigured" to dns_resolve, which would disable name
+/// resolution entirely), the all-ones broadcast, 127.x loopback (nothing
+/// listens on this machine) and 0.x. Anything else - including an address on
+/// no reachable network - is ACCEPTED, because "I typed an unreachable
+/// resolver and now nothing resolves" is a diagnosable, reversible mistake and
+/// refusing addresses on the grounds that we cannot reach them right now would
+/// refuse valid ones while the link is down.
+fn dns_addr_sane(v: u32) -> bool {
+    if v == 0 || v == 0xFFFF_FFFF {
+        return false;
+    }
+    let a = v >> 24;
+    a != 0 && a != 127
+}
+
+/// Return codes. 0 ok; every failure is negative and distinguishable.
+const DNS_SET_EINVAL: i64 = -2; // not a usable resolver address
+const DNS_SET_EPERSIST: i64 = -3; // applied LIVE, but could not be saved
+
+/// SYS_NET_SET_DNS(dns_host_order) -> 0 / -2 / -3.
+///
+/// -3 is not a cosmetic distinction: it means the resolver IS live now and
+/// WILL revert on reboot, which is the one outcome the user must be told about
+/// rather than left to discover. The caller surfaces it.
+///
+/// # Safety
+/// FFI entry point. No pointers. Calls net/dns.c and net/net.c, which touch
+/// only their own file-static state and the filesystem.
+#[no_mangle]
+pub unsafe extern "C" fn net_set_dns_rs(dns: u64) -> i64 {
+    if dns > 0xFFFF_FFFF {
+        return DNS_SET_EINVAL;
+    }
+    let v = dns as u32;
+    if !dns_addr_sane(v) {
+        return DNS_SET_EINVAL;
+    }
+    // LIVE FIRST. If the persist fails the user still gets the resolver they
+    // asked for for this boot, and is told it will not survive a restart. The
+    // other order would risk saving a value that never took effect.
+    dns_set_server(v);
+    if net_persist_netcfg() != 0 {
+        return DNS_SET_EPERSIST;
+    }
+    0
 }
 
 /// Fill `out` with the live status. Returns 0, or -1 for a NULL `out`.

@@ -249,10 +249,24 @@ void __wait_finish(wait_queue_head_t *wq, wait_queue_entry_t *entry) {
     // back as RUNNING (the scheduler sets that when it picks us) or READY, and
     // those must not be touched.
     // ------------------------------------------------------------------
+    //
+    // #167 ADDS PROC_STATE_READY TO THE SET. A task EXECUTING here can only
+    // legitimately be RUNNING: the scheduler is what sets RUNNING, on the task
+    // it just switched to. READY-while-executing is a third way of being parked
+    // and it became reachable with #167's funnel fix, which performs a deferred
+    // wake's state transition at the moment of the decision. The waiter can then
+    // observe its entry unlinked, break out of __wait_event_wait() without ever
+    // sleeping, and arrive here marked READY. Leaving it that way is fatal in
+    // the SAME two ways the comment above describes, plus a third: it is still
+    // sitting in the deferred-enqueue table, so the next sched_drain_deferred()
+    // would enqueue a task that is running, and a second core could switch into
+    // its live kernel stack. sched_self_running() clears both the state and
+    // sched_on_cpu, in that order, which is what closes that door.
     uint64_t flags = spinlock_acquire_irqsave(&wq->lock);
     int rescued = 0;
     process_t *me = entry->proc;
-    if (me && (me->state == PROC_STATE_BLOCKED || me->state == PROC_STATE_SLEEPING)) {
+    if (me && (me->state == PROC_STATE_BLOCKED || me->state == PROC_STATE_SLEEPING ||
+               me->state == PROC_STATE_READY)) {
         sched_self_running(me);                     // #75: set+disarm, one op
         me->wake_time = 0;
         g_wq_unpark_rescues++;

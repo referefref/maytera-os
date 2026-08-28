@@ -53,7 +53,7 @@
 //
 // WHY THIS IS ALWAYS-ON AND NOT DEBUG-ONLY
 // ----------------------------------------
-// The detection cost is one call to sched_preemption_enabled() (a bool load),
+// The detection cost is one call to sched_is_live() (a bool load),
 // one proc_current() (two loads and a branch), and one `pushfq; popq` - a few
 // nanoseconds, on a path that is ABOUT TO CONTEXT SWITCH (microseconds). A
 // guardrail that only runs in a build nobody makes is worthless (#514's whole
@@ -98,5 +98,11 @@ uint32_t wq_assert_may_block(const char *what, void *caller);
 // bug class firing. Surfaced in the [HB] heartbeat next to #610's
 // g_wq_unpark_rescues so a long run can be audited without serial capture.
 extern volatile uint64_t g_wq_noblock_violations;
+
+// #171: times a context blocked while the scheduler was live but preemption was
+// momentarily suppressed. This is LEGAL and is not a violation; the counter
+// exists so the frequency is visible without a serial line per occurrence, and
+// so that a future change that makes it unsafe has a number to compare against.
+extern volatile uint64_t g_wq_block_preempt_off;
 
 #endif // SYNC_NOBLOCK_H

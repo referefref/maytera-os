@@ -1,0 +1,1036 @@
+#!/usr/bin/env python3
+"""dup-const-lint (#222) - ONE NAME, ONE VALUE.
+
+WHY THIS FILE EXISTS
+
+The most expensive recurring fault in this project is not a hard bug. It is a
+value written down twice. Someone fixes one copy, the fix reads correct in
+review, and the shipped binary reads the other copy. The record is unambiguous:
+
+  #106   FIVE version.h files each defining MAYTERA_VERSION_STRING differently,
+         all behind the SAME include guard, so whichever was included first won
+         and the other four were invisible.
+  #178   FIVE copies of the #145 fix. The fifth still carried the pid-indexed
+         baseline that #145 believed it had removed.
+  #166   a SIXTH CPU-count constant, BKL_STAT_CPUS=8, read out of bounds, when
+         five copies were already known and thought to be all of them.
+  #745   two branches allocated syscall 373; git merged both without a conflict
+         because the #defines sat at different line numbers. It COMPILED.
+         Renumbering then reached four of the five copies, and the fifth (a
+         no_std Rust app that cannot include the C header) shipped calling
+         SYS_WM_SET_WORK_AREA believing it was a login-mode setter.
+  #222   dock geometry: DOCK_HEIGHT_MIN/MAX/DEFAULT and DOCK_ZOOM_MIN/MAX/DEFAULT
+         defined in BOTH userland/apps/settings/main.c and
+         userland/apps/compositor/taskbar.c, held in sync by a source comment
+         reading "must match taskbar.c".
+
+That comment is the whole problem in one line. A comment is not a mechanism. It
+cannot fail, it cannot block a build, and it is read only by someone who already
+suspects there is a second copy.
+
+THE MECHANISM, NOT THE INSTANCE. Fixing the dock constants fixes today. The
+seventh copy of the seventh constant gets introduced the same way tomorrow. So:
+
+  A named constant may be defined with only ONE value in the tree. Define it
+  twice with different values and the BUILD FAILS, unless the divergence is
+  written down in allowlist.tsv with a reason.
+
+WHAT IT READS
+
+Exactly two forms, and only when the value is a LITERAL:
+
+    C/C++/headers   #define NAME <literal>
+    Rust            [pub] const NAME: T = <literal>;
+                    [pub] static [mut] NAME: T = <literal>;
+
+A "literal" is an integer (dec/hex/octal/binary, any C or Rust suffix, any
+number of redundant parens), a character constant, a string constant, or a
+float. Anything else - an expression, a reference to another macro, a cast, a
+sizeof, a function-like macro - is NOT COMPARED by the automatic rules.
+
+That narrowness is the design, not a shortcut. `#define BUF (CHUNK * 4)` in two
+files is the same TEXT and possibly two different VALUES; `#define BUF 4096` and
+`#define BUF 0x1000` are different text and certainly the same value. A gate
+that guesses at expressions produces a list nobody reads, and a gate nobody
+reads gets allowlisted into decoration. Detecting the literal case PERFECTLY is
+worth more than a heuristic that flags three hundred things.
+
+Values are NORMALISED before comparison, so 44 == 0x2C == ((44u)) and the gate
+never cries wolf over a base change.
+
+THE THREE RULES, AND WHY ONLY TWO OF THEM CAN FAIL A BUILD
+
+Measured on the tree at #222: 138 names are defined with differing values. That
+number is useless as a gate; it splits, cleanly and 69/69, along one line.
+
+  RULE A - SHARED (69 names on the current tree). At least one of the
+  definitions lives in a HEADER. GATING.
+      A #define in a .h is by intent a contract offered to other files. A
+      second, different definition of that name anywhere is a conflict, and
+      which one wins depends on include order - which is precisely how #106
+      hid five different MAYTERA_VERSION_STRINGs behind one include guard.
+      This class is dense with real faults: it found libc's fb_get_info()
+      calling SYS_DUP, a kernel/userland struct-termios size split, two
+      THEME_NAME_LEN buffer sizes, and two JPEG size ceilings.
+
+  RULE B - PRIVATE (69 names on the current tree). Every definition is in a
+  .c or .rs. REPORTED, NEVER GATING.
+      A #define in a .c has translation-unit scope by language rule. Two apps
+      each writing `#define FOOTER_H 28` and `#define FOOTER_H 24` are two
+      private numbers in two separate binaries, and they always will be. The
+      current 69 are almost entirely per-app layout (BTN_H, SIDEBAR_W, PAD, W,
+      MAXH). Failing on those is exactly the cry-wolf that gets a gate
+      allowlisted into decoration, so this rule does not fail. It prints a
+      count, and --report lists them.
+
+  RULE C - DECLARED VALUE CONTRACTS (contracts.tsv). Opt-in. GATING.
+      Rules A and B are anchored on the NAME, and the fault that opened #222
+      HAS NO SHARED NAME: settings/main.c calls it DOCK_HEIGHT_DEFAULT and
+      compositor/taskbar.c calls it XFCE_DOCK_H_DEFAULT. No name-anchored
+      check can ever see that pair, and saying so is more useful than a gate
+      that quietly does not cover its own motivating bug.
+      So a contract is declared by VALUE and by SITE, not by name: "these
+      named constants, in these files, must all equal 59". Sites are resolved
+      by evaluating the constant, following same-file macro references
+      (XFCE_DOCK_H_DEFAULT is a sum of four other macros), so a site does not
+      have to be a bare literal. A site that drifts FAILS. A site that no
+      longer exists FAILS, because a contract describing something that is not
+      there has stopped describing the thing that is.
+
+WHAT IT CANNOT CATCH (read this before trusting it)
+
+  - A duplicated EXPRESSION under rules A/B. Deliberate, per the scope note.
+  - Differently-named duplicates that nobody has declared in contracts.tsv.
+    Rule C is the mechanism, but it only covers what is written down. There
+    is no automatic detection here and there cannot be one: nothing textual
+    can know that DOCK_HEIGHT_DEFAULT and XFCE_DOCK_H_DEFAULT are one number.
+  - A value duplicated between source and a NON-SOURCE artifact: a shell
+    script, a Makefile, an asset, a partition offset baked into a .sh.
+  - An enum member, or a bare literal used inline, versus a #define of the
+    same concept. DOOM's i_video.c calls `syscall1(201, ...)` with the name
+    only in a comment; nothing here sees that, and argtab.rs has the same
+    shape (which is why #745 needed its own dedicated lint).
+  - The same name meaning two genuinely UNRELATED things in two subsystems
+    (R_OK is a POSIX access() mode in libc and a local refusal code in
+    rustkern/fetchown.rs). That is a real false positive, and allowlist.tsv,
+    with a written reason per name, is where it is recorded.
+  - A twin FILE (hda.c live, intel_hda.c an unused twin; main.c beside
+    main.rs). See --twins and read the honest limit documented there.
+
+USAGE
+  dup-const-lint <root> [--dirs kernel] [--strict] [--twins]
+  dup-const-lint --self-test        # PROVE it goes RED on a duplicate, GREEN on a clean tree
+  dup-const-lint <root> --report    # ungated inventory of every divergence, allowlisted or not
+
+Exit 0 = clean, 1 = a divergence is not allowlisted, a contract is broken, or an
+allowlist/contract entry is stale or unjustified; 2 = the lint could not run
+(fail closed).
+"""
+
+import os
+import re
+import sys
+import subprocess
+
+TOOLDIR = os.path.dirname(os.path.abspath(__file__))
+ALLOWLIST = os.path.join(TOOLDIR, "allowlist.tsv")
+CONTRACTS = os.path.join(TOOLDIR, "contracts.tsv")
+SCOPE = os.path.join(TOOLDIR, "scope.conf")
+
+C_EXT = (".c", ".h", ".cpp", ".hpp", ".cc", ".cxx", ".hh")
+RS_EXT = (".rs",)
+HDR_EXT = (".h", ".hpp", ".hh")
+
+VALID_STATUS = ("[LEGIT]", "[DEBT]", "[LEGACY]")
+
+
+# ---------------------------------------------------------------- value parsing
+_INT_RE = re.compile(
+    r"""^ [+-]? (?:
+            0[xX][0-9a-fA-F_]+
+          | 0[bB][01_]+
+          | 0[oO][0-7_]+
+          | [0-9][0-9_]*
+        ) $""",
+    re.X,
+)
+_INTSUF_C = re.compile(r"(?:[uU](?:LL|ll|L|l)?|(?:LL|ll|L|l)[uU]?)$")
+_INTSUF_RS = re.compile(r"(?:_?(?:[iu](?:8|16|32|64|128|size)))$")
+_FLT_RE = re.compile(r"^[+-]?(?:\d[\d_]*\.\d[\d_]*|\d[\d_]*\.|\.\d[\d_]*)(?:[eE][+-]?\d+)?$")
+_FLTSUF = re.compile(r"(?:[fFlL]|_?f(?:32|64))$")
+_STR_RE = re.compile(r'^"(?:[^"\\]|\\.)*"$')
+_CHR_RE = re.compile(r"^'(?:[^'\\]|\\.)*'$")
+
+
+def strip_parens(s):
+    """((44u)) -> 44u. Only strips when the outer pair actually wraps the whole
+    token, so (a)+(b) is left alone and therefore rejected as a non-literal."""
+    s = s.strip()
+    while len(s) >= 2 and s[0] == "(" and s[-1] == ")":
+        depth = 0
+        wraps = True
+        for i, ch in enumerate(s):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and i != len(s) - 1:
+                    wraps = False
+                    break
+        if not wraps:
+            break
+        s = s[1:-1].strip()
+    return s
+
+
+def normalise(raw):
+    """Return a canonical comparable form, or None if this is not a literal.
+
+    None is not a failure. It means 'this value is an expression and this lint
+    has nothing trustworthy to say about it', which is the whole scope decision.
+    """
+    s = strip_parens(raw)
+    if not s:
+        return None
+
+    if _STR_RE.match(s):
+        return "str:" + s[1:-1]
+    if _CHR_RE.match(s):
+        return "chr:" + s[1:-1]
+
+    # integer, after peeling one C or Rust suffix
+    t = s
+    for suf in (_INTSUF_RS, _INTSUF_C):
+        m = suf.search(t)
+        if m and _INT_RE.match(t[: m.start()].replace("_", "") or "x"):
+            t = t[: m.start()]
+            break
+    t_clean = t.replace("_", "")
+    if _INT_RE.match(t_clean):
+        neg = t_clean.startswith("-")
+        body = t_clean.lstrip("+-")
+        try:
+            if body[:2] in ("0x", "0X"):
+                v = int(body, 16)
+            elif body[:2] in ("0b", "0B"):
+                v = int(body, 2)
+            elif body[:2] in ("0o", "0O"):
+                v = int(body[2:], 8)
+            elif len(body) > 1 and body[0] == "0":
+                v = int(body, 8)
+            else:
+                v = int(body, 10)
+        except ValueError:
+            return None
+        return "int:%d" % (-v if neg else v)
+
+    # float, after peeling a suffix
+    t = s
+    m = _FLTSUF.search(t)
+    if m and _FLT_RE.match(t[: m.start()].replace("_", "")):
+        t = t[: m.start()]
+    if _FLT_RE.match(t.replace("_", "")):
+        try:
+            return "flt:%r" % float(t.replace("_", ""))
+        except ValueError:
+            return None
+    return None
+
+
+# ---------------------------------------------------------------- source parsing
+_DEFINE_RE = re.compile(r"^\s*#\s*define\s+([A-Za-z_][A-Za-z0-9_]*)(.*)$")
+_RSCONST_RE = re.compile(
+    r"^\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:const|static)\s+(?:mut\s+)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*:\s*[^=;]+=\s*(.+?)\s*;\s*$"
+)
+
+
+def strip_trailing_comment(s):
+    # Only handles the trailing case, which is all a single-line define can have
+    # after the value. A // or /* inside a string literal must not be cut.
+    out = []
+    i = 0
+    instr = None
+    while i < len(s):
+        ch = s[i]
+        if instr:
+            if ch == "\\":
+                out.append(s[i : i + 2])
+                i += 2
+                continue
+            if ch == instr:
+                instr = None
+            out.append(ch)
+            i += 1
+            continue
+        if ch in "\"'":
+            instr = ch
+            out.append(ch)
+            i += 1
+            continue
+        if s.startswith("//", i) or s.startswith("/*", i):
+            break
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def scan_file(path, rel):
+    """Yield (name, norm, raw, rel, lineno)."""
+    ext = os.path.splitext(path)[1]
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return
+    if ext in C_EXT:
+        for n, line in enumerate(lines, 1):
+            if line.rstrip().endswith("\\"):
+                continue  # multi-line macro: not a literal by definition
+            m = _DEFINE_RE.match(line)
+            if not m:
+                continue
+            name, rest = m.group(1), m.group(2)
+            if rest.startswith("("):
+                continue  # function-like macro
+            raw = strip_trailing_comment(rest).strip()
+            if not raw:
+                continue  # bare #define / include guard
+            norm = normalise(raw)
+            if norm is not None:
+                yield (name, norm, raw, rel, n)
+    elif ext in RS_EXT:
+        for n, line in enumerate(lines, 1):
+            m = _RSCONST_RE.match(line)
+            if not m:
+                continue
+            name, raw = m.group(1), strip_trailing_comment(m.group(2)).strip()
+            if not raw:
+                continue
+            norm = normalise(raw)
+            if norm is not None:
+                yield (name, norm, raw, rel, n)
+
+
+# ---------------------------------------------------------------- scope
+def load_scope(root, strict, errs):
+    """Excluded path prefixes. Each must still exist: a stale exclusion silently
+    widens or narrows the gate, and this tree has been bitten by stale rulebook
+    entries before (invariant-gate allowlist, KNOWN_STALE_LAUNCH)."""
+    prefixes = []
+    if not os.path.exists(SCOPE):
+        errs.append("scope.conf missing beside the lint; refusing to guess at scope")
+        return None
+    with open(SCOPE, "r", encoding="utf-8") as fh:
+        for n, line in enumerate(fh, 1):
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            p = line.rstrip("/")
+            if strict and not os.path.exists(os.path.join(root, p)):
+                errs.append("scope.conf:%d STALE: '%s' does not exist under %s" % (n, p, root))
+            prefixes.append(p)
+    return prefixes
+
+
+def in_scope(rel, prefixes):
+    for p in prefixes:
+        if rel == p or rel.startswith(p + "/"):
+            return False
+    return True
+
+
+# ---------------------------------------------------------------- allowlist
+def load_allowlist(errs):
+    """name<TAB>status<TAB>reason. Status must be [LEGIT]/[DEBT]/[LEGACY] and the
+    reason must be real prose, exactly as kernel/tools/concurrency-lint requires.
+    An entry with no justification is a silencer, not a decision."""
+    allow = {}
+    if not os.path.exists(ALLOWLIST):
+        errs.append("allowlist.tsv missing beside the lint")
+        return allow
+    with open(ALLOWLIST, "r", encoding="utf-8") as fh:
+        for n, line in enumerate(fh, 1):
+            if line.startswith("#") or not line.strip():
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 3:
+                errs.append("allowlist.tsv:%d malformed (need name<TAB>status<TAB>reason)" % n)
+                continue
+            name, status, reason = parts[0].strip(), parts[1].strip(), "\t".join(parts[2:]).strip()
+            if status not in VALID_STATUS:
+                errs.append(
+                    "allowlist.tsv:%d '%s' has status '%s'; must be one of %s"
+                    % (n, name, status, " ".join(VALID_STATUS))
+                )
+                continue
+            if len(reason) < 25:
+                errs.append(
+                    "allowlist.tsv:%d '%s' has no real justification (%d chars). "
+                    "An entry without a reason is a silencer." % (n, name, len(reason))
+                )
+                continue
+            if name in allow:
+                errs.append("allowlist.tsv:%d duplicate entry for '%s'" % (n, name))
+                continue
+            allow[name] = (status, reason)
+    return allow
+
+
+# ---------------------------------------------------------------- contracts
+#
+# Rule C. Everything below exists for one reason: the fault that opened #222 has
+# NO SHARED NAME (DOCK_HEIGHT_DEFAULT vs XFCE_DOCK_H_DEFAULT), so it is
+# structurally invisible to a name-anchored check. A contract names the SITES
+# instead, and asserts the VALUE they must all carry.
+
+_TOK_RE = re.compile(r"\s*(0[xX][0-9a-fA-F]+|\d+|[A-Za-z_][A-Za-z0-9_]*|<<|>>|[-+*/%()~|&^])")
+
+
+def eval_const(name, table, depth=0, seen=None):
+    """Evaluate a constant to an int by following same-file macro references.
+
+    Used ONLY by rule C, never by rules A/B. A contract is opt-in, so a value
+    this cannot evaluate is a loud FAIL rather than a silent skip: the failure
+    mode of a gate that quietly stops checking is the one this whole ticket is
+    about.
+
+    Deliberately arithmetic-only and same-file-only. It is not a preprocessor
+    and must not grow into one; anything it cannot fold, it refuses.
+    """
+    if depth > 12:
+        return None, "macro expansion too deep at '%s'" % name
+    seen = seen or set()
+    if name in seen:
+        return None, "circular macro reference at '%s'" % name
+    if name not in table:
+        return None, "no definition of '%s' in that file" % name
+    raw = table[name]
+    toks = []
+    pos = 0
+    while pos < len(raw):
+        m = _TOK_RE.match(raw, pos)
+        if not m:
+            return None, "cannot tokenise '%s' = %s" % (name, raw)
+        toks.append(m.group(1))
+        pos = m.end()
+    out = []
+    for t in toks:
+        if re.match(r"^[A-Za-z_]", t):
+            sub, err = eval_const(t, table, depth + 1, seen | {name})
+            if sub is None:
+                return None, err
+            out.append("(%d)" % sub)
+        else:
+            out.append(t)
+    expr = "".join(out)
+    if not re.fullmatch(r"[0-9xXa-fA-F()+\-*/%<>|&^~ ]+", expr):
+        return None, "unsafe expression for '%s': %s" % (name, raw)
+    try:
+        v = eval(expr, {"__builtins__": {}}, {})  # noqa: S307 - grammar checked above
+    except Exception as exc:  # pragma: no cover - defensive
+        return None, "cannot evaluate '%s' = %s (%s)" % (name, raw, exc)
+    if not isinstance(v, int):
+        return None, "'%s' did not evaluate to an integer" % name
+    return v, None
+
+
+def file_define_table(path):
+    """Every #define NAME <rest> in one file, as raw text. Rule C only."""
+    table = {}
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    ext = os.path.splitext(path)[1]
+    for line in lines:
+        if line.rstrip().endswith("\\"):
+            continue
+        if ext in C_EXT:
+            m = _DEFINE_RE.match(line)
+            if not m or m.group(2).startswith("("):
+                # a leading "(" is ambiguous: a function-like macro, or a
+                # parenthesised value. Only the no-space form is function-like.
+                if not m or re.match(r"^\([A-Za-z_][A-Za-z0-9_]*\s*[,)]", m.group(2)):
+                    continue
+            raw = strip_trailing_comment(m.group(2)).strip()
+            if raw:
+                table.setdefault(m.group(1), raw)
+        elif ext in RS_EXT:
+            m = _RSCONST_RE.match(line)
+            if m:
+                raw = strip_trailing_comment(m.group(2)).strip()
+                if raw:
+                    table.setdefault(m.group(1), raw)
+    return table
+
+
+def load_contracts(errs):
+    """contract<TAB>value<TAB>file:NAME[;file:NAME...]<TAB>why
+
+    Same justification discipline as the allowlist: a contract with no stated
+    reason is a number somebody typed, and the next person has no way to judge
+    whether it is still true."""
+    out = []
+    if not os.path.exists(CONTRACTS):
+        errs.append("contracts.tsv missing beside the lint")
+        return out
+    with open(CONTRACTS, "r", encoding="utf-8") as fh:
+        for n, line in enumerate(fh, 1):
+            if line.startswith("#") or not line.strip():
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 4:
+                errs.append("contracts.tsv:%d malformed (need name<TAB>value<TAB>sites<TAB>why)" % n)
+                continue
+            cname, val, sites, why = (p.strip() for p in parts[:4])
+            try:
+                ival = int(val, 0)
+            except ValueError:
+                errs.append("contracts.tsv:%d '%s' value '%s' is not an integer" % (n, cname, val))
+                continue
+            sl = [s.strip() for s in sites.split(";") if s.strip()]
+            if len(sl) < 2:
+                errs.append("contracts.tsv:%d '%s' names %d site(s); a contract needs at least 2"
+                            % (n, cname, len(sl)))
+                continue
+            if len(why) < 25:
+                errs.append("contracts.tsv:%d '%s' has no real justification" % (n, cname))
+                continue
+            out.append((n, cname, ival, sl, why))
+    return out
+
+
+def check_contracts(root, contracts, errs):
+    tables = {}
+    for n, cname, ival, sites, _why in contracts:
+        seen = []
+        for site in sites:
+            if ":" not in site:
+                errs.append("contracts.tsv:%d '%s' site '%s' is not file:NAME" % (n, cname, site))
+                continue
+            rel, sym = site.rsplit(":", 1)
+            path = os.path.join(root, rel)
+            if rel not in tables:
+                tables[rel] = file_define_table(path)
+            tab = tables[rel]
+            if tab is None:
+                errs.append("contracts.tsv:%d '%s' STALE: %s does not exist. A contract "
+                            "describing a file that is gone has stopped describing anything."
+                            % (n, cname, rel))
+                continue
+            v, err = eval_const(sym, tab)
+            if v is None:
+                errs.append("contracts.tsv:%d '%s' site %s: %s" % (n, cname, site, err))
+                continue
+            seen.append((site, v))
+        for site, v in seen:
+            if v != ival:
+                errs.append("contracts.tsv:%d CONTRACT BROKEN '%s': %s is %d, contract says %d"
+                            % (n, cname, site, v, ival))
+    return
+
+
+# ---------------------------------------------------------------- twins
+_FUNCDEF_RE = re.compile(
+    r"^(?!static\b|typedef\b|extern\b|return\b|else\b|case\b|#)"
+    r"[A-Za-z_][A-Za-z0-9_ \t*]*?\b([a-z_][A-Za-z0-9_]*)\s*\([^;]*$"
+)
+_IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def find_twins(root, files):
+    """Report source files that NOTHING ELSE REFERENCES.
+
+    THE HEURISTIC I TRIED FIRST AND THREW AWAY, recorded so nobody rebuilds it:
+    "X.c beside <prefix>X.c that DEFINE THE SAME CONSTANT NAMES". It sounds
+    right and it finds NOTHING. Measured on this tree: kernel/drivers/hda.h and
+    kernel/drivers/intel_hda.h - the canonical live/dead twin pair, and the
+    example the ticket names - share ZERO define names (196 and 78 of them, no
+    overlap), because each prefixes its own. Name similarity without that
+    corroboration would flag every x.c/prefix_x.c pair in the tree.
+
+    "Compiled by nothing" is also not the question. kernel/Makefile collects
+    sources with $(wildcard drivers/*.c), so intel_hda.c IS compiled. It was an
+    unused twin because nothing CALLED it.
+
+    So that is what this measures, directly: a .c file that defines at least one
+    non-static function and NONE of those names appears in any other in-scope
+    file. On the real tree intel_hda.c comes out with zero external references
+    for all 19 of its exported functions, while hda.c's are called from
+    audio.c - which is exactly the live/dead distinction, obtained without
+    guessing at names.
+
+    REPORT ONLY, never gating, for one honest reason: a function reached solely
+    from assembly, from a function-pointer table built by string name, or from a
+    Rust FFI declaration this parser does not read, looks identical to a dead
+    one. It is a lead, not a verdict.
+    """
+    exports = {}
+    idents = {}
+    for rel in files:
+        path = os.path.join(root, rel)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except OSError:
+            continue
+        idents[rel] = set(_IDENT_RE.findall(text))
+        if not rel.endswith(".c"):
+            continue
+        fns = set()
+        for line in text.splitlines():
+            m = _FUNCDEF_RE.match(line)
+            if m:
+                fns.add(m.group(1))
+        if fns:
+            exports[rel] = fns
+    out = []
+    for rel, fns in sorted(exports.items()):
+        referenced = False
+        for other, ids in idents.items():
+            if other == rel or os.path.splitext(other)[0] == os.path.splitext(rel)[0]:
+                continue  # its own companion header does not count as a user
+            if fns & ids:
+                referenced = True
+                break
+        if not referenced:
+            out.append((rel, len(fns)))
+    return out
+
+
+# ---------------------------------------------------------------- driver
+def list_files(root, dirs):
+    """Tracked files only. git ls-files is the source of truth for what is IN the
+    tree; a raw walk picks up build output, agent scratch and stale copies, and
+    those would make the verdict depend on how dirty the checkout happens to be."""
+    cmd = ["git", "-C", root, "ls-files", "-z"]
+    if dirs:
+        cmd += ["--"] + list(dirs)
+    try:
+        out = subprocess.run(cmd, capture_output=True, check=True).stdout
+        rels = [r.decode("utf-8", "replace") for r in out.split(b"\0") if r]
+    except (OSError, subprocess.CalledProcessError):
+        rels = []
+        bases = [os.path.join(root, d) for d in dirs] if dirs else [root]
+        for base in bases:
+            for dp, dn, fn in os.walk(base):
+                dn[:] = [x for x in dn if x != ".git"]
+                for f in fn:
+                    rels.append(os.path.relpath(os.path.join(dp, f), root))
+    return [r for r in rels if os.path.splitext(r)[1] in C_EXT + RS_EXT]
+
+
+def collect(root, dirs, prefixes):
+    defs = {}
+    files = []
+    for rel in list_files(root, dirs):
+        if not in_scope(rel, prefixes):
+            continue
+        files.append(rel)
+        for name, norm, raw, r, n in scan_file(os.path.join(root, rel), rel):
+            defs.setdefault(name, []).append((norm, raw, r, n))
+    return defs, files
+
+
+def divergences(defs):
+    """A name diverges when it holds >=2 distinct values AND those values do not
+    all come from a single file. Same-file alternatives are #ifdef branches."""
+    out = []
+    for name, ds in defs.items():
+        vals = {}
+        for norm, raw, rel, n in ds:
+            vals.setdefault(norm, []).append((rel, n, raw))
+        if len(vals) < 2:
+            continue
+        files = {rel for _, _, rel, _ in ds}
+        if len(files) < 2:
+            continue
+        # require two DIFFERENT files to disagree, not just two values present
+        disagree = False
+        for v1 in vals:
+            for v2 in vals:
+                if v1 == v2:
+                    continue
+                if {f for f, _, _ in vals[v1]} - {f for f, _, _ in vals[v2]}:
+                    disagree = True
+        if disagree:
+            out.append((name, vals))
+    return sorted(out)
+
+
+def is_shared(vals):
+    """Rule A vs rule B: does any definition live in a header?"""
+    for v in vals:
+        for rel, _n, _raw in vals[v]:
+            if os.path.splitext(rel)[1] in HDR_EXT:
+                return True
+    return False
+
+
+def fmt(name, vals):
+    lines = ["  %s" % name]
+    for norm in sorted(vals):
+        for rel, n, raw in sorted(vals[norm]):
+            lines.append("      %-14s %s:%d   (%s)" % (raw, rel, n, norm))
+    return "\n".join(lines)
+
+
+def run(root, dirs, strict, twins, report):
+    errs = []
+    prefixes = load_scope(root, strict, errs)
+    if prefixes is None:
+        for e in errs:
+            print("[dup-const-lint] FATAL: %s" % e, file=sys.stderr)
+        return 2
+    allow = load_allowlist(errs)
+    contracts = load_contracts(errs)
+    defs, files = collect(root, dirs, prefixes)
+    if not files:
+        print("[dup-const-lint] FATAL: no source files in scope under %s" % root, file=sys.stderr)
+        return 2
+
+    divs = divergences(defs)
+    shared = [(n, v) for n, v in divs if is_shared(v)]
+    private = [(n, v) for n, v in divs if not is_shared(v)]
+    unallowed = [(n, v) for n, v in shared if n not in allow]
+    seen_shared = {n for n, _ in shared}
+    stale = sorted(n for n in allow if n not in seen_shared)
+
+    print("[dup-const-lint] scanned %d files, %d literal-valued names; "
+          "%d divergent (%d shared/gating, %d private/reported)"
+          % (len(files), len(defs), len(divs), len(shared), len(private)))
+    if report:
+        print("\n--- RULE A: SHARED (a header defines it) - THESE GATE THE BUILD ---")
+        for name, vals in shared:
+            tag = " [allowlisted %s]" % allow[name][0] if name in allow else "   <-- NOT ALLOWLISTED"
+            print(fmt(name, vals) + tag)
+        print("\n--- RULE B: PRIVATE (.c/.rs only) - reported, never gating ---")
+        for name, vals in private:
+            print(fmt(name, vals))
+        return 0
+
+    # Rule C runs against the whole tree only. Under --dirs the other files are
+    # not present, so a contract site would look "missing" and fail spuriously.
+    if not dirs:
+        check_contracts(root, contracts, errs)
+    elif strict:
+        errs.append("--strict with --dirs cannot check contracts.tsv; run it over the whole tree")
+
+    if private:
+        print("[dup-const-lint] note: %d name(s) diverge only between .c/.rs files "
+              "(translation-unit private; see --report, rule B)" % len(private))
+
+    # STALE-ENTRY RULE, and why it is conditional. An allowlist row describing a
+    # divergence that no longer exists must FAIL: a rulebook describing things
+    # that are not there has stopped describing the things that are. But under
+    # --dirs the other half of the tree is not being read, so every
+    # kernel-vs-userland row (TERM_COLOR_*, NCCS, NSIG, R_OK...) would look
+    # stale and the gate would fail for a reason that is not true. So the rule
+    # runs only over a WHOLE-TREE scan, which is the invocation repo-guard uses.
+    if dirs:
+        if stale:
+            print("[dup-const-lint] note: %d allowlist row(s) not exercised under --dirs %s; "
+                  "staleness is only judged on a whole-tree scan" % (len(stale), " ".join(dirs)))
+    else:
+        for n in stale:
+            errs.append(
+                "allowlist.tsv entry '%s' is STALE: it no longer diverges in the shared "
+                "class. Remove it. A rulebook describing things that are not there stops "
+                "describing the things that are." % n
+            )
+
+    if twins:
+        t = find_twins(root, files)
+        for rel, nfn in t:
+            print("[dup-const-lint] UNREFERENCED? %s exports %d non-static function(s), "
+                  "none of which any other in-scope file names" % (rel, nfn))
+        print("[dup-const-lint] twin report: %d file(s) with no external reference "
+              "(REPORT ONLY, never gating; a table- or asm-reached entry point looks "
+              "the same from here)" % len(t))
+
+    if unallowed:
+        print("[dup-const-lint] FAIL: %d name(s) are defined in a HEADER and also, with a "
+              "DIFFERENT value, somewhere else:" % len(unallowed), file=sys.stderr)
+        for name, vals in unallowed:
+            print(fmt(name, vals), file=sys.stderr)
+        print("\n  Make it ONE definition, or add a row to\n  %s\n"
+              "  as  name<TAB>[LEGIT|DEBT|LEGACY]<TAB>why these really are two "
+              "different things." % ALLOWLIST, file=sys.stderr)
+    for e in errs:
+        print("[dup-const-lint] FAIL: %s" % e, file=sys.stderr)
+
+    if unallowed or errs:
+        return 1
+    print("[dup-const-lint] ok: every shared literal constant has ONE value "
+          "(%d allowlisted divergence(s), all justified; %d value contract(s) hold)"
+          % (len(allow), len(contracts)))
+    return 0
+
+
+# ---------------------------------------------------------------- self-test
+def self_test():
+    """Prove BOTH directions on synthetic fixtures. A gate nobody has watched go
+    red is not a gate (#514: a lint sat in this tree for months, documented as a
+    build guardrail, incapable of failing for two independent reasons)."""
+    import tempfile
+    import shutil
+
+    passed = 0
+    total = 0
+
+    def case(desc, want_red, files, allow_rows=None):
+        nonlocal passed, total
+        total += 1
+        d = tempfile.mkdtemp(prefix="dupconst-st-")
+        try:
+            for rel, body in files.items():
+                p = os.path.join(d, rel)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "w", encoding="utf-8") as fh:
+                    fh.write(body)
+            prefixes = []
+            allow = {}
+            for row in allow_rows or []:
+                allow[row[0]] = (row[1], row[2])
+            defs = {}
+            fl = []
+            for dp, dn, fn in os.walk(d):
+                for f in sorted(fn):
+                    rel = os.path.relpath(os.path.join(dp, f), d)
+                    if os.path.splitext(rel)[1] not in C_EXT + RS_EXT:
+                        continue
+                    fl.append(rel)
+                    for name, norm, raw, r, n in scan_file(os.path.join(d, rel), rel):
+                        defs.setdefault(name, []).append((norm, raw, r, n))
+            divs = [(n, v) for n, v in divergences(defs) if is_shared(v)]
+            red = bool([n for n, _ in divs if n not in allow])
+            if red == want_red:
+                print("  %-5s (correct)  %s" % ("RED" if red else "GREEN", desc))
+                passed += 1
+            else:
+                print("  %-5s (WRONG!)   %s  [saw %s]" % ("RED" if red else "GREEN", desc,
+                                                          [n for n, _ in divs]))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+    print("SELF-TEST: prove dup-const-lint goes RED on a real duplicate and GREEN otherwise.")
+
+    # 1. RULE A: a header's constant contradicted elsewhere -> RED.
+    case("header says 59, a .c says 44 (rule A)", True, {
+        "gui/dock.h": "#define DOCK_HEIGHT_DEFAULT 59\n",
+        "compositor/taskbar.c": "#define DOCK_HEIGHT_DEFAULT 44\n",
+    })
+
+    # 1b. RULE B: the SAME divergence between two .c files does NOT gate. This is
+    #     the deliberate false-positive ceiling: a #define in a .c is
+    #     translation-unit private, and 69 per-app layout constants on the real
+    #     tree collide by name with no consequence whatsoever.
+    case("two .c files disagree - private, must NOT gate (rule B)", False, {
+        "settings/main.c": "#define FOOTER_H 28\n",
+        "files/main.c": "#define FOOTER_H 24\n",
+    })
+
+    # 2. clean tree: same name, same value, two files -> GREEN (mirrored contract)
+    case("same name, same value, two files", False, {
+        "a/a.h": "#define DOCK_HEIGHT_DEFAULT 59\n",
+        "b/b.c": "#define DOCK_HEIGHT_DEFAULT 59\n",
+    })
+
+    # 3. base change must NOT cry wolf: 44 == 0x2C == ((44u))
+    case("44 vs 0x2C vs ((44u)) are the SAME value", False, {
+        "a/a.h": "#define WIDTH 44\n",
+        "b/b.c": "#define WIDTH 0x2C\n",
+        "c/c.c": "#define WIDTH ((44u))\n",
+    })
+
+    # 4. #ifdef alternatives inside ONE file are legitimate -> GREEN
+    case("#ifdef branches in a single file", False, {
+        "a/a.h": "#ifdef BIG\n#define SLOTS 64\n#else\n#define SLOTS 8\n#endif\n",
+    })
+
+    # 5. #745's fifth copy: a Rust const disagreeing with the C header -> RED
+    case("Rust const disagrees with the C #define (the #745 fifth copy)", True, {
+        "kernel/proc/syscall.h": "#define SYS_SET_LOGIN_MODE 374\n",
+        "userland/apps/setup/main.rs": "const SYS_SET_LOGIN_MODE: i64 = 373;\n",
+    })
+
+    # 6. #106: two version.h files, different strings -> RED
+    case("two version.h with different MAYTERA_VERSION_STRING (#106)", True, {
+        "kernel/version.h": '#define MAYTERA_VERSION_STRING "1.9.0"\n',
+        "old/version.h": '#define MAYTERA_VERSION_STRING "1.5.0"\n',
+    })
+
+    # 7. expressions are OUT OF SCOPE and must never be flagged, same or different
+    case("expression-valued macros are never compared", False, {
+        "a/a.h": "#define BUF (CHUNK * 4)\n",
+        "b/b.c": "#define BUF (OTHER * 8)\n",
+    })
+
+    # 8. function-like macros and include guards are not constants
+    case("function-like macro and bare include guard ignored", False, {
+        "a/a.h": "#ifndef A_H\n#define A_H\n#define MAX(a,b) ((a)>(b)?(a):(b))\n#endif\n",
+        "b/b.h": "#ifndef B_H\n#define B_H\n#define MAX(a,b) ((a)<(b)?(a):(b))\n#endif\n",
+    })
+
+    # 9. the allowlist actually silences a divergence -> GREEN
+    case("allowlisted divergence is tolerated", False, {
+        "a/a.h": "#define BLOCK_SIZE 512\n",
+        "b/b.c": "#define BLOCK_SIZE 4096\n",
+    }, allow_rows=[("BLOCK_SIZE", "[LEGIT]",
+                    "unrelated: one is an ATA sector, the other an ext2 block")])
+
+    # 10. char and string literals are compared too
+    case("differing string literals in two files", True, {
+        "a/a.h": '#define BANNER "maytera"\n',
+        "b/b.c": '#define BANNER "MAYTERA"\n',
+    })
+
+    # 11. a // comment after the value must not become part of it
+    case("trailing comment is not part of the value", False, {
+        "a/a.h": "#define TICK_HZ 100 // scheduler tick\n",
+        "b/b.c": "#define TICK_HZ 100   /* same */\n",
+    })
+
+    # 12. a multi-line macro is not a literal
+    case("multi-line macro ignored", False, {
+        "a/a.h": "#define DO_IT 1 \\\n  + 2\n",
+        "b/b.c": "#define DO_IT 4 \\\n  + 5\n",
+    })
+
+    # 13. negative numbers compare correctly
+    case("-1 vs -0x1 are the same; -1 vs 1 are not", True, {
+        "a/a.h": "#define ERRV -1\n",
+        "b/b.c": "#define ERRV -0x1\n",
+        "c/c.c": "#define ERRV 1\n",
+    })
+
+    # ---- RULE C: value contracts across DIFFERENTLY NAMED constants ----------
+    # This is the #222 fault itself. settings/main.c and compositor/taskbar.c
+    # hold the same dock geometry under DIFFERENT names, so no name-anchored
+    # rule can ever see the pair. These four cases are the proof that the
+    # declared-contract path covers it, including the drift that rules A and B
+    # are structurally blind to.
+    def contract_case(desc, want_red, files, rows):
+        nonlocal passed, total
+        total += 1
+        d = tempfile.mkdtemp(prefix="dupconst-ct-")
+        saved = globals()["CONTRACTS"]
+        try:
+            for rel, body in files.items():
+                p = os.path.join(d, rel)
+                os.makedirs(os.path.dirname(p), exist_ok=True)
+                with open(p, "w", encoding="utf-8") as fh:
+                    fh.write(body)
+            cf = os.path.join(d, "contracts.tsv")
+            with open(cf, "w", encoding="utf-8") as fh:
+                for r in rows:
+                    fh.write("\t".join(r) + "\n")
+            globals()["CONTRACTS"] = cf
+            errs = []
+            cs = load_contracts(errs)
+            check_contracts(d, cs, errs)
+            red = bool(errs)
+            if red == want_red:
+                print("  %-5s (correct)  %s" % ("RED" if red else "GREEN", desc))
+                passed += 1
+            else:
+                print("  %-5s (WRONG!)   %s  %s" % ("RED" if red else "GREEN", desc, errs))
+        finally:
+            globals()["CONTRACTS"] = saved
+            shutil.rmtree(d, ignore_errors=True)
+
+    DOCK_SITES = ("settings/main.c:DOCK_HEIGHT_DEFAULT;"
+                  "compositor/taskbar.c:XFCE_DOCK_H_DEFAULT")
+    WHY = "the dock the compositor draws is the dock settings configures"
+    TASKBAR_OK = ("#define XFCE_DOCK_ICON 40\n#define XFCE_DOCK_PAD 8\n"
+                  "#define XFCE_DOCK_IND 8\n#define XFCE_DOCK_PAD_BOT 3\n"
+                  "#define XFCE_DOCK_H_DEFAULT (XFCE_DOCK_ICON + XFCE_DOCK_PAD"
+                  " + XFCE_DOCK_IND + XFCE_DOCK_PAD_BOT)  // 59\n")
+
+    contract_case("differently-named dock constants agree, one is a 4-term sum", False, {
+        "settings/main.c": "#define DOCK_HEIGHT_DEFAULT 59\n",
+        "compositor/taskbar.c": TASKBAR_OK,
+    }, [("dock.height.default", "59", DOCK_SITES, WHY)])
+
+    contract_case("one side drifts to 62 - INVISIBLE to rules A and B, RED here", True, {
+        "settings/main.c": "#define DOCK_HEIGHT_DEFAULT 62\n",
+        "compositor/taskbar.c": TASKBAR_OK,
+    }, [("dock.height.default", "59", DOCK_SITES, WHY)])
+
+    contract_case("a term inside the sum drifts (PAD_BOT 3 -> 6)", True, {
+        "settings/main.c": "#define DOCK_HEIGHT_DEFAULT 59\n",
+        "compositor/taskbar.c": TASKBAR_OK.replace("PAD_BOT 3", "PAD_BOT 6"),
+    }, [("dock.height.default", "59", DOCK_SITES, WHY)])
+
+    contract_case("a contract site that no longer exists is STALE, not silently skipped", True, {
+        "settings/main.c": "#define DOCK_HEIGHT_DEFAULT 59\n",
+    }, [("dock.height.default", "59", DOCK_SITES, WHY)])
+
+    contract_case("a contract naming only one site is refused", True, {
+        "settings/main.c": "#define DOCK_HEIGHT_DEFAULT 59\n",
+    }, [("dock.height.default", "59", "settings/main.c:DOCK_HEIGHT_DEFAULT", WHY)])
+
+    # 14. allowlist validation: a status that is not one of the three FAILS
+    total += 1
+    errs = []
+    saved = globals()["ALLOWLIST"]
+    import tempfile as _tf
+    fd, tmp = _tf.mkstemp()
+    with os.fdopen(fd, "w") as fh:
+        fh.write("FOO\t[MAYBE]\tsome long enough reason text goes right here ok\n")
+        fh.write("BAR\t[LEGIT]\tshort\n")
+        fh.write("BAZ\t[LEGIT]\ta properly long and specific justification here\n")
+    globals()["ALLOWLIST"] = tmp
+    got = load_allowlist(errs)
+    globals()["ALLOWLIST"] = saved
+    os.unlink(tmp)
+    if len(errs) == 2 and "BAZ" in got and "FOO" not in got and "BAR" not in got:
+        print("  RED   (correct)  bad status and empty justification both rejected")
+        passed += 1
+    else:
+        print("  WRONG!  allowlist validation: errs=%d got=%s" % (len(errs), sorted(got)))
+
+    print("\nSELF-TEST: %d/%d correct" % (passed, total))
+    return 0 if passed == total else 1
+
+
+def main(argv):
+    if "--self-test" in argv:
+        return self_test()
+    root = None
+    dirs = []
+    strict = twins = report = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--dirs":
+            i += 1
+            dirs.append(argv[i])
+        elif a == "--strict":
+            strict = True
+        elif a == "--twins":
+            twins = True
+        elif a == "--report":
+            report = True
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        elif a.startswith("-"):
+            print("unknown option %s" % a, file=sys.stderr)
+            return 2
+        else:
+            root = a
+        i += 1
+    if root is None:
+        root = "."
+    root = os.path.abspath(root)
+    if not os.path.isdir(root):
+        print("[dup-const-lint] FATAL: no such root %s" % root, file=sys.stderr)
+        return 2
+    return run(root, dirs, strict, twins, report)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

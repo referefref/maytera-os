@@ -4,10 +4,11 @@
 #include "../serial.h"
 #include "../string.h"
 #include "../fs/fat.h"
+#include "../fs/perms.h"
 #include "diskimg.h"
 
 // Root FS access (the fat_* public wrappers route "/" paths to the ext2 root on
-// a test VM; on a FAT-root system they hit FAT directly). Same handle used by the
+// VM <vmid>; on a FAT-root system they hit FAT directly). Same handle used by the
 // DOS + Win16 file code.
 // #742: fat_mkdir/fat_exists/fat_write_file are NOT re-declared here. ../fs/fat.h
 // above owns them, and a private extern silently opts this whole file out of
@@ -161,7 +162,12 @@ int dos_drive_count(void) {
 
 int dos_path_writable_ex(const char *in, char cur_drive) {
     if (!in || !in[0]) return 1;
-    if (in[0] == '/' || in[0] == '\\') return 1;     // native / root-relative
+    if (in[0] == '/') return 1;                      // native absolute
+    // (#740) A leading backslash is the CURRENT DRIVE's root, not the native
+    // root, and must answer with THAT drive's writability. Same rule as
+    // dos_resolve_path_ex; stating it in only one of the two would let a write
+    // be accepted here and land somewhere else.
+    if (in[0] == '\\') return dos_drive_writable(cur_drive);
     if (in[1] == ':') return dos_drive_writable(in[0]);
     return dos_drive_writable(cur_drive);             // bare relative -> current
 }
@@ -207,9 +213,10 @@ void dos_resolve_path_ex(const char *in, const char *reldir, char cur_drive,
 
     // (1) Already a native absolute path: pass through unchanged (the launcher
     //     and most kernel callers use these, e.g. /WIN16/MSEP/CHIPS.EXE).
-    if (in[0] == '/' || in[0] == '\\') {
-        // Treat a leading single backslash with NO drive as the legacy
-        // "root-relative" path (kept byte-identical to pre-#257 behavior).
+    //
+    // '/' ONLY. A leading BACKSLASH is handled below, because in DOS it does
+    // not mean the native root, it means the root of the CURRENT DRIVE.
+    if (in[0] == '/') {
         append_norm(out, &n, outsz, in);
         for (int i = 0; out[i]; i++) out[i] = up(out[i]);
         return;
@@ -219,6 +226,38 @@ void dos_resolve_path_ex(const char *in, const char *reldir, char cur_drive,
     char drive = 0;
     const char *rest = in;
     if (in[0] && in[1] == ':') { drive = up(in[0]); rest = in + 2; }
+    // (2b) A LEADING BACKSLASH WITH NO DRIVE LETTER IS THE CURRENT DRIVE'S ROOT.
+    //
+    // MEASURED on Discworld II (#740), and it is what stopped the game dead.
+    // Having found E: with INT 21h AX=4409h, the game does AH=0Eh DL=4 (select
+    // E:) and then AH=3Bh on "\DW2". That means E:\DW2. It resolved to the
+    // NATIVE "/DW2", which does not exist, so the chdir failed, so the game
+    // decided E: was not the disc, tried D: and C:, and printed "Discworld
+    // cannot locate the Discworld CD."
+    //
+    // The old comment called the backslash form "the legacy root-relative path,
+    // kept byte-identical to pre-#257 behavior". Pre-#257 there were no drive
+    // letters, so native-root and current-drive-root were the same place and
+    // the distinction could not be observed. Once E: existed they diverged, and
+    // the legacy reading became simply wrong: no DOS program has ever meant
+    // "the host's native root" by a backslash.
+    //
+    // NOTHING THAT WORKED BEFORE STOPS WORKING, and not by luck: a guest whose
+    // current drive is C: now resolves "\FOO" to /WINDIR/DRIVE_C/FOO, and
+    // int21svc.c's native_fallback() already rewrites a /WINDIR/DRIVE_X/... miss
+    // back to the native "/FOO" when that is what exists. The rescue path this
+    // change relies on predates it and exists for exactly this equivalence.
+    else if (in[0] == '\\' && up(cur_drive) >= 'A' && up(cur_drive) <= 'Z') {
+        drive = up(cur_drive);
+        rest = in;                  // keep the leading '\', the branch strips it
+    }
+    // A backslash with no usable current drive keeps the old native reading:
+    // refusing here would turn a resolvable path into nothing at all.
+    else if (in[0] == '\\') {
+        append_norm(out, &n, outsz, in);
+        for (int i = 0; out[i]; i++) out[i] = up(out[i]);
+        return;
+    }
 
     if (drive) {
         // base = /WINDIR/DRIVE_X
@@ -246,10 +285,40 @@ void dos_resolve_path_ex(const char *in, const char *reldir, char cur_drive,
         }
         append_norm(out, &n, outsz, rest);
     } else {
-        // (3) No drive letter.
-        // Bare relative ("CHIPS.DAT") -> reldir (caller CWD / Win16 app dir).
-        // This preserves the legacy behavior the reference games rely on.
-        if (reldir && reldir[0]) {
+        // (3) No drive letter and no leading separator: a BARE RELATIVE name.
+        //
+        // THE CURRENT DIRECTORY WINS OVER THE LAUNCHER'S HINT (#740). A guest
+        // that has issued AH=3Bh has STATED where relative names resolve, and
+        // no hint can be more authoritative than that. This arm used to go
+        // straight to `reldir` (the .EXE's directory), so a chdir had no effect
+        // on any subsequent bare-name open.
+        //
+        // MEASURED: Discworld II chdirs to \DW2 on the candidate CD and then
+        // opens "VOLUME", which is the disc's identity file. Resolving that
+        // against the .EXE directory instead of the directory it had just
+        // selected turned the disc check into a miss, and the game concluded
+        // there was no CD.
+        //
+        // THE LEGACY GAMES ARE UNAFFECTED, and not by luck. A guest that never
+        // chdirs has an EMPTY cwd here and takes the reldir arm exactly as
+        // before. A guest launched from the native namespace has its cwd seeded
+        // with a native fragment ("DOS/KEEN5"), which composes to
+        // /WINDIR/DRIVE_C/DOS/KEEN5/NAME; int21svc.c's native_fallback() maps a
+        // /WINDIR/DRIVE_X miss back to the native path that exists, which is
+        // the same rescue the drive namespace has always leaned on.
+        const char *cwdstr = cwd ? cwd(u, cur_drive) : "";
+        if (!cwdstr) cwdstr = "";
+        char cd = up(cur_drive);
+        if (cwdstr[0] && cd >= 'A' && cd <= 'Z') {
+            char base[24]; int bn = 0;
+            for (const char *p = WINDIR_ROOT "/DRIVE_"; *p; p++) base[bn++] = *p;
+            base[bn++] = cd; base[bn] = '\0';
+            append_norm(out, &n, outsz, base);
+            if (n < outsz - 1) { out[n++] = '/'; out[n] = '\0'; }
+            append_norm(out, &n, outsz, cwdstr);
+            if (n < outsz - 1) { out[n++] = '/'; out[n] = '\0'; }
+            append_norm(out, &n, outsz, rest);
+        } else if (reldir && reldir[0]) {
             append_norm(out, &n, outsz, reldir);
             if (n > 0 && out[n - 1] != '/' && n < outsz - 1) { out[n++] = '/'; out[n] = '\0'; }
             append_norm(out, &n, outsz, rest);
@@ -334,6 +403,163 @@ void dos_scratch_perms(void) {
     perms_set(WINDIR_ROOT "/DRIVE_C", 0, 0, 0777);
     kprintf("[dospath] guest scratch: %s/DRIVE_C set 0777 (see dos_scratch_perms)\n",
             WINDIR_ROOT);
+}
+
+// ===========================================================================
+// #rawrite: MATERIALISING THE PER-USER WRITE OVERLAY
+// ===========================================================================
+// The comment above (dos_scratch_perms) ends by naming this as the thing that
+// was NOT built:
+//
+//     Fixing THAT needs guest writes into a program directory to be redirected
+//     into a per-user overlay, which is a design (where does the redirect live,
+//     how does a read find the overlaid file, what happens on uninstall) and
+//     not a permission tweak. It is not built, and this comment is the place
+//     the next person will look.
+//
+// Those three questions, answered:
+//
+//   WHERE DOES THE REDIRECT LIVE?  In dos_svc_resolve(), the ONE function that
+//     turns a guest path into a native path (dos/int21svc.c overlay_apply),
+//     with the pure policy in rustkern/dosovl.rs. Not in a permission row: no
+//     mode on /DOS/<GAME> can make a save writable without also making the
+//     EXECUTABLE writable, and a user who can rewrite the executable hands the
+//     next user a different program. That is the shortcut fs/perms.c's #221b
+//     block rejects for NetHack, and it is rejected here for the same reason.
+//
+//   HOW DOES A READ FIND THE OVERLAID FILE?  By existence, checked in that one
+//     place: the overlay wins when it has the file, the base is read through
+//     when it does not, and a create lands in the overlay. Directory
+//     enumeration is walked in two phases (int21svc.c find_step) so a save
+//     that exists only in the overlay still appears in a SAVEGAME.* scan.
+//
+//   WHAT HAPPENS ON UNINSTALL?  Nothing here, deliberately. The overlay is a
+//     normal directory in the user's own home, owned by them at 0750; it
+//     outlives the install exactly the way a save game should, and removing it
+//     is a file-manager operation, not a special case in the kernel.
+//
+// THE SEED IS WHAT MAKES THE RULE ACCESS-INDEPENDENT. Red Alert opens
+// REDALERT.INI with 3Ch (create/truncate) and rewrites it whole. If the overlay
+// were empty, that path would exist only in the base and the read-through would
+// send the write to the read-only install. Copying every SMALL file across when
+// the overlay is first created means the mutable copy is already there, so no
+// access bit has to be plumbed through eleven resolve call sites.
+//
+// SMALL, and the cap is the point: 256 KiB copies the .INI/.CFG/.PAL class and
+// refuses the data archives (REDALERT.MIX is 25 MB). A game that wants to
+// rewrite a 25 MB archive in place is denied, which is the correct answer for
+// shipped read-only data.
+#define DOSOVL_SEED_MAX 262144u
+
+// Does this native path exist? fat_exists is NOT ext2-routed (see seed_file
+// above), so probe through the routed opener, which opens directories too.
+static int ovl_exists(const char *path) {
+    fat_file_t f;
+    if (fat_open(&g_fat_fs, path, &f) != 0) return 0;
+    fat_close(&f);
+    return 1;
+}
+
+int dos_overlay_prepare(const char *base, const char *ovl,
+                        unsigned int uid, unsigned int gid) {
+    if (!base || !base[0] || !ovl || ovl[0] != '/') return -1;
+
+    // mkdir -p. Same shape as users_make_home_skeleton(): every parent first,
+    // because the home may exist while <home>/GAMES does not.
+    char path[160];
+    int n = 0;
+    for (int i = 0; ovl[i] && n < (int)sizeof(path) - 2; i++) {
+        path[n++] = ovl[i];
+        if (ovl[i] == '/' && n > 1) { path[n - 1] = '\0'; ensure_dir(path); path[n - 1] = '/'; }
+    }
+    path[n] = '\0';
+    ensure_dir(path);
+    if (!ovl_exists(path)) {
+        kprintf("[dos] #rawrite: could not create the write overlay %s; the guest "
+                "will keep writing to its install directory and being refused\n", path);
+        return -1;
+    }
+    // The directory is the user's, not root's: 0750 so no OTHER non-root
+    // account can even list another player's saves. Set on EVERY run, so an
+    // overlay made before this line existed is corrected.
+    perms_set(path, uid, gid, 0750);
+
+    // SEED PER FILE, EVERY LAUNCH, AND THE ALTERNATIVE COST A WHOLE BUILD.
+    //
+    // This block used to run only when it had just CREATED the overlay
+    // directory ("if (!fresh) return 0"). MEASURED on golden 2229: it never
+    // ran at all, because users_make_home_skeleton() creates <home>/GAMES/RA
+    // at LOGIN, which is long before any DOS guest launches. The directory was
+    // therefore never fresh, REDALERT.INI was never seeded, and overlay_apply's
+    // read-through correctly sent the write to the read-only install, so the
+    // deny this whole change exists to remove was BYTE-IDENTICAL to the one
+    // before it:
+    //
+    //   [GUESTFS-DENY] guest=dos uid=1000 gid=1000 want=-w- op=INT21/3Ch
+    //                  create reason=PERMS path=/DOS/RA/./REDALERT.INI
+    //
+    // A directory-level "have I done this" flag is the wrong shape for a
+    // per-file job: it can be true for a directory that is missing every file
+    // the job was supposed to put in it, and the two facts are set by
+    // different subsystems at different times. The per-file test cannot get
+    // out of step with itself, and it also HEALS an overlay made by an older
+    // build.
+    //
+    // A file the user has deleted comes back. That is deliberate for the class
+    // being copied (config and palette files): the same rule seed_file() above
+    // applies to WIN.INI, where a missing default is worse than a re-seeded
+    // one. It never overwrites, so an edited copy is always kept.
+    fat_file_t d;
+    if (fat_open(&g_fat_fs, base, &d) != 0) return 0;
+    fat_dir_entry_t e;
+    char nm[256];
+    unsigned seeded = 0;
+    while (fat_readdir(&d, &e, nm) == 0) {
+        if (e.name[0] == 0x00) break;
+        if ((unsigned char)e.name[0] == 0xE5) continue;
+        if (e.attr & 0x10) continue;                 // directories are not seeded
+        if (nm[0] == '\0' || nm[0] == '.') continue;
+        if (e.file_size == 0) continue;
+        char src[160], dst[160];
+        int a = 0, b = 0;
+        for (; base[a] && a < (int)sizeof(src) - 2; a++) src[a] = base[a];
+        if (a > 0 && src[a - 1] != '/') src[a++] = '/';
+        for (int i = 0; nm[i] && a < (int)sizeof(src) - 1; i++) src[a++] = nm[i];
+        src[a] = '\0';
+        for (; ovl[b] && b < (int)sizeof(dst) - 2; b++) dst[b] = ovl[b];
+        if (b > 0 && dst[b - 1] != '/') dst[b++] = '/';
+        for (int i = 0; nm[i] && b < (int)sizeof(dst) - 1; i++) dst[b++] = nm[i];
+        dst[b] = '\0';
+        // Already in the overlay: leave the user's copy alone. This is the
+        // test that makes the seed idempotent and order-independent.
+        if (ovl_exists(dst)) continue;
+        // Over the cap: NOT copied, and SAID SO by name. A silent skip here is
+        // how a game ends up denied on one particular file with nothing in the
+        // log connecting it to this decision.
+        if (e.file_size > DOSOVL_SEED_MAX) {
+            kprintf("[dos] #rawrite: %s is %u bytes (> %u), NOT seeded; it stays "
+                    "read-only in %s and a write to it will be refused\n",
+                    nm, (unsigned)e.file_size, DOSOVL_SEED_MAX, base);
+            continue;
+        }
+        unsigned int sz = 0;
+        void *data = fat_read_file(&g_fat_fs, src, &sz);
+        if (!data) continue;
+        if (sz > 0 && fat_write_file(&g_fat_fs, dst, data, sz) == 0) {
+            // 0600: this is one player's settings file, and the directory is
+            // already 0750, so a wider mode would buy nothing and say the
+            // wrong thing about who the file belongs to.
+            perms_set(dst, uid, gid, 0600);
+            seeded++;
+        } else {
+            kprintf("[dos] #rawrite: failed to seed %s into the overlay\n", nm);
+        }
+        kfree(data);
+    }
+    fat_close(&d);
+    kprintf("[dos] #rawrite: overlay %s ready for uid=%u; seeded %u missing "
+            "file(s) (<=%u bytes) from %s\n", ovl, uid, seeded, DOSOVL_SEED_MAX, base);
+    return 0;
 }
 
 void dos_windir_init(void) {

@@ -107,6 +107,26 @@ typedef enum {
     // 61 and 62 in kernel/gui/themes.c.
     THEME_COLOR_TITLEBAR_TOP,
     THEME_COLOR_TITLEBAR_BOTTOM,
+    // (confirm-modal, docs/CONFIRM_MODAL_DESIGN.html) Seven more v2 tokens
+    // that were already parsed into every .mtheme file's theme_t since #711
+    // but had no reader in kernel/gui/themes.c's theme_get_color_by_id()
+    // until this port added cases 63-69. The confirm/notice modal card is
+    // the first caller (see confirmdialog.c and gui.c's gui_confirm_*): a
+    // card body filled with surface_overlay, a footer band filled with
+    // surface_raised one elevation step below it, ink on both
+    // (on_surface/on_surface_muted - the latter already had a reader,
+    // THEME_COLOR_MUTED), and a destructive/primary action button filled
+    // with danger/accent under fixed on_danger/on_accent ink (floored at
+    // draw time with gui_ensure_contrast(), never trusted raw - see the
+    // design doc 5.1 WCAG table). APPEND ONLY; ids must match
+    // kernel/gui/themes.c's switch exactly.
+    THEME_COLOR_SURFACE_OVERLAY,
+    THEME_COLOR_SURFACE_RAISED,
+    THEME_COLOR_ON_SURFACE,
+    THEME_COLOR_ON_ACCENT,
+    THEME_COLOR_DANGER,
+    THEME_COLOR_ON_DANGER,
+    THEME_COLOR_BORDER_SUBTLE,
     THEME_COLOR_COUNT
 } theme_color_id_t;
 
@@ -235,6 +255,20 @@ static inline int theme_metric(theme_metric_id_t id) {
 // Same, from a specific theme id rather than the active one.
 static inline int theme_metric_of(int theme_id, theme_metric_id_t id) {
     return (int)syscall2(SYS_THEME_METRIC, (uint64_t)theme_id, (uint64_t)id);
+}
+
+// (#wizflash) The theme's own 1x design value, with NO UI-scale multiply
+// applied. theme_metric_of() above always returns the value already scaled
+// for the current display (kernel/gui/themes.c: "THE GLOBAL UI SCALE FACTOR
+// IS APPLIED HERE AND ONLY HERE"), which is correct for drawing straight onto
+// the framebuffer but WRONG for a caller drawing through its OWN scale_on
+// window: that window's draw syscalls (win_draw_rect et al) scale every
+// coordinate again at the window boundary, so a pre-scaled metric passed
+// through them is scaled twice. gui_theme_win_preview() (gui_theme.c) is
+// exactly that caller: it wants the theme's 1x geometry and lets the window
+// boundary apply the scale once, in step with the crop box it draws into.
+static inline int theme_metric_raw_of(int theme_id, theme_metric_id_t id) {
+    return (int)syscall2(SYS_THEME_METRIC_RAW, (uint64_t)theme_id, (uint64_t)id);
 }
 
 // Metric with a caller-supplied fallback for the 0 ("unknown id") case.

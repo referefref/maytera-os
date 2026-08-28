@@ -13,7 +13,7 @@ item: Device Manager | /APPS/DEVMGR | icon=computer
 # new id would silently fall back to a vector glyph on the real image.
 item: Disk Images | /APPS/DISKIMG | icon=computer
 item: Install MayteraOS to Disk | /APPS/INSTALL | icon=computer
-item: App Store | /APPS/APPSTORE | icon=appstore
+item: App Repo | /APPS/APPSTORE | icon=appstore
 item: System Log | /APPS/SYSLOG | icon=log
 item: 3D Print | /APPS/PRINT3D | icon=print3d
 item: Recycle Bin | @RECYCLE | icon=trash

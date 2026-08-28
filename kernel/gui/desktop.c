@@ -1,5 +1,8 @@
 // desktop.c - Desktop manager and dock implementation for MayteraOS
 #include "desktop.h"
+#include "uiscale.h"
+#include "../drivers/battery.h"   // #battmeter
+#include "../drivers/rtc.h"   // #135: the ONE RTC driver
 #include "window.h"
 #include "image.h"
 #include "icons.h"
@@ -29,6 +32,7 @@ extern void filebrowser_launch(void);
 extern void settings_launch(void);
 #include "../exec/elf.h"
 #include "../proc/process.h"
+#include "../proc/signal.h"   // #126 session teardown: SIGKILL + sig_raise()
 
 // External timer ticks from ISR
 extern volatile uint64_t timer_ticks;
@@ -122,10 +126,86 @@ int desktop_session_authenticated(void) {
 // User-space application launcher
 // ============================================================================
 
+// #COMPRESPAWN: A BARE -1 IS THE SAME DEFECT CLASS AS A SILENT FAILURE.
+//
+// This function had FOUR ways to return -1 and told the durable log about none
+// of them: three used LOG_ERROR (gui/syslog.h), which appends to an in-RAM
+// syslog ring that dies with the machine, and the fourth (proc_create_user_as)
+// uses kprintf, which is SERIAL ONLY. The one machine this matters on - the
+// owner's iMac14,4 - has no serial port, so /BOOTLOG.TXT carried
+//
+//     [SESSION] compositor launch FAILED: launch_userspace_app returned -1
+//
+// and nothing else. "The filesystem is unmounted", "the heap could not spare
+// 1 MB", "the ELF is corrupt" and "the process table is full" left byte-for-
+// byte identical evidence, and they need four completely different fixes.
+//
+// Every return path below now writes ONE durable line naming the reason and
+// the resource numbers that would decide it. The cost is a bootlog line on a
+// path that already does a megabyte of disk I/O.
+static void launch_fail(const char *path, const char *why, int extra) {
+    bootlog_write("[LAUNCH] FAILED %s: %s (rc=%d) heapfreeKB=%lu heapusedKB=%lu "
+                  "pmmfreeKB=%lu fsmounted=%d",
+                  path, why, extra,
+                  (unsigned long)(heap_get_free_size() / 1024),
+                  (unsigned long)(heap_get_used_size() / 1024),
+                  (unsigned long)(pmm_get_free_pages() * 4),
+                  g_fat_fs.mounted ? 1 : 0);
+    LOG_ERROR("[UserSpace] launch failed");
+}
+
 // Launch a user-space ELF application from filesystem
 static int launch_userspace_app(const char *path) {
+    // #COMPRESPAWN: FREE BEFORE YOU ALLOCATE.
+    //
+    // A dead process returns NOTHING at the moment it dies. proc_exit() marks
+    // it ZOMBIE and explicitly leaves its process slot, its 64 KB kernel stack
+    // and its whole address space in place; the only thing that reclaims them
+    // is reap_orphan_zombies(), whose only caller was alloc_proc_slot().
+    //
+    // That put the reap in the wrong ORDER for exactly this function. The
+    // sequence was: kmalloc ~1 MB for the ELF, THEN proc_create_user_as(), THEN
+    // (inside it) the reap. So when the compositor crashes and this runs to
+    // relaunch it, the 1 MB read is asked for while the dead compositor still
+    // holds ~29 MB of address space, a 64 KB kernel stack and a table slot, and
+    // while every session app the teardown just SIGKILLed is still fully alive
+    // (session_end_teardown() does not wait; they die at their next syscall
+    // return). MEASURED on the owner's VM <vmid>, golden 2054: the compositor
+    // faulted after 8.8 h and this call returned -1, leaving the machine on the
+    // in-kernel fallback desktop until reboot.
+    //
+    // Sweeping here costs a 64-entry snapshot on a path that already reads a
+    // megabyte off disk, and it is the ordinary rule, not a workaround.
+    uint64_t pmm_before = pmm_get_free_pages();
+    int reaped = proc_reap_orphans();
+    if (reaped > 0) {
+        // pmmreturnedKB IS THE NUMBER THAT MATTERS, AND IT IS WHY THIS LINE
+        // EXISTS RATHER THAN A PLAIN "reaped N".
+        //
+        // It is how much PHYSICAL memory the reap actually gave back, differenced
+        // across the one call that destroys dead processes' address spaces.
+        // MEASURED 2026-08-26 on VM <vmid>: reaping NINE zombie slots, one of them
+        // a compositor whose image alone is 29 MB, returned pmmreturnedKB=2048.
+        // Two megabytes. A dead user process's pages are very nearly not returned
+        // at all, and the free-page count fell by ~29 MB on every subsequent
+        // compositor generation, which is one whole compositor image per death.
+        //
+        // That is a live leak on exactly this path and it is NOT fixed here: the
+        // ownership rules in vmm_destroy_user_space() are the ones whose own
+        // comments warn that freeing a shared kernel page table hands live tables
+        // to the PMM, so it needs its own change with its own proof. This line is
+        // the instrument that makes the leak visible in the durable log instead of
+        // requiring someone to difference two heartbeat lines by hand.
+        bootlog_write("[LAUNCH] %s: reaped %d zombie process slot(s) before "
+                      "allocating (heapfreeKB=%lu pmmfreeKB=%lu pmmreturnedKB=%ld)",
+                      path, reaped,
+                      (unsigned long)(heap_get_free_size() / 1024),
+                      (unsigned long)(pmm_get_free_pages() * 4),
+                      (long)((long)pmm_get_free_pages() - (long)pmm_before) * 4);
+    }
+
     if (!g_fat_fs.mounted) {
-        LOG_ERROR("[UserSpace] Filesystem not mounted");
+        launch_fail(path, "root filesystem is not mounted", 0);
         return -1;
     }
 
@@ -133,14 +213,22 @@ static int launch_userspace_app(const char *path) {
     uint32_t size = 0;
     void *data = fat_read_file(&g_fat_fs, path, &size);
     if (!data || size == 0) {
-        LOG_ERROR("[UserSpace] Cannot read file from disk");
+        // NOT NECESSARILY A MISSING FILE. On an ext2-root image this path goes
+        // through ext2_read_whole(), whose kmalloc failure is indistinguishable
+        // from "not present on ext2" to fat_read_file(), which then falls
+        // through to the FAT ESP and reports "open failed". So a heap
+        // exhaustion presents as a missing binary. fs/ext2.c now logs the OOM
+        // itself; the numbers below are here so the two can be told apart even
+        // if that line is lost.
+        launch_fail(path, "could not read the binary (missing, or the heap "
+                          "could not supply the buffer)", (int)size);
         return -1;
     }
 
     // Validate ELF format
     int elf_err = elf_validate(data, size);
     if (elf_err != ELF_SUCCESS) {
-        LOG_ERROR("[UserSpace] Invalid ELF format");
+        launch_fail(path, "not a valid ELF", elf_err);
         kfree(data);
         return -1;
     }
@@ -166,10 +254,61 @@ static int launch_userspace_app(const char *path) {
         // forget it.
         LOG_INFO("[UserSpace] Process created successfully");
     } else {
-        LOG_ERROR("[UserSpace] proc_create_user_as failed");
+        launch_fail(path, "proc_create_user_as() refused the spawn (no free "
+                          "process slot, no address space, no kernel stack, or "
+                          "the ELF would not load)", pid);
     }
 
     kfree(data);
+    return pid;
+}
+
+// (#182) Launch the Ring-3 FM synthesiser for the DOS OPL2 emulation.
+//
+// NOT static, and deliberately here rather than in kernel/dos/: this is the
+// file that already has proc_create_user_as, proc_as_session and elf_validate
+// correctly declared, and dosexec.c cannot include proc/process.h because it
+// carries a conflicting hand-written `extern int proc_create(...)`.
+//
+// THE RETURN VALUE GATES opl2_installed_policy(). If this returns <= 0 the
+// OPL2 reports ABSENT and every DOS guest falls back to no music exactly as it
+// did before #182. That fallback is what keeps the PRESENT answer honest:
+// PRESENT means "a synthesiser is running", not "a synthesiser exists in the
+// source tree".
+// The SAME predicate audio_pcm_open() uses to decide ENODEV
+// (drivers/audio_pcm.c:331), so the kernel's answer and the synthesiser's
+// answer cannot disagree about whether this machine can make a sound.
+extern int uac_is_ready(void);
+extern bool audio_is_available(void);   // drivers/audio.h: returns bool, not int
+
+int fm_launch_synth(void) {
+    // A SUCCESSFUL SPAWN IS NOT PROOF THAT SOUND WILL COME OUT, and this check
+    // exists because the version without it was measured doing the wrong thing.
+    //
+    // On a machine with no audio device the spawn succeeds, this function
+    // returns a valid pid, the OPL2 reports PRESENT, and /APPS/FMSYNTH then
+    // gets ENODEV from sys_audio_pcm_open, correctly refuses to pretend, and
+    // exits. What is left is a chip advertising itself with nothing behind it
+    // and no sound: precisely the fabrication #175 refused to ship, put back by
+    // the ticket that was supposed to earn the right to remove it.
+    //
+    // Both halves were individually right. Only the JOIN was wrong, and it was
+    // only wrong on a machine without an audio device, which is not the machine
+    // anyone would think to test. Measured on VM <vmid>, build 2001.
+    if (!uac_is_ready() && !audio_is_available()) {
+        kprintf("[dos] (#182) no audio sink on this machine (no USB DAC, no HDA/AC97): "
+                "NOT launching the FM synthesiser, and the OPL2 will truthfully "
+                "report ABSENT. A chip that reports PRESENT with nothing behind it "
+                "is the fabrication #175 refused to ship.\n");
+        return -1;
+    }
+    int pid = launch_userspace_app("/APPS/FMSYNTH");
+    if (pid <= 0) {
+        kprintf("[dos] (#182) /APPS/FMSYNTH did not launch (%d): FM synthesis is "
+                "unavailable, so the OPL2 will truthfully report ABSENT.\n", pid);
+        return pid;
+    }
+    kprintf("[dos] (#182) Ring-3 FM synthesiser running as pid %d\n", pid);
     return pid;
 }
 
@@ -788,49 +927,18 @@ static void dock_recalculate(void) {
 // Clock Widget - CMOS RTC Functions
 // ============================================================================
 
-// CMOS RTC port addresses
-#define CMOS_ADDRESS_PORT   0x70
-#define CMOS_DATA_PORT      0x71
-
-// CMOS RTC register addresses
-#define CMOS_REG_SECONDS    0x00
-#define CMOS_REG_MINUTES    0x02
-#define CMOS_REG_HOURS      0x04
-#define CMOS_REG_STATUS_B   0x0B
-
-// Read a byte from CMOS register
-static uint8_t cmos_read(uint8_t reg) {
-    // Disable NMI (bit 7) and select register
-    outb(CMOS_ADDRESS_PORT, (1 << 7) | reg);
-    io_wait();
-    return inb(CMOS_DATA_PORT);
-}
-
-// Convert BCD to binary
-static uint8_t bcd_to_binary(uint8_t bcd) {
-    return ((bcd >> 4) * 10) + (bcd & 0x0F);
-}
-
-// Check if CMOS is in BCD mode (bit 2 of status register B = 0 means BCD)
-static bool cmos_is_bcd(void) {
-    uint8_t status_b = cmos_read(CMOS_REG_STATUS_B);
-    return !(status_b & 0x04);
-}
-
-// Read current time from CMOS RTC
+// #135: this file used to carry a PRIVATE FOURTH copy of the RTC decode
+// (its own bcd_to_binary(), its own cmos_is_bcd(), its own port I/O with a
+// different NMI-bit convention to gui/clock.c's). Four decoders and one
+// encoder that disagreed with all of them is what shipped the 6h06m clock
+// error. There is now one driver, drivers/rtc.c, and one codec,
+// rustkern/rtcenc.rs, for both directions.
 static void rtc_get_time(uint8_t *hours, uint8_t *minutes, uint8_t *seconds) {
-    bool is_bcd = cmos_is_bcd();
-
-    *seconds = cmos_read(CMOS_REG_SECONDS);
-    *minutes = cmos_read(CMOS_REG_MINUTES);
-    *hours = cmos_read(CMOS_REG_HOURS);
-
-    // Convert from BCD if needed
-    if (is_bcd) {
-        *seconds = bcd_to_binary(*seconds);
-        *minutes = bcd_to_binary(*minutes);
-        *hours = bcd_to_binary(*hours & 0x7F);  // Mask bit 7 for 12-hour mode AM/PM
-    }
+    int h = 0, m = 0, s = 0;
+    rtc_read_time(&h, &m, &s);
+    if (hours)   *hours   = (uint8_t)h;
+    if (minutes) *minutes = (uint8_t)m;
+    if (seconds) *seconds = (uint8_t)s;
 }
 
 // Clock widget dimensions
@@ -1159,6 +1267,27 @@ void desktop_init(void) {
     ttf_selfcheck_digits();  // #302: verify digits 0-9 (esp. '7') render OK
 
     kprintf("[Desktop] Initializing desktop manager...\n");
+
+    // THE GLOBAL UI SCALE FACTOR, BEFORE THE THEME SYSTEM.
+    //
+    // Order matters and is not arbitrary. theme_get_metric_by_id() applies the
+    // factor to every metric it returns, and theme_init() below loads the
+    // themes and takes contrast measurements over them. Bringing the scale up
+    // first means there is never a window in which a metric is read at a
+    // different factor than the one that is about to be in force.
+    //
+    // This point in boot also satisfies both of uiscale_init()'s preconditions:
+    // the framebuffer is up (fb_get_width/height are real), and the root
+    // filesystem is mounted, so /CONFIG/DISPLAY.CFG is readable. Reading it
+    // earlier is what makes the first-run wizard readable, which is the whole
+    // reported bug: the wizard runs before any USER exists, so its scale can
+    // only come from a machine-wide default that is already in force by the
+    // time the compositor spawns it.
+    uiscale_init((int)fb_get_width(), (int)fb_get_height());
+
+    // #battmeter: battery presence reuses uiscale_is_laptop() above it, so
+    // this must run AFTER uiscale_init(). See drivers/battery.h.
+    battery_init();
 
     // Initialize the theme system
     theme_init();
@@ -2819,7 +2948,74 @@ static void autorun_worker(void *arg) {
     if (path[0] == '/') launch_userspace_app(path);
 }
 
+// ===========================================================================
+// #126 SESSION TEARDOWN. A login is a boundary; a login gate that leaves the
+// previous user's processes running is not one.
+//
+// Log Out (startmenu.c) and Switch User (lockscreen.c) both exit
+// /APPS/COMPOSIT, this function's caller notices, and main.c re-runs the login
+// gate. Every OTHER process of the departing session used to survive all of
+// that: still scheduled, still owning kernel windows, so the next compositor
+// composited them and the INCOMING user was handed a live, focusable window
+// belonging to a process running as the OUTGOING user. Under the shipped
+// autologin=root that is a root process inside another user's session.
+//
+// THE RULE ITSELF IS NOT HERE. It is rustkern/sessend.rs (new kernel logic, so
+// Rust per the 2026-07-16 rule); this is the table walk, which is C because
+// proc_get()/MAX_PROCESSES/process_t are C and the walk is glue, not policy.
+//
+// SIGKILL, not a direct teardown: sig_raise() is the existing chokepoint and
+// already handles the case that matters here, a GUI app blocked in
+// win_get_event() on a wait queue. wake_up_process() unlinks it with
+// WAIT_EINTR, the syscall returns, and return_work_handler runs the default
+// action (proc_exit). proc_exit() is also what destroys the process's windows
+// (cleanup_user_windows_for_process), which is why nothing here touches the
+// window manager: a second place to tear a window down is a second place to
+// get it wrong.
+//
+// KNOWN LIMIT, stated rather than implied away: termination is asynchronous.
+// A process only dies at its next syscall return, so a Ring 3 process that
+// never syscalls again would linger. Every windowed app polls win_get_event()
+// (that is how it draws at all), so this is not the shipped case, but it is
+// not a guarantee either.
+static int session_end_teardown(uint32_t leader) {
+    extern process_t *proc_get(uint32_t pid);
+    extern void sig_raise(struct process *target, int signo);
+    extern int sessend_should_kill_rs(uint32_t leader, uint32_t pid, uint32_t session,
+                                      uint32_t privilege, uint32_t state);
+    int killed = 0;
+    if (leader == 0) {
+        // Refused, not treated as "kill everything": see sessend.rs. A zero
+        // leader means the session identity was never established, and the
+        // wildcard reading of that would end every Ring 3 process alive.
+        kprintf("[SESSION] teardown refused: no session id\n");
+        return 0;
+    }
+    for (uint32_t pid = 1; pid < MAX_PROCESSES; pid++) {
+        process_t *p = proc_get(pid);
+        if (!p) continue;
+        if (!sessend_should_kill_rs(leader, p->pid, p->session,
+                                    (uint32_t)p->privilege, (uint32_t)p->state)) continue;
+        kprintf("[SESSION] teardown: killing pid %u '%s' (uid=%u session=%u)\n",
+                p->pid, p->name, p->uid, p->session);
+        bootlog_write("[SESSION] teardown killed pid %u '%s' uid=%u session=%u",
+                      p->pid, p->name, p->uid, p->session);
+        sig_raise(p, SIGKILL);
+        killed++;
+    }
+    kprintf("[SESSION] teardown: session %u ended, %d process(es) signalled\n",
+            leader, killed);
+    bootlog_write("[SESSION] teardown: session %u ended, %d signalled", leader, killed);
+    return killed;
+}
+
 void desktop_run(void) {
+    // #157: this file does not pull in video/graphics.h, so declare the two
+    // boot-console entry points it now uses, in the same local-extern style the
+    // rest of this function already uses for gfx_boot_release_display().
+    extern void gfx_boot_log(const char *message);
+    extern void gfx_boot_log_replace(const char *message);
+
     if (!g_desktop.initialized) {
         kprintf("[Desktop] Error: desktop not initialized\n");
         return;
@@ -2827,15 +3023,27 @@ void desktop_run(void) {
 
     kprintf("[Desktop] Starting desktop environment...\n");
 
-    // #569 repaint-artifact fix: the desktop/compositor owns the display from
-    // here on. Release the boot splash so late background boot logging (e.g.
-    // the periodic xHCI rescan worker's gfx_boot_log() calls) can never repaint
-    // the boot-log console over a live UI. An explicit splash (shutdown /
-    // restart screen) re-acquires it.
-    {
-        extern void gfx_boot_release_display(void);
-        gfx_boot_release_display();
-    }
+    // #157: the #569 release used to happen HERE, before the compositor was
+    // even spawned. It was too early by exactly the interval that matters.
+    //
+    // Between this point and the compositor's first present the kernel
+    // deliberately KEEPS THE BOOT SPLASH on screen (see the comment below and
+    // #268), so releasing here meant that during the single riskiest stretch of
+    // the whole boot - loading a Ring-3 ELF off the root disk, faulting in its
+    // pages, running its startup, its first fb_flip - the screen was frozen and
+    // the kernel had voluntarily given up its only way to say anything to
+    // whoever was standing in front of the machine.
+    //
+    // #569's actual requirement is "once a REAL UI is on screen, late
+    // background gfx_boot_log() must not repaint over it". The real UI here is
+    // the compositor's first frame, and the kernel can observe that exactly:
+    // g_fb_flip_count leaving 0. So the release is deferred to the wait loop
+    // below, which does it the moment that counter moves. Until then the boot
+    // console stays live and keeps reporting, which is what turns a frozen
+    // screen into a readable one on a machine with no serial port.
+    //
+    // The compositor-absent fallback further down releases it explicitly before
+    // it draws the kernel desktop, because that path paints a real UI too.
 
     // Auto-launch the userland compositor. While it starts we KEEP THE BOOT
     // SPLASH on screen (do not draw the kernel desktop) so the handoff to the
@@ -2843,6 +3051,12 @@ void desktop_run(void) {
     // The kernel desktop is only drawn as a fallback if the compositor is absent.
     extern int g_compositor_launched;
     int compositor_pid = 0;   // #566: track compositor pid to detect its death
+    // #COMPRESPAWN: bounded relaunch retry state. Armed only by a FAILED
+    // launch; see the failure branch below and the deadline test in the main
+    // loop. Deliberately locals of desktop_run(), so a fresh desktop_run()
+    // (i.e. a fresh login-gate iteration) starts with a fresh budget.
+    int      s_relaunch_left = 0;
+    uint64_t s_relaunch_at   = 0;
     {
         // #430 verification gate: if /PTTEST.RUN exists on the FAT ESP, launch
         // the signals+pthreads test app INSTEAD of the compositor. This runs it
@@ -2876,18 +3090,119 @@ void desktop_run(void) {
         extern void fb_owner_arm(uint32_t pid);
         extern void fb_owner_disarm(void);
         fb_owner_arm(0);
+        // #157: on screen, not just on serial. The owner's machine has no serial
+        // port, so anything that is only kprintf()ed does not exist to him.
+        // (#182) /CONFIG/FMTEST.CFG containing "1" runs the OPL2 FM core's
+        // objective self-test in Ring 3 and prints the result to the serial
+        // console. It is a DIAGNOSTIC gate of the same family as DOSDIAG.CFG /
+        // DOSRING.CFG / DOSIO.CFG / DOSOPL.CFG, it is not shipped in the
+        // golden, and it exists so the in-OS arm of #182's verification can be
+        // RE-RUN rather than re-argued.
+        //
+        // It runs BEFORE the compositor so its output is not interleaved with
+        // the compositor's startup, and because it needs no window: everything
+        // it reports goes to serial via SYS_PUTCHAR, which falls through to
+        // kputc for a process with no stdout fd.
+        {   uint32_t _tz = 0;
+            void *_tc = fat_read_file(&g_fat_fs, "/CONFIG/FMTEST.CFG", &_tz);
+            if (_tc) {
+                char c0 = _tz ? ((char *)_tc)[0] : '0';
+                kfree(_tc);
+                if (c0 == '1') {
+                    kprintf("[BOOT] (#182) FMTEST.CFG armed: running /APPS/FMTEST\n");
+                    int tpid = launch_userspace_app("/APPS/FMTEST");
+                    kprintf("[BOOT] (#182) /APPS/FMTEST pid=%d\n", tpid);
+                }
+            }
+        }
+        gfx_boot_log("[BOOT] Launching compositor (/APPS/COMPOSIT)...");
+        // #307 telemetry: RECORD THE ATTEMPT, NOT ONLY THE SUCCESS.
+        //
+        // Measured on the owner's iMac14,4, golden 2039 (/BOOTLOG.TXT recovered
+        // from partition 2 of his stick, 268 KB, 15.6 h of uptime): the
+        // compositor exited with code 127 twice, and after the SECOND exit the
+        // session relogged in ("[LOGIN] autologin: OK as 'james'") and then NO
+        // "[SESSION] compositor pid N spawned" line ever followed. The machine
+        // sat on a dead desktop for the remaining ~7 minutes.
+        //
+        // The log could not say WHY, because the only two records of this launch
+        // were the success line below and a FAILURE branch that wrote nothing
+        // durable at all (gfx_boot_log + kprintf only). On a machine with no
+        // serial port that failure branch is silence, so "launch_userspace_app
+        // returned <= 0" and "the kernel never reached the call" left byte-for-
+        // byte identical evidence. This line separates them: an attempt with no
+        // following spawned/FAILED line means the loader itself did not return.
+        bootlog_write("[SESSION] launching /APPS/COMPOSIT (session respawn)");
         int cpid = launch_userspace_app("/APPS/COMPOSIT");
         if (cpid > 0) {
             fb_owner_arm((uint32_t)cpid);
             g_compositor_launched = 1;
             compositor_pid = cpid;   // #566
+            // #126: THE COMPOSITOR IS THE SESSION LEADER. process_t already
+            // carries pgrp/session and proc_create already INHERITS them down
+            // a spawn tree (proc/process.c: session = creator->session ?
+            // creator->session : own pid), so the only thing missing was a
+            // leader for the desktop session to hang off. This is what a login
+            // manager does, and what setsid() would do if the compositor could
+            // call it for itself before its first child exists.
+            //
+            // The pre/post values are LOGGED rather than assumed: whether the
+            // compositor was already its own session leader depends on whether
+            // proc_current() is non-NULL in this kernel thread, and "it must
+            // already be right" is exactly the kind of claim this tree has had
+            // outlive the code. Measure it on every boot instead.
+            {
+                extern process_t *proc_get(uint32_t pid);
+                process_t *cp0 = proc_get((uint32_t)cpid);
+                if (cp0) {
+                    bootlog_write("[SESSION] compositor pid %d spawned with pgrp=%u session=%u",
+                                  cpid, cp0->pgrp, cp0->session);
+                    cp0->pgrp    = (uint32_t)cpid;
+                    cp0->session = (uint32_t)cpid;
+                    bootlog_write("[SESSION] compositor pid %d is now session leader (session=%u)",
+                                  cpid, cp0->session);
+                }
+            }
             proc_create_ex("autorun", autorun_worker, 0, PRIO_LOW, 64*1024);
             kprintf("[Desktop] Compositor launched (pid %d); keeping splash until it renders\n", cpid);
+            {
+                char _cb[96];
+                snprintf(_cb, sizeof(_cb),
+                         "[BOOT] Compositor started (pid %d), waiting for its first frame...",
+                         cpid);
+                gfx_boot_log(_cb);
+            }
         } else {
             // Nothing will claim the framebuffer, so do not leave a window open
             // for whatever Ring 3 process happens to ask first.
             fb_owner_disarm();
             kprintf("[Desktop] WARNING: compositor not found; falling back to kernel desktop\n");
+            // #307: DURABLE record of the failure. See the comment at the call
+            // site above for why kprintf/gfx_boot_log alone was not enough.
+            bootlog_write("[SESSION] compositor launch FAILED: "
+                          "launch_userspace_app(\"/APPS/COMPOSIT\") returned %d; "
+                          "falling back to the in-kernel desktop", cpid);
+            // #COMPRESPAWN: THE FALLBACK IS NO LONGER PERMANENT.
+            //
+            // Before this, one failed relaunch meant no desktop until reboot:
+            // the kernel desktop was drawn and nothing ever tried again. That
+            // converts every compositor fault from a blink into a dead machine,
+            // which is strictly worse than the fault.
+            //
+            // The retry is a DEADLINE TEST inside the loop that already runs
+            // below and already sleeps for its own reasons - not a new poll
+            // loop and not a new sleep (#426). Bounded at three attempts,
+            // because a permanently missing or corrupt binary must stop
+            // retrying and say so rather than churn forever.
+            s_relaunch_left = 3;
+            s_relaunch_at   = (uint64_t)timer_ticks +
+                              2ull * (g_timer_hz ? g_timer_hz : 100);
+            // #157: this branch paints a real UI, so it takes over from the boot
+            // console here (the release that used to sit unconditionally at the
+            // top of desktop_run()).
+            { extern void gfx_boot_release_display(void); gfx_boot_release_display(); }
+            gfx_boot_log("[BOOT] compositor NOT FOUND: /APPS/COMPOSIT failed to launch; "
+                         "using the in-kernel desktop");
             wm_invalidate_all();
             desktop_draw();
             wm_draw_all();
@@ -2943,6 +3258,51 @@ pttest_after_launch:;   // #430: gate jumps here, skipping the compositor path
 
     int running = 1;
     while (running) {
+        // #COMPRESPAWN: bounded relaunch retry. No new loop, no new sleep: this
+        // is a deadline test inside the loop that already exists, and it only
+        // ever does anything when a launch has actually failed.
+        //
+        // WHY A RETRY IS THE RIGHT SHAPE HERE AND A WAIT QUEUE IS NOT. The
+        // thing we are waiting for is memory being returned by processes that
+        // session_end_teardown() has SIGKILLed but which have not run yet: a
+        // process only dies at its next syscall return, so there is no
+        // condition anyone can wake us on. That is the "wake source is outside
+        // our control" case, and a bounded, LOGGED, terminating retry is the
+        // honest answer to it.
+        if (!g_compositor_launched && s_relaunch_left > 0 &&
+            (uint64_t)timer_ticks >= s_relaunch_at) {
+            s_relaunch_left--;
+            bootlog_write("[SESSION] compositor relaunch retry (%d attempt(s) "
+                          "left after this one)", s_relaunch_left);
+            extern void fb_owner_arm(uint32_t pid);
+            int rpid = launch_userspace_app("/APPS/COMPOSIT");
+            if (rpid > 0) {
+                fb_owner_arm((uint32_t)rpid);
+                g_compositor_launched = 1;
+                compositor_pid = rpid;
+                {
+                    extern process_t *proc_get(uint32_t pid);
+                    process_t *rp = proc_get((uint32_t)rpid);
+                    if (rp) { rp->pgrp = (uint32_t)rpid; rp->session = (uint32_t)rpid; }
+                }
+                s_relaunch_left = 0;
+                bootlog_write("[SESSION] compositor RELAUNCH SUCCEEDED on retry "
+                              "(pid %d); the fallback desktop is being replaced",
+                              rpid);
+                wm_invalidate_all();
+                continue;
+            }
+            if (s_relaunch_left == 0) {
+                bootlog_write("[SESSION] compositor relaunch gave up after 3 "
+                              "attempts; the in-kernel desktop is now permanent "
+                              "for this session. The [LAUNCH] FAILED lines above "
+                              "name the reason.");
+            } else {
+                s_relaunch_at = (uint64_t)timer_ticks +
+                                2ull * (g_timer_hz ? g_timer_hz : 100);
+            }
+        }
+
         // Check if exclusive mode is active (DOOM fullscreen, etc.)
         // If so, yield CPU and skip desktop processing
         if (wm_is_exclusive_mode() || g_compositor_launched) {
@@ -2959,12 +3319,146 @@ pttest_after_launch:;   // #430: gate jumps here, skipping the compositor path
                     kprintf("[Desktop] Compositor (pid %d) exited; returning to "
                             "login gate (no shell fallback)\n", compositor_pid);
                     g_compositor_launched = 0;
+                    // #126: end the session BEFORE returning to the gate, so
+                    // the next user cannot be handed the previous user's
+                    // running processes. The compositor itself is already gone
+                    // and is excluded by the rule (sessend.rs).
+                    session_end_teardown((uint32_t)compositor_pid);
                     return;
+                }
+                // #307: THE DETECTOR ABOVE POLLS EVERY 50 ms AND IT ONCE TOOK
+                // 3.86 HOURS TO FIRE.
+                //
+                // Measured on the owner's iMac14,4, golden 2039, from the
+                // /BOOTLOG.TXT his machine wrote: "[PROC] 'COMPOSIT' (PID 31)
+                // exiting, code 127" at t=19,957,982 ms, and the session
+                // teardown did not begin until t=33,856,092 ms. The xHCI
+                // heartbeat ticked all the way through, so the scheduler was
+                // alive and this loop was almost certainly running; the pid
+                // therefore sat in a state that is neither ZOMBIE nor UNUSED
+                // for nearly four hours while the desktop stayed dead on
+                // screen. The SECOND death, six hours later, was detected in
+                // the same 60-second window it happened in.
+                //
+                // The log could not say which state, because nothing recorded
+                // it. One line a minute does, and it costs the same as the
+                // xHCI heartbeat that is already there. Rate-limited off
+                // timer_ticks, which is NOT a wall clock (it replays in bursts
+                // under vCPU starvation) - that is fine for a log cadence and
+                // would not be fine for a deadline.
+                else {
+                    static uint64_t s_comp_state_log = 0;
+                    if ((uint64_t)timer_ticks - s_comp_state_log >= 250u * 60u) {
+                        s_comp_state_log = (uint64_t)timer_ticks;
+                        bootlog_write("[SESSION] compositor pid %d present: state=%d",
+                                      compositor_pid, (int)cp->state);
+                    }
                 }
             }
             // The userland compositor owns the screen (or was just launched and is
             // about to render): idle, do NOT draw the kernel desktop, so the boot
             // splash persists seamlessly until the compositor's first frame (#268).
+            // ---------------------------------------------------------------
+            // #157 COMPOSITOR-HANDOFF WATCHDOG.
+            //
+            // Until the compositor's first present the boot console still owns
+            // the display (see the long #157 comment above the launch), so this
+            // is the kernel's last chance to tell a serial-less machine what is
+            // happening. Three jobs, in order:
+            //
+            //  1. The instant g_fb_flip_count leaves 0, a real UI is on screen:
+            //     hand the display over, exactly as #569 requires, and never
+            //     touch it again.
+            //  2. While it is still 0 past a grace period, repaint a status line
+            //     that INCLUDES A LIVE SECONDS COUNTER. That counter is the
+            //     whole point: a static screen cannot tell "the kernel is wedged"
+            //     apart from "the kernel is fine and the compositor never drew",
+            //     and those need completely different fixes. A ticking number
+            //     means the kernel scheduler, timer and framebuffer are alive.
+            //  3. If the compositor has produced nothing at all after a long
+            //     bound, stop waiting for it and fall back to the in-kernel
+            //     desktop, so the machine is usable instead of frozen. Disabled
+            //     by dropping /NOKDESK.TXT on the FAT ESP.
+            //
+            // No spin and no poll loop is introduced (#426): this is the
+            // pre-existing proc_sleep(50) idle iteration of a loop that already
+            // ran, and every branch below is O(1) with no waiting of its own.
+            // ---------------------------------------------------------------
+            if (g_compositor_launched) {
+                extern volatile uint64_t g_fb_flip_count;
+                extern void gfx_boot_release_display(void);
+                extern bool gfx_boot_owns_display(void);
+                static uint64_t s_wait_t0 = 0;
+                static uint32_t s_last_report_s = 0xFFFFFFFFu;
+                static int s_gave_up = 0;
+                static int s_reported_once = 0;
+                if (s_wait_t0 == 0) s_wait_t0 = timer_ticks;
+
+                if (g_fb_flip_count != 0) {
+                    // (1) The compositor is on screen. Hand over once.
+                    if (gfx_boot_owns_display()) {
+                        gfx_boot_release_display();
+                        bootlog_write("[BOOT] #157 compositor first frame seen; "
+                                      "boot console released the display");
+                    }
+                } else if (!s_gave_up) {
+                    uint32_t hz = g_timer_hz ? g_timer_hz : 100;
+                    uint32_t secs = (uint32_t)((timer_ticks - s_wait_t0) / hz);
+                    // (3) Long bound first, so the give-up message is the last
+                    // thing the status line says rather than being overwritten.
+                    if (secs >= 45) {
+                        extern fat_fs_t g_fat_fs;
+                        int inhibit = (g_fat_fs.mounted &&
+                                       fat_exists(&g_fat_fs, "/NOKDESK.TXT"));
+                        bootlog_write("[BOOT] #157 compositor pid %d produced NO frame in "
+                                      "%u s; kernel-desktop fallback %s",
+                                      compositor_pid, secs,
+                                      inhibit ? "INHIBITED by /NOKDESK.TXT" : "ENGAGING");
+                        if (!inhibit) {
+                            {
+                                char _fb[112];
+                                snprintf(_fb, sizeof(_fb),
+                                         "[BOOT] compositor produced no frame in %u s - "
+                                         "falling back to the in-kernel desktop",
+                                         (unsigned)secs);
+                                gfx_boot_log(_fb);
+                            }
+                            gfx_boot_release_display();
+                            g_compositor_launched = 0;
+                            s_gave_up = 1;
+                            continue;   // next iteration draws the kernel desktop
+                        }
+                        s_gave_up = 1;   // inhibited: stop reporting, keep waiting
+                    } else if (secs >= 8 && secs != s_last_report_s) {
+                        // (2) Live, ticking status line. Only from 8 s, so a
+                        // normal boot (first frame well under that) never shows
+                        // it and the handoff stays seamless (#268).
+                        s_last_report_s = secs;
+                        extern process_t *proc_get(uint32_t pid);
+                        process_t *cp = (compositor_pid > 0)
+                                        ? proc_get((uint32_t)compositor_pid) : NULL;
+                        const char *st = !cp ? "GONE"
+                                       : (cp->state == PROC_STATE_ZOMBIE) ? "ZOMBIE"
+                                       : (cp->state == PROC_STATE_UNUSED) ? "DEAD"
+                                       : "alive";
+                        char _wb[112];
+                        snprintf(_wb, sizeof(_wb),
+                                 "[BOOT] waiting for compositor pid %d (%s) - "
+                                 "%u s, 0 frames presented",
+                                 compositor_pid, st, (unsigned)secs);
+                        // #157: REPLACE the last console line rather than
+                        // appending one per second. The point of this line is a
+                        // number that visibly changes, which is what tells the
+                        // person in front of the machine that the kernel is
+                        // still alive; scrolling the log off the screen once a
+                        // second would destroy the rest of the boot record they
+                        // need to read at the same time.
+                        if (s_reported_once) gfx_boot_log_replace(_wb);
+                        else { gfx_boot_log(_wb); s_reported_once = 1; }
+                    }
+                }
+            }
+
             // The userland compositor owns the screen. REALLY sleep (yield the
             // CPU) instead of busy-spinning a volatile delay loop - that loop ran
             // forever under the compositor and pegged pid 0 at ~100% (#180).
@@ -3040,10 +3534,38 @@ pttest_after_launch:;   // #430: gate jumps here, skipping the compositor path
             // Queue key event for window manager
             gui_event_t key_event = {0};
             // Check if this is a key release:
-            // 1. Special release codes (0x90-0x98): subtract 0x10 to get press code
+            // 1. Special release codes: mapped to the matching PRESS code
             // 2. Regular ASCII with bit 7 set (>= 0x80): clear bit 7
-            if (c >= 0x90 && c <= 0x98) {
-                // Special key release (Ctrl, Shift, arrows)
+            //
+            // #232 A SECOND COPY OF THE SAME DECODE. This block is a hand copy
+            // of SYS_INJECT_KEY's (proc/syscall.c), which is how it also
+            // inherited SYS_INJECT_KEY's bug: a blanket `c - 0x10` over the
+            // whole 0x90-0x98 band delivered KEY_LCTRL_UP/KEY_LSHIFT_UP/
+            // KEY_RSHIFT_UP as keycodes 0x84/0x87/0x88, which are the PRESS
+            // codes of F5, F10 and F1. Fixed here TOO rather than only in
+            // syscall.c, because a fallback that decodes keys differently from
+            // the live path is a bug that only ever shows up on the day the
+            // fallback is the one running. See the long note at the
+            // SYS_INJECT_KEY site for the reasoning; the four mappings must
+            // stay identical between the two.
+            if (c == 0x94) {                     // KEY_LCTRL_UP  -> KEY_LCTRL
+                key_event.type = EVENT_KEY_UP;
+                key_event.keycode = 0x99;
+                key_event.key_char = 0;
+            } else if (c == 0x97) {              // KEY_LSHIFT_UP -> KEY_LSHIFT
+                key_event.type = EVENT_KEY_UP;
+                key_event.keycode = 0x95;
+                key_event.key_char = 0;
+            } else if (c == 0x98) {              // KEY_RSHIFT_UP -> KEY_RSHIFT
+                key_event.type = EVENT_KEY_UP;
+                key_event.keycode = 0x96;
+                key_event.key_char = 0;
+            } else if (c == 0x9C) {              // KEY_ALT_UP    -> KEY_ALT
+                key_event.type = EVENT_KEY_UP;
+                key_event.keycode = 0x9A;
+                key_event.key_char = 0;
+            } else if (c >= 0x90 && c <= 0x93) {
+                // Arrow releases only; here -0x10 is exact by construction.
                 key_event.type = EVENT_KEY_UP;
                 key_event.keycode = c - 0x10;
                 key_event.key_char = 0;

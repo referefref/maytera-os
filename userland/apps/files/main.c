@@ -283,6 +283,166 @@ static void qa_path(int i, char *out) {
 // ---- dynamically-enumerated drives ----------------------------------------
 static disk_info_t g_disks[4];
 static int g_disk_count = 0;
+
+// ===========================================================================
+// #250 REMOVABLE VOLUMES (hot-plugged USB drives).
+//
+// disk_info_t above is FIXED ATA disks: it has no mount point, so every Disk
+// row in the sidebar navigates to "/" and none of them can be ejected. A USB
+// stick is a different thing and needs the volume list, which is one syscall.
+//
+// POLLED, NOT PUSHED, and polled from the EVENT LOOP TIMEOUT, never from a
+// draw path. draw_sidebar() runs on every repaint and must not do I/O.
+// ===========================================================================
+// #234i: SC_VOL_MAX (16), not 8. The list gained a second producer (mounted
+// floppy and CD-ROM disk images join the USB hot-plug volumes), and a buffer
+// sized to only one of them silently drops the other's rows.
+#define MAX_VOLS SC_VOL_MAX
+static sc_volume_t g_vols[MAX_VOLS];
+static int g_vol_count = 0;
+
+// ===========================================================================
+// #234i: WHICH VOLUME IS THIS PATH ON?
+// ===========================================================================
+// ADVISORY, NOT ENFORCEMENT. The kernel is the enforcer: fs/fat.c:681 refuses
+// fat_write() on any image-backed handle, so a write to a mounted disc fails
+// whatever this app believes. What this decides is whether Files OFFERS the
+// action, which is a display question and therefore belongs in the app.
+//
+// The matching rule (case-insensitive, and the character after the mount point
+// must be a separator so /USB1 cannot swallow /USB10) is the same rule
+// split_core() implements in kernel/rustkern/hotplug.rs, which is the
+// authority. Kept short and stated rather than shared, because exporting a
+// kernel string routine to Ring 3 for a tooltip is a worse trade than fifteen
+// lines that cannot affect correctness of any write.
+static char up1(char c) { return (c >= 'a' && c <= 'z') ? (char)(c - 32) : c; }
+
+static const sc_volume_t *vol_for_path(const char *path) {
+    if (!path || path[0] != '/') return 0;
+    for (int i = 0; i < g_vol_count; i++) {
+        const char *m = g_vols[i].mount;
+        if (!m[0]) continue;
+        int k = 0;
+        while (m[k] && path[k] && up1(m[k]) == up1(path[k])) k++;
+        if (m[k] != 0) continue;                    // mount point not fully matched
+        if (path[k] == 0 || path[k] == '/') return &g_vols[i];
+    }
+    return 0;
+}
+
+// 1 if the directory Files is showing lives on a volume that refuses writes.
+static int cur_is_readonly(void) {
+    const sc_volume_t *v = vol_for_path(CUR.path);
+    return (v && (v->flags & MOSVOL_READONLY)) ? 1 : 0;
+}
+
+// THE gate for every mutating action. Returns 1 when the action must not
+// proceed, and says why on the way out: a button that silently does nothing
+// is the failure mode this is here to avoid.
+static int ro_block(const char *what) {
+    const sc_volume_t *v = vol_for_path(CUR.path);
+    if (!v || !(v->flags & MOSVOL_READONLY)) return 0;
+    char msg[128]; int l = 0;
+    const char *a = what;              while (*a && l < 40) msg[l++] = *a++;
+    const char *b = " is not possible on ";  while (*b && l < 90) msg[l++] = *b++;
+    for (int k = 0; k < 24 && v->name[k]; k++) msg[l++] = v->name[k];
+    const char *c = ": this volume is read-only.";
+    while (*c && l < (int)sizeof(msg) - 1) msg[l++] = *c++;
+    msg[l] = 0;
+    notify_post("Read-only volume", msg, NOTIFY_WARNING);
+    return 1;
+}
+
+// Cheap change detector, so the common case (nothing plugged in) redraws
+// nothing. Folds the fields a sidebar row actually shows.
+static unsigned volumes_sig(void) {
+    unsigned sig = 2166136261u;
+    for (int i = 0; i < g_vol_count; i++) {
+        sig = (sig ^ (unsigned)g_vols[i].index) * 16777619u;
+        sig = (sig ^ g_vols[i].flags) * 16777619u;
+        sig = (sig ^ (unsigned)(g_vols[i].total_bytes >> 20)) * 16777619u;
+        for (int k = 0; k < 32 && g_vols[i].mount[k]; k++)
+            sig = (sig ^ (unsigned char)g_vols[i].mount[k]) * 16777619u;
+        for (int k = 0; k < 64 && g_vols[i].name[k]; k++)
+            sig = (sig ^ (unsigned char)g_vols[i].name[k]) * 16777619u;
+    }
+    return sig ^ (unsigned)g_vol_count;
+}
+static unsigned g_vol_sig = 0;
+
+// Returns 1 if the list changed since the last call.
+//
+// #234i: AND LEAVES A VOLUME THAT HAS GONE. Eject is no longer only a thing
+// this app does to itself: the Disk Images app, a DOS guest swapping discs, or
+// a second Files window can all unmount the volume this window is standing in.
+// The eject button already navigated away before ejecting (see the sidebar
+// click handler); that only covers the case where WE did it. Without this, a
+// disc ejected from anywhere else leaves the window showing a directory
+// listing of a volume that no longer exists, with every row dead.
+static int poll_volumes(void) {
+    char was_on[MAX_PATH_LEN]; was_on[0] = 0;
+    {
+        const sc_volume_t *v = vol_for_path(CUR.path);
+        if (v) str_copy(was_on, v->mount, MAX_PATH_LEN);
+    }
+
+    int n = vol_list(g_vols, MAX_VOLS);
+    g_vol_count = (n > 0) ? n : 0;
+
+    if (was_on[0]) {
+        int still = 0;
+        for (int i = 0; i < g_vol_count; i++)
+            if (str_eq(g_vols[i].mount, was_on)) { still = 1; break; }
+        if (!still) {
+            // Home, not "/": the user is being moved somewhere they can act,
+            // and every tab that was on the dead volume moves, not just the
+            // visible one.
+            for (int t = 0; t < tab_count; t++) {
+                const char *tp = tabs[t].path;
+                int k = 0;
+                while (was_on[k] && tp[k] && up1(was_on[k]) == up1(tp[k])) k++;
+                if (was_on[k] == 0 && (tp[k] == 0 || tp[k] == '/'))
+                    str_copy(tabs[t].path, g_home, MAX_PATH_LEN);
+            }
+            g_in_recycle = 0;
+            // load_directory, not navigate_to: the tab's path has already
+            // been rewritten above, so navigate_to() would push a history
+            // entry pointing at the folder we are already in.
+            load_directory(CUR.path);
+            notify_post("Volume removed",
+                        "That drive was ejected, so Files went back to your home folder.",
+                        NOTIFY_INFO);
+            g_vol_sig = volumes_sig();
+            return 1;
+        }
+    }
+
+    unsigned sig = volumes_sig();
+    if (sig == g_vol_sig) return 0;
+    g_vol_sig = sig;
+    return 1;
+}
+
+// Human size for a volume row: whole GB above 1 GB, MB above 1 MB, else KB.
+//
+// #234i: THE KB ARM IS NOT COSMETIC. Every volume this ever described was a
+// USB stick measured in gigabytes, so integer-dividing by 1 MB was safe. A
+// 720 KB floppy image and a 354 KB ISO both came out as the string "0MB",
+// which is not a rounding artefact to a reader: it says the disc is empty.
+// Two of the three volumes on screen said 0MB the first time this shipped.
+static void vol_size_label(const sc_volume_t *v, char *out, int cap) {
+    unsigned long long kb = v->total_bytes / 1024ULL;
+    unsigned long long mb = kb / 1024ULL;
+    char num[24];
+    const char *unit;
+    if (mb >= 1024) { gui_itoa((int)(mb / 1024), num, sizeof(num)); unit = "GB"; }
+    else if (mb >= 1) { gui_itoa((int)mb, num, sizeof(num)); unit = "MB"; }
+    else            { gui_itoa((int)kb, num, sizeof(num)); unit = "KB"; }
+    int l = 0;
+    for (int k = 0; num[k] && l < cap - 4; k++) out[l++] = num[k];
+    while (*unit && l < cap - 1) out[l++] = *unit++;
+    out[l] = 0;
+}
 static void enumerate_disks(void) {
     g_disk_count = 0;
     for (int i = 0; i < 4; i++) {
@@ -967,6 +1127,42 @@ static void rb_empty(void) {
     rb_load();
 }
 
+// #745 (docs/CONFIRM_MODAL_DESIGN.html): both actions above used to fire with
+// NO confirmation at all - the audit's single biggest finding ("permanently
+// destroying files has less friction than shutting the machine down"). Now
+// gated behind the shared window-modal confirm card (libc/gui_style.h's
+// gui_confirm_singleton_*), the same component Task Manager's End Task/Kill
+// uses. g_rb_pending_action: 0 none, 1 = delete selected, 2 = empty bin.
+static int g_rb_pending_action;
+
+static void rb_confirm_delete_selected(void) {
+    int n = rb_count_selected();
+    if (!n) return;
+    char body[96];
+    strcpy(body, "Permanently delete the selected item");
+    strcat(body, n == 1 ? "" : "s");
+    strcat(body, "? This cannot be undone.");
+    g_rb_pending_action = 1;
+    gui_confirm_open_s(GUI_CONFIRM_DESTRUCTIVE, "Delete Permanently",
+                       body, 0, 0, 1, "Cancel", "Delete");
+    fb_redraw();
+}
+
+static void rb_confirm_empty(void) {
+    if (!rb_count) return;
+    char body[96];
+    strcpy(body, "Permanently delete all ");
+    { char n[12]; int v = rb_count, i = 0, t; char tmp[12];
+      if (v == 0) tmp[i++] = '0'; else { t = 0; while (v > 0) { tmp[t++] = (char)('0' + v % 10); v /= 10; }
+      while (t > 0) n[i++] = tmp[--t]; }
+      n[i] = 0; strcat(body, n); }
+    strcat(body, " items in the Recycle Bin? This cannot be undone.");
+    g_rb_pending_action = 2;
+    gui_confirm_open_s(GUI_CONFIRM_DESTRUCTIVE, "Empty Recycle Bin",
+                       body, 0, 0, 1, "Cancel", "Empty Bin");
+    fb_redraw();
+}
+
 // ---- preview pane ---------------------------------------------------------
 static unsigned char prev_buf[8192];
 static int prev_len = 0;
@@ -1185,8 +1381,13 @@ static void draw_toolbar(void) {
     gui_textfield2(window_handle, axx, by, aw, 24, CUR.path, false);
     // command buttons: New / View
     int bx = WIN_W - 8 - 3 * 64;
+    // #234i: New is DISABLED, not merely refused, on a read-only volume. A
+    // control that can be pressed and then explains itself is worse than one
+    // that visibly cannot be pressed; ro_block() still guards the action, so
+    // this is the affordance and not the enforcement.
     gui_button(window_handle, bx, by, 60, 24, "New", GUI_BTN_SECONDARY,
-               g_menu == MENU_NEW ? GUI_ST_PRESSED : GUI_ST_NORMAL);
+               cur_is_readonly() ? GUI_ST_DISABLED
+                                 : (g_menu == MENU_NEW ? GUI_ST_PRESSED : GUI_ST_NORMAL));
     gui_button(window_handle, bx + 64, by, 60, 24, "View", GUI_BTN_SECONDARY,
                g_menu == MENU_VIEW ? GUI_ST_PRESSED : GUI_ST_NORMAL);
     // filter box
@@ -1195,12 +1396,73 @@ static void draw_toolbar(void) {
     if (!g_filter[0]) win_draw_text_small(window_handle, fx + 6, by + 7, "Filter..", files_dim(fp_field()));
 }
 
+// #234i fallback glyphs for the two disk-image volume classes. There is no
+// CD or floppy asset in /ICONS (114 files, none of them a drive), so these are
+// drawn, not loaded, in the same "icon identity colour, not chrome" class as
+// the USB stick outline and the disk swatch above: they are the picture of a
+// physical object, and theming them would make a CD stop looking like a CD.
+//
+// The disc is filled by row spans rather than per-pixel, which is one
+// win_draw_rect per row instead of ~200 pixel calls across the compositor
+// boundary; at 16px that is 16 calls.
+// A disc: light body, dark rim, dark hub ring, and the row's own background
+// showing through the centre hole.
+//
+// Three tones, not one. Measured at the 14px this is actually drawn at: a
+// pale filled circle with a 2px dot read as a smudge, and a single-tone
+// annulus read as a cog, because at that size the outer stair-steps ARE the
+// silhouette. Filling the body first and then laying a dark rim on top gives
+// the eye a clean circular edge to latch onto, and the punched hole is what
+// makes it a disc rather than a button.
+//
+// `bg` is the colour of the row behind it, because the centre hole is a HOLE:
+// there is no read-back through win_draw_*, so transparency has to be painted.
+static void draw_disc_icon(int x, int y, int sz, uint32_t bg) {
+    int r = sz / 2, cx = x + r, cy = y + r;
+    int r2 = r * r;
+    // MEASURED at r = 7 (the 14px this is drawn at), by rendering the pixel
+    // pattern before shipping it. A 2px rim and a 3px hub ring left the light
+    // data area ONE pixel wide, and the result read as a cog, not a disc: at
+    // this size the ratio of the bands IS the identity. 1px rim, 1px hub ring,
+    // a 3px hole and everything else data area is what reads correctly.
+    int rim2 = (r - 1) * (r - 1); if (r < 3) rim2 = 0;
+    int rh = r / 7; if (rh < 1) rh = 1;             // hole radius
+    int rhub = rh + 1;                              // hub ring outer radius
+    for (int dy = -r; dy < r; dy++) {
+        for (int dx = -r; dx < r; dx++) {
+            int d2 = dx * dx + dy * dy;
+            if (d2 > r2) continue;
+            uint32_t c;
+            if (d2 <= rh * rh)              c = bg;              // centre hole
+            else if (d2 <= rhub * rhub)     c = 0x00566270;      // hub ring
+            else if (d2 >= rim2)            c = 0x00566270;      // rim
+            else                            c = 0x00C2CCD8;      // data area
+            gui_draw_pixel(window_handle, cx + dx, cy + dy, c);
+        }
+    }
+    gui_draw_pixel(window_handle, cx - r + 2, cy - r + 3, 0x00EEF2F6);
+}
+
+static void draw_floppy_icon(int x, int y, int sz) {
+    // Body, shutter (top centre), and label panel (bottom) - the three parts
+    // that make a 3.5" disk readable at 16px.
+    win_draw_rect(window_handle, x, y, sz, sz, 0x004A5560);
+    gui_draw_rect_outline(window_handle, x, y, sz, sz, 0x00202830);
+    int sw = sz / 2, sh = sz / 3;
+    win_draw_rect(window_handle, x + (sz - sw) / 2, y + 1, sw, sh, 0x00B8C0C8);
+    win_draw_rect(window_handle, x + 3, y + sz - sh - 1, sz - 6, sh, 0x00E8ECF0);
+}
+
 // ---- sidebar (Places) -----------------------------------------------------
 // Build a flat clickable list: section headers + rows. We recompute hit rows
 // each draw and store their target paths for click handling.
 static char side_target[40][MAX_PATH_LEN];
 static int  side_y[40];
-static int  side_kind[40];   // 0=path nav, 1=device(root), 2=network
+// 0=path nav, 1=fixed device, 2=network, 3=recycle bin,
+// 4=removable volume (navigate), 5=removable volume EJECT button,
+// 6=removable volume that is mounted but whose files cannot be read
+static int  side_kind[40];
+static int  side_vol[40];    // #250: volume index for kinds 4/5/6, else -1
 static int  side_rows = 0;
 
 static void draw_sidebar(void) {
@@ -1218,7 +1480,7 @@ static void draw_sidebar(void) {
           if (!draw_mico(icn, 12, y, ICON_SIZE, tint)) draw_folder_icon(12, y); }
         win_draw_text(window_handle, 34, y, qa_label[i], SIDE_TEXT);
         str_copy(side_target[side_rows], p, MAX_PATH_LEN);
-        side_y[side_rows] = y; side_kind[side_rows] = 0; side_rows++;
+        side_y[side_rows] = y; side_kind[side_rows] = 0; side_vol[side_rows] = -1; side_rows++;
         y += ITEM_HEIGHT;
     }
     y += 6;
@@ -1239,7 +1501,7 @@ static void draw_sidebar(void) {
         lbl[l] = 0;
         win_draw_text_small(window_handle, 34, y + 4, lbl, SIDE_TEXT);
         str_copy(side_target[side_rows], "/", MAX_PATH_LEN);
-        side_y[side_rows] = y; side_kind[side_rows] = 1; side_rows++;
+        side_y[side_rows] = y; side_kind[side_rows] = 1; side_vol[side_rows] = -1; side_rows++;
         y += ITEM_HEIGHT;
     }
     if (g_disk_count == 0) { win_draw_text_small(window_handle, 34, y + 4, "(no drives)", SIDE_DIM); y += ITEM_HEIGHT; }
@@ -1251,16 +1513,121 @@ static void draw_sidebar(void) {
         gui_draw_rect_outline(window_handle, 12, y + 2, ICON_SIZE, ICON_SIZE - 2, 0x00405040);
         win_draw_text_small(window_handle, 34, y + 4, "ext2 (/ext2)", SIDE_TEXT);
         str_copy(side_target[side_rows], "/ext2", MAX_PATH_LEN);
-        side_y[side_rows] = y; side_kind[side_rows] = 1; side_rows++;
+        side_y[side_rows] = y; side_kind[side_rows] = 1; side_vol[side_rows] = -1; side_rows++;
         y += ITEM_HEIGHT;
     }
+    // ------------------------------------------------------------------
+    // #250 Removable. One row per hot-plugged USB volume, with an eject
+    // affordance on the right of the row. The section header is drawn only
+    // when there is something in it, so an unremarkable machine looks
+    // exactly as it did before.
+    // ------------------------------------------------------------------
+    if (g_vol_count > 0) {
+        y += 6;
+        win_draw_text(window_handle, 8, y, "Removable", SIDE_TEXT); y += 20;
+        for (int i = 0; i < g_vol_count && side_rows < 38; i++) {
+            const sc_volume_t *v = &g_vols[i];
+            int readable = (v->flags & MOSVOL_READABLE) && (v->flags & MOSVOL_MOUNTED);
+            bool cur = readable && str_eq(CUR.path, v->mount);
+            if (cur) win_draw_rect(window_handle, 4, y - 2, SIDEBAR_W - 8, ITEM_HEIGHT, ITEM_SELECTED);
+
+            // Icon, one per volume CLASS. #234i added the disc and floppy
+            // glyphs: a mounted CD and a mounted floppy drawn with the same
+            // USB-stick outline would be three rows the user has to read to
+            // tell apart. draw_mico() is tried first for each so a real asset
+            // can be dropped into /ICONS later without touching this file;
+            // none of the three exists today, so all three fall through.
+            {
+                uint32_t tint = cur ? files_fg(ITEM_SELECTED) : SIDE_TEXT;
+                if (v->flags & MOSVOL_OPTICAL) {
+                    if (!draw_mico("CDROM", 12, y, ICON_SIZE, tint))
+                        draw_disc_icon(12, y + 1, ICON_SIZE - 2,
+                                       cur ? ITEM_SELECTED : SIDEBAR_BG);
+                } else if (v->flags & MOSVOL_FLOPPY) {
+                    if (!draw_mico("FLOPPY", 12, y, ICON_SIZE, tint))
+                        draw_floppy_icon(12, y + 1, ICON_SIZE - 2);
+                } else if (!draw_mico("USBDRIVE", 12, y, ICON_SIZE, tint)) {
+                    win_draw_rect(window_handle, 15, y + 5, ICON_SIZE - 6, ICON_SIZE - 6, 0x0060A0D0);
+                    gui_draw_rect_outline(window_handle, 15, y + 5, ICON_SIZE - 6, ICON_SIZE - 6, 0x00305070);
+                    win_draw_rect(window_handle, 18, y + 1, ICON_SIZE - 12, 4, 0x00B0B8C0);
+                }
+            }
+
+            // Label: volume name, trimmed to fit, with the size beneath it.
+            // #234i: the fallback name is per class, because "USB Drive" under
+            // a disc icon is worse than no label at all. dos/diskimg.c already
+            // guarantees an image volume has a name (the medium's label, else
+            // the image filename), so these are last resorts.
+            char nm[40]; int l = 0;
+            for (int k = 0; v->name[k] && l < 24; k++) nm[l++] = v->name[k];
+            if (l == 0) {
+                const char *u = (v->flags & MOSVOL_OPTICAL) ? "CD-ROM"
+                              : (v->flags & MOSVOL_FLOPPY)  ? "Floppy Disk"
+                                                            : "USB Drive";
+                while (*u && l < 24) nm[l++] = *u++;
+            }
+            nm[l] = 0;
+            win_draw_text_small(window_handle, 34, y + 1, nm, SIDE_TEXT);
+
+            char sub[48]; int sl = 0;
+            char sz[24]; vol_size_label(v, sz, sizeof(sz));
+            for (int k = 0; sz[k] && sl < 12; k++) sub[sl++] = sz[k];
+            sub[sl++] = ' ';
+            for (int k = 0; k < 8 && v->fsname[k] && sl < 30; k++) sub[sl++] = v->fsname[k];
+            // #234i: SAY IT IS READ-ONLY before the user finds out by being
+            // refused. Same principle as the "(not readable)" note below.
+            if (readable && (v->flags & MOSVOL_READONLY)) {
+                // "R/O", not "read-only". MEASURED: the sidebar is 160px, the
+                // subtitle starts at x=34 and the eject glyph starts at
+                // SIDEBAR_W-22 = 138, which leaves 104px, and
+                // win_draw_text_small is ~6px per character. "354KB ISO9660
+                // read-only" is 21 characters (126px) and drew straight
+                // through the eject button. 17 characters is the fit.
+                const char *w = " R/O";
+                while (*w && sl < 17) sub[sl++] = *w++;
+            }
+            if (!readable) {
+                // SAY SO. An exFAT volume mounts and reports its size and
+                // then every file on it fails to open, because fs/exfat.c
+                // implements mount/unmount/free-space and nothing else.
+                // Showing it as an ordinary browsable drive would be a lie
+                // the user only discovers by double-clicking. Hiding it
+                // would be the bug this whole change exists to fix.
+                const char *w = " (not readable)";
+                while (*w && sl < 46) sub[sl++] = *w++;
+            }
+            sub[sl] = 0;
+            win_draw_text_small(window_handle, 34, y + 12, sub, readable ? SIDE_DIM : 0x00C08040);
+
+            // Eject button: a small triangle-over-bar, right-aligned.
+            int ex = SIDEBAR_W - 22;
+            win_draw_rect(window_handle, ex + 2, y + 13, 10, 2, SIDE_TEXT);
+            for (int r = 0; r < 5; r++)
+                win_draw_rect(window_handle, ex + 6 - r, y + 10 - r, 1 + 2 * r, 1, SIDE_TEXT);
+
+            // TWO rows in the hit table for ONE visual row: the eject button
+            // is listed FIRST so the click scan finds it before the
+            // navigate row that shares the same y band.
+            str_copy(side_target[side_rows], v->mount, MAX_PATH_LEN);
+            side_y[side_rows] = y; side_kind[side_rows] = 5; side_vol[side_rows] = i; side_rows++;
+
+            str_copy(side_target[side_rows], v->mount, MAX_PATH_LEN);
+            side_y[side_rows] = y;
+            side_kind[side_rows] = readable ? 4 : 6;
+            side_vol[side_rows] = i;
+            side_rows++;
+
+            y += ITEM_HEIGHT + 4;
+        }
+    }
+
     y += 6;
     win_draw_text(window_handle, 8, y, "Network", SIDE_TEXT); y += 20;
     if (!draw_mico("NETWORK", 12, y, ICON_SIZE, SIDE_TEXT))
         win_draw_rect(window_handle, 12, y + 3, ICON_SIZE, ICON_SIZE - 4, 0x004A78C0);
     win_draw_text(window_handle, 34, y, "Network", SIDE_TEXT);
     str_copy(side_target[side_rows], "/NET", MAX_PATH_LEN);
-    side_y[side_rows] = y; side_kind[side_rows] = 2; side_rows++;
+    side_y[side_rows] = y; side_kind[side_rows] = 2; side_vol[side_rows] = -1; side_rows++;
     y += ITEM_HEIGHT;
 
     // Recycle Bin: opens the integrated trash view (side_kind 3) instead of a
@@ -1276,7 +1643,7 @@ static void draw_sidebar(void) {
       } }
     win_draw_text(window_handle, 34, y, "Recycle Bin", SIDE_TEXT);
     str_copy(side_target[side_rows], TRASH_DIR, MAX_PATH_LEN);
-    side_y[side_rows] = y; side_kind[side_rows] = 3; side_rows++;
+    side_y[side_rows] = y; side_kind[side_rows] = 3; side_vol[side_rows] = -1; side_rows++;
 }
 
 // ---- file list ------------------------------------------------------------
@@ -1372,6 +1739,10 @@ static void draw_file_list(void) {
         uint32_t sb_track, sb_thumb;
         gui_scroll_colors(0, BG_COLOR, &sb_track, &sb_thumb);
         win_draw_rect(window_handle, sbx, CONTENT_Y, 14, sh, sb_track);
+        // (#117) was fill-only, no boundary, so this trough never inherited
+        // #96's fix even though gui_scroll_draw_on()'s did - see
+        // gui_scroll_trough_border()'s comment in gui_scroll.h.
+        gui_scroll_trough_border(window_handle, sbx, CONTENT_Y, 14, sh, sb_track, BG_COLOR);
         win_draw_rect(window_handle, sbx + 2, CONTENT_Y + ty, 10, th, sb_thumb);
     }
 }
@@ -1478,6 +1849,8 @@ static void draw_recycle_view(void) {
         uint32_t sb_track, sb_thumb;   // surface = BG_COLOR, see the list view
         gui_scroll_colors(0, BG_COLOR, &sb_track, &sb_thumb);
         win_draw_rect(window_handle, sbx, ly, 14, sh, sb_track);
+        // (#117) see the list view's trough above.
+        gui_scroll_trough_border(window_handle, sbx, ly, 14, sh, sb_track, BG_COLOR);
         win_draw_rect(window_handle, sbx + 2, ly + ty, 10, th, sb_thumb);
     }
 }
@@ -1573,17 +1946,24 @@ static void fb_redraw(void) {
     if (g_props_open) draw_props();   // (#251) Properties dialog on top
     if (g_openwith_open) draw_openwith();  // Task C: Open with picker
     if (g_te_open) draw_te();              // Task C: inline Rename text entry
+    // #745: Recycle Bin delete/empty confirm - drawn LAST so it sits on top
+    // of everything else, true modal (see the gate in EVENT_KEY_DOWN/
+    // EVENT_MOUSE_DOWN below: it is checked before any other overlay).
+    if (gui_confirm_singleton_is_open())
+        gui_confirm_singleton_render(window_handle, WIN_W, WIN_H);
     win_invalidate(window_handle);
 }
 
 // ---- operations -----------------------------------------------------------
 static void do_new_folder(void) {
+    if (ro_block("Creating a folder")) return;
     static const char *cand[] = { "NEWFOLD", "NEWFOLD1", "NEWFOLD2", "NEWFOLD3", "NEWFOLD4" };
     char p[MAX_PATH_LEN];
     for (int i = 0; i < 5; i++) { path_join(p, CUR.path, cand[i]); if (mkdir(p, 0755) == 0) break; }
     load_directory(CUR.path); fb_redraw();
 }
 static void do_new_file(void) {
+    if (ro_block("Creating a file")) return;
     static const char *cand[] = { "NEW.TXT", "NEW1.TXT", "NEW2.TXT", "NEW3.TXT" };
     char p[MAX_PATH_LEN];
     for (int i = 0; i < 4; i++) { path_join(p, CUR.path, cand[i]);
@@ -1612,6 +1992,7 @@ static int trash_index_add(const char *name, const char *src) {
 
 static void do_delete(void) {
     if (CUR.sel < 0 || CUR.sel >= item_count) return;
+    if (ro_block("Deleting")) return;
     file_entry_t *it = &items[CUR.sel];
     if (str_eq(it->name, "..") || str_eq(it->name, "(empty)")) return;
     char src[MAX_PATH_LEN], dst[MAX_PATH_LEN];
@@ -1688,6 +2069,7 @@ static void open_selected(void) {
 // ---- Task C: inline Rename (reusable text-entry overlay) -------------------
 static void rename_commit(const char *newname) {
     if (CUR.sel < 0 || CUR.sel >= item_count) return;
+    if (ro_block("Renaming")) return;
     if (!newname || newname[0] == 0) return;
     file_entry_t *it = &items[CUR.sel];
     if (str_eq(it->name, "..") || str_eq(it->name, "(empty)")) return;
@@ -1919,6 +2301,20 @@ static void do_cut(void) {
 }
 static void do_paste(void) {
     if (g_clip_mode == 0 || g_clip_path[0] == 0) return;
+    // The DESTINATION is what has to be writable. A Cut also unlinks the
+    // source, so a cut FROM a read-only volume is refused too, rather than
+    // copying the file and then silently failing to remove the original,
+    // which would look like a successful move that duplicated the file.
+    if (ro_block("Pasting")) return;
+    if (g_clip_mode == 2) {
+        const sc_volume_t *sv = vol_for_path(g_clip_path);
+        if (sv && (sv->flags & MOSVOL_READONLY)) {
+            notify_post("Read-only volume",
+                        "That item was cut from a read-only volume, so it cannot be "
+                        "moved. Copy it instead.", NOTIFY_WARNING);
+            return;
+        }
+    }
     char base[MAX_NAME_LEN]; str_copy(base, basename_of(g_clip_path), MAX_NAME_LEN);
     char dst[MAX_PATH_LEN]; path_join(dst, CUR.path, base);
     // Pasting into the source's own directory would target the original file;
@@ -2158,6 +2554,7 @@ static void tab_switch(int i) {
 // makes <name>.zip / <name>.tar.gz next to the item; Extract here unpacks an
 // archive into the current directory.
 static void do_compress(const char *ext) {
+    if (ro_block("Creating an archive")) return;
     if (CUR.sel < 0 || CUR.sel >= item_count) return;
     file_entry_t *it = &items[CUR.sel];
     if (str_eq(it->name, "..") || str_eq(it->name, "(empty)")) return;
@@ -2204,6 +2601,7 @@ static void do_install_font(void) {
 }
 
 static void do_extract_here(void) {
+    if (ro_block("Extracting here")) return;
     if (CUR.sel < 0 || CUR.sel >= item_count) return;
     file_entry_t *it = &items[CUR.sel];
     if (str_eq(it->name, "..") || str_eq(it->name, "(empty)")) return;
@@ -2272,6 +2670,7 @@ int main(int argc, char **argv) {
         str_copy(g_home, "/HOME/ADMIN", MAX_PATH_LEN);
 
     enumerate_disks();
+    poll_volumes();   // #250: removable volumes, before the first paint
 
     for (int i = 0; i < MAX_TABS; i++) tabs[i].sel = -1;
     tabs[0].used = true; str_copy(tabs[0].path, g_home, MAX_PATH_LEN);
@@ -2320,7 +2719,20 @@ int main(int argc, char **argv) {
     int running = 1;
     while (running) {
         int et = win_get_event(window_handle, &event, 100);
-        if (et == 0) continue;
+        if (et == 0) {
+            // #250: idle. This is the ONLY place volumes are polled: the
+            // event loop's existing 100 ms timeout, throttled to ~1 s, and
+            // never from draw_sidebar(), which runs on every repaint. One
+            // syscall that touches no device; the redraw only happens when
+            // the list actually changed.
+            static unsigned long s_last_vol = 0;
+            unsigned long now = (unsigned long)get_ticks();
+            if (now - s_last_vol >= 18 || s_last_vol == 0) {   // ~1s at 18Hz ticks
+                s_last_vol = now;
+                if (poll_volumes()) fb_redraw();
+            }
+            continue;
+        }
         switch (event.type) {
         case EVENT_REDRAW: fb_redraw(); break;
         case EVENT_RESIZE:
@@ -2329,6 +2741,18 @@ int main(int argc, char **argv) {
         case EVENT_WINDOW_CLOSE: running = 0; break;
         case EVENT_KEY_DOWN: {
             char c = event.key_char; uint32_t kc = event.keycode;
+            // #745: the Recycle Bin confirm is a true modal - it gets first
+            // crack at every key, above even the other modal overlays below.
+            if (gui_confirm_singleton_is_open()) {
+                int r = gui_confirm_singleton_handle_key(c);
+                if (r == 2) {
+                    if (g_rb_pending_action == 1) rb_delete_selected();
+                    else if (g_rb_pending_action == 2) rb_empty();
+                    g_rb_pending_action = 0;
+                }
+                fb_redraw();
+                break;
+            }
             // Task C: modal overlays capture keys first.
             if (g_te_open) { te_key(c, kc); fb_redraw(); break; }
             if (g_openwith_open) { if (c == 27) { g_openwith_open = 0; fb_redraw(); } break; }
@@ -2382,6 +2806,18 @@ int main(int argc, char **argv) {
             int wx, wy; win_get_pos(window_handle, &wx, &wy);
             int lx = event.mouse_x, ly = event.mouse_y;
             int right = (event.mouse_buttons & MOUSE_BUTTON_RIGHT) ? 1 : 0;
+            // #745: the Recycle Bin confirm is a true modal - first crack at
+            // every click, never dismissed by clicking away from it.
+            if (gui_confirm_singleton_is_open()) {
+                int r = gui_confirm_singleton_handle_mouse(lx, ly, 1);
+                if (r == 2) {
+                    if (g_rb_pending_action == 1) rb_delete_selected();
+                    else if (g_rb_pending_action == 2) rb_empty();
+                    g_rb_pending_action = 0;
+                }
+                fb_redraw();
+                break;
+            }
             // Task C: modal overlays consume clicks first.
             if (g_te_open) {
                 int h = te_hit(lx, ly);
@@ -2436,7 +2872,15 @@ int main(int argc, char **argv) {
                 else if (lx >= 64 && lx < 90) navigate_up();
                 else {
                     int bx = WIN_W - 8 - 3 * 64;
-                    if (lx >= bx && lx < bx + 60) { g_menu = MENU_NEW; g_menu_x = bx; g_menu_y = by + 26; fb_redraw(); }
+                    if (lx >= bx && lx < bx + 60) {
+                        // #234i: a DISABLED button must not open its menu. The
+                        // draw path greys it on a read-only volume; without
+                        // this the menu still opened and the refusal only
+                        // arrived one click later, which is the shape that
+                        // teaches people to ignore disabled styling.
+                        if (ro_block("Creating an item")) break;
+                        g_menu = MENU_NEW; g_menu_x = bx; g_menu_y = by + 26; fb_redraw();
+                    }
                     else if (lx >= bx + 64 && lx < bx + 124) { g_menu = MENU_VIEW; g_menu_x = bx + 64; g_menu_y = by + 26; fb_redraw(); }
                 }
                 break;
@@ -2445,7 +2889,37 @@ int main(int argc, char **argv) {
             if (lx < SIDEBAR_W && ly >= CONTENT_Y) {
                 for (int i = 0; i < side_rows; i++) {
                     if (ly >= side_y[i] - 2 && ly < side_y[i] + ITEM_HEIGHT - 2) {
-                        if (side_kind[i] == 3) {
+                        // #250: the eject hot zone is the right-hand end of a
+                        // removable row only. Listed before the navigate row
+                        // for the same volume, so a click inside it wins.
+                        if (side_kind[i] == 5) {
+                            if (lx < SIDEBAR_W - 26) continue;   // not on the button
+                            int vi = side_vol[i];
+                            if (vi < 0 || vi >= g_vol_count) break;
+                            char mnt[MAX_PATH_LEN];
+                            str_copy(mnt, g_vols[vi].mount, MAX_PATH_LEN);
+                            char nm[64]; str_copy(nm, g_vols[vi].name, 64);
+                            // If we are standing on the volume we are about to
+                            // eject, leave FIRST. Otherwise the directory
+                            // listing would refresh against a volume that is
+                            // gone and show an error instead of the eject
+                            // having worked.
+                            if (str_eq(CUR.path, mnt)) { g_in_recycle = 0; navigate_to("/"); }
+                            if (vol_eject(g_vols[vi].index) == 0)
+                                notify_post("Removable drive", "Safe to remove", NOTIFY_SUCCESS);
+                            else
+                                notify_post("Removable drive", "Eject failed", NOTIFY_ERROR);
+                            poll_volumes();
+                            fb_redraw();
+                        } else if (side_kind[i] == 6) {
+                            // Mounted, but its filesystem's file operations do
+                            // not exist. Say why rather than opening an empty
+                            // window.
+                            notify_post("Removable drive",
+                                        "This volume's filesystem is recognised but MayteraOS "
+                                        "cannot read files from it yet. You can still eject it.",
+                                        NOTIFY_WARNING);
+                        } else if (side_kind[i] == 3) {
                             // Enter the integrated Recycle Bin view.
                             g_in_recycle = 1; rb_load(); fb_redraw();
                         } else {
@@ -2467,11 +2941,9 @@ int main(int argc, char **argv) {
                         if (rb_count_selected()) rb_restore_selected();
                         fb_redraw();
                     } else if (rx >= RB_BTN_DELETE_X && rx < RB_BTN_DELETE_X + RB_BTN_DELETE_W) {
-                        if (rb_count_selected()) rb_delete_selected();
-                        fb_redraw();
+                        rb_confirm_delete_selected();
                     } else if (rx >= RB_BTN_EMPTY_X && rx < RB_BTN_EMPTY_X + RB_BTN_EMPTY_W) {
-                        if (rb_count) rb_empty();
-                        fb_redraw();
+                        rb_confirm_empty();
                     }
                     break;
                 }

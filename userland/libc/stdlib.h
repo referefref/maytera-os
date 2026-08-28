@@ -18,7 +18,21 @@ void *calloc(size_t nmemb, size_t size);
 void *realloc(void *ptr, size_t size);
 
 // Process control
+#define EXIT_SUCCESS 0
+#define EXIT_FAILURE 1
+
 void exit(int status) __attribute__((noreturn));
+
+// system(): ISO C command processor. MayteraOS has NO command processor a
+// program can hand a shell string to, and this reports that honestly rather
+// than pretending:
+//   system(NULL) returns 0, which is precisely the standard's way of saying
+//                "no command processor is available";
+//   system(cmd)  returns -1 with errno = ENOSYS.
+// A version that returned 0 for a command it never ran would make every caller
+// believe the command succeeded. Added for the Lua 5.4 port (local queue 91):
+// os.execute() calls this and reports the failure to the script.
+int system(const char *command);
 void abort(void) __attribute__((noreturn));
 int atexit(void (*func)(void));
 
@@ -84,6 +98,7 @@ long clock(void);
 
 // Environment (per-process, starts empty; round-trips within the process)
 extern char **environ;
+void  __libc_init_env(char **envp);   // #112: crt0 hands over the inherited block
 char *getenv(const char *name);
 int   setenv(const char *name, const char *value, int overwrite);
 int   unsetenv(const char *name);

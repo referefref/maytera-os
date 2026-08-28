@@ -237,6 +237,10 @@ const SZ_GFS_EDGE_VIEW: u32 = 48;
 // #739: diskimg_info_t (dos/diskimg.h), locked by a _Static_assert in
 // proc/syscall_argtab_lock.c.
 const SZ_DISKIMG_INFO: u32 = 288;
+// drag_info_t (proc/syscall.h), the SYS_DRAG_PEEK out-param. Locked by a
+// _Static_assert in proc/syscall_argtab_lock.c AND in both copies of the
+// struct (kernel + userland), because it is duplicated three ways.
+const SZ_DRAG_INFO: u32 = 104;
 const SZ_WM_WINDOW_INFO: u16 = 136;   // #44: + int maximized; #41: + char app_id[32] (locked by syscall_argtab_lock.c)
 const SZ_CRON_JOB: u16 = 128;
 const SZ_SC_USER_INFO: u16 = 140;
@@ -262,6 +266,9 @@ const SZ_K_SIGACTION: u32 = 40;
 // so a change to procinfo.h fails the build pointing at THIS table.
 // #745: net_status_t (proc/syscall.h), locked by its own _Static_assert there.
 const SZ_NET_STATUS: u32 = 48;
+// #238: fw_xfer_t = fw_config_t(104) + fw_stats_t(136). Locked by the
+// _Static_assert in proc/syscall.c.
+const SZ_FW_XFER: u32 = 240;
 const SZ_HANDLE_INFO: u16 = 112;
 const SZ_SVC_INFO: u16 = 80;
 const SZ_PROC_DETAIL: u32 = 112;
@@ -277,6 +284,22 @@ const CAP_SVCS: u16 = 32;
 const SZ_GUI_EVENT: u32 = 32;
 const SZ_NET_INFO: u32 = 88;
 const SZ_SC_DISK_INFO: u32 = 72;
+// #250 sc_volume_t. Locked by _Static_assert in proc/syscall.c.
+const SZ_SC_VOLUME: u16 = 136;
+// HOTPLUG_MAX_DEVICES (drivers/hotplug.h). sys_vol_list() clamps `max` to
+// this before writing, so ElemsClamped is the honest descriptor: validating
+// the caller's raw count would reject a legal call that asks for more rows
+// than the table can ever hold.
+// #234i: 16, not 8. sys_vol_list() now marshals TWO producers into one array
+// (up to HOTPLUG_MAX_DEVICES USB volumes plus up to DISKIMG_MAX_MOUNTS mounted
+// disk images) and clamps `max` to SC_VOL_MAX. A stale 8 here would prove the
+// caller's buffer for half the bytes the handler can write, which is a
+// validator that passes a call it should reject.
+const CAP_VOLUMES: u16 = 16;
+// #112 sc_spawn_req_t (proc/syscall.h): 5 pointers + 4 x i32, no padding at the
+// end on x86-64. Locked by a _Static_assert in proc/syscall.c, because a
+// silently stale size here validates fewer bytes than the handler copies.
+const SZ_SC_SPAWN_REQ: u32 = 56;
 const SZ_PRINTER_CFG: u16 = 172;
 // net/ipp.h PRINT_MAX_PRINTERS: print_list() cannot write more rows than the
 // static table has, so the clamp is real even though the handler's loop bound
@@ -288,6 +311,9 @@ const SZ_FONT_GLYPH_META: u32 = 20;
 // #745 aiguard_verdict_t: 5 x i32 + 48 + 64 + 64. Locked by _Static_assert in
 // kernel/security/aiguard.h and a const assert in rustkern/aiguard.rs.
 const SZ_AIGUARD_VERDICT: u32 = 196;
+/// (#182) sizeof(dos_fm_event_t). _Static_assert-locked in dos/dosexec.c AND in
+/// proc/syscall.c, so this number cannot drift away from the struct it sizes.
+const SZ_DOS_FM_EVENT: u16 = 16;
 // The bound sys_svc_control itself scans the name to is procinfo.h PI_NAME_MAX,
 // which this file ALREADY defines for the procinfo builders (see PI_NAME_MAX
 // above). Reused rather than restated: a second copy of the same number is a
@@ -315,6 +341,13 @@ static TAB: &[Desc] = &[
     Desc { num: 13, args: [NONE, ra(3), NONE, NONE, NONE, NONE] },
     // sys_stat_path((const char *)arg1, (void *)arg2) - arg2 is k_stat_t *.
     Desc { num: 15, args: [s(PATH_MAX), wf(SZ_K_STAT), NONE, NONE, NONE, NONE] },
+    // #120 sys_fstat((int)arg1, (void *)arg2) - arg1 is a SCALAR fd, arg2 is
+    // the same k_stat_t * as SYS_STAT above, fully written by the handler.
+    Desc { num: 101, args: [NONE, wf(SZ_K_STAT), NONE, NONE, NONE, NONE] },
+    // #115 sys_utime((const char *)arg1, (int64_t)arg2, (int64_t)arg3).
+    // arg2/arg3 are SCALAR epoch seconds, not pointers - deliberately, so this
+    // syscall adds no new user-memory struct to validate.
+    Desc { num: 387, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] },
     // sys_mkdir((const char *)arg1, (int)arg2)
     Desc { num: 16, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] },
     Desc { num: 17, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] }, // SYS_RMDIR
@@ -358,6 +391,11 @@ static TAB: &[Desc] = &[
     // --- gui / input ------------------------------------------------------
     // sys_win_create((const char *)arg1, x, y, w, h) - title string.
     Desc { num: 30, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] },
+    // #148 (local 164, 2026-08-18): sys_win_create_bg((const char *)arg1,
+    // x, y, w, h) - SYS_WIN_CREATE_BG, identical title-string pointer arg to
+    // num 30 above (sys_win_create_impl() is the shared body both call into),
+    // so the same descriptor shape applies.
+    Desc { num: 393, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] },
     // sys_win_draw_text(win, x, y, (const char *)arg4, colour)
     Desc { num: 33, args: [NONE, NONE, NONE, s(TEXT_MAX), NONE, NONE] },
     // sys_win_get_size((int)arg1, (int *)arg2, (int *)arg3)
@@ -465,6 +503,10 @@ static TAB: &[Desc] = &[
     Desc { num: 243, args: [wa(2), NONE, NONE, NONE, NONE, NONE] },
     // (#745) sys_net_status((net_status_t *)arg1) - fixed 48-byte write.
     Desc { num: 371, args: [wf(SZ_NET_STATUS), NONE, NONE, NONE, NONE, NONE] },
+    // (#238) sys_net_fw((int)arg1, (fw_xfer_t *)arg2) - fixed 240-byte
+    // read-write buffer for EVERY op, which is why the op is arg1 and not
+    // a second pointer shape.
+    Desc { num: 399, args: [NONE, wf(SZ_FW_XFER), NONE, NONE, NONE, NONE] },
     // sys_http_fetch_start((const char *)arg1)
     Desc { num: 255, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] },
     // sys_http_fetch_poll((int)arg1, (int *)arg2, (uint32_t *)arg3) - both optional.
@@ -476,6 +518,11 @@ static TAB: &[Desc] = &[
     // (#745) sys_ai_scan((const char *)arg1 text, (aiguard_verdict_t *)arg2 out).
     // arg1 is an arbitrary-length untrusted string, so TEXT_MAX; arg2 is a
     // fixed 196-byte write the handler always performs on a non-negative return.
+    // (#182) sys_dos_fm_events(dos_fm_event_t *buf, uint32_t max_events).
+    // arg2 is a COUNT of 16-byte events, clamped to the queue's own capacity so
+    // a caller cannot make the validated length enormous. wec, not we: the
+    // handler clamps to 1024 as well, and the two clamps agreeing is the point.
+    Desc { num: 377, args: [wec(2, SZ_DOS_FM_EVENT, 1024), NONE, NONE, NONE, NONE, NONE] },
     Desc { num: 383, args: [s(TEXT_MAX), wf(SZ_AIGUARD_VERDICT), NONE, NONE, NONE, NONE] },
     // sys_http_post_poll((int)arg1, (int *)arg2, (uint32_t *)arg3) - both optional.
     Desc { num: 266, args: [NONE, wf(4), wf(4), NONE, NONE, NONE] },
@@ -538,6 +585,30 @@ static TAB: &[Desc] = &[
     // sys_get_disk_info((int)arg1 idx, (void *)arg2) - zeroes then fills one
     // sc_disk_info_t unconditionally.
     Desc { num: 199, args: [NONE, wf(SZ_SC_DISK_INFO), NONE, NONE, NONE, NONE] },
+    // #250 sys_vol_list((void *)arg1 buf, (int)arg2 max) - writes at most
+    // min(arg2, SC_VOL_MAX) sc_volume_t records (#234i: SC_VOL_MAX, not
+    // HOTPLUG_MAX_DEVICES, since disk-image volumes joined the same list).
+    Desc { num: 283, args: [wec(2, SZ_SC_VOLUME, CAP_VOLUMES), NONE, NONE, NONE, NONE, NONE] },
+    // #250 sys_vol_eject((int)arg1) - no pointers at all. Declared anyway, so
+    // it is not in the syscall-ptr-lint debt ledger by omission.
+    Desc { num: 284, args: [NONE, NONE, NONE, NONE, NONE, NONE] },
+
+    // --- cross-window drag ("docking"), SYS_DRAG_* --------------------------
+    // sys_drag_begin(win, kind, payload=arg3, plen=arg4, label=arg5, llen=arg6).
+    // BOTH buffers are caller-sized reads, so both take their length from the
+    // arg that declares it. The Rust side additionally REFUSES an over-length
+    // payload rather than truncating; this descriptor is the separate,
+    // earlier proof that the declared range is actually readable user memory.
+    Desc { num: 401, args: [NONE, NONE, ra(4), NONE, ra(6), NONE] },
+    // sys_drag_peek(out=arg1) - writes exactly one drag_info_t, always.
+    Desc { num: 402, args: [wf(SZ_DRAG_INFO), NONE, NONE, NONE, NONE, NONE] },
+    // sys_drag_take(win, dst=arg2, cap=arg3) - writes min(payload_len, cap).
+    Desc { num: 403, args: [NONE, wa(3), NONE, NONE, NONE, NONE] },
+    // The remaining three take no pointers. Declared anyway so they are not in
+    // the syscall-ptr-lint debt ledger by omission, same as 284 above.
+    Desc { num: 404, args: [NONE, NONE, NONE, NONE, NONE, NONE] },
+    Desc { num: 405, args: [NONE, NONE, NONE, NONE, NONE, NONE] },
+    Desc { num: 406, args: [NONE, NONE, NONE, NONE, NONE, NONE] },
     // sys_print_list((void *)arg1, (int)arg2 max) -> print_list(), which writes
     // at most min(max, g_printer_count <= PRINT_MAX_PRINTERS) rows.
     Desc { num: 291, args: [wec(2, SZ_PRINTER_CFG, CAP_PRINTERS), NONE, NONE, NONE, NONE, NONE] },
@@ -660,6 +731,15 @@ static TAB: &[Desc] = &[
     Desc { num: 198, args: [s(PATH_MAX), NONE, NONE, NONE, NONE, NONE] },
     // sys_spawn_redir(path, argv, argc, (const char *)arg4 in, (const char *)arg5 out, append)
     Desc { num: 247, args: [s(PATH_MAX), NONE, NONE, s(PATH_MAX), s(PATH_MAX), NONE] },
+    // #112 sys_spawn_env((const sc_spawn_req_t *)arg1) - ONE pointer to a
+    // fixed-size request struct, read in full by copy_from_user(). The
+    // pointers INSIDE it (path, argv, envp, infile, outfile) are NOT covered
+    // by this descriptor and cannot be: a flat argtab cannot express a
+    // two-level deref. They are validated by the handler itself, in the order
+    // the comment on sys_spawn_env() states, and the paths go through
+    // sc_path_from_user() inside spawn_impl(). This entry's job is only to
+    // stop arg1 naming kernel memory.
+    Desc { num: 394, args: [rf(SZ_SC_SPAWN_REQ), NONE, NONE, NONE, NONE, NONE] },
 
     // --- ipc messaging ----------------------------------------------------
     // sys_msg_send((int)arg1, (const void *)arg2, (size_t)arg3) - READ of arg3.

@@ -6,20 +6,34 @@
 #include "../../libc/userconf.h"   // #745: <home>/APPS on PATH
 #include "../../libc/termios.h"
 #include "../../libc/aiclient.h"
+#include "../../libc/pipeline.h"   // #745 local 108: the ONE pipeline runner
+#include "../../libc/stdio.h"      // stderr: a pipeline's errors must not go
+                                   // into the pipe it failed to build
 
 // Shell limits
 #define MAX_LINE        1024
 #define MAX_ARGS        64
-#define MAX_PIPES       8
-#define MAX_ENV_VARS    64
-#define MAX_VAR_LEN     256
+// One definition: a pipeline's stage cap is the shared runner's cap. Two
+// numbers that must agree is a bug waiting for the day they do not.
+#define MAX_PIPES       MPIPE_MAX_STAGES
 #define PATH_MAX        512
 #define HISTORY_SIZE    64
 
-// Environment variable storage
-static char env_keys[MAX_ENV_VARS][64];
-static char env_vals[MAX_ENV_VARS][MAX_VAR_LEN];
-static int env_count = 0;
+// #112: THE SHELL'S ENVIRONMENT IS THE PROCESS'S ENVIRONMENT NOW.
+//
+// This used to be a private 64 x (64 + 256) table, and it was a FORKED COPY of
+// a primitive libc already had. That mattered for one reason: `export FOO=bar`
+// wrote into this table, the table was never carried across a spawn, and the
+// child therefore never saw FOO. The shell reported success and the variable
+// went nowhere, which is the exact defect #112 is about, one layer up from the
+// kernel.
+//
+// The storage is gone. env_get/env_set/env_unset below are now three-line
+// adapters over getenv/setenv/unsetenv, so what `export` writes is the same
+// `environ` that libc's spawn wrappers hand to the kernel. MAX_ENV_VARS and
+// MAX_VAR_LEN are gone with it: libc mallocs each entry, and the real caps are
+// the kernel block's (64 entries, 511 bytes each), enforced where the block is
+// actually built rather than restated here.
 
 // Current working directory
 static char cwd[PATH_MAX] = "/";
@@ -172,37 +186,15 @@ static int expand_history(const char *in, char *out, int max) {
 // ============================================================================
 
 static const char *env_get(const char *key) {
-    for (int i = 0; i < env_count; i++) {
-        if (str_eq(env_keys[i], key)) return env_vals[i];
-    }
-    return NULL;
+    return getenv(key);
 }
 
 static void env_set(const char *key, const char *value) {
-    for (int i = 0; i < env_count; i++) {
-        if (str_eq(env_keys[i], key)) {
-            str_copy(env_vals[i], value, MAX_VAR_LEN);
-            return;
-        }
-    }
-    if (env_count < MAX_ENV_VARS) {
-        str_copy(env_keys[env_count], key, 64);
-        str_copy(env_vals[env_count], value, MAX_VAR_LEN);
-        env_count++;
-    }
+    setenv(key, value, 1);
 }
 
 static void env_unset(const char *key) {
-    for (int i = 0; i < env_count; i++) {
-        if (str_eq(env_keys[i], key)) {
-            env_count--;
-            if (i < env_count) {
-                str_copy(env_keys[i], env_keys[env_count], 64);
-                str_copy(env_vals[i], env_vals[env_count], MAX_VAR_LEN);
-            }
-            return;
-        }
-    }
+    unsetenv(key);
 }
 
 static void env_init(void) {
@@ -454,9 +446,10 @@ static int builtin_unset(command_t *cmd) {
 }
 
 static int builtin_env(void) {
-    for (int i = 0; i < env_count; i++) {
-        printf("%s=%s\n", env_keys[i], env_vals[i]);
-    }
+    // The real environment, in the order libc holds it. Before #112 this
+    // printed a table that only this process could see.
+    if (!environ) return 0;
+    for (int i = 0; environ[i]; i++) printf("%s\n", environ[i]);
     return 0;
 }
 
@@ -497,22 +490,64 @@ static int builtin_screenshot(command_t *cmd) {
 // Forward declarations for scripting support
 static int execute_line(char *line);
 
+// #745 local 108: ONE builtin table, looked up by id.
+//
+// This used to be a chain of str_eq() calls inside try_builtin(). A pipeline
+// has to ask "is this stage a builtin?" BEFORE it decides whether to spawn it,
+// and answering that with a SECOND list of the same names is how two lists
+// drift apart. builtin_id() is the only place the names live; try_builtin()
+// and the pipeline runner both go through it.
+enum {
+    BI_NONE = 0, BI_CD, BI_EXPORT, BI_UNSET, BI_ENV, BI_PWD, BI_EXIT,
+    BI_HISTORY, BI_SCREENSHOT, BI_TRUE, BI_FALSE
+};
+
+static int builtin_id(const command_t *cmd) {
+    if (cmd->argc == 0) return BI_NONE;
+    const char *name = cmd->args[0];
+    if (str_eq(name, "cd"))         return BI_CD;
+    if (str_eq(name, "export"))     return BI_EXPORT;
+    if (str_eq(name, "unset"))      return BI_UNSET;
+    // #745 local 108: `env` is a builtin ONLY with no arguments, where it
+    // prints this shell's own variable table. With arguments it must reach
+    // /APPS/ENV: the old builtin ignored argv entirely, so `env FOO=bar prog`
+    // printed the shell's table and exited 0 without running prog - the same
+    // silent-wrong-answer shape /APPS/ENV itself had.
+    if (str_eq(name, "env") && cmd->argc == 1) return BI_ENV;
+    if (str_eq(name, "pwd"))        return BI_PWD;
+    if (str_eq(name, "exit"))       return BI_EXIT;
+    if (str_eq(name, "history"))    return BI_HISTORY;
+    if (str_eq(name, "screenshot")) return BI_SCREENSHOT;
+    if (str_eq(name, "true"))       return BI_TRUE;
+    if (str_eq(name, "false"))      return BI_FALSE;
+    return BI_NONE;
+}
+
+// Run a builtin and return its exit status. stdout is whatever the caller has
+// pointed fd 1 at, which is how a builtin works as a pipeline stage.
+static int run_builtin(int id, command_t *cmd) {
+    switch (id) {
+        case BI_CD:         return builtin_cd(cmd);
+        case BI_EXPORT:     return builtin_export(cmd);
+        case BI_UNSET:      return builtin_unset(cmd);
+        case BI_ENV:        return builtin_env();
+        case BI_PWD:        return builtin_pwd();
+        case BI_EXIT:       return builtin_exit(cmd);
+        case BI_HISTORY:    builtin_history(); return 0;
+        case BI_SCREENSHOT: return builtin_screenshot(cmd);
+        case BI_TRUE:       return 0;
+        case BI_FALSE:      return 1;
+        default:            return 0;
+    }
+}
+
 // Check if command is a builtin; returns 1 if handled, 0 if not
 static int try_builtin(command_t *cmd) {
     if (cmd->argc == 0) return 1;
-
-    const char *name = cmd->args[0];
-    if (str_eq(name, "cd"))       { last_status = builtin_cd(cmd); return 1; }
-    if (str_eq(name, "export"))   { last_status = builtin_export(cmd); return 1; }
-    if (str_eq(name, "unset"))    { last_status = builtin_unset(cmd); return 1; }
-    if (str_eq(name, "env"))      { last_status = builtin_env(); return 1; }
-    if (str_eq(name, "pwd"))      { last_status = builtin_pwd(); return 1; }
-    if (str_eq(name, "exit"))     { last_status = builtin_exit(cmd); return 1; }
-    if (str_eq(name, "history"))  { builtin_history(); last_status = 0; return 1; }
-    if (str_eq(name, "screenshot")) { last_status = builtin_screenshot(cmd); return 1; }
-    if (str_eq(name, "true"))     { last_status = 0; return 1; }
-    if (str_eq(name, "false"))    { last_status = 1; return 1; }
-    return 0;
+    int id = builtin_id(cmd);
+    if (id == BI_NONE) return 0;
+    last_status = run_builtin(id, cmd);
+    return 1;
 }
 
 // ============================================================================
@@ -704,6 +739,152 @@ static void execute_external(command_t *cmd) {
     int status = 0;
     sys_waitpid(pid, &status, 0);
     last_status = status;
+}
+
+// ============================================================================
+// Pipelines (#745 local 108)
+//
+// WHAT THIS REPLACED. execute_pipeline() split the line on '|' and then ran
+// the stages SEQUENTIALLY AND UNCONNECTED, with the comment "run sequentially
+// for now (proper pipe fds need kernel pipe support)". `ls | wc -l` printed
+// the listing and then blocked reading the terminal, exit 0. The premise in
+// that comment had been false for a long time: kernel/fs/pipe.c is a real
+// 64 KB ring with a blocking read and a proper EOF, SYS_PIPE/SYS_DUP2 are
+// dispatched, and spawn_impl() gives the child the caller's fds[0..2]. The
+// Terminal app had been running two-stage pipelines on exactly that mechanism.
+//
+// So this does not invent a mechanism; it calls the shared one. The Terminal's
+// working implementation moved into userland/libc/pipeline.c, grew N stages,
+// and both programs now go through mpipe_run(). See pipeline.h for the two
+// kernel gaps that remain (no blocking write, no SIGPIPE).
+//
+// A BUILTIN stage runs in this process, because there is no fork() here. That
+// is a real semantic difference from a POSIX shell (`cd` in a pipeline changes
+// the shell's directory) and is documented rather than hidden.
+// ============================================================================
+
+static char *strip(char *s);   // defined with the scripting helpers below
+
+static command_t  g_pl_cmd[MAX_PIPES];
+static char       g_pl_path[MAX_PIPES][PATH_MAX];
+static char      *g_pl_argv[MAX_PIPES][MAX_ARGS + 1];
+
+static int pipeline_builtin_thunk(void *ctx) {
+    command_t *c = (command_t *)ctx;
+    int rc = run_builtin(builtin_id(c), c);
+    // The stdout stream is line-buffered whenever fd 1 is not a tty, which is
+    // exactly the case here: fd 1 is a pipe. Anything still in the buffer when
+    // mpipe_run() puts fd 1 back would be flushed into the RESTORED
+    // destination, i.e. into the terminal instead of into the next stage.
+    fflush(stdout);
+    return rc;
+}
+
+// Does LINE contain a '|' outside quotes? Cheap enough to ask of every line.
+static int has_pipe(const char *s) {
+    int sq = 0, dq = 0;
+    for (; *s; s++) {
+        if (*s == '\'' && !dq) sq = !sq;
+        else if (*s == '"' && !sq) dq = !dq;
+        else if (*s == '|' && !sq && !dq) return 1;
+    }
+    return 0;
+}
+
+// Execute "a | b | c". Returns the exit status of the LAST stage, as POSIX
+// specifies, or a non-zero status after reporting a failure on stderr.
+//
+// Every stage is parsed and RESOLVED before a single descriptor is touched, so
+// that "command not found" cannot be written into the pipe instead of to the
+// user. That ordering is deliberate.
+static int run_pipeline(char *line) {
+    char *segments[MAX_PIPES + 1];
+    mpipe_stage_t st[MAX_PIPES];
+    int statuses[MAX_PIPES];
+    int seg_count = 0;
+    int sq = 0, dq = 0;
+    char *p = line;
+
+    // Anything already buffered belongs to the CURRENT fd 1, not to the pipe
+    // we are about to point it at.
+    fflush(stdout);
+
+    segments[seg_count++] = p;
+    for (; *p; p++) {
+        if (*p == '\'' && !dq) sq = !sq;
+        else if (*p == '"' && !sq) dq = !dq;
+        else if (*p == '|' && !sq && !dq) {
+            if (seg_count >= MAX_PIPES) {
+                fprintf(stderr, "msh: too many pipeline stages (max %d)\n", MAX_PIPES);
+                return (last_status = 2);
+            }
+            *p = '\0';
+            segments[seg_count++] = p + 1;
+        }
+    }
+
+    for (int i = 0; i < seg_count; i++) {
+        char *seg = strip(segments[i]);
+        command_t *c = &g_pl_cmd[i];
+
+        st[i].path = 0; st[i].argv = 0; st[i].argc = 0;
+        st[i].infile = 0; st[i].outfile = 0; st[i].append = 0;
+        st[i].builtin = 0; st[i].builtin_ctx = 0;
+        statuses[i] = -1;
+
+        if (parse_command(seg, c) <= 0) {
+            // An empty stage is `a || b`, a trailing '|', or a leading one.
+            // A shell that silently runs the non-empty half of that is
+            // guessing at what was meant.
+            fprintf(stderr, "msh: syntax error near unexpected token `|'\n");
+            return (last_status = 2);
+        }
+
+        int bid = builtin_id(c);
+        if (bid != BI_NONE) {
+            if (c->infile || c->outfile) {
+                // mpipe_run() expresses a per-stage redirection through
+                // sys_spawn_redir, which only exists for a SPAWNED stage.
+                // Accepting it here and ignoring it is the defect this ticket
+                // is about, so it is refused instead.
+                fprintf(stderr, "msh: %s: redirection on a builtin inside a pipeline "
+                                "is not implemented\n", c->args[0]);
+                return (last_status = 2);
+            }
+            st[i].builtin = pipeline_builtin_thunk;
+            st[i].builtin_ctx = c;
+            continue;
+        }
+
+        expand_globs(c);
+        if (resolve_path(c->args[0], g_pl_path[i], PATH_MAX) != 0) {
+            fprintf(stderr, "msh: %s: command not found\n", c->args[0]);
+            return (last_status = 127);
+        }
+        g_pl_argv[i][0] = g_pl_path[i];
+        for (int k = 1; k < c->argc; k++) g_pl_argv[i][k] = c->args[k];
+        g_pl_argv[i][c->argc] = 0;
+
+        st[i].path   = g_pl_path[i];
+        st[i].argv   = g_pl_argv[i];
+        st[i].argc   = c->argc;
+        st[i].infile = c->infile;
+        st[i].outfile= c->outfile;
+        st[i].append = c->append;
+    }
+
+    if (seg_count == 1) {
+        // Not a pipeline after all (has_pipe() gates this, so this is only
+        // reachable if a caller asks for it directly).
+        if (st[0].builtin) return (last_status = run_builtin(builtin_id(&g_pl_cmd[0]), &g_pl_cmd[0]));
+    }
+
+    int rc = mpipe_run(st, seg_count, -1, -1, statuses);
+    if (rc < 0) {
+        fprintf(stderr, "msh: pipeline: %s\n", mpipe_error());
+        return (last_status = 1);
+    }
+    return (last_status = rc);
 }
 
 // ============================================================================
@@ -984,7 +1165,51 @@ static int execute_line(char *line) {
 // Execute a simple (non-compound) line
 static int execute_simple_line(char *line) {
     command_t cmd;
-    if (parse_command(line, &cmd) <= 0) return 0;
+
+    // #745 local 108: a pipeline is decided HERE rather than above execute_line(),
+    // which is where the old execute_pipeline() sat. Splitting on '|' before
+    // splitting on ';' meant `a | b; c` was cut into "a" and "b; c" and the
+    // whole compound-statement layer (if/while/for) could never contain a
+    // pipeline at all. Asking at the simple-command level makes both work.
+    if (has_pipe(line)) return run_pipeline(line);
+
+    if (parse_command(line, &cmd) <= 0) {
+        // #745 local 109: A REDIRECTION WITH NO COMMAND IS A COMMAND.
+        // `> file` is one of the most reflexive things anyone types at a
+        // shell, and this line used to throw the whole parse away whenever
+        // argc was 0 - the redirection had already been parsed into
+        // cmd.outfile and was then discarded, so the shell silently did
+        // nothing at all. There is no kernel defect behind it: O_TRUNC empties
+        // a file correctly on both filesystems (measured, #745 local 109); the
+        // shell simply never asked.
+        //
+        // POSIX: the redirections of a command with no words are still
+        // performed, in order, in a subshell environment. That is exactly an
+        // open() and a close() here.
+        if (cmd.outfile && cmd.outfile[0]) {
+            int fd = open(cmd.outfile,
+                          O_WRONLY | O_CREAT | (cmd.append ? O_APPEND : O_TRUNC),
+                          0644);
+            if (fd < 0) {
+                fprintf(stderr, "msh: %s: cannot open\n", cmd.outfile);
+                return (last_status = 1);
+            }
+            close(fd);
+        }
+        if (cmd.infile && cmd.infile[0]) {
+            // `< file` performs the redirection too, which for a command with
+            // no words means only that the file must be openable. Reporting
+            // that is the whole observable effect.
+            int fd = open(cmd.infile, O_RDONLY, 0);
+            if (fd < 0) {
+                fprintf(stderr, "msh: %s: No such file or directory\n", cmd.infile);
+                return (last_status = 1);
+            }
+            close(fd);
+        }
+        if (cmd.outfile || cmd.infile) return (last_status = 0);
+        return 0;
+    }
 
     // Try builtins first
     if (try_builtin(&cmd)) return last_status;
@@ -992,41 +1217,6 @@ static int execute_simple_line(char *line) {
     // External command
     execute_external(&cmd);
     return last_status;
-}
-
-// ============================================================================
-// Pipeline execution
-// ============================================================================
-
-static void execute_pipeline(char *line) {
-    // Split by '|' (not inside quotes)
-    char *segments[MAX_PIPES + 1];
-    int seg_count = 0;
-
-    char *p = line;
-    segments[seg_count++] = p;
-    while (*p) {
-        if (*p == '|') {
-            *p = '\0';
-            p++;
-            if (seg_count < MAX_PIPES + 1) {
-                segments[seg_count++] = p;
-            }
-        } else {
-            p++;
-        }
-    }
-
-    if (seg_count == 1) {
-        execute_line(segments[0]);
-        return;
-    }
-
-    // Multi-stage pipeline: run sequentially for now
-    // (proper pipe fds need kernel pipe support)
-    for (int i = 0; i < seg_count; i++) {
-        execute_line(segments[i]);
-    }
 }
 
 // ============================================================================
@@ -1261,9 +1451,39 @@ static void ai_handle(const char *rest) {
 }
 
 int main(int argc, char **argv) {
-    (void)argc; (void)argv;
-
     env_init();
+
+    // #745 local 108: `msh -c '<line>'`. Two reasons it exists.
+    //
+    //  1. It is how a pipeline can be VERIFIED. msh's line editor reads a tty;
+    //     with stdin redirected from a file, getchar() finds no termios on fd 0
+    //     and falls back to the kernel's global keyboard buffer (see
+    //     userland/libc/stdio.c), so a script file is not a way in. Without -c
+    //     the only way to drive this shell is to type at it.
+    //  2. It is the shape every caller already expects (`sh -c`), including
+    //     libc's system(), which today refuses honestly because no command
+    //     processor could be handed a string. Wiring system() to this is a
+    //     separate change and is NOT done here.
+    //
+    // It runs ONE line, with the same variable expansion and the same
+    // execute_line() the interactive loop uses, and exits with its status.
+    if (argc >= 2 && str_eq(argv[1], "-c")) {
+        char cline[MAX_LINE], cexp[MAX_LINE];
+        if (argc < 3) {
+            fprintf(stderr, "msh: -c: option requires an argument\n");
+            return 2;
+        }
+        str_copy(cline, argv[2], MAX_LINE);
+        expand_variables(cline, cexp, MAX_LINE);
+        execute_line(cexp);
+        return last_status;
+    }
+    if (argc >= 2) {
+        // A script-file operand would be the obvious next thing and is NOT
+        // implemented. Saying so beats treating the argument as noise.
+        fprintf(stderr, "msh: %s: script files are not implemented; use -c '<line>'\n", argv[1]);
+        return 2;
+    }
 
     printf("\033[1;36mMayteraOS Shell (msh)\033[0m\n");
     printf("Type 'exit' to quit.\n\n");
@@ -1299,8 +1519,9 @@ int main(int argc, char **argv) {
         // Expand variables
         expand_variables(line, expanded, MAX_LINE);
 
-        // Execute
-        execute_pipeline(expanded);
+        // Execute. execute_line() splits on ';' and handles the compound
+        // statements; a pipeline is recognised inside it, per simple command.
+        execute_line(expanded);
     }
 
     return last_status;

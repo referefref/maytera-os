@@ -9,21 +9,35 @@ upstream 3.11.9 and is not vendored here.
 |---|---|
 | `src-cpython/` | `mos_pymain.c` (the MayteraOS launcher: sys.path onto the ext2 root, script-from-disk execution, kernel-CSPRNG hash randomisation), `compat.c` and `misc.c` (trimmed supplements standing in for POSIX pieces we do not have) |
 | `src-libc/` | The libc additions CPython forced: `posixextra.c`, real `errno.c/.h`, plus the headers CPython expects (`unistd.h`, `stdlib.h`, `time.h`, `inttypes.h`, `sys/time.h`, `sys/types.h`) |
-| `src-kernel/` | The kernel-side `syscall.c/.h` state this port was built against |
+| `src-kernel/` | The kernel-side `syscall.c/.h` state this port was built against. **Version at that time: MayteraOS 1.95.0, kernel build 686.** |
 | `diffs/` | The five diffs against libc and the kernel, kept so the delta is legible rather than having to be re-derived by comparison |
 | `scripts/relink.sh` | The exact link recipe that produced the shipping binary |
 
 ## Why this is here
 
-The port existed only under a `cpython-port-phase2-golden` directory on one build
+The port existed only under `<workspace>` on one build
 container. The 5.1 MB `PYTHON` binary shipped, but nothing that could rebuild
 it was under version control, so "we have a working Python 3" was true only for
 as long as that container survived. Same shape as the browser engine, fixed the
 same way: commit what is ours, record how to fetch what is not.
 
+### A note on `src-kernel/`
+
+These files are a VERBATIM SNAPSHOT of `kernel/proc/`, kept for provenance. They
+are not a build input and cannot be one: `syscall.c` still carries its original
+`#include "../gui/image.h"`, `"../serial.h"`, `"../cpu/gdt.h"` and a dozen more
+relative includes that resolve to nothing from this directory.
+
+The same copy once brought a whole `version.h` along with it. That made a SIXTH
+definition of `MAYTERA_VERSION_STRING` in the tree, which somebody then had to
+hand-sync on every version bump, and which had already fallen out of step with
+its own MAJOR/MINOR/PATCH triple. It is deleted; the one fact it carried is the
+version number recorded in the table above, and `build/version-gate.sh` now
+fails the build if any second definition comes back (#745, local 106).
+
 ## What is NOT here
 
-- **CPython 3.11.9 itself** (a `cpython-port` working directory, 467 MB): upstream source
+- **CPython 3.11.9 itself** (`<workspace>`, 467 MB): upstream source
   plus its build tree, re-downloadable from python.org.
 - **`libpython3.11.a` and the four supplement archives** (`libpymath_supp.a`,
   `libwcharsupp.a`, `libmiscsupp.a`, `libcompatsupp.a`): build outputs.

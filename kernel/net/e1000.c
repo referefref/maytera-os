@@ -496,3 +496,13 @@ void e1000_exit_crash_context(void) {
 int e1000_is_safe(void) {
     return e1000_can_access_mmio();
 }
+
+// #NETDROP: is the driver currently quiesced by the crash handler? This exists
+// so the condition is REPORTABLE. While the flag is set, e1000_link_up()
+// returns 0 for a NIC whose link is physically up, and the diagnostic line
+// printed "NO-CARRIER" - a false statement about the cable that sent an
+// investigation after DHCP leases and switch ports while the actual cause was
+// a crashed application. A driver that has switched itself off must SAY so.
+int e1000_crash_context_active(void) {
+    return e1000_in_crash_context ? 1 : 0;
+}

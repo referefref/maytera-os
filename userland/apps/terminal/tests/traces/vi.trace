@@ -1,0 +1,464 @@
+Script started on 2026-08-26 08:17:36+00:00 [COMMAND="vi /tmp/vifile.txt" <not executed on terminal>]
+bash: warning: setlocale: LC_ALL: cannot change locale (en_US.UTF-8)
+[1;24r[27m[24m[m[H[J[?25l[?1c[24;1H"/tmp/vifile.txt" 400 lines, 27600 bytes[1;1Hline 1    the quick brown fox jumps over the lazy dog and back again
+line 2    the quick brown fox jumps over the lazy dog and back again
+line 3    the quick brown fox jumps over the lazy dog and back again
+line 4    the quick brown fox jumps over the lazy dog and back again
+line 5    the quick brown fox jumps over the lazy dog and back again
+line 6    the quick brown fox jumps over the lazy dog and back again
+line 7    the quick brown fox jumps over the lazy dog and back again
+line 8    the quick brown fox jumps over the lazy dog and back again
+line 9    the quick brown fox jumps over the lazy dog and back again
+line 10   the quick brown fox jumps over the lazy dog and back again
+line 11   the quick brown fox jumps over the lazy dog and back again
+line 12   the quick brown fox jumps over the lazy dog and back again
+line 13   the quick brown fox jumps over the lazy dog and back again
+line 14   the quick brown fox jumps over the lazy dog and back again
+line 15   the quick brown fox jumps over the lazy dog and back again
+line 16   the quick brown fox jumps over the lazy dog and back again
+line 17   the quick brown fox jumps over the lazy dog and back again
+line 18   the quick brown fox jumps over the lazy dog and back again
+line 19   the quick brown fox jumps over the lazy dog and back again
+line 20   the quick brown fox jumps over the lazy dog and back again
+line 21   the quick brown fox jumps over the lazy dog and back again
+line 22   the quick brown fox jumps over the lazy dog and back again
+line 23   the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1cline 378[2;6H379[3;7H80[4;6H381[5;6H382[6;6H383[7;6H384[8;6H385[9;6H386[10;6H387[11;6H388[12;6H389[13;6H390[14;6H391[15;6H392[16;6H393[17;6H394[18;6H395[19;6H396[20;6H397[21;6H398[22;6H399[23;6H400[?25h[?0c[?25l[?1c[1;6H1  [2;6H2  [3;7H  [4;6H4  [5;6H5  [6;6H6  [7;6H7  [8;6H8  [9;6H9  [10;6H10 [11;6H11 [12;6H12 [13;6H13 [14;6H14 [15;6H15 [16;6H16 [17;6H17 [18;6H18 [19;6H19 [20;6H20 [21;6H21 [22;6H22 [23;6H23 [1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 22   the quick brown fox jumps over the lazy dog and back again
+line 23   the quick brown fox jumps over the lazy dog and back again
+line 24   the quick brown fox jumps over the lazy dog and back again
+line 25   the quick brown fox jumps over the lazy dog and back again
+line 26   the quick brown fox jumps over the lazy dog and back again
+line 27   the quick brown fox jumps over the lazy dog and back again
+line 28   the quick brown fox jumps over the lazy dog and back again
+line 29   the quick brown fox jumps over the lazy dog and back again
+line 30   the quick brown fox jumps over the lazy dog and back again
+line 31   the quick brown fox jumps over the lazy dog and back again
+line 32   the quick brown fox jumps over the lazy dog and back again
+line 33   the quick brown fox jumps over the lazy dog and back again
+line 34   the quick brown fox jumps over the lazy dog and back again
+line 35   the quick brown fox jumps over the lazy dog and back again
+line 36   the quick brown fox jumps over the lazy dog and back again
+line 37   the quick brown fox jumps over the lazy dog and back again
+line 38   the quick brown fox jumps over the lazy dog and back again
+line 39   the quick brown fox jumps over the lazy dog and back again
+line 40   the quick brown fox jumps over the lazy dog and back again
+line 41   the quick brown fox jumps over the lazy dog and back again
+line 42   the quick brown fox jumps over the lazy dog and back again
+line 43   the quick brown fox jumps over the lazy dog and back again
+line 44   the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 43   the quick brown fox jumps over the lazy dog and back again
+line 44   the quick brown fox jumps over the lazy dog and back again
+line 45   the quick brown fox jumps over the lazy dog and back again
+line 46   the quick brown fox jumps over the lazy dog and back again
+line 47   the quick brown fox jumps over the lazy dog and back again
+line 48   the quick brown fox jumps over the lazy dog and back again
+line 49   the quick brown fox jumps over the lazy dog and back again
+line 50   the quick brown fox jumps over the lazy dog and back again
+line 51   the quick brown fox jumps over the lazy dog and back again
+line 52   the quick brown fox jumps over the lazy dog and back again
+line 53   the quick brown fox jumps over the lazy dog and back again
+line 54   the quick brown fox jumps over the lazy dog and back again
+line 55   the quick brown fox jumps over the lazy dog and back again
+line 56   the quick brown fox jumps over the lazy dog and back again
+line 57   the quick brown fox jumps over the lazy dog and back again
+line 58   the quick brown fox jumps over the lazy dog and back again
+line 59   the quick brown fox jumps over the lazy dog and back again
+line 60   the quick brown fox jumps over the lazy dog and back again
+line 61   the quick brown fox jumps over the lazy dog and back again
+line 62   the quick brown fox jumps over the lazy dog and back again
+line 63   the quick brown fox jumps over the lazy dog and back again
+line 64   the quick brown fox jumps over the lazy dog and back again
+line 65   the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 64   the quick brown fox jumps over the lazy dog and back again
+line 65   the quick brown fox jumps over the lazy dog and back again
+line 66   the quick brown fox jumps over the lazy dog and back again
+line 67   the quick brown fox jumps over the lazy dog and back again
+line 68   the quick brown fox jumps over the lazy dog and back again
+line 69   the quick brown fox jumps over the lazy dog and back again
+line 70   the quick brown fox jumps over the lazy dog and back again
+line 71   the quick brown fox jumps over the lazy dog and back again
+line 72   the quick brown fox jumps over the lazy dog and back again
+line 73   the quick brown fox jumps over the lazy dog and back again
+line 74   the quick brown fox jumps over the lazy dog and back again
+line 75   the quick brown fox jumps over the lazy dog and back again
+line 76   the quick brown fox jumps over the lazy dog and back again
+line 77   the quick brown fox jumps over the lazy dog and back again
+line 78   the quick brown fox jumps over the lazy dog and back again
+line 79   the quick brown fox jumps over the lazy dog and back again
+line 80   the quick brown fox jumps over the lazy dog and back again
+line 81   the quick brown fox jumps over the lazy dog and back again
+line 82   the quick brown fox jumps over the lazy dog and back again
+line 83   the quick brown fox jumps over the lazy dog and back again
+line 84   the quick brown fox jumps over the lazy dog and back again
+line 85   the quick brown fox jumps over the lazy dog and back again
+line 86   the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 85   the quick brown fox jumps over the lazy dog and back again
+line 86   the quick brown fox jumps over the lazy dog and back again
+line 87   the quick brown fox jumps over the lazy dog and back again
+line 88   the quick brown fox jumps over the lazy dog and back again
+line 89   the quick brown fox jumps over the lazy dog and back again
+line 90   the quick brown fox jumps over the lazy dog and back again
+line 91   the quick brown fox jumps over the lazy dog and back again
+line 92   the quick brown fox jumps over the lazy dog and back again
+line 93   the quick brown fox jumps over the lazy dog and back again
+line 94   the quick brown fox jumps over the lazy dog and back again
+line 95   the quick brown fox jumps over the lazy dog and back again
+line 96   the quick brown fox jumps over the lazy dog and back again
+line 97   the quick brown fox jumps over the lazy dog and back again
+line 98   the quick brown fox jumps over the lazy dog and back again
+line 99   the quick brown fox jumps over the lazy dog and back again
+line 100  the quick brown fox jumps over the lazy dog and back again
+line 101  the quick brown fox jumps over the lazy dog and back again
+line 102  the quick brown fox jumps over the lazy dog and back again
+line 103  the quick brown fox jumps over the lazy dog and back again
+line 104  the quick brown fox jumps over the lazy dog and back again
+line 105  the quick brown fox jumps over the lazy dog and back again
+line 106  the quick brown fox jumps over the lazy dog and back again
+line 107  the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 106  the quick brown fox jumps over the lazy dog and back again
+line 107  the quick brown fox jumps over the lazy dog and back again
+line 108  the quick brown fox jumps over the lazy dog and back again
+line 109  the quick brown fox jumps over the lazy dog and back again
+line 110  the quick brown fox jumps over the lazy dog and back again
+line 111  the quick brown fox jumps over the lazy dog and back again
+line 112  the quick brown fox jumps over the lazy dog and back again
+line 113  the quick brown fox jumps over the lazy dog and back again
+line 114  the quick brown fox jumps over the lazy dog and back again
+line 115  the quick brown fox jumps over the lazy dog and back again
+line 116  the quick brown fox jumps over the lazy dog and back again
+line 117  the quick brown fox jumps over the lazy dog and back again
+line 118  the quick brown fox jumps over the lazy dog and back again
+line 119  the quick brown fox jumps over the lazy dog and back again
+line 120  the quick brown fox jumps over the lazy dog and back again
+line 121  the quick brown fox jumps over the lazy dog and back again
+line 122  the quick brown fox jumps over the lazy dog and back again
+line 123  the quick brown fox jumps over the lazy dog and back again
+line 124  the quick brown fox jumps over the lazy dog and back again
+line 125  the quick brown fox jumps over the lazy dog and back again
+line 126  the quick brown fox jumps over the lazy dog and back again
+line 127  the quick brown fox jumps over the lazy dog and back again
+line 128  the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 127  the quick brown fox jumps over the lazy dog and back again
+line 128  the quick brown fox jumps over the lazy dog and back again
+line 129  the quick brown fox jumps over the lazy dog and back again
+line 130  the quick brown fox jumps over the lazy dog and back again
+line 131  the quick brown fox jumps over the lazy dog and back again
+line 132  the quick brown fox jumps over the lazy dog and back again
+line 133  the quick brown fox jumps over the lazy dog and back again
+line 134  the quick brown fox jumps over the lazy dog and back again
+line 135  the quick brown fox jumps over the lazy dog and back again
+line 136  the quick brown fox jumps over the lazy dog and back again
+line 137  the quick brown fox jumps over the lazy dog and back again
+line 138  the quick brown fox jumps over the lazy dog and back again
+line 139  the quick brown fox jumps over the lazy dog and back again
+line 140  the quick brown fox jumps over the lazy dog and back again
+line 141  the quick brown fox jumps over the lazy dog and back again
+line 142  the quick brown fox jumps over the lazy dog and back again
+line 143  the quick brown fox jumps over the lazy dog and back again
+line 144  the quick brown fox jumps over the lazy dog and back again
+line 145  the quick brown fox jumps over the lazy dog and back again
+line 146  the quick brown fox jumps over the lazy dog and back again
+line 147  the quick brown fox jumps over the lazy dog and back again
+line 148  the quick brown fox jumps over the lazy dog and back again
+line 149  the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 148  the quick brown fox jumps over the lazy dog and back again
+line 149  the quick brown fox jumps over the lazy dog and back again
+line 150  the quick brown fox jumps over the lazy dog and back again
+line 151  the quick brown fox jumps over the lazy dog and back again
+line 152  the quick brown fox jumps over the lazy dog and back again
+line 153  the quick brown fox jumps over the lazy dog and back again
+line 154  the quick brown fox jumps over the lazy dog and back again
+line 155  the quick brown fox jumps over the lazy dog and back again
+line 156  the quick brown fox jumps over the lazy dog and back again
+line 157  the quick brown fox jumps over the lazy dog and back again
+line 158  the quick brown fox jumps over the lazy dog and back again
+line 159  the quick brown fox jumps over the lazy dog and back again
+line 160  the quick brown fox jumps over the lazy dog and back again
+line 161  the quick brown fox jumps over the lazy dog and back again
+line 162  the quick brown fox jumps over the lazy dog and back again
+line 163  the quick brown fox jumps over the lazy dog and back again
+line 164  the quick brown fox jumps over the lazy dog and back again
+line 165  the quick brown fox jumps over the lazy dog and back again
+line 166  the quick brown fox jumps over the lazy dog and back again
+line 167  the quick brown fox jumps over the lazy dog and back again
+line 168  the quick brown fox jumps over the lazy dog and back again
+line 169  the quick brown fox jumps over the lazy dog and back again
+line 170  the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 169  the quick brown fox jumps over the lazy dog and back again
+line 170  the quick brown fox jumps over the lazy dog and back again
+line 171  the quick brown fox jumps over the lazy dog and back again
+line 172  the quick brown fox jumps over the lazy dog and back again
+line 173  the quick brown fox jumps over the lazy dog and back again
+line 174  the quick brown fox jumps over the lazy dog and back again
+line 175  the quick brown fox jumps over the lazy dog and back again
+line 176  the quick brown fox jumps over the lazy dog and back again
+line 177  the quick brown fox jumps over the lazy dog and back again
+line 178  the quick brown fox jumps over the lazy dog and back again
+line 179  the quick brown fox jumps over the lazy dog and back again
+line 180  the quick brown fox jumps over the lazy dog and back again
+line 181  the quick brown fox jumps over the lazy dog and back again
+line 182  the quick brown fox jumps over the lazy dog and back again
+line 183  the quick brown fox jumps over the lazy dog and back again
+line 184  the quick brown fox jumps over the lazy dog and back again
+line 185  the quick brown fox jumps over the lazy dog and back again
+line 186  the quick brown fox jumps over the lazy dog and back again
+line 187  the quick brown fox jumps over the lazy dog and back again
+line 188  the quick brown fox jumps over the lazy dog and back again
+line 189  the quick brown fox jumps over the lazy dog and back again
+line 190  the quick brown fox jumps over the lazy dog and back again
+line 191  the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 190  the quick brown fox jumps over the lazy dog and back again
+line 191  the quick brown fox jumps over the lazy dog and back again
+line 192  the quick brown fox jumps over the lazy dog and back again
+line 193  the quick brown fox jumps over the lazy dog and back again
+line 194  the quick brown fox jumps over the lazy dog and back again
+line 195  the quick brown fox jumps over the lazy dog and back again
+line 196  the quick brown fox jumps over the lazy dog and back again
+line 197  the quick brown fox jumps over the lazy dog and back again
+line 198  the quick brown fox jumps over the lazy dog and back again
+line 199  the quick brown fox jumps over the lazy dog and back again
+line 200  the quick brown fox jumps over the lazy dog and back again
+line 201  the quick brown fox jumps over the lazy dog and back again
+line 202  the quick brown fox jumps over the lazy dog and back again
+line 203  the quick brown fox jumps over the lazy dog and back again
+line 204  the quick brown fox jumps over the lazy dog and back again
+line 205  the quick brown fox jumps over the lazy dog and back again
+line 206  the quick brown fox jumps over the lazy dog and back again
+line 207  the quick brown fox jumps over the lazy dog and back again
+line 208  the quick brown fox jumps over the lazy dog and back again
+line 209  the quick brown fox jumps over the lazy dog and back again
+line 210  the quick brown fox jumps over the lazy dog and back again
+line 211  the quick brown fox jumps over the lazy dog and back again
+line 212  the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 211  the quick brown fox jumps over the lazy dog and back again
+line 212  the quick brown fox jumps over the lazy dog and back again
+line 213  the quick brown fox jumps over the lazy dog and back again
+line 214  the quick brown fox jumps over the lazy dog and back again
+line 215  the quick brown fox jumps over the lazy dog and back again
+line 216  the quick brown fox jumps over the lazy dog and back again
+line 217  the quick brown fox jumps over the lazy dog and back again
+line 218  the quick brown fox jumps over the lazy dog and back again
+line 219  the quick brown fox jumps over the lazy dog and back again
+line 220  the quick brown fox jumps over the lazy dog and back again
+line 221  the quick brown fox jumps over the lazy dog and back again
+line 222  the quick brown fox jumps over the lazy dog and back again
+line 223  the quick brown fox jumps over the lazy dog and back again
+line 224  the quick brown fox jumps over the lazy dog and back again
+line 225  the quick brown fox jumps over the lazy dog and back again
+line 226  the quick brown fox jumps over the lazy dog and back again
+line 227  the quick brown fox jumps over the lazy dog and back again
+line 228  the quick brown fox jumps over the lazy dog and back again
+line 229  the quick brown fox jumps over the lazy dog and back again
+line 230  the quick brown fox jumps over the lazy dog and back again
+line 231  the quick brown fox jumps over the lazy dog and back again
+line 232  the quick brown fox jumps over the lazy dog and back again
+line 233  the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 232  the quick brown fox jumps over the lazy dog and back again
+line 233  the quick brown fox jumps over the lazy dog and back again
+line 234  the quick brown fox jumps over the lazy dog and back again
+line 235  the quick brown fox jumps over the lazy dog and back again
+line 236  the quick brown fox jumps over the lazy dog and back again
+line 237  the quick brown fox jumps over the lazy dog and back again
+line 238  the quick brown fox jumps over the lazy dog and back again
+line 239  the quick brown fox jumps over the lazy dog and back again
+line 240  the quick brown fox jumps over the lazy dog and back again
+line 241  the quick brown fox jumps over the lazy dog and back again
+line 242  the quick brown fox jumps over the lazy dog and back again
+line 243  the quick brown fox jumps over the lazy dog and back again
+line 244  the quick brown fox jumps over the lazy dog and back again
+line 245  the quick brown fox jumps over the lazy dog and back again
+line 246  the quick brown fox jumps over the lazy dog and back again
+line 247  the quick brown fox jumps over the lazy dog and back again
+line 248  the quick brown fox jumps over the lazy dog and back again
+line 249  the quick brown fox jumps over the lazy dog and back again
+line 250  the quick brown fox jumps over the lazy dog and back again
+line 251  the quick brown fox jumps over the lazy dog and back again
+line 252  the quick brown fox jumps over the lazy dog and back again
+line 253  the quick brown fox jumps over the lazy dog and back again
+line 254  the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 253  the quick brown fox jumps over the lazy dog and back again
+line 254  the quick brown fox jumps over the lazy dog and back again
+line 255  the quick brown fox jumps over the lazy dog and back again
+line 256  the quick brown fox jumps over the lazy dog and back again
+line 257  the quick brown fox jumps over the lazy dog and back again
+line 258  the quick brown fox jumps over the lazy dog and back again
+line 259  the quick brown fox jumps over the lazy dog and back again
+line 260  the quick brown fox jumps over the lazy dog and back again
+line 261  the quick brown fox jumps over the lazy dog and back again
+line 262  the quick brown fox jumps over the lazy dog and back again
+line 263  the quick brown fox jumps over the lazy dog and back again
+line 264  the quick brown fox jumps over the lazy dog and back again
+line 265  the quick brown fox jumps over the lazy dog and back again
+line 266  the quick brown fox jumps over the lazy dog and back again
+line 267  the quick brown fox jumps over the lazy dog and back again
+line 268  the quick brown fox jumps over the lazy dog and back again
+line 269  the quick brown fox jumps over the lazy dog and back again
+line 270  the quick brown fox jumps over the lazy dog and back again
+line 271  the quick brown fox jumps over the lazy dog and back again
+line 272  the quick brown fox jumps over the lazy dog and back again
+line 273  the quick brown fox jumps over the lazy dog and back again
+line 274  the quick brown fox jumps over the lazy dog and back again
+line 275  the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 274  the quick brown fox jumps over the lazy dog and back again
+line 275  the quick brown fox jumps over the lazy dog and back again
+line 276  the quick brown fox jumps over the lazy dog and back again
+line 277  the quick brown fox jumps over the lazy dog and back again
+line 278  the quick brown fox jumps over the lazy dog and back again
+line 279  the quick brown fox jumps over the lazy dog and back again
+line 280  the quick brown fox jumps over the lazy dog and back again
+line 281  the quick brown fox jumps over the lazy dog and back again
+line 282  the quick brown fox jumps over the lazy dog and back again
+line 283  the quick brown fox jumps over the lazy dog and back again
+line 284  the quick brown fox jumps over the lazy dog and back again
+line 285  the quick brown fox jumps over the lazy dog and back again
+line 286  the quick brown fox jumps over the lazy dog and back again
+line 287  the quick brown fox jumps over the lazy dog and back again
+line 288  the quick brown fox jumps over the lazy dog and back again
+line 289  the quick brown fox jumps over the lazy dog and back again
+line 290  the quick brown fox jumps over the lazy dog and back again
+line 291  the quick brown fox jumps over the lazy dog and back again
+line 292  the quick brown fox jumps over the lazy dog and back again
+line 293  the quick brown fox jumps over the lazy dog and back again
+line 294  the quick brown fox jumps over the lazy dog and back again
+line 295  the quick brown fox jumps over the lazy dog and back again
+line 296  the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 295  the quick brown fox jumps over the lazy dog and back again
+line 296  the quick brown fox jumps over the lazy dog and back again
+line 297  the quick brown fox jumps over the lazy dog and back again
+line 298  the quick brown fox jumps over the lazy dog and back again
+line 299  the quick brown fox jumps over the lazy dog and back again
+line 300  the quick brown fox jumps over the lazy dog and back again
+line 301  the quick brown fox jumps over the lazy dog and back again
+line 302  the quick brown fox jumps over the lazy dog and back again
+line 303  the quick brown fox jumps over the lazy dog and back again
+line 304  the quick brown fox jumps over the lazy dog and back again
+line 305  the quick brown fox jumps over the lazy dog and back again
+line 306  the quick brown fox jumps over the lazy dog and back again
+line 307  the quick brown fox jumps over the lazy dog and back again
+line 308  the quick brown fox jumps over the lazy dog and back again
+line 309  the quick brown fox jumps over the lazy dog and back again
+line 310  the quick brown fox jumps over the lazy dog and back again
+line 311  the quick brown fox jumps over the lazy dog and back again
+line 312  the quick brown fox jumps over the lazy dog and back again
+line 313  the quick brown fox jumps over the lazy dog and back again
+line 314  the quick brown fox jumps over the lazy dog and back again
+line 315  the quick brown fox jumps over the lazy dog and back again
+line 316  the quick brown fox jumps over the lazy dog and back again
+line 317  the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 316  the quick brown fox jumps over the lazy dog and back again
+line 317  the quick brown fox jumps over the lazy dog and back again
+line 318  the quick brown fox jumps over the lazy dog and back again
+line 319  the quick brown fox jumps over the lazy dog and back again
+line 320  the quick brown fox jumps over the lazy dog and back again
+line 321  the quick brown fox jumps over the lazy dog and back again
+line 322  the quick brown fox jumps over the lazy dog and back again
+line 323  the quick brown fox jumps over the lazy dog and back again
+line 324  the quick brown fox jumps over the lazy dog and back again
+line 325  the quick brown fox jumps over the lazy dog and back again
+line 326  the quick brown fox jumps over the lazy dog and back again
+line 327  the quick brown fox jumps over the lazy dog and back again
+line 328  the quick brown fox jumps over the lazy dog and back again
+line 329  the quick brown fox jumps over the lazy dog and back again
+line 330  the quick brown fox jumps over the lazy dog and back again
+line 331  the quick brown fox jumps over the lazy dog and back again
+line 332  the quick brown fox jumps over the lazy dog and back again
+line 333  the quick brown fox jumps over the lazy dog and back again
+line 334  the quick brown fox jumps over the lazy dog and back again
+line 335  the quick brown fox jumps over the lazy dog and back again
+line 336  the quick brown fox jumps over the lazy dog and back again
+line 337  the quick brown fox jumps over the lazy dog and back again
+line 338  the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 337  the quick brown fox jumps over the lazy dog and back again
+line 338  the quick brown fox jumps over the lazy dog and back again
+line 339  the quick brown fox jumps over the lazy dog and back again
+line 340  the quick brown fox jumps over the lazy dog and back again
+line 341  the quick brown fox jumps over the lazy dog and back again
+line 342  the quick brown fox jumps over the lazy dog and back again
+line 343  the quick brown fox jumps over the lazy dog and back again
+line 344  the quick brown fox jumps over the lazy dog and back again
+line 345  the quick brown fox jumps over the lazy dog and back again
+line 346  the quick brown fox jumps over the lazy dog and back again
+line 347  the quick brown fox jumps over the lazy dog and back again
+line 348  the quick brown fox jumps over the lazy dog and back again
+line 349  the quick brown fox jumps over the lazy dog and back again
+line 350  the quick brown fox jumps over the lazy dog and back again
+line 351  the quick brown fox jumps over the lazy dog and back again
+line 352  the quick brown fox jumps over the lazy dog and back again
+line 353  the quick brown fox jumps over the lazy dog and back again
+line 354  the quick brown fox jumps over the lazy dog and back again
+line 355  the quick brown fox jumps over the lazy dog and back again
+line 356  the quick brown fox jumps over the lazy dog and back again
+line 357  the quick brown fox jumps over the lazy dog and back again
+line 358  the quick brown fox jumps over the lazy dog and back again
+line 359  the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 358  the quick brown fox jumps over the lazy dog and back again
+line 359  the quick brown fox jumps over the lazy dog and back again
+line 360  the quick brown fox jumps over the lazy dog and back again
+line 361  the quick brown fox jumps over the lazy dog and back again
+line 362  the quick brown fox jumps over the lazy dog and back again
+line 363  the quick brown fox jumps over the lazy dog and back again
+line 364  the quick brown fox jumps over the lazy dog and back again
+line 365  the quick brown fox jumps over the lazy dog and back again
+line 366  the quick brown fox jumps over the lazy dog and back again
+line 367  the quick brown fox jumps over the lazy dog and back again
+line 368  the quick brown fox jumps over the lazy dog and back again
+line 369  the quick brown fox jumps over the lazy dog and back again
+line 370  the quick brown fox jumps over the lazy dog and back again
+line 371  the quick brown fox jumps over the lazy dog and back again
+line 372  the quick brown fox jumps over the lazy dog and back again
+line 373  the quick brown fox jumps over the lazy dog and back again
+line 374  the quick brown fox jumps over the lazy dog and back again
+line 375  the quick brown fox jumps over the lazy dog and back again
+line 376  the quick brown fox jumps over the lazy dog and back again
+line 377  the quick brown fox jumps over the lazy dog and back again
+line 378  the quick brown fox jumps over the lazy dog and back again
+line 379  the quick brown fox jumps over the lazy dog and back again
+line 380  the quick brown fox jumps over the lazy dog and back again[1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 379  the quick brown fox jumps over the lazy dog and back again
+line 380  the quick brown fox jumps over the lazy dog and back again
+line 381  the quick brown fox jumps over the lazy dog and back again
+line 382  the quick brown fox jumps over the lazy dog and back again
+line 383  the quick brown fox jumps over the lazy dog and back again
+line 384  the quick brown fox jumps over the lazy dog and back again
+line 385  the quick brown fox jumps over the lazy dog and back again
+line 386  the quick brown fox jumps over the lazy dog and back again
+line 387  the quick brown fox jumps over the lazy dog and back again
+line 388  the quick brown fox jumps over the lazy dog and back again
+line 389  the quick brown fox jumps over the lazy dog and back again
+line 390  the quick brown fox jumps over the lazy dog and back again
+line 391  the quick brown fox jumps over the lazy dog and back again
+line 392  the quick brown fox jumps over the lazy dog and back again
+line 393  the quick brown fox jumps over the lazy dog and back again
+line 394  the quick brown fox jumps over the lazy dog and back again
+line 395  the quick brown fox jumps over the lazy dog and back again
+line 396  the quick brown fox jumps over the lazy dog and back again
+line 397  the quick brown fox jumps over the lazy dog and back again
+line 398  the quick brown fox jumps over the lazy dog and back again
+line 399  the quick brown fox jumps over the lazy dog and back again
+line 400  the quick brown fox jumps over the lazy dog and back again
+[1m[34m~                                                                               [1;1H[?25h[?0c[?25l[?1c[27m[24m[m[H[J[1;1Hline 400  the quick brown fox jumps over the lazy dog and back again
+[1m[34m~                                                                               [3;1H~                                                                               [4;1H~                                                                               [5;1H~                                                                               [6;1H~                                                                               [7;1H~                                                                               [8;1H~                                                                               [9;1H~                                                                               [10;1H~                                                                               [11;1H~                                                                               [12;1H~                                                                               [13;1H~                                                                               [14;1H~                                                                               [15;1H~                                                                               [16;1H~                                                                               [17;1H~                                                                               [18;1H~                                                                               [19;1H~                                                                               [20;1H~                                                                               [21;1H~                                                                               [22;1H~                                                                               [23;1H~                                                                               [1;1H[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[mline 377
+line 378  the quick brown fox jumps over the lazy dog and back again[2;69H[K[3;1Hline 379  the quick brown fox jumps over the lazy dog and back again[3;69H[K[4;1Hline 380  the quick brown fox jumps over the lazy dog and back again[4;69H[K[5;1Hline 381  the quick brown fox jumps over the lazy dog and back again[5;69H[K[6;1Hline 382  the quick brown fox jumps over the lazy dog and back again[6;69H[K[7;1Hline 383  the quick brown fox jumps over the lazy dog and back again[7;69H[K[8;1Hline 384  the quick brown fox jumps over the lazy dog and back again[8;69H[K[9;1Hline 385  the quick brown fox jumps over the lazy dog and back again[9;69H[K[10;1Hline 386  the quick brown fox jumps over the lazy dog and back again[10;69H[K[11;1Hline 387  the quick brown fox jumps over the lazy dog and back again[11;69H[K[12;1Hline 388  the quick brown fox jumps over the lazy dog and back again[12;69H[K[13;1Hline 389  the quick brown fox jumps over the lazy dog and back again[13;69H[K[14;1Hline 390  the quick brown fox jumps over the lazy dog and back again[14;69H[K[15;1Hline 391  the quick brown fox jumps over the lazy dog and back again[15;69H[K[16;1Hline 392  the quick brown fox jumps over the lazy dog and back again[16;69H[K[17;1Hline 393  the quick brown fox jumps over the lazy dog and back again[17;69H[K[18;1Hline 394  the quick brown fox jumps over the lazy dog and back again[18;69H[K[19;1Hline 395  the quick brown fox jumps over the lazy dog and back again[19;69H[K[20;1Hline 396  the quick brown fox jumps over the lazy dog and back again[20;69H[K[21;1Hline 397  the quick brown fox jumps over the lazy dog and back again[21;69H[K[22;1Hline 398  the quick brown fox jumps over the lazy dog and back again[22;69H[K[23;1Hline 399  the quick brown fox jumps over the lazy dog and back again[23;69H[K[23;1H[?25h[?0c[?25l[?1c[1;7H56[2;7H57[3;7H58[4;7H59[5;7H60[6;7H61[7;7H62[8;7H63[9;7H64[10;7H65[11;7H66[12;7H67[13;7H68[14;7H69[15;7H70[16;7H71[17;7H72[18;7H73[19;7H74[20;7H75[21;7H76[22;7H77[23;7H78[?25h[?0c[?25l[?1c[1;7H35[2;7H36[3;7H37[4;7H38[5;7H39[6;7H40[7;7H41[8;7H42[9;7H43[10;7H44[11;7H45[12;7H46[13;7H47[14;7H48[15;7H49[16;7H50[17;7H51[18;7H52[19;7H53[20;7H54[21;7H55[22;7H56[23;7H57[?25h[?0c[?25l[?1c[1;7H14[2;7H15[3;7H16[4;7H17[5;7H18[6;7H19[7;7H20[8;7H21[9;7H22[10;7H23[11;7H24[12;7H25[13;7H26[14;7H27[15;7H28[16;7H29[17;7H30[18;7H31[19;7H32[20;7H33[21;7H34[22;7H35[23;7H36[?25h[?0c[?25l[?1c[1;6H293[2;6H294[3;6H295[4;6H296[5;6H297[6;6H298[7;6H299[8;7H00[9;7H01[10;7H02[11;7H03[12;7H04[13;7H05[14;7H06[15;7H07[16;7H08[17;7H09[18;7H10[19;7H11[20;7H12[21;7H13[22;7H14[23;7H15[?25h[?0c[?25l[?1c[1;7H72[2;7H73[3;7H74[4;7H75[5;7H76[6;7H77[7;7H78[8;6H279[9;6H280[10;6H281[11;6H282[12;6H283[13;6H284[14;6H285[15;6H286[16;6H287[17;6H288[18;6H289[19;6H290[20;6H291[21;6H292[22;6H293[23;6H294[?25h[?0c[?25l[?1c[1;7H51[2;7H52[3;7H53[4;7H54[5;7H55[6;7H56[7;7H57[8;7H58[9;7H59[10;7H60[11;7H61[12;7H62[13;7H63[14;7H64[15;7H65[16;7H66[17;7H67[18;7H68[19;7H69[20;7H70[21;7H71[22;7H72[23;7H73[?25h[?0c[?25l[?1c[1;7H30[2;7H31[3;7H32[4;7H33[5;7H34[6;7H35[7;7H36[8;7H37[9;7H38[10;7H39[11;7H40[12;7H41[13;7H42[14;7H43[15;7H44[16;7H45[17;7H46[18;7H47[19;7H48[20;7H49[21;7H50[22;7H51[23;7H52[?25h[?0c[?25l[?1c[1;7H09[2;7H10[3;7H11[4;7H12[5;7H13[6;7H14[7;7H15[8;7H16[9;7H17[10;7H18[11;7H19[12;7H20[13;7H21[14;7H22[15;7H23[16;7H24[17;7H25[18;7H26[19;7H27[20;7H28[21;7H29[22;7H30[23;7H31[?25h[?0c[?25l[?1c[1;6H188[2;6H189[3;6H190[4;6H191[5;6H192[6;6H193[7;6H194[8;6H195[9;6H196[10;6H197[11;6H198[12;6H199[13;7H00[14;7H01[15;7H02[16;7H03[17;7H04[18;7H05[19;7H06[20;7H07[21;7H08[22;7H09[23;7H10[?25h[?0c[?25l[?1c[1;7H67[2;7H68[3;7H69[4;7H70[5;7H71[6;7H72[7;7H73[8;7H74[9;7H75[10;7H76[11;7H77[12;7H78[13;6H179[14;6H180[15;6H181[16;6H182[17;6H183[18;6H184[19;6H185[20;6H186[21;6H187[22;6H188[23;6H189[?25h[?0c[?25l[?1c[1;7H46[2;7H47[3;7H48[4;7H49[5;7H50[6;7H51[7;7H52[8;7H53[9;7H54[10;7H55[11;7H56[12;7H57[13;7H58[14;7H59[15;7H60[16;7H61[17;7H62[18;7H63[19;7H64[20;7H65[21;7H66[22;7H67[23;7H68[?25h[?0c[?25l[?1c[1;7H25[2;7H26[3;7H27[4;7H28[5;7H29[6;7H30[7;7H31[8;7H32[9;7H33[10;7H34[11;7H35[12;7H36[13;7H37[14;7H38[15;7H39[16;7H40[17;7H41[18;7H42[19;7H43[20;7H44[21;7H45[22;7H46[23;7H47[?25h[?0c[?25l[?1c[1;7H04[2;7H05[3;7H06[4;7H07[5;7H08[6;7H09[7;7H10[8;7H11[9;7H12[10;7H13[11;7H14[12;7H15[13;7H16[14;7H17[15;7H18[16;7H19[17;7H20[18;7H21[19;7H22[20;7H23[21;7H24[22;7H25[23;7H26[?25h[?0c[?25l[?1c[1;6H83 [2;6H84 [3;6H85 [4;6H86 [5;6H87 [6;6H88 [7;6H89 [8;6H90 [9;6H91 [10;6H92 [11;6H93 [12;6H94 [13;6H95 [14;6H96 [15;6H97 [16;6H98 [17;6H99 [18;7H00[19;7H01[20;7H02[21;7H03[22;7H04[23;7H05[?25h[?0c[?25l[?1c[1;6H62[2;6H63[3;6H64[4;6H65[5;6H66[6;6H67[7;6H68[8;6H69[9;6H70[10;6H71[11;6H72[12;6H73[13;6H74[14;6H75[15;6H76[16;6H77[17;6H78[18;6H79 [19;6H80 [20;6H81 [21;6H82 [22;6H83 [23;6H84 [?25h[?0c[?25l[?1c[1;6H41[2;6H42[3;6H43[4;6H44[5;6H45[6;6H46[7;6H47[8;6H48[9;6H49[10;6H50[11;6H51[12;6H52[13;6H53[14;6H54[15;6H55[16;6H56[17;6H57[18;6H58[19;6H59[20;6H60[21;6H61[22;6H62[23;6H63[?25h[?0c[?25l[?1c[1;6H20[2;6H21[3;6H22[4;6H23[5;6H24[6;6H25[7;6H26[8;6H27[9;6H28[10;6H29[11;6H30[12;6H31[13;6H32[14;6H33[15;6H34[16;6H35[17;6H36[18;6H37[19;6H38[20;6H39[21;6H40[22;6H41[23;6H42[?25h[?0c[?25l[?1c[1;23r[1;1H[19L[1;24r[1;1Hline 1    the quick brown fox jumps over the lazy dog and back again
+line 2    the quick brown fox jumps over the lazy dog and back again
+line 3    the quick brown fox jumps over the lazy dog and back again
+line 4    the quick brown fox jumps over the lazy dog and back again
+line 5    the quick brown fox jumps over the lazy dog and back again
+line 6    the quick brown fox jumps over the lazy dog and back again
+line 7    the quick brown fox jumps over the lazy dog and back again
+line 8    the quick brown fox jumps over the lazy dog and back again
+line 9    the quick brown fox jumps over the lazy dog and back again
+line 10   the quick brown fox jumps over the lazy dog and back again
+line 11   the quick brown fox jumps over the lazy dog and back again
+line 12   the quick brown fox jumps over the lazy dog and back again
+line 13   the quick brown fox jumps over the lazy dog and back again
+line 14   the quick brown fox jumps over the lazy dog and back again
+line 15   the quick brown fox jumps over the lazy dog and back again
+line 16   the quick brown fox jumps over the lazy dog and back again
+line 17   the quick brown fox jumps over the lazy dog and back again
+line 18   the quick brown fox jumps over the lazy dog and back again
+line 19   the quick brown fox jumps over the lazy dog and back again
+
+[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c[?25l[?1c[?25h[?0c
+
+[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 24   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 25   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 26   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 27   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 28   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 29   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 30   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 31   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 32   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 33   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 34   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 35   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 36   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 37   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 38   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 39   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 40   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[?25l[?1c[1;23r[23;1H
+[1;24r[23;1Hline 41   the quick brown fox jumps over the lazy dog and back again[?25h[?0c[22;1H[21;1H[20;1H[19;1H[18;1H[17;1H[16;1H[15;1H[14;1H[13;1H[12;1H[11;1H[10;1H[9;1H[8;1H[7;1H[6;1H[5;1H[4;1H[3;1H[?25l[?1c[24;1H:q![?25h[?0c[24;1H[K[24;1H
+Script done on 2026-08-26 08:17:49+00:00 [COMMAND_EXIT_CODE="0"]

@@ -4,9 +4,11 @@
 //
 // time.c - calendar time for MayteraOS userland (#422 / CPython #359).
 // Pure epoch<->civil conversion (Howard Hinnant's algorithm). No timezone
-// database: localtime == gmtime (UTC). time() returns whatever the kernel
-// clock provides via SYS_TIME (currently seconds; wall-clock epoch depends on
-// the kernel RTC wiring, a separate concern).
+// database here: localtime == gmtime (UTC), and the chosen zone is applied by
+// libc/tz.c, which is THE one place in this tree that applies an offset.
+// #113: time() is now a REAL epoch. SYS_TIME used to return seconds since BOOT,
+// so every date this file formatted was 1970-01-01 plus the uptime. It is now
+// the CMOS RTC anchored against the TSC (kernel/cpu/wallclock.h).
 #include "time.h"
 #include "stdio.h"
 #include "string.h"

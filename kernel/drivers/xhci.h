@@ -507,6 +507,64 @@ int xhci_root_port_info(xhci_controller_t *xhc, int port,
 // =============================================================================
 
 // Controller initialization
+// #139: the xHCI MSI vector. Local-APIC delivered like the HDA vector (0x50),
+// so it needs its own IDT gate (cpu/idt.asm irq_xhci_msi + cpu/idt.c) and its
+// handler EOIs with lapic_eoi().
+#define XHCI_MSI_VECTOR 0x51
+
+// #139: arm MSI on every initialised controller. MUST run after lapic_init().
+// Safe to skip: a controller with no MSI capability, or one that never raises
+// an interrupt, leaves behaviour exactly as it was, because the timer-driven
+// drain workers remain the always-armed backstop.
+void xhci_setup_interrupt(void);
+
+// #139: how many times the MSI handler has actually run, and whether MSI was
+// armed at all. Prose about an interrupt handler is worth nothing; this is how
+// a capture from a machine with no serial console proves it FIRES.
+uint64_t xhci_msi_count(void);
+int      xhci_msi_armed(void);
+
+// #139: monotonically increasing counter bumped by the MSI handler. A waiter
+// that has recorded the value it last acted on can tell "an interrupt has
+// arrived since" without draining anything itself, which is what lets the HID
+// worker block instead of poll while keeping the drain in thread context.
+uint64_t xhci_msi_seq(void);
+
+// #139: THE shared event-ring wait queue (see xhci_evt_worker in xhci.c for
+// the redundant-wake contract). Exposed so the HID poll worker can block on
+// the same queue every other xHCI waiter uses, rather than growing a second
+// one that the ISR would then have to remember to wake.
+// Returned as `struct wait_queue_head *` rather than the `wait_queue_head_t`
+// typedef so this header does not have to pull in sync/waitq.h. It is the same
+// named struct (sync/waitq.h: `typedef struct wait_queue_head {...}`), so a
+// caller that includes waitq.h can use the result directly.
+struct wait_queue_head;
+struct wait_queue_head *xhci_event_waitq(void);
+
+// #139: has a drainer recorded an unconsumed completion for this endpoint?
+// Non-blocking, no drain, no lock: purely a read of the completion byte, for
+// use as a wait-queue condition.
+int xhci_xfer_pending(int slot_id, int dci);
+
+// #155: per-transfer-event observer for a driver that keeps MORE THAN ONE TD in
+// flight on one endpoint (USB Ethernet). g_xfer_cc[][] holds ONE completion per
+// (slot, DCI), so a second completion destroys the first; a queued-depth driver
+// installs this and keeps its own completion ring. Called from the event
+// drainer with the event-ring lock held, possibly with interrupts off and
+// possibly from an MSI handler: it MUST NOT block, sleep, log or allocate.
+// NULL (the default) costs one branch-not-taken per transfer event.
+extern void (*xhci_xfer_observer)(uint32_t slot, uint32_t dci,
+                                  uint8_t cc, uint32_t residual);
+
+// #133: completion code of the last FAILED transfer on this endpoint, 0 if the
+// last one succeeded. The recovery a failure needs depends on which failure it
+// was, and g_xfer_cc is consumed too early to tell afterwards.
+uint8_t xhci_xfer_last_error(int slot_id, int dci);
+
+// #133: CLEAR_FEATURE(ENDPOINT_HALT) on a device endpoint. BLOCKS; call it from
+// a worker thread that may block, never from the HID poll worker.
+int xhci_clear_endpoint_halt(xhci_controller_t *xhc, int slot_id, int ep_addr);
+
 int xhci_init(pci_device_t *pci);
 int xhci_reset(xhci_controller_t *xhc);
 int xhci_start(xhci_controller_t *xhc);
@@ -528,6 +586,15 @@ int xhci_control_transfer(xhci_controller_t *xhc, int slot_id,
                           uint8_t request_type, uint8_t request,
                           uint16_t value, uint16_t index,
                           void *data, uint16_t length);
+// #373/#62: same, with an EXPLICIT completion budget. The 5s default above is
+// an ENUMERATION budget. Any request issued PERIODICALLY at runtime (hub port
+// polling, ASIX MII register reads, HID class requests) must pass its own much
+// shorter budget: a device that has stopped answering otherwise costs 5 seconds
+// per request, on whatever thread happens to be asking.
+int xhci_control_transfer_to(xhci_controller_t *xhc, int slot_id,
+                             uint8_t request_type, uint8_t request,
+                             uint16_t value, uint16_t index,
+                             void *data, uint16_t length, uint32_t timeout_ms);
 int xhci_bulk_transfer(xhci_controller_t *xhc, int slot_id, int endpoint,
                        void *data, uint32_t length, int direction);
 int xhci_interrupt_transfer(xhci_controller_t *xhc, int slot_id, int endpoint,
@@ -572,6 +639,10 @@ int xhci_configure_endpoint_ep(xhci_controller_t *xhc, int slot_id,
                                int b_interval, int speed);
 
 // #307: non-blocking interrupt-IN transfer model used by USB HID polling.
+// #139: microsecond stamp of the last observed transfer event on (slot, DCI).
+// See drivers/xhci.c for the three-delay decomposition it exists to support.
+uint32_t xhci_xfer_done_us(int slot_id, int dci);
+
 int xhci_int_in_submit(xhci_controller_t *xhc, int slot_id, int dci,
                        uint64_t buf_phys, uint32_t len);
 int xhci_int_in_poll(xhci_controller_t *xhc, int slot_id, int dci,
@@ -592,6 +663,16 @@ void xhci_dump_controller_info(xhci_controller_t *xhc);
 // #362: PIT-calibrated wall-clock delay (wrapper around the static
 // xhci_delay) for use by USB class/vendor drivers.
 void xhci_delay_ms(uint32_t ms);
+
+// #133/#134: endpoint HALT recovery. TRB_RESET_EP / TRB_SET_TR_DEQUEUE above had
+// ZERO callers before this, so a single Stall / Transaction Error / Babble on an
+// endpoint left it halted and dead until reboot.
+int xhci_reset_endpoint(xhci_controller_t *xhc, int slot_id, int dci);
+int xhci_stop_endpoint(xhci_controller_t *xhc, int slot_id, int dci);
+int xhci_set_tr_dequeue(xhci_controller_t *xhc, int slot_id, int dci);
+int xhci_recover_endpoint(xhci_controller_t *xhc, int slot_id, int dci);
+// #62: control-endpoint (DCI 1) recovery after a failed control transfer.
+int xhci_recover_control_endpoint(xhci_controller_t *xhc, int slot_id, int wait_rc);
 
 // Global controller access
 extern xhci_controller_t *xhci_get_controller(int index);

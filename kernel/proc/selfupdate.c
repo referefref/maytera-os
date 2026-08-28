@@ -353,8 +353,13 @@ void kernel_selfupdate_reboot(void) {
     extern void acpi_shutdown_flush(void);
     kprintf("[SELFUPD] flushing + rebooting to apply update...\n");
     bootlog_write("[SELFUPD] rebooting to apply update");
+    // #229: acpi_reboot() now flushes and marks the ext2 root clean itself, so
+    // this call site no longer has to remember to. Kept as an explicit,
+    // harmless early flush because a self-update has just rewritten the kernel
+    // on all four boot paths and the sooner that reaches the medium the better;
+    // ext2_mark_clean() is idempotent, so doing it twice costs one 1KB write.
     acpi_shutdown_flush();   // best-effort flush of buffered disk/log state
-    acpi_reboot();           // does not return on success
+    acpi_reboot();           // flushes again, then resets; does not return
     // If ACPI reboot somehow returns, spin so we do not fall through.
     for (;;) { __asm__ volatile ("hlt"); }
 }

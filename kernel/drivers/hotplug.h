@@ -28,6 +28,15 @@
 #define HOTPLUG_FS_FAT32        2
 #define HOTPLUG_FS_EXFAT        3
 #define HOTPLUG_FS_NTFS         4  // Not supported, just detected
+// #234i: a MOUNTED DISK IMAGE is a removable volume too. It is not a physical
+// device and drivers/hotplug.c knows nothing about it, but it is the same
+// THING to a user: something that appears, is browsable, and is ejected. It
+// therefore joins the same list rather than growing a second one, and these
+// two fs_type values are how the marshaller tells the two classes of image
+// apart (rustkern/hotplug.rs derives MOSVOL_OPTICAL / MOSVOL_FLOPPY /
+// MOSVOL_READONLY from them). kernel/dos/diskimg.c is the producer.
+#define HOTPLUG_FS_ISO9660      5  // mounted .iso / raw CD image, READ-ONLY
+#define HOTPLUG_FS_FAT12        6  // mounted floppy image (.img / .ima)
 
 // =============================================================================
 // Data Structures
@@ -158,6 +167,74 @@ int hotplug_get_sidebar_entries(hotplug_sidebar_entry_t *entries, int max_entrie
 
 // Handle eject button click from file browser
 int hotplug_eject_from_browser(const char *mount_point);
+
+// =============================================================================
+// #250 GUI INTEGRATION: the parts that were written and never wired up
+// =============================================================================
+//
+// Every function in the "Desktop Integration" and "File Browser Integration"
+// blocks above was written for the IN-KERNEL desktop and file browser, which
+// stopped being the shipping shell when /APPS/COMPOSIT took over. So they had
+// no callers, and a hot-plugged stick mounted in silence: no sidebar row, no
+// desktop icon, no way to eject. The shell is now a Ring-3 process, so the
+// integration has to cross the syscall boundary, and these are the pieces
+// that carry it. hotplug_get_sidebar_entries() above is still THE list
+// builder; hotplug_vol_raw() is the same data in a form a #[repr(C)] Rust
+// consumer can read without mirroring a union.
+
+// Raw per-slot snapshot for the Rust volume marshaller (rustkern/hotplug.rs).
+// Locked against drift by _Static_assert in drivers/hotplug.c.
+typedef struct {
+    int32_t  present;           // slot is occupied by a physical device
+    int32_t  mounted;           // filesystem mounted
+    int32_t  fs_type;           // HOTPLUG_FS_*
+    int32_t  readable;          // file READS are implemented for this fs_type
+    uint64_t capacity_bytes;
+    uint64_t free_bytes;
+    int32_t  free_known;        // 0 = free_bytes is not meaningful
+    int32_t  reserved0;
+    char     name[HOTPLUG_NAME_LEN];
+    char     mount_point[HOTPLUG_MOUNT_PATH_LEN];
+} hotplug_raw_t;
+
+// Fill `out` for slot `index`. Returns 0 on success, -1 if the index is out of
+// range. An unoccupied slot returns 0 with present == 0.
+int hotplug_vol_raw(int index, hotplug_raw_t *out);
+
+// #234i: the SAME snapshot shape, produced by kernel/dos/diskimg.c for a
+// mounted disk image on DOS drive-letter index `idx` (0 = A .. 25 = Z).
+// Returns 1 and fills `out` when an image is mounted there, 0 otherwise.
+//
+// DECLARED HERE, NOT IN dos/diskimg.h, on purpose: hotplug_raw_t is the
+// contract, and a contract with two producers should have ONE declaration
+// site or the two drift. diskimg.c includes this header to implement it.
+//
+// NON-BLOCKING. Every field is answered out of the mount table in RAM (see
+// dos/diskimg.h: "Neither call reads a sector"), so this is safe from the
+// same contexts hotplug_vol_raw() is.
+int diskimg_vol_raw(int idx, hotplug_raw_t *out);
+
+// Non-zero if this filesystem type can actually serve file reads. exFAT
+// mounts and reports free space but every one of its file operations is
+// unimplemented (fs/exfat.c), so a browsable-looking exFAT volume would be a
+// lie. The ONE place that judgement is made.
+int hotplug_fs_readable(int fs_type);
+
+// Path routing. If `path` names a file on a mounted removable volume, return
+// that volume's slot index and set *rel_out to the path RELATIVE to the
+// volume root (always starting with '/'). Otherwise return -1 and leave
+// *rel_out alone. Case-insensitive, because the mount point is spelled in
+// FAT-style uppercase and userland paths arrive in both cases.
+int hotplug_resolve_path(const char *path, const char **rel_out);
+
+// The mounted filesystem for a slot, or NULL. Used by the fd layer to open a
+// handle against the right volume: fat_open() is already parameterised by
+// fat_fs_t, so no second open path is needed.
+fat_fs_t *hotplug_volume_fat(int index);
+
+// Eject by slot index, from a syscall. Flushes, unmounts, then tells the
+// device it is safe to remove. Returns 0 on success.
+int hotplug_eject_slot(int index);
 
 // =============================================================================
 // Debugging

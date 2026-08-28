@@ -1,0 +1,58 @@
+--- a/src/regex/regex.h
++++ b/src/regex/regex.h
+@@ -5,18 +5,35 @@
+ extern "C" {
+ #endif
+ 
+-#include <features.h>
+-
+-#define __NEED_regoff_t
+-#define __NEED_size_t
+-
+-#include <bits/alltypes.h>
+-
++/* MayteraOS (#745 local 97): upstream reaches its typedefs through musl's own
++ * <features.h> and <bits/alltypes.h>, neither of which exists in this
++ * freestanding userland. regoff_t is musl's own definition for a 64-bit
++ * target, spelled out here rather than pulled in. */
++#include <stddef.h>
++typedef long regoff_t;
++
++/* MayteraOS: this ONE struct is both the POSIX regex_t and the GNU
++ * re_pattern_buffer, exactly as it is in glibc and in the GNU regex this port
++ * replaces, because busybox vi and GNU grep both declare
++ * `struct re_pattern_buffer` by name and both also call POSIX regexec() on it
++ * in other functions of the same file. Two types could not satisfy both.
++ * Everything from re_nsub to __padding2 is upstream musl, untouched and in
++ * upstream order; the GNU-compat fields are appended AFTER it so that no musl
++ * source has to change and no offset musl computes can move. See
++ * <gnuregex.h> for what reads them. */
+ typedef struct re_pattern_buffer {
+ 	size_t re_nsub;
+ 	void *__opaque, *__padding[4];
+ 	size_t __nsub2;
+ 	char __padding2;
++
++	/* GNU-compat extension fields (MayteraOS). */
++	unsigned int not_bol : 1;   /* subject start is not a line start */
++	unsigned int not_eol : 1;   /* subject end is not a line end */
++	unsigned int newline_anchor : 1; /* ^ and $ also match at newlines */
++	unsigned long __gnu_syntax;      /* the reg_syntax_t it was compiled with */
++	char *fastmap;              /* accepted and unused; see gnuregex.h */
++	char *translate;            /* accepted and unused; see gnuregex.h */
+ } regex_t;
+ 
+ typedef struct {
+@@ -31,6 +48,12 @@
+ 
+ #define REG_NOTBOL      1
+ #define REG_NOTEOL      2
++/* MayteraOS: the 4.4BSD extension. pmatch[0] carries the byte range of the
++ * subject to search on INPUT, so a caller can match inside a buffer that is
++ * not NUL-terminated at the point it wants matching to stop. busybox vi's
++ * :substitute requires it. Returned offsets stay relative to `string`, which
++ * is what every REG_STARTEND user expects. */
++#define REG_STARTEND    4
+ 
+ #define REG_OK          0
+ #define REG_NOMATCH     1

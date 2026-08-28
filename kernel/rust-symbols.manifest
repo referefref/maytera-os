@@ -48,6 +48,41 @@ mono_ms_rs
 mono_us_rs
 mono_tsc_khz_rs
 mono_busy_delay_us_rs
+mono_pit_state_rs
+mono_source_rs
+mono_cpuid_khz_rs
+mono_pit_khz_rs
+
+# rustkern/earlyfb.rs - #ASUSDIAG the boot-stage tracker painted straight to the
+# firmware framebuffer, live from the first instruction of kernel_main. C API in
+# video/earlyfb.h, driven by fs/bootstage.c. No dependency on fb_init(), the
+# heap, the PMM or the console: on a laptop, which has no serial port, this is
+# the only diagnostic channel that exists before a filesystem mounts.
+early_fb_init
+early_fb_valid
+early_fb_force_arm
+early_fb_ready
+early_fb_stage
+early_fb_note
+early_fb_banner_refresh
+early_fb_page
+
+# rustkern/fltrec.rs - #ASUSDIAG the raw-LBA boot flight recorder. Record layout,
+# ring bookkeeping and CRC32 for breadcrumbs written to the GPT alignment gap
+# (LBA 34..2046) of the boot medium, which no filesystem owns. Needs no mount, so
+# it survives exactly the failure that leaves /BOOTLOG.TXT unwritten. C glue and
+# the block I/O are in fs/fltrec.c; this half is Rust because the dirty-sector
+# arithmetic is where the off-by-one lives.
+fltrec_crc32_rs
+fltrec_sb_encode_rs
+fltrec_sb_decode_rs
+fltrec_hdr_encode_rs
+fltrec_hdr_decode_rs
+fltrec_append_rs
+fltrec_dirty_rs
+fltrec_gpt_geom_rs
+fltrec_parr_scan_rs
+fltrec_selftest_rs
 
 # ---------------------------------------------------------------------------
 # rustkern/checksum.rs - #404 Phase B/D: IP + transport checksums.
@@ -162,6 +197,11 @@ rk_chown_route
 # ---------------------------------------------------------------------------
 perms_path_check_rs
 perms_canon_rs
+# #58: relative paths resolve against process_t::cwd. The JOIN lives beside the
+# canonicalizer it shares with perms_check()/sys_chdir, so the string that is
+# checked stays the object that is opened. Self-test runs at boot.
+path_resolve_cwd_rs
+path_resolve_selftest_rs
 
 # ---------------------------------------------------------------------------
 # rustkern/spawnid.rs - #692: the uid/gid a new Ring-3 process runs as. The
@@ -171,6 +211,17 @@ perms_canon_rs
 # ---------------------------------------------------------------------------
 spawn_ident_resolve_rs
 spawn_ident_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/envblock.rs - #112: the initial-process-stack layout (argc/argv/envp
+# and their strings) and the NAME=VALUE rule an environment entry must satisfy.
+# The raw stores stay in C (foreign-CR3 window, SMAP AC); the checked
+# arithmetic and the accept/reject decision live here.
+# ---------------------------------------------------------------------------
+env_entry_len_rs
+user_stack_plan_rs
+env_default_rs
+envblock_selftest_rs
 
 # ---------------------------------------------------------------------------
 # rustkern/sessionid.rs - #745 session identity policy.
@@ -206,6 +257,18 @@ first_admin_uid_rs
 next_user_uid_rs
 
 # ---------------------------------------------------------------------------
+# rustkern/firstrun.rs - #252: THE first-run (OOBE) state chokepoint. The
+# wizard used to create four names under /CONFIG, which a uid-1000 session
+# cannot do; these two symbols are the policy and its boot self-test. Losing
+# firstrun_op_rs would take the escape hatch with it.
+firstrun_op_rs
+firstrun_selftest_rs
+# #OOBEAUTH (2026-08-23): the first-boot bootstrap privilege predicate. Called
+# from proc/syscall.c at TWO sites (sys_firstboot_admin()'s non-root
+# exception, and sys_firstrun()'s FR_BOOTSTRAP_QUERY) which must never
+# disagree - see the long comment above this function in firstrun.rs.
+firstboot_bootstrap_ok_rs
+
 # rustkern/loginmode.rs - #745: the /CONFIG/LOGIN.CFG contract. One parse for
 # the sign-in screen mode, and ONE composer that decides the whole file, so a
 # writer of either key cannot erase the other.
@@ -227,6 +290,29 @@ guestfs_disarm_rs
 guestfs_cred_rs
 guestfs_stats_rs
 guestfs_check_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/dpmi.rs - #740: THE DPMI HOST CORE (INT 31h) for DOS/4GW guests.
+# We do not run DOS4GW.EXE, we ARE the extender, so the only surface that has
+# to exist is what the GAME calls: 0400 version; 0000/0001/0002/0003 and
+# 0006/0007/0008/0009/000A descriptors; 0100/0101 DOS memory (a THIN WRAPPER
+# over the existing INT 21h AH=48h MCB allocator, never a second one); and
+# 0600/0601 lock/unlock, which are tier 1 because Doom locks its entire image
+# at startup and a CF=1 there aborts it. 0300/0301/0302 attach through
+# dpmi_set_ext_rs. Every other AX is a LOGGED MISS returning CF=1/AX=0x8001,
+# never an untouched register file.
+# ---------------------------------------------------------------------------
+dpmi_int31_rs
+dpmi_rmvec_seed_rs
+dpmi_host_reset_rs
+dpmi_bind_dosmem_rs
+dpmi_set_ext_rs
+dpmi_bind_arena_rs
+dpmi_bind_meminfo_rs
+dpmi_seed_desc_rs
+dpmi_sel_lookup_rs
+dpmi_report_rs
+dpmi_selftest_rs
 guestfs_selftest_rs
 
 # ---------------------------------------------------------------------------
@@ -387,6 +473,33 @@ http_reuse_ok_rs
 # rustkern/sched_age.rs - #254/#601 scheduler anti-starvation policy
 sched_age_select_rs
 
+# rustkern/aptick.rs - #169 per-core preemption decision for an AP scheduler tick
+ap_tick_decide_rs
+
+# rustkern/bklsite.rs - #118: per-CALL-SITE Big Kernel Lock hold accounting.
+# The [SCHEDCORE] "maxhold=...@0xNNN" reason tag is read at RELEASE from a
+# per-cpu variable that every ISR and syscall ENTRY overwrites, so for any hold
+# longer than one 4 ms timer period it names the last interrupt to fire, not the
+# holder. These key the accounting on the depth-0 acquire return address
+# instead, which does name the holder. State is in cpu/smp.c because it is
+# written with interrupts masked inside the release path; the ranking decisions
+# are here, the same split as schedwatch.rs and tickwatch.rs.
+bklsite_add
+bklsite_top
+
+# rustkern/scprof.rs - #121: per-SYSCALL time census and read-path phase
+# attribution. bklsite (above) keys on the depth-0 acquire return address,
+# which names proc/syscall.asm:89 - the doorway EVERY syscall in the kernel
+# goes through - and so can never say which syscall, or what it was doing.
+# These key on the syscall NUMBER, and record for the worst call of each how
+# many interrupt entries happened during it and how many times the BKL hold was
+# broken by a context switch. State is in cpu/scprof.c (per-cpu storage plus
+# the probe brackets in the dispatch and block paths); the slot, merge, ranking
+# and self-check decisions are here, the same split as bklsite.rs.
+scprof_add
+scprof_top
+scprof_selfcheck
+
 # rustkern/schedwatch.rs - #67 SMP scheduler livelock diagnostic + run-queue
 # placement policy. sched_storm_verdict_rs is the ONLY one of these that runs on
 # every build regardless of g_smp_user_sched: it is the context-switch storm
@@ -396,6 +509,153 @@ sched_place_rs
 sched_steal_rs
 sched_core_pct_rs
 sched_watch_selftest_rs
+
+# rustkern/cpuobs.rs - #83: "which core is this task on", made answerable.
+# process_t::running_cpu had exactly ONE writer (the end of sched_rq_pop) and no
+# invalidator anywhere, so it recorded "which core last picked this up" and then
+# said it for ever - for tasks that were since blocked, sleeping, or running
+# elsewhere. proc/process.h now splits it into a live running_cpu (published at
+# the switch, cleared for the outgoing task) and a sticky last_cpu (the
+# placement hint, which is what the merged field was really computing).
+# These own the ACCOUNTING and the VERDICTS over caller-built snapshots; the two
+# stores stay in C next to the switch asm, the same split as schedwatch.rs.
+# sched_cpuobs_note_rs runs on EVERY context switch on every build.
+sched_cpuobs_note_rs
+sched_cpuobs_distinct_rs
+sched_cpuobs_migrations_rs
+sched_cpuobs_switchins_rs
+sched_cpuobs_drops_rs
+sched_cpuobs_last_mig_rs
+sched_cpuobs_live_verdict_rs
+sched_cpuobs_selftest_rs
+
+# rustkern/rqlock.rs - #143 part 2: is the run-queue lock the bottleneck?
+# Judges one ~4s reporting window of the counters C collects at the lock.
+# The counters are incremented in C because they sit on the scheduler hot
+# path with interrupts masked; only the arithmetic is here. Called once per
+# window from sched_smp_report(), never on the hot path.
+rqlock_verdict_rs
+rqlock_contended_pct_rs
+rqlock_held_pct_rs
+rqlock_selftest_rs
+
+# rustkern/bklstat.rs - #166: the BKL's per-window deltas and the invariants
+# that say when they are lying. The counter STORES stay in C (hot, asm-bracketed
+# bkl_take_locked path); this is the once-per-4s arithmetic that was wrong.
+bkl_window_rs
+bkl_window_bad_rs
+bkl_stat_selftest_rs
+
+# rustkern/hdadma.rs - #71: did the HD Audio output stream DMA engine actually
+# RUN while a sound was supposed to come out? A single LPIB read cannot tell
+# "stopped" from "we looked at the wrong moment", which is exactly how build
+# 1932s AUDIOLOG produced a RUN=0/LPIB=0 snapshot taken before the tone had
+# played and three theories were built on it. These are pure functions over a
+# two-read delta plus elapsed REAL time (mono_us, never timer_ticks); the MMIO
+# reads and the sleep live in drivers/hda.c.
+hda_dma_bytes_advanced_rs
+hda_dma_expected_bytes_rs
+hda_dma_bytes_per_sec_rs
+hda_dma_rate_permille_rs
+hda_dma_verdict_rs
+hda_dma_verdict_name_rs
+# -------------------------------------------------------------------- sinkown
+# #205 pass 2: the PCM mixer is now the only legitimate opener of the ONE
+# hardware output stream, because every other producer pushes into it. These
+# make that IMPOSSIBLE TO BREAK rather than merely true today: audio_open()
+# claims the sink and a second caller is refused a stream at all, so it has
+# nothing to write through. Same shape as fbown.rs/fetchown.rs/blkstage.rs.
+# Pure state machine over one token, no allocation, no MMIO, no dereference of
+# the token it is given.
+sink_claim_rs
+sink_release_rs
+sink_is_owner_rs
+sink_owner_rs
+sink_stats_rs
+sink_selftest_rs
+# --------------------------------------------------------------------- pcmmix
+# #205: drivers/audio_pcm.c used to serve ONE producer, so /APPS/FMSYNTH holding
+# the sink for a DOS session silenced /APPS/MIDIPLAY with EBUSY on the owner's
+# machine. These are the arithmetic behind the mixer that replaced that: linear
+# resample of one source into a shared stereo accumulator, and a SATURATING
+# clamp back down to S16 (a wrap would turn two loud producers into white
+# noise). Integer only, as the kernel target requires. No rings, no locks, no
+# allocation; audio_pcm.c owns all of those.
+pcm_mix_add_rs
+pcm_mix_finish_rs
+pcm_mix_step_rs
+pcm_mix_selftest_rs
+# ---------------------------------------------------------------------- pcmeq
+# #231r: the 5-band graphic equaliser's ACTUAL per-band DSP, and the reason the
+# tray control is allowed to exist again. #231 (8a5fcee5) deleted the previous
+# EQ because its faders "write a static int g_eq[5] that only the fader itself
+# reads - no EQ syscall exists and it is not even persisted". These are the
+# missing half: five cascaded fixed-point RBJ biquads per channel (Q28
+# coefficients, Q24 design intermediates, TDF2 state in i64), applied POST-MIX
+# to audio_pcm.c's summed accumulator, i.e. a master EQ. Integer only, as the
+# kernel's soft-float/-mno-sse target requires. A flat EQ is BYPASSED, so the
+# EQ-disabled path stays bit-identical. No rings, no locks, no allocation.
+# pcm_eq_selftest_rs is a real per-band SPECTRAL measurement (5x5 matrix in
+# tenths of a dB, printed to /AUDIOLOG.TXT every boot), not a plumbing check,
+# because "the fader moved" is exactly the evidence #231 rejected.
+pcm_eq_process_rs
+pcm_eq_session_start_rs
+pcm_eq_set_rs
+pcm_eq_get_rs
+pcm_eq_bands_rs
+pcm_eq_freq_rs
+pcm_eq_db10_rs
+pcm_eq_active_rs
+pcm_eq_reset_rs
+pcm_eq_frames_rs
+pcm_eq_peak_state_rs
+pcm_eq_selftest_rs
+pcm_eq_bench_rs
+# ------------------------------------------------------------------ hdastarve
+# #189: an HDA output stream replays its BDL forever once RUN is set, so a
+# producer that stops feeding leaves its last ring lap looping (measured: 0.743
+# s repeating for 60+ s). These decide which slots the DMA has finished, how
+# many the producer may claim, and prove the silencer's window and the
+# producer's window can never alias after the modulo. Free-running slot
+# counters, no floats, no allocation; the memset/memcpy and MMIO are in
+# drivers/hda.c.
+hda_starve_advance_rs
+hda_starve_zero_count_rs
+hda_starve_sil_floor_rs
+hda_starve_resync_rs
+hda_starve_avail_slots_rs
+hda_starve_selftest_rs
+# AUDLEAD: starvation ACCOUNTING, split from the repair path above. resync_rs
+# already knew the producer had run dry every single time it fired, and said
+# nothing, so the only report anyone could make was "it sounds stuttery".
+# deficit_rs is the magnitude of exactly what resync_rs is about to repair;
+# lead_rs is the healthy buffer depth measured against LPIB rather than against
+# a tick counter that stops being a wall clock precisely when the machine is
+# too busy. Pure functions over the same two counters, no MMIO, no allocation.
+hda_starve_deficit_rs
+hda_starve_lead_rs
+hda_starve_stat_selftest_rs
+# #173: the question one step earlier than the DMA verdict. Did the RUN
+# bit actually get set, and if not, was it a stale playing-shadow (the
+# real iMac14,4 fault: the driver believed the stream was already running
+# over an engine something else had stopped) or a controller that refused
+# the write? Pure logic over the SDnCTL reads bracketing the write.
+hda_start_verdict_rs
+hda_start_verdict_lpib_rs
+hda_start_verdict_name_rs
+
+# rustkern/tickwatch.rs - #745 (#62): is the periodic tick actually being
+# DELIVERED? Every timer in this OS is downstream of one interrupt (the 8254
+# PIT on IRQ0, vector 32), nothing measured whether it arrives, and on the
+# owner's iMac14,4 the evidence says it sometimes does not. These are pure
+# decision functions; the port/MMIO access and the state are in cpu/tickwatch.c.
+# The verdict function deliberately takes elapsed REAL time as a separate
+# argument: timer_ticks is the counter under test and can never be its own
+# reference.
+tick_health_verdict_rs
+tick_permille_rs
+tick_synth_decide_rs
+tick_watch_selftest_rs
 
 # ---------------------------------------------------------------------------
 # rustkern/seccore.rs - #624 CPU security core. Owns the CPUID feature decode
@@ -480,6 +740,12 @@ gfsf_enc_edge_revoke
 iso_vd_parse_rs
 iso_dirrec_at_rs
 iso_name_decode_rs
+# #184: a well-formed volume descriptor is not the same fact as a present disc.
+# These two answer "is what the descriptor points at actually in the file", which
+# iso_vd_parse_rs deliberately does not (it only sees one sector). New code, so
+# Rust-only with no C twin and nothing in the boot differential to compare.
+iso_root_within_rs
+iso_vd_declared_bytes_rs
 
 # ---------------------------------------------------------------------------
 # rustkern/certname.rs - #tls-certfix. X.509 subjectAltName parsing (length
@@ -529,6 +795,12 @@ pw_policy_info_rs
 pwpolicy_selftest_rs
 
 # ---------------------------------------------------------------------------
+# rustkern/intelgpu.rs - Intel integrated GPU IDENTIFICATION (detection only).
+# Pure device-id -> generation/name classification plus a boot property test.
+# No MMIO, no display registers. Called from drivers/intel_gpu_detect.c.
+intelgpu_ident_rs
+intelgpu_selftest_rs
+
 # rustkern/hidmap.rs - #763: HID usage -> PS/2 set-1 scancode translation
 hid_usage_to_set1_rs
 hidmap_selftest_rs
@@ -538,13 +810,257 @@ drvmap_class_for_fmt_rs
 drvmap_alloc_rs
 drvmap_place_rs
 drvmap_mscdex_rs
+drvmap_ioctl_removable_rs
+drvmap_ioctl_attrword_rs
 drvmap_path_ok_rs
+# #193: splits /WINDIR/DRIVE_<L>/... into (letter index, path inside the drive).
+# The ONE definition of what a native drive path looks like; fs/fat.c and
+# proc/syscall_path.h both route through it so the fat layer and the syscall
+# layer cannot disagree about whose file a path is.
+drvmap_windir_split_rs
+
+# rustkern/dosovl.rs - #rawrite: the PER-USER WRITE OVERLAY for a DOS game
+# directory. Pure path policy plus the per-title registry; the filesystem half
+# is dos/dospath.c (dos_overlay_prepare) and the resolve half is
+# dos/int21svc.c (overlay_apply, find_step). Owner: the DOS guest layer.
+dosovl_map_rs
+dosovl_title_rs
+dosovl_selftest_rs
+
+# rustkern/usbvol.rs - #740: DATA VOLUMES in the unpartitioned tail of the boot
+# device, so a game whose data does not fit in the 1.62 GB OS image (Discworld 2
+# is 1.54 GB compressed) can be read off the stick instead. Owner: dos/usbvol.c,
+# which does the I/O; every offset and length it uses is first checked here,
+# because they all come off an untrusted medium. dos/imgfile.c consumes the
+# result as a raw block-device backing. See the header of usbvol.rs for why the
+# tail and not a third GPT partition.
+usbvol_iso_extent_rs
+usbvol_range_ok_rs
+usbvol_next_off_rs
+usbvol_consts_rs
+usbvol_selftest_rs
+
+# rustkern/doswin.rs - #745 (local 105): where a DOS guest's fixed-resolution
+# screen sits inside a host window the user can resize. Letterbox geometry,
+# shared by the present path and the mouse-input path so they cannot drift.
+dos_letterbox_rs
+dos_letterbox_selftest_rs
+# #163: displayed rows from the CRTC's vertical timing (Vertical
+# Display End / Start Vertical Blank / scanlines per row).
+dos_vga_rows_rs
+dos_vga_rows_selftest_rs
+
+# rustkern/dosmick.rs - (#mickey) what a DOS guest is TOLD the mouse did. A DOS
+# mouse driver is relative and reports mickeys; our pointer is absolute. Owns
+# the unit-gain counters, the separate 0Bh accumulator, and the clamp-homing
+# state machine that puts a mickey-integrating guest pointer (The Dig) under
+# the host cursor instead of 2x away from it.
+dos_mick_reset_rs
+dos_mick_arm_home_rs
+dos_mick_move_rs
+dos_mick_take_rel_rs
+dos_mick_next_rs
+dos_mick_phase_done_rs
+dos_mick_tick_rs
+dos_mick_selftest_rs
+
+# rustkern/dosmem.rs - #745: XMS 3.0 (extended memory) and LIM EMS 4.0 (expanded
+# memory) for the 16-bit DOS guest. These are the reason Disney's Aladdin gets
+# past "XMS allocation error..": the wall was memory managers, not opcodes.
+#
+# NOTE FOR ANYONE TEMPTED TO DELETE ONE. Neither manager is reached through an
+# obvious call site. XMS is reached by a FAR CALL to an address handed out by
+# INT 2Fh AX=4310h, through the interpreter's far-call trap; EMS is reached only
+# after the guest OPENS "EMMXXXX0" as a file and IOCTLs the handle. So a
+# grep for callers under-counts both, and the dispatchers look dead. They are
+# not: dos/dosexec.c holds the only C references.
+# rustkern/dosmcb.rs - #172: what INT 21h AH=48h reports as the largest
+# free block, and AH=26h Create New PSP. The free-space report used to be
+# 0xA000 - bump_pointer, which answers 2 paragraphs once a guest has done
+# the standard allocate-high dance, whatever is actually free below.
+# Stunts' LOAD.EXE asks exactly that question and exits on the answer.
+dos_mcb_largest_free_rs
+dos_psp_create_rs
+dos_mcb_selftest_rs
+
+# rustkern/dospit.rs - #172: the 8253/8254 PIT channel register protocol
+# (control word, counter latch, lo/hi byte toggle), used by BOTH channel 0
+# and channel 2. dosexec.c emulated channel 0 only and answered port 0x42
+# with 0xFF, which made Stunts' channel-2 delay loop unterminatable.
+dos_pit_ctrl_rs
+dos_pit_read_rs
+dos_pit_write_rs
+dos_pit_selftest_rs
+# #175 rustkern/opl2.rs - AdLib/OPL2 detection protocol for the DOS guest.
+# DETECTION ONLY: no FM synthesis anywhere in this module, deliberately.
+dos_opl2_status_rs
+dos_opl2_addr_rs
+dos_opl2_data_rs
+dos_opl2_init_rs
+dos_opl2_writes_rs
+dos_opl2_selftest_rs
+
+# #181 rustkern/dossb.rs - Sound Blaster DSP command protocol + 8237A DMA
+# channel state for the DOS guest. NO FM synthesis (that is #182/opl2.rs) and
+# no synthesis of any kind: the guest supplies the PCM.
+dos_sb_init_rs
+dos_sb_reset_rs
+dos_sb_read_rs
+dos_sb_write_rs
+dos_sb_raise_irq_rs
+dos_sb_irq_pending_rs
+dos_sb_block_done_rs
+dos_sb_u8_to_s16_rs
+dos_sb_selftest_rs
+dos_dma_init_rs
+dos_dma_out_rs
+dos_dma_in_rs
+dos_dma_page_rs
+dos_dma_cur_phys_rs
+dos_dma_phys_at_rs
+dos_dma_playback_armed_rs
+dos_dma_autoinit_rs
+dos_dma_block_bytes_rs
+dos_dma_set_played_rs
+# #182 rustkern/fmq.rs - the DOS OPL2 register-write bridge to Ring 3.
+# The kernel does NOT synthesise. There is exactly one FM core and it lives in
+# userland/lib/opl2, because the kernel is -mno-sse soft-float and because a
+# second implementation is this project's signature failure. These six carry the
+# guest's register writes, in order and timestamped with mono_us(), to
+# /APPS/FMSYNTH via SYS_DOS_FM_EVENTS.
+dos_fmq_open_rs
+dos_fmq_close_rs
+dos_fmq_push_rs
+dos_fmq_drain_rs
+dos_fmq_status_rs
+dos_fmq_selftest_rs
+
+# #176 rustkern/dosbus.rs - what a guest port access costs in emulated time.
+# An 8-bit ISA I/O cycle is a bus transaction, not a CPU operation, and the
+# era's delay loops are written as port reads precisely because of that.
+dos_bus_init_rs
+dos_bus_charge_rs
+dos_bus_selftest_rs
+# (#252) The same accumulator, charged an explicit interval instead of one bus
+# cycle. A BIOS wait (INT 15h AH=86h) is non-instruction emulated time and must
+# land in the SAME ticks_charged dos_emu_clock_rate() reads, or it advances the
+# guest's clock past the wall clock.
+dos_bus_charge_us_rs
+
+# (#252) rustkern/dosint15.rs: INT 15h AH=86h, the BIOS WAIT. Monkey Island
+# times its AdLib probe's 80 us with this call rather than with port reads, so
+# #176's bus cost never reached it and the probe concluded "no chip".
+dos_int15_rs
+dos_int15_selftest_rs
+
+dos_xms_state_size_rs
+dos_xms_init_rs
+dos_xms_dispatch_rs
+dos_xms_report_rs
+dos_ems_state_size_rs
+dos_ems_init_rs
+dos_ems_dispatch_rs
+dos_ems_report_rs
+dos_mem_selftest_rs
+
+# rustkern/modex.rs - #740: Mode X (unchained 256-colour VGA). ONLY the thing no
+# other video mode needs: what RESOLUTION the guest is in, derived from the CRTC
+# because Mode X has no mode number to look it up by. Everything else (stride,
+# start address, Line Compare, pan, Map Mask, Chain-4, Read Map Select) comes
+# from dos_vga_decode_geom() in dosexec.c, which is the one decode every
+# presenter shares.
+# Callers: dos_present_modex(), dos_present_aspect() and the launch selftest,
+# all in kernel/dos/dosexec.c.
+dos_modex_geom_rs
+dos_modex_selftest_rs
+
+# rustkern/doscrtc.rs - #740: WHAT AN INT 10h MODE SET LEAVES IN THE CRTC, and
+# the ONE definition of the CRTC-0x13 "unprogrammed" sentinel that decides the
+# framebuffer row length. A real BIOS mode set writes all 25 CRTC registers;
+# ours wrote a subset and inherited 0x0C/0x0D (start) and 0x13 (Offset) from
+# whatever mode ran before, which are exactly the three whose ZERO value the
+# decode reads as "use the mode default". Aladdin sets mode 0Dh then 13h, so
+# the mode-0Dh Offset of 0x14 (40 bytes) survived and the chained presenter
+# read the framebuffer at 40 bytes per row instead of 320 -> eight identical
+# vertical columns.
+# Callers: int10() mode-13h set and dos_vga_decode_geom(), both in
+# kernel/dos/dosexec.c, plus the launch selftest.
+dos_crtc_seed_mode13_rs
+dos_crtc_stride_rs
+dos_crtc_selftest_rs
 drvmap_selftest_rs
+
+# rustkern/dpmi_rmcs.rs (#740) - DPMI FUNCTION 0300h, simulate real-mode
+# interrupt: the bridge by which a 32-bit DOS/4GW guest reaches the ONE INT
+# 21h service core (#736). Owner: dos/dpmi_rmcs.c, which holds the layout
+# locks and the default service router. The four dpmi_arena_* symbols are
+# THE guest-memory bounds chokepoint and are bound into dos_svc_ctx_t.mem,
+# so they are called through a vtable and an `nm`-visible C caller is not
+# proof any of them is reachable; this manifest is.
+dpmi_rmcs_call_rs
+dpmi_rmcs_stats_rs
+dpmi_rmcs_layout_selftest_rs
+dpmi_arena_rd8_rs
+dpmi_arena_wr8_rs
+dpmi_arena_rd16_rs
+dpmi_arena_wr16_rs
 
 # instdisk.rs (#306) - install-target enumeration. Owner: installer (gui/installer.c).
 # Callers: installer_autoinstall_worker() and the future /APPS/INSTALL syscall path.
 inst_enumerate_targets
 inst_target_installable
+
+# ktime.rs (#115, local 120) - the kernel's ONE calendar-time converter and the
+# ONE wall clock a filesystem may stamp a file with. Owner: fs/fat.c, fs/ext2.c
+# and proc/syscall.c (sys_stat_path). Before #115 there was no shared converter
+# at all and three private, mutually inconsistent ones (see the module header).
+ktime_civil_to_unix_rs
+ktime_dos_to_unix_rs
+ktime_unix_to_dos_rs
+ktime_selftest_rs
+wallclock_now_unix_rs
+# #113: the realtime clock (epoch microseconds) that time()/gettimeofday() are
+# built on, plus the epoch -> civil direction #86's login clock needs to render
+# a LOCAL date, plus its provably-RED self-test.
+realtime_us_rs
+realtime_sec_rs
+realtime_steps_rs
+ktime_unix_to_civil_rs
+rtclock_selftest_rs
+# #234a: the same clock in the shape a DOS guest asks for it (INT 21h AH=2Ch/2Ah,
+# INT 1Ah AH=00/02/04). Owner: dos/int21svc.c and dos/dosexec.c. Exists because
+# all three of those answered a compile-time constant, which hung Epyx Rogue.
+ktime_dos_clock_rs
+
+# ktz.rs (#86) - the kernel's reader for the timezone the user chose. A PARSER,
+# not a second zone list: the TZ.CFG token encodes its own offset.
+ktz_parse_offset_rs
+ktz_selftest_rs
+
+# cfgread.rs (#192) - the ONE decision of whether a config-file read outcome
+# deserves a log line and how loud it should be. Owners: proc/users.c's
+# fat_read_file_retry() and gui/clock.c's timezone refresh. It exists because an
+# ABSENT /CONFIG file (the normal state of an unconfigured setting) was reported
+# as "read FAILED/empty ... giving up", three lines at a time, every 2 seconds,
+# forever. cfgread_abi_check_rs is not decorative: it locks fs/cfgread.h's
+# constants to this module's, because swapping NOTE and WARN would silently
+# downgrade every genuine fault.
+cfgread_report_rs
+cfgread_abi_check_rs
+cfgread_selftest_rs
+
+# rtcenc.rs (#135) - THE MC146818 register codec, both directions. Owner:
+# drivers/rtc.c, which is the only file that touches the chip. These exist
+# because the tree previously had FOUR hand-rolled DECODERS that consulted
+# Status Register B and ONE hand-rolled ENCODER that did not, and that
+# asymmetry shipped a permanent 6h06m clock error on any binary-mode RTC.
+# If the ENCODE half ever goes missing while the DECODE half builds, the same
+# class of bug comes straight back, so both halves are declared together.
+rtc_encode_field_rs
+rtc_decode_field_rs
+rtc_encode_hour_rs
+rtc_decode_hour_rs
+rtc_selftest_rs
 
 # sntp.rs (#797) - SNTP (RFC 4330) reply validation + civil-time conversion.
 # Owner: net/sntp.c. This is the check that decides whether a packet off the
@@ -560,6 +1076,7 @@ sntp_selftest_rs
 # New code, not a port: no _c twin and no -DRUST_* flag.
 net_status_build_rs
 net_probe_rs
+net_set_dns_rs
 
 # ---------------------------------------------------------------------------
 # rustkern/aiguard.rs - #745 LLM prompt-injection screen. New code, not a port:
@@ -584,6 +1101,44 @@ fetchown_owner_rs
 fetchown_note_exit_release_rs
 fetchown_stats_rs
 fetchown_selftest_rs
+
+# rustkern/fdown.rs - #fdguard: legacy fd table (fd_table/e2fd/smbfd) per-slot
+# thread-group ownership, so a Ring 3 process cannot read/write/close another
+# process's open file by fd number. Same shape as fetchown.rs/fbown.rs.
+fdown_slots_rs
+fdown_claim_rs
+fdown_release_rs
+fdown_check_rs
+fdown_owner_rs
+fdown_mark_dead_if_owner_rs
+fdown_refusals_rs
+fdown_exit_marks_rs
+fdown_selftest_rs
+
+# rustkern/ptsown.rs - #fdguard: /dev/pts/N pair ownership, so a process
+# cannot attach to a terminal it did not create and is not attached to.
+ptsown_slots_rs
+ptsown_claim_rs
+ptsown_release_rs
+ptsown_owner_rs
+ptsown_note_refusal_rs
+ptsown_refusals_rs
+ptsown_selftest_rs
+
+# rustkern/blkstage.rs - #SB single-owner claim over the block-write staging
+# (bounce) buffer. Removes the payload-theft race that destroyed the ext2
+# primary superblock on golden build 2215. blkstage_unsafe_base_rs is NOT
+# listed: it is cfg-gated to BLKSTAGE_UNSAFE builds and must never exist in a
+# shipping kernel.
+blkstage_install_rs
+blkstage_token_rs
+blkstage_free_rs
+blkstage_try_claim_rs
+blkstage_release_rs
+blkstage_seal_rs
+blkstage_verify_rs
+blkstage_stats_rs
+blkstage_seal_broken_rs
 
 # rustkern/fbown.rs - #745 (task #59) framebuffer claim ownership + lifetime
 fbown_arm_rs
@@ -624,7 +1179,356 @@ pgrp_resolve_pgid_rs
 pgrp_setpgid_decide_rs
 pgrp_selftest_rs
 
+# rustkern/pipewr.rs - #111 the pipe WRITE-side decision machine: blocking
+# write, SIGPIPE, and the partial-write rules. Owner: fs/pipe.c
+# (pipe_write_fn). No -DRUST_* flag and no C twin: before #111 the write side
+# had no state machine, so there is nothing to strangle.
+pipe_write_step_rs
+pipe_write_step_selftest_rs
+
 # rustkern/pollsys.rs - #745 (local 82) poll(2)
 sys_poll_rs
 poll_bits_match_rs
 pollsys_selftest_rs
+
+# rustkern/winbuf.rs - #137: how big a window content buffer may be, and how
+# many bytes it needs. Owner: proc/syscall.c (sys_win_create, win16_host_create,
+# the nochrome-panel path, sys_win_blit growth, sys_win_draw_image). Before this
+# the size came from an unvalidated Ring-3 int multiply.
+winbuf_bytes_rs
+winbuf_geom_ok_rs
+# #221: one window's WINDOW_FLAG_* -> the stable WIN_STATE_* bitmask its own
+# process sees through SYS_WIN_GET_STATE.
+winstate_bits_rs
+
+# rustkern/winblit.rs - #blitguard: the geometry contract of sys_win_blit().
+# NEW code, so there is no <fn>_c twin and no -DRUST_* strangler flag.
+# Owner: proc/syscall.c (sys_win_blit). winblit_plan_rs decides the whole blit
+# before a user byte is touched: it REFUSES src_w/src_h < 1 (src_h == 0 drove
+# the source row index to -1, reading up to 256 KiB BELOW an attacker-named
+# pointer, while making the #503 argtab length compute ZERO so the choke point
+# skipped the range entirely), and CLAMPS the destination to the content buffer
+# that actually exists (a failed grow used to run the write loop off the end of
+# a kernel heap allocation). winblit_scale_row_rs is the nearest-neighbour inner
+# loop, which never sees a user pointer: the caller bounces each source row
+# through copy_from_user first.
+winblit_plan_rs
+winblit_scale_row_rs
+
+# rustkern/le.rs - #740: LE (Linear Executable) parse, relocate and load for
+# DOS/4GW. NEW code, so there is no `<fn>_c` twin and no -DRUST_LE flag: the
+# whole parser is Rust and the C in exec/le.c only does file I/O and printing.
+# The reference implementation is the HOST harness tools/le-harness/le.c.
+# Owner: kernel/exec/le.c (le_info_dump, le_load_test, le_boot_selftest).
+# The input is a downloaded game binary and is treated as hostile: every read
+# is Option-returning, because a panicking index here HALTS THE CPU.
+le_strerror_rs
+le_find_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/go32.rs (#211) - the go32/DJGPP v2 i386 COFF loader. Owner:
+# kernel/exec/go32.h, called from dos/dosexec.c go32_prepare(). This is the
+# format only: where the image goes, and the descriptors it is entered with,
+# are the host s decisions and live in C next to the run loop that shares them
+# with the DOS/4GW guest.
+# ---------------------------------------------------------------------------
+go32_parse_rs
+go32_strerror_rs
+go32_load_rs
+go32_stubinfo_size_rs
+go32_stubinfo_build_rs
+go32_report_rs
+go32_selftest_rs
+le_parse_rs
+le_page_entry_rs
+le_page_file_off_rs
+le_page_object_rs
+le_page_linear_rs
+le_fixup_hist_rs
+le_fixup_at_rs
+le_fixup_page_range_rs
+le_relocate_rs
+le_load_rs
+le_validate_rs
+le_selftest_rs
+le_sizeof_image_rs
+le_sizeof_fixup_rs
+le_sizeof_hist_rs
+le_sizeof_stats_rs
+le_sizeof_valid_rs
+# rustkern/x86_32.rs - #740: the 32-bit protected-mode guest execution core
+# (DOS/4GW). Owner: kernel/exec/x86_32.h + exec/x86_32_test.c, and, when it
+# lands, the DPMI host. These are NOT behind a -DRUST_* strangler flag: there is
+# no C predecessor to strangle, so the link IS the backstop for x86_32_run, but
+# not for the other four, which only the oracle self-test calls today.
+x86_32_run
+x86_32_init
+x86_32_cpu_size
+x86_32_read_guest
+x86_32_write_guest
+# M4: asynchronous interrupt delivery INTO the guest (the events-IN direction).
+# Called only from dos/dosexec.c dos4gw_timebase(), at the instruction boundary
+# x86_32_run() returns on. Its return path is IRETD in the same core.
+x86_32_inject_int
+# (#740 digplay) a far CALL into the guest, for an INT 33h 0Ch/14h mouse event
+# handler installed by a NATIVE protected-mode INT 33h. It returns with RETF,
+# not IRET, so it cannot be delivered through x86_32_inject_int's gate frame.
+# Called only from dos/dosexec.c dos4gw_mouse_events().
+x86_32_inject_farcall
+# #740 doom-present: the VGA-aperture memory hook this core did not have.
+# Without it, a DOS/4GW guest's writes into an unchained (Mode X) framebuffer
+# landed as flat stores into the shared `mem` arena and never reached the
+# per-plane storage dos_present_modex() reads, presenting a permanently
+# zero-filled flat colour for every Mode X DOS/4GW title. Called once from
+# dos/dosexec.c right after x86_32_init() when a 4GW module is loaded.
+x86_32_set_mem_hook
+x86_32_set_sel_base_cb
+x86_32_set_low_watch
+
+# (#rafault) The branch trace. Owner: kernel/exec/x86_32.h + dos/dosexec.c's
+# dos4gw_dump_derail(). Armed only under /CONFIG/DOSDIAG.CFG; a diagnostic, not
+# a shipped feature, and the golden never calls x86_32_btrace(1, ...).
+x86_32_btrace
+x86_32_btrace_on
+x86_32_btrace_dump
+
+# ---------------------------------------------------------------------------
+# rustkern/x87.rs (#211) - the x87 EXECUTION UNIT for the 32-bit guest core.
+# The numeric results all come from exec/softfpu.c, which is the SAME
+# arithmetic the Win16 layer's software x87 uses; this module owns the
+# register stack, the control/status words and the encodings.
+#
+# Only the self-test is exported. The unit itself is called from
+# rustkern/x86_32.rs's D8..DF arm, i.e. Rust to Rust, so there is nothing for
+# a C extern to get wrong. Owner of the export: kernel/exec/x86_32.h, driven
+# from dos/dos4gw.c's boot self-test report.
+# ---------------------------------------------------------------------------
+x87_selftest_rs
+
+
+# rustkern/vbe.rs - #740: VESA BIOS Extensions (VBE 1.2) for the DOS guest.
+# The mode table, the two spec-defined structure layouts, the guest-visible
+# video-BIOS ROM blob and the whole INT 10h AH=4Fh dispatcher. Callers: the
+# glue in dos/dosexec.c (int10() case 0x4F, dos_run_file() at launch).
+# Banked at A000:0000 only, no linear framebuffer: see the module header and
+# docs/VESA_VIDEO_DESIGN.md F1 for why an LFB is UNREACHABLE, not merely slow.
+vbe_build_rom_rs
+vbe_dispatch_rs
+vbe_selftest_rs
+vbe_vram_bytes_rs
+vbe_present_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/cga.rs (#212) - the CGA GRAPHICS presenter, modes 04h/05h/06h.
+# Owner: the marshalling in dos/dosexec.c (dos_present_cga, called from
+# dos_present_inner) and the mode-set / AH=0Bh / port-0x3D9 arms beside it.
+#
+# It exists because dos_present_inner() had arms for VESA, text, EGA planar
+# and mode 13h ONLY, so every CGA graphics mode fell off the end of
+# "if (t->video_mode != 0x13) return;" and drew NOTHING: the window kept the
+# compositor's uniform grey. /DOS/JOUST/JOUST.COM sets mode 04h as its first
+# act, which is the whole of #212.
+cga_present_rs
+cga_selftest_rs
+# ---------------------------------------------------------------------------
+# rustkern/dos4gw.rs (#740) - THE REGISTER-FRAME BRIDGE for a 32-bit DOS/4GW
+# guest: the answer to rustkern/x86_32.rs's X32_EXIT_INT. Owner:
+# kernel/dos/dos4gw.{c,h} and the dos_run_le() path in kernel/dos/dosexec.c.
+#
+# New logic with no C predecessor, so no _c twin and no -DRUST_* strangler
+# flag; the link is not the backstop either, because the whole point of this
+# module is that it RUNS: dos4gw_selftest_rs is driven at every boot and
+# dos4gw_report_rs prints the MISS histogram of a real guest.
+#
+# The state object is OPAQUE to C (it allocates dos4gw_state_size_rs() bytes
+# and never reads a field), so this manifest is the entire declared surface;
+# there is no #[repr(C)] mirror to drift and no _Static_assert set.
+# ---------------------------------------------------------------------------
+dos4gw_state_size_rs
+dos4gw_xfer_max_rs
+dos4gw_init_rs
+dos4gw_int21_pre_rs
+dos4gw_int21_post_rs
+dos4gw_int_pre_rs
+dos4gw_int_post_rs
+dos4gw_int_refuse_rs
+dos4gw_int31_pre_rs
+dos4gw_int31_post_rs
+dos4gw_dpmi_mem_rs
+dos4gw_report_rs
+dos4gw_miss_count_rs
+dos4gw_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/hidrepd.rs - #162: HID REPORT DESCRIPTOR parse (usage page 0x0C,
+# Consumer) so the volume/mute media keys can be found on a device that says
+# nothing useful in its interface descriptor. drivers/usb_hid.c owns the
+# HidConsMap storage; its layout is sizeof-locked by a _Static_assert in
+# drivers/usb_hid.h against the const assert in the Rust module.
+# ---------------------------------------------------------------------------
+hidrepd_parse_rs
+hidrepd_decode_rs
+hidrepd_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/sysvol.rs - #162: THE system master-volume/mute state machine. One
+# holder of the level, driven by SYS_SET_VOLUME/SYS_SET_MUTE, the media keys
+# and SYS_VOL_STATE alike. See drivers/sysvol.h for the C surface.
+# ---------------------------------------------------------------------------
+sysvol_key_rs
+sysvol_set_rs
+sysvol_mute_rs
+sysvol_get_rs
+sysvol_muted_rs
+sysvol_state_rs
+sysvol_dirty_rs
+sysvol_apply_rs
+sysvol_applied_count_rs
+sysvol_selftest_rs
+
+# rustkern/hotplug.rs - #250: THE removable-volume surface the GUI reads, and
+# the mount-point path matcher that decides which volume a path belongs to.
+# See drivers/hotplug.h for the C surface (hotplug_raw_t, hotplug_resolve_path).
+hotplug_path_split_rs
+hotplug_vol_list_rs
+hotplug_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/wakeloss.rs (#167) - verdict for the block/wake race reproducer in
+# proc/wakeloss.c. Decides which waiter has stopped making progress while the
+# waker kept kicking, and proves itself red-and-green at boot.
+# ---------------------------------------------------------------------------
+wakeloss_verdict_rs
+wakeloss_selftest_rs
+# ---------------------------------------------------------------------------
+# rustkern/fstatkind.rs - #120 the file-KIND classification behind SYS_FSTAT.
+# C face + the type layout are in fs/vfs.h; the layout is locked by a
+# _Static_assert in proc/syscall_argtab_lock.c.
+# ---------------------------------------------------------------------------
+fstat_kind_rs
+fstat_kind_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/clickacct.rs - #197 click delivery ledger for the #334 test-input
+# channel. Splits a synthetic click into INJECTED / SAMPLED / ROUTED / HIT so
+# the gap between counts names the layer that lost it, instead of trusting an
+# ACK line that only ever proved the parser ran. clickacct_note_sample_rs is
+# called from sys_get_mouse() and also reports left-button EDGES, which is what
+# lets a CLICK latch its injected level until the compositor has genuinely
+# observed it rather than guessing with a fixed sleep.
+# ---------------------------------------------------------------------------
+clickacct_note_inject_rs
+clickacct_note_sample_rs
+clickacct_note_routed_rs
+clickacct_get_rs
+
+# --- rustkern/uiscale.rs: THE GLOBAL UI SCALE FACTOR -------------------------
+# Owner: UI/UX. One value, one place, reached by the kernel (theme metrics,
+# window chrome, the window-boundary transform) and by Ring 3 (SYS_UI_SCALE).
+# The _at_ variants take the factor explicitly and exist for exactly one
+# caller, uw_rescale_all(), which converts a live window between TWO factors
+# and must not grow a second rounding rule to do it. uiscale_selftest_rs is a
+# PROPERTY test, not a differential: there is no C original to differ against.
+uiscale_pct_rs
+uiscale_src_rs
+uiscale_gen_rs
+uiscale_set_pct_rs
+uiscale_max_pct_rs
+uiscale_auto_pct_rs
+uiscale_px_rs
+uiscale_px_at_rs
+uiscale_span_rs
+uiscale_unpx_rs
+uiscale_unpx_at_rs
+uiscale_selftest_rs
+uiscale_mark_native_rs
+uiscale_clear_native_rs
+uiscale_is_native_rs
+
+# rustkern/sessend.rs - #126: session teardown attribution. Which Ring 3
+# processes belonged to the desktop session that just ended (Log Out / Switch
+# User), so gui/desktop.c can end them at the login gate instead of handing a
+# live process of the OUTGOING user to the INCOMING one.
+sessend_should_kill_rs
+sessend_selftest_rs
+
+# --- rustkern/fwfilter.rs (#238: THE packet filter) ---
+fw_filter_rs
+fw_install_rs
+fw_get_config_rs
+fw_get_stats_rs
+fw_reset_stats_rs
+fw_default_config_rs
+fw_parse_cfg_rs
+fw_format_cfg_rs
+fw_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/mprotect.rs - #404 SYS_MPROTECT Ring-3 argument validation.
+# NOT a strangler port: there is no C twin and no -DRUST_* flag, because there
+# was never any C here. It is the privilege-boundary check for a new syscall,
+# and it is called unconditionally from sys_mprotect() in proc/syscall.c.
+# ---------------------------------------------------------------------------
+mprotect_validate_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/dragsess.rs - the cross-window drag session (Tier 5 "docking").
+# NOT a strangler port: there is no C twin and no -DRUST_* flag, because there
+# was never any C here. It is new kernel state whose whole risk surface is
+# copying a Ring-3-sized byte range into and out of fixed buffers and indexing
+# a fixed table by a Ring-3-supplied window handle, so it was written in Rust
+# under the 2026-07-16 Rust-by-default rule. Called from proc/syscall.c
+# (SYS_DRAG_*), gui/window.c has NO hook, and main.c runs the boot self-test.
+# ---------------------------------------------------------------------------
+drag_active_rs
+drag_accept_rs
+drag_begin_rs
+drag_peek_rs
+drag_win_accepts_rs
+drag_take_rs
+drag_release_rs
+drag_end_rs
+drag_cancel_win_rs
+drag_selftest_rs
+
+# rustkern/amlhid.rs - #ASUSKBD: does the firmware DECLARE a PS/2 keyboard?
+# A byte-pattern presence scan of the DSDT/SSDT AML for known input-device
+# _HID values. Deliberately NOT an AML interpreter; see the module header.
+amlhid_reset_rs
+amlhid_scan_rs
+# Generic EISAID presence count, exposed so the UI-scale laptop probe reuses
+# this scanner instead of forking a second one over hostile firmware bytecode.
+amlhid_count_eisaid_rs
+amlhid_selftest_rs
+
+# rustkern/battery.rs - #battmeter: control-method battery (_BIF/_BST)
+# percentage/state/time-remaining. A bounded, read-only constant-AML
+# evaluator (Return(Package{consts}) only; no Store/If/EC Field access - see
+# the module header for why that is a deliberate, safety-motivated limit)
+# plus the pure percent/state/minutes arithmetic, kept separate so it is
+# self-testable without synthesizing bytecode.
+battery_eval_method_rs
+battery_compute_rs
+battery_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/permhome.rs - #PERMSKIP: the shape predicate that replaced the
+# literal "/HOME/ADMIN" in perms_selftest(). A key is a user home if it is
+# "/HOME/" plus exactly one component; whatever the owner named the account,
+# it is found.
+# ---------------------------------------------------------------------------
+perm_home_shape_rs
+permhome_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/selftestreg.rs - #PERMSKIP: the register of self-test groups that
+# DECLINED TO RUN, so a boot summary can say so on a durable sink instead of
+# each subsystem printing a quiet SKIP of its own.
+# ---------------------------------------------------------------------------
+selftest_notrun_rs
+selftest_ran_rs
+selftest_notrun_count_rs
+selftest_notrun_overflow_rs
+selftest_ran_count_rs
+selftest_notrun_entry_rs
+selftestreg_selftest_rs

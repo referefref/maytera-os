@@ -116,6 +116,16 @@ void tz_local_now(tz_time_t *out);
 void tz_local_hms(int *hour, int *min, int *sec);
 void tz_local_date(int *day, int *month, int *year);
 
+// #148: a sortable local-time filename stamp, "YYYYMMDD-HHMMSS" (15 chars +
+// NUL), for any caller that names a file after the moment it was created
+// (screenshots today; anything else that wants "when was this captured" in
+// the name later). Goes through tz_local_now() like every other clock in the
+// OS - NOT a second RTC read, NOT a second offset application. `out` must
+// hold >= TZ_STAMP_LEN bytes. Zero-padded so lexical sort == chronological
+// sort (the whole point of a timestamp-named file over a counter).
+#define TZ_STAMP_LEN 16
+void tz_local_stamp(char *out, unsigned long cap);
+
 // Add off_min minutes to a full civil date-time, in place, with correct
 // day/month/year rollover in both directions. THE one implementation: local =
 // tz_shift(+offset), UTC-from-local = tz_shift(-offset).

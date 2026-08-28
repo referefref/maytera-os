@@ -160,6 +160,21 @@ typedef struct {
 // why a seek through the duplicate moves the original's file position. A
 // one-level handle array cannot express that, and every "dup" built on one is a
 // silent divergence waiting for the first program that relies on the sharing.
+// #234h: DOS CHARACTER DEVICES. A DOS program reaches the console, the printer
+// and the bit bucket by OPENING A NAME, not through a special API: "CON",
+// "NUL", "PRN", "AUX". Those names are not files and never were, and DOS
+// resolves them ahead of the filesystem from any directory and any drive.
+//
+// This mattered, MEASURED: The Dig (LucasArts, DOS/4GW) opens "CON" during
+// startup. With no device layer that became an ordinary path lookup,
+// `3Dh open FAIL '/WINDIR/DRIVE_E/DIG/CON'`, and the game exited 1 after 7,700
+// instructions. Nothing in the log said "unimplemented", because from the
+// filesystem's point of view nothing was: it was asked for a file that is not
+// there and correctly said so.
+#define DOS_CHARDEV_OPAQUE 1
+#define DOS_CHARDEV_CON    2
+#define DOS_CHARDEV_NUL    3
+
 typedef struct {
     int        refs;                      // handles pointing here; 0 = free
     int        streaming;                 // fat handle live (read path)
@@ -173,6 +188,24 @@ typedef struct {
     int        wrote;                     // a write-back has been attempted
     int        commit_failed;             // ... and it failed. 3Eh must report it.
     char       path[DOS_SVC_PATH_MAX];    // resolved NATIVE path (gate re-check)
+    // #745: nonzero when this handle is a CHARACTER DEVICE rather than a
+    // file. It has no fat_file_t and no buffer, so every path that would touch
+    // the filesystem must test this first.
+    //
+    // #234h: WHICH device, not just whether. It stays an int and every value is
+    // TRUTHY, so every pre-existing `if (f->chardev)` keeps its exact meaning
+    // and no call site had to be audited for a behaviour change; only the
+    // sites that now need to tell CON from NUL look at the value.
+    //
+    //   DOS_CHARDEV_OPAQUE  the EMS driver "EMMXXXX0". Opened by name as the
+    //                       first half of expanded-memory detection; reads and
+    //                       writes are consumed, and IOCTL is the point of it.
+    //   DOS_CHARDEV_CON     the console. Reads take the keyboard, writes reach
+    //                       the screen, i.e. the SAME con.getkey/con.putc the
+    //                       predefined handles 0/1/2 use. This is not a new
+    //                       console, it is the existing one reached by name.
+    //   DOS_CHARDEV_NUL     the bit bucket. Writes are consumed, reads are EOF.
+    int        chardev;
 } dos_svc_sft_t;
 
 // ---------------------------------------------------------------------------
@@ -190,6 +223,10 @@ struct dos_svc_ctx {
     void               *con_u;
     dos_svc_con_ops_t   con;
     int                 has_ivt;          // 25h/35h reach a real IVT at 0000:0
+    // #745: nonzero when an EMS manager is installed for this guest, so
+    // 3Dh may open "EMMXXXX0" as a character device. The DOS task sets it
+    // once its arena exists; the Win16 layer leaves it 0.
+    int                 has_ems;
     uint16_t            psp_seg;          // answered by AH=62h
     uint16_t            dos_version;      // AX answered by AH=30h. The DOS task
                                           // says 0005h (DOS 5.0); the Win16
@@ -200,6 +237,38 @@ struct dos_svc_ctx {
 
     // ---- DOS state ----
     char      appdir[128];                // relative opens resolve here
+
+    // #221b: THE LAUNCHING USER'S HOME DIRECTORY, native form, no trailing
+    // slash. Empty means "this guest has no resolvable home", and the token
+    // below is then left alone rather than expanded to something wrong.
+    //
+    // WHY A GUEST NEEDS THIS AT ALL. A DOS program keeps its state (save game,
+    // high score, preferences) next to its executable, because DOS had one
+    // user. On this system /DOS/<GAME> is root-owned 0755, so a desktop
+    // session running as uid 1000 is refused every one of those writes: the
+    // measured symptom was NetHack printing "Warning: cannot write record" and
+    // "Some invalid directory locations were specified: leveldir, savedir,
+    // bonesdir, scoredir, lockdir, troubledir" and then exiting. The game's
+    // own config file can point those elsewhere, but a DOS path is a FIXED
+    // STRING and cannot say "the current user's home", so there was no
+    // per-user destination any DOS-era config could name. This field is that
+    // destination, and dos_svc_resolve() expands "%HOME%" to it.
+    char      homedir[128];
+
+    // #rawrite: THE PER-USER WRITE OVERLAY. Empty ovl_base means this guest has
+    // no overlay and every path resolves exactly as it did before the overlay
+    // existed. When both are set, a resolved native path that is ovl_base or
+    // lies under it gets a second candidate spelling under ovl_dir, and
+    // overlay_apply() (dos/int21svc.c) picks between them by EXISTENCE. The
+    // mapping itself is rustkern/dosovl.rs; these two strings are the whole of
+    // the per-guest state it needs.
+    //
+    // WHY A PAIR AND NOT A GLOBAL TABLE: the overlay destination depends on WHO
+    // launched the guest, so it is per-run state that belongs next to homedir,
+    // which is per-run for the same reason. A global would be the cross-guest
+    // leak that #736 Stage 1b removed from the CWD store.
+    char      ovl_base[128];        // read-only shared install, e.g. "/DOS/RA"
+    char      ovl_dir[128];         // per-user writable twin
     char      cur_drive;                  // 'A'..'E'
     uint16_t  dta_seg, dta_off;
     // Last DOS error, answered by AH=59h (Get Extended Error). The MS-C runtime
@@ -208,6 +277,31 @@ struct dos_svc_ctx {
     // GetTempFileName loop unable to recognise a free name. It is per-guest
     // state like everything else here.
     uint16_t  last_err;
+
+    // #221: A BLOCKING CONSOLE READ THAT FOUND NOTHING.
+    //
+    // INT 21h AH=01/07/08 and INT 16h AH=00/10h are BLOCKING services on real
+    // DOS: they do not return until a key exists. This core answered them
+    // non-blockingly (AL=0) on the reasoning that "a guest loops, exactly as it
+    // does around the real BIOS". That is true of a guest that POLLS (AH=0Bh
+    // then AH=07h) and false of a guest that calls the blocking service once
+    // and believes the answer. NetHack is the second kind, and it reads a
+    // zero as EOF: tty_askname() counts ten EOFs in a few microseconds and
+    // calls bail("Giving up after 10 tries."), and every yn_function() prompt
+    // is auto-answered with its escape default.
+    //
+    // The fix is NOT to block the interpreter thread (the banned #426 pattern,
+    // and it would stop us pumping the very input being waited for). The
+    // service sets this flag and writes NOTHING to the register file; the
+    // caller then re-issues the SAME interrupt on a later run-loop pass, after
+    // the loop has pumped input, presented a frame and yielded. The guest
+    // cannot tell that apart from an INT that took a long time, which is
+    // exactly what a blocking BIOS call is.
+    //
+    // The caller MUST clear it. dos_svc_int21() sets it only, so a caller that
+    // does not honour it gets the old non-blocking behaviour minus the AL=0
+    // write, which is why every caller is wired up in the same change.
+    uint8_t   input_blocked;
     // The Job File Table: handle -> index into sft[], or -1 for closed.
     // Handles 0..4 are the five DOS standard handles and are never in the SFT.
     signed char  jft[DOS_SVC_MAX_FH];
@@ -218,6 +312,14 @@ struct dos_svc_ctx {
     int        find_active;
     char       find_pat[16];
     char       find_dirpath[DOS_SVC_PATH_MAX];
+    // #rawrite: the OVERLAY half of a directory enumeration. A find that lands
+    // on an overlaid directory has TWO directories to walk, and a save game
+    // that exists only in the overlay must still appear in a SAVEGAME.* scan
+    // or the game's load menu is empty. find_ovl is the overlay directory (or
+    // empty, meaning there is only one phase); find_phase is 0 while the base
+    // directory is being walked and 1 while the overlay is.
+    char       find_ovl[DOS_SVC_PATH_MAX];
+    int        find_phase;
     // The CX attribute mask AH=4Eh was called with. It used to be dropped on
     // the floor, which made every attribute-qualified search impossible: most
     // visibly _dos_findfirst(path, _A_VOLID, &f), the standard way a DOS
@@ -262,6 +364,7 @@ struct dos_svc_ctx {
     uint32_t n_bytes_written;
     uint32_t n_commits;                   // files written back to the medium
     uint32_t n_commit_fail;               // ... and the ones that did NOT land
+    int      warned_lfn;                  // #221 one-shot: AH=71h declined
     int      warned_foreign_handle;       // one-shot: a handle from the Win16
                                           // KERNEL's separate table reached an
                                           // INT 21h handle call. See the note
@@ -306,6 +409,22 @@ void dos_svc_int21(dos_svc_ctx_t *ctx, struct x86_16_cpu *c);
 // Resolve a DOS path against this context's appdir, current drive and per-drive
 // CWD, into a native MayteraOS path. Includes the /WINDIR -> native-root
 // fallback. This is the ONLY path-to-native translation the core performs.
+// #rawrite: rustkern/dosovl.rs. Returns 1 and fills `out` with the overlay
+// spelling of `path` when `path` is `base` or lies under it, 0 otherwise (and
+// on every failure, so a fault is "not overlaid", never a wrong path).
+int dosovl_map_rs(const unsigned char *base, const unsigned char *ovl,
+                  const unsigned char *path, unsigned char *out, int outsz);
+unsigned int dosovl_selftest_rs(void);
+
+// #rawrite: the C wrapper over dosovl_map_rs that knows about a context. 1 when
+// `native` is overlaid for this guest and `out` now holds the overlay spelling.
+int dos_svc_overlay_dir(dos_svc_ctx_t *ctx, const char *native, char *out, int outsz);
+
+// #rawrite: configure this guest's per-user write overlay. `base` is the shared
+// read-only install directory, `ovl` the per-user writable twin. Either NULL or
+// empty disables the overlay entirely (the pre-#rawrite behaviour).
+void dos_svc_set_overlay(dos_svc_ctx_t *ctx, const char *base, const char *ovl);
+
 void dos_svc_resolve(dos_svc_ctx_t *ctx, const char *in, char *out, int outsz);
 
 // The #708 gate, for this context's identity. 1 = allow, 0 = deny.

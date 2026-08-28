@@ -30,10 +30,12 @@
 #include "../mm/heap.h"
 #include "../sync/waitq.h"
 #include "../cpu/mono.h"     // #499: sched_now_ms() - THE shared real-elapsed-ms clock
+#include "irqwin.h"          // #69: per-site interrupts-off window accounting
 #include "../security/validate.h"
 
 // ---- externs from other TUs ----
 extern int  eth_receive(void);
+extern unsigned net_rx_drain_chunked(void);  // #69: THE shared chunked RX drain
 extern void tcp_timer(void);
 extern uint64_t vmm_get_pml4(void);
 extern void net_lock(void);
@@ -150,66 +152,82 @@ static inline void sk_cr3_exit(uint64_t saved) {
     __asm__ volatile("mov %0, %%cr3" : : "r"(saved) : "memory");
 }
 
+
+// #69: drain (chunked, own windows) then run the TCP timer in one short window.
+// tcp_timer() MUST still run on these paths: it is what retransmits the SYN
+// whose first attempt was dropped for an unresolved next-hop MAC, which is the
+// only reason a polling connect() ever completes. Dropping it while hoisting
+// the drain would have broken connect in a way that looks like a network fault.
+static void sk_drain_and_timer(void) {
+    net_rx_drain_chunked();
+    IRQWIN_DECL;
+    IRQWIN_ENTER();
+    uint64_t saved = sk_cr3_enter();
+    tcp_timer();
+    sk_cr3_exit(saved);
+    IRQWIN_EXIT(IRQWIN_SUB_TCPTIMER);
+}
+
+// #69: THESE FIVE HOLD NO net_lock. They reach the NIC ring and the TCP
+// connection table under nothing but their own `cli`, which on a single core is
+// mutual exclusion by construction (nothing else can be running) but is
+// INVISIBLE to every net_lock counter the heartbeat reports. holdmax= being
+// small was therefore never evidence about these paths; they contributed
+// exactly zero to it. IRQWIN_* measures the window that actually exists.
+//
 // Drive the NIC RX ring + TCP timer once, on the kernel CR3 with interrupts
 // off. Bounded (<=64 frames). This is the RX engine of every blocking op.
 static void sk_pump(void) {
-    uint64_t flags;
-    __asm__ volatile("pushfq; pop %0" : "=r"(flags));
-    __asm__ volatile("cli");
+    net_rx_drain_chunked();          // #69: chunked, outside any window
+    IRQWIN_DECL;
+    IRQWIN_ENTER();
     uint64_t saved = sk_cr3_enter();
-    for (int i = 0; i < 64; i++) { if (!eth_receive()) break; }
-    tcp_timer();
+    { IRQWIN_SUB_DECL; IRQWIN_SUB_BEGIN(); tcp_timer(); IRQWIN_SUB_END(IRQWIN_SUB_TCPTIMER); }
     sk_cr3_exit(saved);
-    if (flags & 0x200) __asm__ volatile("sti");
+    IRQWIN_EXIT(IRQWIN_SK_PUMP);
 }
 
 // STREAM ops that touch the NIC, each wrapped in one CR3 window.
 static int sk_tcp_rx(int slot, void *kbuf, uint16_t chunk) {
-    uint64_t flags;
-    __asm__ volatile("pushfq; pop %0" : "=r"(flags));
-    __asm__ volatile("cli");
+    net_rx_drain_chunked();          // #69: chunked, outside the window
+    IRQWIN_DECL;
+    IRQWIN_ENTER();
     uint64_t saved = sk_cr3_enter();
-    for (int i = 0; i < 64; i++) { if (!eth_receive()) break; }
-    tcp_timer();
-    int r = tcp_recv(slot, kbuf, chunk);
+    { IRQWIN_SUB_DECL; IRQWIN_SUB_BEGIN(); tcp_timer(); IRQWIN_SUB_END(IRQWIN_SUB_TCPTIMER); }
+    int r; { IRQWIN_SUB_DECL; IRQWIN_SUB_BEGIN(); r = tcp_recv(slot, kbuf, chunk); IRQWIN_SUB_END(IRQWIN_SUB_TCPRECV); }
     sk_cr3_exit(saved);
-    if (flags & 0x200) __asm__ volatile("sti");
+    IRQWIN_EXIT(IRQWIN_SK_TCP_RX);
     return r;
 }
 static int sk_tcp_tx(int slot, const void *kbuf, uint16_t len) {
-    uint64_t flags;
-    __asm__ volatile("pushfq; pop %0" : "=r"(flags));
-    __asm__ volatile("cli");
+    IRQWIN_DECL;
+    IRQWIN_ENTER();
     uint64_t saved = sk_cr3_enter();
     int r = tcp_send(slot, kbuf, len);
-    for (int i = 0; i < 64; i++) { if (!eth_receive()) break; }
-    tcp_timer();
     sk_cr3_exit(saved);
-    if (flags & 0x200) __asm__ volatile("sti");
+    IRQWIN_EXIT(IRQWIN_SK_TCP_TX);
+    sk_drain_and_timer();            // #69: chunked drain + timer, outside
     return r;
 }
 static int sk_tcp_conn(int slot, uint32_t hip, uint16_t hport) {
-    uint64_t flags;
-    __asm__ volatile("pushfq; pop %0" : "=r"(flags));
-    __asm__ volatile("cli");
+    IRQWIN_DECL;
+    IRQWIN_ENTER();
     uint64_t saved = sk_cr3_enter();
     int r = tcp_connect(slot, hip, hport);
-    for (int i = 0; i < 64; i++) { if (!eth_receive()) break; }
-    tcp_timer();
     sk_cr3_exit(saved);
-    if (flags & 0x200) __asm__ volatile("sti");
+    IRQWIN_EXIT(IRQWIN_SK_TCP_CONN);
+    sk_drain_and_timer();            // #69: chunked drain + timer, outside
     return r;
 }
 static int sk_udp_tx(uint32_t hip, uint16_t sport, uint16_t dport,
                      const void *kbuf, uint16_t len) {
-    uint64_t flags;
-    __asm__ volatile("pushfq; pop %0" : "=r"(flags));
-    __asm__ volatile("cli");
+    IRQWIN_DECL;
+    IRQWIN_ENTER();
     uint64_t saved = sk_cr3_enter();
     extern int udp_send(uint32_t, uint16_t, uint16_t, const void *, uint16_t);
     int r = udp_send(hip, sport, dport, kbuf, len);
     sk_cr3_exit(saved);
-    if (flags & 0x200) __asm__ volatile("sti");
+    IRQWIN_EXIT(IRQWIN_SK_UDP_TX);
     return r;
 }
 
@@ -483,6 +501,10 @@ int64_t sys_sock_open(int domain, int type, int protocol) {
         if (!s->ring) { s->in_use = 0; return E_NOMEM; }
     }
     file_t *f = file_alloc(&g_sock_fops, s, O_RDWR);
+    // #120: name the description. Sockets were the ONE fd family that recorded
+    // no path at all, so fstat() could not tell a socket from an anonymous
+    // description and Task Manager (#487) showed a bare fd number for it.
+    if (f) file_set_path(f, (s->type == SOCK_STREAM) ? "socket:[tcp]" : "socket:[udp]");
     if (!f) {
         if (s->ring) { kfree(s->ring); s->ring = 0; }
         if (s->tcp_slot >= 0) tcp_close(s->tcp_slot);
@@ -605,6 +627,7 @@ int64_t sys_sock_accept(int fd, void *uaddr, void *uaddrlen) {
     ns->type = SOCK_STREAM;
     ns->tcp_slot = newslot;
     file_t *f = file_alloc(&g_sock_fops, ns, O_RDWR);
+    if (f) file_set_path(f, "socket:[tcp]");   // #120: accepted connection
     if (!f) { ns->in_use = 0; tcp_close(newslot); return E_MFILE; }
     ns->file = f;
     int nfd = fd_alloc_install(f);

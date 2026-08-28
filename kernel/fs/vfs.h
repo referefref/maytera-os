@@ -43,6 +43,19 @@ typedef struct file_ops {
     int64_t (*read)(struct file *f, void *buf, size_t count);
     int64_t (*write)(struct file *f, const void *buf, size_t count);
     int64_t (*seek)(struct file *f, int64_t offset, int whence);
+    // #120: the LIVE logical size of this description, or -1 for "this kind
+    // does not know". OPTIONAL: a NULL size op is answered as -1 by
+    // file_size(), so no existing fd family had to change.
+    //
+    // WHY THIS EXISTS RATHER THAN A SEEK. sys_fstat() needs the size, and both
+    // shipping filesystems buffer writes (fat_vfs.c's g_wbuf, ext2_vfs.c's
+    // whole-file buffer), so the on-disk directory entry is STALE for exactly
+    // as long as a file is being written. Reading the size back through
+    // seek(SEEK_END) is what userland's fstat() used to do and it has two
+    // faults this op does not: it MOVES the file position, so the caller has to
+    // save and restore it, and on a kind whose seek is a no-op it silently
+    // returns a wrong answer instead of admitting it does not know.
+    int64_t (*size)(struct file *f);
     int     (*ioctl)(struct file *f, unsigned cmd, void *arg);
     // #695 Phase 1. OPTIONAL. Commit buffered state to the medium WITHOUT
     // releasing the description, so the caller can check the result and still
@@ -208,6 +221,28 @@ void vfs_path_selftest(void);
 // MAX_FDS is defined in proc/process.h (since the fd array lives in
 // process_t). Include it only where the fd helpers are used.
 
+// ---------------------------------------------------------------------------
+// #120: what KIND of object an fd refers to. The DECISION lives in
+// rustkern/fstatkind.rs (new kernel code = Rust); this is only its C face, and
+// it is the ONLY such decision in the kernel - proc/procinfo.c's
+// handle_kind_of() was a second copy of the same prefix matching and now calls
+// this. The struct layout is locked by a _Static_assert in
+// proc/syscall_argtab_lock.c.
+// ---------------------------------------------------------------------------
+// `kind` is a PI_KIND_* value from proc/procinfo.h, which has owned that
+// numbering since #487. Deliberately NOT re-#defined here: a second set of
+// names for the same numbers is how two of them come to disagree, and #120
+// caught itself doing exactly that (it had DEV and PIPE transposed).
+typedef struct {
+    uint32_t kind;   // PI_KIND_* (proc/procinfo.h)
+    uint32_t mode;   // full st_mode (type | perms), or 0 for UNKNOWN
+    uint64_t dev;    // st_dev, or 0
+    uint64_t rdev;   // st_rdev, or 0
+} kstat_kind_t;
+
+void fstat_kind_rs(const char *path, uint32_t cap, kstat_kind_t *out);
+uint32_t fstat_kind_selftest_rs(void);
+
 // ---- struct file lifecycle ----
 
 // Allocate a new file with refcount=1. Caller fills in ops+priv+flags.
@@ -235,6 +270,9 @@ MUST_CHECK int  file_flush(file_t *f);
 int64_t file_read(file_t *f, void *buf, size_t count);
 MUST_CHECK int64_t file_write(file_t *f, const void *buf, size_t count);
 int64_t file_seek(file_t *f, int64_t offset, int whence);
+// #120: LIVE size, or -1 when this description cannot answer (no size op, or
+// NULL f). Never moves the file position, unlike a seek-based size.
+int64_t file_size(file_t *f);
 int     file_ioctl(file_t *f, unsigned cmd, void *arg);
 int     file_poll(file_t *f, int events);
 // #745 (local 82). 1 when this file kind implements ops->poll at all.
@@ -269,6 +307,10 @@ int fd_close(int fd);
 
 // Close every fd in the current process's table. Used from proc_exit.
 void fd_close_all(void);
+
+// #745 local 109: shrink an OPEN fd's file to `length` bytes. Defined in
+// proc/fdlayer.c; declared here because that is where the fd families live.
+int64_t sys_ftruncate(int fd, int64_t length);
 
 // Bump the refcount on every open fd in the fd table. Used from proc_fork
 // so the child inherits each parent file description with a fresh reference.

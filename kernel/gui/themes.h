@@ -297,6 +297,15 @@ typedef enum {
 // rather than reading garbage.
 int32_t theme_get_metric_by_id(int theme_id, int metric_id);
 
+// The theme's OWN 1x design value, with the global UI scale factor NOT
+// applied. theme_get_metric_by_id() above is what drawing code wants: it is
+// the single point where the scale factor enters the theme system, so every
+// theme-wired widget in the kernel and in every Ring 3 app scales through it
+// with no call-site change. Use this one only where you need the number the
+// .mtheme file actually contains - e.g. a preview thumbnail that draws a
+// miniature window inside a fixed-size box.
+int32_t theme_get_metric_raw(int theme_id, int metric_id);
+
 // Convenience for kernel drawing code: the ACTIVE theme's metric.
 static inline int32_t theme_metric_i(int metric_id) {
     return theme_get_metric_by_id(-1, metric_id);

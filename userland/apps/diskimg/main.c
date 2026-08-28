@@ -24,8 +24,20 @@
 // destructive one (eject, which invalidates a running guest's handles) reachable
 // by the same gesture as browsing. Discoverability is a real point though, so
 // the right split is: the ACTIONS live here, and Files should grow read-only
-// "go to this mounted disc" rows later. That is noted, not done, and not
-// claimed.
+// "go to this mounted disc" rows later.
+//
+// #234i UPDATE: THAT HAPPENED, AND IT WAS NOT A FILES CHANGE. The half of the
+// split above that this file deferred turned out to be free: #250 had already
+// built a volume surface (SYS_VOL_LIST -> the Files "Removable" sidebar
+// section and the desktop volume icons) and wired only USB hot-plug into it.
+// Mounted images now publish into that SAME list from dos/diskimg.c
+// (diskimg_vol_raw), so Files and the desktop grew disc and floppy rows with
+// no second list and no second idea of what is mounted. Eject from those rows
+// routes to the same diskimg_eject_idx() this app calls.
+//
+// What did NOT move: MOUNT still lives only here, because mounting names a
+// path, needs a file picker and carries a permission check. This app remains
+// the place you PUT a disc in; Files is where you find one that is already in.
 //
 // So: a standalone app, modelled on devmgr, which is this tree's house shape
 // for a system utility (two panes, live query, Refresh, no bespoke look).
@@ -58,18 +70,85 @@
 #include "../../libc/stdio.h"
 #include "../../libc/string.h"
 #include "../../libc/dirent.h"
+#include "../../libc/textfield.h"
+
+// (#appstyle) EVERY string in this window is antialiased TrueType from here on.
+//
+// THIS IS THE WHOLE TYPOGRAPHY BUG, AND IT IS NOT A WRONG CONSTANT. Until this
+// line, all 16 text draws in this file went through win_draw_text(), which is
+// the kernel's fixed 8x16 BITMAP font (proc/syscall.c:7172 walks a 16-byte
+// glyph array and advances cx += 8). There is NO size argument on that code
+// path at all, so the window could not have a type hierarchy even in
+// principle: heading, description, column headers, rows and the keyboard hint
+// were one size because one size was all that existed. Next to the compositor's
+// own TrueType titlebar it read as a different application.
+//
+// The shim is the two lines files/main.c:21-22 already uses, verbatim, so this
+// window and the Files window now resolve identically. 14 is type.body and 11
+// is type.caption from docs/UI_STYLE_GUIDE.md 4.2. Note these are SIZE UNITS,
+// not CSS px: ttf.c scales with stbtt_ScaleForPixelHeight(), which maps
+// ascent-descent (not the em square) onto the number, so one unit is 0.859 em
+// px on the shipped DejaVu Sans and 14 renders at em 12.03px. Picking 12 here
+// "because the mock says 12px" ships the whole app 14% small.
+//
+// textfield.h is included ABOVE this point on purpose: its own
+// gui_draw_textfield_tf() is the monospace renderer and legitimately wants the
+// real win_draw_text(). Defining the macro first would silently redirect it.
+#define win_draw_text(h, x, y, s, c)       win_draw_text_ttf((h), (x), (y), (s), 14, (c))
+#define win_draw_text_small(h, x, y, s, c) win_draw_text_ttf((h), (x), (y), (s), 11, (c))
+#define TY_TITLE   16
+#define TY_BODY    14
+#define TY_CAPTION 11
 
 #define WIN_W   660
 #define WIN_H   430
+
+// #184: WIN_W/WIN_H are what win_create() is GIVEN, and that is the OUTER
+// window size: the frame and title bar come out of it, so the drawable content
+// is smaller. MEASURED on build 1998 by reading the framebuffer: an outer height
+// of 430 gave 406 rows of content, and the "M mount  E eject  R refresh  N of M
+// images mounted" hint, drawn at WIN_H-18, landed 6px below the last drawable
+// row and was never visible on screen. The app's only statement of its own key
+// bindings and of how many mount slots were in use could not be read.
+//
+// win_get_size() (SYS_WIN_GET_SIZE) answers with the CONTENT size, so it is
+// asked rather than assumed: the 24px difference is the compositor's current
+// chrome, not a constant of the universe, and a theme with a taller title bar
+// would silently reintroduce the same clipping under any hardcoded number.
+// content_h()/content_w() are what every y/x coordinate below is computed from;
+// nothing may use WIN_H as a coordinate again.
+static int g_cw = WIN_W, g_ch = WIN_H;
+static void sync_content_size(int w) {
+    int cw = 0, ch = 0;
+    if (w >= 0 && win_get_size(w, &cw, &ch) == 0 && cw > 0 && ch > 0) {
+        g_cw = cw; g_ch = ch;
+    }
+}
+#define CONTENT_H  (g_ch)
 #define PAD     10
-#define ROW_H   22
-#define BTN_H   24
+#define ROW_H   24
+#define BTN_H   26
 #define BTN_W   86
+
+// (#appstyle) Bands, not floating controls. The old layout put the three
+// buttons and the key hint at CONTENT_H-minus-something, and #184 records what
+// that costs: an outer height of 430 gives 406 drawable rows, the hint was
+// drawn at WIN_H-18, and the app's only statement of its own key bindings
+// landed six pixels past the last visible row. A band whose height is
+// SUBTRACTED from the list before the list is laid out cannot do that, whatever
+// the chrome height turns out to be.
+#define TOOLBAR_H  40
+#define STATUS_H   26
+#define DESC_Y     48
+#define HDR_Y      70
+#define LIST_Y     88
 
 // Directories the picker looks in. A user's images realistically live under
 // /WINDIR (next to the DOS drive folders) or a dedicated /IMAGES; the root is
 // scanned too so a freshly copied file is findable without knowing the
-// convention. Typing a full path always works regardless.
+// convention. A path outside all three is typed into the picker's path field
+// (#appstyle: that field is new - the sentence that used to sit here claimed it
+// already existed, and it did not).
 static const char *SCAN_DIRS[] = { "/WINDIR", "/IMAGES", "/" };
 #define NSCAN 3
 
@@ -79,7 +158,19 @@ static const char *SCAN_DIRS[] = { "/WINDIR", "/IMAGES", "/" };
 static int win = -1;
 
 // ---- palette ---------------------------------------------------------------
-static unsigned int C_BG, C_CARD, C_FIELD, C_BORDER, C_INK, C_DIM, C_ACC, C_SEL, C_SELTX;
+static unsigned int C_BG, C_CARD, C_FIELD, C_BORDER, C_INK, C_ACC, C_SEL, C_SELTX;
+// (#appstyle) THREE dim inks, not one, because a single "dim" is only ever
+// guaranteed against ONE background and this window has three.
+//
+// MEASURED on Modern Dark with a one-dim palette: the description and column
+// headers (on C_BG) cleared 4.61:1, but the SAME ink measured 3.84:1 on the
+// list fill and 4.16:1 / 3.94:1 in the status band, because those bands are
+// C_FIELD and C_CARD. "Guaranteed readable" is a statement about a PAIR, and
+// carrying one member of the pair around while changing the other is exactly
+// how a colour that passed its own test ships failing.
+static unsigned int C_DIM;        // on C_BG    (description, column headers)
+static unsigned int C_DIM_CARD;   // on C_CARD  (status band)
+static unsigned int C_DIM_FIELD;  // on C_FIELD (an unmounted row's "(empty)")
 
 static unsigned int lum_ink(unsigned int bg) {
     int r = (bg >> 16) & 255, g = (bg >> 8) & 255, b = bg & 255;
@@ -110,8 +201,33 @@ static void apply_style(void) {
     C_CARD   = tint(dark ? 0x002C313B : 0x00EDEFF3, C_ACC, 6);
     C_FIELD  = dark ? 0x00333A45 : 0x00FFFFFF;
     C_BORDER = dark ? 0x003A424F : 0x00CDD3DB;
-    C_INK = lum_ink(C_BG); C_DIM = dim_ink(C_BG);
-    C_SEL = C_ACC; C_SELTX = lum_ink(C_ACC);
+    C_INK = lum_ink(C_BG);
+    (void)0;
+    // (#appstyle) dim_ink()'s 50/50 average of ink and background MEASURES
+    // 3.26:1 on retro_unix (#818384 on #EAEEF0), which is under the 4.5:1 WCAG
+    // text floor - and it is the colour the column headers, the description
+    // line, the status bar and every "(empty)" cell are drawn in, i.e. most of
+    // the text in the window. It is kept as the STARTING point (so a theme's
+    // own tone survives where it already passes) and walked to the floor by the
+    // shared primitive, which guarantees it on all 14 themes rather than on the
+    // one that happened to be open when the number was chosen.
+    C_DIM       = gui_ensure_contrast(dim_ink(C_BG),    C_BG,    GUI_FLOOR_TEXT);
+    C_DIM_CARD  = gui_ensure_contrast(dim_ink(C_CARD),  C_CARD,  GUI_FLOOR_TEXT);
+    C_DIM_FIELD = gui_ensure_contrast(dim_ink(C_FIELD), C_FIELD, GUI_FLOOR_TEXT);
+    // (#appstyle) SELECTION IS A TINT OF THE ACCENT, NOT THE RAW ACCENT.
+    //
+    // This is Files' answer (fp_sel() in apps/files/main.c) adopted verbatim,
+    // and Files arrived at it the hard way: "the raw accent rendered near-black
+    // on Nord and made the selected row + its text unreadable". Measured here
+    // on Modern Dark, raw #0A84FF forced the label to near-BLACK to reach the
+    // text floor at all - legible, but a dark label on a saturated blue is not
+    // what a selected row looks like anywhere else in this OS, and the row's
+    // secondary column had nowhere left to go.
+    //
+    // A tint keeps the row's ink at its normal colour, so a selected row and an
+    // unselected one differ by BACKGROUND, which is what a selection is.
+    C_SEL   = tint(dark ? 0x003C434F : 0x00CCD6E6, C_ACC, dark ? 28 : 26);
+    C_SELTX = gui_ensure_contrast(lum_ink(C_SEL), C_SEL, GUI_FLOOR_TEXT);
     gui_palette_t p;
     p.surface = C_BG; p.surface_raised = C_CARD; p.ink = C_INK; p.ink_dim = C_DIM;
     p.accent = C_ACC; p.accent_hover = gui_lighten(C_ACC, 24); p.border = C_BORDER;
@@ -196,6 +312,12 @@ static const char *mount_err(int rc) {
         case -12: return "Not an ISO, and too large to be a floppy image.";
         case -13: return "Refused: you do not have permission to read that file, "
                          "or there was not enough memory.";
+        // #184. Its own sentence, not folded into "unrecognised format": this
+        // file IS an ISO, so telling the user it is not one sends them looking
+        // for the wrong problem. The measured cause is an incomplete copy or
+        // download.
+        case -15: return "That ISO is truncated or corrupt: its directory is "
+                         "past the end of the file. Copy or download it again.";
         default:  return "Mount failed.";
     }
 }
@@ -206,6 +328,16 @@ static int  g_npick = 0;
 static int  g_picksel = 0;
 static int  g_picking = 0;
 static gui_list_t g_picklist;
+
+// (#appstyle) The picker now has two focusable things, so it needs a focus
+// model. Two, not "the list plus a special case": Tab moves between them, both
+// draw a visible focus indication, and Enter means the same thing in both
+// (mount whatever the path field currently holds) so there is no state in which
+// the primary action does something the user cannot see.
+enum { PKF_PATH = 0, PKF_LIST = 1 };
+static int         g_pkfocus = PKF_PATH;
+static textfield_t g_path;
+static char        g_pathbuf[PATHW];
 
 static int ends_with_ci(const char *s, const char *suf) {
     int ls = (int)strlen(s), lf = (int)strlen(suf);
@@ -261,21 +393,85 @@ static const char *pick_label(void *ctx, int index, char *buf, int cap) {
 }
 
 // ---- drawing ---------------------------------------------------------------
-static int content_w(void) { return WIN_W; }
+static int content_w(void) { return g_cw; }
+static int list_h(void)    { return CONTENT_H - LIST_Y - STATUS_H - PAD; }
+
+// ONE column table, computed from the list's OWN geometry and used by BOTH the
+// header row and the data rows.
+//
+// WHY IT IS A STRUCT AND NOT SIX EXPRESSIONS. The header used to be one string
+// with spaces in it ("Drive   Type        Image") drawn at lx+4, while the rows
+// were drawn at lx+6+8*N. Those are two independent layouts that happened to
+// nearly agree under an 8px monospace cell and cannot agree under a
+// proportional one - measured on build 2058, the Image header sat 14px left of
+// the Image column. Deriving both from the same struct makes disagreement
+// inexpressible rather than merely unlikely.
+//
+// The right-hand columns hang off gui_list_row_w(), which already subtracts the
+// scrollbar gutter when one is showing, so Size and Format do not slide under
+// the scrollbar the moment a 5th mounted image appears.
+typedef struct { int drive, type, image, image_w, size_r, fmt; } cols_t;
+static cols_t g_col;
+
+static void cols_compute(int lx, int rw) {
+    int rx = lx + 1;
+    g_col.drive  = rx + 6;
+    g_col.type   = rx + 54;
+    g_col.image  = rx + 142;
+    g_col.fmt    = rx + rw - 124;
+    g_col.size_r = rx + rw - 134;         // RIGHT edge: numerals right-align (4.5)
+    g_col.image_w = g_col.size_r - 62 - g_col.image;
+    if (g_col.image_w < 60) g_col.image_w = 60;
+}
+
+// Single-line fit-with-ellipsis. gui_wrap_text_ttf() with max_lines == 1 is the
+// shared ellipsizer (it measures with the real glyph metrics and appends a
+// real-measured "..."), so this is not a private truncation rule.
+static char g_fitbuf[1][GUI_WRAP_COL];
+static const char *fit1(const char *sstr, int size, int maxw) {
+    if (gui_wrap_text_ttf(sstr, size, maxw, 1, g_fitbuf) > 0) return g_fitbuf[0];
+    return sstr;
+}
+
+static void draw_toolbar(void) {
+    int w = content_w();
+    win_draw_rect(win, 0, 0, w, TOOLBAR_H, C_CARD);
+    win_draw_rect(win, 0, TOOLBAR_H - 1, w, 1, C_BORDER);
+
+    diskimg_info_t *d = (g_sel < g_nrows) ? &g_row[g_sel] : 0;
+    int can_mount = d && (d->flags & DISKIMG_F_MOUNTABLE);
+    int can_eject = d && (d->flags & DISKIMG_F_MOUNTED);
+    gui_button(win, PAD, 7, 96, BTN_H, "Mount...", GUI_BTN_PRIMARY,
+               can_mount ? GUI_ST_NORMAL : GUI_ST_DISABLED);
+    gui_button(win, PAD + 104, 7, BTN_W - 2, BTN_H, "Eject", GUI_BTN_SECONDARY,
+               can_eject ? GUI_ST_NORMAL : GUI_ST_DISABLED);
+    gui_button(win, PAD + 196, 7, BTN_W - 2, BTN_H, "Refresh", GUI_BTN_GHOST,
+               GUI_ST_NORMAL);
+}
 
 static void draw_table(void) {
-    int lx = PAD, ly = 64;
+    int lx = PAD, ly = LIST_Y;
     int lw = content_w() - 2 * PAD;
-    int lh = WIN_H - ly - PAD - BTN_H - 12 - 24;
-
-    gui_card(win, lx - 2, ly - 20, lw + 4, lh + 24);
-    win_draw_text(win, lx + 4, ly - 16, "Drive   Type        Image", C_DIM);
-    win_draw_text(win, lx + 4 + 8 * 40, ly - 16, "Size        Format", C_DIM);
+    int lh = list_h();
 
     gui_list_config(&g_list, lx, ly, lw, lh, ROW_H, g_nrows);
-    // Frame + track drawn by hand because the rows are multi-column; the
-    // GEOMETRY and input are still gui_list's, which is the pattern gui_menu.c
-    // and Settings both use for rows that carry more than one string.
+    cols_compute(lx, gui_list_row_w(&g_list));
+
+    // Column headers sit ABOVE the box, in type.caption, with a rule under
+    // them: the same shape Files' details view uses.
+    win_draw_text_small(win, g_col.drive, HDR_Y, "Drive",  C_DIM);
+    win_draw_text_small(win, g_col.type,  HDR_Y, "Type",   C_DIM);
+    win_draw_text_small(win, g_col.image, HDR_Y, "Image",  C_DIM);
+    {
+        int sw = gui_ttf_width("Size", TY_CAPTION);
+        win_draw_text_small(win, g_col.size_r - sw, HDR_Y, "Size", C_DIM);
+    }
+    win_draw_text_small(win, g_col.fmt, HDR_Y, "Format", C_DIM);
+    win_draw_rect(win, lx, HDR_Y + 16, lw, 1, C_BORDER);
+
+    // Frame + track by hand because the rows are multi-column; the GEOMETRY and
+    // the input are still gui_list's, which is the pattern gui_menu.c and
+    // Settings both use for rows that carry more than one string.
     win_draw_rect(win, lx, ly, lw, lh, C_FIELD);
     win_draw_rect(win, lx, ly, lw, 1, C_BORDER);
     win_draw_rect(win, lx, ly + lh - 1, lw, 1, C_BORDER);
@@ -288,95 +484,117 @@ static void draw_table(void) {
         int ry;
         if (!gui_list_row_y(&g_list, i, &ry)) continue;   // never draw outside the box
         diskimg_info_t *d = &g_row[i];
-        unsigned int fg = C_INK;
+        unsigned int fg = C_INK, dim = C_DIM_FIELD;   // rows sit on C_FIELD
         if (i == g_sel) {
             win_draw_rect(win, lx + 1, ry, rw, ROW_H, C_SEL);
-            fg = C_SELTX;
+            fg = C_SELTX; dim = C_SELTX;
         }
+        int ty = ry + (ROW_H - TY_BODY) / 2;
         char letter[8];
         snprintf(letter, sizeof letter, "%c:", (char)('A' + d->letter));
-        win_draw_text(win, lx + 6, ry + 3, letter, fg);
-        win_draw_text(win, lx + 6 + 8 * 6, ry + 3, cls_name(d->cls), fg);
+        win_draw_text(win, g_col.drive, ty, letter, fg);
+        win_draw_text(win, g_col.type,  ty, cls_name(d->cls), fg);
 
         if (d->flags & DISKIMG_F_MOUNTED) {
-            char nm[40];
-            snprintf(nm, sizeof nm, "%.30s", d->name);
-            win_draw_text(win, lx + 6 + 8 * 18, ry + 3, nm, fg);
+            win_draw_text(win, g_col.image, ty, fit1(d->name, TY_BODY, g_col.image_w), fg);
             char sz[24]; size_str(d->size, sz, sizeof sz);
-            win_draw_text(win, lx + 6 + 8 * 40, ry + 3, sz, fg);
+            win_draw_text(win, g_col.size_r - gui_ttf_width(sz, TY_BODY), ty, sz, fg);
             char tail[48];
             snprintf(tail, sizeof tail, "%s%s%s",
                      fmt_name(d->fmt),
                      (d->flags & DISKIMG_F_JOLIET) ? " +Joliet" : "",
                      (d->flags & DISKIMG_F_INUSE) ? " (in use)" : "");
-            win_draw_text(win, lx + 6 + 8 * 52, ry + 3, tail, fg);
+            win_draw_text(win, g_col.fmt, ty, fit1(tail, TY_BODY, 118), fg);
         } else if (d->cls == DISKIMG_CLASS_FIXED) {
-            win_draw_text(win, lx + 6 + 8 * 18, ry + 3, "(system disk)", i == g_sel ? fg : C_DIM);
+            win_draw_text(win, g_col.image, ty, "(system disk)", dim);
         } else {
-            win_draw_text(win, lx + 6 + 8 * 18, ry + 3, "(empty)", i == g_sel ? fg : C_DIM);
+            win_draw_text(win, g_col.image, ty, "(empty)", dim);
         }
     }
 }
 
-static void draw_buttons(void) {
-    int by = WIN_H - PAD - BTN_H - 20;
-    diskimg_info_t *d = (g_sel < g_nrows) ? &g_row[g_sel] : 0;
-    int can_mount = d && (d->flags & DISKIMG_F_MOUNTABLE);
-    int can_eject = d && (d->flags & DISKIMG_F_MOUNTED);
+static void draw_status(void) {
+    int w = content_w(), y = CONTENT_H - STATUS_H;
+    win_draw_rect(win, 0, y, w, STATUS_H, C_CARD);
+    win_draw_rect(win, 0, y, w, 1, C_BORDER);
+    int ty = y + (STATUS_H - TY_CAPTION) / 2;
+    win_draw_text_small(win, PAD, ty, "M mount    E eject    R refresh", C_DIM_CARD);
 
-    gui_button(win, PAD, by, BTN_W, BTN_H, "Mount...", GUI_BTN_PRIMARY,
-               can_mount ? GUI_ST_NORMAL : GUI_ST_DISABLED);
-    gui_button(win, PAD + BTN_W + 8, by, BTN_W, BTN_H, "Eject", GUI_BTN_SECONDARY,
-               can_eject ? GUI_ST_NORMAL : GUI_ST_DISABLED);
-    gui_button(win, PAD + 2 * (BTN_W + 8), by, BTN_W, BTN_H, "Refresh",
-               GUI_BTN_GHOST, GUI_ST_NORMAL);
-
-    char hint[110];
-    snprintf(hint, sizeof hint,
-             "M mount   E eject   R refresh   %d of %d images mounted",
-             0, g_maxmounts);
     int n = 0;
     for (int i = 0; i < g_nrows; i++) if (g_row[i].flags & DISKIMG_F_MOUNTED) n++;
-    snprintf(hint, sizeof hint,
-             "M mount   E eject   R refresh   %d of %d images mounted",
-             n, g_maxmounts);
-    win_draw_text(win, PAD, WIN_H - 18, hint, C_DIM);
+    char cnt[64];
+    snprintf(cnt, sizeof cnt, "%d of %d images mounted", n, g_maxmounts);
+    win_draw_text_small(win, w - PAD - gui_ttf_width(cnt, TY_CAPTION), ty, cnt, C_DIM_CARD);
 }
 
-static void draw_picker(void) {
-    int w = 520, h = 300;
-    int x = (WIN_W - w) / 2, y = (WIN_H - h) / 2;
-    gui_card(win, x, y, w, h);
-    win_draw_text(win, x + 12, y + 10, "Choose a disk image", C_INK);
-    win_draw_text(win, x + 12, y + 30,
-                  ".ISO mounts as a CD-ROM, .IMG/.IMA as a floppy", C_DIM);
+// The picker is a real modal: an interlaced-scanline scrim over the parent (the
+// same construction gui_confirm_render() uses, so a modal in this app and a
+// modal in Files read as the same thing), and it closes ONLY on Mount, Cancel
+// or Esc - never on a stray click outside it.
+#define PK_W  520
+#define PK_H  320
+static int pk_x(void) { return (content_w() - PK_W) / 2; }
+static int pk_y(void) { return (CONTENT_H - PK_H) / 2; }
 
-    gui_list_config(&g_picklist, x + 12, y + 52, w - 24, h - 52 - 46, ROW_H, g_npick);
-    // The flat-string case: this is what gui_list_draw() is for, frame,
-    // rows, selection and scrollbar in one call.
+static void draw_picker(void) {
+    int x = pk_x(), y = pk_y();
+    for (int sy = 0; sy < CONTENT_H; sy += 2)
+        win_draw_rect(win, 0, sy, content_w(), 1, gui_mix(C_BG, 0x00000000, 108));
+
+    gui_card(win, x, y, PK_W, PK_H);
+    win_draw_text_ttf(win, x + 16, y + 14, "Choose a disk image", TY_TITLE, C_INK);
+    win_draw_text_small(win, x + 16, y + 38,
+                        ".ISO mounts as a CD-ROM.  .IMG and .IMA mount as a floppy.", C_DIM_CARD);
+
+    // (#appstyle) THE PATH FIELD IS NEW, AND IT IS A CORRECTNESS FIX, NOT A
+    // FLOURISH. This file's own header comment said "Typing a full path always
+    // works regardless" - and until now it did not: the picker drew a list and
+    // two buttons, there was no text entry anywhere in the GUI, and an image
+    // outside /WINDIR, /IMAGES or / could only be mounted through the headless
+    // `DISKIMG mount <path>` form. The sentence is now true. The field is the
+    // SHARED textfield_t, so it arrives with caret, selection, the system
+    // clipboard and undo rather than a hand-rolled character buffer.
+    win_draw_text_small(win, x + 16, y + 62, "PATH", C_ACC);
+    gui_textfield_tf(win, x + 16, y + 78, PK_W - 32, 26,
+                     g_pathbuf, g_path.len, g_path.cursor, g_path.sel_anchor,
+                     g_pkfocus == PKF_PATH, "/IMAGES/DISC.ISO");
+
+    int ly = y + 118, lh = PK_H - 118 - 62;
+    gui_list_config(&g_picklist, x + 16, ly, PK_W - 32, lh, ROW_H, g_npick);
     gui_list_draw(win, &g_picklist, g_picksel, C_FIELD, C_BORDER, C_INK,
                   C_SEL, C_SELTX, pick_label, 0);
+    if (g_pkfocus == PKF_LIST) {
+        // 2px, matching the field's own focus ring above (gui_textfield2 draws
+        // a focused field's border in p->focus). A 1px ring beside a 2px one
+        // reads as "this list is less focused", which is not a state.
+        gui_draw_rect_outline(win, x + 14, ly - 2, PK_W - 28, lh + 4, C_ACC);
+        gui_draw_rect_outline(win, x + 13, ly - 3, PK_W - 26, lh + 6, C_ACC);
+    }
 
+    char found[80];
     if (g_npick == 0)
-        win_draw_text(win, x + 20, y + 60,
-                      "No .iso/.img files found in /WINDIR, /IMAGES or /", C_DIM);
+        snprintf(found, sizeof found, "No .iso/.img files found in /WINDIR, /IMAGES or /");
+    else
+        snprintf(found, sizeof found, "%d found in /WINDIR, /IMAGES and /   -   Tab switches",
+                 g_npick);
+    win_draw_text_small(win, x + 16, ly + lh + 8, found, C_DIM_CARD);
 
-    int by = y + h - 34;
-    gui_button(win, x + w - 2 * (BTN_W + 8) - 4, by, BTN_W, BTN_H, "Mount",
-               GUI_BTN_PRIMARY, g_npick ? GUI_ST_NORMAL : GUI_ST_DISABLED);
-    gui_button(win, x + w - (BTN_W + 8) - 4, by, BTN_W, BTN_H, "Cancel",
+    int by = y + PK_H - 16 - BTN_H;
+    gui_button(win, x + PK_W - 16 - 96 - 8 - BTN_W, by, BTN_W, BTN_H, "Cancel",
                GUI_BTN_SECONDARY, GUI_ST_NORMAL);
-    win_draw_text(win, x + 12, by + 6, "Enter mount   Esc cancel", C_DIM);
+    gui_button(win, x + PK_W - 16 - 96, by, 96, BTN_H, "Mount", GUI_BTN_PRIMARY,
+               g_path.len ? GUI_ST_NORMAL : GUI_ST_DISABLED);
+    win_draw_text_small(win, x + 16, by + (BTN_H - TY_CAPTION) / 2,
+                        "Enter mounts    Esc cancels", C_DIM_CARD);
 }
 
 static void draw(void) {
-    win_draw_rect(win, 0, 0, WIN_W, WIN_H, C_BG);
-    win_draw_text(win, PAD, PAD, "Disk Images", C_INK);
-    win_draw_text(win, PAD, PAD + 20,
-                  "Mount a CD or floppy image so DOS and Windows 3.x programs can read it.",
-                  C_DIM);
+    win_draw_rect(win, 0, 0, content_w(), CONTENT_H, C_BG);
+    draw_toolbar();
+    win_draw_text_small(win, PAD, DESC_Y,
+        "Mount a CD or floppy image so DOS and Windows 3.x programs can read it.", C_DIM);
     draw_table();
-    draw_buttons();
+    draw_status();
     if (g_picking) draw_picker();
 }
 
@@ -420,9 +638,31 @@ static void do_eject(int letter_idx) {
     refresh();
 }
 
+// Keep the path field and the list selection in step: selecting a row fills the
+// field, so the common case (mount one of the images we found) still needs no
+// typing, and the uncommon case (an image somewhere else) is a matter of
+// editing what is already there rather than knowing the syntax.
+static void pk_sync_path_from_sel(void) {
+    if (g_picksel >= 0 && g_picksel < g_npick) tf_set_text(&g_path, g_pick[g_picksel]);
+}
+
 static void open_picker(void) {
     scan_dirs();
+    tf_init(&g_path, g_pathbuf, sizeof g_pathbuf);
+    pk_sync_path_from_sel();
+    g_pkfocus = g_npick ? PKF_LIST : PKF_PATH;
     g_picking = 1;
+}
+
+// The ONE place a mount is started from the picker, so the button, Enter in the
+// list and Enter in the field cannot drift apart.
+static void pk_commit(void) {
+    if (g_path.len == 0) return;
+    char chosen[PATHW];
+    strncpy(chosen, g_pathbuf, PATHW - 1);
+    chosen[PATHW - 1] = 0;
+    g_picking = 0;
+    do_mount(chosen, DISKIMG_LETTER_AUTO);
 }
 
 // ---- headless mode ---------------------------------------------------------
@@ -477,6 +717,7 @@ int main(int argc, char **argv) {
     apply_style();
     win = win_create("Disk Images", 140, 90, WIN_W, WIN_H);
     if (win < 0) return 1;
+    sync_content_size(win);      // #184: ask, do not assume (see CONTENT_H)
     refresh();
     draw();
 
@@ -492,6 +733,7 @@ int main(int argc, char **argv) {
         switch (ev.type) {
         case EVENT_REDRAW:
         case EVENT_RESIZE:
+            sync_content_size(win);   // #184: a resize changes what may be drawn
             draw(); break;
         case EVENT_WINDOW_CLOSE:
             running = 0; break;
@@ -501,19 +743,21 @@ int main(int argc, char **argv) {
             uint32_t kc = ev.keycode;
             if (g_picking) {
                 if (c == 27) { g_picking = 0; draw(); break; }
-                if (c == '\n' || c == '\r') {
-                    if (g_npick > 0) {
-                        char chosen[PATHW];
-                        strncpy(chosen, g_pick[g_picksel], PATHW - 1);
-                        chosen[PATHW - 1] = 0;
-                        g_picking = 0;
-                        do_mount(chosen, DISKIMG_LETTER_AUTO);
-                    }
-                    draw(); break;
-                }
+                if (c == '\t') { g_pkfocus = (g_pkfocus == PKF_PATH) ? PKF_LIST : PKF_PATH;
+                                 draw(); break; }
+                if (c == '\n' || c == '\r') { pk_commit(); draw(); break; }
+                // Up/Down always drive the list, from either focus: they are the
+                // only thing a single-line field does not want them for, and a
+                // user who has just typed a path still expects the arrows to
+                // browse.
                 if (kc == GUI_KEY_UP || kc == GUI_KEY_DOWN) {
                     gui_list_move_sel(&g_picklist, &g_picksel, kc == GUI_KEY_UP ? -1 : 1);
+                    pk_sync_path_from_sel();
                     draw(); break;
+                }
+                if (g_pkfocus == PKF_PATH) {
+                    if (tf_handle_key(&g_path, &ev)) draw();
+                    break;
                 }
                 if (gui_list_key(&g_picklist, kc)) draw();
                 break;
@@ -541,36 +785,46 @@ int main(int argc, char **argv) {
         case EVENT_MOUSE_DOWN: {
             int lx = ev.mouse_x, ly = ev.mouse_y;
             if (g_picking) {
-                int w = 520, h = 300;
-                int px = (WIN_W - w) / 2, py = (WIN_H - h) / 2;
-                int by = py + h - 34;
+                int px = pk_x(), py = pk_y();
+                int by = py + PK_H - 16 - BTN_H;
                 if (ly >= by && ly < by + BTN_H) {
-                    if (lx >= px + w - 2 * (BTN_W + 8) - 4 && lx < px + w - (BTN_W + 8) - 4) {
-                        if (g_npick > 0) {
-                            char chosen[PATHW];
-                            strncpy(chosen, g_pick[g_picksel], PATHW - 1);
-                            chosen[PATHW - 1] = 0;
-                            g_picking = 0;
-                            do_mount(chosen, DISKIMG_LETTER_AUTO);
-                        }
-                    } else if (lx >= px + w - (BTN_W + 8) - 4) {
-                        g_picking = 0;
+                    if (lx >= px + PK_W - 16 - 96 - 8 - BTN_W && lx < px + PK_W - 16 - 96)
+                        g_picking = 0;                       // Cancel
+                    else if (lx >= px + PK_W - 16 - 96 && lx < px + PK_W - 16)
+                        pk_commit();                         // Mount
+                    draw(); break;
+                }
+                if (ly >= py + 78 && ly < py + 78 + 26 &&
+                    lx >= px + 16 && lx < px + PK_W - 16) {
+                    g_pkfocus = PKF_PATH;
+                    // Caret to the clicked glyph, not to the end: a click that
+                    // ignores where it landed is the cursor-hostile behaviour
+                    // this project has been bitten by before. Measured with
+                    // gui_ttf_render_width() because that is the width function
+                    // that agrees with the renderer drawing the text.
+                    int rel = lx - (px + 16 + 8), best = 0;
+                    for (int i = 0; i <= g_path.len; i++) {
+                        char pre[PATHW];
+                        int n = i < PATHW - 1 ? i : PATHW - 1;
+                        for (int k = 0; k < n; k++) pre[k] = g_pathbuf[k];
+                        pre[n] = 0;
+                        if (gui_ttf_render_width(pre, TY_BODY) <= rel) best = i; else break;
                     }
+                    tf_set_caret(&g_path, best);
                     draw(); break;
                 }
                 int hit = gui_list_press(&g_picklist, lx, ly);
-                if (hit >= 0) g_picksel = hit;
+                if (hit >= 0) { g_picksel = hit; g_pkfocus = PKF_LIST; pk_sync_path_from_sel(); }
                 draw(); break;
             }
-            int by = WIN_H - PAD - BTN_H - 20;
-            if (ly >= by && ly < by + BTN_H) {
-                if (lx >= PAD && lx < PAD + BTN_W) {
+            if (ly >= 7 && ly < 7 + BTN_H) {
+                if (lx >= PAD && lx < PAD + 96) {
                     if (g_sel < g_nrows && (g_row[g_sel].flags & DISKIMG_F_MOUNTABLE))
                         open_picker();
-                } else if (lx >= PAD + BTN_W + 8 && lx < PAD + 2 * BTN_W + 8) {
+                } else if (lx >= PAD + 104 && lx < PAD + 104 + BTN_W - 2) {
                     if (g_sel < g_nrows && (g_row[g_sel].flags & DISKIMG_F_MOUNTED))
                         do_eject((int)g_row[g_sel].letter);
-                } else if (lx >= PAD + 2 * (BTN_W + 8) && lx < PAD + 2 * (BTN_W + 8) + BTN_W) {
+                } else if (lx >= PAD + 196 && lx < PAD + 196 + BTN_W - 2) {
                     refresh();
                 }
                 draw(); break;

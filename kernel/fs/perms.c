@@ -6,6 +6,12 @@
 #include "../string.h"
 #include "../serial.h"
 #include "../mm/heap.h"
+#include "bootlog.h"                        // #PERMSKIP: a security self-test
+                                            // that only reaches a serial port
+                                            // proves nothing on the laptop or
+                                            // the iMac, which have none.
+#include "../security/selftest_registry.h"  // #PERMSKIP: a group that declines
+                                            // to run must say so LOUDLY.
 
 // External filesystem
 extern fat_fs_t g_fat_fs;
@@ -318,6 +324,130 @@ static const struct { const char *path; uint16_t mode; } perms_system_seed[] = {
     { "/CONFIG/CACERTS.PEM",   0644 },
 };
 
+// ============================================================================
+// #221b SHARED GAME STATE SEED
+// ============================================================================
+// READ THIS BEFORE ADDING A LINE. Every entry in perms_system_seed[] above
+// TIGHTENS a path: each one takes something off perms_check()'s world-readable
+// no-entry default. Every entry BELOW does the opposite, it GRANTS write to a
+// path that the same default would refuse, and a table that grants is a
+// different kind of object from a table that restricts. They are separate so
+// that "what did we open up" is one grep and not a mode-by-mode audit of a
+// list whose other forty entries are locks.
+//
+// WHY ANYTHING NEEDS TO BE OPENED UP AT ALL. A DOS-era game keeps its state
+// beside its executable, because DOS had one user. /DOS/<GAME> here is
+// root-owned 0755, so a desktop session (uid 1000) is refused every such
+// write. Measured on golden 2053: NetHack printed "Warning: cannot write
+// record record", then "Some invalid directory locations were specified:
+// leveldir, savedir, bonesdir, scoredir, lockdir, troubledir", and exited.
+// The gate was working exactly as designed; there was simply nowhere writable
+// for the game to put anything.
+//
+// The answer is NOT to make /DOS/NETHACK writable. That directory holds
+// NETHACK.EXE and NHDAT, and a user who can rewrite the executable can hand
+// the next user a different program. The state is split by WHAT IT IS instead:
+//
+//   /GAMES/NETHACK    0777  SHARED, and shared is the correct answer for a
+//                           high-score table: `record` is one table for the
+//                           machine, which is what it has meant since NetHack
+//                           ran setgid on a UNIX timeshare. The lock file, the
+//                           bones files (one player's death furnishing another
+//                           player's dungeon) and the panic log are shared for
+//                           the same reason. 0777 rather than a group mode
+//                           because there is no "games" group to put a session
+//                           user in, and the directory holds no code.
+//   <home>/GAMES/NETHACK      PER-USER, created 0750 by
+//                           users_make_home_skeleton(). Save files and the
+//                           level files of a game in progress are private
+//                           state: two people playing on one machine must not
+//                           share them, and a save is exactly the file you do
+//                           not want another account able to edit.
+//
+// The two `record` files below are NOT a duplicate, and the difference is
+// measured, not assumed:
+//
+//   /GAMES/NETHACK/RECORD  is the REAL high-score table. topten() opens the
+//                          record file for READING and gives up if the open
+//                          fails ("Cannot open record file!"); it never
+//                          creates it. Measured: with the directory writable
+//                          but no `record` in it, a completed game wrote its
+//                          logfile entry and NO score. So the file has to
+//                          exist before the first game, and the build ships it
+//                          empty.
+//   /DOS/NETHACK/RECORD    exists so that NetHack's own startup probe passes.
+//                          chdirx(hackdir, TRUE) calls check_recordfile()
+//                          BEFORE initoptions() has read defaults.nh, so the
+//                          probe runs with the DEFAULT (empty) score prefix
+//                          and lands on hackdir/record whatever the config
+//                          says. Measured: the warning names the file as
+//                          "record", relative, which is what proves the config
+//                          has not been read at that point. The probe opens
+//                          O_RDWR and only warns if that fails, so an existing
+//                          0666 file silences it. Nothing ever writes to it.
+//
+// These are files and directories the BUILD creates (build/build-golden.sh,
+// section 3b-vii) and this table gives them their modes, so a fresh install
+// has both halves. The seed only fills a MISSING entry, so an operator chmod
+// still wins.
+// #rawrite: AND THE THIRD INSTANCE ADDED NO ROW AT ALL, ON PURPOSE.
+//
+// Command & Conquer: Red Alert hits the identical wall and is the case that
+// showed this table cannot be the answer for every game. Measured on a hand
+// install at /DOS/RA:
+//
+//   [GUESTFS-DENY] guest=dos uid=1000 gid=1000 want=-w- op=INT21/3Ch create
+//                  reason=PERMS path=/DOS/RA/./REDALERT.INI
+//
+// The two titles above were each rescued by pointing the GAME somewhere else:
+// NetHack has DEFAULTS.NH, which names savedir and scoredir, and SimCity has a
+// load/save requester that takes a typed path. Red Alert has NEITHER. Every
+// mutable file it touches is a bare relative name in its own install
+// directory, and it ignores the current directory it was launched with:
+// measured under a DOSBox-X reference run on 2026-08-27, launched as
+// C:\RA\GAME.EXE with the shell current directory set to C:\SAVE, it wrote its
+// DOS/4G swap file and rewrote REDALERT.INI into C:\RA and left C:\SAVE empty.
+//
+// So there is no string this table could hold that makes Red Alert work
+// EXCEPT a write grant on /DOS/RA itself, which is exactly the shortcut the
+// block above rejects: that directory holds GAME.DAT, and a user who can
+// rewrite the executable can hand the next user a different program. A 0777
+// there would also be strictly worse than the NetHack case it is imitating,
+// because NetHack's 0777 is on /GAMES/NETHACK, a directory holding NO CODE.
+//
+// The fix is therefore a MECHANISM and not a row: dos/int21svc.c now redirects
+// a guest's writes into a per-user overlay under the launching user's own home
+// (rustkern/dosovl.rs, and see the long note in dos/dospath.c, which had named
+// this as the missing piece since #736 Stage 2). The overlay lives at
+// <home>/GAMES/RA, created 0750 by users_make_home_skeleton(), so the ONLY
+// permission change Red Alert needs is inside a directory the user already
+// owns. Nothing under /DOS is loosened by one bit, and /DOS/RA stays root:root
+// 0755 with no entry here at all.
+//
+// Read that as the shape for the next title: if a game can be POINTED at a
+// writable directory, do that and put the mode here; if it cannot, redirect it
+// and add nothing here.
+static const struct { const char *path; uint16_t mode; } perms_shared_state_seed[] = {
+    { "/GAMES/NETHACK",        0777 },
+    { "/GAMES/NETHACK/RECORD", 0666 },
+    { "/DOS/NETHACK/RECORD",   0666 },
+    // #234f SimCity Classic. Same shape as NetHack and for the same reason:
+    // /DOS/SIMCITY is root:root 0755 because it holds SIMCITY.EXE, so a
+    // desktop session running as uid 1000 cannot write a city beside the
+    // executable. This is the machine-wide half; the per-user half is
+    // %HOME%/GAMES/SIMCITY, created by users_make_home_skeleton().
+    //
+    // SimCity Classic differs from NetHack in one way that matters: it has NO
+    // config file that can name a save directory, so nothing redirects its
+    // writes for it. What makes this usable is that its load/save requester
+    // takes a TYPED path, and dospath.c resolves C:\GAMES\SIMCITY\NAME.CTY
+    // to /WINDIR/DRIVE_C/GAMES/SIMCITY/NAME.CTY, which int21svc.c's
+    // native_fallback() then maps to the native /GAMES/SIMCITY/NAME.CTY that
+    // exists. So the player names the writable location once and the game
+    // remembers it for the session.
+    { "/GAMES/SIMCITY",        0777 },
+};
+
 // #674: /CONFIG shipped as mode 0700 (verified on golden build 1018, commit
 // 1f2ee02: /CONFIG/PERMS.DB carries the line "/CONFIG:0:0:0700"). That is
 // BACKWARDS relative to the model it is imitating. In Linux, /etc is 0755 and
@@ -414,15 +544,32 @@ static void perms_fix_config_dir(void) {
 // It does not modify the database, and it uses uid 1000/1002 (admin/ref, the
 // accounts /CONFIG/PASSWD actually ships) rather than inventing users.
 extern int perms_canon_rs(const char *src, char *out, uint32_t cap);
+extern int perm_home_shape_rs(const char *path);   // rustkern/permhome.rs
+extern int permhome_selftest_rs(void);             // rustkern/permhome.rs
+extern int selftestreg_selftest_rs(void);          // rustkern/selftestreg.rs
 
 static int st_fail;
+static int st_ran;      // vectors actually EXECUTED, so "PASS" carries a size
+static int st_notrun;   // groups that declined, so "PASS" cannot hide one
 
+// #PERMSKIP: every line below goes to bootlog_write(), not kprintf().
+//
+// This is a security self-test. Its verdict is worth exactly as much as the
+// number of machines it can be read on, and kprintf() reaches a serial port
+// only: serial is silent in GUI mode, and the two targets whose evidence
+// actually matters (the owner's ASUS laptop, the iMac14,4) have no serial port
+// at all. bootlog_write() mirrors to serial anyway and replays into
+// /BOOTLOG.TXT once the root volume is writable, so choosing it costs nothing.
+// perms_selftest() is called from perms_init(), not from main.c, which is the
+// only reason kernel/tools/diaglog-gate was not already failing the build over
+// this: that gate scopes to main.c's callees.
 static void st_canon(const char *in, const char *want) {
     char got[256];
     int n = perms_canon_rs(in, got, sizeof(got));
+    st_ran++;
     if (n < 0 || strcmp(got, want) != 0) {
-        kprintf("[PERMS-SELFTEST] FAIL canon(\"%s\") = \"%s\" (want \"%s\")\n",
-                in, n < 0 ? "<error>" : got, want);
+        bootlog_write("[PERMS-SELFTEST] FAIL canon(\"%s\") = \"%s\" (want \"%s\")",
+                      in, n < 0 ? "<error>" : got, want);
         st_fail++;
     }
 }
@@ -430,16 +577,217 @@ static void st_canon(const char *in, const char *want) {
 static void st_check(const char *path, uint32_t uid, uint32_t gid, int access,
                      int want, const char *why) {
     int got = perms_check(path, uid, gid, access);
+    st_ran++;
     // perms_check returns 0 (allow) or -1 (deny); compare on the sign only.
     if ((got == 0) != (want == 0)) {
-        kprintf("[PERMS-SELFTEST] FAIL %s uid=%u access=%d -> %d (want %d) [%s]\n",
-                path, uid, access, got, want, why);
+        bootlog_write("[PERMS-SELFTEST] FAIL %s uid=%u access=%d -> %d (want %d) [%s]",
+                      path, uid, access, got, want, why);
         st_fail++;
     }
 }
 
+// ===========================================================================
+// #PERMSKIP: FINDING THE HOME TO TEST, INSTEAD OF NAMING ONE.
+// ===========================================================================
+// THE DEFECT THIS REPLACES. The traversal vectors were armed by the literal
+// string "/HOME/ADMIN". The first-boot wizard lets the owner name the account
+// and proc/users.c derives the home from that name, so an owner called "james"
+// gets /HOME/JAMES and /HOME/ADMIN never exists. The kernel therefore printed
+//
+//     [PERMS-SELFTEST] SKIP traversal vectors (/HOME/ADMIN not 1000:0750)
+//
+// on every boot of a CORRECTLY PROVISIONED machine, forever, in a line that
+// reads like routine noise about an unfinished image. MEASURED on golden build
+// 2234: the shipped /CONFIG/PERMS.DB holds three entries and /CONFIG/PASSWD is
+// empty, so the vectors could not run before provisioning either. The
+// directory-traversal half of #674 - the half that stops one account reading
+// another's home - has probably never been exercised on a real user's machine.
+//
+// DO NOT "FIX" THIS BY LOOKING AT THE INODE. perms_check() never consults the
+// ext2 inode; perms_lookup() is a pure hash-table lookup and /CONFIG/PERMS.DB
+// is the only source of truth. A previous attempt spent its time discovering
+// that debugfs-set ext2 uid/mode changes nothing here.
+//
+// So the homes are DISCOVERED, from the live database, by SHAPE (rustkern/
+// permhome.rs: "/HOME/" plus exactly one component). Whatever the owner called
+// the account, it is found.
+#define ST_MAX_HOMES 8
+
+// The "some other account" identity used by the deny-direction vectors.
+//
+// It used to be a hardcoded 1002 ("ref"), an account this image does not ship
+// and may never have. Worse, 1002 is a GUESS about a gid as well as a uid: if
+// it ever collided with the home's own gid, the 0750 GROUP bits would ALLOW
+// and the vector would quietly assert the opposite of what it reads as, which
+// is a security test that passes by being wrong. 65534:65534 (the conventional
+// "nobody") cannot be 0, and cannot collide with a real account here because
+// uids start at 1000 and MAX_USERS is 32. The two decrements below make that
+// total rather than merely overwhelmingly likely.
+#define ST_OTHER_UID 65534u
+#define ST_OTHER_GID 65534u
+
+typedef struct {
+    char     path[256];
+    uint32_t uid;
+    uint32_t gid;
+    uint16_t mode;
+} st_home_t;
+
+// Walk the LIVE hash table for user home directories. Not a lookup of a name
+// we chose: an enumeration of what this machine actually has.
+//
+// uid < 1000 is excluded on purpose. perms_check() returns 0 on its FIRST LINE
+// for uid 0, so a root-owned home would make every owner-direction vector pass
+// without consulting the walker at all: a group of assertions structurally
+// incapable of failing. If a home IS root-owned, excluding it here is what
+// turns the situation into a loud not-run instead.
+static int st_collect_homes(st_home_t *out, int max) {
+    int n = 0;
+    for (int b = 0; b < PERM_TABLE_SIZE && n < max; b++) {
+        for (perm_entry_t *e = perm_table[b]; e && n < max; e = e->next) {
+            if (!perm_home_shape_rs(e->path)) continue;
+            if (e->uid < 1000) continue;
+            int i = 0;
+            while (e->path[i] && i < (int)sizeof(out[n].path) - 1) {
+                out[n].path[i] = e->path[i];
+                i++;
+            }
+            out[n].path[i] = '\0';
+            out[n].uid  = e->uid;
+            out[n].gid  = e->gid;
+            out[n].mode = e->mode;
+            n++;
+        }
+    }
+    return n;
+}
+
+// The traversal vectors, for ONE home, whatever it is called.
+//
+// The subject is a child path with NO ENTRY OF ITS OWN. That is the whole
+// point of #674: the child is protected by its PARENT's mode, which is exactly
+// what the pre-#674 exact-path lookup could not do. If every probe name we try
+// already has an entry, there is no such child left and the group has to
+// decline rather than test something else.
+static void st_home_vectors(const st_home_t *h, const char *ctx) {
+    static const char *cands[3] = { "/NOSUCH.STV", "/NOSUCH2.STV", "/NOSUCH3.STV" };
+    char child[256];
+    int have_child = 0;
+
+    for (int c = 0; c < 3 && !have_child; c++) {
+        int hl = 0; while (h->path[hl]) hl++;
+        int cl = 0; while (cands[c][cl]) cl++;
+        if (hl + cl + 1 > (int)sizeof(child)) break;
+        for (int i = 0; i < hl; i++) child[i] = h->path[i];
+        for (int i = 0; i <= cl; i++) child[hl + i] = cands[c][i];
+        uint32_t cu = 0, cg = 0; uint16_t cm = 0;
+        if (perms_get(child, &cu, &cg, &cm) != 0) have_child = 1;
+    }
+    if (!have_child) {
+        selftest_notrun("perms/traversal",
+                        "every probe name already has its own PERMS.DB entry, so no "
+                        "path is left that is protected ONLY by its parent directory");
+        st_notrun++;
+        return;
+    }
+
+    uint32_t ou = ST_OTHER_UID, og = ST_OTHER_GID;
+    if (ou == h->uid) ou--;
+    if (og == h->gid) og--;
+
+    // POLICY, ASSERTED RATHER THAN READ OFF THE ENTRY.
+    //
+    // proc/users.c creates every home 0750 and kernel/main.c re-asserts
+    // 0750 at every login (#745), so a home that is not 0750 is drift from
+    // the model. The vectors below therefore assert "other is refused"
+    // UNCONDITIONALLY, and a world-searchable home FAILS them.
+    //
+    // Deriving the expectation from the mode instead - "deny if the o bits are
+    // clear, allow if they are set" - would produce a test that agrees with
+    // whatever it finds. That is the same shape as a counter incremented only
+    // on the success path: it can never see the fault it is named after. If a
+    // machine's home really is 0755, that is a finding about the machine, and
+    // the right behaviour is to say so every boot until somebody fixes it.
+    if ((h->mode & 0777) != 0750) {
+        bootlog_write("[PERMS-SELFTEST] POLICY FAIL (%s): home '%s' is %04o, not 0750 "
+                      "(owner %u:%u). Any bit granted to OTHER exposes this home to "
+                      "every other account on the machine.",
+                      ctx, h->path, (unsigned)(h->mode & 0777),
+                      (unsigned)h->uid, (unsigned)h->gid);
+        st_fail++;
+    }
+
+    st_check(child, ou, og, R_OK, -1,
+             "no x on 0750 parent for other: child inherits protection");
+    st_check(child, h->uid, h->gid, R_OK, 0,
+             "owner traverses its own 0750 home");
+    // #676: the exact predicate the O_CREAT gate consults. Creating a NAME is a
+    // write to the PARENT DIRECTORY, so sys_open_k() asks
+    // perms_check(parent, W_OK | X_OK).
+    st_check(h->path, h->uid, h->gid, W_OK | X_OK, 0,
+             "#676: create in OWN HOME permitted (this is what #679 unblocks)");
+    st_check(h->path, ou, og, W_OK | X_OK, -1,
+             "#676: create in ANOTHER user's home refused");
+}
+
+static void st_summary(const char *ctx) {
+    if (st_fail == 0 && st_notrun == 0) {
+        bootlog_write("[PERMS-SELFTEST] #674 PASS (%s): %d vector(s), "
+                      "canonicalization + directory traversal enforced", ctx, st_ran);
+    } else if (st_fail == 0) {
+        // NOT a pass. A group that declined is the failure mode this whole
+        // change exists to make visible, and it must not be reported in the
+        // same word as a clean run.
+        bootlog_write("[PERMS-SELFTEST] #674 *** NOT FULLY VERIFIED *** (%s): "
+                      "%d vector(s) passed but %d group(s) DID NOT RUN",
+                      ctx, st_ran, st_notrun);
+    } else {
+        bootlog_write("[PERMS-SELFTEST] #674 *** %d FAILURE(S) *** (%s, %d vector(s) "
+                      "run, %d group(s) did not run) permission model is NOT correct",
+                      st_fail, ctx, st_ran, st_notrun);
+    }
+}
+
+// ===========================================================================
+// #674 BOOT SELF-TEST
+// ===========================================================================
+// blame.md's most-repeated lesson is that in-tree prose lies: a control is only
+// real if you watched it fire. This runs on EVERY boot, against the LIVE
+// permission database (not a synthetic one), and it exercises perms_check()
+// itself rather than a re-implementation of it, so a bug in the walker cannot
+// hide behind a test that shares it.
+//
+// It asserts BOTH directions. A test that only checks denials passes trivially
+// if the checker denies everything, which would be a total outage dressed up as
+// a security win.
+//
+// It does not modify the database.
 void perms_selftest(void) {
     st_fail = 0;
+    st_ran = 0;
+    st_notrun = 0;
+
+    // The two pure Rust helpers this test now leans on, proven BEFORE they are
+    // used to select anything. A shape predicate that matched nothing would
+    // recreate the exact bug being fixed, and would do it silently: the homes
+    // would simply stop being found and the group would decline forever.
+    {
+        int bad = permhome_selftest_rs();
+        if (bad) {
+            bootlog_write("[PERMS-SELFTEST] FAIL home-shape predicate: %d bad vector(s); "
+                          "home discovery cannot be trusted this boot", bad);
+            st_fail += bad;
+        } else {
+            selftest_ran("perms/homeshape");
+        }
+        bad = selftestreg_selftest_rs();
+        if (bad) {
+            bootlog_write("[PERMS-SELFTEST] FAIL not-run register: %d bad vector(s)", bad);
+            st_fail += bad;
+        } else {
+            selftest_ran("selftest/register");
+        }
+    }
 
     // --- canonicalization: the walker must see the object the FS will open ---
     st_canon("/CONFIG/SHADOW",            "/CONFIG/SHADOW");
@@ -452,10 +800,11 @@ void perms_selftest(void) {
     st_canon("/../../..",                 "/");
     st_canon("/",                         "/");
     st_canon("/CONFIG/",                  "/CONFIG");         // trailing slash
+    selftest_ran("perms/canon");
 
     // --- enforcement, on the live database --------------------------------
     // Guard on the entries this test reasons about, so a hand-edited PERMS.DB
-    // produces a clear SKIP rather than a misleading FAIL.
+    // produces a clear not-run rather than a misleading FAIL.
     uint32_t u = 0, g = 0; uint16_t m = 0;
     if (perms_get("/CONFIG/KIMI.KEY", &u, &g, &m) == 0 && u == 0 && (m & 0777) == 0600) {
         // The whole point of #674: three spellings of ONE object, all denied.
@@ -466,8 +815,13 @@ void perms_selftest(void) {
         st_check("CONFIG/KIMI.KEY",            1000, 1000, R_OK, -1, "relative bypass closed");
         // The uid-0 early-out must be EXACTLY as it was before #674.
         st_check("/CONFIG/KIMI.KEY",              0,    0, R_OK,  0, "root bypass preserved");
+        selftest_ran("perms/secret");
     } else {
-        kprintf("[PERMS-SELFTEST] SKIP secret vectors (/CONFIG/KIMI.KEY not root:0600)\n");
+        selftest_notrun("perms/secret",
+                        "/CONFIG/KIMI.KEY is not root-owned 0600 in PERMS.DB (it is absent "
+                        "from images that ship no API key), so the dot/dotdot/double-slash "
+                        "bypass vectors against a real 0600 secret did not run");
+        st_notrun++;
     }
 
     // The other direction: /CONFIG must stay TRAVERSABLE and its public files
@@ -476,54 +830,192 @@ void perms_selftest(void) {
         ((m & 0777) == 0755 || (m & 0777) == 0711)) {
         st_check("/CONFIG",        1000, 1000, X_OK, 0, "/CONFIG searchable (like /etc)");
         st_check("/CONFIG/PASSWD", 1000, 1000, R_OK, 0, "uid->name lookup must keep working");
+        selftest_ran("perms/configopen");
     } else {
-        kprintf("[PERMS-SELFTEST] SKIP traversal-open vectors "
-                "(/CONFIG is neither 0755 nor 0711)\n");
+        selftest_notrun("perms/configopen",
+                        "/CONFIG is neither 0755 nor 0711 in PERMS.DB, so the "
+                        "must-stay-usable direction of #674 did not run and this kernel "
+                        "has not checked that it is not simply denying everything");
+        st_notrun++;
     }
 
     // Traversal proper: a directory that denies search to others must protect a
     // child that has NO entry of its own. This is precisely what the pre-#674
     // exact-path lookup could not do.
-    if (perms_get("/HOME/ADMIN", &u, &g, &m) == 0 && u == 1000 && (m & 0777) == 0750 &&
-        perms_get("/HOME/ADMIN/NOSUCHFILE", &u, &g, &m) != 0) {
-        st_check("/HOME/ADMIN/NOSUCHFILE", 1002, 1002, R_OK, -1,
-                 "no x on 0750 parent for other: child inherits protection");
-        st_check("/HOME/ADMIN/NOSUCHFILE", 1000, 1000, R_OK,  0,
-                 "owner traverses its own 0750 home");
-    } else {
-        kprintf("[PERMS-SELFTEST] SKIP traversal vectors (/HOME/ADMIN not 1000:0750)\n");
+    //
+    // #PERMSKIP: over EVERY home this machine actually has, discovered by
+    // shape. See st_collect_homes() above for why this is no longer a literal
+    // path, and why zero homes is a loud not-run rather than a quiet SKIP.
+    {
+        st_home_t homes[ST_MAX_HOMES];
+        int nh = st_collect_homes(homes, ST_MAX_HOMES);
+        if (nh == 0) {
+            selftest_notrun("perms/traversal(boot)",
+                            "no user home directory exists in /CONFIG/PERMS.DB, so the "
+                            "directory-traversal half of the permission model is UNVERIFIED. "
+                            "Expected on a virgin image before the first-boot wizard; a "
+                            "DEFECT on any machine that has an account");
+            st_notrun++;
+        } else {
+            for (int i = 0; i < nh; i++) {
+                bootlog_write("[PERMS-SELFTEST] traversal vectors on home %d/%d: "
+                              "'%s' %u:%u %04o", i + 1, nh, homes[i].path,
+                              (unsigned)homes[i].uid, (unsigned)homes[i].gid,
+                              (unsigned)(homes[i].mode & 0777));
+                st_home_vectors(&homes[i], "boot");
+            }
+            selftest_ran("perms/traversal(boot)");
+        }
     }
 
     // #676: the exact predicate the O_CREAT gate consults. Creating a NAME is a
     // write to the PARENT DIRECTORY, so sys_open_k() (and open_redir_file())
     // ask perms_check(parent, W_OK | X_OK). Asserted here in BOTH directions on
     // the live database, because the allow direction alone is what a boot
-    // happens to exercise: the desktop creates files in its own home and never
-    // tries to create one in /CONFIG, so nothing in a normal boot log shows the
-    // gate REFUSING. HONEST SCOPE: this proves the decision function, not the
-    // syscall wiring; the wiring is evidenced separately by the fact that a
-    // uid-1000 session now creates /HOME/ADMIN/UIPROFIL.YML and still cannot
-    // write /CONFIG.
+    // happens to exercise.
+    //
+    // ===================================================================
+    // #229 CORRECTION. THE JUSTIFICATION THIS ASSERTION CARRIED WAS FALSE,
+    // AND IT WAS FALSE ABOUT THE ONE THING IT WAS ASSERTING.
+    // ===================================================================
+    // It read: "the desktop creates files in its own home and NEVER TRIES TO
+    // CREATE ONE IN /CONFIG, so nothing in a normal boot log shows the gate
+    // REFUSING."
+    //
+    // /APPS/SETUP, the first-boot wizard, tried FOUR TIMES on every virgin
+    // boot: /CONFIG/SETUPDONE, /CONFIG/SETUPSKIP, /CONFIG/SETUPNEW and
+    // /CONFIG/NETIP.CFG. The boot log did not merely SHOW the refusal, it
+    // showed it as the reason a virgin machine could not be set up and could
+    // not reach a desktop (#226, measured on golden 2011):
+    //
+    //     [PERMS-DENY] proc=SETUP uid=1000 gid=1000 want=-wx path=/CONFIG
+    //
+    // A PASSING SELF-TEST WHOSE JUSTIFICATION IS FALSE IS A BUG REPORT THAT
+    // PRINTS PASS EVERY BOOT. The refusal being asserted here was the live
+    // symptom of the top-severity defect on the tracker, and the sentence
+    // beside it said the situation could not arise. Whoever read this block
+    // while chasing that bug was told, by the kernel's own self-test, to look
+    // elsewhere.
+    //
+    // THE ASSERTION ITSELF IS CORRECT AND IS KEPT UNCHANGED. /CONFIG holds
+    // SHADOW, AUTHKEYS, SSHD.CFG and the owner's API keys; a uid-1000 process
+    // creating names in it is exactly what must not happen, and #745 spent a
+    // whole change tightening this directory (0755 -> 0711) rather than
+    // loosening it. What was wrong was the CLAIM ABOUT REALITY, not the
+    // POLICY. #229 fixed the caller, not the gate: the wizard now asks the
+    // kernel for first-run state through SYS_FIRSTRUN
+    // (kernel/rustkern/firstrun.rs), which owns the set of legal keys and
+    // writes them from Ring 0, so there is no longer anything on the machine
+    // that wants to create a name here.
+    //
+    // HONEST SCOPE, unchanged: this proves the decision function, not the
+    // syscall wiring. The wiring is evidenced separately by a uid-1000 session
+    // creating <home>/UIPROFIL.YML while still being refused /CONFIG - and,
+    // since #229, by the wizard completing every step without one
+    // [PERMS-DENY] line.
     st_check("/CONFIG", 1000, 1000, W_OK | X_OK, -1,
-             "#676: create in /CONFIG refused (root-owned, no w for other)");
+             "#676/#229: create in /CONFIG refused (root-owned, no w for other)");
     st_check("/",       1000, 1000, W_OK | X_OK, -1,
              "#676: create in / refused (root-owned 0755)");
-    if (perms_get("/HOME/ADMIN", &u, &g, &m) == 0 && u == 1000 && (m & 0777) == 0750) {
-        st_check("/HOME/ADMIN", 1000, 1000, W_OK | X_OK, 0,
-                 "#676: create in OWN HOME permitted (this is what #679 unblocks)");
-        st_check("/HOME/ADMIN", 1002, 1002, W_OK | X_OK, -1,
-                 "#676: create in ANOTHER user's home refused");
+    selftest_ran("perms/create");
+
+    st_summary("boot");
+}
+
+// ===========================================================================
+// #PERMSKIP: THE SESSION-SCOPED RUN.
+// ===========================================================================
+// perms_init() runs at main.c:2934 and users_init() at :2940, so at boot time
+// there is no session and no loaded user database: the boot run above can only
+// enumerate what PERMS.DB already holds. This one runs from the login path,
+// where kernel/main.c has just claimed the home for the session identity, so it
+// tests THE ACTUAL USER'S HOME, under THE ACTUAL USER'S uid/gid, whatever the
+// owner chose to call the account. That is the definitive run.
+//
+// ROOT SESSIONS. Root's home is "/", and the filesystem root is not a home
+// directory: it is root:root 0755 by design and every account must be able to
+// traverse it, so asserting "another account cannot search it" would assert the
+// opposite of the model. Stating that here rather than leaving a third silent
+// skip: for a root session the vectors run against every non-root home the
+// database holds, and if there are none, that is a LOUD not-run.
+void perms_selftest_session(const char *home, uint32_t uid, uint32_t gid) {
+    st_fail = 0;
+    st_ran = 0;
+    st_notrun = 0;
+
+    int root_home = (home == NULL || home[0] == '\0' ||
+                     (home[0] == '/' && home[1] == '\0'));
+
+    if (root_home) {
+        st_home_t homes[ST_MAX_HOMES];
+        int nh = st_collect_homes(homes, ST_MAX_HOMES);
+        if (nh == 0) {
+            selftest_notrun("perms/traversal(session)",
+                            "session user is root, whose home is the filesystem root and is "
+                            "not a home directory, and PERMS.DB holds no non-root home to "
+                            "test instead: no account on this machine has a protected home");
+            st_notrun++;
+        } else {
+            bootlog_write("[PERMS-SELFTEST] session user is uid %u with home '/' (root); "
+                          "the filesystem root is not a home directory, so the traversal "
+                          "vectors run against the %d non-root home(s) in PERMS.DB",
+                          (unsigned)uid, nh);
+            for (int i = 0; i < nh; i++) st_home_vectors(&homes[i], "session/root");
+            selftest_ran("perms/traversal(session)");
+        }
+    } else {
+        st_home_t h;
+        uint32_t u = 0, g = 0; uint16_t m = 0;
+        if (perms_get(home, &u, &g, &m) != 0) {
+            selftest_notrun("perms/traversal(session)",
+                            "the session user's home has NO entry in /CONFIG/PERMS.DB, so "
+                            "nothing is protecting it and there is nothing to verify; "
+                            "main.c claims it at every login (#745) and that did not happen");
+            st_notrun++;
+        } else {
+            int i = 0;
+            while (home[i] && i < (int)sizeof(h.path) - 1) { h.path[i] = home[i]; i++; }
+            h.path[i] = '\0';
+            h.uid = u; h.gid = g; h.mode = m;
+
+            // The database entry must BE the session identity. If it is not,
+            // the login-time claim did not take, and every vector below would
+            // be testing somebody else's ownership while reading as though it
+            // had tested this session's.
+            if (u != uid || g != gid) {
+                bootlog_write("[PERMS-SELFTEST] FAIL session home '%s' is owned %u:%u but the "
+                              "session is %u:%u; the login-time claim (#745) did not take",
+                              home, (unsigned)u, (unsigned)g,
+                              (unsigned)uid, (unsigned)gid);
+                st_fail++;
+            }
+            // The account name is the tail of the home path, but ONLY if the
+            // path really has the "/HOME/<name>" shape. Printing h.path + 6
+            // unconditionally would read past the NUL of a shorter path and
+            // put uninitialized kernel stack bytes into a log that is written
+            // to disk. Every home users.c produces has that shape today; "it
+            // has the right shape in practice" is precisely the reasoning this
+            // whole change exists to stop trusting.
+            const char *who = perm_home_shape_rs(h.path) ? (h.path + 6) : "?";
+            bootlog_write("[PERMS-SELFTEST] session home '%s' %u:%u %04o (user '%s' as "
+                          "provisioned, not a hardcoded name)",
+                          h.path, (unsigned)h.uid, (unsigned)h.gid,
+                          (unsigned)(h.mode & 0777), who);
+            st_home_vectors(&h, "session");
+            selftest_ran("perms/traversal(session)");
+        }
     }
 
-    if (st_fail == 0) {
-        kprintf("[PERMS-SELFTEST] #674 PASS: canonicalization + directory traversal enforced\n");
-    } else {
-        kprintf("[PERMS-SELFTEST] #674 *** %d FAILURE(S) *** permission model is NOT correct\n",
-                st_fail);
-    }
+    st_summary("session");
 }
 
 static void perms_seed_system(void) {
+    unsigned ns = sizeof(perms_shared_state_seed) / sizeof(perms_shared_state_seed[0]);
+    for (unsigned i = 0; i < ns; i++) {
+        if (perms_lookup(perms_shared_state_seed[i].path)) continue;   // operator wins
+        perms_set(perms_shared_state_seed[i].path, 0, 0,
+                  perms_shared_state_seed[i].mode);
+    }
     unsigned n = sizeof(perms_system_seed) / sizeof(perms_system_seed[0]);
     unsigned added = 0;
     for (unsigned i = 0; i < n; i++) {
@@ -607,6 +1099,25 @@ void perms_init(void) {
 
     perms_initialized = true;
     perms_selftest();         // #674: proves the walker on the LIVE database
+    {   // #58: and the CWD RESOLVER, which shares this file's canonicalizer.
+        // "A rule that has never been watched being right is a comment"
+        // (dos/dosexec.c). The cases include the exact golden-1811 failure
+        // recorded in blame.md - mkdir("texpacks") under a chdir'd cwd landing
+        // at the filesystem root and reporting success - plus the
+        // ".. cannot escape the root" case that is what makes cwd resolution
+        // safe to expose to Ring 3 at all, and the cwd="/" case that proves a
+        // process which never calls chdir sees no change whatsoever.
+        extern int path_resolve_selftest_rs(void);
+        int rbad = path_resolve_selftest_rs();
+        kprintf("[PERMS] #58 cwd path-resolution selftest: %s (%d failing)\n",
+                rbad == 0 ? "PASS" : "FAIL", rbad);
+        // The END-TO-END half does NOT run here. It needs a current process to
+        // carry a cwd, and perms_init() runs long before the first one exists:
+        // wired here it printed "[#58] e2e SKIPPED: no current process" on
+        // every boot. It is latched to the first Ring-3 open instead
+        // (proc/fdlayer.c). Keeping the loud-skip line was what surfaced this;
+        // a test that skipped quietly would have read exactly like a pass.
+    }
     kprintf("[PERMS] Permissions database ready\n");
 }
 

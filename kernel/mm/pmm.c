@@ -2,7 +2,10 @@
 // Uses a bitmap to track 4KB page frames
 
 #include "pmm.h"
+#include "../sync/spinlock.h"   // #745 (#75): the SHARED irqsave spinlock
+#include "../proc/schedrace.h"  // #745 (#75): SR_SITE_PMM_HOLD reproducer
 #include "../boot_info.h"
+#include "../cpu/scprof.h"    // #121: allocator phase attribution
 #include "../serial.h"
 
 // Linker-provided symbols for kernel memory bounds
@@ -44,17 +47,73 @@ static memory_map_entry_t *g_mmap = 0;
 static uint32_t g_mmap_entries = 0;
 static uint64_t g_phys_limit = 0;   // one past the highest address in the map
 
-// Spinlock for thread safety (simple implementation)
-static volatile int pmm_lock = 0;
+// #745 (#75) THE PHYSICAL ALLOCATOR'S LOCK MUST MASK INTERRUPTS.
+//
+// This was a hand-rolled `volatile int` + test-and-set spin that left
+// RFLAGS.IF ALONE. That is the same defect #347 fixed in mm/heap.c and never
+// carried across to the physical allocator sitting next to it, and on two
+// scheduling cores it is not a self-deadlock but an AB-BA deadlock with the
+// Big Kernel Lock:
+//
+//   cpu A: takes pmm_lock with IF=1 and WITHOUT the BKL, is then interrupted;
+//          cpu/idt.c wraps every ISR in bkl_acquire(), so A now spins for the
+//          BKL WHILE HOLDING pmm_lock.
+//   cpu B: is inside a SYSCALL, which took the BKL at syscall_entry, and calls
+//          pmm_alloc_page(); it spins for pmm_lock WHILE HOLDING the BKL.
+//
+// Neither can ever proceed, both spin with interrupts ENABLED, and no core is
+// halted - which is why "the owner stops taking interrupts" and "a core halted
+// holding the lock" were both the wrong picture.
+//
+// MEASURED, build 1878 on throwaway VM <vmid>, gate ON, six QMP samples over
+// 30 s with every value identical:
+//   bkl_owner=1 bkl_depth=1 bkl_word=1        (cpu1 owns the BKL)
+//   cpu0 RIP=0x45d9c2 -> bkl_take_locked   cpu/smp.c:1112   HLT=0 IF=1
+//   cpu1 RIP=0x456ea2 -> pmm_acquire_lock  mm/pmm.c:66      HLT=0 IF=1
+//   pmm_lock=1  holder_cpu=0  holder_if=1  holder_bkl=0
+//   holder_ra=0x4574b6 -> pmm_alloc_page   mm/pmm.c:300
+//   ctxsw frozen at 48, both run queues empty, g_haltbkl all zero.
+//
+// The fix is the one the heap already has, taken through the SHARED primitive
+// rather than a third private copy: mask IF for the whole hold. A holder can
+// then never be interrupted, so it can never become a BKL waiter, and the only
+// remaining order is BKL -> pmm_lock, which is total.
+//
+// The critical sections here are a bitmap scan and a few counters. They are
+// bounded and short; this is not a place where masking interrupts costs.
+static spinlock_t pmm_lock = SPINLOCK_INIT_NAMED("pmm");
 
-static void pmm_acquire_lock(void) {
-    while (__sync_lock_test_and_set(&pmm_lock, 1)) {
-        __asm__ volatile("pause");
-    }
+// #745 (#75) PMM-HOLDER FORENSICS, kept. These two stores are what turned the
+// wedge from a story into a measurement: read out of guest memory over QMP they
+// name the core holding this lock and the call that took it, which is how the
+// deadlock partner above was identified rather than guessed. Two per-hold
+// stores on a path that already does an atomic read-modify-write.
+volatile int32_t  g_pmm_holder_cpu = -1;
+volatile uint64_t g_pmm_holder_ra  = 0;
+
+static uint64_t pmm_acquire_lock(void) {
+    uint64_t irqf = spinlock_acquire_irqsave(&pmm_lock);
+    { extern uint32_t smp_this_cpu(void);
+      g_pmm_holder_cpu = (int32_t)smp_this_cpu();
+      g_pmm_holder_ra  = (uint64_t)__builtin_return_address(0); }
+    // #745 (#75) REPRODUCER, `make SCHEDRACE=1` only, compiled out otherwise:
+    // hold this lock open so the other core has time to arrive. Reuses #75's own
+    // race-widening primitive rather than a private delay (SR_SITE_PMM_HOLD).
+    //
+    // ONE IN 64, not every allocation. A boot allocates tens of thousands of
+    // pages; 40 us on each would make the reproducer arm slow enough to fail the
+    // harness for a reason that is not the deadlock, and a confounded arm proves
+    // nothing. One in 64 still opens thousands of windows per boot.
+#ifdef SCHEDRACE
+    { static volatile uint32_t sr_n; if ((++sr_n & 63u) == 0u) schedrace_delay(SR_SITE_PMM_HOLD); }
+#endif
+    return irqf;
 }
 
-static void pmm_release_lock(void) {
-    __sync_lock_release(&pmm_lock);
+static void pmm_release_lock(uint64_t irqf) {
+    g_pmm_holder_cpu = -1;
+    g_pmm_holder_ra  = 0;
+    spinlock_release_irqrestore(&pmm_lock, irqf);
 }
 
 // Set a page as used in the bitmap
@@ -266,16 +325,63 @@ static void pmm_live_check(uint64_t pa, uint64_t count, uint64_t ret) {
 #endif
 
 // Allocate a single physical page
+static uint64_t pmm_alloc_page_inner(void);
 uint64_t pmm_alloc_page(void) {
-    pmm_acquire_lock();
+    scp_span_t __sp = scp_begin();   // #121
+    uint64_t __r = pmm_alloc_page_inner();
+    scp_end(SCP_PMMALLOC, __sp);
+    return __r;
+}
+// #121: START THE SCAN WHERE THE LAST ONE FINISHED.
+//
+// MEASURED on build 1899, VM <vmid>, one 300 s run to DESKTOP_READY: the single
+// longest UNBROKEN syscall in the system is SYS_SPAWN at 450207 us, and
+// 423261 us of it - 94% - is inside this function. #118 reported that hold as a
+// 446 ms Big Kernel Lock hold and #121 was opened to narrow the lock; the lock
+// is not what makes it long. The work inside it is, and almost all of the work
+// is here.
+//
+// WHY IT WAS SLOW. The loop below started at memory_start on EVERY call and
+// walked the bitmap one page at a time until it found a free bit. Allocating N
+// pages therefore costs O(N * used_pages), and it does so with the PMM lock
+// held, which is spinlock_acquire_irqsave: interrupts are OFF for the whole
+// scan. A spawn allocates the user stack and then every ELF segment page, which
+// is why the cost showed up as one enormous critical section and why it grows
+// with uptime rather than with the size of the binary.
+//
+// THE HINT VISITS THE SAME PAGES, IN A ROTATED ORDER. It starts at the page
+// after the last successful allocation and wraps once, so the set of pages
+// examined before giving up is EXACTLY the same set as before: this can never
+// fail where the old loop would have succeeded, which is the only property that
+// matters for an allocator. It is next-fit rather than first-fit, so a page
+// freed below the cursor is reused after the wrap instead of immediately; that
+// is standard and costs nothing that was being relied on. pmm_alloc_pages()
+// (the CONTIGUOUS allocator, used for DMA buffers) is deliberately NOT changed
+// and still scans from memory_start, so nothing about contiguity moves.
+//
+// C, not Rust, and stating the reason as the rule requires: this is not new
+// code. It is a minimal in-place change to an existing hot-path C function,
+// entangled with this file's static bitmap, its page counters and its irqsave
+// lock. Porting the physical allocator to Rust is a real piece of work with a
+// real risk budget and it is not this ticket.
+static uint64_t alloc_hint = 0;
 
-    // Search for a free page
-    for (uint64_t page = memory_start; page < memory_end; page++) {
+static uint64_t pmm_alloc_page_inner(void) {
+    uint64_t irqf = pmm_acquire_lock();
+
+    // Search for a free page, starting at the hint and wrapping once.
+    uint64_t span  = memory_end - memory_start;
+    uint64_t start = alloc_hint;
+    if (start < memory_start || start >= memory_end) start = memory_start;
+    for (uint64_t n = 0; n < span; n++) {
+        uint64_t page = start + n;
+        if (page >= memory_end) page -= span;
         if (!bitmap_test(page)) {
             bitmap_set(page);
             free_pages--;
             used_pages++;
-            pmm_release_lock();
+            alloc_hint = (page + 1 < memory_end) ? (page + 1) : memory_start;
+            pmm_release_lock(irqf);
             uint64_t pa = page * PMM_PAGE_SIZE;
 #ifdef PTWALK_SELFTEST
             pmm_live_check(pa, 1, (uint64_t)__builtin_return_address(0));
@@ -295,7 +401,7 @@ uint64_t pmm_alloc_page(void) {
         }
     }
 
-    pmm_release_lock();
+    pmm_release_lock(irqf);
     kprintf("[PMM] ERROR: Out of physical memory!\n");
     return 0;
 }
@@ -305,7 +411,7 @@ uint64_t pmm_alloc_pages(uint64_t count) {
     if (count == 0) return 0;
     if (count == 1) return pmm_alloc_page();
 
-    pmm_acquire_lock();
+    uint64_t irqf = pmm_acquire_lock();
 
     // Search for contiguous free pages
     uint64_t start_page = memory_start;
@@ -327,7 +433,7 @@ uint64_t pmm_alloc_pages(uint64_t count) {
             }
             free_pages -= count;
             used_pages += count;
-            pmm_release_lock();
+            pmm_release_lock(irqf);
 #ifdef PTWALK_SELFTEST
             pmm_live_check(start_page * PMM_PAGE_SIZE, count,
                            (uint64_t)__builtin_return_address(0));
@@ -336,7 +442,7 @@ uint64_t pmm_alloc_pages(uint64_t count) {
         }
     }
 
-    pmm_release_lock();
+    pmm_release_lock(irqf);
     kprintf("[PMM] ERROR: Cannot allocate %lu contiguous pages!\n", count);
     return 0;
 }
@@ -359,10 +465,10 @@ void pmm_free_page(uint64_t phys_addr) {
         }
     }
 
-    pmm_acquire_lock();
+    uint64_t irqf = pmm_acquire_lock();
 
     if (!bitmap_test(page)) {
-        pmm_release_lock();
+        pmm_release_lock(irqf);
         kprintf("[PMM] WARNING: Double free of page 0x%lx\n", phys_addr);
         return;
     }
@@ -371,7 +477,7 @@ void pmm_free_page(uint64_t phys_addr) {
     free_pages++;
     used_pages--;
 
-    pmm_release_lock();
+    pmm_release_lock(irqf);
 }
 
 // Free multiple contiguous physical pages
@@ -417,15 +523,15 @@ int pmm_reserve_page(uint64_t phys_addr) {
         return -1;
     }
 
-    pmm_acquire_lock();
+    uint64_t irqf = pmm_acquire_lock();
     if (bitmap_test(page)) {
-        pmm_release_lock();
+        pmm_release_lock(irqf);
         return 0;
     }
     bitmap_set(page);
     free_pages--;
     used_pages++;
-    pmm_release_lock();
+    pmm_release_lock(irqf);
     return 1;
 }
 

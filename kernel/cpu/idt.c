@@ -1,5 +1,6 @@
 // idt.c - Interrupt Descriptor Table implementation for x86_64
 #include "idt.h"
+#include "../fs/bootlog.h"   // #134: bootlog_fault_write (owning header, NOT a private extern)
 #include "gdt.h"
 #include "../serial.h"
 #include "../gui/crashhandler.h"
@@ -111,6 +112,33 @@ void idt_init(void) {
     extern void irq_hda_msi(void);
     idt_set_gate(0x50, (uint64_t)irq_hda_msi, GDT_KERNEL_CODE, IDT_GATE_INTERRUPT);
 
+    // #139: xHCI MSI vector (0x51 / 81, XHCI_MSI_VECTOR in drivers/xhci.h).
+    // Until #139 this kernel had NO xHCI interrupt at all: the event ring was
+    // drained only by timer-driven workers, so every USB completion (a HID
+    // report included) waited for the next poll pass. The C handler is
+    // registered at runtime by xhci_setup_interrupt(), or not at all if the
+    // controller turns out to have no MSI capability.
+    extern void irq_xhci_msi(void);
+    idt_set_gate(0x51, (uint64_t)irq_xhci_msi, GDT_KERNEL_CODE, IDT_GATE_INTERRUPT);
+
+    // #745 (#62): gate for the REDUNDANT tick source (Local APIC timer,
+    // vector 0x41). cpu/isr.c registers the C handler; without THIS the gate
+    // is absent and the first redundant tick raises #GP (error code 0x20b =
+    // vector 0x41, IDT, external).
+    extern void irq_tick_redundant(void);
+    idt_set_gate(0x41, (uint64_t)irq_tick_redundant, GDT_KERNEL_CODE, IDT_GATE_INTERRUPT);
+
+    // #169: gate for the PER-CORE AP PREEMPTION TICK (Local APIC timer,
+    // vector 0x42). Installed unconditionally on the ONE IDT the whole machine
+    // shares (idt_load_ap() loads this same table on every AP), so by the time
+    // an AP arms its timer the gate is already in place and arming is a single
+    // register write with no window. The C handler is registered in cpu/isr.c;
+    // doing only one half builds clean and #GPs with error code 0x213 on the
+    // first interrupt (0x42 << 3 | 2 | 1) - see the 0x41 note above, which is
+    // the same mistake, measured.
+    extern void irq_ap_tick(void);
+    idt_set_gate(0x42, (uint64_t)irq_ap_tick, GDT_KERNEL_CODE, IDT_GATE_INTERRUPT);
+
     // Use IST1 for Double Fault (vector 8) to prevent stack overflow
     idt[8].ist = 1;
 
@@ -152,19 +180,76 @@ static const char *exception_names[] = {
 
 // Common interrupt handler (called from assembly)
 static void isr_handler_impl(interrupt_frame_t *frame);
+// #161: isr_handler_impl() plus the asynchronous signal delivery point that
+// follows it. Defined below; see isr_async_sig_check() for the full writeup.
+static void isr_handler_body(interrupt_frame_t *frame);
 void isr_handler(interrupt_frame_t *frame) {  // #279 3b-3C BKL wrapper
     extern int g_smp_bkl_full; extern void bkl_acquire(void); extern void bkl_release(void);
     // #67 pass 5: tag what this core is doing so a long BKL hold can be blamed
     // on a VECTOR rather than on this wrapper, which is the same address every
     // time. One per-cpu store; no shared cacheline.
     extern void bkl_set_reason(uint32_t r);
+    // #118: execution-continuity witness. See cpu/smp.c bkl_irq_mark().
+    extern void bkl_irq_mark(void);
+    // #121: an interrupt-entry witness that does NOT depend on the BKL.
+    // bkl_irq_mark() lives inside the g_smp_bkl_full branch below AND
+    // returns early unless a hold is already in progress, so it cannot
+    // answer "did this core service anything at all during that syscall".
+    // That is the question #118 left open, so it gets its own counter.
+    { extern void scp_irq_tick(void); scp_irq_tick(); }
     if (g_smp_bkl_full) {
         bkl_acquire();
         bkl_set_reason(0x0100u | (uint32_t)(frame->int_no & 0xFF));
-        isr_handler_impl(frame);
+        bkl_irq_mark();
+        isr_handler_body(frame);
         bkl_release();
     }
-    else { isr_handler_impl(frame); }
+    else { isr_handler_body(frame); }
+}
+
+// #161: THE ASYNCHRONOUS SIGKILL DELIVERY POINT.
+//
+// Signal delivery used to happen at exactly one place, syscall.asm's
+// syscall_check_return_work() on the way out of a syscall. A Ring 3 process
+// grinding through a render loop therefore never reached a delivery point, and
+// a pending SIGKILL sat on it forever: Force Quit and Task Manager's Kill
+// failed on exactly the busy apps a user most wants to kill (a game, a media
+// player) while appearing to work on idle ones, because an idle app is blocked
+// in a syscall that sig_raise() wakes.
+//
+// The fix is here rather than in the app or the caller because SIGKILL must not
+// depend on the target cooperating. Every Ring 3 process is interrupted by the
+// timer many times a second whatever it is doing, and THAT is a delivery point
+// no process can decline.
+//
+// Restricted to signals that terminate outright with no handler
+// (sig_async_terminate_pending(), which is SIGKILL and any other
+// default-action-terminate signal the app has not caught). Handler delivery
+// stays on the syscall path, because building a sigframe means rewriting a
+// saved user frame and the interrupt frame's GPR order differs from the syscall
+// frame's - one layout, one delivery site, no second frame builder to keep in
+// step.
+//
+// SAFETY, and why proc_exit() from here is not new ground: this runs only when
+// the interrupt came FROM Ring 3 ((cs & 3) == 3), so the victim was in
+// userland, its kernel stack holds nothing but this interrupt frame, and it is
+// not mid-syscall holding anything. exception_fatal() below already calls
+// proc_exit(-1) from this same isr_handler_impl() context, with the BKL held,
+// for every user-mode fault; sched_schedule() drops the BKL across the context
+// switch (bkl_release_all()), so the abandoned hold is released exactly as it
+// is for a faulting process. proc_exit() does not return.
+static void isr_async_sig_check(interrupt_frame_t *frame) {
+    if ((frame->cs & 0x3) != 0x3) return;   // returning to Ring 0: not a delivery point
+    extern int sig_async_terminate_pending(void);
+    int signo = sig_async_terminate_pending();
+    if (signo <= 0) return;
+    extern void proc_exit(int exit_code);
+    proc_exit(128 + signo);   // conventional POSIX status, same as the syscall path
+}
+
+static void isr_handler_body(interrupt_frame_t *frame) {
+    isr_handler_impl(frame);
+    isr_async_sig_check(frame);
 }
 static void isr_handler_impl(interrupt_frame_t *frame) {
     uint64_t int_no = frame->int_no;
@@ -195,27 +280,147 @@ void exception_fatal(interrupt_frame_t *frame) {
     uint64_t int_no = frame->int_no;
     {
         const char *name = int_no < 21 ? exception_names[int_no] : "Unknown Exception";
-        kprintf("\n[EXCEPTION] %s (INT %lu)\n", name, int_no);
-        kprintf("  Error code: 0x%lx\n", frame->error_code);
-        kprintf("  RIP: 0x%lx  CS: 0x%lx\n", frame->rip, frame->cs);
-        kprintf("  RSP: 0x%lx  SS: 0x%lx\n", frame->rsp, frame->ss);
-        kprintf("  RFLAGS: 0x%lx\n", frame->rflags);
-        kprintf("  RAX: 0x%lx  RBX: 0x%lx\n", frame->rax, frame->rbx);
-        kprintf("  RCX: 0x%lx  RDX: 0x%lx\n", frame->rcx, frame->rdx);
-        kprintf("  RSI: 0x%lx  RDI: 0x%lx\n", frame->rsi, frame->rdi);
-        kprintf("  RBP: 0x%lx\n", frame->rbp);
-        kprintf("  R8:  0x%lx  R9:  0x%lx\n", frame->r8, frame->r9);
-        kprintf("  R10: 0x%lx  R11: 0x%lx\n", frame->r10, frame->r11);
+// #130 (2026-08-14): THE PANIC PATH MUST NOT TAKE THE CONSOLE LOCK.
+// kprintf() acquires g_console_lock (serial.c:830/836). A core that faults
+// WHILE HOLDING that lock then enters this handler, calls kprintf(), and blocks
+// on a lock it already owns - with interrupts off, so nothing can rescue it.
+// The other cores pile up behind it and the machine hangs SILENTLY.
+//
+// MEASURED: a 4-vCPU boot wedged with ALL FOUR CPUs at spinlock.h:251 (the
+// spin) with RDI = 0x210c8c0 = g_console_lock, desktop never reached, and NOT
+// ONE line of panic output emitted.
+//
+// It is worse than a hang: it MASKS the original fault. Note the ordering below
+// - the register dump runs BEFORE panic_log_write(), so a deadlock here also
+// means /boot/PANIC.TXT is never written and the fault leaves no record at all.
+// That is the signature the user hit on real hardware in #137 (whole OS frozen,
+// clock stopped, empty panic file).
+//
+// kprintf_nolock() (serial.c:847) already exists for exactly this. Using the
+// shared primitive rather than inventing another one, per the project rule.
+// Interleaved output from two dying cores is an acceptable price; a silent hang
+// is not.
+        kprintf_nolock("\n[EXCEPTION] %s (INT %lu)\n", name, int_no);
+// #134: AND IT MUST REACH THE PERSISTENT LOG, because the machine this matters
+// on has no serial console. Everything above and below here is kprintf_nolock,
+// i.e. serial only, so on the iMac14,4 a fault has produced NO RECORD AT ALL -
+// blame.md records that exact cost for #153 (a launched app that spawned and
+// instantly died, with /BOOTLOG.TXT missing precisely the lines needed).
+//
+// bootlog_write() MUST NOT be called here: it calls kprintf(), which takes
+// g_console_lock, which is the deadlock 240dc9f fixed a few lines above, and
+// its flush enters fat/ext2 -> blk_write -> usb_msc_transport from a context
+// that must never park. bootlog_fault_write() is the fault-safe sibling: a
+// stack-formatted line, a lock-free CAS reservation into a static ring,
+// mirrored with kprintf_nolock, and NO filesystem. A later safe context (the
+// next bootlog_write, or the 2 s heartbeat) flushes it. One line, every field
+// an addr2line needs. See fs/bootlog.c for the full argument.
+        bootlog_fault_write("[EXCEPTION] %s (INT %lu) %s err=0x%lx RIP=0x%lx "
+                            "CS=0x%lx RSP=0x%lx RFLAGS=0x%lx CR2=0x%lx",
+                            name, int_no,
+                            ((frame->cs & 0x3) != 0) ? "USER" : "KERNEL",
+                            frame->error_code, frame->rip, frame->cs,
+                            frame->rsp, frame->rflags,
+                            (int_no == EXCEPTION_PF) ? read_cr2() : 0UL);
+        // ==================================================================
+        // #COMPRESPAWN: A FAULTING RIP IS USELESS UNDER PIE+ASLR ON ITS OWN.
+        //
+        // Every userland binary is a static PIE and exec/elf.c randomises its
+        // base within a 1 GB window at 2 MB granularity (#640 stage 3). The
+        // line above prints RIP=0x8001ebe772; to turn that into a function you
+        // must first know which of up to 512 ASLR slots this run got, and
+        // nothing recorded it. MEASURED 2026-08-25 on the owner's VM <vmid>: the
+        // slot had to be brute-forced by hand (the only value for which
+        // RIP-base lands inside .text was slot 15, giving image+0xBE772 =
+        // memcpy). That is not a thing anyone can do on a machine they cannot
+        // attach a debugger to.
+        //
+        // Two lines fix it permanently:
+        //   1. the image base and the RIP as an IMAGE OFFSET, which is exactly
+        //      what `addr2line -e <binary> <offset>` wants;
+        //   2. a conservative scan of the user stack for words that fall inside
+        //      the image, printed as offsets. Frame pointers are omitted at -O2
+        //      so an RBP walk is not reliable, but saved return addresses are
+        //      still ON the stack, and a handful of candidates names the CALLER
+        //      - which is the whole question when the fault is inside memcpy.
+        //
+        // Fault-safe by construction: every stack word is read through
+        // vmm_get_physical_in() (so an unmapped page ENDS the scan instead of
+        // faulting inside the fault handler) and through the PHYSICAL address
+        // (so SMAP and the user mapping are irrelevant). Bounded at 96 words.
+        // ==================================================================
+        if ((frame->cs & 0x3) != 0) {
+            extern int proc_current_image(uint32_t *pid, uint64_t *base,
+                                          uint64_t *end, uint64_t *cr3);
+            extern uint64_t vmm_get_physical_in(uint64_t pml4_phys,
+                                                uint64_t virt_addr);
+            extern const char *proc_current_name(void);
+            uint32_t fpid = 0; uint64_t ibase = 0, iend = 0, fcr3 = 0;
+            int have = proc_current_image(&fpid, &ibase, &iend, &fcr3);
+            if (have) {
+                if (frame->rip >= ibase && frame->rip < iend) {
+                    bootlog_fault_write("[FAULT] pid=%u '%s' image=[0x%lx,0x%lx) "
+                                        "FAULTING RIP = image+0x%lx  (addr2line -e "
+                                        "the binary 0x%lx)",
+                                        fpid, proc_current_name(), ibase, iend,
+                                        frame->rip - ibase, frame->rip - ibase);
+                } else {
+                    bootlog_fault_write("[FAULT] pid=%u '%s' image=[0x%lx,0x%lx) "
+                                        "RIP 0x%lx is OUTSIDE its own image - a "
+                                        "wild jump, not a bug at a source line",
+                                        fpid, proc_current_name(), ibase, iend,
+                                        frame->rip);
+                }
+                // Candidate return addresses, as image offsets, nearest first.
+                if (fcr3) {
+                    char cand[192];
+                    int  used = 0, found = 0;
+                    cand[0] = 0;
+                    uint64_t sp = frame->rsp & ~7ULL;
+                    for (int i = 0; i < 96 && found < 8; i++) {
+                        uint64_t a  = sp + (uint64_t)i * 8;
+                        uint64_t pp = vmm_get_physical_in(fcr3, a & ~0xFFFULL);
+                        if (!pp) break;              // unmapped: stop, do not fault
+                        uint64_t v  = *(volatile uint64_t *)(pp + (a & 0xFFF));
+                        if (v <= ibase || v >= iend) continue;
+                        // 12 chars max per entry ("+0x000abcde "), 192-byte buf
+                        if (used > (int)sizeof(cand) - 16) break;
+                        int n = snprintf(cand + used, sizeof(cand) - (size_t)used,
+                                         "+0x%lx ", v - ibase);
+                        if (n <= 0) break;
+                        used += n; found++;
+                    }
+                    if (found) {
+                        bootlog_fault_write("[FAULT] pid=%u user-stack candidates "
+                                            "(image offsets, addr2line these): %s",
+                                            fpid, cand);
+                    } else {
+                        bootlog_fault_write("[FAULT] pid=%u no in-image words found "
+                                            "on the user stack near RSP", fpid);
+                    }
+                }
+            }
+        }
+        kprintf_nolock("  Error code: 0x%lx\n", frame->error_code);
+        kprintf_nolock("  RIP: 0x%lx  CS: 0x%lx\n", frame->rip, frame->cs);
+        kprintf_nolock("  RSP: 0x%lx  SS: 0x%lx\n", frame->rsp, frame->ss);
+        kprintf_nolock("  RFLAGS: 0x%lx\n", frame->rflags);
+        kprintf_nolock("  RAX: 0x%lx  RBX: 0x%lx\n", frame->rax, frame->rbx);
+        kprintf_nolock("  RCX: 0x%lx  RDX: 0x%lx\n", frame->rcx, frame->rdx);
+        kprintf_nolock("  RSI: 0x%lx  RDI: 0x%lx\n", frame->rsi, frame->rdi);
+        kprintf_nolock("  RBP: 0x%lx\n", frame->rbp);
+        kprintf_nolock("  R8:  0x%lx  R9:  0x%lx\n", frame->r8, frame->r9);
+        kprintf_nolock("  R10: 0x%lx  R11: 0x%lx\n", frame->r10, frame->r11);
 
         // Dump user-mode stack for any user-mode fault. The values near RSP are
         // saved return addresses; a corrupted one reveals a stack smash.
         if ((frame->cs & 0x3) != 0) {
-            kprintf("  Stack dump (from RSP=0x%lx):\n", frame->rsp);
+            kprintf_nolock("  Stack dump (from RSP=0x%lx):\n", frame->rsp);
             uint64_t *sp = (uint64_t *)frame->rsp;
             for (int i = 0; i < 24; i++) {
                 uint64_t addr = (uint64_t)&sp[i];
                 if (addr >= 0x1000 && addr < 0x800000000000ULL) {
-                    kprintf("    [RSP+0x%x] = 0x%lx\n", i * 8, sp[i]);
+                    kprintf_nolock("    [RSP+0x%x] = 0x%lx\n", i * 8, sp[i]);
                 }
             }
         }
@@ -223,8 +428,8 @@ void exception_fatal(interrupt_frame_t *frame) {
         // Page fault has special handling
         if (int_no == EXCEPTION_PF) {
             uint64_t cr2 = read_cr2();
-            kprintf("  CR2 (fault address): 0x%lx\n", cr2);
-            kprintf("  Error bits: %s%s%s%s\n",
+            kprintf_nolock("  CR2 (fault address): 0x%lx\n", cr2);
+            kprintf_nolock("  Error bits: %s%s%s%s\n",
                     (frame->error_code & 1) ? "P " : "",
                     (frame->error_code & 2) ? "W " : "R ",
                     (frame->error_code & 4) ? "U " : "S ",
@@ -261,14 +466,59 @@ void exception_fatal(interrupt_frame_t *frame) {
         // Kernel-mode faults: halt to prevent triple fault.
         // The GUI crash dialog would re-enter corrupt kernel state.
         if ((frame->cs & 0x3) == 0) {
-            kprintf("[KERNEL PANIC] %s at RIP=0x%lx\n", name, frame->rip);
+            kprintf_nolock("[KERNEL PANIC] %s at RIP=0x%lx\n", name, frame->rip);
             uint64_t cr2_val = 0;
             if (int_no == 14) {
                 cr2_val = read_cr2();
-                kprintf("[KERNEL PANIC] CR2=0x%lx err=0x%lx\n", cr2_val, frame->error_code);
+                kprintf_nolock("[KERNEL PANIC] CR2=0x%lx err=0x%lx\n", cr2_val, frame->error_code);
             }
-            kprintf("[KERNEL PANIC] RSP=0x%lx  Halting CPU.\n", frame->rsp);
-            // #418: kernel-mode faults previously only reached kprintf()
+            kprintf_nolock("[KERNEL PANIC] RSP=0x%lx  Halting CPU.\n", frame->rsp);
+            // ==============================================================
+            // #167: A WILD RIP IS A JUMP, AND A JUMP HAS A SOURCE.
+            //
+            // "Invalid Opcode at RIP=0x45" is #75's original signature and it
+            // has now been reported four separate times (the original report,
+            // #165's arm-gateon/run05, and three times in ONE boot of #167's
+            // SCHEDRACE + exit-churn reproducer) with nothing after it but the
+            // register dump. 0x45 is not a code address; the core got there by
+            // executing a `ret` off a stack slot that did not hold a return
+            // address, or by an indirect branch through corrupted memory.
+            //
+            // Either way the STACK still holds the frames that led there, and
+            // the ones that are real return addresses are exactly the ones that
+            // land in kernel TEXT. Printing sixteen words with that one test
+            // applied turns a wild RIP from a dead end into a list of
+            // addresses to run through addr2line - which is what every previous
+            // report of this fault needed and did not have.
+            //
+            // SAFETY. Read-only, no locks, no heap, no framebuffer, bounded at
+            // 16 words, and it runs AFTER everything else has been printed, so
+            // it can only ever add information to a machine that is already
+            // halting. RSP is sanity-checked first: a fault whose RSP is itself
+            // wild (#75 also reported RSP=0x10002) must not be dereferenced.
+            // The bound is the kernel identity map, which is what every other
+            // pointer check in this file uses.
+            {
+                extern char __text_start[], __text_end[];
+                uint64_t lo = (uint64_t)__text_start, hi = (uint64_t)__text_end;
+                uint64_t sp = frame->rsp;
+                if (sp >= 0x100000ULL && sp < 0x80000000ULL && (sp & 7) == 0) {
+                    kprintf_nolock("[KERNEL PANIC] stack walk from RSP "
+                                   "(text=[0x%lx,0x%lx), * = a return address):\n",
+                                   lo, hi);
+                    const uint64_t *w = (const uint64_t *)sp;
+                    for (int i = 0; i < 16; i++) {
+                        uint64_t v = w[i];
+                        kprintf_nolock("[KERNEL PANIC]   [rsp+0x%02x] = 0x%lx %s\n",
+                                       i * 8, v,
+                                       (v >= lo && v < hi) ? "*" : "");
+                    }
+                } else {
+                    kprintf_nolock("[KERNEL PANIC] RSP 0x%lx is not a usable "
+                                   "stack pointer; no walk.\n", sp);
+                }
+            }
+            // #418: kernel-mode faults previously only reached kprintf_nolock()
             // (serial-only) - on the physical iMac (no serial cable) that is
             // a total loss of diagnosis. Write RIP/CR2/error-code/CR3/last
             // stage/version to /PANIC.TXT via a raw, unlocked, single-sector
@@ -335,6 +585,28 @@ void exception_fatal(interrupt_frame_t *frame) {
         { extern int g_smp_bkl_full;
           if (!g_smp_bkl_full) crashhandler_show_dialog();
           else kprintf("[CrashHandler] SMP: skipping modal dialog (would hold BKL); killing process\n"); }
+        // #NETDROP: hand the NIC back before we resume normal operation.
+        //
+        // crashhandler_report() above calls e1000_enter_crash_context() as its
+        // FIRST action. That makes e1000_can_access_mmio() false, which disables
+        // the ENTIRE driver: TX, RX, and the link-status register read. The
+        // quiesce is right while we are walking a faulted address space, but it
+        // was a ONE-WAY DOOR. e1000_exit_crash_context() had ZERO callers in the
+        // whole tree, and this is the only path that ever enters the context, a
+        // path that ALWAYS continues running (kernel-mode faults halt further
+        // up, in the branch above, and never reach here).
+        //
+        // So any Ring-3 fault, i.e. one crashed application on an otherwise
+        // healthy desktop, permanently killed networking for the rest of the
+        // boot: nic_link_up() returned 0 forever, so the stack reported
+        // NO-CARRIER on a NIC whose link was physically up, every send failed,
+        // and the RX ring was never drained again. Owner-visible symptom was an
+        // SSH session dying mid-use and the machine showing no connectivity,
+        // with nothing in the log naming the NIC.
+        //
+        // A recoverable user fault must leave the NIC exactly as it found it.
+        { extern void e1000_exit_crash_context(void);
+          e1000_exit_crash_context(); }
         kprintf("[KERNEL] Killing crashed user process\n");
         // Terminate the faulting process. Returning would re-execute
         // the faulting instruction in an infinite crash loop.

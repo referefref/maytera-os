@@ -5,11 +5,32 @@
 #include "../types.h"
 
 // Parsed ext2 inode (only the fields we use).
+//
+// #115: THIS STRUCT WAS THE REAL SHAPE OF K1/K2/K3. The ticket's premise was
+// that "ext2 inodes carry i_mtime", which is true ON DISK and was NOT true in
+// this kernel: ext2_read_inode() parsed FOUR fields out of a 128/256-byte
+// on-disk inode and dropped the rest on the floor, so sys_stat_path() could not
+// have filled st_mtime, st_nlink, st_uid or st_gid from it even if it had tried
+// - the values were never read off the disk in the first place. Everything
+// below the i_block array was added by #115 and is parsed in ext2_read_inode().
+//
+// Layout note for anyone extending this: the ext2 on-disk offsets are in
+// ext2_read_inode(), not here, and they are NOT the order of this struct.
+// Do not infer one from the other.
 typedef struct {
     uint16_t i_mode;        // file type + permissions
     uint32_t i_size;        // size in bytes (low 32 bits)
     uint32_t i_size_high;   // high 32 bits (i_dir_acl) for large_file
     uint32_t i_block[15];   // 12 direct, 1 singly, 1 doubly, 1 triply
+    // ---- #115 ----
+    uint32_t i_uid;         // owner uid (low 16 + osd2 high 16)
+    uint32_t i_gid;         // owner gid (low 16 + osd2 high 16)
+    uint16_t i_links_count; // hard links. 0 means a DELETED inode, never "one".
+    uint32_t i_blocks;      // allocated size in 512-byte units (POSIX st_blocks)
+    uint32_t i_atime;       // last access,     seconds since the UNIX epoch
+    uint32_t i_ctime;       // last inode change,        "        "
+    uint32_t i_mtime;       // last data modification,   "        "
+    uint32_t i_dtime;       // deletion time (non-zero => inode is deleted)
 } ext2_inode_t;
 
 // Mounted ext2 filesystem state.
@@ -50,6 +71,11 @@ int     ext2_mount(uint8_t channel, uint8_t drive, uint32_t part_start_lba);
 // Parses GPT (preferred) then MBR. Returns 0 and sets *out_base_lba on success.
 int     ext2_find_partition(uint8_t channel, uint8_t drive, uint32_t *out_base_lba);
 int     ext2_read_inode(uint32_t ino, ext2_inode_t *out);
+// #115: set i_atime/i_mtime on an existing inode (the ext2 half of utime(2)).
+// Pass -1 for a time to leave it unchanged. i_ctime is always set to now,
+// because POSIX says a metadata change updates it and lying about that is the
+// exact defect #115 removes. Returns 0 on success.
+int     ext2_set_times(uint32_t ino, int64_t atime, int64_t mtime);
 // #554: thin is-directory accessor for rustkern/fsperm.rs; see ext2.c for why
 // this exists instead of mirroring ext2_inode_t's layout in Rust.
 int     ext2_get_is_dir(uint32_t ino, int *is_dir_out);
@@ -284,6 +310,7 @@ void     ext2_fsck_boot_check(int skip_requested, int bench);
 void     ext2_fsck_selftest(void);
 // Superblock state writes (the only #610 writes to the filesystem).
 void     ext2_mark_clean(void);
+void     ext2_mark_dirty(void);   // #229: undo a clean mark that outlived the stop
 void     ext2_mark_error(const char *why);
 uint16_t ext2_state_at_mount(void);
 uint16_t ext2_mnt_count(void);

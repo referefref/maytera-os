@@ -55,19 +55,87 @@
 #include "compositor.h"
 #include "../../libc/syscall.h"
 #include "../../libc/string.h"
+// (#123) write(1,...) serial mirror. Declared here rather than including
+// libc/unistd.h: that header pulls in libc/types.h, whose `bool` typedef
+// collides with compositor.h/stdbool in this translation unit.
+long write(int fd, const void *buf, unsigned long n);
 #include "../../libc/gui_theme.h"
 #include "../../libc/userconf.h"   // #745 GLASSTHEME
+#include "../../libc/dock_opacity.h"  // #132: shared DOCK_OPACITY_MIN/MAX
+#include "../../libc/stdio.h"    // (#231r) vsnprintf for th_logf below
+#include <stdarg.h>
+
+// (#123) Provided by taskbar.c under the same MAYTERA_TESTHOOK guard.
+void taskbar_dock_debug_dump(int force);
+int  taskbar_dock_debug_click(int32_t x, int32_t y);
+int  taskbar_dock_slot_point(int n, int32_t *x, int32_t *y);
+
+// (#231r) traymenu.c, TESTHOOK-only: where the renderer puts a given
+// band's fader cap. See the EQDRAG verb below for why the geometry is
+// asked for rather than assumed.
+int traymenu_eq_fader_point(int b, int pos, int *out_x, int *out_y);
 
 #define TH_CMD_PATH "/TESTHOOK.CMD"
+
+// Verification-only delayed-lock state for the PANELLOCK verb below: avoids
+// needing a second host-side write to a live guest disk (unsafe/racy against
+// the running compositor's own filesystem cache) just to sequence "open a
+// panel, THEN lock" for a screenshot.
+static uint64_t s_th_lock_at_ms = 0;
 #define TH_OUT_PATH "/TESTHOOK.OUT"
 #define TH_O_APPEND (0x1 | 0x40 | 0x400)   // O_WRONLY | O_CREAT | O_APPEND
 
+// (#123) When a SEQ is running, every command it dispatches must hand control
+// back to SEQ afterwards, or the sequence stops after one step. Every verb path
+// in testhook_poll() ends in exactly one th_log() call, so re-arming here is
+// the ONE place that covers all of them without touching each verb - and it
+// cannot re-arm when no sequence is running, because g_seq_running is only set
+// by the SEQ verb itself.
+int g_seq_running = 0;
+int g_th_mouse_pinned = 0;   // (#123) see poll_input() in main.c
+// (#123) Extra SEQ hold, in polls, requested by the HOLD verb. A host-side
+// screendump watcher with a fixed delay CANNOT reliably capture a step whose
+// hold is shorter than its own lag - runs 2 and 3 both produced captures of
+// the wrong state for exactly that reason, and a screenshot labelled with the
+// wrong state is worse than no screenshot. HOLD lets the sequence freeze a
+// state for as long as the capture needs, so the capture is matched to the
+// serial log by CONTENT and with a wide margin.
+int g_seq_extra_hold = 0;
+static void th_rearm_seq(void) {
+    if (!g_seq_running) return;
+    int fd = sys_open(TH_CMD_PATH, 0x1 | 0x40 | 0x200);
+    if (fd >= 0) { sys_write(fd, "SEQ\n", 4); sys_close(fd); }
+}
 static void th_log(const char *msg) {
+    // Mirror to serial FIRST, and re-arm LAST, both unconditionally: the file
+    // write below can fail (read-only root, full disk) and an early return
+    // there used to take the whole rest of this function with it. That would
+    // silently stall a running SEQ, which is exactly the "a guard that never
+    // fires and a guard that is absent look identical" failure mode.
+    // /TESTHOOK.OUT can only be read after the VM is shut down and its image
+    // mounted, which is useless for a live, paced run - hence the mirror.
+    write(1, "[TH] ", 5);
+    write(1, msg, strlen(msg));
+    write(1, "\n", 1);
     int fd = sys_open(TH_OUT_PATH, TH_O_APPEND);
-    if (fd < 0) return;
-    sys_write(fd, msg, strlen(msg));
-    sys_write(fd, "\n", 1);
-    sys_close(fd);
+    if (fd >= 0) {
+        sys_write(fd, msg, strlen(msg));
+        sys_write(fd, "\n", 1);
+        sys_close(fd);
+    }
+    th_rearm_seq();
+}
+
+
+// (#231r) th_log() takes a plain string and every EQ report below carries
+// numbers. One local formatter beats a hand-rolled itoa at eight call sites.
+static void th_logf(const char *fmt, ...) {
+    char b[192];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof(b), fmt, ap);
+    va_end(ap);
+    th_log(b);
 }
 
 // Split "VERB rest-of-line" in place. Returns the verb (buf, trimmed of
@@ -268,7 +336,11 @@ static void th_glass_probe(int backdrop_white) {
 // Report the live per-surface counters.
 static void th_glass_stat(const char *tag) {
     char line[144];
-    static const char *NM[3] = { "PANEL", "DOCK", "MENU" };
+    // (#glassmodal) GLASS_SURF_MODAL added as the 4th slot (compositor.h) -
+    // this array MUST track GLASS_SURF_COUNT or the loop below reads past
+    // its end (caught by -Waggressive-loop-optimizations when this was
+    // still sized [3] and the loop already ran to 4).
+    static const char *NM[GLASS_SURF_COUNT] = { "PANEL", "DOCK", "MENU", "MODAL" };
     for (int i = 0; i < GLASS_SURF_COUNT; i++) {
         uint32_t cn = 0, cms = 0, cw = 0, hn = 0; int tier = 0;
         glass_perf_get(i, &cn, &cms, &cw, &hn, &tier);
@@ -362,14 +434,36 @@ static void th_glass_all(int iters) {
 }
 
 void testhook_poll(void) {
+    if (s_th_lock_at_ms != 0 && uptime_ms() >= s_th_lock_at_ms) {
+        s_th_lock_at_ms = 0;
+        lock_enter();
+        th_log("OK PANELLOCK fired");
+    }
     int fd = sys_open(TH_CMD_PATH, 0 /* O_RDONLY */);
     if (fd < 0) return;   // no pending command: fast common-case return
 
     char buf[192];
     long n = sys_read(fd, buf, sizeof(buf) - 1);
     sys_close(fd);
-    sys_unlink(TH_CMD_PATH);   // consume so a command never re-fires
-    if (n < 0) n = 0;
+    // (#231) Consume BEFORE dispatch, and do not rely on sys_unlink() alone.
+    // MEASURED this session: a /TESTHOOK.CMD baked onto the image OFFLINE
+    // before boot (the documented way to deliver a one-shot command - see
+    // the file-top comment) is owned by a different uid/context than the
+    // logged-in session that runs this poll, and sys_unlink() on it silently
+    // no-ops - the file was still present, byte-for-byte unchanged, after a
+    // command had been dispatched from it dozens of times over a live
+    // session. Its return value was never checked, so "consume so a command
+    // never re-fires" was not true for exactly the offline-baked delivery
+    // path this file's own design relies on. A truncate-to-empty (O_TRUNC on
+    // the existing file, no directory entry change, no ownership
+    // dependency - proven to work here even when unlink on the same path did
+    // not) is what actually stops the re-fire; unlink is kept as a best-
+    // effort cleanup on top; a WLOCK/WDESIGN toggle-style verb fired this
+    // way flips on every single poll and its net effect is essentially
+    // parity noise, not a controlled one-shot change.
+    { int tfd = sys_open(TH_CMD_PATH, 0x1 | 0x40 | 0x200); if (tfd >= 0) sys_close(tfd); }
+    sys_unlink(TH_CMD_PATH);
+    if (n <= 0) return;   // already-empty file: nothing pending, not an error
     buf[n] = '\0';
 
     char *arg = "";
@@ -508,7 +602,10 @@ void testhook_poll(void) {
         while (*sp == ' ') sp++;
         if (*sp) {
             int v = th_atoi((char *)sp);
-            if (v >= 70 && v <= 100) g_dock_opacity = v;   // #745 dockgrey: floor 60 -> 70
+            // (#132) was a hard `v >= 70`, silently dropping any lower value
+            // a verification run tried to probe with - it would have hidden
+            // the very regression this test hook exists to catch.
+            if (v >= DOCK_OPACITY_MIN && v <= DOCK_OPACITY_MAX) g_dock_opacity = v;
         }
         th_glass_probe(white);
         th_log("OK GLASSPROBE");
@@ -542,10 +639,353 @@ void testhook_poll(void) {
         return;
     }
 
+    if (strcmp(verb, "LAUNCHARG") == 0) {
+        // LAUNCHARG <path> <arg>  - spawn with one argv[1], via the same
+        // sys_spawn_args() the shell and Files "Open with" already use.
+        char *sp = arg;
+        while (*sp && *sp != ' ') sp++;
+        if (*sp == ' ') *sp++ = '\0';
+        if (arg[0] == '\0') { th_log("ERR LAUNCHARG needs a path"); return; }
+        char *av[2]; av[0] = arg; av[1] = sp;
+        sys_spawn_args(arg, av, 2);
+        th_log("OK LAUNCHARG");
+        return;
+    }
+
+    // ======================================================================
+    // #123 marble dock verbs.
+    //
+    // WHAT THESE PROVE AND DO NOT PROVE, same honesty rule as the file header:
+    //   DOCKINFO  - prints the dock's real geometry (effective height, tile,
+    //               gutter, pane width, the 75% budget, every slot x) to SERIAL,
+    //               live. No screenshot can report a number, and "measure it,
+    //               do not assert it" needs a number.
+    //   DOCKH/DOCKZ - write the SAME /CONFIG CFG files the Settings sliders
+    //               write, so they exercise the real poll -> apply -> persist
+    //               channel end to end, not a private setter. What they do NOT
+    //               exercise is the Settings slider's own hit test; that is what
+    //               the VNC client is for.
+    //   DOCKCLICK - enters taskbar_handle_mouse() at real screen coordinates,
+    //               i.e. the REAL hit test, unlike ICON/MENUITEM. It bypasses
+    //               only the mouse DRIVER, not the geometry.
+    //   DOCKMOUSE - moves the compositor's notion of the pointer so a hover
+    //               magnify can be screenshotted deterministically (QEMU
+    //               relative-mouse injection cannot place a pointer, #334).
+    // ======================================================================
+    if (strcmp(verb, "DOCKINFO") == 0) {
+        taskbar_dock_debug_dump(1);
+        th_log("OK DOCKINFO");
+        return;
+    }
+
+    if (strcmp(verb, "DOCKH") == 0) {
+        extern void dock_height_write_cfg(int v);
+        dock_height_write_cfg(th_atoi(arg));
+        th_log("OK DOCKH");
+        return;
+    }
+
+    if (strcmp(verb, "DOCKZ") == 0) {
+        extern void dock_zoom_write_cfg(int v);
+        dock_zoom_write_cfg(th_atoi(arg));
+        th_log("OK DOCKZ");
+        return;
+    }
+
+    // (#132) DOCKOP <pct> - same shape as DOCKH/DOCKZ above: writes
+    // /CONFIG/DOCKOPAC.CFG through dock_opacity_write_cfg(), the SAME
+    // function the Settings opacity slider calls, so this exercises the real
+    // write -> poll -> apply -> persist channel end to end, not a private
+    // setter (that is what GLASSPROBE's optional trailing number already is -
+    // it pokes g_dock_opacity directly and exists to probe glass_render() in
+    // isolation, not to stand in for this). Added because #132 removed the
+    // hard 70% floor and the only way to prove a value below it is actually
+    // honoured, not just accepted by one function, is to drive it through the
+    // full channel a screendump can then show.
+    if (strcmp(verb, "DOCKOP") == 0) {
+        extern void dock_opacity_write_cfg(int v);
+        dock_opacity_write_cfg(th_atoi(arg));
+        th_log("OK DOCKOP");
+        return;
+    }
+
+    // Write the CFG, do NOT call taskbar_set_style() directly. MEASURED: a
+    // direct call is reverted within ~10 frames, because dock_style_poll()
+    // reads /CONFIG/DOCKSTYL.CFG on main.c's poll cadence and re-applies
+    // whatever is in the file. The first attempt at the style-regression pass
+    // produced five screendumps that all showed the marble dock for exactly
+    // this reason.
+    if (strcmp(verb, "DOCKSTYLE") == 0) {
+        extern void dock_style_write_cfg(int v);
+        dock_style_write_cfg(th_atoi(arg));
+        g_needs_redraw = true;
+        th_log("OK DOCKSTYLE");
+        return;
+    }
+
+    // Release the #123 pointer pin so the real mouse takes over again.
+    if (strcmp(verb, "HOLD") == 0) {
+        g_seq_extra_hold = th_atoi(arg);
+        th_log("OK HOLD");
+        return;
+    }
+
+    if (strcmp(verb, "DOCKMOUSEFREE") == 0) {
+        g_th_mouse_pinned = 0;
+        th_log("OK DOCKMOUSEFREE");
+        return;
+    }
+
+    if (strcmp(verb, "DOCKCLICK") == 0) {
+        // "x y"
+        int x = th_atoi(arg);
+        const char *sp = arg;
+        while (*sp && *sp != ' ') sp++;
+        while (*sp == ' ') sp++;
+        int y = th_atoi(sp);
+        taskbar_dock_debug_click(x, y);
+        th_log("OK DOCKCLICK");
+        return;
+    }
+
+    // Address a slot by INDEX instead of by pixel, so a pre-written sequence
+    // does not have to predict the framebuffer width or the auto-scaled
+    // geometry. The resolved pixel coordinates are printed and then fed
+    // through the SAME taskbar_handle_mouse() a real click takes.
+    if (strcmp(verb, "DOCKCLICKSLOT") == 0) {
+        int32_t x = 0, y = 0;
+        if (!taskbar_dock_slot_point(th_atoi(arg), &x, &y)) { th_log("ERR DOCKCLICKSLOT no such slot"); return; }
+        taskbar_dock_debug_click(x, y);
+        th_log("OK DOCKCLICKSLOT");
+        return;
+    }
+
+    if (strcmp(verb, "DOCKMOUSESLOT") == 0) {
+        int32_t x = 0, y = 0;
+        if (!taskbar_dock_slot_point(th_atoi(arg), &x, &y)) { th_log("ERR DOCKMOUSESLOT no such slot"); return; }
+        g_th_mouse_pinned = 1;
+        g_mouse_x = x; g_mouse_y = y;
+        g_needs_redraw = true;
+        { char b[96]; int q = 0;
+          const char *k = "[DOCK123] HOVER slot ";
+          for (const char *z = k; *z; z++) b[q++] = *z;
+          q += th_int(b + q, th_atoi(arg));
+          const char *k2 = " at "; for (const char *z = k2; *z; z++) b[q++] = *z;
+          q += th_int(b + q, x); b[q++] = ','; q += th_int(b + q, y);
+          // The zoom percent goes in the SAME banner the host watcher triggers
+          // on, so every hover screendump is self-labelling from the serial log
+          // instead of being matched to a step number by timing (which is what
+          // made run 2's zoom captures unusable - the watcher's fixed delay
+          // does not track a step whose hold is longer than the delay).
+          const char *k3 = " zoom="; for (const char *z = k3; *z; z++) b[q++] = *z;
+          q += th_int(b + q, g_dock_zoom); b[q++] = 10;
+          write(1, b, (unsigned long)q); }
+        th_log("OK DOCKMOUSESLOT");
+        return;
+    }
+
+    // Trim the favourites list to exactly <n> entries by unpinning from the
+    // tail, through startmenu_toggle_favorite_path() - the SAME writer the
+    // dock's own right-click "Unpin from Favorites" and the Settings Remove
+    // button use, so this is the real removal path and it persists through the
+    // real sm_save_state(). Exists so the auto-scale RECOVERY case (item count
+    // drops -> the dock returns to the user's preferred height) is one script
+    // step instead of twenty-two.
+    if (strcmp(verb, "DOCKPINS") == 0) {
+        int want = th_atoi(arg);
+        if (want < 0) want = 0;
+        for (int guard = 0; guard < 64; guard++) {
+            sm_fav_info_t f[64];
+            int n = startmenu_get_favorites(f, 64);
+            if (n <= want) break;
+            startmenu_toggle_favorite_path(f[n - 1].exec_path);
+        }
+        { sm_fav_info_t f[64];
+          int n = startmenu_get_favorites(f, 64);
+          char b[64]; int q = 0;
+          const char *k = "[DOCK123] PINS now ";
+          for (const char *z = k; *z; z++) b[q++] = *z;
+          q += th_int(b + q, n); b[q++] = 10;
+          write(1, b, (unsigned long)q); }
+        g_needs_redraw = true;
+        th_log("OK DOCKPINS");
+        return;
+    }
+
+    if (strcmp(verb, "DOCKMOUSE") == 0) {
+        int x = th_atoi(arg);
+        const char *sp = arg;
+        while (*sp && *sp != ' ') sp++;
+        while (*sp == ' ') sp++;
+        int y = th_atoi(sp);
+        g_th_mouse_pinned = 1;
+        g_mouse_x = x; g_mouse_y = y;
+        g_needs_redraw = true;
+        th_log("OK DOCKMOUSE");
+        return;
+    }
+
+    // Run /DOCK123.SEQ, one line per invocation, re-arming itself between
+    // lines. The compositor has no shell and its serial is a one-way log, so a
+    // multi-step verification run has to come from a file placed on the image
+    // BEFORE boot. Each step announces itself on serial, which is what a host
+    // watcher synchronises its QMP screendumps against - a real handshake, not
+    // a guessed sleep. `#` comments and blank lines are skipped.
+    if (strcmp(verb, "SEQ") == 0) {
+        static int line_no = 0;
+        static int delay = 0;
+        g_seq_running = 1;
+        if (arg[0] >= '0' && arg[0] <= '9') line_no = th_atoi(arg);
+        // Pace: hold each step for SEQ_HOLD polls before advancing, so the host
+        // has a stable frame to capture.
+        #define SEQ_HOLD 90
+        if (g_seq_extra_hold > 0) { delay += g_seq_extra_hold; g_seq_extra_hold = 0; }
+        if (delay > 0) {
+            delay--;
+            int fd2 = sys_open(TH_CMD_PATH, 0x1 | 0x40 | 0x200);
+            if (fd2 >= 0) { sys_write(fd2, "SEQ\n", 4); sys_close(fd2); }
+            return;
+        }
+        int fd = sys_open("/DOCK123.SEQ", 0);
+        if (fd < 0) { th_log("ERR SEQ no /DOCK123.SEQ"); return; }
+        static char sq[4096];
+        long n = sys_read(fd, sq, sizeof(sq) - 1);
+        sys_close(fd);
+        if (n <= 0) { th_log("ERR SEQ empty"); return; }
+        sq[n] = 0;
+        // Find line `line_no` (counting only non-blank, non-comment lines).
+        char *p = sq; int idx = 0; char *pick = 0;
+        while (*p) {
+            char *ls = p;
+            while (*p && *p != '\n') p++;
+            if (*p) *p++ = 0;
+            char *t = ls;
+            while (*t == ' ' || *t == '\t') t++;
+            if (*t == 0 || *t == '#') continue;
+            if (idx == line_no) { pick = t; break; }
+            idx++;
+        }
+        if (!pick) {
+            char e[64]; int q = 0;
+            const char *k = "[DOCK123] SEQ END at line ";
+            for (const char *z = k; *z; z++) e[q++] = *z;
+            q += th_int(e + q, line_no); e[q++] = 10;
+            write(1, e, (unsigned long)q);
+            return;
+        }
+        { char e[160]; int q = 0;
+          const char *k = "[DOCK123] STEP ";
+          for (const char *z = k; *z; z++) e[q++] = *z;
+          q += th_int(e + q, line_no); e[q++] = ' ';
+          for (const char *z = pick; *z && q < 150; z++) e[q++] = *z;
+          e[q++] = 10;
+          write(1, e, (unsigned long)q); }
+        // Execute the picked line by re-entering this dispatcher's body: write
+        // it as the pending command, then queue ourselves for the NEXT line.
+        { int fd2 = sys_open(TH_CMD_PATH, 0x1 | 0x40 | 0x200);
+          if (fd2 >= 0) {
+              char c[192]; int q = 0;
+              for (const char *z = pick; *z && q < 180; z++) c[q++] = *z;
+              c[q++] = 10;
+              sys_write(fd2, c, (unsigned long)q); sys_close(fd2);
+          } }
+        line_no++;
+        delay = SEQ_HOLD;
+        return;
+    }
+
     if (strcmp(verb, "LAUNCH") == 0) {
         if (arg[0] == '\0') { th_log("ERR LAUNCH needs a path"); return; }
         sys_spawn(arg);
         th_log("OK LAUNCH");
+        return;
+    }
+
+    // #223 ROUND 2 verification-only verb: close a window the SAME way a real
+    // titlebar-X click does, by finding it via wm_get_windows() and driving
+    // taskbar_close_window() (the existing synthetic-click closer #44 already
+    // uses for the dock's own "Close" context-menu action - no new close
+    // mechanism, just a way to name a target without a coordinate-accurate
+    // mouse click, same "sidestep hit-testing" philosophy as MENUITEM/ICON).
+    // Matches by app_id (kernel-resolved binary basename, #41) case-
+    // insensitively, exact match preferred; falls back to a case-insensitive
+    // SUBSTRING of the window title if no app_id matches (some windows have
+    // no app_id - see wm_window_info_t's own comment). First match wins.
+    // Never shipped: gated the same as every other verb in this file.
+    if (strcmp(verb, "WINCLOSE") == 0) {
+        if (arg[0] == '\0') { th_log("ERR WINCLOSE needs a name"); return; }
+        wm_window_info_t wins[16];
+        int n = wm_get_windows(wins, 16);
+        if (n < 0) n = 0;
+        int target = -1;
+        for (int i = 0; i < n && target < 0; i++) {
+            if (wins[i].app_id[0] == '\0') continue;
+            int j = 0;
+            for (; arg[j] && wins[i].app_id[j]; j++) {
+                char a = arg[j], b = wins[i].app_id[j];
+                if (a >= 'a' && a <= 'z') a = (char)(a - 32);
+                if (b >= 'a' && b <= 'z') b = (char)(b - 32);
+                if (a != b) break;
+            }
+            if (arg[j] == '\0' && wins[i].app_id[j] == '\0') target = wins[i].id;
+        }
+        if (target < 0) {
+            for (int i = 0; i < n && target < 0; i++) {
+                const char *t = wins[i].title, *want = arg;
+                for (const char *h = t; *h; h++) {
+                    const char *hh = h, *nn = want;
+                    while (*hh && *nn) {
+                        char a = *hh, b = *nn;
+                        if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+                        if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+                        if (a != b) break;
+                        hh++; nn++;
+                    }
+                    if (!*nn) { target = wins[i].id; break; }
+                }
+            }
+        }
+        if (target < 0) { th_log("ERR WINCLOSE not found"); return; }
+        taskbar_close_window(target);
+        th_log("OK WINCLOSE");
+        return;
+    }
+
+    // Verification-only verb: open Settings straight to a named panel via the
+    // real settings_open_panel() singleton-safe path (same one the tray/
+    // context-menu/widget shortcuts use), so a specific panel (e.g. Network,
+    // #144) can be screenshotted without navigating the sidebar by mouse.
+    if (strcmp(verb, "PANEL") == 0) {
+        if (arg[0] == ' ') { th_log("ERR PANEL needs a number"); return; }
+        settings_open_panel(th_atoi(arg));
+        th_log("OK PANEL");
+        return;
+    }
+
+    // #151 verification-only verb: trigger an explicit session lock the same
+    // way Start Menu / Super+L do (lock_enter() -> sys_session_lock()), so a
+    // throwaway TESTHOOK build can screenshot the lock overlay without
+    // needing a real idle timeout or a landed mouse click. Never shipped:
+    // gated identically to every other verb in this file.
+    if (strcmp(verb, "LOCK") == 0) {
+        lock_enter();
+        th_log("OK LOCK");
+        return;
+    }
+
+    if (strcmp(verb, "APPLOCK") == 0) {
+        if (arg[0] == ' ') { th_log("ERR APPLOCK needs a path"); return; }
+        sys_spawn(arg);
+        s_th_lock_at_ms = uptime_ms() + 2500;
+        th_log("OK APPLOCK");
+        return;
+    }
+
+    if (strcmp(verb, "PANELLOCK") == 0) {
+        if (arg[0] == ' ') { th_log("ERR PANELLOCK needs a number"); return; }
+        settings_open_panel(th_atoi(arg));
+        s_th_lock_at_ms = uptime_ms() + 1500;
+        th_log("OK PANELLOCK");
         return;
     }
 
@@ -567,6 +1007,26 @@ void testhook_poll(void) {
         screensaver_note_activated();   // #570: starts the input-ignore grace
         g_needs_redraw = true;
         th_log("OK SAVER");
+        return;
+    }
+
+    // (#glassmodal) verification-only: open a power confirm dialog by action
+    // number (1=Shut Down, 2=Restart, 3=Log Out, 4=Lock), bypassing the
+    // power-grid icon's mouse hit-test (#334/#440). Used to screenshot the
+    // glass confirm-dialog port without needing a landed click.
+    if (strcmp(verb, "POWERCONFIRM") == 0) {
+        if (arg[0] == '\0') { th_log("ERR POWERCONFIRM needs 1-4"); return; }
+        startmenu_test_power_confirm(th_atoi(arg));
+        th_log("OK POWERCONFIRM");
+        return;
+    }
+
+    // (#glassmodal) verification-only: open the CPU/RAM/DSK/NET perf pop-out
+    // by gauge index (0=CPU,1=RAM,2=DSK,3=NET), bypassing the gauge's mouse
+    // hit-test.
+    if (strcmp(verb, "PERFPOPUP") == 0) {
+        taskbar_test_open_perf_popup(th_atoi(arg));
+        th_log("OK PERFPOPUP");
         return;
     }
 
@@ -604,6 +1064,24 @@ void testhook_poll(void) {
         return;
     }
 
+    // #131 (local 150) throwaway verification-only verb: launch two named
+    // items in one shot (this hook has no way to queue a second /TESTHOOK.CMD
+    // while the disk is exclusively held by a running VM in the throwaway
+    // test harness). Names separated by '|', e.g. "OPENAB Settings|Terminal".
+    // Never shipped: gated the same as every other verb in this file, by
+    // MAYTERA_TESTHOOK / `make TESTHOOK=1`.
+    if (strcmp(verb, "OPENAB") == 0) {
+        char *sep = arg;
+        while (*sep && *sep != '|') sep++;
+        if (*sep != '|') { th_log("ERR OPENAB needs a|b"); return; }
+        *sep = '\0';
+        char *b = sep + 1;
+        bool ok1 = startmenu_launch_item_by_name(arg);
+        bool ok2 = startmenu_launch_item_by_name(b);
+        th_log(ok1 && ok2 ? "OK OPENAB" : "ERR OPENAB one or both not found");
+        return;
+    }
+
     // #: Start-menu uplift verification verbs. Same "drive by name, sidestep
     // hit-testing" philosophy as MENUITEM/ICON above - these prove the search
     // filter / favorites-toggle / context-menu-open LOGIC is wired, not that a
@@ -634,6 +1112,238 @@ void testhook_poll(void) {
         if (idx < 0) { th_log("ERR MENUPIN not found"); return; }
         startmenu_item_toggle_favorite(idx);
         th_log("OK MENUPIN");
+        return;
+    }
+
+    // #223 rd2 GUARD VERIFICATION verb: force g_fav_count to 0 in memory with
+    // NO legitimate write (simulates the exact glitch this investigation
+    // chased but could not catch live), so the sm_save_recents_only() fix can
+    // be proven to stop the NEXT launch/recents save from stamping that
+    // glitch onto disk - independent of ever reproducing the real trigger.
+    // Diagnostic-only, never shipped, gated the same as every other verb here.
+    if (strcmp(verb, "FAVZERO") == 0) {
+        startmenu_debug_force_fav_zero();
+        th_log("OK FAVZERO");
+        return;
+    }
+
+    // #223 rd3 HYPOTHESIS TEST verb: drives the REAL sm_record_recent() (via
+    // startmenu_debug_record_recent()) with arg verbatim as the path, so a
+    // path >=128 bytes can be recorded without needing a real app whose
+    // exec_path happens to be that long. arg is not space-split (a real
+    // path can't contain a space anyway in this tree's usage), so the whole
+    // rest of the line after the verb is the path. Built with FAVDEBUG=1
+    // this logs fav_count/canary state to serial + /FAVDEBUG.OUT on every
+    // call via sm_favdebug_check() inside sm_record_recent() itself -
+    // proof or refutation needs no separate accessor. Diagnostic-only,
+    // never shipped, gated the same as every other verb here.
+    if (strcmp(verb, "RECENTPUSH") == 0) {
+        if (arg[0] == '\0') { th_log("ERR RECENTPUSH needs a path"); return; }
+        startmenu_debug_record_recent(arg);
+        th_log("OK RECENTPUSH");
+        return;
+    }
+
+    // #223 rd3: single-shot version of the above that exercises every
+    // sm_record_recent() branch (fill, already-full eviction, found>0
+    // promote) with maximal-length paths, since one TESTHOOK.CMD can only
+    // carry one verb. See startmenu_debug_recent_stress()'s own comment.
+    if (strcmp(verb, "RECENTSTRESS") == 0) {
+        startmenu_debug_recent_stress();
+        th_log("OK RECENTSTRESS");
+        return;
+    }
+
+    // #223 rd3b: coordinator-requested correction - RECENTSTRESS above ran
+    // against g_fav_count==0 (this diagnostic VM never seeds favourites on
+    // its own), so it could not have shown a nonzero-to-zero transition even
+    // if one exists. This verb forces a real nonzero baseline (7 default
+    // favourites, same as a real first boot) FIRST, confirmed via
+    // sm_favdebug_check, then runs the identical long-path stress sequence.
+    if (strcmp(verb, "SEEDSTRESS") == 0) {
+        startmenu_debug_seed_and_stress();
+        th_log("OK SEEDSTRESS");
+        return;
+    }
+
+    // #127/#128/#129 verification-only verbs. Same "drive by name/number,
+    // sidestep hit-testing" philosophy as MENUITEM/STARTMENU above - these
+    // let a throwaway VM be screenshotted in every dock style and with a
+    // controlled notification history WITHOUT fighting #334/#440 mouse
+    // injection. They prove the RENDER/geometry logic, same caveat as the
+    // rest of this file: they do NOT prove a real click at a tray icon's
+    // actual screen coordinates reaches settings_open_panel() - that needs
+    // the #440 VNC path (vnc.c) injecting a real PointerEvent.
+    if (strcmp(verb, "DOCKSTYLE") == 0) {
+        extern void dock_style_write_cfg(int v);   // main.c
+        if (arg[0] == '\0') { th_log("ERR DOCKSTYLE needs 0-4"); return; }
+        int s = th_atoi(arg);
+        if (s < 0 || s >= DOCK_COUNT) { th_log("ERR DOCKSTYLE out of range"); return; }
+        taskbar_set_style(s);
+        dock_style_write_cfg(s);   // else dock_style_poll() reverts it in ~10 ticks
+        g_needs_redraw = true;
+        th_log("OK DOCKSTYLE");
+        return;
+    }
+
+    if (strcmp(verb, "NOTIFCENTER") == 0) {
+        notif_toggle_center();
+        g_needs_redraw = true;
+        th_log("OK NOTIFCENTER");
+        return;
+    }
+
+    // arg is "sev|title|body", sev 0-3 (info/success/warning/error) matching
+    // notif.c's NTF_* constants - same wire format the real spool file uses,
+    // so this exercises the exact same push_notification() the spool poller
+    // calls, not a parallel path.
+    if (strcmp(verb, "NOTIFY") == 0) {
+        char *p = arg, *title, *body;
+        int sev = th_atoi(p);
+        while (*p && *p != '|') p++;
+        if (*p != '|') { th_log("ERR NOTIFY needs sev|title|body"); return; }
+        *p++ = '\0'; title = p;
+        while (*p && *p != '|') p++;
+        if (*p != '|') { th_log("ERR NOTIFY needs sev|title|body"); return; }
+        *p++ = '\0'; body = p;
+        notif_test_push(sev, title, body);
+        g_needs_redraw = true;
+        th_log("OK NOTIFY");
+        return;
+    }
+
+    // Convenience composite for a single-boot #127/#128/#129 verification
+    // screenshot pass (a throwaway VM disk cannot be re-written with a
+    // second /TESTHOOK.CMD while qemu holds it open, see the file-top
+    // comment, so a multi-step scenario needs everything in ONE command).
+    // Reuses the exact same primitives DOCKSTYLE/NOTIFY/NOTIFCENTER above
+    // call - no separate logic path.
+    if (strcmp(verb, "DEMO127") == 0) {
+        extern void dock_style_write_cfg(int v);   // main.c
+        int s = arg[0] ? th_atoi(arg) : DOCK_XFCE;
+        if (s >= 0 && s < DOCK_COUNT) {
+            taskbar_set_style(s);
+            // dock_style_poll() re-applies from /CONFIG/DOCKSTYL.CFG every 10
+            // ticks and would otherwise revert this in-memory change back to
+            // whatever stale value Settings/boot last wrote there (that file
+            // is the live IPC channel FROM Settings, and taskbar_set_style()
+            // alone does not update it - only Settings' own apply path does).
+            dock_style_write_cfg(s);
+        }
+        notif_test_push(0, "Background Update", "A background update finished successfully and needs a restart to apply the change.");
+        notif_test_push(1, "Backup Complete", "Nightly backup finished without errors.");
+        notif_test_push(2, "Low Disk Space", "Only 800MB remain on the root volume.");
+        notif_test_push(3, "Network Fault", "Lost connection to the update server, retrying.");
+        notif_toggle_center();
+        g_needs_redraw = true;
+        th_log("OK DEMO127");
+        return;
+    }
+
+    // (#231) Verification-only verbs for the profile-persistence fix: toggle
+    // the analog clock/calendar Lock flags and cycle the digital clock's
+    // "Next design", via the EXACT SAME assignments the widget's own
+    // right-click menu (widget_menu_handle(), widgets.c) makes when those
+    // items are clicked. This proves the FIX under test - that the value now
+    // survives profile_tick()'s change-detection and a reboot - not the
+    // menu's own hit-test/geometry, the same scope every other verb in this
+    // file keeps to (see the file-top comment on what this class of verb
+    // does and does not prove).
+
+    // (#231r) EQ verification, and it drives the REAL input path.
+    //
+    // "EQDRAG <band> <pos>" opens the sound tray panel, asks traymenu.c where
+    // band <band>'s fader cap sits for position <pos> using the renderer's own
+    // geometry, and then feeds that point to traymenu_handle_mouse() - the
+    // same entry point a real click reaches. So a pass proves the hit-test
+    // accepts the pixel the draw code puts the cap at, that snd_val_from_y()
+    // inverts snd_cap_y() exactly at this UI scale, and that the drag ends in
+    // eq_band_set() reaching the kernel's filter bank.
+    //
+    // #334 is why this exists: QEMU relative-mouse injection does not reliably
+    // land where it is sent, so the geometry is computed here and the EVENT is
+    // real rather than the other way round.
+    if (strcmp(verb, "EQDRAG") == 0) {
+        const char *p = arg;
+        int band = th_atoi(p);
+        while (*p && *p != ' ') p++;
+        while (*p == ' ') p++;
+        int pos = th_atoi(p);
+        if (*p == '\0') { th_log("ERR EQDRAG needs <band> <pos>"); return; }
+
+        extern int g_tray_bar_y;
+        traymenu_open_for_icon(1 /* sound */, g_fb_width / 2);
+        int fx = 0, fy = 0;
+        if (traymenu_eq_fader_point(band, pos, &fx, &fy) != 0) {
+            th_logf("ERR EQDRAG could not locate band %d (panel not open?)", band);
+            traymenu_close();
+            return;
+        }
+        int before = eq_band_get(band);
+        // One press with held=false is a complete grab-set-release in
+        // snd_mouse(): the fader loop claims the drag, the drag branch applies
+        // the value, and the release branch logs it to /AUDIOLOG.TXT.
+        traymenu_handle_mouse(fx, fy, true, false);
+        int after = eq_band_get(band);
+        th_logf("OK EQDRAG band=%d asked=%d point=(%d,%d) before=%d after=%d %s",
+               band, pos, fx, fy, before, after,
+               (after == pos) ? "HIT" : "<<<< MISS: the hit-test and the draw disagree");
+        traymenu_close();
+        g_needs_redraw = true;
+        return;
+    }
+
+    // "EQSTATE" reports every band the kernel currently holds, so a reboot can
+    // be asked what survived without a GUI.
+    // "EQPANEL <p0> <p1> <p2> <p3> <p4>" sets all five bands and leaves the
+    // sound tray panel OPEN, so a host-side screendump can show the restored
+    // #336 faceplate with the faders at distinct, known positions. Purely for
+    // producing a picture of the thing the ticket asked to be restored;
+    // EQDRAG is what proves the input path.
+    if (strcmp(verb, "EQPANEL") == 0) {
+        const char *p = arg;
+        int n = eq_band_count();
+        for (int i = 0; i < n && i < 8; i++) {
+            while (*p == ' ') p++;
+            if (*p == '\0') break;
+            eq_band_set(i, th_atoi(p));
+            while (*p && *p != ' ') p++;
+        }
+        traymenu_open_for_icon(1 /* sound */, g_fb_width / 2);
+        g_needs_redraw = true;
+        th_logf("OK EQPANEL open, faders %d/%d/%d/%d/%d",
+                eq_band_get(0), eq_band_get(1), eq_band_get(2),
+                eq_band_get(3), eq_band_get(4));
+        return;
+    }
+
+    if (strcmp(verb, "EQSTATE") == 0) {
+        int n = eq_band_count();
+        th_logf("OK EQSTATE bands=%d active=%d selftest=0x%x",
+               n, eq_is_active(), eq_selftest_mask());
+        for (int i = 0; i < n && i < 8; i++)
+            th_logf("OK EQSTATE band%d %d Hz pos=%d gain=%d tenths-dB",
+                   i, eq_band_freq(i), eq_band_get(i), eq_band_db10(i));
+        return;
+    }
+
+    if (strcmp(verb, "WLOCK") == 0) {
+        extern int g_clock_locked, g_cal_locked;   // widgets.c
+        if (arg[0] == '\0') { th_log("ERR WLOCK needs 0 (clock) or 1 (calendar)"); return; }
+        int which = th_atoi(arg);
+        if (which == 0) g_clock_locked = !g_clock_locked;
+        else if (which == 1) g_cal_locked = !g_cal_locked;
+        else { th_log("ERR WLOCK 0 or 1 only"); return; }
+        g_needs_redraw = true;
+        th_log("OK WLOCK");
+        return;
+    }
+
+    if (strcmp(verb, "WDESIGN") == 0) {
+        extern int g_digclk_style;   // clock.c
+        g_digclk_style = (g_digclk_style + 1) % 5;
+        g_needs_redraw = true;
+        th_log("OK WDESIGN");
         return;
     }
 

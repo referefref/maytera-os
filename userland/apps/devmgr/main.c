@@ -10,6 +10,7 @@
 #include "../../libc/syscall.h"
 #include "../../libc/devinfo.h"
 #include "../../libc/stdio.h"
+#include "../../libc/keys.h"   // #243: GUI_KEY_* nav codes
 
 #define WIN_W      800
 #define WIN_H      560
@@ -440,9 +441,9 @@ int main(void) {
                     if (sel_cat != 0) { expanded[sel_cat] = 0; sel_item = -1; } draw();
                 } else if (kc == 0x83) {     // right: expand
                     if (sel_cat != 0) { expanded[sel_cat] = 1; } draw();
-                } else if (kc == 0x49) {     // page up
+                } else if (kc == GUI_KEY_PGUP) {
                     prop_scroll -= prop_rows_vis(); if (prop_scroll < 0) prop_scroll = 0; draw();
-                } else if (kc == 0x51) {     // page down
+                } else if (kc == GUI_KEY_PGDN) {
                     prop_scroll += prop_rows_vis(); draw();
                 }
                 break;

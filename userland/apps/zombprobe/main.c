@@ -1,6 +1,6 @@
 // zombprobe - #745 task 37: does an async HTTP fetch leak a process-table slot?
 //
-// WHY THIS EXISTS. The App Store's "Couldn't reach the App Store repository"
+// WHY THIS EXISTS. The App Repo's "Couldn't reach the App Repo server"
 // is reached when http_get_live() returns <= 0 four times, and http_get_live()
 // returns -1 IMMEDIATELY when http_fetch_start() returns a negative number,
 // before a single packet is sent. So the interesting question is not "can the
@@ -141,7 +141,7 @@ static void zp_store_probe(void) {
              attempt, job, st, status, len, n);
     }
     if (n <= 0)
-        outf("ZP:STORE VERDICT app would show: \"Couldn't reach the App Store repository\"\n");
+        outf("ZP:STORE VERDICT app would show: \"Couldn't reach the App Repo server\"\n");
     else
         outf("ZP:STORE VERDICT app would LOAD the catalog (n=%d)\n", n);
 }

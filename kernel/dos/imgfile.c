@@ -14,10 +14,68 @@
 #include "../string.h"
 #include "../fs/fat.h"
 #include "../fs/ext2.h"
+#include "../fs/blockdev.h"   // #740: raw block-device backing
 
 extern fat_fs_t g_fat_fs;
 extern void *kmalloc(unsigned long n);
 extern void  kfree(void *p);
+
+// #740: parse exactly `n` hex digits into *out. Returns the address just past
+// them, or NULL if any of the n characters is not a hex digit. Fixed-width on
+// purpose: a variable-width parse would have to decide what terminates a field,
+// and the producer (dos/usbvol.c) is the only writer of this string, so there
+// is no reason to accept anything it does not emit.
+static const char *hex_n(const char *s, int n, uint64_t *out) {
+    uint64_t v = 0;
+    for (int i = 0; i < n; i++) {
+        char c = s[i];
+        uint64_t d;
+        if (c >= '0' && c <= '9')      d = (uint64_t)(c - '0');
+        else if (c >= 'A' && c <= 'F') d = (uint64_t)(c - 'A' + 10);
+        else if (c >= 'a' && c <= 'f') d = (uint64_t)(c - 'a' + 10);
+        else return 0;
+        v = (v << 4) | d;
+    }
+    *out = v;
+    return s + n;
+}
+
+// #740: recognise and decode IMGF_BLKDEV_PREFIX. Returns 1 and fills the handle
+// (kind/base/size/ch/dr) if `path` is a well-formed synthetic device path, 0 if
+// it is an ordinary path that the file backings should handle.
+//
+// A malformed synthetic path returns 0, NOT an error, so it falls through to
+// the filesystem lookup and fails there as a missing file. There is no caller
+// that can produce one except a bug in dos/usbvol.c, and a confusing "no such
+// file" is a better failure than a special error code nobody handles.
+static int blkdev_parse(imgfile_t *f, const char *path) {
+    const char *p = path;
+    for (const char *q = IMGF_BLKDEV_PREFIX; *q; q++, p++)
+        if (*p != *q) return 0;
+
+    uint64_t ch, dr, base, len;
+    if (!(p = hex_n(p, 2, &ch)))  return 0;
+    if (*p++ != ':')              return 0;
+    if (!(p = hex_n(p, 2, &dr)))  return 0;
+    if (*p++ != ':')              return 0;
+    if (!(p = hex_n(p, 16, &base))) return 0;
+    if (*p++ != ':')              return 0;
+    if (!(p = hex_n(p, 16, &len)))  return 0;
+    if (*p != '\0')               return 0;
+
+    // The cache reads whole IMGF_CACHE_BLK blocks and turns each into a whole
+    // number of 512-byte sectors, so a base that is not sector-aligned would
+    // silently shear every read. rustkern/usbvol.rs enforces 1 MiB alignment
+    // on the producing side; this is the consuming side refusing to trust it.
+    if (len == 0 || (base & 511u) != 0) return 0;
+
+    f->kind = IMGF_KIND_BLKDEV;
+    f->base = base;
+    f->size = len;
+    f->ch   = (uint8_t)ch;
+    f->dr   = (uint8_t)dr;
+    return 1;
+}
 
 int imgfile_is_open(const imgfile_t *f) {
     return (f && f->kind != IMGF_KIND_NONE) ? 1 : 0;
@@ -51,10 +109,16 @@ int imgfile_open(imgfile_t *f, const char *path) {
     memset(f, 0, sizeof(*f));
     f->kind = IMGF_KIND_NONE;
 
+    // #740: the raw block-device backing is decided FIRST, because it is the
+    // one form that must never be looked up as a filename. On success it sets
+    // f->kind, and the two filesystem lookups below are both already guarded on
+    // f->kind still being NONE, so they simply do not run.
+    blkdev_parse(f, path);
+
     // ext2 root first (the two-partition golden, #365). ext2_resolve_path
     // returns 0 when the path is absent, in which case we fall through to FAT
     // so an image on the FAT ESP still works.
-    if (ext2_is_mounted()) {
+    if (f->kind == IMGF_KIND_NONE && ext2_is_mounted()) {
         uint32_t ino = ext2_resolve_path(path);
         if (ino) {
             int is_dir = 1;
@@ -108,6 +172,23 @@ static int64_t imgfile_backing_read(imgfile_t *f, uint64_t blk, uint8_t *dst) {
 
     if (f->kind == IMGF_KIND_EXT2)
         return ext2_read_file_range(f->ino, off, want, dst);
+
+    // #740: raw device range. f->base is 512-aligned (checked at open) and `off`
+    // is always a multiple of IMGF_CACHE_BLK, so base + off is sector-aligned
+    // and the read needs no bounce buffer. `want` is IMGF_CACHE_BLK except in
+    // the final partial block, so nsec is at most IMGF_CACHE_BLK / 512 = 16 and
+    // nsec * 512 never exceeds the IMGF_CACHE_BLK-sized slot `dst` points into.
+    //
+    // Reading only the sectors `want` needs, rather than a full block every
+    // time, is what keeps the LAST block of a volume that ends at the end of
+    // the medium from running off the end of it.
+    if (f->kind == IMGF_KIND_BLKDEV) {
+        uint64_t dev_off = f->base + off;
+        uint32_t nsec    = (uint32_t)((want + 511u) / 512u);
+        int got = blk_read(f->ch, f->dr, dev_off / 512u, nsec, dst);
+        if (got != (int)nsec) return -1;
+        return (int64_t)want;
+    }
 
     if (f->kind == IMGF_KIND_FAT) {
         fat_file_t *ff = (fat_file_t *)f->fat;

@@ -44,7 +44,8 @@ static void fire_hotplug_event(usb_msc_event_type_t type, int device_index) {
         usb_msc_event_t event;
         event.type = type;
         event.device_index = device_index;
-        event.device = (device_index >= 0 && device_index < msc_device_count) ?
+        event.device = (device_index >= 0 && device_index < msc_device_count &&
+                        msc_devices[device_index].present) ?
                        &msc_devices[device_index] : NULL;
         hotplug_callback(&event);
     }
@@ -845,13 +846,25 @@ static int usb_msc_probe_lun(usb_msc_device_t *dev, uint8_t lun) {
 int usb_msc_enumerate(xhci_controller_t *xhc, int slot_id, int interface_num,
                       int bulk_in_ep, int bulk_out_ep,
                       int max_packet_in, int max_packet_out) {
-    if (msc_device_count >= MAX_MSC_DEVICES) {
-        kprintf("[USB-MSC] Maximum devices reached\n");
-        return -1;
+    // #250: claim the lowest FREE slot, which is not necessarily the highest
+    // one ever used. Slots are stable for a device's lifetime (see the
+    // `present` comment in usb_msc.h), so a removal leaves a hole and the next
+    // insertion fills it without disturbing anyone else's index.
+    int free_slot = -1;
+    for (int i = 0; i < msc_device_count; i++) {
+        if (!msc_devices[i].present) { free_slot = i; break; }
+    }
+    if (free_slot < 0) {
+        if (msc_device_count >= MAX_MSC_DEVICES) {
+            kprintf("[USB-MSC] Maximum devices reached\n");
+            return -1;
+        }
+        free_slot = msc_device_count;
     }
 
-    usb_msc_device_t *dev = &msc_devices[msc_device_count];
+    usb_msc_device_t *dev = &msc_devices[free_slot];
     memset(dev, 0, sizeof(usb_msc_device_t));
+    dev->present = 1;
 
     dev->controller = xhc;
     dev->slot_id = slot_id;
@@ -885,8 +898,8 @@ int usb_msc_enumerate(xhci_controller_t *xhc, int slot_id, int interface_num,
     dev->ready = lun0->ready;
     dev->removable = lun0->removable;
 
-    int device_index = msc_device_count;
-    msc_device_count++;
+    int device_index = free_slot;
+    if (free_slot >= msc_device_count) msc_device_count = free_slot + 1;
 
     // Fire hotplug event
     fire_hotplug_event(USB_MSC_EVENT_INSERTED, device_index);
@@ -929,6 +942,9 @@ usb_msc_device_t *usb_msc_get_device(int index) {
     if (index < 0 || index >= msc_device_count) {
         return NULL;
     }
+    // #250: a freed slot answers NULL, not a stale struct. This is what makes
+    // a stale index FAIL rather than silently address another device.
+    if (!msc_devices[index].present) return NULL;
     return &msc_devices[index];
 }
 
@@ -938,7 +954,7 @@ int usb_msc_get_device_count(void) {
 
 int usb_msc_find_device_by_slot(int slot_id) {
     for (int i = 0; i < msc_device_count; i++) {
-        if (msc_devices[i].slot_id == slot_id) {
+        if (msc_devices[i].present && msc_devices[i].slot_id == slot_id) {
             return i;
         }
     }
@@ -951,14 +967,16 @@ void usb_msc_device_removed(int slot_id) {
 
     kprintf("[USB-MSC] Device removed (slot %d)\n", slot_id);
 
-    // Fire removal event
+    // Fire removal event FIRST, while the slot still describes the device, so
+    // the hotplug manager can name it and tear its mount down.
     fire_hotplug_event(USB_MSC_EVENT_REMOVED, index);
 
-    // Remove device from list
-    for (int i = index; i < msc_device_count - 1; i++) {
-        msc_devices[i] = msc_devices[i + 1];
-    }
-    msc_device_count--;
+    // #250: free the slot IN PLACE. See the `present` comment in usb_msc.h for
+    // why compacting here was a data-corruption bug and not a tidy-up.
+    msc_devices[index].present = 0;
+    msc_devices[index].ready = 0;
+    msc_devices[index].mounted = 0;
+    for (int l = 0; l < USB_MSC_MAX_LUNS; l++) msc_devices[index].luns[l].ready = 0;
 }
 
 // =============================================================================
@@ -1016,6 +1034,7 @@ void usb_msc_poll_hotplug(void) {
     // Check for media ready state changes on removable devices
     for (int i = 0; i < msc_device_count; i++) {
         usb_msc_device_t *dev = &msc_devices[i];
+        if (!dev->present) continue;   // #250: freed slot
         if (!dev->removable) continue;
 
         // Test unit ready on LUN 0
@@ -1060,6 +1079,7 @@ void usb_msc_print_devices(void) {
     kprintf("\n[USB-MSC] Device List (%d devices):\n", msc_device_count);
     for (int i = 0; i < msc_device_count; i++) {
         usb_msc_device_t *dev = &msc_devices[i];
+        if (!dev->present) { kprintf("  %d: (empty slot)\n", i); continue; }  // #250
         kprintf("  %d: %s %s (slot %d)\n", i, dev->vendor, dev->product, dev->slot_id);
 
         for (int lun = 0; lun <= dev->max_lun; lun++) {
