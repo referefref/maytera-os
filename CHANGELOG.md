@@ -21,6 +21,13 @@ source constant read lower than the image it produced. `/BUILDINFO.TXT` on the
 image records the commit it was built from, and that commit is the identifier
 to trust.
 
+This release publishes a compressed disk image and no `.iso`. MayteraOS has no
+ATAPI read path and no ISO9660 support on any boot path, so an `.iso` from this
+project would be a disk image with the wrong extension: it would fail in a real
+optical drive, or in a VM told to boot one, in a way that looks like a corrupt
+download rather than an unsupported medium. The README names the files in the
+kernel that make that true.
+
 ### Security
 
 - **Three Ring-3 privilege-boundary fixes.** A process could read or write

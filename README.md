@@ -344,32 +344,33 @@ A fresh image has **no user accounts**. It boots to first-run account creation
 and asks you to choose an administrator username and password. There are no
 default credentials to change, because none are shipped.
 
-### Two files, and which one you want
+### The release is a disk image. There is deliberately no ISO
 
-| Asset | Use it when |
-|---|---|
-| `maytera-os-v2.0.2-b2285.img.gz` | You are writing to a USB stick or attaching a disk to a VM. This is the smaller download and the one to prefer. |
-| `maytera-os-v2.0.2-b2285.iso` | Your tool wants a `.iso`. It is the same image, uncompressed, with an ISO9660 wrapper so that writers which insist on the extension will accept it. |
+The release publishes **`maytera-os-v2.0.2-b2285.img.gz`** and a `SHA256SUMS`
+to check it against. No `.iso` is offered, and that is a decision rather than an
+oversight.
 
-**Read this before you reach for the ISO: MayteraOS cannot boot from a CD or a
-DVD, real or virtual.** The `.iso` is a hybrid image and it boots the same way
-the `.img` does, by being written to a disk. Attaching it to a virtual **CD-ROM**
-drive will not work. This is not a packaging accident, it is a missing driver
-and a missing filesystem, and both are checkable in this tree:
+**MayteraOS cannot boot from optical media.** There is no ATAPI read path and no
+ISO9660 support anywhere in the tree that a boot could use, so a `.iso` from this
+project would be a disk image wearing the wrong extension. It would fail in a
+real optical drive, and in any virtual machine configured to boot one, in a way
+that looks like a corrupt download rather than an unsupported medium. Handing
+you a file that fails that way is worse than handing you no file, so the reason
+is written here instead.
 
-- `kernel/drivers/ata.c` identifies an ATAPI device but has no packet-read
-  (`0xA8`) path, and `kernel/drivers/ahci.c` records a SATAPI port as present
-  and says in as many words that it does not drive it. So there is no way to
-  read blocks off an optical device.
+Both halves are checkable in this repository:
+
+- `kernel/drivers/ata.c` identifies an ATAPI device but implements no
+  packet-read (`0xA8`) path, and `kernel/drivers/ahci.c` records a SATAPI port
+  as present while stating that it does not drive it. Nothing can read blocks
+  off an optical device.
 - There is no ISO9660 filesystem under `kernel/fs/`. The ISO9660 parser that
   does exist, `kernel/rustkern/iso9660.rs`, is reached only from `kernel/dos/`
-  and serves CD images mounted **for a DOS guest**. It is not a root
-  filesystem and is not on any boot path.
+  and serves disc images mounted **for a DOS guest**. It is not a root
+  filesystem and is on no boot path.
 
-A kernel booted from optical media therefore comes up with no root filesystem,
-no login and no desktop. Publishing a `.iso` that implies otherwise would be
-worse than publishing none, so the limitation is stated here rather than left
-for you to discover.
+A kernel booted from optical media comes up with no root filesystem, no login
+and no desktop.
 
 ### How to boot it
 
@@ -377,18 +378,22 @@ for you to discover.
 # USB stick. This DESTROYS the target disk. Check the device name twice.
 gunzip -c maytera-os-v2.0.2-b2285.img.gz | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress
 
-# Or attach it to a VM as a DISK (not a CD-ROM), with UEFI firmware:
+# Or attach it to a VM as a DISK (never a CD-ROM), with UEFI firmware:
+gunzip -k maytera-os-v2.0.2-b2285.img.gz
 qemu-system-x86_64 -machine pc -cpu kvm64 -m 2G \
     -bios /usr/share/OVMF/OVMF_CODE.fd \
     -drive file=maytera-os-v2.0.2-b2285.img,format=raw,if=ide \
     -serial stdio
 ```
 
+`-machine pc` is load-bearing too: the ATA driver expects legacy IDE, which
+`q35` does not provide.
+
 Use `-cpu kvm64`, not `-cpu host`. AVX crashes the compositor.
 
 ### Verify what you downloaded
 
-Every release publishes a `SHA256SUMS` asset next to the images. Check it before
+Every release publishes a `SHA256SUMS` asset next to the image. Check it before
 you write anything to a disk:
 
 ```sh
