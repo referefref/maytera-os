@@ -71,6 +71,25 @@ volatile uint64_t g_fb_rot_copy_max_cyc = 0;
 volatile uint64_t g_fb_rot_copy_calls   = 0;
 volatile uint64_t g_fb_rot_copy_px_tot  = 0;   // total pixels copied, for cyc/px
 
+// #halfres: integer PRESENT-SCALE compositing (see the block comment above
+// fb_set_present_scale() in framebuffer.h). 1 == off, byte-identical to a
+// kernel that never had this feature. >1 is an exact integer replication
+// factor: fb_width/fb_height/fb_pitch are reduced to fb_phys_*/n and every
+// draw primitive in this file (and everything upstream of it: the
+// compositor, uiscale) is none the wiser, exactly like fb_rotation above.
+static int fb_present_scale_n = 1;
+
+// Present-scale replication copy cycle counters, mirroring g_fb_rot_copy_*
+// one block up. src_px is what was actually COMPOSITED (the number this
+// feature exists to shrink); dst_px is physical pixels WRITTEN, which is
+// src_px * n * n and does not shrink - the present still touches the whole
+// panel either way. Read by main.c's [SCALEPROF] boot log line.
+volatile uint64_t g_fb_scale_copy_tot_cyc = 0;
+volatile uint64_t g_fb_scale_copy_max_cyc = 0;
+volatile uint64_t g_fb_scale_copy_calls   = 0;
+volatile uint64_t g_fb_scale_copy_src_px_tot = 0;
+volatile uint64_t g_fb_scale_copy_dst_px_tot = 0;
+
 // Global variables for external access (fb_syscall.c)
 uint64_t g_fb_phys_addr = 0;
 uint32_t g_fb_width = 0;
@@ -78,6 +97,82 @@ uint32_t g_fb_height = 0;
 uint32_t g_fb_pitch = 0;
 uint32_t g_fb_bpp = 0;
 static bool fb_double_buffered = false;
+
+int fb_get_present_scale(void) { return fb_present_scale_n; }
+
+// #halfres: apply an integer present-scale factor. Called once at boot, AFTER
+// fb_init() and AFTER the root filesystem is mounted (kernel/gui/presentscale.c
+// reads its config from ext2/FAT), and BEFORE uiscale_init() so uiscale sees
+// the REDUCED logical dims (kernel/gui/desktop.c calls both, in that order).
+// Not supported live: like display rotation, this is a reboot-to-apply
+// setting, which keeps it out of the compositor's already-complex live-resize
+// path (uiscale's uw_rescale_all) for a feature that is one owner's choice
+// about one physical panel, not something anyone needs to preview and back
+// out of in the same session.
+//
+// WHY THIS DOES NOT REALLOCATE fb_back, AND WHY THAT IS NOT MERELY THE
+// SIMPLER OPTION. fb_back was allocated with kmalloc_aligned(size, 4096) in
+// fb_init() below, and this kernel's heap has NO kfree_aligned(): kfree()
+// assumes the header sits immediately before the returned pointer, which is
+// true for a plain kmalloc() but not for the >16-byte-aligned path, which
+// stores the real allocation elsewhere and returns an interior pointer.
+// Calling kfree() on that interior pointer would corrupt the heap the first
+// time this ever ran, on a code path with zero prior callers to have caught
+// it (see blame.md's "zero callers" lesson). So this REPACKS the SAME
+// allocation at a smaller pitch/height instead: fb_back was sized for the
+// full PHYSICAL screen, and any n>=1 view of it needs less than that, never
+// more, so shrinking fb_width/fb_height/fb_pitch in place can never run past
+// the allocation's end. No realloc, no free, no new failure mode.
+bool fb_set_present_scale(int n) {
+    if (n <= 1) {
+        fb_present_scale_n = 1;
+        return true;
+    }
+    if (!fb_back || !fb_front || fb_phys_width == 0 || fb_phys_height == 0) {
+        return false;
+    }
+    // Validation (exact divisor, logical floor, no-rotation) is the caller's
+    // job (presentscale_valid_rs in rustkern/presentscale.rs) - this function
+    // trusts it and only guards against dividing into nothing.
+    uint32_t new_w = fb_phys_width  / (uint32_t)n;
+    uint32_t new_h = fb_phys_height / (uint32_t)n;
+    if (new_w == 0 || new_h == 0) {
+        return false;
+    }
+    uint32_t new_pitch = new_w * 4;   // tightly packed, same reasoning fb_init
+                                      // uses for the 90/270 rotated back buffer
+
+    fb_width  = new_w;
+    fb_height = new_h;
+    fb_pitch  = new_pitch;
+    g_fb_width  = fb_width;
+    g_fb_height = fb_height;
+    g_fb_pitch  = fb_pitch;
+
+    // The old (physical-sized) content is meaningless at the new, smaller
+    // pitch - zero it so nothing stale from before this call can show through
+    // a torn early partial present.
+    memset(fb_back, 0, (size_t)fb_height * fb_pitch);
+    if (fb_addr == fb_back || fb_addr != fb_front) {
+        fb_addr = fb_back;
+    }
+
+    fb_present_scale_n = n;
+    kprintf("[FB] present-scale %dx applied: compositing %ux%u into a "
+            "physical %ux%u panel (back buffer repacked, no realloc)\n",
+            n, fb_width, fb_height, fb_phys_width, fb_phys_height);
+    return true;
+}
+
+void fb_scale_profile_get(uint64_t *tot_cyc, uint64_t *max_cyc,
+                           uint64_t *calls, uint64_t *src_px_tot,
+                           uint64_t *dst_px_tot) {
+    if (tot_cyc)    *tot_cyc    = g_fb_scale_copy_tot_cyc;
+    if (max_cyc)    *max_cyc    = g_fb_scale_copy_max_cyc;
+    if (calls)      *calls      = g_fb_scale_copy_calls;
+    if (src_px_tot) *src_px_tot = g_fb_scale_copy_src_px_tot;
+    if (dst_px_tot) *dst_px_tot = g_fb_scale_copy_dst_px_tot;
+}
 // Bochs VGA (stdvga) DISPI register definitions
 #define VBE_DISPI_IOPORT_INDEX  0x01CE
 #define VBE_DISPI_IOPORT_DATA   0x01CF
@@ -766,6 +861,111 @@ void fb_rotate_profile_get(uint64_t *tot_cyc, uint64_t *max_cyc,
     if (px_tot)  *px_tot  = g_fb_rot_copy_px_tot;
 }
 
+// ===========================================================================
+// #halfres: integer PRESENT-SCALE replication. Entered ONLY when
+// fb_present_scale_n > 1 - fb_swap_buffers()/fb_swap_dirty_rects() keep their
+// exact pre-existing code path otherwise (grep both for fb_present_scale_n:
+// the old lines are reached with zero new code in between, same proof #745's
+// rotation feature offers above).
+//
+// UNLIKE the 90/270 rotation transpose, this is NOT cache-hostile: it is
+// EXACTLY the "build one widened row once, then memcpy it N times" trick
+// dosexec.c's dos_row_reuse()/dos_xscale_t already use for the DOS presenters
+// (see kernel/dos/dosexec.c's "ONE scaling/blit path" block comment) and the
+// same principle this file's OWN fb_present_rect_rotated() uses for its
+// FB_ROTATE_180 case (row-contiguous reads, row-oriented writes). Nothing
+// here is a new algorithm; it is the smallest instance of a pattern this
+// codebase already leans on twice, generalised to an arbitrary integer N
+// instead of hardcoding N=2, because "reject a non-integer factor" (the
+// whole point: no resampling) does not mean N is always 2 on every panel.
+//
+// C, NOT RUST, and that is a stated choice, not a default: this function
+// shares a translation unit and a hot invariant (interrupts already off,
+// the temporary kernel CR3 already live - see sys_fb_flip() in
+// gui/fb_syscall.c) with fb_present_rect_rotated() immediately above, which
+// was already accepted as C in THIS FILE for exactly that entanglement.
+// Splitting the replication loop into Rust while leaving fb_swap_buffers()/
+// fb_swap_dirty_rects() in C would add an FFI hop inside an already
+// hand-tuned cli region for no measured benefit. The DECISION logic (is a
+// requested factor valid for this panel) has none of those constraints and
+// lives in rustkern/presentscale.rs instead, exactly mirroring the uiscale.c
+// (C plumbing) / uiscale.rs (Rust arithmetic) split one file over.
+//
+// MEASURED (see the [SCALEPROF] boot-log line in main.c, and the CHANGELOG
+// entry for a real 2x capture): building the widened row costs lw stores;
+// replicating it costs n memcpy()s of lw*n*4 bytes each. Total bytes WRITTEN
+// to the front buffer are the same as a straight full-resolution present
+// (the panel has the pixels it has), which is exactly why this ticket's
+// mandate is "do not claim a 4x speedup" - the saving is in what gets READ
+// and RECOMPUTED (compositing), not in the unavoidable physical write.
+// ===========================================================================
+
+// Widest single destination (physical) row this supports, in pixels. 4096
+// covers every panel this kernel has ever booted with headroom; a caller
+// asking for a wider one is refused rather than overrunning this buffer.
+#define FB_SCALE_SCRATCH_MAXW 4096
+static uint32_t fb_scale_scratch[FB_SCALE_SCRATCH_MAXW];
+
+// Copy one rectangle from the LOGICAL back buffer into the PHYSICAL front
+// buffer, replicating each source pixel into an nxn block. lx,ly,lw,lh are
+// already clamped to the logical screen by both call sites before this is
+// reached (same contract fb_present_rect_rotated documents above).
+static void fb_present_rect_scaled(int32_t lx, int32_t ly, int32_t lw, int32_t lh) {
+    if (lw <= 0 || lh <= 0) return;
+    int n = fb_present_scale_n;
+    if (n <= 1) return;
+
+    int32_t dst_w = lw * n;
+    if (dst_w > FB_SCALE_SCRATCH_MAXW) {
+        // Should not happen for any mode this kernel supports (checked at
+        // config-apply time by presentscale_valid_rs); refuse rather than
+        // overrun the scratch row.
+        return;
+    }
+
+    uint64_t t0 = dp_tsc();
+
+    for (int32_t row = 0; row < lh; row++) {
+        const uint32_t *src = (const uint32_t *)((const uint8_t *)fb_back +
+                                (uint32_t)(ly + row) * fb_pitch) + lx;
+
+        // Build the widened row ONCE: each source pixel replicated n times.
+        uint32_t *srow = fb_scale_scratch;
+        for (int32_t col = 0; col < lw; col++) {
+            uint32_t px = src[col];
+            for (int k = 0; k < n; k++) *srow++ = px;
+        }
+
+        // n IDENTICAL destination rows, each a straight memcpy of the row
+        // just built - the row-reuse trick, applied vertically instead of
+        // detecting a repeat (there is no need to detect one: at an integer
+        // replication factor every one of the n rows is a repeat, always).
+        uint32_t dst_x0 = (uint32_t)lx * (uint32_t)n;
+        uint32_t dst_y0 = (uint32_t)(ly + row) * (uint32_t)n;
+        for (int k = 0; k < n; k++) {
+            uint32_t *dstrow = (uint32_t *)((uint8_t *)fb_front +
+                                 (dst_y0 + (uint32_t)k) * fb_phys_pitch) + dst_x0;
+            memcpy(dstrow, fb_scale_scratch, (size_t)dst_w * 4);
+        }
+    }
+
+    uint64_t d = dp_tsc() - t0;
+    uint64_t src_px = (uint64_t)lw * (uint64_t)lh;
+    uint64_t dst_px = (uint64_t)dst_w * (uint64_t)lh * (uint64_t)n;
+    g_fb_scale_copy_tot_cyc     += d;
+    g_fb_scale_copy_calls++;
+    g_fb_scale_copy_src_px_tot  += src_px;
+    g_fb_scale_copy_dst_px_tot  += dst_px;
+    g_fb_front_bytes            += dst_px * 4ULL;   // #COMPIDLE
+    if (d > g_fb_scale_copy_max_cyc) g_fb_scale_copy_max_cyc = d;
+}
+
+// Full-screen scaled present: the first frame, a whole-screen damage rect,
+// and any caller that passes full_redraw all fall back to this.
+static void fb_present_full_scaled(void) {
+    fb_present_rect_scaled(0, 0, (int32_t)fb_width, (int32_t)fb_height);
+}
+
 void fb_swap_buffers(void) {
     if (!fb_double_buffered || !fb_back || !fb_front) {
         return;  // Nothing to swap in single buffer mode
@@ -778,6 +978,17 @@ void fb_swap_buffers(void) {
         fb_present_full_rotated();
         g_fb_full_presents++;                 // #COMPIDLE (bytes counted in
         __asm__ volatile("sfence" ::: "memory");   // fb_present_rect_rotated)
+        return;
+    }
+
+    // #halfres: integer present-scale replication. Mutually exclusive with
+    // rotation (checked at config-apply time, not here) - reached only when
+    // fb_present_scale_n > 1, which is only ever true on a machine that
+    // opted in. Every other machine takes the unchanged memcpy below.
+    if (fb_present_scale_n > 1) {
+        fb_present_full_scaled();
+        g_fb_full_presents++;                 // #COMPIDLE (bytes counted in
+        __asm__ volatile("sfence" ::: "memory");   // fb_present_rect_scaled)
         return;
     }
 
@@ -804,6 +1015,12 @@ void fb_swap_dirty_rects(const void *dirty_rects, uint32_t count, bool full_redr
     if (full_redraw || count == 0 || dirty_rects == NULL) {
         if (fb_rotation != FB_ROTATE_NONE) {          // #745 (local 102)
             fb_present_full_rotated();
+            g_fb_full_presents++;                     // #COMPIDLE
+            __asm__ volatile("sfence" ::: "memory");
+            return;
+        }
+        if (fb_present_scale_n > 1) {                 // #halfres
+            fb_present_full_scaled();
             g_fb_full_presents++;                     // #COMPIDLE
             __asm__ volatile("sfence" ::: "memory");
             return;
@@ -847,6 +1064,12 @@ void fb_swap_dirty_rects(const void *dirty_rects, uint32_t count, bool full_redr
         // available even though the rotated rect IS a physical rectangle.
         if (fb_rotation != FB_ROTATE_NONE) {
             fb_present_rect_rotated(x, y, w, h);
+            continue;
+        }
+        // #halfres: same per-rect replication for a partial present as the
+        // full-screen path above uses.
+        if (fb_present_scale_n > 1) {
+            fb_present_rect_scaled(x, y, w, h);
             continue;
         }
 

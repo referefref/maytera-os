@@ -59,6 +59,13 @@ typedef struct {
 #define DHCP_TRC_RX           6   // dhcp_handle entered (arg = msg_type)
 static dhcp_trc_t       dhcp_trc[DHCP_TRC_N];
 static volatile uint32_t dhcp_trc_seq = 0;
+// Dedupe state for the POLL_EXPIRED trace: the last deadline value already
+// recorded, and how many further poll calls saw that same expiry. The count is
+// reported once per drain so the burst is still VISIBLE (it is real evidence of
+// how many contexts race one expiry, which is what #522 was about) without it
+// being able to crowd out the DORA itself.
+static volatile uint64_t dhcp_trc_expired_seen = 0;
+static volatile uint64_t dhcp_trc_expired_dup  = 0;
 
 static inline void dhcp_trace(uint32_t ev, uint32_t arg) {
     uint32_t i = __sync_fetch_and_add(&dhcp_trc_seq, 1);
@@ -81,6 +88,162 @@ void dhcp_trace_dump(void) {
                 k, (unsigned)s->ticks, s->ev, s->arg);
     }
 }
+// ---------------------------------------------------------------------------
+// DURABLE DORA EVIDENCE (no ticket, 2026-08-28).
+//
+// Every DHCP line in this file is kprintf, i.e. SERIAL ONLY. The owner's laptop
+// has no serial port, so on the machine where DHCP actually failed there was no
+// evidence at all: `grep -i dhcp` over his BOOTLOG returned nothing but boot
+// self-tests. Two diagnostics shipped this week reached only serial and were
+// useless for the same reason.
+//
+// This drains the existing lock-free event ring onto the DURABLE bootlog. It
+// runs ON THE NET WORKER, never from dhcp_handle()/dhcp_poll(): those execute
+// inside eth_receive under net_lock, which is cli + spinlock, and bootlog_write
+// performs a filesystem write. Writing the log from there would be the #549
+// mistake with a FAT transaction attached to it.
+//
+// Cost control: bootlog_write rewrites the whole growing file, so the total
+// number of durable DHCP lines per boot is capped. Past the cap the ring still
+// records everything and dhcp_trace_dump() still prints it to serial.
+#define DHCP_DURABLE_MAX 40
+// RESERVATION, not just a total (no ticket, 2026-08-29). DHCP_DURABLE_MAX alone
+// was a single shared budget, so the noisiest event class could consume all of
+// it and leave nothing for the events that actually describe a DORA. That is
+// not hypothetical: it is what happened on golden 2277 (see the long note in
+// dhcp_poll()). Deduping POLL_EXPIRED at its source fixes that specific burst,
+// but a shared budget stays one bad day away from the same inversion, so the
+// two classes now draw from separate pools:
+//
+//   NOISE  = POLL_EXPIRED / CLAIM_WON / CLAIM_LOST. Retry-schedule mechanics.
+//            Useful, but emitted per timeout, and unbounded if a server never
+//            answers. Capped hard and separately.
+//   STORY  = SEND / RX / GIVEUP. At most a handful per acquisition, and the
+//            only events that answer 'did a reply arrive'. These keep the
+//            full DHCP_DURABLE_MAX to themselves.
+//
+// The property that matters: NO amount of noise can now make a received OFFER
+// or ACK unloggable.
+#define DHCP_DURABLE_NOISE_MAX 8
+static uint32_t dhcp_durable_reported = 0;   // ring index already reported
+static uint32_t dhcp_durable_lines = 0;      // STORY lines emitted this boot
+static uint32_t dhcp_durable_noise = 0;      // NOISE lines emitted this boot
+static uint64_t dhcp_durable_dup_seen = 0;   // dup count already reported
+static uint32_t dhcp_durable_last_ip = 0;    // last address we announced
+
+static const char *dhcp_trc_name(uint32_t ev) {
+    switch (ev) {
+        case DHCP_TRC_POLL_EXPIRED: return "deadline-expired";
+        case DHCP_TRC_CLAIM_WON:    return "retry-claimed";
+        case DHCP_TRC_CLAIM_LOST:   return "retry-lost";
+        case DHCP_TRC_SEND:         return "SEND";
+        case DHCP_TRC_GIVEUP:       return "give-up";
+        case DHCP_TRC_RX:           return "RX";
+        default:                    return "?";
+    }
+}
+
+static const char *dhcp_msg_name(uint32_t t) {
+    switch (t) {
+        case DHCP_DISCOVER: return "DISCOVER";
+        case DHCP_OFFER:    return "OFFER";
+        case DHCP_REQUEST:  return "REQUEST";
+        case DHCP_ACK:      return "ACK";
+        case DHCP_NAK:      return "NAK";
+        default:            return "other";
+    }
+}
+
+static const char *dhcp_state_name(uint32_t s) {
+    switch (s) {
+        case DHCP_STATE_IDLE:        return "IDLE";
+        case DHCP_STATE_DISCOVERING: return "DISCOVERING";
+        case DHCP_STATE_REQUESTING:  return "REQUESTING";
+        case DHCP_STATE_BOUND:       return "BOUND";
+        default:                     return "DAD/other";
+    }
+}
+
+// Call ONLY from top-level context (net_worker). Emits one durable line per new
+// ring event, plus one when the interface's address changes.
+void dhcp_durable_drain(void) {
+    uint32_t n = dhcp_trc_seq;
+    if (dhcp_durable_reported > n) dhcp_durable_reported = n;   // ring reset
+    uint32_t start = dhcp_durable_reported;
+    // If the ring wrapped past what we have reported, resume at the oldest entry
+    // still present rather than replaying stale slots.
+    if (n - start > DHCP_TRC_N) start = n - DHCP_TRC_N;
+
+    for (uint32_t k = start; k < n && dhcp_durable_lines < DHCP_DURABLE_MAX; k++) {
+        dhcp_trc_t *s = &dhcp_trc[k & (DHCP_TRC_N - 1)];
+        uint32_t ev = s->ev, arg = s->arg;
+        int noise = (ev == DHCP_TRC_POLL_EXPIRED ||
+                     ev == DHCP_TRC_CLAIM_WON ||
+                     ev == DHCP_TRC_CLAIM_LOST);
+        if (noise) {
+            // Draw from the noise pool. Skipping the line still consumes the
+            // ring entry (k advances), so a suppressed burst can never stall
+            // the drain behind it.
+            if (dhcp_durable_noise >= DHCP_DURABLE_NOISE_MAX) continue;
+            dhcp_durable_noise++;
+        } else {
+            dhcp_durable_lines++;
+        }
+        if (ev == DHCP_TRC_RX) {
+            // NOTE the second field is the state AT DRAIN TIME, not at the
+            // event: the ring records the message type only, and the drain runs
+            // up to a second later. Labelled \"now=\" so it can never be misread
+            // as \"this OFFER arrived while BOUND\".
+            bootlog_write("[DHCP] #%u RX %s (now=%s)",
+                          k, dhcp_msg_name(arg), dhcp_state_name(dhcp_state));
+        } else if (ev == DHCP_TRC_SEND) {
+            bootlog_write("[DHCP] #%u SEND %s (xid %08x)", k,
+                          arg == DHCP_STATE_DISCOVERING ? "DISCOVER" : "REQUEST",
+                          (unsigned)dhcp_xid);
+        } else {
+            bootlog_write("[DHCP] #%u %s arg=%u", k, dhcp_trc_name(ev), arg);
+        }
+    }
+    dhcp_durable_reported = n;
+
+    // How many further poll calls saw an expiry that was already recorded. This
+    // is the number that used to BE the log. Reported as a single delta line,
+    // and only when it actually moved, so the evidence of the #522 multi-context
+    // race survives without it being able to bury the DORA again.
+    uint64_t dup = dhcp_trc_expired_dup;
+    if (dup != dhcp_durable_dup_seen &&
+        dhcp_durable_noise < DHCP_DURABLE_NOISE_MAX) {
+        dhcp_durable_noise++;
+        bootlog_write("[DHCP] %lu further poll call(s) saw an already-recorded "
+                      "expiry (deduped, not lost)",
+                      (unsigned long)(dup - dhcp_durable_dup_seen));
+        dhcp_durable_dup_seen = dup;
+    }
+
+    uint32_t ip = ip_get_address();
+    if (ip != dhcp_durable_last_ip) {
+        dhcp_durable_last_ip = ip;
+        uint8_t *a = (uint8_t *)&ip;
+        uint32_t gw = ip_get_gateway(), nm = ip_get_netmask();
+        uint8_t *g = (uint8_t *)&gw, *m = (uint8_t *)&nm;
+        if (ip) {
+            // NOT called \"BOUND\": the interface can acquire an address WITHOUT a
+            // lease (the carrier-gated DAD-verified .200-.209 static fallback,
+            // which reads dhcp=IDLE here). Saying BOUND for that would report a
+            // DHCP success that did not happen, which is the exact class of
+            // mistake #504 records for this same fallback.
+            bootlog_write("[DHCP] ADDRESS ip=%d.%d.%d.%d mask=%d.%d.%d.%d "
+                          "gw=%d.%d.%d.%d dhcp=%s",
+                          a[3], a[2], a[1], a[0], m[3], m[2], m[1], m[0],
+                          g[3], g[2], g[1], g[0], dhcp_state_name(dhcp_state));
+        } else {
+            bootlog_write("[DHCP] address cleared (dhcp=%s)",
+                          dhcp_state_name(dhcp_state));
+        }
+    }
+}
+// ---------------------------------------------------------------------------
+
 static uint32_t dhcp_offered_ip = 0;
 static uint32_t dhcp_server_ip = 0;
 static uint32_t dhcp_gateway = 0;
@@ -609,6 +772,12 @@ int dhcp_discover(void) {
     // Send to broadcast
     int result = udp_send(0xFFFFFFFF, DHCP_CLIENT_PORT, DHCP_SERVER_PORT,
                           packet, len);
+    // The OPENING DISCOVER of every DORA was not in the ring: dhcp_trace(SEND)
+    // existed only on dhcp_poll()'s RETRY path, so a transaction that succeeded
+    // first time left no SEND event at all and the durable log could show an
+    // OFFER arriving in reply to nothing. Record it here, at the one place the
+    // first DISCOVER actually hits udp_send.
+    dhcp_trace(DHCP_TRC_SEND, (uint32_t)DHCP_STATE_DISCOVERING);
     if (result < 0) {
         kprintf("[DHCP] Failed to send DISCOVER\n");
     }
@@ -887,7 +1056,49 @@ void dhcp_poll(void) {
     uint64_t now_ticks = timer_ticks;
     uint64_t deadline  = dhcp_timeout;
     if (now_ticks > deadline) {
-        dhcp_trace(DHCP_TRC_POLL_EXPIRED, (uint32_t)dhcp_state);
+        // ONE POLL_EXPIRED PER DEADLINE, NOT ONE PER POLL CALL (no ticket,
+        // 2026-08-29). This trace used to be unconditional, and that made the
+        // durable DORA evidence below actively LIE on the one machine it was
+        // written for.
+        //
+        // MEASURED, from the owner's golden-2277 /BOOTLOG.TXT: the log showed
+        // '#0 SEND DISCOVER' followed by #1..#39 'deadline-expired' and then
+        // NOTHING for the remaining six minutes of uptime. That was read as
+        // 'the DISCOVER got no reply' and sent an investigation after the
+        // USB-Ethernet driver. It was not true. Four lines further down the
+        // same file: '[DHCP] ADDRESS ip=192.0.2.1 mask=255.255.255.0
+        // gw=192.0.2.1 dhcp=BOUND'. The DORA completed. dhcp_state reaches
+        // BOUND from exactly one place (the DAD completion at the top of this
+        // file), reachable only from the ACK branch, whose dhcp_offered_ip
+        // comes only from a received OFFER's yiaddr. So that one line is
+        // proof of a real OFFER and a real ACK over that adapter.
+        //
+        // WHY THE EVIDENCE WAS DESTROYED. dhcp_poll() is driven by at least
+        // five contexts at >=250Hz. Once the deadline expires, EVERY one of
+        // those calls reached this trace, and the #524 burst guard immediately
+        // below returns without clearing the expiry, so the condition stays
+        // true for the whole 200-poll guard window. The ring therefore took
+        // POLL_EXPIRED at poll rate. dhcp_durable_drain() is capped at
+        // DHCP_DURABLE_MAX (40) lines FOR THE WHOLE BOOT, so 39 copies of the
+        // one event that is emitted at poll rate consumed the entire budget
+        // before the OFFER arrived. Every RX, every SEND REQUEST, every ACK
+        // after that was silently unloggable.
+        //
+        // A rate-limited logger that spends its whole budget on its noisiest
+        // event class does not merely lose detail, it inverts the conclusion.
+        // The fix is to make the event mean what its name says: 'this DEADLINE
+        // expired' is a property of a deadline, not of a poll call. Claim it
+        // with the same atomic_cas64 the retry claim below uses, so exactly one
+        // context records each distinct expiry and the rest are counted.
+        uint64_t seen = dhcp_trc_expired_seen;
+        if (seen == deadline ||
+            atomic_cas64(&dhcp_trc_expired_seen, seen, deadline) != seen) {
+            // Either this deadline is already recorded, or another context won
+            // the race to record it. Count, do not trace.
+            __sync_fetch_and_add(&dhcp_trc_expired_dup, 1);
+        } else {
+            dhcp_trace(DHCP_TRC_POLL_EXPIRED, (uint32_t)dhcp_state);
+        }
 
         // #524 BURST GUARD: an expired tick deadline is necessary but NOT
         // sufficient. Require real poll progress too, so a reinjected tick burst

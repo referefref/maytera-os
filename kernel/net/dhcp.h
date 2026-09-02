@@ -114,6 +114,11 @@ void dhcp_rust_selftest(void);
 // Initialize DHCP client
 void dhcp_init(void);
 
+// Drain the lock-free DORA event ring onto the DURABLE bootlog. TOP-LEVEL
+// CONTEXT ONLY (the net worker): it performs a filesystem write and must never
+// be reached from dhcp_handle()/dhcp_poll(), which run under net_lock.
+void dhcp_durable_drain(void);
+
 // Start DHCP discovery
 int dhcp_discover(void);
 

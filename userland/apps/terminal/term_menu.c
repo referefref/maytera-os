@@ -212,14 +212,14 @@ static int tm_win_h(void) { int w = 0, h = 0; term_layout_content_size(&w, &h); 
 // there is no multi-line notice dialog in libc (gui_confirm_t holds three
 // wrapped lines), the output is scrollable and copyable where a dialog is
 // neither, and it needs no new modal machinery in a draw path.
-static void tm_begin_output(void) {
-    for (int i = 0; i < input_pos; i++) { term_putc('\b'); term_putc(' '); term_putc('\b'); }
-    term_puts("\r\n");
-}
-static void tm_end_output(void) {
-    print_prompt();
-    for (int i = 0; i < input_pos; i++) term_putc(input_line[i]);
-}
+//
+// [tabcomp] The bodies moved to term_util.c as term_begin_output()/
+// term_end_output() so term_shell.c's Tab-completion match listing can reuse
+// them instead of forking a second copy. These stay as thin wrappers so the
+// eight tm_begin_output()/tm_end_output() call sites below did not need
+// touching.
+static void tm_begin_output(void) { term_begin_output(); }
+static void tm_end_output(void)   { term_end_output(); }
 
 // Run `cmd` exactly as if the user had typed it and pressed Enter: echoed,
 // added to history, executed through the one shell entry point, prompt

@@ -1242,6 +1242,13 @@ int32_t taskbar_get_y(void);
 // calling the same code path a real gauge click uses - sidesteps the
 // gauge's mouse hit-test (#334/#440).
 void taskbar_test_open_perf_popup(int gauge);
+// (#battpop) headless verification hooks ONLY (see testhook.c). Clicks the
+// tray battery icon through the REAL taskbar_handle_mouse() hit test (0 if
+// no battery icon is currently in the tray), and reads back the battery
+// info card's current finalized rect (0 if the card is closed) so a test
+// script can confirm the rect is stable across frames instead of drifting.
+int  taskbar_test_click_battery_tray(void);
+int  taskbar_test_battery_card_rect(int32_t *x, int32_t *y, int32_t *w, int32_t *h);
 #endif
 
 // Per-app taskbar-tile right-click menu (Close). A right-click on a running
@@ -1485,6 +1492,18 @@ void startmenu_open_category_by_name(const char *label);
 // startmenu_power_confirm_show() the real power-grid icon click uses -
 // bypasses that icon's mouse hit-test the same way the verbs above do.
 void startmenu_test_power_confirm(int action);
+// (#shutdlg) Injects a click at (x,y) straight into
+// startmenu_power_confirm_handle_mouse() - the SAME function main.c's real
+// mouse-click path calls (see main.c ~1651). Unlike
+// startmenu_test_power_confirm() above, this does NOT bypass hit-testing:
+// it exercises the real cd_geom()-derived button rects, which is the point -
+// #440's QMP mouse cannot reliably land a click on a compositor-drawn
+// target, so this is how a destructive Cancel-vs-confirm button boundary
+// gets verified without real mouse injection. Mirrors
+// taskbar_dock_debug_click()'s shape (taskbar.c), minus the coordinate echo
+// (no local int-to-string helper in this file; the caller already knows
+// what it sent - only the outcome is new information).
+int  startmenu_test_power_confirm_click(int32_t x, int32_t y);
 #endif
 
 // clock.c - Floating clock
@@ -1534,6 +1553,22 @@ bool iconpicker_is_open(void);
 void iconpicker_render(void);
 bool iconpicker_handle_mouse(int32_t x, int32_t y, bool clicked);
 int  iconpicker_handle_key(int key);
+
+// dosspeed.c - #778 per-window DOS guest speed control (the CPU cycle cap,
+// alongside Window Opacity). A TRUE MODAL (Save/Cancel/Esc only, never
+// click-away, same discipline as iconpicker.c above). dosspeed_window_is_dos()
+// is the shared detector taskbar.c and contextmenu.c both call before
+// offering a "Speed..." item, so there is one definition of "this window is a
+// DOS guest" rather than two title-suffix checks drifting apart.
+int  dosspeed_window_is_dos(int win_id, char *game, int cap);
+void dosspeed_open(int win_id, const char *game);
+int  dosspeed_is_open(void);
+void dosspeed_render(void);
+int  dosspeed_handle_key(int key);
+int  dosspeed_handle_mouse(int x, int y, int click);
+int  dosspeed_press(int x, int y);
+void dosspeed_drag_to(int x, int y);
+void dosspeed_drag_end(void);
 
 // wallpaper.c - Wallpaper system
 void wallpaper_init(void);

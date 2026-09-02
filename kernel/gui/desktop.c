@@ -1,6 +1,7 @@
 // desktop.c - Desktop manager and dock implementation for MayteraOS
 #include "desktop.h"
 #include "uiscale.h"
+#include "presentscale.h"   // #halfres: must run BEFORE uiscale_init(), see below
 #include "../drivers/battery.h"   // #battmeter
 #include "../drivers/rtc.h"   // #135: the ONE RTC driver
 #include "window.h"
@@ -32,6 +33,7 @@ extern void filebrowser_launch(void);
 extern void settings_launch(void);
 #include "../exec/elf.h"
 #include "../proc/process.h"
+#include "../proc/affinity.h"   // #affinity: pin the compositor to one core
 #include "../proc/signal.h"   // #126 session teardown: SIGKILL + sig_raise()
 
 // External timer ticks from ISR
@@ -152,6 +154,83 @@ static void launch_fail(const char *path, const char *why, int extra) {
                   (unsigned long)(pmm_get_free_pages() * 4),
                   g_fat_fs.mounted ? 1 : 0);
     LOG_ERROR("[UserSpace] launch failed");
+}
+
+// #comppri: THE COMPOSITOR RUNS ABOVE ORDINARY USER PROCESSES.
+//
+// proc_create_user_as() gives EVERY Ring-3 process PRIO_NORMAL
+// (proc/process.c: init_proc(proc, name, PRIO_NORMAL)), so until this call the
+// compositor competed on equal terms with whatever the user launched. That is
+// wrong for the one process that owns the framebuffer and routes all input:
+// when it loses the CPU, the whole machine looks frozen, not just one app.
+//
+// MEASURED 2026-08-31 (owner report + [HB] flips counter): moving the DOS
+// interpreter from a Ring-0 kernel worker to an ordinary Ring-3 process took
+// the compositor from 22.9 flips/s and 12-14 percent CPU to 5.07 flips/s and 3 percent, at
+// the same SMP setting. The DOS guest is CPU-bound and has no cycle cap
+// (#232 defaults to none), so at equal priority it simply out-runs the
+// compositor in a strict-priority queue.
+//
+// PRIO_HIGH, NOT PRIO_REALTIME, DELIBERATELY. The ready queue is STRICT
+// priority sorted (proc/process.c add_to_ready_queue / sched_rq_push, both via
+// sched_eff_prio()), with only the #254/#601 aging sweep to break starvation.
+// PRIO_REALTIME sorts ahead of everything and, against a guest that never
+// blocks, risks trading one stutter for a different one. PRIO_HIGH puts the
+// compositor above every ordinary app while leaving the aging sweep's
+// SCHED_BOOST (8, strictly above PRIO_REALTIME) as the escape hatch that can
+// still lift a starved PRIO_LOW thread past it.
+//
+// The scheduler DOES read this field: both the single global queue and the
+// per-CPU SMP queues insert by sched_eff_prio(), so this is not a stored-and-
+// ignored value. Verified by reading proc/process.c before the change.
+static void compositor_raise_priority(int pid) {
+    if (pid <= 0) return;
+    extern process_t *proc_get(uint32_t pid);
+    process_t *cp = proc_get((uint32_t)pid);
+    if (!cp) {
+        bootlog_write("[SESSION] compositor pid %d not found; priority left at default", pid);
+        return;
+    }
+    cp->priority = PRIO_HIGH;
+    bootlog_write("[SESSION] compositor pid %d priority raised to PRIO_HIGH (%d)",
+                  pid, (int)PRIO_HIGH);
+
+    // #affinity: AND PIN IT TO ONE CORE.
+    //
+    // Priority decides WHEN it runs. This decides WHERE, and the two are
+    // independent problems. The compositor is one thread, it is the most
+    // latency-sensitive thread on the machine, and every migration throws away
+    // the working set it just built: its window list, its damage rectangles and
+    // whatever part of the back buffer is still hot. Nothing else on the system
+    // has that combination, which is why it is the one process pinned by
+    // default and everything else is left alone.
+    //
+    // CPU 0, THE BSP, DELIBERATELY. It is the only core guaranteed to be a
+    // scheduler consumer in every configuration this kernel ships: without SMP
+    // it is the only core there is, and with SMP the placement policy's own
+    // fallback path already treats queue 0 as the always-available one
+    // (proc/process.c, the #130 comment). Pinning to an AP would be a
+    // preference for a core that may not be consuming.
+    //
+    // THIS IS A PREFERENCE, NOT A PRISON. sched_place_masked_rs() drops the
+    // mask entirely if no allowed core is a consumer, so this cannot strand the
+    // compositor even if cpu0 stops consuming. See rustkern/affinity.rs.
+    //
+    // AND IT IS NOW LIVE. Both readers exist: sched_rq_push() passes the mask to
+    // sched_place_masked_rs(), and sched_rq_pop_locked() refuses a queued task
+    // whose mask excludes the core TAKING it (subject to the
+    // SCHED_AFF_STARVE_TICKS escape). This paragraph previously said the mask
+    // was stored but unread, which was true for three commits and is kept in
+    // the history rather than the source: a comment describing a state the code
+    // has left is the same defect as the dead `migratable` field this ticket
+    // found three lines below its own syscall.
+    {
+        int ar = affinity_set_rs((uint32_t)pid, 1ull << 0);
+        bootlog_write("[SESSION] compositor pid %d affinity mask=0x1 (cpu0) rc=%d "
+                      "(soft preference, LIVE: consulted by sched_rq_push "
+                      "placement AND by the sched_rq_pop_locked steal path)",
+                      pid, ar);
+    }
 }
 
 // Launch a user-space ELF application from filesystem
@@ -1268,6 +1347,25 @@ void desktop_init(void) {
 
     kprintf("[Desktop] Initializing desktop manager...\n");
 
+    // #halfres: INTEGER PRESENT-SCALE COMPOSITING, BEFORE THE UI SCALE FACTOR.
+    //
+    // This must run first, not merely early: presentscale_init() may shrink
+    // fb_get_width()/fb_get_height() to a REDUCED LOGICAL surface (e.g.
+    // 1920x1080 on a 3840x2160 panel, compositing at 100% and presenting at
+    // an exact 2x pixel replication). uiscale_init() right below derives its
+    // own auto-detected default from whatever fb_get_width()/height() report
+    // AT THE MOMENT IT RUNS. Reversing this order would hand uiscale the
+    // PHYSICAL panel size, auto-select 200% for the already-halved logical
+    // surface on top of the already-2x present, and produce a picture four
+    // times too large - the exact trap this feature exists to avoid (see
+    // presentscale.h and rustkern/presentscale.rs). Same precondition
+    // requirement as uiscale_init() below: the framebuffer is up and the
+    // root filesystem is mounted, so /CONFIG/DISPLAY.CFG is readable.
+    //
+    // Off by default: absent both the ESP override and the config key, this
+    // is a complete no-op and fb_get_width()/height() are unchanged.
+    presentscale_init();
+
     // THE GLOBAL UI SCALE FACTOR, BEFORE THE THEME SYSTEM.
     //
     // Order matters and is not arbitrary. theme_get_metric_by_id() applies the
@@ -1277,12 +1375,14 @@ void desktop_init(void) {
     // different factor than the one that is about to be in force.
     //
     // This point in boot also satisfies both of uiscale_init()'s preconditions:
-    // the framebuffer is up (fb_get_width/height are real), and the root
-    // filesystem is mounted, so /CONFIG/DISPLAY.CFG is readable. Reading it
-    // earlier is what makes the first-run wizard readable, which is the whole
-    // reported bug: the wizard runs before any USER exists, so its scale can
-    // only come from a machine-wide default that is already in force by the
-    // time the compositor spawns it.
+    // the framebuffer is up (fb_get_width/height are real - and, per the
+    // presentscale_init() call directly above, are the LOGICAL surface this
+    // feature composites at, not necessarily the physical panel), and the
+    // root filesystem is mounted, so /CONFIG/DISPLAY.CFG is readable. Reading
+    // it earlier is what makes the first-run wizard readable, which is the
+    // whole reported bug: the wizard runs before any USER exists, so its
+    // scale can only come from a machine-wide default that is already in
+    // force by the time the compositor spawns it.
     uiscale_init((int)fb_get_width(), (int)fb_get_height());
 
     // #battmeter: battery presence reuses uiscale_is_laptop() above it, so
@@ -3001,6 +3101,44 @@ static int session_end_teardown(uint32_t leader) {
         bootlog_write("[SESSION] teardown killed pid %u '%s' uid=%u session=%u",
                       p->pid, p->name, p->uid, p->session);
         sig_raise(p, SIGKILL);
+        // #compkill (owner report: killing COMPOSIT from Task Manager while a
+        // DOS guest is running hangs the whole machine). ROOT CAUSE: 'dos' is
+        // a Ring-0 KERNEL WORKER (kernel/dos/dosexec.c: proc_create("dos",
+        // dos_proc_entry, ...)), not a Ring-3 process. sig_raise() above sets
+        // a pending-signal bit that is only ever CONSUMED at one of two
+        // chokepoints: syscall_check_return_work() on a syscall's way back to
+        // Ring 3 (proc/syscall.asm), or isr_async_sig_check() on an interrupt
+        // return to Ring 3 (cpu/idt.c, #161). A kernel worker takes NEITHER
+        // path - it never executes SYSCALL and its interrupt frames always
+        // have cs&3==0 - so the SIGKILL this loop just raised against it is
+        // a permanent, silent no-op: dosexec.c has no sig_pending check
+        // anywhere in its run loop. The ONLY existing way to stop it is
+        // dos_request_close(), documented at its definition as running "on
+        // the WM/compositor thread" (the titlebar X, via
+        // dos_host_close_handler in proc/syscall.c) - which is exactly the
+        // thread session teardown just killed, so nothing was left to call
+        // it. The DOS run loop then keeps executing on whatever CPU it has,
+        // still writing frames straight to the framebuffer with no owner to
+        // arbitrate it, which is what reads as "the OS hung": the screen
+        // never reaches the login gate this teardown is trying to reach.
+        //
+        // Fix: call the SAME stop request the titlebar X already uses,
+        // reusing the existing primitive rather than forking a second one
+        // (project rule). Matched by process NAME, the same identity
+        // dos_proc_entry() registers itself under, since a Ring-0 worker has
+        // no window/fd this loop could key off instead. Harmless when no DOS
+        // guest is running or when it belongs to a different session: this
+        // fires only for a pid this loop already decided to kill, and
+        // dos_request_close() is idempotent (a plain flag clear + a wake of
+        // an already-empty wait queue) - see its definition for why calling
+        // it with nothing running is a safe no-op.
+        if (strcmp(p->name, "dos") == 0) {
+            extern void dos_request_close(void);
+            dos_request_close();
+            bootlog_write("[SESSION] teardown: pid %u is the DOS kernel worker; "
+                          "also sent dos_request_close() (SIGKILL alone cannot "
+                          "stop a Ring-0 worker, see #compkill)", p->pid);
+        }
         killed++;
     }
     kprintf("[SESSION] teardown: session %u ended, %d process(es) signalled\n",
@@ -3057,6 +3195,13 @@ void desktop_run(void) {
     // (i.e. a fresh login-gate iteration) starts with a fresh budget.
     int      s_relaunch_left = 0;
     uint64_t s_relaunch_at   = 0;
+    // #rootcomp (2026-08-30): once the fast budget (s_relaunch_left) is spent,
+    // do NOT give up permanently. See the giving-up branch below for why: a
+    // permanent give-up here means the in-kernel (Ring 0, no privilege
+    // boundary at all) fallback desktop runs for the rest of this session,
+    // however long that is. s_relaunch_slow switches to an indefinite, slow
+    // (30s) retry instead, so a transient resource shortage self-heals.
+    int      s_relaunch_slow = 0;
     {
         // #430 verification gate: if /PTTEST.RUN exists on the FAT ESP, launch
         // the signals+pthreads test app INSTEAD of the compositor. This runs it
@@ -3136,6 +3281,7 @@ void desktop_run(void) {
         int cpid = launch_userspace_app("/APPS/COMPOSIT");
         if (cpid > 0) {
             fb_owner_arm((uint32_t)cpid);
+            compositor_raise_priority(cpid);   // #comppri
             g_compositor_launched = 1;
             compositor_pid = cpid;   // #566
             // #126: THE COMPOSITOR IS THE SESSION LEADER. process_t already
@@ -3269,15 +3415,18 @@ pttest_after_launch:;   // #430: gate jumps here, skipping the compositor path
         // condition anyone can wake us on. That is the "wake source is outside
         // our control" case, and a bounded, LOGGED, terminating retry is the
         // honest answer to it.
-        if (!g_compositor_launched && s_relaunch_left > 0 &&
+        if (!g_compositor_launched && (s_relaunch_left > 0 || s_relaunch_slow) &&
             (uint64_t)timer_ticks >= s_relaunch_at) {
-            s_relaunch_left--;
-            bootlog_write("[SESSION] compositor relaunch retry (%d attempt(s) "
-                          "left after this one)", s_relaunch_left);
+            if (s_relaunch_left > 0) {
+                s_relaunch_left--;
+                bootlog_write("[SESSION] compositor relaunch retry (%d attempt(s) "
+                              "left after this one)", s_relaunch_left);
+            }
             extern void fb_owner_arm(uint32_t pid);
             int rpid = launch_userspace_app("/APPS/COMPOSIT");
             if (rpid > 0) {
                 fb_owner_arm((uint32_t)rpid);
+                compositor_raise_priority(rpid);   // #comppri
                 g_compositor_launched = 1;
                 compositor_pid = rpid;
                 {
@@ -3286,17 +3435,52 @@ pttest_after_launch:;   // #430: gate jumps here, skipping the compositor path
                     if (rp) { rp->pgrp = (uint32_t)rpid; rp->session = (uint32_t)rpid; }
                 }
                 s_relaunch_left = 0;
+                s_relaunch_slow = 0;
                 bootlog_write("[SESSION] compositor RELAUNCH SUCCEEDED on retry "
                               "(pid %d); the fallback desktop is being replaced",
                               rpid);
                 wm_invalidate_all();
                 continue;
             }
-            if (s_relaunch_left == 0) {
-                bootlog_write("[SESSION] compositor relaunch gave up after 3 "
-                              "attempts; the in-kernel desktop is now permanent "
-                              "for this session. The [LAUNCH] FAILED lines above "
-                              "name the reason.");
+            if (s_relaunch_left == 0 && !s_relaunch_slow) {
+                // #rootcomp: NEVER PERMANENT. This used to declare the in-
+                // kernel (Ring 0, no privilege boundary at all - more
+                // privileged than "root") desktop permanent for the rest of
+                // the session after just 3 attempts spread over 6 seconds.
+                // MEASURED on VM <vmid>, golden 2277: a compositor generation
+                // that died into a near-exhausted PMM (pmmfreeKB=0..4028)
+                // hit this branch and the machine ran its GUI in Ring 0 for
+                // the remaining 13+ hours of that boot, because ordinary
+                // system memory pressure had not eased within 6 seconds. A
+                // corrupt/missing binary is a permanent condition, but this
+                // slow indefinite retry (one failed spawn every 30s) costs
+                // nothing extra in that case; a resource shortage is USUALLY
+                // transient (zombies finish dying, other processes exit),
+                // and this is what lets the desktop repair itself back to
+                // the unprivileged Ring-3 compositor instead of staying
+                // kernel-privileged forever.
+                s_relaunch_slow = 1;
+                bootlog_write("[SESSION] compositor relaunch exhausted its fast "
+                              "budget (3 attempts); now retrying every 30s "
+                              "INDEFINITELY (never permanent) while the "
+                              "in-kernel Ring-0 desktop is in use. The "
+                              "[LAUNCH] FAILED lines above name the reason.");
+                s_relaunch_at = (uint64_t)timer_ticks +
+                                30ull * (g_timer_hz ? g_timer_hz : 100);
+            } else if (s_relaunch_slow) {
+                // Already in slow indefinite mode. Rate-limit the log (every
+                // 10th failure) so a genuinely unrecoverable case does not
+                // flood /BOOTLOG.TXT over hours.
+                static int s_slow_fail_count = 0;
+                s_slow_fail_count++;
+                if (s_slow_fail_count % 10 == 1) {
+                    bootlog_write("[SESSION] compositor relaunch: still "
+                                  "failing in slow retry mode (attempt #%d); "
+                                  "still on the in-kernel Ring-0 desktop.",
+                                  s_slow_fail_count);
+                }
+                s_relaunch_at = (uint64_t)timer_ticks +
+                                30ull * (g_timer_hz ? g_timer_hz : 100);
             } else {
                 s_relaunch_at = (uint64_t)timer_ticks +
                                 2ull * (g_timer_hz ? g_timer_hz : 100);

@@ -449,4 +449,19 @@ void dos_svc_bind_x86_16(dos_svc_ctx_t *ctx, struct x86_16_cpu *cpu);
 // There were two private copies of this; this is the one.
 int dos_svc_wild_match(const char *pat, const char *name);
 
+// (doscd) Split an already-resolved NATIVE path into the directory INT 21h
+// AH=4Eh should enumerate and the filename pattern it should match. Declared
+// here, and not as a private extern at the one other call site, because a
+// private extern silently opts a file out of this header's attributes and binds
+// to whatever signature was typed there (blame.md, #742).
+//
+// A path that IS a drive root ("/WINDIR/DRIVE_E", from the DOS spelling "E:\\")
+// yields that directory and an EMPTY pattern. That case is the whole reason
+// this is a named function: splitting it at the last slash instead yields
+// (/WINDIR, DRIVE_E), the drive-root test on the directory half then fails, and
+// a volume-label search answers "no such disc" on every letter. dos/cdprobe.c
+// property-tests THIS function at boot so the rule cannot go quiet again.
+void dos_find_split(const char *fp, char *dirpath, int dircap,
+                    char *pat, int patcap);
+
 #endif // DOS_INT21SVC_H

@@ -136,6 +136,16 @@ int  bootlog_fault_flush(void);
 uint32_t bootlog_fault_lost(void);
 uint64_t bootlog_dropped_bytes(void);
 
+// Lines that did not fit the 256-byte per-line format buffer, and the total
+// bytes lost to that. A cut line is stamped in place with "~CUT n~" so it
+// admits the loss where it happened; these counters are the aggregate, so the
+// boot self-test can assert on them instead of anyone eyeballing a log.
+// MEASURED on the owner's ASUS golden-2277 boot log: 14 lines cut, silently,
+// including the half of the #307 xHCI give-up line that told the operator how
+// to override the decision.
+uint32_t bootlog_truncated_lines(void);
+uint32_t bootlog_truncated_bytes(void);
+
 void bootlog_defer_begin(void);
 void bootlog_defer_end(void);
 

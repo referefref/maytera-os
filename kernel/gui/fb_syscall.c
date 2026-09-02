@@ -13,6 +13,9 @@
 #include "../fs/panic.h"   // #418: STAGE_COMPOSITOR_UP / STAGE_DESKTOP_READY breadcrumbs
 #include "../fs/bootstage.h"  // the screen + flight-recorder breadcrumb trail
 #include "../sync/spinlock.h"   // b740: partial-present damage accumulator
+#include "../sync/waitq.h"      // g_fb_flip_wq: the "screen updated" wake source
+#include "../cpu/mono.h"       // #affinity: THE monotonic clock (never timer_ticks)
+#include "../cpu/inputlat.h"   // #affinity: close the input-to-present sample
 #include "../cpu/dlprof.h"      // #632: dp_tsc() - the shared rdtsc helper
 #include "fs/bootlog.h"   // #742: the owning header, NOT a private extern
 #include "fbown.h"        // #745 task #59: the framebuffer ownership latch
@@ -401,6 +404,12 @@ int64_t sys_fb_info(fb_info_user_t *info) {
 // old growing bootlog write). Declared non-static so main.c can extern it.
 volatile uint64_t g_fb_flip_count = 0;
 
+// (no-ticket) The wake that goes with the counter above. See fb_syscall.h.
+// Woken AFTER the sti below, never inside the interrupts-off present window:
+// the masked window is already the machine's worst latency source (#632) and
+// nothing may be added to it for a waiter's convenience.
+wait_queue_head_t g_fb_flip_wq = { .head = NULL, .lock = SPINLOCK_INIT };
+
 // ---------------------------------------------------------------------------
 // #632: the network stack's heartbeat was the compositor's frame present, with
 // interrupts off.
@@ -518,6 +527,32 @@ static inline uint64_t flip_net_pump(void)
     return d;
 }
 
+// (#flipfix) The present counter, read-only, for a Ring-3 caller.
+//
+// WHY A SYSCALL AT ALL. The DOS frame gate (rustkern/dosdisp.rs) needs to know
+// whether the screen has moved on since the frame it last published. In Ring 0
+// dos/dosexec.c reads g_fb_flip_count directly. The Ring-3 DOS host has no such
+// option: its shim's copy of the symbol was a stub that nothing could ever
+// write, so the gate saw no progress on any frame and every picture came out of
+// the 200 ms staleness backstop instead - a measured 5.005 flips/s against the
+// in-kernel path's 24.98 on the same guest.
+//
+// NO SECOND COUNTER. This returns THE counter, the one incremented in
+// sys_fb_flip() below and printed by [FLIPPROF]; a private count of the same
+// event is the fork the reuse rule exists to prevent, and it would agree with
+// this one right up until someone added a present path.
+//
+// Unprivileged on purpose: it is a monotonic count of screen updates, which
+// leaks nothing a Ring-3 app could not obtain by watching its own window, and
+// every windowed app has an equally good reason to pace itself on it.
+int64_t sys_fb_flip_count(void) {
+    // Plain read of a volatile uint64_t. Single writer (sys_fb_flip), 8-byte
+    // aligned, so the read is atomic on x86-64 and needs no lock; a reader
+    // racing the increment gets either the old or the new value and both are
+    // correct answers to "how many presents had happened when you asked".
+    return (int64_t)g_fb_flip_count;
+}
+
 int64_t sys_fb_flip(void) {
     // #307: the compositor's per-frame present is the longest single syscall
     // (net_poll + a ~4 MB back->front memcpy). A timer preemption anywhere in
@@ -533,6 +568,7 @@ int64_t sys_fb_flip(void) {
     // counter nobody reads is not a measurement (#621).
     uint64_t _t_enter = dp_tsc();
     uint64_t _t_net = 0;
+    uint64_t _il_area = 0;   // #affinity: damaged pixels in this present
 
     // #745 (task #62): measure the present-to-present gap. See the comment on
     // g_flip_gap_max_cyc. First call has no predecessor and is skipped.
@@ -586,6 +622,20 @@ int64_t sys_fb_flip(void) {
         g_fb_damage_full  = false;
         g_fb_damage_count = 0;
         spinlock_release(&g_fb_damage_lock);
+
+        // #affinity: total damaged pixel area of THIS present, so the
+        // responsiveness instrument can record what kind of frame closed a
+        // sample. A cursor-only present damages a few hundred pixels; a
+        // keystroke echo damages at least a character cell. The instrument
+        // cannot REFUSE such a close without guessing, so it records the area
+        // and lets the reader see it, rather than filtering on a threshold
+        // nobody has justified. 0 means a full-screen present.
+        if (!lany || lfull || lcount == 0) {
+            _il_area = 0;
+        } else {
+            for (int i = 0; i < lcount; i++)
+                _il_area += (uint64_t)local[i].w * (uint64_t)local[i].h;
+        }
 
         uint64_t saved_cr3 = read_cr3();
         if (g_kernel_cr3) vmm_switch_pml4(g_kernel_cr3);
@@ -646,6 +696,22 @@ int64_t sys_fb_flip(void) {
         if (khz && cli_cyc > khz) g_flip_cli_over1ms++;
     }
     __asm__ volatile("sti");
+    // (no-ticket) The screen now shows what the compositor just drew. One
+    // spinlock acquire on an almost-always-empty queue, at most ~70 times a
+    // second, and it turns "wait a while and hope it painted" into a real
+    // condition for every future caller.
+    wake_up_all(&g_fb_flip_wq);
+    // #affinity: T2. The screen now shows what the compositor drew, so this is
+    // as close to a photon as the kernel can observe. AFTER the sti, beside the
+    // wake, and never inside the interrupts-off present window: #632 records
+    // what happens in this exact function when a measurement is moved inside
+    // that region and the instrument becomes the fault it was measuring.
+    //
+    // This closes the FIRST present after a key was delivered, which may not be
+    // the frame that actually shows the key. See rustkern/inputlat.rs: the
+    // resulting S_PRESENT is a LOWER BOUND on true input-to-photon, and it is
+    // named for what it measures rather than for what it is wanted for.
+    inputlat_present_rs(mono_us(), _il_area);
     return 0;
 }
 
@@ -746,11 +812,61 @@ int64_t sys_get_mouse(int32_t *x, int32_t *y, uint32_t *buttons) {
 
 // Read-only global cursor for non-compositor processes (#185). Position only,
 // never -1 throttling: docked panels poll this to track the OS cursor.
+//
+// #aiflap (2026-08-28): THE ONE POSITION SYSCALL THAT SKIPPED THE UI-SCALE
+// BOUNDARY. sys_fb_info() (above), sys_win_get_pos(), sys_win_get_size() and
+// every mouse EVENT delivered to a window (kernel/proc/syscall.c's uwu()
+// calls at the click/move/resize sites) all report LOGICAL coordinates to a
+// non-scale-native app: physical pixels divided by the live UI scale factor.
+// This function was the lone holdout, returning the RAW physical mouse_x/
+// mouse_y unconditionally to every caller. At 100% scale physical==logical
+// and the bug is invisible; the owner's report (AI Chat docked panel opening
+// and closing with the mouse "nowhere near it", closing it freeing CPU) came
+// from his real 4K panel at 200% scale, where it is not invisible.
+//
+// aichat's poll_dock() (userland/apps/aichat/main.c) is exactly the shape
+// that breaks: it compares this call's amx/amy against g_screen_w (from
+// fb_info(), LOGICAL) and against win_get_pos()/its own g_win_w/g_win_h
+// (LOGICAL). At 200% scale, physical mouse_x ranges 0..~3839 while every
+// other value in that comparison ranges 0..~1919 - so "on_edge" (hover the
+// right dock edge) reads true across the ENTIRE RIGHT HALF of the physical
+// screen instead of the ~28px sliver it is meant to be, and DOCK_PEEK's
+// "outside the panel" retract check reads true almost immediately after
+// opening because the panel's LOGICAL rect never contains a PHYSICAL cursor
+// coordinate. 200ms dwell-open + near-instant retract-closed is a ~700ms
+// self-sustaining flap for as long as the cursor sits anywhere in that
+// mismatched half of the screen - matching the report exactly. musicplayer's
+// drag code (get_global_mouse() mixed with win_get_pos()/win_move(), all
+// assumed to be one coordinate system) has the same latent bug for window
+// dragging at non-100% scale; this fix corrects it too, for free, because
+// the fix is in the one shared syscall rather than a patch in aichat alone.
+//
+// Fix mirrors sys_fb_info()'s exact pattern: the compositor (scale-native or
+// the current framebuffer owner) gets the real physical cursor, because it
+// draws the cursor and owns absolute screen coordinates; every other caller
+// gets the same LOGICAL value fb_info/win_get_pos/window events already give
+// it, so one app never has to reconcile two coordinate systems for one cursor.
 int64_t sys_get_global_mouse(int32_t *x, int32_t *y, uint32_t *buttons) {
+    extern uint32_t fbown_owner_rs(void);
+    extern int32_t uiscale_unpx_rs(int32_t v);
+    extern int32_t uiscale_pct_rs(void);
+    extern int32_t uiscale_is_native_rs(int32_t pid);
+
+    int32_t rx = mouse_x, ry = mouse_y;
+    {
+        process_t *cp = proc_current();
+        int is_comp = cp && (uiscale_is_native_rs((int32_t)cp->pid) ||
+                             fbown_owner_rs() == cp->pid);
+        if (cp && !is_comp && uiscale_pct_rs() != 100) {
+            rx = uiscale_unpx_rs(mouse_x);
+            ry = uiscale_unpx_rs(mouse_y);
+        }
+    }
+
     // #19/#645: three stores into Ring-3 out-params.
     uaccess_ac_t __ac = uaccess_begin();
-    if (x) *x = mouse_x;
-    if (y) *y = mouse_y;
+    if (x) *x = rx;
+    if (y) *y = ry;
     if (buttons) *buttons = mouse_buttons;
     uaccess_end(__ac);
     return 0;
@@ -803,6 +919,117 @@ int64_t sys_get_key(key_event_t *event) {
     key_queue_tail = (key_queue_tail + 1) % KEY_QUEUE_SIZE;
     
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// #DOSRING3 Stage 1: focus-scoped RAW SCANCODES for a Ring-3 DOS host.
+//
+// sys_get_key() above hands Ring 3 a cooked key_event_t and is
+// is_compositor()-gated, so exactly one process can ever use it. A DOS guest
+// needs something that gate cannot express: the raw set-1 MAKE and BREAK bytes
+// (including the 0xE0 prefix) for its own INT 9 handler, delivered to an
+// ORDINARY app rather than to the compositor.
+//
+// This is not a privilege increase over what Ring 3 has today. SYS_GET_KEYBOARD
+// already returns keystrokes to unprivileged apps; these are the same
+// keystrokes in a less processed form. The thing that must be controlled is
+// SCOPE - a keylogger wants the bytes while ANOTHER window is focused - so
+// delivery requires BOTH conditions, re-checked on every call and never
+// latched:
+//
+//   1. the caller OWNS the window handle it names, and
+//   2. that window currently HAS FOCUS.
+//
+// On losing focus the subscription is dropped and the ring flushed, so bytes
+// typed into another window cannot be read out afterwards, and there is no
+// teardown step a caller could skip. That is STRICTER than g_dos_scancode_tap,
+// the in-kernel splice this is designed to replace, which is a global on/off
+// flag with no window scoping at all.
+//
+// Returns the number of bytes written to `buf`, or -1 if not entitled. The
+// policy and the ring live in rustkern/rawsc.rs (new kernel code is Rust).
+extern void rawsc_arm_rs(uint32_t pid, int32_t handle);
+extern void rawsc_disarm_rs(uint32_t pid);
+extern uint32_t rawsc_drain_rs(uint8_t *out, uint32_t cap);
+
+int64_t sys_win_get_scancodes(int handle, uint8_t *buf, int cap) {
+    process_t *p = proc_current();
+    if (!p) return -1;
+    if (!buf || cap <= 0) return -1;
+    if (cap > 64) cap = 64;      // one PS/2 burst; bounds the kernel bounce buffer
+
+    // Ownership and focus are BOTH properties of the window table, which lives
+    // in proc/syscall.c. Reuse its accessors rather than reaching into
+    // user_windows[] from here: they already handle a destroyed window and a
+    // stale handle, and a second copy of that logic is how the two would drift.
+    extern int  uw_caller_owns_window(int handle);
+    extern int  win16_host_is_focused(int slot);
+
+    if (!uw_caller_owns_window(handle)) {
+        static uint32_t s_noown = 0;
+        if (++s_noown <= 3)
+            kprintf("[RAWSC-SC] REFUSED not-owner pid=%u handle=%d\n", p->pid, handle);
+        return -1;
+    }
+    if (!win16_host_is_focused(handle)) {
+        static uint32_t s_nofoc = 0;
+        if (++s_nofoc <= 3)
+            kprintf("[RAWSC-SC] not-focused pid=%u handle=%d (subscription dropped)\n",
+                    p->pid, handle);
+        // Not focused: drop the subscription so the keyboard path stops
+        // buffering for us at the source, and discard anything already
+        // buffered. Doing this HERE rather than on a window-manager focus hook
+        // means there is no edge to miss - every path that could deliver bytes
+        // passes through this check first.
+        rawsc_disarm_rs(p->tgid ? p->tgid : p->pid);
+        return 0;
+    }
+
+    // THE SUBSCRIPTION BELONGS TO THE PROCESS, NOT THE THREAD.
+    //
+    // This passed p->pid, and in this kernel a thread is a process_t of its
+    // own. The Ring-3 DOS host polls from a worker thread, and it briefly had
+    // TWO of them (its window is created, destroyed and recreated at a
+    // corrected size, and each creation started a pump). rawsc_arm_rs() clears
+    // the ring whenever the subscriber CHANGES, which is right for a genuinely
+    // different subscriber and catastrophic here: threads 33 and 34 took turns
+    // arming, so every 50 ms each one's arm wiped the ring, and a scancode
+    // pushed between two polls was destroyed before either could drain it.
+    // MEASURED as pushed climbing while drained never moved, with
+    // [RAWSC-SC] showing call#1 pid=33, call#2 pid=34, call#3 pid=33.
+    //
+    // Keying on the thread-group makes the identity match the thing that
+    // actually owns the window, and is the same correction applied to
+    // uw_caller_owns_window(). Two threads of one process now share one
+    // subscription instead of fighting over it.
+    uint32_t owner = p->tgid ? p->tgid : p->pid;
+    rawsc_arm_rs(owner, handle);
+
+    uint8_t tmp[64];
+    uint32_t n = rawsc_drain_rs(tmp, (uint32_t)cap);
+
+    // Rate-limited truth about this call. The census says bytes were pushed and
+    // not drained; only the syscall itself can say which of its own gates the
+    // caller is failing, and "returns 0" is ambiguous between "not focused",
+    // "armed but ring empty" and "drained nothing". Logged on the first few
+    // calls and then only when it actually yields bytes, so it cannot flood.
+    {
+        // First three calls only. It logged on every drain too while the
+        // two-pump bug was being chased, which is one serial line PER
+        // KEYSTROKE - fine for an afternoon, wrong for a shipping image.
+        static uint32_t s_calls = 0;
+        s_calls++;
+        if (s_calls <= 3) {
+            kprintf("[RAWSC-SC] call#%u pid=%u handle=%d owns=1 focused=1 "
+                    "drained=%u\n", s_calls, p->pid, handle, n);
+        }
+    }
+    if (n) {
+        uaccess_ac_t __ac = uaccess_begin();
+        for (uint32_t i = 0; i < n; i++) buf[i] = tmp[i];
+        uaccess_end(__ac);
+    }
+    return (int64_t)n;
 }
 
 int64_t sys_grab_input(int grab) {

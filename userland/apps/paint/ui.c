@@ -473,45 +473,73 @@ int ui_splash(int win, int w, int h){
     g_win = win;
     theme_sync();
 
-    int artH = (h*58)/100;                 // maritime art occupies the top ~58%
-    int horizon = (artH*72)/100;           // sea starts here
+    int artH = (h*58)/100;                 // maritime art band (fallback layout only)
+    int horizon = (artH*72)/100;           // sea starts here (fallback layout only)
 
-    // --- Sky: dusk gradient, deep indigo up top warming to amber at the horizon.
-    vgrad(0,0,w,horizon, 0x000d1430, 0x00e8933a);
-    // Sun low over the water, with a soft halo.
-    int sx=(w*68)/100, sy=(horizon*82)/100, sr=w/16; if(sr<26) sr=26; if(sr>70) sr=70;
-    splash_disc(sx,sy,sr+8, mix(0x00e8933a,0x00ffd98a,90));   // halo
-    splash_disc(sx,sy,sr,   0x00ffe4a0);                       // sun body
-    splash_disc(sx,sy,sr-6, 0x00fff2cf);                       // hot core
+    // Load the real STUDIO.BMP artwork - the WHOLE window, not just a top
+    // band - and fall back to the procedural maritime title card only when
+    // it is missing or fails to decode. STUDIO.BMP is a complete branded
+    // card (icon + "Maytera Studio" + tagline already baked into the art,
+    // not a bare background photo - confirmed by opening it), so when it
+    // loads it becomes the WHOLE splash and the panel below draws only the
+    // progress bar/loading lines: drawing the logo/title/subtitle a SECOND
+    // time on top of art that already has them would double the branding.
+    // The fallback keeps the ORIGINAL layout unchanged (art band + a
+    // separate panel with its own drawn logo/title), because the procedural
+    // scene carries no text of its own to duplicate. This is the fallback
+    // the comment above always claimed existed, but until now no code
+    // anywhere loaded STUDIO.BMP - io_splash_art() (imgio.c) is the ONE
+    // image-loading path here, reusing the same SYS_DECODE_IMAGE decoder
+    // every other image-open in this app already goes through, not a
+    // second bespoke one.
+    int have_art = io_splash_art(win, 0, 0, w, h);
+    if (!have_art) {
+        R(0,0,w,artH, 0x00101418);   // neutral base fill behind the art band
+        // --- Sky: dusk gradient, deep indigo up top warming to amber at the horizon.
+        vgrad(0,0,w,horizon, 0x000d1430, 0x00e8933a);
+        // Sun low over the water, with a soft halo.
+        int sx=(w*68)/100, sy=(horizon*82)/100, sr=w/16; if(sr<26) sr=26; if(sr>70) sr=70;
+        splash_disc(sx,sy,sr+8, mix(0x00e8933a,0x00ffd98a,90));   // halo
+        splash_disc(sx,sy,sr,   0x00ffe4a0);                       // sun body
+        splash_disc(sx,sy,sr-6, 0x00fff2cf);                       // hot core
 
-    // --- Sea: darker gradient below the horizon, with the sun's shimmer + waves.
-    vgrad(0,horizon,w,artH-horizon, 0x00223a58, 0x00081020);
-    for(int y=horizon+3;y<artH;y+=5){                          // horizontal wave streaks
-        uint32_t wc = mix(0x00223a58,0x005a86b8, 40 - (y-horizon)/3);
-        for(int x=0;x<w;x+=7) R(x,y,4,1,wc);
-    }
-    for(int y=horizon;y<artH;y+=2){                            // sun reflection column
-        int spread=((y-horizon)*sr)/(artH-horizon)+3;
-        R(sx-spread/2,y,spread,1, mix(0x00ffe4a0, 0x00223a58, ((y-horizon)*180)/(artH-horizon)));
-    }
-    // --- Sailboat silhouette to the left, riding the horizon.
-    { int bx=(w*26)/100, by=horizon+4, bw=w/10; if(bw<48) bw=48;
-      uint32_t sil=0x000a1420;
-      for(int i=0;i<bw/2;i++) R(bx-bw/2+i, by-(i*bw/bw), bw-2*i, 2, sil);   // hull
-      int mh=bw; for(int i=0;i<mh;i++){ R(bx, by-mh+i, 1, 1, sil);          // mast
-        R(bx+1, by-mh+i, 1+(i*bw/3)/mh, 1, sil); }                          // mainsail
-      for(int i=0;i<mh*2/3;i++) R(bx-1-(i*bw/4)/(mh), by-mh*2/3+i, 1, 1, sil); // jib
+        // --- Sea: darker gradient below the horizon, with the sun's shimmer + waves.
+        vgrad(0,horizon,w,artH-horizon, 0x00223a58, 0x00081020);
+        for(int y=horizon+3;y<artH;y+=5){                          // horizontal wave streaks
+            uint32_t wc = mix(0x00223a58,0x005a86b8, 40 - (y-horizon)/3);
+            for(int x=0;x<w;x+=7) R(x,y,4,1,wc);
+        }
+        for(int y=horizon;y<artH;y+=2){                            // sun reflection column
+            int spread=((y-horizon)*sr)/(artH-horizon)+3;
+            R(sx-spread/2,y,spread,1, mix(0x00ffe4a0, 0x00223a58, ((y-horizon)*180)/(artH-horizon)));
+        }
+        // --- Sailboat silhouette to the left, riding the horizon.
+        { int bx=(w*26)/100, by=horizon+4, bw=w/10; if(bw<48) bw=48;
+          uint32_t sil=0x000a1420;
+          for(int i=0;i<bw/2;i++) R(bx-bw/2+i, by-(i*bw/bw), bw-2*i, 2, sil);   // hull
+          int mh=bw; for(int i=0;i<mh;i++){ R(bx, by-mh+i, 1, 1, sil);          // mast
+            R(bx+1, by-mh+i, 1+(i*bw/3)/mh, 1, sil); }                          // mainsail
+          for(int i=0;i<mh*2/3;i++) R(bx-1-(i*bw/4)/(mh), by-mh*2/3+i, 1, 1, sil); // jib
+        }
     }
 
-    // --- Studio info panel (the rectangular editor-style plate).
-    R(0,artH,w,h-artH, 0x00141821);
-    R(0,artH,w,2, C_ACCENT);                                   // accent divider
-    // Logo chevrons.
-    int lx=w/2-150, ly=artH+34;
-    for(int i=0;i<3;i++){ int s=20-i*6; uint32_t c=mix(C_ACCENT,0x00ffffff,i*46);
-        for(int t=0;t<=s;t++){ R(lx-t, ly+s-t, 2,2,c); R(lx+t-2, ly+s-t, 2,2,c); } }
-    win_draw_text_ttf(win, lx+28, artH+22, "Maytera Studio", 30, 0x00f2f5f8);
-    win_draw_text_ttf(win, lx+30, artH+54, "Image Editor  \xC2\xB7  Version 2.0", 13, 0x008fa0b4);
+    // --- Studio info panel (the rectangular editor-style plate). Full height
+    // with its own drawn logo/title/subtitle for the fallback (the
+    // procedural art has no text of its own); a short strip for just the
+    // progress bar/loading lines when the real branded art is showing (it
+    // already carries the logo/title/tagline - see the comment above).
+    int panelH = have_art ? (h*24)/100 : (h-artH);
+    int panelY = h - panelH;
+    R(0,panelY,w,panelH, 0x00141821);
+    R(0,panelY,w,2, C_ACCENT);                                   // accent divider
+    if (!have_art) {
+        // Logo chevrons.
+        int lx=w/2-150, ly=panelY+34;
+        for(int i=0;i<3;i++){ int s=20-i*6; uint32_t c=mix(C_ACCENT,0x00ffffff,i*46);
+            for(int t=0;t<=s;t++){ R(lx-t, ly+s-t, 2,2,c); R(lx+t-2, ly+s-t, 2,2,c); } }
+        win_draw_text_ttf(win, lx+28, panelY+22, "Maytera Studio", 30, 0x00f2f5f8);
+        win_draw_text_ttf(win, lx+30, panelY+54, "Image Editor  \xC2\xB7  Version 2.0", 13, 0x008fa0b4);
+    }
 
     // Progress bar + verbose loading lines revealed one at a time. Lines that
     // depend on real numbers are formatted from live queries, not hardcoded.
@@ -529,7 +557,7 @@ int ui_splash(int win, int w, int h){
     };
     int nsteps = (int)(sizeof(steps)/sizeof(steps[0]));
     int barX = w/2-150, barY = h-46, barW = 300, barH = 8;
-    int listX = w/2-150, listY = artH+92, lineH = (barY-8-listY)/nsteps; if(lineH<14) lineH=14;
+    int listX = w/2-150, listY = have_art ? (panelY+18) : (artH+92), lineH = (barY-8-listY)/nsteps; if(lineH<14) lineH=14;
     int doc_ok = 0;
     for(int s=0;s<nsteps;s++){
         // Do the real work this step names BEFORE drawing it as done, so the

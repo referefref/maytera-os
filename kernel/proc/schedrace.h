@@ -92,4 +92,13 @@ void schedrace_dump(const char *why);
 // wrong during #67; this one gets validated before it is trusted.
 void schedrace_selftest(void);
 
+// #75 THE NEGATIVE CONTROL. `make SCHEDRACE_INJECT=1` arms a one-shot,
+// DELIBERATE corruption of an incoming Ring-3 context's rsp, in the exact shape
+// of the fault under investigation (reason 1, rsp outside the task's kernel
+// stack), so the whole visibility chain - detector, gate-live kpanic, serial
+// capture, harness classification - can be SEEN to go RED. A detector that has
+// only ever been observed silent is not evidence of anything. No-op in every
+// other build; the symbol exists in all of them so no caller is conditional.
+void schedrace_inject(void *nextv);
+
 #endif // SCHEDRACE_H

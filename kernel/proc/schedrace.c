@@ -6,8 +6,16 @@
 #include "../string.h"
 #include "../cpu/smp.h"
 #include "../cpu/mono.h"
-
-extern void kpanic(const char *fmt, ...);
+// kpanic(), WITH its noreturn and printf-format attributes. This file used to
+// carry a bare local `extern void kpanic(const char *fmt, ...);` instead, which
+// compiles but throws away both attributes: the compiler could not check the
+// format string against its arguments, and could not see that the call does not
+// return. That was tolerable while the only call sat under `#ifdef SCHEDRACE`
+// (a build that never ships). The gate-live panic below is compiled into EVERY
+// build, so it uses the real declaration, and the bare extern is deleted rather
+// than left beside it: two declarations of the same function, one of them
+// weaker, is exactly how a format-string mismatch reaches a golden.
+#include "../fs/panic.h"
 
 // ---------------------------------------------------------------------------
 // 1. THE RING
@@ -150,6 +158,23 @@ int schedrace_check(uint32_t cpu, const void *prevv, const void *nextv,
 
     if (!g_reported) {
         g_reported = 1;
+        // #75 2026-08-29: STOP THE OTHER CORES BEFORE PRINTING, not after.
+        // MEASURED: with four cores live, this dump interleaves character by
+        // character with the DOS worker's own output and with a second core's
+        // [SCHEDRACE] lines, and the result is genuinely unreadable - the
+        // reason string, the pid and the rsp of the actual fault arrive shuffled
+        // into other lines. The forensics are bought and then spent on making
+        // them illegible. kpanic() stops the world too, but only after this
+        // whole dump has been printed, which is exactly too late.
+        //
+        // Idempotent with the kpanic() call below: once g_panic_stopping is
+        // set the other cores are halted and the second call finds them
+        // already acked.
+        {
+            extern int g_smp_user_sched;
+            extern uint32_t smp_panic_stop_others(uint32_t *expected);
+            if (g_smp_user_sched) (void)smp_panic_stop_others((uint32_t *)0);
+        }
         kprintf("[SCHEDRACE] *** CORRUPT CONTEXT DETECTED at %s on cpu %u ***\n",
                 when ? when : "?", cpu);
         kprintf("[SCHEDRACE] reason %d: %s\n", r, sr_reason(r));
@@ -187,6 +212,80 @@ int schedrace_check(uint32_t cpu, const void *prevv, const void *nextv,
                     (unsigned long)prev->stack_base,
                     (unsigned long)((uint64_t)prev->stack_base + prev->stack_size));
         }
+        // #75 2026-08-29: THE QUESTION THE OLD DUMP COULD NOT ANSWER.
+        //
+        // reason 2 says the incoming task was still marked on-cpu, i.e. another
+        // core was mid-switch-out on the very task this core had already popped
+        // and pinned. sched_rq_pop_locked() refuses sched_on_cpu != 0, so for
+        // that to be possible the task must have been SITTING IN A RUN QUEUE
+        // WHILE A CORE WAS EXECUTING IT. Two things decide which defect that is
+        // and neither was printed:
+        //
+        //   rq_queued  - is it (still) linked into a run queue?
+        //   yield_gap  - is some core inside proc_yield()'s "enqueued myself
+        //                while still running" window right now?
+        //   bkl        - were the two cores serialised by the Big Kernel Lock
+        //                at all? sched_schedule() is called BOTH with it held
+        //                (syscall/ISR paths) and without it (the AP idle loop
+        //                calls it directly), and that is the difference between
+        //                "a window inside one lock" and "no lock at all".
+        {
+            extern volatile uint8_t g_yield_gap[];
+            extern void bkl_snapshot(uint32_t *, int32_t *, uint32_t *);
+            uint32_t bw = 0, bd = 0; int32_t bo = -1;
+            bkl_snapshot(&bw, &bo, &bd);
+            uint32_t gapmask = 0;
+            for (uint32_t i = 0; i < SCHEDRACE_CPUS && i < 32; i++)
+                if (g_yield_gap[i]) gapmask |= (1u << i);
+            kprintf("[SCHEDRACE] STATE '%s' pid=%u: rq_queued=%u rq_wanted=%u "
+                    "running_cpu=%d last_cpu=%d migratable=%u | bkl word=%u "
+                    "owner=%d depth=%u thiscpu=%u | yieldgap=0x%x\n",
+                    next ? next->name : "-", next ? next->pid : 0,
+                    next ? (uint32_t)next->rq_queued : 0,
+                    next ? (uint32_t)next->rq_wanted : 0,
+                    next ? next->running_cpu : -1,
+                    next ? next->last_cpu : -1,
+                    next ? (uint32_t)next->migratable : 0,
+                    bw, bo, bd, cpu, gapmask);
+        }
+        // #smpfix: WHO SAVED THIS rsp. Stamped by sched_publish_cpu() on the
+        // core that performed the save, at the last point before the switch
+        // asm stores the live stack pointer. Without it this dump can say the
+        // value is wrong but not which core wrote it, from which path, or
+        // whether the core was already on the wrong stack at the time.
+        if (next) {
+            uint64_t lo = (uint64_t)next->stack_base;
+            uint64_t hi = lo + next->stack_size;
+            kprintf("[SCHEDRACE] SAVEDBY '%s' pid=%u: saved by cpu %d, live "
+                    "rsp at save=0x%lx (%s its kernel stack [0x%lx,0x%lx)), "
+                    "sched_ra=0x%lx, saves=%lu\n",
+                    next->name, next->pid, next->rsp_save_cpu,
+                    (unsigned long)next->rsp_save_live,
+                    (next->rsp_save_live >= lo && next->rsp_save_live < hi)
+                        ? "INSIDE" : "*** OUTSIDE ***",
+                    (unsigned long)lo, (unsigned long)hi,
+                    (unsigned long)next->rsp_save_ra,
+                    (unsigned long)next->rsp_save_n);
+        }
+        // #75 2026-08-29: IS THE BAD rsp THIS TASK'S OWN USER STACK POINTER?
+        // That single comparison separates two completely different bugs:
+        //   - equal (or within the same page): the kernel ran on the USER stack
+        //     and the switch saved a user rsp into process_t::rsp. The only
+        //     path that can do that is syscall_entry's "kernel stack is null"
+        //     fallback (see g_syscall_kstack_null).
+        //   - not equal: a genuine cross-core stale-rsp handoff.
+        // The recorded fault (rsp=0xbffee738 on a priv=3 task) is consistent
+        // with the first and nobody had the number needed to tell them apart.
+        if (next && next->privilege == PRIV_USER) {
+            uint64_t d = (next->rsp > next->user_rsp)
+                       ? (next->rsp - next->user_rsp) : (next->user_rsp - next->rsp);
+            kprintf("[SCHEDRACE] USERRSP '%s' pid=%u: rsp=0x%lx user_rsp=0x%lx "
+                    "delta=%lu %s\n", next->name, next->pid,
+                    (unsigned long)next->rsp, (unsigned long)next->user_rsp,
+                    (unsigned long)d,
+                    (d < 4096) ? "*** the saved rsp IS this task's USER stack "
+                                 "(syscall ran on the user stack) ***" : "");
+        }
         // WHOSE memory is the bad rsp, if anyone's? A stray rsp is only
         // actionable once you know what owns the bytes under it.
         if (next && next->rsp) {
@@ -205,6 +304,46 @@ int schedrace_check(uint32_t cpu, const void *prevv, const void *nextv,
         schedrace_dump("at corruption");
     }
 
+    // -----------------------------------------------------------------
+    // A DETECTOR THAT NAMES THE FAULT AND THEN EXECUTES IT ANYWAY.
+    // -----------------------------------------------------------------
+    // Until 2026-08-28 the kpanic below was under `#ifdef SCHEDRACE` alone, so
+    // in every shipping build this function printed the dump, returned r, and
+    // its ONE caller (proc/process.c, the pre-switch site) discarded the return
+    // value and performed the switch regardless. MEASURED consequence, #67 arm
+    // G-on-r2 on 2026-08-20: the detector reported "reason 4: saved return
+    // address is not in kernel text", the switch went ahead, and the machine
+    // took a GPF at RIP=0x20C49BA5E353F7CF, which is not an address at all but
+    // the compiler reciprocal constant for division by 1000, i.e. a data word
+    // executed as a return address. 19 [KERNEL PANIC] lines and two minutes of
+    // silence followed. The forensics were bought and then immediately spent on
+    // a worse crash.
+    //
+    // A panic with the state beats a corrupt switch, so the panic is now armed
+    // in EVERY build, but only while g_smp_user_sched is live. That condition is
+    // the point rather than timidity:
+    //
+    //   * With the gate OFF (the shipping default) main.c never calls
+    //     smp_start_aps(), so no application processor exists and the shipping
+    //     configuration is unchanged BY CONSTRUCTION: the branch cannot be
+    //     taken. That is a statement about reachability, not about how likely a
+    //     fault is judged to be.
+    //   * With the gate ON, this detector is firing on the one class of fault
+    //     (#75: a cross-core pop of a task another core is still executing)
+    //     that has no safe continuation. prev and next are already published as
+    //     this core's current process, the BKL is about to be dropped, and the
+    //     next instruction hands this core a kernel stack another core owns.
+    //
+    // SCHEDRACE=1 still panics unconditionally: a reproducer build is asking to
+    // be stopped at the first sign of the fault in either gate state.
+    {
+        extern int g_smp_user_sched;
+        if (g_smp_user_sched)
+            kpanic("[SCHEDRACE] corrupt context on cpu %u at %s: %s. AP user "
+                   "scheduling is LIVE and the incoming context is not safe to "
+                   "switch to; the dump above is the state at the fault (#75).",
+                   cpu, when ? when : "?", sr_reason(r));
+    }
 #ifdef SCHEDRACE
     kpanic("[SCHEDRACE] corrupt context on cpu %u at %s: %s. This is the #75 "
            "reproducer firing; the dump above is the state at the fault.",
@@ -242,6 +381,53 @@ void schedrace_delay(schedrace_site_t site) { (void)site; }
 // ---------------------------------------------------------------------------
 // #67 believed four instruments that were wrong. This one is checked against a
 // known-good and four known-bad contexts at boot, and says so on the console.
+// ---------------------------------------------------------------------------
+// 5. THE NEGATIVE CONTROL
+// ---------------------------------------------------------------------------
+// #67/#75 recorded THREE fault-visibility mechanisms that did not work, and the
+// project has shipped a GUARD130_DISABLE that built a normal kernel, an
+// increment_build.sh that was `exit 0`, and a concurrency lint that could not
+// run. The common shape is an instrument nobody ever saw go RED.
+//
+// `make SCHEDRACE_INJECT=1` corrupts ONE incoming context, on purpose, in the
+// exact shape of the open fault (a Ring-3 task whose rsp is outside its own
+// kernel stack - `reason 1`, the COMPOSIT priv=3 case). It fires only when
+// g_smp_user_sched is live (so it cannot touch the shipping single-core
+// configuration), only on a user process, only once, and only after
+// SCHEDRACE_INJECT_AT switches have gone by, which puts it in steady state
+// after the desktop is up rather than during boot.
+//
+// EXPECTED RESULT: [SCHEDRACE] CORRUPT CONTEXT DETECTED, reason 1, followed by
+// the gate-live kpanic. If the machine instead keeps running, or dies without
+// the dump, the visibility chain is broken and any green campaign run against
+// it means nothing.
+#ifdef SCHEDRACE_INJECT
+// SECONDS of uptime, not a switch count: the count is load-dependent and the
+// point is to fire in steady state AFTER the desktop is up, which is a wall-
+// clock property.
+#ifndef SCHEDRACE_INJECT_AT
+#define SCHEDRACE_INJECT_AT 90
+#endif
+static int      g_injected;
+void schedrace_inject(void *nextv) {
+    extern int g_smp_user_sched;
+    process_t *next = (process_t *)nextv;
+    if (!g_smp_user_sched || g_injected || !next) return;
+    if (next->privilege != PRIV_USER) return;
+    if (mono_us() < (uint64_t)SCHEDRACE_INJECT_AT * 1000000ull) return;
+    g_injected = 1;
+    kprintf("[SCHEDRACE-INJECT] DELIBERATE FAULT: setting '%s' pid=%u rsp "
+            "0x%lx -> 0xDEAD0000 (outside its stack [0x%lx,0x%lx)). The "
+            "detector MUST catch this and the kernel MUST panic.\n",
+            next->name, next->pid, (unsigned long)next->rsp,
+            (unsigned long)next->stack_base,
+            (unsigned long)((uint64_t)next->stack_base + next->stack_size));
+    next->rsp = 0xDEAD0000ul;
+}
+#else
+void schedrace_inject(void *nextv) { (void)nextv; }
+#endif
+
 void schedrace_selftest(void) {
     process_t good, bad;
     static uint8_t stack[4096] __attribute__((aligned(16)));

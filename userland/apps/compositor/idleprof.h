@@ -44,6 +44,14 @@
 #ifndef COMPOSITOR_IDLEPROF_H
 #define COMPOSITOR_IDLEPROF_H
 
+// #rinpin: for wm_window_info_t (idleprof_dirty_pin_report() below). Self-
+// contained (no further includes, no bool typedef of its own), so unlike most
+// userland/libc headers this one is safe to pull into the compositor's
+// otherwise draw.c-primitives-only world - see the compositor agent's own
+// "Key facts" and blame.md's gui_scroll.h `bool` collision writeup (#563) for
+// why every OTHER libc GUI header is avoided here.
+#include "../../libc/syscall.h"
+
 // WHY the tick was not idle. Set from the exact booleans main.c already has.
 #define IP_R_INPUT      (1u << 0)   // recent_input (pointer/key within 500ms)
 #define IP_R_APPSDIRTY  (1u << 1)   // an open window invalidated itself
@@ -68,6 +76,9 @@ enum {
     IP_P_IDLE,          // render_frame_idle: desktop damage rects only
     IP_P_CHROME,        // render_frame_chrome: taskbar/toast rects only
     IP_P_CURSOR,        // render_frame_cursor: two small cursor rects
+    IP_P_WINDOWED,      // render_frame_windowed: apps_dirty, geometry stable -
+                        // union of visible window bounds + chrome damage only
+                        // (no-ticket compositor partial-present fix)
     IP_P_FULL,          // render_frame: whole-screen composite + present
     IP_P_SCRSAVER,      // render_frame under the screensaver
     IP_P_COUNT
@@ -85,12 +96,52 @@ enum {
 // aperture, directly: an uncached mapping cannot hide in a per-pixel cost.
 // Comparing his number with the VM's is the measurement #642's own header
 // says can only be taken on the real machine.
+// #compthread: per-phase breakdown of a render_frame_body() composite pass,
+// in cycles, charged to whichever phase ran between two idleprof_phase_mark()
+// calls. Exists to answer "where do the composite ms/tick actually go" from
+// evidence instead of guessing before deciding which axis (tiling the pixel
+// work across threads vs moving decode/scale off the draw thread) any
+// parallelisation should target. Covers every call to render_frame_body(),
+// not only the full-screen path, so the average is weighted by whatever mix
+// of full/windowed/idle/cursor paths actually ran.
+//
+// IP_PH_WINWM is compositor_render_windows(), a SINGLE KERNEL SYSCALL
+// (SYS_COMPOSITOR_RENDER_WINDOWS -> wm_draw_all/wm_draw_apps/wm_draw_winmenu
+// in kernel/gui/window.c) that runs Ring 0 on the compositor's own thread.
+// A userland pthread_create() in this process CANNOT parallelise time spent
+// inside that one syscall - only the phases either side of it run in
+// Ring-3 code this process controls.
+enum {
+    IP_PH_WALLPAPER = 0,   // wallpaper_render_background()
+    IP_PH_DESKTOP,         // desktop icons/version + widgets + stickies
+    IP_PH_SHADOWS,         // windows_render_shadows()
+    IP_PH_WINWM,           // compositor_render_windows() - KERNEL syscall, see above
+    IP_PH_CHROME,          // taskbar/startmenu/contextmenu/popups/notif/OSD/etc
+    IP_PH_CURSOR,          // cursor_render() + apply_display_effects()
+    IP_PH_COUNT
+};
+void idleprof_phase_begin(void);      // call once at the top of render_frame_body()
+void idleprof_phase_mark(int phase);  // charge cycles since the last mark/begin
+
 void idleprof_tick_begin(void);
 int  idleprof_flip(void);                 // timed fb_flip()
 void idleprof_motion(int dx, int dy);     // raw pointer deltas this tick
+// #rinpin: WHICH non-motion signal set got_input this tick (see idleprof.c's
+// declaration comment). Bits, not an enum, so a tick with both a button edge
+// and a key event counts each once.
+#define IP_IN_BUTTON (1u << 0)
+#define IP_IN_KEY    (1u << 1)
+void idleprof_input_kind(unsigned bits);
 void idleprof_reason(unsigned bits);
 void idleprof_path(int path);
 void idleprof_damage_px(unsigned long px);
 void idleprof_tick_end(void);
+
+// One-shot diagnostic for the apps_dirty circuit breaker in main.c: dumps the
+// current window list (id/visible/minimized/app_id/title) to /BOOTLOG.TXT,
+// one line per window (each comfortably under sys_bootlog_write()'s 200-byte
+// bounce - see the file-top comment on that limit). Called at most once per
+// trip, not on a poll cadence, so it does not need its own rate limit.
+void idleprof_dirty_pin_report(int n, const wm_window_info_t *wins);
 
 #endif // COMPOSITOR_IDLEPROF_H

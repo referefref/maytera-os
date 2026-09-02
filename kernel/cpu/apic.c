@@ -392,14 +392,62 @@ int lapic_wait_ipi_idle(void) {
     return -1;
 }
 
+// #wakeipi: WHY A CORE CANNOT TAKE A GIVEN VECTOR RIGHT NOW.
+//
+// The Local APIC delivers an interrupt only when its PRIORITY CLASS (vector >> 4)
+// is STRICTLY GREATER than the core's current processor priority class. PPR is
+// max(TPR, highest-in-service priority), so one read answers the question for
+// any vector: v is deliverable iff (v >> 4) > (ppr >> 4). An interrupt that is
+// not deliverable is not lost - it sits in the IRR - but the IRR holds ONE BIT
+// PER VECTOR, so every further send of that vector while it waits collapses
+// into the one already pending and is invisible at the target.
+//
+// This is not a hypothetical. EOI is at the END of isr_handler() while
+// bkl_acquire() is at the START of it, so a core that contends for the BKL from
+// inside an interrupt handler carries that handler's vector IN SERVICE for the
+// entire wait. Every IPI vector this kernel routes through isr_handler is
+// priority class 15 (0xF0), and the BKL wake is 0xF4 - also class 15. Class 15
+// is the TOP class, so no fixed vector whatsoever can preempt an in-service
+// class-15 interrupt. There is no higher vector to move the wake to.
+uint32_t lapic_ppr(void) { return lapic_base ? lapic_read(LAPIC_PPR) : 0; }
+
+// Highest vector currently IN SERVICE on this core, or 0 if none. The eight ISR
+// words are scanned from the top so the first bit found is the highest. Counted
+// loops over a fixed 8x32 register file; nothing here waits for anything.
+uint32_t lapic_isr_highest(void) {
+    if (!lapic_base || lapic_unusable) return 0;
+    for (int i = 7; i >= 0; i--) {
+        uint32_t w = lapic_read(LAPIC_ISR + (uint32_t)(i * 0x10));
+        if (!w) continue;
+        for (int b = 31; b >= 0; b--)
+            if (w & (1u << b)) return (uint32_t)(i * 32 + b);
+    }
+    return 0;
+}
+
+// #wakeipi: EVERY fixed-vector send path below can decline silently. That is
+// the correct behaviour (see the #426 note in lapic_send_ipi), but a silent
+// decline is indistinguishable at the caller from a delivered IPI, and callers
+// that count their own sends therefore count sends that were never issued.
+// Count them here, once, in the shared primitive, so every sender benefits
+// rather than each growing its own guess.
+volatile uint64_t g_lapic_ipi_dropped = 0;
+
 // Send IPI to a specific CPU
-void lapic_send_ipi(uint32_t apic_id, uint32_t vector) {
+// #wakeipi: RETURNS 0 IF THE IPI WAS ISSUED, -1 IF IT WAS DECLINED.
+//
+// This was `void`, and the decline below was therefore invisible to every
+// caller: a sender could count 408,816 wake IPIs "sent" while the controller
+// accepted none of them, and nothing in the tree could tell those two cases
+// apart. The value is safe to ignore (most callers do), but a caller whose
+// whole measurement is a send/receive ratio must not have to guess.
+int lapic_send_ipi(uint32_t apic_id, uint32_t vector) {
     // #426: writing ICR_LOW while a previous IPI is still pending is
     // architecturally undefined, so a failed wait must abort the send rather
     // than push a second command into a controller that never finished the
     // first. On a dead window this is also what stops the send paths from
     // looping through five give-ups per AP.
-    if (lapic_wait_ipi_idle() != 0) return;
+    if (lapic_wait_ipi_idle() != 0) { g_lapic_ipi_dropped++; return -1; }
     
     // Set destination APIC ID in high dword
     lapic_write(LAPIC_ICR_HIGH, apic_id << 24);
@@ -408,6 +456,7 @@ void lapic_send_ipi(uint32_t apic_id, uint32_t vector) {
     lapic_write(LAPIC_ICR_LOW, 
                 vector | ICR_DM_FIXED | ICR_DST_PHYSICAL | 
                 ICR_LEVEL_ASSERT | ICR_TRIGGER_EDGE);
+    return 0;
 }
 
 // Send IPI to all CPUs excluding self
@@ -417,6 +466,36 @@ void lapic_send_ipi_all_excluding_self(uint32_t vector) {
     lapic_write(LAPIC_ICR_HIGH, 0);
     lapic_write(LAPIC_ICR_LOW,
                 vector | ICR_DM_FIXED | ICR_DST_OTHERS |
+                ICR_LEVEL_ASSERT | ICR_TRIGGER_EDGE);
+}
+
+// #75: NMI broadcast, for the panic stop-the-world ONLY.
+//
+// A fixed-vector IPI is not delivered while the target has RFLAGS.IF clear, and
+// a core spinning for the Big Kernel Lock from inside an interrupt handler is
+// exactly such a target. MEASURED 2026-08-29 with a deliberately injected
+// corrupt context: the fixed stop IPI halted 1 of 3 other cores; the remaining
+// two sat in bkl_take_locked() for a lock whose owner had just halted holding
+// it, and the machine looked "stopped" on serial while two cores burned.
+// An NMI ignores IF, which is why every kernel that stops the world on a panic
+// uses one. It carries no vector: delivery mode alone selects it.
+// Directed NMI to ONE apic id. The broadcast shorthand below was measured to
+// reach exactly one other core per panic on a 4-vCPU KVM guest; a directed send
+// lets the caller report per-core whether the send itself was even issued.
+int lapic_send_nmi(uint32_t apic_id) {
+    if (lapic_wait_ipi_idle() != 0) return -1;
+    lapic_write(LAPIC_ICR_HIGH, apic_id << 24);
+    lapic_write(LAPIC_ICR_LOW,
+                ICR_DM_NMI | ICR_DST_PHYSICAL |
+                ICR_LEVEL_ASSERT | ICR_TRIGGER_EDGE);
+    return 0;
+}
+
+void lapic_send_nmi_all_excluding_self(void) {
+    if (lapic_wait_ipi_idle() != 0) return;
+    lapic_write(LAPIC_ICR_HIGH, 0);
+    lapic_write(LAPIC_ICR_LOW,
+                ICR_DM_NMI | ICR_DST_OTHERS |
                 ICR_LEVEL_ASSERT | ICR_TRIGGER_EDGE);
 }
 

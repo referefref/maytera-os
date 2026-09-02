@@ -82,6 +82,13 @@ int traymenu_eq_fader_point(int b, int pos, int *out_x, int *out_y);
 // the running compositor's own filesystem cache) just to sequence "open a
 // panel, THEN lock" for a screenshot.
 static uint64_t s_th_lock_at_ms = 0;
+// (#shutdlg) Same idiom, for PCTEST below: a real click has to land AFTER
+// confirmdialog.c's own 250ms input-settle window (CONFIRM_SETTLE_MS) has
+// elapsed in REAL uptime, or confirm_dialog_handle_mouse() ignores it by
+// design (#745) - an immediate open-then-click in one testhook_poll() call
+// would always land inside that window and prove nothing.
+static uint64_t s_th_pcclick_at_ms = 0;
+static int32_t  s_th_pcclick_x = 0, s_th_pcclick_y = 0;
 #define TH_OUT_PATH "/TESTHOOK.OUT"
 #define TH_O_APPEND (0x1 | 0x40 | 0x400)   // O_WRONLY | O_CREAT | O_APPEND
 
@@ -438,6 +445,11 @@ void testhook_poll(void) {
         s_th_lock_at_ms = 0;
         lock_enter();
         th_log("OK PANELLOCK fired");
+    }
+    if (s_th_pcclick_at_ms != 0 && uptime_ms() >= s_th_pcclick_at_ms) {
+        s_th_pcclick_at_ms = 0;
+        startmenu_test_power_confirm_click(s_th_pcclick_x, s_th_pcclick_y);
+        th_log("OK PCTEST click fired");
     }
     int fd = sys_open(TH_CMD_PATH, 0 /* O_RDONLY */);
     if (fd < 0) return;   // no pending command: fast common-case return
@@ -1021,12 +1033,104 @@ void testhook_poll(void) {
         return;
     }
 
+    // (#shutdlg) verification-only: click at "x y" straight into the open
+    // power confirm dialog's REAL hit-test (startmenu_power_confirm_handle_
+    // mouse -> cd_geom()), the same one a real mouse click reaches. This is
+    // deliberately NOT a bypass, unlike POWERCONFIRM above - the whole point
+    // is proving the button rects a real click would hit, since #440's QMP
+    // mouse cannot reliably land on a compositor-drawn target and this
+    // dialog's buttons are destructive (Cancel must never resolve to
+    // Shut Down). Logs [PCCLICK] consumed=0|1 on serial.
+    if (strcmp(verb, "PCCLICK") == 0) {
+        int x = th_atoi(arg);
+        const char *sp = arg;
+        while (*sp && *sp != ' ') sp++;
+        while (*sp == ' ') sp++;
+        int y = th_atoi(sp);
+        startmenu_test_power_confirm_click(x, y);
+        th_log("OK PCCLICK");
+        return;
+    }
+
+    // (#shutdlg) Convenience composite for a single-boot verification pass:
+    // "action x y" opens the power confirm dialog for `action` (same as
+    // POWERCONFIRM), then ARMS a click at (x,y) to fire ~400ms later (past
+    // CONFIRM_SETTLE_MS) via s_th_pcclick_at_ms above, so a real
+    // Cancel-vs-confirm-button hit-test can be proven without a second boot
+    // (see DEMO127's file-top rationale: a throwaway VM disk cannot be
+    // re-written with a second /TESTHOOK.CMD while qemu holds it open).
+    if (strcmp(verb, "PCTEST") == 0) {
+        // (#shutdlg) MEASURED this session: an offline-baked TESTHOOK.CMD
+        // (written to the disk image before boot, as this composite verb
+        // always is - see the DEMO127 rationale above) is NOT reliably
+        // consumed by the truncate+unlink above, so this verb can be
+        // re-dispatched every single poll. A one-shot guard makes that safe:
+        // without it, a repeat dispatch would re-open the dialog and push
+        // the deferred click's deadline forward every frame, so the click
+        // would never fire.
+        static int s_pctest_done = 0;
+        if (s_pctest_done) return;
+        s_pctest_done = 1;
+        int action = th_atoi(arg);
+        const char *sp = arg;
+        while (*sp && *sp != ' ') sp++;
+        while (*sp == ' ') sp++;
+        int x = th_atoi(sp);
+        while (*sp && *sp != ' ') sp++;
+        while (*sp == ' ') sp++;
+        int y = th_atoi(sp);
+        startmenu_test_power_confirm(action);
+        s_th_pcclick_x = x; s_th_pcclick_y = y;
+        s_th_pcclick_at_ms = uptime_ms() + 400;
+        th_log("OK PCTEST armed");
+        return;
+    }
+
     // (#glassmodal) verification-only: open the CPU/RAM/DSK/NET perf pop-out
     // by gauge index (0=CPU,1=RAM,2=DSK,3=NET), bypassing the gauge's mouse
     // hit-test.
     if (strcmp(verb, "PERFPOPUP") == 0) {
         taskbar_test_open_perf_popup(th_atoi(arg));
         th_log("OK PERFPOPUP");
+        return;
+    }
+
+    // (#battpop) verification-only: click the tray battery icon through the
+    // REAL taskbar_handle_mouse() hit test (toggles the info card open/shut,
+    // same as a physical click). Logs consumed=0 if there was no battery
+    // icon to hit (no battery present).
+    if (strcmp(verb, "BATTCLICK") == 0) {
+        int r = taskbar_test_click_battery_tray();
+        char b[48]; int p = 0;
+        const char *k = "[BATTCLICK] consumed="; for (const char *q = k; *q; q++) b[p++] = *q;
+        p += th_int(b + p, r);
+        b[p] = '\0';
+        th_log(b);
+        return;
+    }
+
+    // (#battpop) verification-only: print the battery info card's CURRENT
+    // finalized rect, or "closed" if it is not open. A script calling this
+    // on consecutive frames and diffing the printed rect is the direct
+    // proof that the card is stationary (see g_bc_anchor_x's comment in
+    // taskbar.c for the drift bug this replaced).
+    if (strcmp(verb, "BATTRECT") == 0) {
+        int32_t x = 0, y = 0, w = 0, h = 0;
+        if (!taskbar_test_battery_card_rect(&x, &y, &w, &h)) {
+            th_log("[BATTRECT] closed");
+        } else {
+            char b[96]; int p = 0;
+            const char *k1 = "[BATTRECT] x="; for (const char *q = k1; *q; q++) b[p++] = *q;
+            p += th_int(b + p, x);
+            const char *k2 = " y="; for (const char *q = k2; *q; q++) b[p++] = *q;
+            p += th_int(b + p, y);
+            const char *k3 = " w="; for (const char *q = k3; *q; q++) b[p++] = *q;
+            p += th_int(b + p, w);
+            const char *k4 = " h="; for (const char *q = k4; *q; q++) b[p++] = *q;
+            p += th_int(b + p, h);
+            b[p] = '\0';
+            th_log(b);
+        }
         return;
     }
 
@@ -1344,6 +1448,50 @@ void testhook_poll(void) {
         g_digclk_style = (g_digclk_style + 1) % 5;
         g_needs_redraw = true;
         th_log("OK WDESIGN");
+        return;
+    }
+
+    // #keydrop verification-only verb: create a sticky note straight into
+    // edit mode via sticky_new_at() (stickies.c), sidestepping the "right-
+    // click desktop -> New Sticky Note" context-menu hit-test the same way
+    // every other verb here sidesteps hit-testing. sticky_new_at() itself
+    // sets s_edit to the new note, which is what routes subsequently-typed
+    // keys to stickies_handle_key() via the g_modal_grabs[] "sticky-editor"
+    // row in main.c - exactly the class of compositor-native typing surface
+    // the #keydrop dropped-keypress fix is about, so this is what lets a
+    // burst of real KEY/TYPE injections (testinput.c, kernel/drivers/) be
+    // driven straight at it without needing a landed mouse click. Default
+    // position (400, 300) if no "x y" arg is given. Never shipped: gated
+    // identically to every other verb in this file.
+    if (strcmp(verb, "STICKY") == 0) {
+        extern int sticky_new_at(int px, int py);   // stickies.c
+        int px = 400, py = 300;
+        if (arg[0] != '\0') {
+            px = th_atoi(arg);
+            const char *sp = arg;
+            while (*sp && *sp != ' ') sp++;
+            while (*sp == ' ') sp++;
+            if (*sp) py = th_atoi(sp);
+        }
+        int idx = sticky_new_at(px, py);
+        th_logf("OK STICKY idx=%d", idx);
+        return;
+    }
+
+    // #keydrop verification-only verb: read back the in-memory text of
+    // whichever note is currently being edited (stickies.c's s_edit), so a
+    // burst of KEY/TYPE injections sent over the testinput.c serial channel
+    // can be checked against what the compositor's g_modal_grabs[]
+    // "sticky-editor" dispatch actually delivered - the exact mechanism the
+    // #keydrop dropped-keypress fix changes. No disk round trip.
+    if (strcmp(verb, "STICKYTXT") == 0) {
+        extern int stickies_edit_index(void);
+        extern int stickies_edit_len(void);
+        extern const char *stickies_edit_text(void);
+        int idx = stickies_edit_index();
+        if (idx < 0) { th_log("ERR STICKYTXT no note editing"); return; }
+        th_logf("OK STICKYTXT idx=%d len=%d text=%s",
+                idx, stickies_edit_len(), stickies_edit_text());
         return;
     }
 

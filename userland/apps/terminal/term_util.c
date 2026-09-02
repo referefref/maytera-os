@@ -7,6 +7,9 @@
 
 #include "term_common.h"
 #include "term_util.h"
+#include "term_shell.h"   // [tabcomp]: input_line/input_pos/print_prompt for
+                           // term_begin_output()/term_end_output() below.
+#include "term_parse.h"   // term_putc()
 
 // String helper functions
 
@@ -60,4 +63,18 @@ void int_to_str(int num, char *buf) {
     if (neg) buf[j++] = '-';
     while (i > 0) buf[j++] = tmp[--i];
     buf[j] = '\0';
+}
+
+// [tabcomp] Promoted verbatim from term_menu.c's static tm_begin_output()/
+// tm_end_output() (see term_util.h). Behaviour unchanged: erase the
+// half-typed input echo back to column 0 with the same backspace idiom every
+// other editing path in this file uses, or reprint the prompt plus whatever
+// the user had typed.
+void term_begin_output(void) {
+    for (int i = 0; i < input_pos; i++) { term_putc('\b'); term_putc(' '); term_putc('\b'); }
+    term_puts("\r\n");
+}
+void term_end_output(void) {
+    print_prompt();
+    for (int i = 0; i < input_pos; i++) term_putc(input_line[i]);
 }

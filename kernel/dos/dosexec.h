@@ -26,4 +26,23 @@ int dos_launch_kernel(const char *path);
 // or <0 on load failure.
 int dos_run_file(const char *path);
 
+// Blocking run of a whole LAUNCH LINE, "<path>[ <command tail>]", splitting it
+// with the SAME rule dos_launch_common() uses (#172) rather than a second copy
+// of it. For a caller that reaches the runner without going through a launcher:
+// today that is only the Ring-3 host, which is already a process and is handed
+// the raw /CONFIG/DOSRING3.CFG line. Returns the program exit code, or <0.
+int dos_run_line(const char *line);
+
+// (#67/#168) The PROGRAM half of "<path>[ <tail>]", written to `out`, with the
+// SAME rule dos_run_line()/dos_launch() use rather than a second copy of it.
+// The routing layer needs the program path before any launch happens, to decide
+// which path the guest runs on, and must not disturb the g_dos_* statics to get
+// it. Returns the index into `line` just past the program half.
+int dos_launch_program_half(const char *line, char *out, int outsz);
+
+// (#67/#168) Is an in-kernel DOS guest running right now? One guest at a time
+// is a DOS-subsystem-wide invariant; the routing layer needs to see it in order
+// to keep it true across the in-kernel and Ring-3 paths both.
+int dos_is_busy(void);
+
 #endif // DOSEXEC_H

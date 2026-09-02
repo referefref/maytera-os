@@ -112,6 +112,7 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/dragsess.rs"] mod dragsess;   // cross-window drag session (Tier 5 docking)
 #[path = "rustkern/doscrtc.rs"] mod doscrtc;   // #740: what an INT 10h mode set leaves in the CRTC (stale-Offset trap)
 #[path = "rustkern/dosmem.rs"] mod dosmem;   // #745: XMS 3.0 + LIM EMS 4.0 for the DOS guest
+#[path = "rustkern/doslinger.rs"] mod doslinger;   // the DOS guest post-exit linger policy
 #[path = "rustkern/dosmcb.rs"] mod dosmcb;   // #172: conventional-memory free-space truth (INT 21h 48h BX) + AH=26h Create New PSP
 #[path = "rustkern/dospit.rs"] mod dospit;   // #172: the 8253/8254 channel state machine, shared by PIT channels 0 and 2
 #[path = "rustkern/opl2.rs"] mod opl2;   // #175: the OPL2/AdLib DETECTION protocol (no FM synthesis; see the module header)
@@ -120,6 +121,9 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/dosbus.rs"] mod dosbus;
 #[path = "rustkern/dosint15.rs"] mod dosint15;   // #252: INT 15h AH=86h, the BIOS WAIT a DOS AdLib probe times its 80us with   // #176: what a guest port access costs in emulated time (ISA bus cycle, not a CPU op)
 #[path = "rustkern/doswin.rs"] mod doswin;
+#[path = "rustkern/dosprof.rs"] mod dosprof;
+#[path = "rustkern/rawsc.rs"] mod rawsc;   // #DOSRING3: focus-scoped raw scancodes for a Ring-3 DOS host
+#[path = "rustkern/dosdisp.rs"] mod dosdisp;
 #[path = "rustkern/dosmick.rs"] mod dosmick;   // (#mickey) what a DOS guest is told the mouse did: unit-gain counters + clamp homing   // #745 (local 105): DOS host-window letterbox geometry
 #[path = "rustkern/dos4gw.rs"] mod dos4gw;   // #740: DOS/4GW guest bridge - INT frame marshalling, MISS census, DPMI memory
 #[path = "rustkern/dpmi.rs"] mod dpmi;   // #740: the DPMI host core (INT 31h) for DOS/4GW guests
@@ -127,6 +131,8 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/dpmi_rmcs.rs"] mod dpmi_rmcs;   // #740: DPMI 0300h simulate-real-mode-interrupt marshaller
 #[path = "rustkern/drvmap.rs"] mod drvmap;   // #739: drive-letter policy for mounted disk images
 #[path = "rustkern/dosovl.rs"] mod dosovl;   // #rawrite: per-user write overlay for a DOS game directory
+#[path = "rustkern/dospolicy.rs"] mod dospolicy;   // #67/#168: DOS kernel-or-Ring-3 routing policy (/CONFIG/DOSROUTE.CFG)
+#[path = "rustkern/dospath.rs"] mod dospath;   // The Dig: collapse "." and ".." out of a resolved DOS path, with a drive-root clamp
 #[path = "rustkern/ed25519.rs"] mod ed25519;
 #[path = "rustkern/elf.rs"] mod elf;
 #[path = "rustkern/elevate.rs"] mod elevate;   // #745: system-wide install elevation policy
@@ -150,6 +156,7 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/hdastarve.rs"] mod hdastarve;   // #189: what the HDA output ring must contain once the producer stops feeding it
 #[path = "rustkern/intelgpu.rs"] mod intelgpu;   // Intel iGPU identification (detection only, no MMIO)
 #[path = "rustkern/hidmap.rs"] mod hidmap;   // #763: HID usage -> PS/2 set-1, shared by USB and Bluetooth HID
+#[path = "rustkern/usbport.rs"] mod usbport;   // #307/#433: when to STOP retrying a root port
 #[path = "rustkern/hidrepd.rs"] mod hidrepd; // #162: HID REPORT DESCRIPTOR parse -> consumer-page volume keys
 #[path = "rustkern/hmac.rs"] mod hmac;
 #[path = "rustkern/http.rs"] mod http;
@@ -160,6 +167,9 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/guestfs.rs"] mod guestfs;   // #708: DOS/Win16 guest filesystem identity + gate
 #[path = "rustkern/inflate.rs"] mod inflate;
 #[path = "rustkern/iso9660.rs"] mod iso9660;   // #196: ISO 9660 + Joliet parse (untrusted disc images)
+#[path = "rustkern/imgra.rs"] mod imgra;   // [no-ticket]: sequential readahead policy for the disk-image block cache
+#[path = "rustkern/isomemo.rs"] mod isomemo;   // [no-ticket]: 4-way memo over the last ISO path resolved
+#[path = "rustkern/blkhist.rs"] mod blkhist;   // [no-ticket]: block-layer transfer-size accounting (round trips per MB)
 #[path = "rustkern/aiguard.rs"] mod aiguard;   // #745: LLM prompt-injection screen
 #[path = "rustkern/jpeg.rs"] mod jpeg;
 #[path = "rustkern/le.rs"] mod le;   // #740: LE (Linear Executable) parse + load for DOS/4GW
@@ -171,6 +181,7 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/modex.rs"] mod modex;   // #740: Mode X (unchained VGA) geometry + present scanline kernel
 #[path = "rustkern/mono.rs"] mod mono;
 #[path = "rustkern/mprotect.rs"] mod mprotect;   // #404: SYS_MPROTECT Ring-3 argument validation
+#[path = "rustkern/netattach.rs"] mod netattach;   // hot-plug NIC attach handoff (xhci rescan -> net worker)
 #[path = "rustkern/netstat.rs"] mod netstat;   // #745: structured net status + non-blocking probe
 #[path = "rustkern/fwfilter.rs"] mod fwfilter;   // #238: THE packet filter (rules, conntrack, config codec)
 #[path = "rustkern/mp4.rs"] mod mp4;
@@ -196,6 +207,8 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/aptick.rs"] mod aptick;         // #169: per-core AP preemption decision
 #[path = "rustkern/schedwatch.rs"] mod schedwatch;
 #[path = "rustkern/cpuobs.rs"] mod cpuobs;   // #83: which core is a task on
+#[path = "rustkern/affinity.rs"] mod affinity;   // #affinity: persistent per-process CPU affinity + per-process migration counts
+#[path = "rustkern/inputlat.rs"] mod inputlat;   // #affinity: input-to-present latency, the first responsiveness instrument
 #[path = "rustkern/tickwatch.rs"] mod tickwatch;   // #745 (#62): periodic-tick health verdict + failover decision   // #67: SMP livelock diagnostic + run-queue placement policy
 #[path = "rustkern/seccore.rs"] mod seccore;
 #[path = "rustkern/sha256.rs"] mod sha256;
@@ -210,6 +223,7 @@ pub extern "C" fn rust_marker() -> u32 {
 #[path = "rustkern/sha512.rs"] mod sha512;
 #[path = "rustkern/taskmgr.rs"] mod taskmgr;
 #[path = "rustkern/uiscale.rs"] mod uiscale;   // global UI scale factor: ONE definition, kernel + Ring 3
+#[path = "rustkern/presentscale.rs"] mod presentscale;   // #halfres: integer PRESENT-SCALE compositing (mirrors uiscale)
 #[path = "rustkern/battery.rs"] mod battery;   // #battmeter: control-method battery _BIF/_BST evaluation
 #[path = "rustkern/theme.rs"] mod theme;
 #[path = "rustkern/tls12.rs"] mod tls12;

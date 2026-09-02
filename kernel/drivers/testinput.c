@@ -50,9 +50,22 @@ extern int  keyboard_buffer_depth(void);                        // cpu/isr.c (ne
 extern volatile uint64_t g_kbd_consumed;                        // cpu/isr.c (new)
 extern volatile uint64_t g_kbd_irq_scancodes;                   // cpu/isr.c (new)
 extern void mouse_inject_button(int32_t x, int32_t y, int down);// drivers/mouse.c
+extern void mouse_inject_button_mask(int32_t x, int32_t y, uint32_t mask); // drivers/mouse.c (#speedcap)
 extern void mouse_inject_move(int32_t x, int32_t y);            // drivers/mouse.c (Win16 SkiFree repro)
 extern void mouse_get_position(int32_t *x, int32_t *y);         // drivers/mouse.c
 extern volatile uint64_t g_mouse_poll_count;                    // gui/fb_syscall.c (new)
+// #resizelag: kernel-side cost of user_window_handle_resize() (kmalloc +
+// background fill + memcpy of the content buffer), proc/syscall.c.
+extern uint64_t g_uwresize_calls;
+extern uint64_t g_uwresize_total_us;
+extern uint64_t g_uwresize_max_us;
+extern int32_t  g_uwresize_last_cw;
+extern int32_t  g_uwresize_last_ch;
+// #resizelag: real outer window bounds for slot `idx` (proc/syscall.c),
+// so a host-side drag probe can compute a resize-grip point exactly
+// instead of guessing off a screenshot.
+extern int testinput_win_query(int idx, int32_t *x, int32_t *y, int32_t *w,
+                                int32_t *h, char *title, int titlesz);
 extern int  proc_create(const char *name, void (*entry)(void *), void *arg, int prio);
 extern void proc_sleep(uint32_t ms);
 
@@ -103,6 +116,8 @@ extern uint64_t clickacct_get_rs(uint32_t which);
 #define CA_ROUTED   4u
 #define CA_HIT      5u
 #define CA_POLLS    6u
+#define CA_SMP_RDOWN 7u
+#define CA_SMP_RUP   8u
 
 static wait_queue_head_t ti_click_wq;         // woken on every sampled edge
 static volatile int      ti_click_wq_ready = 0;
@@ -128,6 +143,43 @@ static int ti_click_edge(int32_t x, int32_t y, int down) {
                                 clickacct_get_rs(which) != before,
                                 wq_ms_to_ticks(ti_click_ms));
     return (rc == WAIT_OK) ? 1 : 0;
+}
+
+// (#speedcap) THE RIGHT-BUTTON EDGE, on the SAME latch as the left one.
+//
+// WHY THIS HAD TO EXIST AT ALL. Every per-window menu in this desktop opens on
+// a RIGHT click: the taskbar tile popup (taskbar.c tbmenu), the XFCE dock's
+// CTX_MODE_DOCK menu (contextmenu.c), and therefore the ONLY route to the #778
+// DOS Speed dialog. This channel could inject only a left click, so no such
+// menu had ever been opened under test, and #778 shipped with its own CHANGELOG
+// entry admitting it had never been booted. A feature whose only entry point is
+// unreachable by the test harness is a feature that ships unverified.
+//
+// It is NOT a fixed pulse, for the identical reason the left path is not (#197):
+// the compositor SAMPLES the physical level once per frame and computes the edge
+// itself, so a pulse shorter than a frame is silently lost and the ACK would
+// describe the parser rather than delivery. The wait is #426-acceptable for the
+// same reason ti_click_edge()'s is: two independent wake sources (the sampled
+// edge wakes the queue, and wait_event_timeout re-checks on its own cadence) over
+// a MONOTONIC counter, with the bound present only so a dead compositor reports
+// a failure instead of parking the channel.
+static int ti_rclick_edge(int32_t x, int32_t y, int down) {
+    uint32_t which  = down ? CA_SMP_RDOWN : CA_SMP_RUP;
+    uint64_t before = clickacct_get_rs(which);
+    mouse_inject_button_mask(x, y, down ? 2u : 0u);
+    if (!ti_click_mode) return -1;            // pulse mode: no latch
+    int rc = wait_event_timeout(&ti_click_wq,
+                                clickacct_get_rs(which) != before,
+                                wq_ms_to_ticks(ti_click_ms));
+    return (rc == WAIT_OK) ? 1 : 0;
+}
+
+// One complete RIGHT click. Same 2-bit return as ti_click_once().
+static int ti_rclick_once(int32_t x, int32_t y) {
+    int m = 0;
+    if (ti_rclick_edge(x, y, 1) == 1) m |= 1;
+    if (ti_rclick_edge(x, y, 0) == 1) m |= 2;
+    return m;
 }
 
 // One complete click. Returns a 2-bit mask: bit0 = press edge observed,
@@ -386,11 +438,14 @@ static void ti_process_line(const char *line) {
     // guest while the guest was consuming every event).
     if (!strncmp(p, "CLICKS", 6)) {
         snprintf(buf, sizeof(buf),
-                 "OK CLICKS inj_d=%lu inj_u=%lu smp_d=%lu smp_u=%lu routed=%lu hit=%lu polls=%lu\n",
+                 "OK CLICKS inj_d=%lu inj_u=%lu smp_d=%lu smp_u=%lu "
+                 "rsmp_d=%lu rsmp_u=%lu routed=%lu hit=%lu polls=%lu\n",
                  (unsigned long)clickacct_get_rs(CA_INJ_DOWN),
                  (unsigned long)clickacct_get_rs(CA_INJ_UP),
                  (unsigned long)clickacct_get_rs(CA_SMP_DOWN),
                  (unsigned long)clickacct_get_rs(CA_SMP_UP),
+                 (unsigned long)clickacct_get_rs(CA_SMP_RDOWN),
+                 (unsigned long)clickacct_get_rs(CA_SMP_RUP),
                  (unsigned long)clickacct_get_rs(CA_ROUTED),
                  (unsigned long)clickacct_get_rs(CA_HIT),
                  (unsigned long)clickacct_get_rs(CA_POLLS));
@@ -456,6 +511,53 @@ static void ti_process_line(const char *line) {
         ti_reply(buf);
         return;
     }
+    if (!strncmp(p, "RCLICK", 6)) {              // RCLICK <x> <y>  (right down+up)
+        p += 6; int x = parse_dec(&p); int y = parse_dec(&p);
+        if (x <= -1000000 || y <= -1000000) { ti_reply("ERR RCLICK badarg\n"); return; }
+        ti_last_x = x; ti_last_y = y;
+        int m = ti_rclick_once(x, y);
+        // No routed=/hit= here, and that absence is deliberate rather than an
+        // omission: clickacct's ROUTED/HIT legs count sys_inject_mouse relays of
+        // a LEFT down only (see clickacct.rs), and a right click opens compositor
+        // chrome instead of being relayed to a window, so those two counters
+        // would be a constant 0 and would read as a failure.
+        snprintf(buf, sizeof(buf),
+                 "OK RCLICK %d %d mode=%s down=%d up=%d rsmp_d=%lu rsmp_u=%lu polls=%lu\n",
+                 x, y, ti_click_mode ? "latch" : "pulse",
+                 (m & 1) ? 1 : 0, (m & 2) ? 1 : 0,
+                 (unsigned long)clickacct_get_rs(CA_SMP_RDOWN),
+                 (unsigned long)clickacct_get_rs(CA_SMP_RUP),
+                 (unsigned long)g_mouse_poll_count);
+        ti_reply(buf);
+        return;
+    }
+    // (#speedcap) WRITEF <path> <text...> - replace a whole small file's CONTENT.
+    //
+    // SETKV above edits ONE key= line in a flat key=value file, which is every
+    // config file in this OS except the ones that are a single bare token. The
+    // DOS speed cap's <program dir>/SPEED.CFG is exactly that shape (one decimal,
+    // or "off"), so SETKV cannot write it: it would append "cycles=500" to a file
+    // dos_cycles_parse() reads from byte 0. Without this verb the #778 LIVE
+    // re-poll could not be exercised from the host at all, because the golden
+    // ships no sshd and the only other writer is the compositor dialog under
+    // test, so the mechanism and its UI could never be separated.
+    //
+    // Same fat_write_file() route SETKV uses (routes "/" to the ext2 root), same
+    // /TESTINPUT.TXT arming, same TI_KV_MAX bound. Unlike SETKV it MAY create the
+    // file, which is the point: SPEED.CFG is absent for most titles.
+    if (!strncmp(p, "WRITEF ", 7)) {
+        p += 7;
+        char path[96];
+        if (ti_copy_tok(&p, path, sizeof(path)) <= 0) { ti_reply("ERR WRITEF badarg\n"); return; }
+        const char *body = skip_ws(p);
+        int n = 0; while (body[n] && body[n] != '\r' && body[n] != '\n') n++;
+        if (n > 512) { ti_reply("ERR WRITEF toolong\n"); return; }
+        int rc = fat_write_file(&g_fat_fs, path, body, (uint32_t)n);
+        if (rc < 0) snprintf(buf, sizeof(buf), "ERR WRITEF rc=%d\n", rc);
+        else        snprintf(buf, sizeof(buf), "OK WRITEF %s bytes=%d\n", path, n);
+        ti_reply(buf);
+        return;
+    }
     if (!strncmp(p, "MDOWN", 5)) {               // MDOWN <x> <y>
         p += 5; int x = parse_dec(&p); int y = parse_dec(&p);
         if (x <= -1000000 || y <= -1000000) { ti_reply("ERR MDOWN badarg\n"); return; }
@@ -471,6 +573,39 @@ static void ti_process_line(const char *line) {
         ti_last_x = x; ti_last_y = y;
         mouse_inject_move(x, y);
         snprintf(buf, sizeof(buf), "OK MOVE %d %d\n", x, y);
+        ti_reply(buf);
+        return;
+    }
+    // #resizelag: read the resize-cost ledger. RSTAT resets nothing (so a
+    // test can poll mid-drag); RSTATZ reads then zeroes it (so a test can
+    // isolate exactly one drag from a clean baseline).
+    if (!strncmp(p, "RSTATZ", 6) || !strncmp(p, "RSTAT", 5)) {
+        int zero = !strncmp(p, "RSTATZ", 6);
+        snprintf(buf, sizeof(buf),
+                 "OK RSTAT calls=%lu total_us=%lu max_us=%lu avg_us=%lu last=%dx%d\n",
+                 (unsigned long)g_uwresize_calls,
+                 (unsigned long)g_uwresize_total_us,
+                 (unsigned long)g_uwresize_max_us,
+                 (unsigned long)(g_uwresize_calls ? g_uwresize_total_us / g_uwresize_calls : 0),
+                 g_uwresize_last_cw, g_uwresize_last_ch);
+        ti_reply(buf);
+        if (zero) {
+            g_uwresize_calls = 0; g_uwresize_total_us = 0; g_uwresize_max_us = 0;
+        }
+        return;
+    }
+    // #resizelag: WINQ <idx> - outer bounds of user_windows[idx], for
+    // computing an accurate resize-grip click point from the host.
+    if (!strncmp(p, "WINQ", 4)) {
+        p += 4;
+        int idx = parse_dec(&p);
+        if (idx <= -1000000) idx = 0;
+        int32_t wx = 0, wy = 0, ww = 0, wh = 0;
+        char title[32];
+        int ok = testinput_win_query(idx, &wx, &wy, &ww, &wh, title, sizeof(title));
+        if (!ok) { ti_reply("ERR WINQ noWindow\n"); return; }
+        snprintf(buf, sizeof(buf), "OK WINQ %d x=%d y=%d w=%d h=%d title=%s\n",
+                 idx, wx, wy, ww, wh, title);
         ti_reply(buf);
         return;
     }

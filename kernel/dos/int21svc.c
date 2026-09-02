@@ -625,6 +625,71 @@ static int attr_match(uint16_t mask, uint8_t attr) {
     return 1;
 }
 
+// (doscd) THE 4Eh DIRECTORY/PATTERN SPLIT, in one externally testable place.
+//
+// Factored out of the AH=4Eh arm so dos_find_split_selftest() below exercises
+// the SHIPPING function rather than a copy of it. A copy is what let the
+// original defect hide: the rule "E:\\ and E:\\*.* are the same request" was
+// written in a comment next to code that did not implement it.
+//
+// `fp` is an already-resolved NATIVE path. On return `dirpath` is the directory
+// to enumerate and `pat` is the filename pattern ("" for a drive root).
+void dos_find_split(const char *fp, char *dirpath, int dircap,
+                    char *pat, int patcap) {
+    int slash = -1;
+    for (int i = 0; fp[i]; i++) if (fp[i] == '/') slash = i;
+    // A RESOLVED PATH THAT IS ITSELF A DRIVE ROOT HAS NO SPLIT TO MAKE, and
+    // this test must come FIRST because the generic split below is wrong for it.
+    //
+    // "E:\\" resolves to /WINDIR/DRIVE_E. Splitting that at the last slash
+    // yields the directory /WINDIR and the pattern DRIVE_E, so find_drive
+    // (computed from the directory half) is 0, find_volume_step() bails on
+    // "not a drive root: no label here", and a VOLUME-LABEL search on the drive root
+    // answers "no such disc" for every letter, forever.
+    //
+    // MEASURED (2026-08-29). Red Alert asks for its disc exactly this way.
+    // On kernel 2241: "4Eh findfirst dir='/WINDIR/DRIVE_E' pat='' attr=0008
+    // drive=E -> hit" then "4Eh volume label on E: -> 'CD1'". On dev HEAD:
+    // "4Eh findfirst dir='/WINDIR' pat='DRIVE_E' attr=0008 drive=- -> none",
+    // and the game puts up "PLEASE INSERT A RED ALERT CD INTO THE CD-ROM
+    // DRIVE" with the disc mounted and listed on the desktop.
+    //
+    // WHAT CHANGED UNDERNEATH IT. This code never handled the drive root; it
+    // only LOOKED as though it did, because dos_resolve_path_ex() used to emit
+    // "/WINDIR/DRIVE_E/" WITH a trailing slash, which the split happened to
+    // turn into (dir=/WINDIR/DRIVE_E, pat=""). Commit 6d14fece added
+    // dospath_canon_rs(), whose header said "a trailing slash is not preserved.
+    // Nothing in this tree depends on one." This did. The correctness of every
+    // volume-label search rested on incidental punctuation in a string, so it
+    // is a rule here instead: ask whether the path IS a drive root.
+    if (dos_native_root_drive(fp)) {
+        int n = 0;
+        for (; fp[n] && n < dircap - 1; n++) dirpath[n] = fp[n];
+        // Trailing separators are dropped: "E:\\" and "E:" must hand fat_open()
+        // the SAME directory string, and a path ending in '/' is not one this
+        // tree's filesystems open.
+        while (n > 0 && (dirpath[n - 1] == '/' || dirpath[n - 1] == '\\')) n--;
+        dirpath[n] = '\0';
+        pat[0] = '\0';
+        return;
+    }
+    if (slash < 0) {
+        dirpath[0] = '/'; dirpath[1] = '\0';
+        int k = 0;
+        for (; fp[k] && k < patcap - 1; k++) pat[k] = fp[k];
+        pat[k] = '\0';
+        return;
+    }
+    int n = slash > 0 ? slash : 1;
+    if (n > dircap - 1) n = dircap - 1;
+    for (int i = 0; i < n; i++) dirpath[i] = fp[i];
+    dirpath[n] = '\0';
+    const char *tail = fp + slash + 1;
+    int k = 0;
+    for (; tail[k] && k < patcap - 1; k++) pat[k] = tail[k];
+    pat[k] = '\0';
+}
+
 // The volume-label half of a find. Returns 1 when the DTA now holds the label.
 //
 // WHY THE LABEL IS SYNTHESISED AND NOT ENUMERATED. It is not a directory entry
@@ -650,6 +715,13 @@ static int find_volume_step(dos_svc_ctx_t *x) {
     // names the directory it searches, and both spellings DOS accepts ("E:\\"
     // and "E:\\*.*") mean the same request; matching a label like "CD1" against
     // the pattern would answer one spelling and silently miss the other.
+    //
+    // (doscd) BOTH SPELLINGS ONLY REACH HERE BECAUSE OF THE DRIVE-ROOT TEST IN
+    // THE 4Eh HANDLER. This comment claimed the two were equivalent while the
+    // caller silently sent "E:\\" to the directory /WINDIR with the pattern
+    // DRIVE_E, so find_drive was 0 and this function returned at the line
+    // above. A claim about two callers being equivalent is worth exactly as
+    // much as the test that makes them so.
     write_find_result(x, lbl, 0, 0x08);
     kprintf("[int21:%s] 4Eh volume label on %c: -> '%s'\n", x->tag, x->find_drive, lbl);
     return 1;
@@ -1030,6 +1102,54 @@ void dos_svc_int21(dos_svc_ctx_t *x, x86_16_cpu_t *c) {
         c->bx = 0xFF00;
         c->cx = 0;
         break;
+
+    // (#digrun) AH=38h - GET COUNTRY-DEPENDENT INFORMATION.
+    //
+    // MEASURED on The Dig's IMUSE.EXE, whose Rational DOS/16M loader stub asks
+    // for it during startup. It is not a formatting nicety to the programs that
+    // call it: a C runtime asks once, near entry, and a refusal there is a
+    // refusal from something that has no fallback path.
+    //
+    // AL=0 is 'the current country' and is the only form anything in the
+    // corpus issues; DS:DX is a 34-byte buffer (DOS 3.0+; the DOS 2.x form was
+    // 32 and the two extra bytes are the data-list separator, which is why the
+    // buffer is filled to 34 and not to 32). DX=FFFFh with AL!=0 is SET
+    // country, which this core does not do and declines the documented way.
+    //
+    // The values are the US/DOS defaults, and they are the honest answer rather
+    // than a placeholder: this layer has one locale, decides nothing from it,
+    // and a guest that reads mm/dd/yy and '.' as a decimal point is reading
+    // exactly what the rest of the emulated environment behaves like.
+    case 0x38: {
+        if ((c->ax & 0xFF) != 0x00 || c->dx == 0xFFFF) {   // SET country
+            svc_err(x, c, 0x0001);
+            kprintf("[int21:%s] AH=38h AL=%02x (set country) declined; only "
+                    "AL=00h get-current-country is implemented\n",
+                    x->tag, c->ax & 0xFF);
+            break;
+        }
+        static const uint8_t ci[34] = {
+            0x00, 0x00,                   //  0 date format: 0 = USA mm/dd/yy
+            '$', 0, 0, 0, 0,               //  2 currency symbol, ASCIIZ[5]
+            ',', 0,                       //  7 thousands separator
+            '.', 0,                       //  9 decimal separator
+            '-', 0,                       // 11 date separator
+            ':', 0,                       // 13 time separator
+            0x00,                         // 15 currency format: symbol leads, no space
+            0x02,                         // 16 digits after the decimal point
+            0x00,                         // 17 time format: 12-hour
+            0x00, 0x00, 0x00, 0x00,       // 18 case-map FAR call: none
+            ',', 0,                       // 22 data-list separator
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0  // 24 reserved
+        };
+        for (int i = 0; i < 34; i++)
+            g_wr8(x, c->ds, (uint16_t)(c->dx + i), ci[i]);
+        c->bx = 0x0001;                   // country code 1 = USA
+        CLR_CF(c); x->last_err = 0;
+        kprintf("[int21:%s] 38h country info -> 34 bytes at %04x:%04x, country 1 (USA)\n",
+                x->tag, c->ds, c->dx);
+        break;
+    }
 
     case 0x41: { // delete file DS:DX
         char dp[DOS_SVC_PATH_MAX], fp[DOS_SVC_PATH_MAX];
@@ -1740,17 +1860,9 @@ void dos_svc_int21(dos_svc_ctx_t *x, x86_16_cpu_t *c) {
         char dp[DOS_SVC_PATH_MAX], fp[DOS_SVC_PATH_MAX];
         rd_asciiz(x, c->ds, c->dx, dp, sizeof(dp));
         dos_svc_resolve(x, dp, fp, sizeof(fp));
-        char dirpath[DOS_SVC_PATH_MAX]; int slash = -1;
-        for (int i = 0; fp[i]; i++) if (fp[i] == '/') slash = i;
-        if (slash < 0) {
-            dirpath[0] = '/'; dirpath[1] = '\0';
-            strncpy(x->find_pat, fp, sizeof(x->find_pat) - 1);
-        } else {
-            int n = slash > 0 ? slash : 1;
-            for (int i = 0; i < n; i++) dirpath[i] = fp[i];
-            dirpath[n] = '\0';
-            strncpy(x->find_pat, fp + slash + 1, sizeof(x->find_pat) - 1);
-        }
+        char dirpath[DOS_SVC_PATH_MAX];
+        dos_find_split(fp, dirpath, (int)sizeof(dirpath),
+                       x->find_pat, (int)sizeof(x->find_pat));
         x->find_pat[sizeof(x->find_pat) - 1] = '\0';
         // The attribute mask. Previously never read, so no search could
         // ask for anything but plain files.

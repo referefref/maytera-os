@@ -20,6 +20,7 @@
 #include "../serial.h"
 #include "../string.h"
 #include "../fs/fat.h"
+#include "../fs/bootlog.h"   // hot-plug attach evidence goes to the DURABLE log
 #include "../mm/heap.h"
 #include "../proc/process.h"   // #381: proc_create/proc_sleep/PRIO_* for net worker
 #include "../cpu/dlprof.h"
@@ -95,16 +96,88 @@ static volatile net_conn_state_t g_net_conn_state = NET_STATE_UP;
 static volatile uint32_t g_net_fail_streak = 0;
 static volatile uint64_t g_net_probe_next_ms = 0;   // earliest permitted re-probe
 
+// ---------------------------------------------------------------------------
+// #549 OBSERVABILITY (browsenet, 2026-09-01). MEASURED MOTIVE, not a nicety.
+//
+// Every transition in this breaker was kprintf-only, i.e. SERIAL ONLY. The
+// machine it matters on is the owner's ASUS laptop, which has no serial port.
+// Golden 2317's /BOOTLOG.TXT from that laptop records state=FAULTY twice and
+// NOT ONE byte about WHEN it tripped, WHAT failed, whether a re-probe was ever
+// granted, or to whom. So the single most likely explanation for "the browser
+// cannot load example.com while ping 1.1.1.1 works" was un-diagnosable from the
+// only evidence that machine can produce.
+//
+// This is the third diagnostic this quarter that could not reach the machine it
+// was written for; net/dhcp.c and main.c both carry the same lesson in prose.
+// The counters below are rendered by net_diag_line(), which main.c ALREADY
+// persists to /BOOTLOG.TXT on every qualitative change and on a slow periodic
+// sample, so they cost no additional write and no new plumbing. trip= sits in
+// the QUALITATIVE half deliberately: it changes exactly once per trip, which is
+// precisely when a durable line is worth spending.
+static volatile uint32_t g_net_fail_total    = 0;  // reach-failures ever counted
+static volatile uint32_t g_net_trip_count    = 0;  // times FAULTY was entered
+static volatile uint32_t g_net_recover_count = 0;  // times a transfer cleared it
+static volatile uint32_t g_net_probe_grants  = 0;  // re-probes let onto the wire
+static volatile uint32_t g_net_probe_refused = 0;  // fetches refused while FAULTY
+static char g_net_fail_host[40];                   // most recent failing host
+static char g_net_trip_host[40];                   // host that COMPLETED the streak
+// browsenet 2026-09-01: the FAILURE CODE too, because the classes are not
+// equivalent and the fix differs by class. wget.h's codes: -1 invalid URL,
+// -2 no network, -3 DNS failed, -4 connect failed, -5 send failed, -6 timeout,
+// -7 no memory, -12 SSRF-blocked. https_get collapses most of its failures to
+// a bare -1. Several of those (-1, -7, and https.c:214 "Failed to create
+// socket" under TCP socket-pool exhaustion) are evidence about US, not about
+// the remote, and #549's own 2026-08-10 note says such a failure must not be
+// counted; that fix excluded only the no-carrier/no-address case. Recording
+// the code is the cheap half: it turns "what tripped it" from a guess into a
+// number in the next boot log, without changing any behaviour.
+static volatile int g_net_fail_rc = 0;             // rc of the most recent failure
+static volatile int g_net_trip_rc = 0;             // rc that COMPLETED the streak
+
+// Copy the host out of a URL ("scheme://host[:port]/...") into dst. No strstr
+// here (freestanding); this is a bounded hand walk on purpose.
+static void net_note_host(char *dst, unsigned long cap, const char *url) {
+    unsigned long n = 0;
+    if (!dst || cap < 2) return;
+    if (!url || !url[0]) { dst[0] = 0; return; }
+    const char *h = url;
+    for (const char *q = url; q[0] && q[1] && q[2]; q++) {
+        if (q[0] == ':' && q[1] == '/' && q[2] == '/') { h = q + 3; break; }
+    }
+    while (*h && *h != '/' && *h != ':' && *h != '?' && n < cap - 1) dst[n++] = *h++;
+    dst[n] = 0;
+}
+
+// Read-only accessors for net_diag_line() and any future Settings panel.
+uint32_t net_fault_fail_total(void)    { return g_net_fail_total; }
+uint32_t net_fault_trip_count(void)    { return g_net_trip_count; }
+uint32_t net_fault_recover_count(void) { return g_net_recover_count; }
+uint32_t net_fault_probe_grants(void)  { return g_net_probe_grants; }
+uint32_t net_fault_probe_refused(void) { return g_net_probe_refused; }
+int      net_fault_trip_rc(void)       { return g_net_trip_rc; }
+const char *net_fault_trip_host(void)  { return g_net_trip_host[0] ? g_net_trip_host : "-"; }
+
+
 void net_report_reach_ok(void) {
     g_net_fail_streak = 0;
     g_net_probe_next_ms = 0;
     if (g_net_conn_state != NET_STATE_UP) {
         g_net_conn_state = NET_STATE_UP;
+        g_net_recover_count++;
         kprintf("[NET] a transfer completed; interface re-enabled (was NET_FAULTY)\n");
     }
 }
 
-void net_report_reach_fail(void) {
+void net_report_reach_fail_rc(const char *url, int rc) {
+    g_net_fail_rc = rc;
+    net_report_reach_fail_url(url);
+}
+
+void net_report_reach_fail_url(const char *url) {
+    // browsenet 2026-09-01: remember WHICH remote failed. Without this the trip
+    // is a bare state change and the next reader has to guess whether the box
+    // has no internet or one background poller has an unreachable target.
+    net_note_host(g_net_fail_host, sizeof(g_net_fail_host), url);
     if (g_net_conn_state == NET_STATE_FAULTY) return;   // already tripped; stay quiet
     // #549 FIX (2026-08-10): only count a failure that actually REACHED THE WIRE.
     // wget_fetch()/https_connect() return WGET_ERR_NO_NETWORK the instant
@@ -115,15 +188,27 @@ void net_report_reach_fail(void) {
     // the resulting FAULTY state then outlived the condition that caused it.
     if (!net_wire_usable()) return;
     if (g_net_fail_streak < 0xFFFFFFFFu) g_net_fail_streak++;
+    if (g_net_fail_total < 0xFFFFFFFFu) g_net_fail_total++;
     if (g_net_fail_streak >= NET_FAIL_STREAK_MAX) {
         g_net_conn_state = NET_STATE_FAULTY;
         g_net_probe_next_ms = mono_ms() + NET_PROBE_INTERVAL_MS;
-        kprintf("[NET] %u consecutive unreachable-remote failures: marking interface "
-                "NET_FAULTY. Bulk traffic stopped; one re-probe every %ums until a "
-                "transfer completes.\n",
-                (unsigned)g_net_fail_streak, (unsigned)NET_PROBE_INTERVAL_MS);
+        g_net_trip_count++;
+        for (unsigned i = 0; i < sizeof(g_net_trip_host); i++)
+            g_net_trip_host[i] = g_net_fail_host[i];
+        g_net_trip_host[sizeof(g_net_trip_host) - 1] = 0;
+        g_net_trip_rc = g_net_fail_rc;
+        kprintf("[NET] %u consecutive unreachable-remote failures (last host '%s' rc=%d): "
+                "marking interface NET_FAULTY. Bulk traffic stopped; one re-probe "
+                "every %ums until a transfer completes.\n",
+                (unsigned)g_net_fail_streak,
+                g_net_trip_host[0] ? g_net_trip_host : "?",
+                g_net_trip_rc,
+                (unsigned)NET_PROBE_INTERVAL_MS);
     }
 }
+
+// Back-compat entry point for call sites with no URL in scope.
+void net_report_reach_fail(void) { net_report_reach_fail_url(0); }
 
 net_conn_state_t net_get_conn_state(void) { return g_net_conn_state; }
 int net_is_faulty(void) { return g_net_conn_state == NET_STATE_FAULTY; }
@@ -158,9 +243,19 @@ int net_is_faulty(void) { return g_net_conn_state == NET_STATE_FAULTY; }
 int net_fetch_probe_take(void) {
     if (g_net_conn_state != NET_STATE_FAULTY) return 1;
     uint64_t now = mono_ms();
-    if (now < g_net_probe_next_ms) return 0;
+    if (now < g_net_probe_next_ms) {
+        // browsenet 2026-09-01: COUNT the refusals. This is the number that
+        // says whether the user's browser request is losing a race for the one
+        // 30s token against the background pollers, or whether it is getting
+        // onto the wire and failing there. Those are different tickets and
+        // nothing distinguished them before.
+        if (g_net_probe_refused < 0xFFFFFFFFu) g_net_probe_refused++;
+        return 0;
+    }
     g_net_probe_next_ms = now + NET_PROBE_INTERVAL_MS;
-    kprintf("[NET] NET_FAULTY: allowing one re-probe onto the wire\n");
+    if (g_net_probe_grants < 0xFFFFFFFFu) g_net_probe_grants++;
+    kprintf("[NET] NET_FAULTY: allowing one re-probe onto the wire (grant #%u)\n",
+            (unsigned)g_net_probe_grants);
     return 1;
 }
 
@@ -183,6 +278,54 @@ static int (*driver_link_up)(void) = NULL;
 extern void kprintf_set_dual_output(int enable);
 extern fat_fs_t g_fat_fs;
 static int nic_refresh_link(void);   // #381: defined below; used by net_init()
+
+// ---------------------------------------------------------------------------
+// HOT-PLUG NIC ATTACH (no ticket, 2026-08-28).
+//
+// net_init() binds a NIC exactly once, during boot. A USB Ethernet adapter
+// plugged in later enumerated fine and the CDC-ECM driver claimed it and read
+// its MAC, but the network stack never learned it existed: no DISCOVER, no
+// OFFER, no lease, ever, because nothing on the xHCI re-scan path reaches
+// net_init(). The measured artifact was an owner BOOTLOG with
+// "[USB-ECM] CDC-ECM NIC attached" and NO "[USB-NET] ... active as NIC" line,
+// which is usb_eth_start() never being called.
+//
+// The handoff is deliberately split across two threads:
+//
+//   ARM   drivers/usb_ecm.c usb_net_probe(), on the xhci_rescan worker, inside
+//         device enumeration. Three atomic ops, nothing else. That context is
+//         one control transfer away from every other device on the bus and
+//         must never block (#549).
+//
+//   BIND  net_late_attach_service(), called at the top of net_worker()'s loop.
+//         net_worker is the single owner of carrier polling and DHCP; it is a
+//         normal PRIO_NORMAL thread and is allowed to be slow. Everything
+//         expensive (usb_eth_start, the protocol-stack bring-up, the config
+//         file reads) happens HERE.
+//
+// DHCP then starts with NO extra plumbing: net_worker's next statement is
+// nic_refresh_link(), and a NIC that was absent has left prev_link at 0, so the
+// existing #431 carrier down->up branch runs dhcp_reset() + dhcp_discover() in
+// the SAME iteration. Carrier is handled by the same pre-existing code: an ASIX
+// dongle with no cable reports link 0, so the worker takes its fast no-op path
+// (#381) and DHCP waits for the cable rather than spinning or failing.
+// ---------------------------------------------------------------------------
+extern void netattach_boot_done_rs(void);
+extern int  netattach_on_probe_rs(int nic_bound);
+extern int  netattach_take_rs(void);
+extern void netattach_on_detach_rs(void);
+extern int  netattach_take_detach_rs(void);
+extern void netattach_rearm_rs(void);
+extern void netattach_stats_rs(uint64_t *probe, uint64_t *armed, uint64_t *taken,
+                               uint64_t *skip_boot, uint64_t *skip_bound,
+                               uint64_t *coalesced, uint64_t *pending,
+                               uint64_t *detach, uint64_t *detach_taken);
+
+// Is a NIC currently carrying the stack? The ONE definition of that fact; the
+// Rust side is passed it rather than keeping its own copy.
+int net_has_nic(void) {
+    return active_driver != NET_DRIVER_NONE;
+}
 
 // Minimal, robust dotted-quad parser. Returns 1 on success and writes the
 // address in host byte order (a.b.c.d -> (a<<24)|(b<<16)|(c<<8)|d), 0 on any
@@ -448,6 +591,12 @@ int net_init(void) {
                 driver_link_up = usb_eth_link_up;
             } else {
                 kprintf("[NET] Network initialization failed (no supported NIC found)\n");
+                // Boot-time binding is OVER even though it found nothing. From
+                // here on a USB NIC that enumerates is a HOT-PLUG and must be
+                // armed for the net worker, not left for a net_init() that has
+                // already run. This is the exact case the owner hit.
+                netattach_boot_done_rs();
+                bootlog_write("[NET] no NIC at boot; hot-plug attach armed");
                 return -1;
             }
         }
@@ -512,6 +661,11 @@ int net_init(void) {
     kprintf("[NET] Test ARP request sent for 192.0.2.1\n");
     kprintf("[NET] net_init complete, disabling dual output\n");
     kprintf_set_dual_output(0); // Disable dual output after init
+
+    // Boot-time binding is over. A later USB NIC probe is now a hot-plug; with
+    // a NIC already bound netattach_on_probe_rs() will refuse to arm, so the
+    // live interface and its lease are never disturbed.
+    netattach_boot_done_rs();
 
     return 0;
 }
@@ -1148,6 +1302,154 @@ int net_is_up(void) {
 extern int  dhcp_is_bound(void);
 extern int  dhcp_discover(void);
 
+// Unbind a NIC that was UNPLUGGED. Runs ONLY on net_worker, for the same reason
+// the bind does: the USB side must not touch the network stack from inside slot
+// teardown. Returns 1 if it unbound one.
+//
+// The STACK STAYS UP (net_initialized keeps its value). Only the driver binding
+// and the address go; every handler stays registered, which is what makes the
+// replug path cheap and is why eth_refresh_mac() exists rather than a second
+// eth_init().
+static int net_late_detach_service(void) {
+    if (!netattach_take_detach_rs()) return 0;
+    if (active_driver != NET_DRIVER_USB) return 0;
+    if (usb_eth_present()) return 0;      // it came back before we got here
+
+    // Clear the function pointers under net_lock so this cannot race a
+    // transmit that has already passed nic_send()'s NULL check. net_lock is
+    // cli + a spinlock: four stores under it, no allocation, no wait (#549).
+    net_lock();
+    active_driver  = NET_DRIVER_NONE;
+    driver_get_mac = NULL;
+    driver_send    = NULL;
+    driver_receive = NULL;
+    driver_link_up = NULL;
+    net_unlock();
+    g_link_cached = 0;
+
+    // Drop the lease. The address belonged to a NIC that is gone, and keeping
+    // it would make net_wire_usable() lie and would stop a replug re-running
+    // DORA (dhcp_discover() early-returns while BOUND).
+    dhcp_reset();
+    ip_set_address(0);
+
+    bootlog_write("[NETATTACH] USB NIC unbound after unplug; address dropped, "
+                  "stack left up for a replug");
+    kprintf("[NETATTACH] USB NIC unbound after unplug\n");
+    return 1;
+}
+
+// Bind a NIC that appeared after net_init() ran. Runs ONLY on net_worker.
+// Returns 1 if it bound one, 0 if there was nothing to do.
+static int net_late_attach_service(void) {
+    if (!netattach_take_rs()) return 0;
+
+    // Second guard, on net.c's own state rather than the flag. The flag can only
+    // have been armed while unbound, but the bind is the irreversible step and
+    // it costs one compare to be sure.
+    if (active_driver != NET_DRIVER_NONE) {
+        bootlog_write("[NETATTACH] attach ignored: driver type %d already bound",
+                      (int)active_driver);
+        return 0;
+    }
+    if (!usb_eth_present()) {
+        bootlog_write("[NETATTACH] attach taken but no USB NIC present; dropped");
+        return 0;
+    }
+    if (usb_eth_start() != 0) {
+        // Re-arm rather than lose the device: the next pass retries, so a
+        // transient submit failure does not require the user to replug.
+        netattach_rearm_rs();
+        bootlog_write("[NETATTACH] usb_eth_start() failed; will retry");
+        return 0;
+    }
+
+    // No net_lock here, unlike the UNBIND above, and the asymmetry is
+    // deliberate. Unbinding NULLs a pointer another context may be about to
+    // call, so it has to exclude nic_send(); binding only ever makes a NULL
+    // pointer valid, each pointer is read on its own and never as a set, and
+    // the interface has no address until DORA runs later on THIS thread, so
+    // there is nothing in flight to tear.
+    active_driver   = NET_DRIVER_USB;
+    driver_get_mac  = usb_eth_get_mac;
+    driver_send     = usb_eth_send;
+    driver_receive  = usb_eth_receive;
+    driver_link_up  = usb_eth_link_up;
+
+    if (!net_initialized) {
+        // Nothing was ever brought up: net_init() returned -1 at boot because
+        // there was no NIC, so it never reached eth_init(). Run the same
+        // sequence it runs, in the same order.
+        eth_init();
+        ip_init();
+        arp_init();
+        icmp_init();
+        udp_init();
+        tcp_init();
+        dhcp_init();
+        dns_init();
+        crypto_init();
+        https_init();
+        wget_init();
+        ftp_init();
+        net_initialized = 1;
+        // #238: the packet filter is loaded BEFORE any address is configured and
+        // therefore before the first DISCOVER leaves the machine, exactly as in
+        // net_init(). The compiled-in fail-safe policy is already in force.
+        fw_boot_load();
+        g_net_static_configured = net_apply_static_config();
+    } else {
+        // A stack that is already up gets the new MAC and keeps its handler
+        // table. eth_init() would zero eth_handler_count and make the stack
+        // deaf, which is why eth_refresh_mac() exists.
+        eth_refresh_mac();
+    }
+
+    // #155 bulk-IN reaper. Idempotent; the boot path starts it from
+    // net_start_worker() when the USB NIC is bound at boot instead.
+    usb_eth_start_rx_worker();
+
+    uint8_t m[6];
+    nic_get_mac(m);
+    bootlog_write("[NETATTACH] hot-plug NIC bound: %s MAC %02x:%02x:%02x:%02x:%02x:%02x "
+                  "stack=%s static=%d",
+                  usb_eth_name(), m[0], m[1], m[2], m[3], m[4], m[5],
+                  net_initialized ? "up" : "DOWN", g_net_static_configured);
+    kprintf("[NETATTACH] hot-plug NIC bound: %s\n", usb_eth_name());
+    return 1;
+}
+
+// Boot self-test for the hot-plug attach handoff. Proves, destructively and
+// against the real statics, the four properties the fix rests on: a boot-time
+// probe arms nothing; a hot-plug probe with no NIC arms exactly one bind; a
+// probe while a NIC is already bound arms NOTHING (so a second adapter cannot
+// rebind the stack or start a second DHCP client); and repeated probes coalesce
+// into one bind while an unplug/replug pair produces two. It is a real assert
+// on the take count, not a compile check, and it writes to the DURABLE log
+// because the owner's machine has no serial port.
+void netattach_selftest(void) {
+    extern int netattach_selftest_rs(void);
+    int fails = netattach_selftest_rs();
+    bootlog_write("[NETATTACH-SELFTEST] %s (%d failing case(s) of 30)",
+                  fails == 0 ? "PASS" : "FAIL", fails);
+}
+
+// One-line census of the attach handoff, for the durable log.
+void netattach_log_stats(const char *why) {
+    uint64_t probe = 0, armed = 0, taken = 0, sb = 0, sn = 0, co = 0, pend = 0;
+    uint64_t det = 0, dett = 0;
+    netattach_stats_rs(&probe, &armed, &taken, &sb, &sn, &co, &pend, &det, &dett);
+    bootlog_write("[NETATTACH] %s: probes=%llu armed=%llu taken=%llu "
+                  "skip_boot=%llu skip_bound=%llu coalesced=%llu pending=%llu "
+                  "unplugs=%llu unbinds=%llu",
+                  why ? why : "census",
+                  (unsigned long long)probe, (unsigned long long)armed,
+                  (unsigned long long)taken, (unsigned long long)sb,
+                  (unsigned long long)sn, (unsigned long long)co,
+                  (unsigned long long)pend, (unsigned long long)det,
+                  (unsigned long long)dett);
+}
+
 static void net_worker(void *arg) {
     (void)arg;
     int prev_link = -1;
@@ -1156,6 +1458,26 @@ static void net_worker(void *arg) {
 
     kprintf("[NET] background net worker running\n");
     for (;;) {
+        // Hot-plug bind FIRST, so nic_refresh_link() below already sees the new
+        // NIC and the existing carrier down->up branch starts DHCP in this very
+        // iteration. prev_link is 0 (the no-NIC passes took the !link path), so
+        // the #431 relink branch is the one that fires.
+        // Unbind BEFORE bind, so a fast unplug/replug inside one worker period
+        // is processed in the order it happened rather than leaving the new
+        // device refused by the old one's binding.
+        if (net_late_detach_service()) {
+            netattach_log_stats("unbound");
+            prev_link = 0;     // the next attach is a genuine down->up edge
+        }
+        if (net_late_attach_service()) {
+            netattach_log_stats("bound");
+        }
+
+        // Durable DORA evidence. Here, on the worker, because it writes a file
+        // and every DHCP event site runs under net_lock (cli + spinlock) where
+        // that is forbidden. Cheap when nothing happened: one seq compare.
+        dhcp_durable_drain();
+
         int link = nic_refresh_link();   // slow USB PHY read here, OFF the UI path
 
         if (!link) {
@@ -1416,7 +1738,9 @@ int net_diag_line(char *buf, unsigned long len) {
     extern uint64_t g_usbnet_fifo_drops;
     return snprintf(buf, len,
         "drv=%s carrier=%d state=%s cfg=%s dhcp=%s ip=%d.%d.%d.%d "
-        "gw=%d.%d.%d.%d gwarp=%s dns=%d.%d.%d.%d rx=%lu tx=%lu txfail=%lu "
+        "gw=%d.%d.%d.%d gwarp=%s dns=%d.%d.%d.%d trip=%s/%d "
+        "rx=%lu tx=%lu txfail=%lu "
+        "nfail=%u ntrip=%u nrec=%u nprobe=%u/%u "
         "usbagg=%lu usbsplit=%lu usbdesync=%lu "
         "usbq=%d usbrx=%lu usbdry=%lu usbfd=%lu usbrsy=%lu usbref=%lu",
         drv, carrier, state,
@@ -1426,9 +1750,16 @@ int net_diag_line(char *buf, unsigned long len) {
         pg[3], pg[2], pg[1], pg[0],
         gwarp ? "RESOLVED" : "UNRESOLVED",
         pd[3], pd[2], pd[1], pd[0],
+        g_net_trip_host[0] ? g_net_trip_host : "-",
+        g_net_trip_rc,
         (unsigned long)g_net_poll_pkts,
         (unsigned long)g_nic_tx_ok,
         (unsigned long)g_nic_tx_fail,
+        (unsigned)g_net_fail_total,
+        (unsigned)g_net_trip_count,
+        (unsigned)g_net_recover_count,
+        (unsigned)g_net_probe_grants,
+        (unsigned)g_net_probe_refused,
         (unsigned long)g_asix_rx_max_xfer,
         (unsigned long)g_asix_rx_split_frames,
         (unsigned long)g_asix_rx_desync,

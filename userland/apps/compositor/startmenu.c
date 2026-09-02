@@ -3398,4 +3398,12 @@ void startmenu_open_category_by_name(const char *label) {
 void startmenu_test_power_confirm(int action) {
     startmenu_power_confirm_show(action);
 }
+
+// (#shutdlg) verification-only: see compositor.h for the contract.
+int startmenu_test_power_confirm_click(int32_t x, int32_t y) {
+    int r = startmenu_power_confirm_handle_mouse(x, y, true) ? 1 : 0;
+    const char *msg = r ? "[PCCLICK] consumed=1\n" : "[PCCLICK] consumed=0\n";
+    sys_write(1, msg, strlen(msg));
+    return r;
+}
 #endif

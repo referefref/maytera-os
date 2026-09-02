@@ -222,6 +222,14 @@ int io_printer_default(char *out, int cap);
 // Decode a scaled opaque ARGB thumbnail (tw*th) into `out` WITHOUT touching the
 // current document. BMP/DIB only for now; other formats return -1. ret 0 ok.
 int io_thumb(const char *path, uint32_t *out, int tw, int th);
+// Splash art (ui.c ui_splash): decode /STUDIO.BMP into the (x,y,boxw,boxh)
+// box of `win`, fit-by-width then centre-cropped vertically, never upscaled
+// (if the art is narrower/shorter than the box the caller's own background
+// shows through the gap). Returns 1 if drawn, 0 if the file is missing or
+// fails to decode (caller must fall back to its own procedural art then -
+// the splash performs real startup work and must never fail to start over
+// a missing/corrupt asset).
+int io_splash_art(int win, int x, int y, int boxw, int boxh);
 
 // ---------------------------------------------------------------------------
 // AI (ai.c). Native LLM via the existing Kimi path: key at /CONFIG/KIMI.KEY,

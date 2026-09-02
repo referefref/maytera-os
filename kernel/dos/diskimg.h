@@ -223,6 +223,94 @@ typedef struct {
 // Succeeds for an UNMOUNTED letter too: the UI needs to show empty drives, and
 // an empty CD letter is exactly what "no disc" looks like.
 int diskimg_query(int idx, diskimg_info_t *out);
+// ===========================================================================
+// #VOLAPI: THE MEDIATED VOLUME GATEWAY (dimg_vol_t)
+// ---------------------------------------------------------------------------
+// THE REQUIREMENT, in the owner's words: "we need a proxy/gateway/api to allow
+// virtual cd access to usermode apps". The alternative, exposing blk_read to
+// Ring 3, was considered and REJECTED: it hands a userland process the whole
+// device and destroys the boundary the Ring-3 DOS port exists to create. The
+// standing rule is that privileged access is reachable "only with a negotiated
+// contract". dimg_vol_t IS that contract, and this comment is its text.
+//
+// WHAT THE CONTRACT SAYS, and what it deliberately does not say:
+//
+//   THE APP ASKS   "which mounted volumes may I use, and what are they?"
+//   THE KERNEL SAYS a per-letter identity: class, format, read-only, the disc's
+//                   own LABEL, its geometry, and ONE VFS PATH (`root`) under
+//                   which its files live.
+//   THE APP THEN    uses ordinary open()/read()/lseek()/readdir() beneath that
+//                   root, where EVERY existing credential check already applies.
+//
+// There is no LBA in this struct, no device identity, no channel/drive pair and
+// no host-side image path. An app cannot express "read sector N of the disk"
+// through it, because the only noun it is given is a directory.
+//
+// WHY A PATH AND NOT A FILE-HANDLE FAMILY. Because the files are ALREADY in the
+// namespace: fs/fat.c's fat_open() has served a mounted image's subtree at
+// /WINDIR/DRIVE_<L> since #196, and proc/syscall_path.h's path_root_ext2()
+// routes every path syscall there via path_img_shadows(). So per-file
+// open/read/seek/close, per-volume scoping, ".."-containment and the uid/gid
+// check come from machinery that is already written, already exercised on every
+// other path in the system, and already enforced at ~94 call sites rather than
+// at however many a new bespoke syscall family remembered to check. A second
+// handle family would have been a second place to forget. The ONLY thing that
+// was genuinely missing from the namespace was the ANSWER TO "WHAT IS THIS
+// DISC", which is what this struct is and nothing more.
+//
+// CAPABILITY GATING REUSES perms_check(), THE CANONICAL MECHANISM. A volume is
+// enumerable to a caller exactly when that caller could traverse and read its
+// root: perms_check(root, euid, egid, R_OK | X_OK). So "which apps may see
+// which volumes" is a /CONFIG/PERMS.DB decision, expressed the same way every
+// other access decision in this system is expressed, with no second policy
+// scheme to keep in step. The no-entry default (fs/perms.c: root-owned 0755)
+// makes a volume readable and NOT writable, which is the correct default for
+// read-only media; an operator narrows it with a PERMS.DB entry on the root.
+// Note the same honest limit sys_diskimg()'s MOUNT gate records: this means
+// "the caller may read this", not "this is not a secret".
+//
+// READ-ONLY IS ENFORCED, NOT ASSUMED. ISO 9660 is read-only by nature, and this
+// struct says so in DISKIMG_F_READONLY, but "by nature" is not enforcement: the
+// kernel refuses writes/creates/unlinks/renames beneath an image-shadowed path
+// outright (fs/fat.c img_ro_refuse()), so a bug in a caller cannot turn into a
+// write attempt that some other layer happens to allow.
+//
+// SIZE IS LOCKED AT 288 BYTES ON PURPOSE. rustkern/argtab.rs validates syscall
+// 361's out-buffer as a fixed 288-byte writable region (SZ_DISKIMG_INFO), so
+// making this struct the SAME width lets the new command share the existing
+// entry instead of needing a second one that could drift from it. The padding
+// is not slack, it is the width lock; _Static_assert in
+// proc/syscall_argtab_lock.c holds it.
+// ===========================================================================
+typedef struct {
+    uint32_t letter;      // index, 0 = A .. 25 = Z
+    uint32_t cls;         // DISKIMG_CLASS_* (drvmap.rs is the authority)
+    uint32_t fmt;         // DISKIMG_FMT_*
+    uint32_t flags;       // DISKIMG_F_* (MOUNTED / JOLIET / READONLY / INUSE)
+    uint32_t gen;         // mount generation: identifies WHICH disc this is
+    uint32_t bytes_per_sector;    // 2048 for ISO 9660
+    uint32_t sectors_per_cluster; // 1 for ISO 9660
+    uint32_t total_clusters;      // clamped to 0xFFFF, as DOS reports it
+    uint64_t size;        // media size in bytes, 0 if not mounted
+    char     label[40];   // the disc's OWN volume identifier, "" if none
+    char     root[64];    // "/WINDIR/DRIVE_E" - where its files are, or ""
+    uint8_t  reserved[144];  // width lock, see the note above. Always zeroed.
+} dimg_vol_t;
+
+// Fill *out for letter index idx, WITHOUT any credential filtering (the
+// syscall layer applies that; an in-kernel caller has already been trusted).
+// Returns 0 on success, -1 for an out-of-range index. Succeeds for an unmounted
+// letter, reporting flags without DISKIMG_F_MOUNTED and an empty label, because
+// "no disc" is a state a caller needs to be able to observe.
+int diskimg_volinfo(int idx, dimg_vol_t *out);
+
+// The VFS path beneath which drive letter `idx`'s files are served, e.g.
+// "/WINDIR/DRIVE_E". Written even for an unmounted letter (the folder exists);
+// this is the ONE definition of the spelling, so the syscall layer and the
+// permission check cannot disagree with fs/fat.c about it.
+// Returns 0 on success, -1 on a bad index or too small a buffer.
+int diskimg_vol_root(int idx, char *out, int cap);
+
 
 // ---------------------------------------------------------------------------
 // VOLUME LABEL AND MEDIA SIZE
@@ -386,5 +474,11 @@ void diskimg_iso_rust_selftest(void);
 // E:, lists the root directory, checksums a named file, then ejects and mounts
 // the next WITHOUT rebooting. Absent file = no-op. Called from main.c.
 void diskimg_boot_harness(void);
+
+// [no-ticket] Force the ISO resolved-extent memo off (every read re-walks the
+// directory tree, the pre-change behaviour). Set from /CONFIG/CDRAOFF.CFG and
+// by dos/cdbench.c's control arm.
+void isomemo_set_disabled(int off);
+int  isomemo_disabled(void);
 
 #endif // DOS_DISKIMG_H

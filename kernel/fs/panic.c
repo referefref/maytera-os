@@ -335,6 +335,29 @@ void kpanic_halt(void) {
     // synchronous, so everything printed after this point goes straight out.
     // An unflushed buffer at a panic would be a worse bug than the latency this
     // ticket set out to remove.
+    // #75 STOP THE WORLD. Every terminal path reaches here (kpanic() above and
+    // cpu/idt.c's kernel-fault branch), so this is the one place that covers
+    // both. Until 2026-08-29 a panic with the #67 SMP gate ON halted only the
+    // faulting core and the other three carried on scheduling - measured, with
+    // a deliberately injected corrupt context: the dump was printed, the banner
+    // was printed, and the machine kept running with the corrupt task still
+    // selected on the dead core. Every subsequent line in such a log describes
+    // a machine that is STILL CHANGING, which makes the whole capture
+    // untrustworthy rather than merely incomplete.
+    //
+    // Done BEFORE the console flush so the banner is not interleaved with three
+    // other cores' output, and before bkl_release_all() so no stopped core can
+    // be resumed into a lock this one is about to drop.
+    {
+        extern uint32_t smp_panic_stop_others(uint32_t *expected);
+        uint32_t expect = 0;
+        uint32_t got = smp_panic_stop_others(&expect);
+        if (expect)
+            kprintf("[PANIC] stopped %u of %u other core(s)%s\n", got, expect,
+                    (got < expect) ? "  *** THE REST ARE STILL RUNNING: read "
+                                     "everything below this line as a moving "
+                                     "target ***" : "");
+    }
     console_panic_flush();
     // Declared locally (matches cpu/smp.h) to avoid an fs -> cpu include edge.
     extern uint32_t bkl_release_all(void);

@@ -27,6 +27,8 @@ typedef struct {
 
 // Initialize ethernet
 void eth_init(void);
+// Re-read the NIC MAC without clearing the handler table (late NIC bind).
+void eth_refresh_mac(void);
 
 // Send an ethernet frame
 int eth_send(const uint8_t *dest_mac, uint16_t type, const void *data, uint16_t length);

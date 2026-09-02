@@ -204,7 +204,20 @@ void dos_resolve_path(const char *in, const char *reldir, char *out, int outsz) 
     dos_resolve_path_ex(in, reldir, g_cur_drive, dospath_global_cwd, 0, out, outsz);
 }
 
-void dos_resolve_path_ex(const char *in, const char *reldir, char cur_drive,
+// rustkern/dospath.rs: collapse "." and ".." components of a resolved native
+// path in place, clamped so a guest cannot climb out of /WINDIR/DRIVE_<X>.
+// Returns 1 if it rewrote the path. Declared here rather than in a header
+// because dospath.c is its only caller: the whole point is that ONE function
+// resolves DOS paths, so exactly one function needs to canonicalise them.
+int dospath_canon_rs(char *path, int cap);
+
+// The resolver proper. Everything below the wrapper is unchanged; the wrapper
+// exists so that the canonicalisation cannot be skipped by one of the three
+// early returns in here. (The Dig, 2026-08-28: ".\\*.BUN" resolved to
+// /WINDIR/DRIVE_E/DIG/./*.BUN, whose directory half no filesystem in this tree
+// can open, so 4Eh findfirst reported the perfectly plausible "no more files"
+// and the game never found DIGMUSIC.BUN or DIGVOICE.BUN. See blame.md.)
+static void dos_resolve_path_body(const char *in, const char *reldir, char cur_drive,
                          dos_cwd_lookup_fn cwd, void *u, char *out, int outsz) {
     if (!out || outsz <= 0) return;
     out[0] = '\0';
@@ -334,6 +347,14 @@ void dos_resolve_path_ex(const char *in, const char *reldir, char cur_drive,
     }
 
     for (int i = 0; out[i]; i++) out[i] = up(out[i]);
+}
+
+void dos_resolve_path_ex(const char *in, const char *reldir, char cur_drive,
+                         dos_cwd_lookup_fn cwd, void *u, char *out, int outsz) {
+    dos_resolve_path_body(in, reldir, cur_drive, cwd, u, out, outsz);
+    // AFTER the uppercase pass, because the canonicaliser matches the
+    // /WINDIR/DRIVE_<X> prefix literally to know where the ".." floor is.
+    dospath_canon_rs(out, outsz);
 }
 
 // Create one directory if it does not already exist (best effort).
@@ -563,6 +584,16 @@ int dos_overlay_prepare(const char *base, const char *ovl,
 }
 
 void dos_windir_init(void) {
+    // PROVE the path canonicaliser at boot rather than describe it. This runs
+    // on the golden too: it is eighteen string comparisons once per boot, and
+    // the alternative is a rule about ".." clamping that nobody can see hold.
+    {
+        extern int dospath_canon_selftest_rs(int *total);
+        int total = 0;
+        int fails = dospath_canon_selftest_rs(&total);
+        kprintf("[DOSPATH] canon '.'/'..' self-test: %d/%d vectors PASS%s\n",
+                total - fails, total, fails ? "  *** FAIL ***" : "");
+    }
     ensure_dir(WINDIR_ROOT);
     ensure_dir(WINDIR_ROOT "/DRIVE_A");
     ensure_dir(WINDIR_ROOT "/DRIVE_B");   // #739: B: is a real floppy slot now

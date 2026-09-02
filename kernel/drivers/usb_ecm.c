@@ -564,6 +564,19 @@ static void usbnet_rx_worker(void *arg) {
     int announced = 0;
 
     for (;;) {
+        // The device is gone (unplugged) or not yet (re)started. Do NOT service
+        // its ring: the slot is disabled and the buffers are being reset by a
+        // concurrent re-attach on the net worker. Fall through to the SAME
+        // wait_event_timeout the loop already uses, so this is a skipped pass,
+        // not a new wait and not a spin.
+        if (!d->active || !d->started) {
+            uint64_t idle_seen = xhci_msi_seq();
+            (void)wait_event_timeout(evtq,
+                                     (d->active && d->started) ||
+                                     xhci_msi_seq() != idle_seen,
+                                     wq_ms_to_ticks(USBNET_RX_BACKSTOP_MS));
+            continue;
+        }
         if (d->rx_resync) usbnet_rx_restart(d);
         // Ramp to full depth as a ONE-SHOT inside the normal loop, so a token
         // held by the inline fallback costs one more pass rather than a retry
@@ -608,6 +621,34 @@ void usb_eth_start_rx_worker(void) {
 
 int usb_eth_present(void) {
     return g_usbnet.active;
+}
+
+// Does the USB NIC live on this slot? Asked by xhci_teardown_port_slots(),
+// which must know which of its slots belong to which class driver.
+int usb_net_owns_slot(int slot_id) {
+    return g_usbnet.active && g_usbnet.slot_id == slot_id;
+}
+
+// UNPLUG. Without this a replug is silently ignored: usb_net_probe() opens with
+// `if (g_usbnet.active) return 0`, so the NEW device is claimed by nobody, and
+// net_has_nic() still answers 1, so nothing would arm even if it were.
+// g_usbnet also keeps pointing at a slot the controller has disabled.
+//
+// Runs on the xhci_rescan worker, from the ONE place a slot is freed, so it
+// cannot be missed by a future caller (the same argument xhci.c makes for
+// usb_hid_detach_slot). It clears the device flags and ARMS the unbind; the
+// unbind itself happens on net_worker, like the attach, so nothing about the
+// network stack is touched from inside USB teardown.
+void usb_net_detach_slot(int slot_id) {
+    usbnet_dev_t *d = &g_usbnet;
+    if (!d->active || d->slot_id != slot_id) return;
+    d->active  = 0;     // stops the RX reaper servicing a dead slot
+    d->started = 0;     // a replug re-runs usb_eth_start()
+    d->link    = 0;
+    extern void netattach_on_detach_rs(void);
+    netattach_on_detach_rs();
+    kprintf("[USB-NET] NIC unplugged (slot %d)\n", slot_id);
+    bootlog_write("[NETATTACH] USB NIC unplugged (slot %d); unbind armed", slot_id);
 }
 
 const char *usb_eth_name(void) {
@@ -803,8 +844,11 @@ static int cfg_find_ecm_iface(uint8_t *cfg, int total) {
     return -1;
 }
 
-int usb_ecm_attach_cfg(xhci_controller_t *xhc, int slot_id, int speed,
-                       uint8_t *cfg, int total) {
+// cfg_idx is the GET_DESCRIPTOR configuration INDEX this descriptor came from
+// (0 = the one enumeration already fetched). It exists only so the durable log
+// can say which configuration was bound; nothing branches on it.
+int usb_ecm_attach_cfg_idx(xhci_controller_t *xhc, int slot_id, int speed,
+                           uint8_t *cfg, int total, int cfg_idx) {
     int ctrl_if = cfg_find_ecm_iface(cfg, total);
     if (ctrl_if < 0) return -1;
     int cfg_value = (total >= 6) ? cfg[5] : 1;
@@ -875,7 +919,9 @@ int usb_ecm_attach_cfg(xhci_controller_t *xhc, int slot_id, int speed,
     d->type = USBNET_TYPE_ECM;
 
     // MAC address from the Ethernet functional descriptor's string.
+    int mac_from_descriptor = 1;
     if (ecm_read_mac_string(xhc, slot_id, imac, d->mac) != 0) {
+        mac_from_descriptor = 0;
         // Fall back to a locally administered address rather than failing:
         // a NIC with a random MAC still gets a DHCP lease.
         kprintf("[USB-ECM] iMACAddress string unreadable, using fallback MAC\n");
@@ -914,7 +960,38 @@ int usb_ecm_attach_cfg(xhci_controller_t *xhc, int slot_id, int speed,
     bootlog_write("[USB-ECM] CDC-ECM NIC attached (slot %d), MAC %02x:%02x:%02x:%02x:%02x:%02x",
                   slot_id, d->mac[0], d->mac[1], d->mac[2],
                   d->mac[3], d->mac[4], d->mac[5]);
+    // BINDING PROVENANCE, durable (no ticket, 2026-08-28).
+    //
+    // A composite device can expose a vendor-specific configuration AND a CDC
+    // one; the Realtek RTL8156 (0bda:8156) exposes three configurations and
+    // the FIRST one, which is the only one /USBLOG.TXT records, is a single
+    // class 0xff interface. From the old log line alone there was no way to
+    // tell whether "CDC-ECM NIC attached" meant a real CDC binding or an ECM
+    // framing bolted onto a vendor data path, and those two fail identically:
+    // DHCP sends and nothing ever answers.
+    //
+    // Everything on this line is decisive. cfgidx/cfgval say WHICH of the
+    // device's configurations we selected. ctrlif is the interface that
+    // matched bInterfaceClass==0x02 && bInterfaceSubClass==0x06 (Communications
+    // / Ethernet Networking Control Model), which is a strict class match, not
+    // an endpoint-shape guess and not a VID/PID table. mac=descriptor means the
+    // MAC came from the CDC Ethernet Networking functional descriptor's
+    // iMACAddress string (0x24 subtype 0x0F), which does not exist outside a
+    // real CDC function; mac=FALLBACK means we could not read it and installed
+    // a locally administered address, which is worth knowing before blaming
+    // the network.
+    bootlog_write("[USB-ECM] binding: cfgidx=%d cfgval=%d ctrlif=%d(class 02/06) "
+                  "dataif=%d alt=%d in=0x%02x/%d out=0x%02x/%d mac=%s",
+                  cfg_idx, cfg_value, ctrl_if, data_if, alt,
+                  ep_in, in_mps, ep_out, out_mps,
+                  mac_from_descriptor ? "descriptor" : "FALLBACK");
     return 0;
+}
+
+// Back-compat wrapper: the config already fetched by enumeration is index 0.
+int usb_ecm_attach_cfg(xhci_controller_t *xhc, int slot_id, int speed,
+                       uint8_t *cfg, int total) {
+    return usb_ecm_attach_cfg_idx(xhc, slot_id, speed, cfg, total, 0);
 }
 
 // =============================================================================
@@ -937,6 +1014,27 @@ static const struct { uint16_t vid, pid; int is179; } asix_ids[] = {
     { 0x2001, 0x4A00, 1 },   // D-Link DUB-1312
 };
 
+// Hot-plug attach hook (no ticket, 2026-08-28). Called on EVERY path that
+// successfully claims a USB NIC (CDC-ECM in the first configuration, CDC-ECM in
+// a later configuration, ASIX AX88772/AX88179, and anything added later), which
+// is why it lives at the ONE exit of usb_net_probe() rather than in each driver.
+//
+// It arms a flag and returns. It does NOT start DHCP, bind the driver or touch
+// the wire: this runs on the xhci_rescan worker inside device enumeration, one
+// control transfer away from every other device on the bus, and #549 is the
+// recorded cost of blocking somewhere that cannot block. net_worker does the
+// work, within ~1s. See the long comment in net/net.c.
+static int usbnet_probe_done(int claimed) {
+    extern int  netattach_on_probe_rs(int nic_bound);
+    extern int  net_has_nic(void);
+    if (!claimed) return 0;
+    if (netattach_on_probe_rs(net_has_nic())) {
+        bootlog_write("[NETATTACH] hot-plug USB NIC (%s) armed for the net worker",
+                      usb_eth_name());
+    }
+    return 1;
+}
+
 int usb_net_probe(xhci_controller_t *xhc, int slot_id, int speed,
                   uint16_t vid, uint16_t pid,
                   uint8_t *cfg, int cfg_total, uint8_t num_configs) {
@@ -947,14 +1045,15 @@ int usb_net_probe(xhci_controller_t *xhc, int slot_id, int speed,
         if (asix_ids[k].vid == vid && asix_ids[k].pid == pid) {
             kprintf("[USB-NET] ASIX %s dongle %04x:%04x detected\n",
                     asix_ids[k].is179 ? "AX88179" : "AX88772", vid, pid);
-            return usb_asix_attach(xhc, slot_id, speed, vid, pid,
-                                   asix_ids[k].is179, cfg, cfg_total) == 0;
+            return usbnet_probe_done(usb_asix_attach(xhc, slot_id, speed, vid, pid,
+                                     asix_ids[k].is179, cfg, cfg_total) == 0);
         }
     }
 
     // 2) CDC-ECM in the already-fetched configuration (index 0).
     if (cfg_find_ecm_iface(cfg, cfg_total) >= 0) {
-        return usb_ecm_attach_cfg(xhc, slot_id, speed, cfg, cfg_total) == 0;
+        return usbnet_probe_done(usb_ecm_attach_cfg(xhc, slot_id, speed,
+                                                   cfg, cfg_total) == 0);
     }
 
     // 3) Search the device's OTHER configurations for an ECM function.
@@ -980,7 +1079,15 @@ int usb_net_probe(xhci_controller_t *xhc, int slot_id, int speed,
             if (cc != CC_SUCCESS && cc != CC_SHORT_PACKET) continue;
             if (cfg_find_ecm_iface(cfg2, total) >= 0) {
                 kprintf("[USB-NET] CDC-ECM function found in config index %d\n", ci);
-                return usb_ecm_attach_cfg(xhc, slot_id, speed, cfg2, total) == 0;
+                // DURABLE: on a composite device this is the step that decides
+                // we are NOT binding the vendor-specific configuration that
+                // enumeration fetched. It was kprintf-only, i.e. invisible on a
+                // machine with no serial port, which is every real one.
+                bootlog_write("[USB-NET] %04x:%04x: config index 0 has no CDC-ECM "
+                              "function; found one in config index %d of %d, "
+                              "binding that", vid, pid, ci, (int)num_configs);
+                return usbnet_probe_done(usb_ecm_attach_cfg_idx(xhc, slot_id, speed,
+                                                                cfg2, total, ci) == 0);
             }
         }
     }

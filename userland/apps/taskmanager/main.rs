@@ -1049,7 +1049,23 @@ fn draw_processes(a: &App) {
         draw_text(a.win, c_pid, ry + 3, b.as_c(), 12, ink);
         draw_text(a.win, c_state, ry + 3, state_name(a.procs[i].state), 11, dim);
         b.clear();
-        if a.procs[i].running_cpu < 1 { b.put(b'-'); } else { b.puts(b"AP"); b.putu(a.procs[i].running_cpu as u64); }
+        // (rakbd) THREE STATES, NOT TWO. This used to be `< 1 -> '-'`, which
+        // rendered "running on the BSP right now" (running_cpu == 0) and "not
+        // running anywhere" (running_cpu == -1) as the SAME dash. Since the
+        // scheduler publishes 0 for every process the BSP is executing, and the
+        // BSP is where almost everything runs, the column could only ever show
+        // a value for an AP - so it read as a nearly empty column with an
+        // occasional AP number appearing and vanishing, which is exactly what
+        // it was reported as. The data was right; the rendering collapsed the
+        // common case into the "nothing here" glyph.
+        if a.procs[i].running_cpu < 0 {
+            b.put(b'-');
+        } else if a.procs[i].running_cpu == 0 {
+            b.puts(b"CPU0");
+        } else {
+            b.puts(b"AP");
+            b.putu(a.procs[i].running_cpu as u64);
+        }
         draw_text(a.win, c_thr, ry + 3, b.as_c(), 11, dim);
         b.clear(); b.putu(a.cpu_pct[i] as u64); b.put(b'%');
         draw_text(a.win, c_cpu, ry + 3, b.as_c(), 12, ink);

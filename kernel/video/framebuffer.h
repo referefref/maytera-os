@@ -49,6 +49,45 @@ uint32_t fb_get_phys_height(void);
 void fb_rotate_profile_get(uint64_t *tot_cyc, uint64_t *max_cyc,
                             uint64_t *calls, uint64_t *px_tot);
 
+// ---------------------------------------------------------------------------
+// #halfres: integer PRESENT-SCALE compositing. One owner's 3840x2160 panel
+// has no 1920x1080 firmware mode (all seven GOP modes are 4:3/5:4 except
+// native 4K), and he already runs the UI at 200% scale, i.e. every widget is
+// already drawn at double size into 8.29 Mpx. Compositing at 1920x1080
+// (scale 100%) and presenting with an EXACT integer 2x pixel replication
+// gives the identical apparent picture for a quarter of the compositing
+// work, with no resampling softness (unlike the general "virtual resolution"
+// idea a prior investigation measured and rejected as both slower and soft).
+//
+// This reuses EXACTLY the logical/physical split #745's display rotation
+// already built: fb_get_width()/fb_get_height() (and every draw primitive)
+// stay LOGICAL - the compositor, uiscale, and every app keep thinking in
+// 1920x1080 and never learn this exists - while fb_get_phys_*() is the real
+// panel, and only the present chokepoint (fb_swap_buffers/fb_swap_dirty_
+// rects) knows how to get from one to the other. See kernel/gui/presentscale.c
+// for the config/ESP-override plumbing (mirrors uiscale.c) and
+// kernel/rustkern/presentscale.rs for the pure validate-the-factor arithmetic
+// (mirrors uiscale.rs). See framebuffer.c for why this does NOT reallocate
+// the back buffer (kmalloc_aligned() memory here has no matching free).
+//
+// n=1 (the default, and what every machine that never asked for this stays
+// at) is byte-identical to a kernel without this feature: fb_set_present_
+// scale(1) is a no-op and fb_swap_buffers()/fb_swap_dirty_rects() take their
+// UNCHANGED pre-existing code path.
+bool fb_set_present_scale(int n);
+int  fb_get_present_scale(void);
+
+// Cumulative TSC-cycle cost of the present-scale replication copy
+// (fb_present_rect_scaled in framebuffer.c), mirroring fb_rotate_profile_get.
+// All-zero when fb_get_present_scale() == 1. Read by main.c's [SCALEPROF]
+// boot log line. src_px_tot is what the compositor actually composited (the
+// number this feature is meant to shrink); dst_px_tot is physical pixels
+// written, which does NOT shrink - the present still touches every real
+// panel pixel either way, only the SOURCE read shrinks.
+void fb_scale_profile_get(uint64_t *tot_cyc, uint64_t *max_cyc,
+                           uint64_t *calls, uint64_t *src_px_tot,
+                           uint64_t *dst_px_tot);
+
 // Get framebuffer dimensions
 uint32_t fb_get_width(void);
 uint32_t fb_get_height(void);

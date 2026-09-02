@@ -6,6 +6,7 @@
 // copied by the Rust builders (rustkern.rs) through exactly-sized slices.
 #include "procinfo.h"
 #include "procmem.h"
+#include "../sync/spinlock.h"   // #SMPGLOBALS: process_t::fd_lock
 #include "process.h"
 #include "services.h"
 #include "../serial.h"
@@ -103,7 +104,19 @@ int64_t sys_proc_handles(uint32_t pid, void *ubuf, int max) {
 
     handle_src_t src[PI_MAX_HANDLES];
     uint32_t n = 0;
-    for (int fd = 0; fd < MAX_FDS && n < (uint32_t)max; fd++) {
+    // #SMPGLOBALS: this is THE cross-process reader of an fd table, and the
+    // only one. Every other toucher of fds[] works on proc_current(), which
+    // runs on one core at a time; the Task Manager walks a table its owner is
+    // concurrently mutating. Take that process's fd_lock for the whole scan,
+    // so a slot cannot be read mid-swap and the census cannot straddle a
+    // close. handle_kind_of() only inspects f->ops, so it is safe under the
+    // lock; nothing here blocks.
+    //
+    // NOTE, and this is not fixed by the lock: src[].path is a pointer INTO
+    // the description. The owner can still close and free it after we drop
+    // the lock. See the fd_get() note in fs/vfs.c.
+    { uint64_t __fl = spinlock_acquire_irqsave(&p->fd_lock);
+      for (int fd = 0; fd < MAX_FDS && n < (uint32_t)max; fd++) {
         file_t *f = p->fds[fd];
         if (!f) continue;
         src[n].fd = fd;
@@ -112,7 +125,8 @@ int64_t sys_proc_handles(uint32_t pid, void *ubuf, int max) {
         src[n]._pad = 0;
         src[n].path = f->path;
         n++;
-    }
+      }
+      spinlock_release_irqrestore(&p->fd_lock, __fl); }
     // #19/#645: the BUILDER is this path's copy engine (see the file header:
     // every byte reaching the caller's buffer is written by it through
     // exactly-sized slices), so the AC window is around the copy engine, which
@@ -259,7 +273,11 @@ int64_t sys_proc_detail(uint32_t pid, void *uout) {
     c_cstr_into(d.name, PI_NAME_MAX, p->name);
 
     uint32_t nh = 0;
-    for (int fd = 0; fd < MAX_FDS; fd++) if (p->fds[fd]) nh++;
+    // #SMPGLOBALS: same reason as the handle scan above - a count taken while
+    // the owner is closing fds could otherwise straddle a swap.
+    { uint64_t __fl = spinlock_acquire_irqsave(&p->fd_lock);
+      for (int fd = 0; fd < MAX_FDS; fd++) if (p->fds[fd]) nh++;
+      spinlock_release_irqrestore(&p->fd_lock, __fl); }
     d.handles = nh;
 
     // #421 phase 5: this is a THIRD caller of proc_mem_fill_in()+

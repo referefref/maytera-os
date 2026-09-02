@@ -342,6 +342,26 @@ endif
 #   make SMAPTEST=1     - arm a DELIBERATE unsanctioned Ring-0 read of a user
 #                         page (exec/elf.c), the negative control that PROVES
 #                         CR4.SMAP traps. Never for a golden.
+# ---------------------------------------------------------------------------
+# `make GUARD130_DISABLE=1` -- #pid0desk: THE #130 REPRODUCER. NEVER for a golden.
+# ---------------------------------------------------------------------------
+# Removes the one-line guard in add_to_ready_queue() that stops an idle process
+# entering the shared run queue, so the corruption #130 fixed can be shown to
+# still be real rather than merely asserted. Needs a MULTI-vCPU boot with an
+# empty /SMPSCHED.TXT on the ESP as well; see the comment at the guard itself.
+# Expect [SCHEDRACE] CORRUPT CONTEXT and/or a wild-RIP panic in pid 0's stack.
+#
+# THIS BLOCK MUST STAY AT TOP LEVEL. It was first written nested inside
+# `ifeq ($(NOBLOCKPANIC),1)`, where `make GUARD130_DISABLE=1` exited 0, built a
+# whole kernel, and quietly produced a NORMAL one: the define never reached
+# CFLAGS. A build flag that silently does nothing is the same failure class as
+# the increment_build.sh that was `exit 0` for months. The $(info) below is the
+# receipt: if you do not see that line, the flag is NOT in effect.
+ifdef GUARD130_DISABLE
+CFLAGS += -DGUARD130_DISABLE
+$(info [pid0desk] GUARD130_DISABLE=1: the #130 idle-enqueue guard is COMPILED OUT. Reproducer kernel, NEVER ship.)
+endif
+
 ifeq ($(NOBLOCKPANIC),1)
 CFLAGS += -DWQ_NOBLOCK_PANIC
 endif
@@ -373,6 +393,57 @@ CFLAGS += -DXHCI_EPTEST
 endif
 ifeq ($(XHCIEPTEST),2)
 CFLAGS += -DXHCI_EPTEST -DXHCI_EPTEST_NORECOVER
+endif
+
+# #307/#433: `make XHCIFAILPORT=<n>` reproduces the owner's FAULTY ROOT PORT.
+# Root port <n> is made to fail Address Device on every single attempt, after
+# Enable Slot, which is precisely what his ASUS does: a port that reports a
+# device connected at Low-Speed and can never address it. Every OTHER port is
+# untouched, so one boot proves both halves - the bad port stops being retried
+# AND the working devices (including the USB device the machine booted from)
+# still come up. NEVER for a golden.
+#   XHCIFAILPORT=<n>                  GREEN arm: the give-up governor is live.
+#                                     Expect a bounded number of attempts
+#                                     (USBPORT_GIVEUP_BUDGETS x XHCI_ENUM_RETRIES
+#                                     = 24) then one "*** PORT n GIVEN UP ON"
+#                                     line and silence.
+#   XHCIFAILPORT=<n> XHCINOGOVERNOR=1 RED arm: governor removed, i.e. the
+#                                     pre-fix behaviour. Expect the attempt count
+#                                     to keep climbing for as long as the VM runs.
+# If the RED arm also stops, the test proves nothing and must be discarded.
+#   XHCIFAILPORT=<n> XHCIFLAPEVERY=<k> (deadport) ALSO injects a synthetic
+#                                     connect-status change on that port every
+#                                     k-th re-scan. The plain arm above proves
+#                                     the RETRY budget; it cannot reproduce the
+#                                     fault that actually bit, because that port
+#                                     ALSO asserts real CCS edges on its own and
+#                                     so keeps being handed a fresh budget
+#                                     (MEASURED 2026-08-28: two give-ups, 48
+#                                     attempts, one boot). Expect at most
+#                                     USBPORT_MAX_RETIRES give-ups and then a
+#                                     FINAL one, after which the injected
+#                                     changes are logged as REFUSED.
+# (#fmzombie) make FMSPINPLANT=<frames> - PROOF GATE, never shipped.
+#   Makes sys_audio_pcm_write answer /APPS/FMSYNTH's writes with 0 (no block,
+#   no error) once that stream has taken <frames> frames. That is EXACTLY what
+#   pcm_write_common() returned for an already-stopped stream before this
+#   ticket, and it is the condition that turned the synthesiser's render loop
+#   into a busy-wait. It exists so the consumer's handling of a zero-length
+#   write can be MEASURED in both arms rather than argued from the source.
+#   882000 frames is 20 s at 44100. There is no default and no config file:
+#   omit the variable and the plant does not exist in the binary (PROVEN: a
+#   plain `make` with the plant added produced a byte-identical kernel.elf).
+ifneq ($(FMSPINPLANT),)
+CFLAGS += -DFMSPIN_PLANT=$(FMSPINPLANT)
+endif
+ifneq ($(XHCIFAILPORT),)
+CFLAGS += -DXHCI_FAILPORT=$(XHCIFAILPORT)
+endif
+ifneq ($(XHCIFLAPEVERY),)
+CFLAGS += -DXHCI_FLAPEVERY=$(XHCIFLAPEVERY)
+endif
+ifeq ($(XHCINOGOVERNOR),1)
+CFLAGS += -DXHCI_NOGOVERNOR
 endif
 
 # #156: `make XHCIMSI=1` arms #139's xHCI MSI. IT IS OFF IN A NORMAL/GOLDEN
@@ -1176,6 +1247,49 @@ ifneq ($(YMMTEST),)
 ASFLAGS += -dFPU_YMM_SELFTEST
 endif
 
+# ---------------------------------------------------------------------------
+# #SMPGLOBALS: `make SIGFRAMEDIFF=1` -- THE PROOF BUILD. NEVER for a golden.
+# ---------------------------------------------------------------------------
+# Keeps the DELETED global g_syscall_saved_frame alive (proc/syscall.asm still
+# stores rsp into it) purely as the reference the per-task fix is measured
+# against, and compiles in:
+#   * a differential in sys_rt_sigreturn that counts how often that global
+#     named a DIFFERENT frame than the caller's own, and names the task whose
+#     saved registers the old code would therefore have rewritten;
+#   * a RED arm: drop an empty /SIGFRAMEBUG.TXT on the FAT ESP and
+#     rt_sigreturn USES the global again, restoring the pre-fix behaviour so
+#     the corruption can be SEEN rather than inferred from a counter.
+# One binary serves both arms; the arm is chosen at boot by that file, exactly
+# as /SMPSCHED.TXT chooses the SMP arm.
+#
+# BOTH flags are needed and they go to DIFFERENT tools: the store is in nasm
+# (ASFLAGS -d), the differential is in C (CFLAGS -D). This block sits BELOW the
+# ASFLAGS assignment on purpose; up with the other CFLAGS test flags the
+# ASFLAGS append would be silently discarded by the assignment further down,
+# which is the exact failure the GUARD130_DISABLE comment ~900 lines above
+# records. The $(info) line is the receipt: no line, no flag. The other receipt
+# is `nm kernel.dbg.elf | grep g_syscall_saved_frame`, which must find the
+# symbol in this build and MUST NOT find it in a normal one.
+# ---------------------------------------------------------------------------
+# #SMPGLOBALS: `make FDRACETEST=1` -- the fd-table lock's NEGATIVE CONTROL.
+# ---------------------------------------------------------------------------
+# Compiles in fs/fdrace_test.c and a run-time switch that turns the per-process
+# fd_lock OFF (drop an empty /FDLOCKOFF.TXT on the ESP), so the harness can be
+# SEEN to go red on the pre-2026-08-30 behaviour and green with the lock. Same
+# argument and same one-binary-two-arms shape as NOBLOCKTEST / XHCIEPTEST /
+# SIGFRAMEDIFF: a lock nobody has watched a race hit is not evidence.
+# The $(info) below is the receipt. NEVER for a golden.
+ifeq ($(FDRACETEST),1)
+CFLAGS += -DFDRACE_TEST
+$(info [smpglobals] FDRACETEST=1: fs/fdrace_test.c is COMPILED IN and the fd_lock can be turned OFF at run time. Proof kernel, NEVER ship.)
+endif
+
+ifeq ($(SIGFRAMEDIFF),1)
+CFLAGS  += -DSIGFRAME_DIFF
+ASFLAGS += -dSIGFRAME_DIFF
+$(info [smpglobals] SIGFRAMEDIFF=1: g_syscall_saved_frame is KEPT and the rt_sigreturn differential is COMPILED IN. Proof kernel, NEVER ship.)
+endif
+
 # Linker flags
 # -z noexecstack (#404 Phase A): a Rust staticlib member can omit the
 # .note.GNU-stack section; the GNU linker then conservatively marks the WHOLE
@@ -1423,11 +1537,50 @@ dirs:
 # split sync/noblock.c uses.
 #   make SCHEDRACE=1              - reproducer build, 40us per site
 #   make SCHEDRACE=1 SCHEDRACE_US=200 - wider still
+# `make SCHEDRACE_INJECT=1` -- THE NEGATIVE CONTROL for the whole #75 fault-
+# visibility chain. Corrupts one incoming Ring-3 context on purpose (see
+# proc/schedrace.c section 5) so the detector, the gate-live kpanic, the serial
+# capture and the campaign harness can each be SEEN to go RED. Needs the #67
+# gate ON (/SMPSCHED.TXT) to fire at all. NEVER for a golden.
+#   make SCHEDRACE_INJECT=1                       - fire at 90s uptime
+#   make SCHEDRACE_INJECT=1 SCHEDRACE_INJECT_AT=45 - fire earlier (seconds of uptime)
+# Written at TOP LEVEL and with an $(info) line, because the GUARD130_DISABLE
+# flag was once nested inside an unrelated ifeq and silently built a NORMAL
+# kernel while exiting 0. If the [smpcore] line below does not appear in the
+# build log, the flag is NOT in effect.
+ifdef SCHEDRACE_INJECT
+CFLAGS += -DSCHEDRACE_INJECT
+ifdef SCHEDRACE_INJECT_AT
+CFLAGS += -DSCHEDRACE_INJECT_AT=$(SCHEDRACE_INJECT_AT)
+endif
+$(info [smpcore] SCHEDRACE_INJECT=1: a DELIBERATE corrupt context will be injected once the #67 gate is on. Reproducer kernel, NEVER ship.)
+endif
+
 ifdef SCHEDRACE
 CFLAGS += -DSCHEDRACE
 ifdef SCHEDRACE_US
 CFLAGS += -DSCHEDRACE_US=$(SCHEDRACE_US)
 endif
+endif
+
+# --- #67/#421 CONTEXT-SWITCH STORM: panic instead of wedging -----------------
+# make: Nothing to be done for all. turns the first [SCHEDSTORM] report into a kpanic.
+#
+# THIS BLOCK WAS MISSING. proc/process.c:2492 has had the  kpanic for as long as the detector has existed, and THREE
+# comments (proc/process.c:947, :2414 and cpu/smp.c:118) told the reader to
+# build with make: Nothing to be done for all. - but nothing here ever turned that
+# variable into a -D, so the documented command silently produced an ordinary
+# kernel. A make variable that no makefile reads is not a switch; it is a
+# spelling of the default that reads like a switch, which is worse, because
+# somebody chasing the #421 livelock signature would have concluded the panic
+# arm does not fire when in fact it was never compiled in.
+#
+# Same gating shape as SCHEDRACE and NOBLOCKPANIC: the DETECTOR is always
+# compiled in (it is cheap, and the recorded failure mode is silence); only the
+# reaction is gated. Never ship this: a storm report is a diagnosis, and on a
+# machine that is otherwise usable a panic is worse than a log line.
+ifeq ($(SCHEDSTORMPANIC),1)
+CFLAGS += -DSCHEDSTORMPANIC
 endif
 
 # #135: `make RTCBINTEST=1` compiles in drivers/rtc.c's LIVE hardware

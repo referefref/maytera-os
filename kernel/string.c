@@ -676,22 +676,54 @@ typedef struct {
     char   *buf;
     size_t  size;     // full buffer size, including the terminator slot
     size_t  written;
+    size_t  dropped;  // deadport: characters the sink had no room to store
 } kfmt_buf_ctx_t;
 
 static void kfmt_buf_sink(void *vctx, char c) {
     kfmt_buf_ctx_t *b = (kfmt_buf_ctx_t *)vctx;
     if (b->written < b->size - 1) b->buf[b->written++] = c;
+    else b->dropped++;
 }
 
-int vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap) {
+// deadport: THIS vsnprintf IS NOT C99, AND CALLERS DEPEND ON THAT.
+//
+// C99 returns the length that WOULD have been written, so the standard
+// truncation test is `if (n >= size)`. This one returns the bytes ACTUALLY
+// written, capped at size-1, so that test CAN NEVER BE TRUE. Every such test in
+// this tree is therefore dead code, and at least two existed and had never once
+// fired: the clamp in fs/bootlog.c (four copies) and the one it replaced. Lines
+// were being cut at exactly 255 characters, in the owner's boot logs, with
+// nothing detecting it, because the detector was structurally incapable of
+// firing. MEASURED on a test boot: three lines sat at exactly 255 characters,
+// visibly cut mid-word, while the truncation counter read zero.
+//
+// The fix is NOT to make vsnprintf C99. Code here is written against the
+// clamped semantics, most importantly the accumulate-into-one-buffer idiom
+// `o += snprintf(buf + o, sizeof(buf) - o, ...)` (drivers/xhci.c's heartbeat is
+// one), where a C99 return would let `o` run PAST the end of the buffer and the
+// next call would compute a negative size. Changing the return value would turn
+// a cosmetic truncation bug into an out-of-bounds write across the tree.
+//
+// So the overflow is reported out of band instead, by the sink that actually
+// sees it. vsnprintf() keeps its exact previous behaviour and return value;
+// callers that care about truncation ask for it explicitly.
+int vsnprintf_dropped(char *buf, size_t size, const char *fmt,
+                      __builtin_va_list ap, size_t *dropped) {
+    if (dropped) *dropped = 0;
     if (size == 0) return 0;
     kfmt_buf_ctx_t ctx;
     ctx.buf = buf;
     ctx.size = size;
     ctx.written = 0;
+    ctx.dropped = 0;
     kvformat(kfmt_buf_sink, &ctx, fmt, ap);
     buf[ctx.written] = '\0';
+    if (dropped) *dropped = ctx.dropped;
     return (int)ctx.written;
+}
+
+int vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap) {
+    return vsnprintf_dropped(buf, size, fmt, ap, 0);
 }
 
 // ===========================================================================

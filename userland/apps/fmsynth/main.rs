@@ -81,6 +81,25 @@ const SYS_AUDIO_PCM_OPEN: i64 = 315;
 const SYS_AUDIO_PCM_WRITE: i64 = 316;
 const SYS_AUDIO_PCM_CLOSE: i64 = 317;
 const SYS_DOS_FM_EVENTS: i64 = 377;
+/// Monotonic milliseconds since boot. Used ONLY by the health line below: this
+/// loop's timeline is driven by the audio clock, never by this.
+const SYS_UPTIME_MS: i64 = 252;
+/// (#fmzombie) One line into the persistent /BOOTLOG.TXT, mirrored to serial by
+/// the kernel as `[BOOTLOG] [USERSPACE uid=N] ...`.
+///
+/// EVERYTHING THIS PROCESS SAYS USED TO GO NOWHERE. `puts` below writes through
+/// SYS_PUTCHAR, which sys_putchar() (proc/syscall.c) delivers to the caller's
+/// fd 1 when it has one; /APPS/FMSYNTH is spawned by the kernel's own
+/// launch_userspace_app() and its fd 1 is not the console, so its banner, its
+/// error messages and its exit summary reached no log at all. MEASURED on a
+/// stock golden Ring-3 DOS run: the serial capture contains every kernel line
+/// ABOUT this process and not one line FROM it.
+///
+/// That is why this defect was reported as a CPU percentage rather than as a
+/// message. The owner's machine has no serial port either, so the durable file
+/// is the only channel that reaches him: SYS_BOOTLOG_WRITE is the one the DOS
+/// layer already uses for exactly that reason (#307).
+const SYS_BOOTLOG_WRITE: i64 = 298;
 
 const AUDIO_FORMAT_S16_LE: i64 = 0x0002;
 
@@ -120,6 +139,70 @@ struct FmEvent {
     seq: u32,
 }
 const FMEV_RESET: u8 = 0x01;
+
+/// The address of frame `n` inside PCM. Split out so the retry loop above reads
+/// as arithmetic rather than as a pointer cast in the middle of a syscall.
+fn unsafe_pcm_at(frame: i64) -> i64 {
+    core::ptr::addr_of!(PCM) as i64 + frame * 2 * 2
+}
+
+/// A fixed 192-byte line for SYS_BOOTLOG_WRITE (the kernel bounces at 200 and
+/// one call is one record, so a line is assembled whole and sent once).
+struct Line {
+    b: [u8; 192],
+    n: usize,
+}
+impl Line {
+    fn new() -> Line {
+        Line { b: [0u8; 192], n: 0 }
+    }
+    fn s(&mut self, t: &str) -> &mut Line {
+        for c in t.as_bytes() {
+            if self.n < self.b.len() - 1 {
+                self.b[self.n] = *c;
+                self.n += 1;
+            }
+        }
+        self
+    }
+    fn i(&mut self, mut v: i64) -> &mut Line {
+        if v < 0 {
+            self.s("-");
+            v = -v;
+        }
+        if v == 0 {
+            return self.s("0");
+        }
+        let mut d = [0u8; 24];
+        let mut k = 0;
+        while v > 0 {
+            d[k] = b'0' + (v % 10) as u8;
+            v /= 10;
+            k += 1;
+        }
+        while k > 0 {
+            k -= 1;
+            if self.n < self.b.len() - 1 {
+                self.b[self.n] = d[k];
+                self.n += 1;
+            }
+        }
+        self
+    }
+    /// Send it, and ALSO put it on the SYS_PUTCHAR channel. Both, because the
+    /// two reach different readers: the bootlog reaches a machine with no
+    /// serial port, and the putchar channel is what a terminal-hosted run sees.
+    fn emit(&mut self) {
+        self.b[self.n] = 0;
+        unsafe {
+            syscall1(SYS_BOOTLOG_WRITE, self.b.as_ptr() as i64);
+        }
+        for i in 0..self.n {
+            putc(self.b[i]);
+        }
+        putc(b'\n');
+    }
+}
 
 fn putc(c: u8) {
     unsafe {
@@ -192,6 +275,23 @@ pub extern "C" fn main() -> i32 {
     let mut guest_gone = false;
     let mut tail_blocks: i64 = 0;
 
+    // ---- #fmzombie: THE HEALTH LINE, AND WHY IT IS A RATE ------------------
+    // This process is paced by ONE thing, sys_audio_pcm_write's wait queue, so
+    // the single number that says whether it is healthy is HOW MANY BLOCKS PER
+    // SECOND it completes. At 1024 frames and 44100 Hz that is 43. A rate far
+    // above 43 means the write is returning without blocking and this loop is a
+    // busy-wait, which is exactly the thing CLAUDE.md #426 bans and exactly what
+    // a reader looking at 89% of a core needs told. A rate far below 43 means
+    // the sink is starving it. Neither is visible from the outside: the OS-level
+    // view is a CPU percentage, which cannot distinguish "synthesising hard"
+    // from "spinning on a write that accepts nothing".
+    //
+    // Emitted on WALL time, not on a block count, so a spinning loop cannot
+    // flood the serial port with its own evidence.
+    let mut last_report_ms: i64 = unsafe { syscall1(SYS_UPTIME_MS, 0) };
+    let mut last_report_blocks: i64 = 0;
+    let mut zero_writes: i64 = 0;
+
     loop {
         // ---- 1. DRAIN. Non-blocking; see the header. ----------------------
         let n = unsafe {
@@ -203,6 +303,21 @@ pub extern "C" fn main() -> i32 {
         };
         if n == FM_EPERM {
             puts("[FMSYNTH] another process already owns the FM queue; exiting.\n");
+            break;
+        }
+        // (#fmzombie) ANY OTHER NEGATIVE IS A REFUSAL, AND IGNORING IT IS THE
+        // SAME MISTAKE AS IGNORING A ZERO WRITE. The old code recognised
+        // exactly two negatives and let every other one fall through to the
+        // `n > 0` test, which is false, so an unrecognised error became a
+        // silent no-op repeated for the life of the process. dos_fm_drain()
+        // already returns -1 for a bad argument, and a kernel without
+        // SYS_DOS_FM_EVENTS returns -ENOSYS; either way this process has no
+        // source of events and no way to learn the guest has gone, so it must
+        // stop rather than render silence for ever.
+        if n < 0 && n != FM_ENODEV {
+            puts("[FMSYNTH] SYS_DOS_FM_EVENTS returned an unrecognised error (");
+            put_i64(n);
+            puts("): no event source, exiting.\n");
             break;
         }
         if n == FM_ENODEV {
@@ -285,23 +400,108 @@ pub extern "C" fn main() -> i32 {
         total_blocks += 1;
 
         // ---- 3. HAND IT TO THE SINK. THIS IS THE ONLY BLOCKING CALL. ------
-        let w = unsafe {
-            syscall3(
-                SYS_AUDIO_PCM_WRITE,
-                h,
-                core::ptr::addr_of!(PCM) as i64,
-                BLOCK as i64,
-            )
-        };
-        if w < 0 {
-            puts("[FMSYNTH] sys_audio_pcm_write failed (");
-            put_i64(w);
-            puts("), exiting.\n");
+        //
+        // (#fmzombie) A ZERO IS NOT A SUCCESS, AND TESTING ONLY `w < 0` IS WHAT
+        // TURNED THIS LOOP INTO A BUSY-WAIT.
+        //
+        // sys_audio_pcm_write blocks in the PCM ring's wait queue while the
+        // stream is live, and that block is the ONLY thing pacing this process:
+        // the drain above is deliberately non-blocking and the render is pure
+        // computation. So the moment the write stops blocking, this loop has no
+        // pacing left at all and spins at the speed of the CPU.
+        //
+        // pcm_write_common() (kernel/drivers/audio_pcm.c) opens its loop with
+        // `if (s->stop) break;` and returns the frame count it managed to write,
+        // so a stream whose pump or mixer has gone away returns ZERO, every
+        // time, immediately. The old test here was `if (w < 0)`, which reads a
+        // zero as a successful write, and the process then renders and offers
+        // block after block that nothing accepts. That is the 89%-of-a-core the
+        // owner saw, and it is the hand-rolled poll CLAUDE.md #426 bans, arrived
+        // at by omission rather than by writing a poll on purpose.
+        //
+        // The kernel's OWN callers already knew this: drivers/audio.c:262 tests
+        // `if (w <= 0) break;` with the comment "stream gone; do not spin on
+        // it", and media/audio_decode.c:493 tests `if (w <= 0)`. Every C
+        // consumer of this call had the right test. This one did not.
+        //
+        // A SHORT WRITE IS ALSO NOT A FULL ONE. The same function can return a
+        // partial count (it stops early if the stream is torn down mid-block,
+        // and returns what it managed). The old code discarded the remainder
+        // silently, which is dropped audio nobody could account for. Offer the
+        // rest, and only give up when the sink accepts nothing at all.
+        let mut sent: i64 = 0;
+        let mut w: i64 = 0;
+        let mut dead = false;
+        while sent < BLOCK as i64 {
+            w = unsafe {
+                syscall3(
+                    SYS_AUDIO_PCM_WRITE,
+                    h,
+                    unsafe_pcm_at(sent),
+                    BLOCK as i64 - sent,
+                )
+            };
+            if w < 0 {
+                // Through the bootlog, not puts(): see SYS_BOOTLOG_WRITE above.
+                // A message about why this process stopped is worthless on a
+                // channel that reaches no log, and that is exactly how this
+                // defect came to be reported as a CPU percentage.
+                let mut l = Line::new();
+                l.s("[FMSYNTH] sys_audio_pcm_write failed (").i(w)
+                 .s("), exiting after ").i(sent).s(" of ").i(BLOCK as i64)
+                 .s(" frames");
+                l.emit();
+                dead = true;
+                break;
+            }
+            if w == 0 {
+                // The sink accepted NOTHING. It is stopped or torn down: a
+                // blocking write that returns zero has told us there is nothing
+                // left to pace us. Stop, rather than offer it the same block
+                // for the rest of the boot.
+                zero_writes += 1;
+                let mut l = Line::new();
+                l.s("[FMSYNTH] the PCM sink accepted 0 of ")
+                 .i(BLOCK as i64 - sent)
+                 .s(" frames after ").i(total_blocks)
+                 .s(" blocks: the stream is stopped, so nothing is left to ")
+                 .s("pace this loop. Exiting rather than spinning.");
+                l.emit();
+                dead = true;
+                break;
+            }
+            sent += w;
+        }
+        if dead {
             break;
         }
 
         // ---- 4. advance the timeline, with bounded self-correction --------
         base_us += block_us;
+
+        if w == 0 { zero_writes += 1; }
+
+        // ---- 4b. #fmzombie HEALTH LINE ------------------------------------
+        {
+            let now_ms = unsafe { syscall1(SYS_UPTIME_MS, 0) };
+            let dt = now_ms - last_report_ms;
+            if dt >= 5000 {
+                let db = total_blocks - last_report_blocks;
+                let mut l = Line::new();
+                l.s("[FMSYNTH] blocks=").i(total_blocks)
+                 .s(" +").i(db).s(" in ").i(dt).s("ms = ")
+                 .i(db * 1000 / if dt > 0 { dt } else { 1 })
+                 .s(" blk/s (44100/1024 = 43 is correct; far above 43 means the ")
+                 .s("PCM write stopped blocking and this is a SPIN) events=")
+                 .i(total_events).s(" lastwrite=").i(w)
+                 .s(" zerowrites=").i(zero_writes)
+                 .s(" lastdrain=").i(n)
+                 .s(" guestgone=").i(if guest_gone { 1 } else { 0 });
+                l.emit();
+                last_report_ms = now_ms;
+                last_report_blocks = total_blocks;
+            }
+        }
 
         // ---- 5. exit condition --------------------------------------------
         if guest_gone {
@@ -325,6 +525,16 @@ pub extern "C" fn main() -> i32 {
         syscall1(SYS_AUDIO_PCM_CLOSE, h);
     }
 
+    {
+        let mut l = Line::new();
+        l.s("[FMSYNTH] done: ").i(total_events).s(" regwrites ")
+         .i(total_blocks).s(" blocks ").i(resyncs).s(" resyncs ")
+         .i(seq_gaps).s(" seqgaps ").i(zero_writes).s(" zerowrites");
+        if seq_gaps > 0 {
+            l.s(" <<<< EVENTS WERE LOST");
+        }
+        l.emit();
+    }
     puts("[FMSYNTH] done: ");
     put_i64(total_events);
     puts(" register writes, ");
@@ -333,7 +543,9 @@ pub extern "C" fn main() -> i32 {
     put_i64(resyncs);
     puts(" resyncs, ");
     put_i64(seq_gaps);
-    puts(" sequence gaps");
+    puts(" sequence gaps, ");
+    put_i64(zero_writes);
+    puts(" zero-length writes");
     if seq_gaps > 0 {
         puts(" <<<< EVENTS WERE LOST: expect wrong or stuck notes");
     }

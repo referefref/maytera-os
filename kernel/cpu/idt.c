@@ -103,6 +103,33 @@ void idt_init(void) {
     // #279 SMP: AP wake-IPI vector (240). Lets idle APs HLT and be kicked awake.
     extern void irq_smp_wake(void);
     idt_set_gate(240, (uint64_t)irq_smp_wake, GDT_KERNEL_CODE, IDT_GATE_INTERRUPT);
+    // #75: IPI_VECTOR_STOP (0xF3). Needed so a panic can actually stop the
+    // other cores; without the gate the broadcast raises #GP on each AP.
+    extern void irq_smp_stop(void);
+    idt_set_gate(0xF3, (uint64_t)irq_smp_stop, GDT_KERNEL_CODE, IDT_GATE_INTERRUPT);    // #404: IPI_VECTOR_TLB (0xF2). Needed so a cross-CPU TLB shootdown can
+    // actually be received. Before this, cpu/smp.c broadcast this vector from
+    // smp_tlb_shootdown() (which had zero callers) into a not-present IDT
+    // entry, which raises #GP on every AP that takes it. A vector needs BOTH a
+    // gate here AND a stub in cpu/idt.asm, never one of the two: #75 measured
+    // that registering only a C handler stopped 0 of 3 cores.
+    //
+    // Note irq_smp_tlb does NOT route through isr_handler and therefore does
+    // not need idt_register_handler() at all. See the comment on the stub in
+    // cpu/idt.asm for why it must not take the BKL.
+    extern void irq_smp_tlb(void);
+    idt_set_gate(0xF2, (uint64_t)irq_smp_tlb, GDT_KERNEL_CODE, IDT_GATE_INTERRUPT);
+
+    // #smpfix (#67/#168): BKL_WAKE_VECTOR (0xF4). Sent by bkl_release() and
+    // bkl_release_all() to a core parked in HLT waiting for the lock. 0xF4
+    // rather than the declared-but-dead IPI_VECTOR_CALL (0xF1), so a vector
+    // with no sender stays a vector with no sender; see the audit comment in
+    // cpu/smp.c. Priority class 15, so it cannot be blocked on the target by a
+    // lower-priority in-service vector - which matters, because this is the
+    // PRIMARY wake arm and the per-core tick is only the backstop. Like
+    // irq_smp_tlb the stub does NOT route through isr_handler, and must not.
+    extern void irq_bkl_wake(void);
+    idt_set_gate(0xF4, (uint64_t)irq_bkl_wake, GDT_KERNEL_CODE, IDT_GATE_INTERRUPT);
+
 
     // #71: Intel HDA MSI vector (0x50 / 80, HDA_MSI_VECTOR in drivers/hda.h).
     // MSI targets the Local APIC directly, so like the SMP wake IPI this needs
@@ -183,8 +210,49 @@ static void isr_handler_impl(interrupt_frame_t *frame);
 // #161: isr_handler_impl() plus the asynchronous signal delivery point that
 // follows it. Defined below; see isr_async_sig_check() for the full writeup.
 static void isr_handler_body(interrupt_frame_t *frame);
+// ===========================================================================
+// #smpfix (#75): AN INTERRUPT TAKEN AT CPL 0 ON A USER STACK.
+// ===========================================================================
+//
+// In 64-bit mode the CPU pushes SS:RSP for EVERY interrupt, same-privilege
+// ones included, so frame->rsp is the interrupted stack pointer and this test
+// costs one compare. A CPL-0 interrupt does not switch stacks (only #DF has an
+// IST entry here), so if the interrupted RSP is a user address the handler is
+// running on the USER stack, and any context switch taken from it saves a user
+// rsp into process_t::rsp - the open reason-1 corruption.
+//
+// This counts the WINDOW BEING ENTERED, not just the rare case where a switch
+// follows, so it is a far higher-rate signal than the panic and can be
+// compared between arms in one boot. Physical == virtual in this kernel and
+// the PMM is capped at 2 GB, so every kernel address is below 0x80000000 and
+// every user address is at or above it (user text loads at 2 GB, user stacks
+// sit just under 3 GB).
+#define SMPFIX_USER_BASE 0x80000000ull
+volatile uint64_t g_irq_on_user_stack = 0;
+volatile uint64_t g_irq_on_user_stack_rip = 0;
+volatile uint64_t g_irq_on_user_stack_vec = 0;
+volatile uint64_t g_irq_on_user_stack_rsp = 0;
+
+static inline void smpfix_note_cpl0_user_stack(interrupt_frame_t *frame) {
+    if ((frame->cs & 0x3) != 0) return;              // came from Ring 3: normal
+    if (frame->rsp < SMPFIX_USER_BASE) return;       // on a kernel stack: normal
+    // COUNT ONLY. This runs at the very top of isr_handler, BEFORE
+    // bkl_acquire, on a core whose stack pointer is already wrong. A kprintf
+    // from here takes the console lock from interrupt context on a corrupted
+    // stack, and the first RED-arm run of this campaign hung dead at the first
+    // occurrence with a truncated line on the wire. The evidence is not worth
+    // a second failure mode: the counters are printed once a second by
+    // sched_smp_report()'s [IRQUSTACK] line, from a context that can safely
+    // print, and the last offending RIP is recorded here for addr2line.
+    g_irq_on_user_stack++;
+    g_irq_on_user_stack_rip = frame->rip;
+    g_irq_on_user_stack_vec = frame->int_no;
+    g_irq_on_user_stack_rsp = frame->rsp;
+}
+
 void isr_handler(interrupt_frame_t *frame) {  // #279 3b-3C BKL wrapper
     extern int g_smp_bkl_full; extern void bkl_acquire(void); extern void bkl_release(void);
+    smpfix_note_cpl0_user_stack(frame);   // #smpfix (#75)
     // #67 pass 5: tag what this core is doing so a long BKL hold can be blamed
     // on a VECTOR rather than on this wrapper, which is the same address every
     // time. One per-cpu store; no shared cacheline.
@@ -197,6 +265,13 @@ void isr_handler(interrupt_frame_t *frame) {  // #279 3b-3C BKL wrapper
     // answer "did this core service anything at all during that syscall".
     // That is the question #118 left open, so it gets its own counter.
     { extern void scp_irq_tick(void); scp_irq_tick(); }
+    // #wakeipi (#67/#168): THE SECOND, ALWAYS-ARMED BKL WAKE ARM. It MUST be
+    // here, above bkl_acquire(), and not inside any handler: the tick arm the
+    // parking design assumed was starved precisely because bkl_acquire() runs
+    // first and a contended core never reaches its handler body. See the long
+    // comment on bkl_wake_rescue() in cpu/smp.c. In the healthy case this is
+    // one load of a hot word and no ICR write.
+    { extern void bkl_wake_rescue(void); bkl_wake_rescue(); }
     if (g_smp_bkl_full) {
         bkl_acquire();
         bkl_set_reason(0x0100u | (uint32_t)(frame->int_no & 0xFF));
@@ -253,6 +328,17 @@ static void isr_handler_body(interrupt_frame_t *frame) {
 }
 static void isr_handler_impl(interrupt_frame_t *frame) {
     uint64_t int_no = frame->int_no;
+
+    // #75: NMI (vector 2) DURING A PANIC STOP-THE-WORLD. Only then; outside a
+    // panic an NMI still falls through to the normal fatal path below, so this
+    // does not hijack the vector. An NMI is used because it is the only
+    // delivery that reaches a core running with RFLAGS.IF clear, which is where
+    // a core spinning for the BKL inside an interrupt handler actually is.
+    if (int_no == 2) {
+        extern int  smp_panic_stopping(void);
+        extern void smp_panic_stop_ack(void);
+        if (smp_panic_stopping()) smp_panic_stop_ack();   // never returns
+    }
 
     // Check if there's a registered handler
     if (handlers[int_no]) {

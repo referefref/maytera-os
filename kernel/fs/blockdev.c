@@ -260,6 +260,17 @@ static spinlock_t g_blk_lock = SPINLOCK_INIT;
 #endif
 
 #define BLK_HIST_N 6   /* <1us, <10, <100, <1ms, <10ms, >=10ms */
+
+// [no-ticket] rustkern/blkhist.rs owns the bucketing and every derived rate.
+#define BLKHIST_N 6
+// Distinct single-sector call sites tracked. Eight is enough to name the
+// offenders; a ninth lands in c1_other, which is printed so the table can never
+// silently under-report.
+#define BLK_C1_SITES 8
+extern uint32_t blkhist_bucket_rs(uint32_t sectors);
+extern uint64_t blkhist_xfers_per_mb_x10_rs(uint64_t xfers, uint64_t sectors);
+extern uint64_t blkhist_sectors_per_xfer_x10_rs(uint64_t xfers, uint64_t sectors);
+extern uint64_t blkhist_projected_ms_rs(uint64_t xfers, uint64_t cmd_us);
 typedef struct {
     uint64_t calls, sectors, hits, misses;
     uint64_t t_call, t_dev, n_dev;
@@ -295,6 +306,22 @@ typedef struct {
     uint64_t worst_iter, worst_iter_bytes;
     uint64_t pf_in_win, n_win_with_pf;
     uint64_t probe_ns_x1000;           // measured cost of the probe itself
+    // [no-ticket] ROUND TRIPS, the quantity a USB root actually pays for. A
+    // command costs a fixed ~121-148 us whatever its size (measured on real
+    // hardware), so "5 sectors per transfer" is the whole diagnosis and a mean
+    // cannot tell "everything is 5" from "half are 1 and half are 64" (#69).
+    uint64_t csz[BLKHIST_N];           // blk_read() call sizes, by sector count
+    uint64_t xsz[BLKHIST_N];           // DEVICE transfer sizes, by sector count
+    // [no-ticket] WHO issues the single-sector reads. The size histogram above
+    // says 94% of blk_read calls and 78% of device commands are ONE SECTOR; it
+    // cannot say which caller, and "the block layer does small reads" is not a
+    // fixable statement. A return address is, via addr2line against
+    // kernel.dbg.elf. Recorded only for count == 1, so it costs an 8-entry scan
+    // on exactly the population being investigated and nothing on any other.
+    uint64_t c1_ret[BLK_C1_SITES];     // caller return address
+    uint64_t c1_n[BLK_C1_SITES];       // calls from it
+    uint64_t c1_dev[BLK_C1_SITES];     // of those, ones that reached the device
+    uint64_t c1_other;                 // calls from a 9th-or-later site
 } blk_census_t;
 // Updated WITHOUT synchronisation, deliberately and consistently with the
 // counters already in this file (g_blk_write_calls, g_usb_reads). These are
@@ -690,6 +717,20 @@ void blk_cache_stats(uint64_t *hits, uint64_t *misses, int *enabled) {
     if (enabled) *enabled = g_mode;   // 0 off, 1 toram, 2 cache
 }
 
+// [no-ticket] The four I/O totals a caller needs to charge ONE operation for
+// what it cost the device. Snapshot before, snapshot after, subtract. They are
+// the SAME counters [BLK122] prints, so a benchmark and the boot census can
+// never disagree about what happened.
+void blk_census_io(uint64_t *calls, uint64_t *sectors,
+                   uint64_t *n_dev, uint64_t *t_dev) {
+    blk_census_t c = g_bc;    // one snapshot, so the four cannot come from
+                              // four different instants
+    if (calls)   *calls   = c.calls;
+    if (sectors) *sectors = c.sectors;
+    if (n_dev)   *n_dev   = c.n_dev;
+    if (t_dev)   *t_dev   = c.t_dev;
+}
+
 // #617: how many demand-cache installs were declined because a write landed
 // during the read. Zero on a read-only workload (boot, fsck, app launch) by
 // construction, so a non-zero value is a real measurement of read/write overlap
@@ -792,6 +833,46 @@ void blk_census_report(void) {
             (unsigned long long)(c.calls ? c.t_call / c.calls : 0),
             (unsigned long long)c.t_dev, (unsigned long long)c.n_dev,
             (unsigned long long)(c.t_call ? c.t_dev * 100 / c.t_call : 0));
+    // [no-ticket] THE quantity this ticket turns on, printed as the contract's
+    // own unit rather than as a raw count, and next to the projection it
+    // implies on a device whose command cost is known.
+    {
+        uint64_t spx = blkhist_sectors_per_xfer_x10_rs(c.n_dev, c.sectors);
+        uint64_t xpm = blkhist_xfers_per_mb_x10_rs(c.n_dev, c.sectors);
+        kprintf("[BLK122] ROUND TRIPS: %llu.%llu sectors/xfer, %llu.%llu xfers/MB"
+                " | at 121us/cmd that is %llums of pure round trip\n",
+                (unsigned long long)(spx / 10), (unsigned long long)(spx % 10),
+                (unsigned long long)(xpm / 10), (unsigned long long)(xpm % 10),
+                (unsigned long long)blkhist_projected_ms_rs(c.n_dev, 121));
+        // Same shape as the HIST lines below: one line built with the kernel's
+        // own snprintf rather than a second string helper.
+        static const char *lbl[BLKHIST_N] = { "1", "2-4", "5-16", "17-32", "33-64", ">64" };
+        char cb[200]; char xb[200]; int cn = 0, xn = 0;
+        cb[0] = 0; xb[0] = 0;
+        for (int i = 0; i < BLKHIST_N; i++) {
+            cn += snprintf(cb + cn, sizeof(cb) - (size_t)cn, " %s=%llu", lbl[i],
+                           (unsigned long long)c.csz[i]);
+            xn += snprintf(xb + xn, sizeof(xb) - (size_t)xn, " %s=%llu", lbl[i],
+                           (unsigned long long)c.xsz[i]);
+            if (cn >= (int)sizeof(cb) - 24 || xn >= (int)sizeof(xb) - 24) break;
+        }
+        kprintf("[BLK122] blk_read call sectors:%s\n", cb);
+        kprintf("[BLK122] DEVICE xfer sectors:%s\n", xb);
+        // The single-sector callers by return address. addr2line -e
+        // kernel.dbg.elf <addr> names the line. "dev" is how many of that
+        // site's calls actually reached the device rather than the RAM cache,
+        // which is the column that costs round trips.
+        for (int i = 0; i < BLK_C1_SITES; i++) {
+            if (!g_bc.c1_ret[i]) break;
+            kprintf("[BLK122] 1-sector caller ret=%llx calls=%llu dev=%llu\n",
+                    (unsigned long long)c.c1_ret[i],
+                    (unsigned long long)c.c1_n[i],
+                    (unsigned long long)c.c1_dev[i]);
+        }
+        if (c.c1_other)
+            kprintf("[BLK122] 1-sector callers beyond the %d tracked: %llu call(s)\n",
+                    BLK_C1_SITES, (unsigned long long)c.c1_other);
+    }
     kprintf("[BLK122] worst blk_read %lluus for %llu sectors, of which device "
             "%lluus | cache hits=%llu misses=%llu | lock acquires=%llu "
             "contended=%llu\n",
@@ -887,6 +968,17 @@ int blk_read(uint8_t channel, uint8_t drive, uint64_t lba, uint32_t count, void 
     if (__t0) {
         uint64_t d = mono_us() - __t0;
         g_bc.calls++; g_bc.sectors += count; g_bc.t_call += d;
+        g_bc.csz[blkhist_bucket_rs(count)]++;
+        if (count == 1) {
+            uint64_t ra = (uint64_t)(uintptr_t)__builtin_return_address(0);
+            int slot = -1;
+            for (int i = 0; i < BLK_C1_SITES; i++) {
+                if (g_bc.c1_ret[i] == ra) { slot = i; break; }
+                if (g_bc.c1_ret[i] == 0)  { g_bc.c1_ret[i] = ra; slot = i; break; }
+            }
+            if (slot < 0) g_bc.c1_other++;
+            else { g_bc.c1_n[slot]++; if (__dev) g_bc.c1_dev[slot]++; }
+        }
         if (d > g_bc.max_call) {
             g_bc.max_call = d; g_bc.max_call_sec = count; g_bc.max_call_dev = __dev;
         }
@@ -984,6 +1076,7 @@ static int blk_read_inner(uint8_t channel, uint8_t drive, uint64_t lba,
             int __ur = usb_msc_read(dev, 0, lba_i, dst, run);
             if (__dt0) { uint64_t __dd = mono_us() - __dt0;
                          g_bc.t_dev += __dd; g_bc.n_dev++; *dev_us += __dd; }
+            g_bc.xsz[blkhist_bucket_rs(run)]++;
             scp_end(SCP_USBMSC, __su);
             if (__ur != 0) return -1;
             g_usb_reads += run;
@@ -1047,6 +1140,7 @@ static int blk_read_inner(uint8_t channel, uint8_t drive, uint64_t lba,
         int __ar = ata_read_sectors_dma(channel, drive, (uint32_t)lba, (uint8_t)count, buf);
         if (__dt0) { uint64_t __dd = mono_us() - __dt0;
                      g_bc.t_dev += __dd; g_bc.n_dev++; *dev_us += __dd; }
+        g_bc.xsz[blkhist_bucket_rs(count)]++;
         scp_end(SCP_USBMSC, __sa);
         return __ar; }
 }

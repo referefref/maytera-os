@@ -578,6 +578,13 @@ static TAB: &[Desc] = &[
     // --- #503 batch 3: fixed-size out-params --------------------------------
     // sys_win_get_event((int)arg1, (void *)arg2, (int)arg3) - arg2 is gui_event_t*.
     Desc { num: 36, args: [NONE, wf(SZ_GUI_EVENT), NONE, NONE, NONE, NONE] },
+    // #DOSRING3 sys_win_get_scancodes(handle, buf, cap): writes at most `cap`
+    // RAW scancode BYTES into arg2. The handler clamps cap to 64 before it
+    // writes anything (`if (cap > 64) cap = 64;` in gui/fb_syscall.c), so this
+    // is the capped form: validating the raw count would reject a caller that
+    // legitimately passes a larger cap against a smaller buffer, while every
+    // byte the handler can actually reach is still proven user-writable.
+    Desc { num: 416, args: [NONE, wec(3, 1, 64), NONE, NONE, NONE, NONE] },
     // sys_get_net_info((void *)arg1, (uint64_t)arg2 len) - writes exactly one
     // net_info_t. The handler already refuses len < sizeof(net_info_t), so the
     // bytes it can write are a constant, not arg2.
@@ -609,6 +616,16 @@ static TAB: &[Desc] = &[
     Desc { num: 404, args: [NONE, NONE, NONE, NONE, NONE, NONE] },
     Desc { num: 405, args: [NONE, NONE, NONE, NONE, NONE, NONE] },
     Desc { num: 406, args: [NONE, NONE, NONE, NONE, NONE, NONE] },
+    // #affinity: SYS_SET_AFFINITY(pid, mask) and SYS_GET_AFFINITY(pid) take no
+    // pointers. Declared anyway rather than omitted, so they are not in the
+    // syscall-ptr-lint debt ledger by silence.
+    Desc { num: 420, args: [NONE, NONE, NONE, NONE, NONE, NONE] },
+    Desc { num: 421, args: [NONE, NONE, NONE, NONE, NONE, NONE] },
+    // SYS_GET_MIGRATIONS(pid, &migrations, &switchins): two optional u64 out
+    // params, each exactly 8 bytes, each NULL-checked by the handler. Fixed
+    // length because the size is the kernel's, not the caller's - a caller
+    // cannot declare a wider one and get more written.
+    Desc { num: 422, args: [NONE, wf(8), wf(8), NONE, NONE, NONE] },
     // sys_print_list((void *)arg1, (int)arg2 max) -> print_list(), which writes
     // at most min(max, g_printer_count <= PRINT_MAX_PRINTERS) rows.
     Desc { num: 291, args: [wec(2, SZ_PRINTER_CFG, CAP_PRINTERS), NONE, NONE, NONE, NONE, NONE] },

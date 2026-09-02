@@ -91,10 +91,46 @@ void imgfile_close(imgfile_t *f) {
         fat_close((fat_file_t *)f->fat);
         kfree(f->fat);
     }
-    if (f->cache) kfree(f->cache);
+    if (f->cache_raw) kfree(f->cache_raw);
     memset(f, 0, sizeof(*f));
     f->kind = IMGF_KIND_NONE;
 }
+
+// [no-ticket] rustkern/imgra.rs owns the readahead policy and the victim-run
+// choice. The struct is shared by value, so its width is locked here the same
+// way every other rustkern FFI struct in this tree is.
+_Static_assert(sizeof(imgra_stream_t) == 16, "[no-ticket] FFI: ImgRaStream is u64 + two u32");
+_Static_assert(sizeof(imgra_t) == 104,
+               "[no-ticket] FFI: ImgRa is four streams, two u32 and four u64");
+extern void imgra_reset_rs(imgra_t *ra);
+extern uint32_t imgra_plan_rs(imgra_t *ra, uint64_t blk, uint32_t max_win, uint64_t avail);
+extern void imgra_abort_rs(imgra_t *ra);
+extern uint32_t imgra_victim_rs(const uint32_t *ages, uint32_t nslots, uint32_t run,
+                                uint32_t align);
+
+// The device command size fs/blockdev.c can reach is bounded by the 64 KB xHCI
+// TRB boundary, so a readahead span that starts on a 64 KB boundary costs
+// strictly fewer round trips than the same span starting anywhere else. Align
+// the cache base so slot 0 is on one; the aligned victim search then keeps
+// every full-window span aligned too.
+#define IMGF_CACHE_ALIGN 65536ull
+
+// [no-ticket] RUNTIME OFF SWITCH, and it is not decoration.
+//
+// It is what makes the before/after numbers in this ticket a CONTROLLED
+// experiment rather than two builds compared: dos/cdbench.c runs the same file,
+// on the same medium, in the same boot, over two cold regions, with only this
+// flag differing. Two kernels compared across two boots would have carried
+// every difference between those boots into the result, and this project has
+// already published one number that turned out to be the host's load (#122).
+//
+// It is also the escape hatch. Readahead changes what the device is asked for
+// on the machine the OS BOOTS FROM. If it ever misbehaves on a particular
+// stick, /CONFIG/CDRAOFF.CFG restores the old one-block-per-miss behaviour
+// exactly, with no rebuild.
+static int g_ra_off = 0;
+void imgfile_readahead_set_disabled(int off) { g_ra_off = off ? 1 : 0; }
+int  imgfile_readahead_disabled(void) { return g_ra_off; }
 
 static void imgfile_cache_reset(imgfile_t *f) {
     for (int i = 0; i < IMGF_CACHE_SLOTS; i++) {
@@ -156,18 +192,33 @@ int imgfile_open(imgfile_t *f, const char *path) {
 
     if (f->kind == IMGF_KIND_NONE) return -3;
 
-    f->cache = (uint8_t *)kmalloc((unsigned long)IMGF_CACHE_SLOTS * IMGF_CACHE_BLK);
-    if (!f->cache) { imgfile_close(f); return -4; }
+    // Over-allocate by one alignment unit and align the usable base up. The raw
+    // pointer is kept because it, not the aligned one, is what kfree() wants.
+    unsigned long need = (unsigned long)IMGF_CACHE_SLOTS * IMGF_CACHE_BLK
+                       + (unsigned long)IMGF_CACHE_ALIGN;
+    f->cache_raw = (uint8_t *)kmalloc(need);
+    if (!f->cache_raw) { imgfile_close(f); return -4; }
+    uint64_t a = (uint64_t)f->cache_raw;
+    uint64_t aligned = (a + (IMGF_CACHE_ALIGN - 1)) & ~(IMGF_CACHE_ALIGN - 1);
+    f->cache = (uint8_t *)aligned;
+    imgra_reset_rs(&f->ra);
     imgfile_cache_reset(f);
     return 0;
 }
 
-// Read exactly one cache block (index `blk`) from the backing store into `dst`.
-// Returns bytes read (may be short only at EOF), or negative on error.
-static int64_t imgfile_backing_read(imgfile_t *f, uint64_t blk, uint8_t *dst) {
+// Read `nblk` CONSECUTIVE cache blocks starting at index `blk` from the backing
+// store into `dst`, which must be nblk * IMGF_CACHE_BLK bytes of contiguous
+// buffer. Returns bytes read (short only at EOF), or negative on error.
+//
+// [no-ticket] `nblk` is the whole point: ONE backing read of 64 KiB instead of
+// eight of 8 KiB is eight fewer trips through blk_read() and, on a USB root,
+// six fewer SCSI commands. The bytes are identical; the round trips are not.
+static int64_t imgfile_backing_read(imgfile_t *f, uint64_t blk, uint32_t nblk,
+                                    uint8_t *dst) {
+    if (nblk == 0) return 0;
     uint64_t off = blk * (uint64_t)IMGF_CACHE_BLK;
     if (off >= f->size) return 0;
-    uint64_t want = IMGF_CACHE_BLK;
+    uint64_t want = (uint64_t)nblk * IMGF_CACHE_BLK;
     if (off + want > f->size) want = f->size - off;
 
     if (f->kind == IMGF_KIND_EXT2)
@@ -175,9 +226,11 @@ static int64_t imgfile_backing_read(imgfile_t *f, uint64_t blk, uint8_t *dst) {
 
     // #740: raw device range. f->base is 512-aligned (checked at open) and `off`
     // is always a multiple of IMGF_CACHE_BLK, so base + off is sector-aligned
-    // and the read needs no bounce buffer. `want` is IMGF_CACHE_BLK except in
-    // the final partial block, so nsec is at most IMGF_CACHE_BLK / 512 = 16 and
-    // nsec * 512 never exceeds the IMGF_CACHE_BLK-sized slot `dst` points into.
+    // and the read needs no bounce buffer. `want` is nblk * IMGF_CACHE_BLK
+    // except in the final partial block, so nsec is at most
+    // nblk * IMGF_CACHE_BLK / 512 and nsec * 512 never exceeds the
+    // nblk-slot span `dst` points into, which the caller guarantees is
+    // contiguous (the slots are one allocation and the run is consecutive).
     //
     // Reading only the sectors `want` needs, rather than a full block every
     // time, is what keeps the LAST block of a volume that ends at the end of
@@ -207,9 +260,6 @@ static int64_t imgfile_backing_read(imgfile_t *f, uint64_t blk, uint8_t *dst) {
 // Find or fill the cache slot holding block `blk`. Returns the slot's buffer
 // and its valid length in *vlen, or NULL on error.
 static uint8_t *imgfile_block(imgfile_t *f, uint64_t blk, uint32_t *vlen) {
-    int victim = 0;
-    uint32_t oldest = 0xFFFFFFFFu;
-
     for (int i = 0; i < IMGF_CACHE_SLOTS; i++) {
         if (f->tag[i] == blk) {
             f->age[i] = ++f->clock;
@@ -219,22 +269,77 @@ static uint8_t *imgfile_block(imgfile_t *f, uint64_t blk, uint32_t *vlen) {
             *vlen = (rem > IMGF_CACHE_BLK) ? IMGF_CACHE_BLK : (uint32_t)rem;
             return f->cache + (uint64_t)i * IMGF_CACHE_BLK;
         }
-        if (f->tag[i] == IMGF_TAG_EMPTY) { victim = i; oldest = 0; }
-        else if (oldest != 0 && f->age[i] < oldest) { oldest = f->age[i]; victim = i; }
+    }
+
+    // [no-ticket] MISS. How many CONSECUTIVE blocks is it worth fetching?
+    // rustkern/imgra.rs answers, from whether this caller is streaming. A cold
+    // or random caller gets 1 and pays exactly what it paid before.
+    uint64_t nblocks_total = (f->size + IMGF_CACHE_BLK - 1) / IMGF_CACHE_BLK;
+    uint64_t avail = (blk < nblocks_total) ? (nblocks_total - blk) : 0;
+    uint32_t run = imgra_plan_rs(&f->ra, blk, g_ra_off ? 1u : IMGF_RA_MAX, avail);
+    if (run == 0) run = 1;
+    if (run > IMGF_CACHE_SLOTS) run = IMGF_CACHE_SLOTS;
+
+    // A run of CONSECUTIVE slots is one contiguous buffer, which is what makes
+    // the whole readahead a single backing read. Aligning the start to the run
+    // length keeps the span on a 64 KB boundary (see imgra_victim_rs).
+    uint32_t victim = imgra_victim_rs(f->age, (uint32_t)IMGF_CACHE_SLOTS, run, run);
+    if (victim + run > IMGF_CACHE_SLOTS) victim = 0;   // defensive; Rust guarantees it
+
+    // Slots about to be overwritten stop describing anything BEFORE the read,
+    // so a failure part-way cannot leave a tag pointing at a half-written slot.
+    for (uint32_t k = 0; k < run; k++) {
+        f->tag[victim + k] = IMGF_TAG_EMPTY;
+        f->age[victim + k] = 0;
+    }
+    // Any OTHER slot already holding one of the blocks we are about to install
+    // is dropped, so no block index is ever tagged in two places.
+    for (int i = 0; i < IMGF_CACHE_SLOTS; i++) {
+        if ((uint32_t)i >= victim && (uint32_t)i < victim + run) continue;
+        if (f->tag[i] != IMGF_TAG_EMPTY && f->tag[i] >= blk && f->tag[i] < blk + run) {
+            f->tag[i] = IMGF_TAG_EMPTY;
+            f->age[i] = 0;
+        }
     }
 
     uint8_t *buf = f->cache + (uint64_t)victim * IMGF_CACHE_BLK;
-    int64_t got = imgfile_backing_read(f, blk, buf);
-    if (got < 0) { f->tag[victim] = IMGF_TAG_EMPTY; return 0; }
-    // A short read that is not at EOF means the backing store failed mid-block;
-    // zero the tail so a caller can never observe stale bytes from the previous
-    // tenant of this slot.
-    if ((uint64_t)got < IMGF_CACHE_BLK)
-        memset(buf + got, 0, IMGF_CACHE_BLK - (uint32_t)got);
-    f->tag[victim] = blk;
-    f->age[victim] = ++f->clock;
+    int64_t got = imgfile_backing_read(f, blk, run, buf);
+    if (got <= 0) {
+        // Nothing was installed, so the prediction this plan made has to be
+        // withdrawn or the next miss is judged sequential against absent blocks.
+        imgra_abort_rs(&f->ra);
+        return 0;
+    }
+
+    // Tag only the blocks the read actually covered. A short read at EOF covers
+    // fewer; a short read that is NOT at EOF means the backing store failed
+    // mid-run, and the same rule applies, so the untouched slots stay EMPTY
+    // rather than advertising bytes nobody wrote.
+    uint32_t full = (uint32_t)((uint64_t)got / IMGF_CACHE_BLK);
+    uint32_t tail = (uint32_t)((uint64_t)got % IMGF_CACHE_BLK);
+    if (full > run) { full = run; tail = 0; }
+    for (uint32_t k = 0; k < full; k++) {
+        f->tag[victim + k] = blk + k;
+        f->age[victim + k] = ++f->clock;
+    }
+    if (tail && full < run) {
+        // The last block is partial: zero its tail so a caller can never observe
+        // stale bytes from this slot's previous tenant.
+        memset(buf + (uint64_t)full * IMGF_CACHE_BLK + tail, 0,
+               IMGF_CACHE_BLK - tail);
+        f->tag[victim + full] = blk + full;
+        f->age[victim + full] = ++f->clock;
+        full++;
+    }
+    if (full == 0) { imgra_abort_rs(&f->ra); return 0; }
     f->misses++;
-    *vlen = (uint32_t)got;
+
+    // `blk` itself is always the first block of the run, so the slot to return
+    // is the one we just filled at `victim`.
+    uint64_t off0 = blk * (uint64_t)IMGF_CACHE_BLK;
+    uint64_t rem0 = (off0 < f->size) ? (f->size - off0) : 0;
+    *vlen = (rem0 > IMGF_CACHE_BLK) ? IMGF_CACHE_BLK : (uint32_t)rem0;
+    if ((uint64_t)*vlen > (uint64_t)got) *vlen = (uint32_t)got;
     return buf;
 }
 

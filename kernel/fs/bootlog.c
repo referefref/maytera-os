@@ -145,6 +145,71 @@ int      bootlog_last_persist_rc(void)  { return g_last_persist_rc; }
 // no ext2 partition at all (single FAT32 root, by design), so this does not
 // affect the real-hardware scenario it was built for.
 
+// ===========================================================================
+// SILENT TRUNCATION IS HOW A DIAGNOSTIC LINE LIES. (deadport)
+// ===========================================================================
+// Every writer in this file formats into a fixed 256-byte buffer and used to
+// clamp an over-long line with a bare
+//
+//     if ((uint32_t)n >= sizeof(line)) n = (int)sizeof(line) - 1;
+//
+// which drops the tail and says nothing. MEASURED on the owner's ASUS boot log
+// from golden 2277 (/ssdmirror/asus-logs-2277/BOOTLOG.TXT): 14 lines were cut
+// at exactly 255 characters, and the two that mattered most were among them.
+//
+//  1. The #307 xHCI give-up line is ~700 characters. It was cut mid-word at
+//     "...(unplug/replug). Thi", so the operator lost the ENTIRE second half:
+//     the /USBPORT.CFG override syntax, which the driver's own comment says was
+//     spelled out on purpose "so an operator can act on this line without
+//     reading any source". The intent was written down; the delivery failed
+//     silently, and nothing in the log admitted it had.
+//  2. The [xHCI-HB] per-port state map, the mechanism that makes a retired port
+//     visible on EVERY scan, was cut at port 14 of the owner's 21.
+//
+// So the clamp now STAMPS the line with how many bytes went missing. It costs a
+// few instructions on a path that runs a few times a second at most, and it
+// turns an invisible failure into one that names itself. A reader who sees
+// "~CUT n~" knows to go looking; a reader of a silently cut line does not know
+// there is anything to look for. This does NOT fix an over-long line, and is
+// not meant to: it makes the next one findable instead of undetectable.
+//
+// The counters are exported so the boot self-test can assert on them rather
+// than anyone having to eyeball a log.
+static uint32_t g_bl_trunc_lines = 0;
+static uint32_t g_bl_trunc_bytes = 0;
+uint32_t bootlog_truncated_lines(void) { return g_bl_trunc_lines; }
+uint32_t bootlog_truncated_bytes(void) { return g_bl_trunc_bytes; }
+
+// Record a truncated line, stamping the loss into the line itself. `n` is the
+// bytes vsnprintf_dropped() actually wrote and `dropped` is what would not fit.
+// Returns the usable length, or -1 if the format failed.
+//
+// CORRECTED after the first VM verification run, and the correction is the
+// whole point of the mechanism: the first version of this function tested
+// `if ((uint32_t)n >= cap)`, the C99 truncation idiom, AND THAT TEST CAN NEVER
+// BE TRUE HERE. This kernel's vsnprintf returns bytes ACTUALLY WRITTEN, capped
+// at cap-1 (see the note above vsnprintf_dropped in string.c). So the detector
+// I wrote to catch silent truncation was itself silently incapable of firing,
+// exactly like the four-copy clamp it replaced. MEASURED on the test boot that
+// caught it: three lines sat at exactly 255 characters, cut mid-word, one of
+// them the port-governor self-test line added by this very change, while the
+// audit line confidently reported "0 line(s) truncated". A detector that cannot
+// fire is worse than no detector, because it answers the question wrongly.
+static int bl_clamp(char *line, uint32_t cap, int n, size_t dropped) {
+    if (n < 0) return -1;
+    if (dropped == 0) return n;               // fitted; not touched at all
+    g_bl_trunc_lines++;
+    g_bl_trunc_bytes += (uint32_t)dropped;
+    // Overwrite the tail rather than append: there is by definition no room to
+    // append.
+    char tag[28];
+    int t = snprintf(tag, sizeof(tag), "~CUT %lu~", (unsigned long)dropped);
+    if (t > 0 && (uint32_t)t < cap && n >= t) {
+        memcpy(line + (uint32_t)n - (uint32_t)t, tag, (uint32_t)t);
+    }
+    return n;
+}
+
 static char     g_bootlog_buf[BOOTLOG_BUF_CAP];
 static uint32_t g_bootlog_len = 0;
 static int      g_bootlog_armed = 0;
@@ -449,10 +514,11 @@ void bootlog_fault_write(const char *fmt, ...) {
     char line[BOOTLOG_LINE_MAX];
     va_list args;
     va_start(args, fmt);
-    int n = vsnprintf(line, sizeof(line), fmt, args);
+    size_t bl_dropped = 0;
+    int n = vsnprintf_dropped(line, sizeof(line), fmt, args, &bl_dropped);
     va_end(args);
     if (n < 0) return;
-    if ((uint32_t)n >= sizeof(line)) n = (int)sizeof(line) - 1;
+    n = bl_clamp(line, (uint32_t)sizeof(line), n, bl_dropped);
     line[n] = '\n';
     uint32_t need = (uint32_t)n + 1;
 
@@ -510,10 +576,11 @@ int bootlog_write(const char *fmt, ...) {
     char line[BOOTLOG_LINE_MAX];
     va_list args;
     va_start(args, fmt);
-    int n = vsnprintf(line, sizeof(line), fmt, args);
+    size_t bl_dropped = 0;
+    int n = vsnprintf_dropped(line, sizeof(line), fmt, args, &bl_dropped);
     va_end(args);
     if (n < 0) return -1;
-    if ((uint32_t)n >= sizeof(line)) n = (int)sizeof(line) - 1;
+    n = bl_clamp(line, (uint32_t)sizeof(line), n, bl_dropped);
 
     // Mirror to the existing serial log (additive, never replaces it).
     kprintf("[BOOTLOG] %s\n", line);
@@ -785,10 +852,11 @@ void usblog_write(const char *fmt, ...) {
     char line[USBLOG_LINE_MAX];
     va_list args;
     va_start(args, fmt);
-    int n = vsnprintf(line, sizeof(line), fmt, args);
+    size_t bl_dropped = 0;
+    int n = vsnprintf_dropped(line, sizeof(line), fmt, args, &bl_dropped);
     va_end(args);
     if (n < 0) return;
-    if ((uint32_t)n >= sizeof(line)) n = (int)sizeof(line) - 1;
+    n = bl_clamp(line, (uint32_t)sizeof(line), n, bl_dropped);
 
     // Mirror to serial (additive), same as bootlog_write().
     kprintf("[USBLOG] %s\n", line);
@@ -838,10 +906,11 @@ void audiolog_write(const char *fmt, ...) {
     char line[AUDIOLOG_LINE_MAX];
     va_list args;
     va_start(args, fmt);
-    int n = vsnprintf(line, sizeof(line), fmt, args);
+    size_t bl_dropped = 0;
+    int n = vsnprintf_dropped(line, sizeof(line), fmt, args, &bl_dropped);
     va_end(args);
     if (n < 0) return;
-    if ((uint32_t)n >= sizeof(line)) n = (int)sizeof(line) - 1;
+    n = bl_clamp(line, (uint32_t)sizeof(line), n, bl_dropped);
 
     // Mirror to serial (additive), same as usblog_write().
     kprintf("[AUDIOLOG] %s\n", line);

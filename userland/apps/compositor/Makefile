@@ -17,7 +17,7 @@ LDFLAGS = -pie --no-dynamic-linker -z notext -T ../../user-pie.ld -nostdlib -z m
 SRCS = main.c draw.c icons.c lockscreen.c desktop.c taskbar.c \
        startmenu.c clock.c contextmenu.c screensaver.c screensaver_gfx.c wallpaper.c widgets.c traymenu.c profile.c \
        stickies.c notif.c bt_impl.c screenshot.c vnc.c launcher.c ha_format.c \
-       elevate.c iconpicker.c confirmdialog.c perfframe.c volosd.c dragghost.c idleprof.c
+       elevate.c iconpicker.c confirmdialog.c perfframe.c volosd.c dragghost.c idleprof.c dosspeed.c
 
 # #334 headless GUI verification hook (testhook.c). OFF by default - a plain
 # `make`/`make install` (what build/build-golden.sh always uses) builds

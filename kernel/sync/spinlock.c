@@ -66,6 +66,27 @@ void spinlock_acquire(spinlock_t *lock) {
     while (1) {
         // Spin while lock appears held (cache-friendly)
         while (atomic_load32(&lock->locked)) {
+            // #404 COOPERATIVE TLB SHOOTDOWN DELIVERY. This is the single most
+            // important placement in the whole shootdown change, and it is here
+            // rather than in a private copy because this is the ONE spin loop
+            // every spinlock in the kernel funnels through (the irqsave forms
+            // all call straight into this function).
+            //
+            // Why it is needed: a core that is contending for an IRQSAVE
+            // spinlock has RFLAGS.IF CLEAR, so it cannot take the 0xF2 IPI, and
+            // it will not clear it until it wins the lock. If the core that
+            // HOLDS that lock is at the same moment inside a shootdown waiting
+            // for this core to acknowledge, the two deadlock. mm_lock() is
+            // exactly such a lock, and vma_teardown_pages() unmaps and frees
+            // under it, so this is the common case, not a corner.
+            //
+            // Why it is safe from here: servicing a shootdown invalidates TLB
+            // entries and clears one bit. It takes no lock, allocates nothing,
+            // touches no scheduler state, and an unnecessary invalidation is
+            // never wrong, only occasionally wasted. It is also a no-op costing
+            // one load of an already-hot global whenever no shootdown is in
+            // flight, which is essentially always.
+            { extern void tlb_service_local(void); tlb_service_local(); }
             // Hint to CPU that we're in a spin loop
             pause();
 #ifdef SMP_DEBUG

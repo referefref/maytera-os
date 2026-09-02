@@ -31,6 +31,19 @@ static inline uint16_t ntohs(uint16_t n) {
 }
 
 // Initialize ethernet
+// Re-read the NIC's MAC WITHOUT disturbing the registered handlers.
+//
+// eth_init() zeroes eth_handler_count, so calling it a second time silently
+// unregisters ARP and IP and the stack goes deaf. A NIC bound after boot
+// (hot-plugged USB adapter) needs the MAC refreshed and nothing else, so it
+// calls this instead. See net_late_attach_service() in net/net.c.
+void eth_refresh_mac(void) {
+    nic_get_mac(our_mac);
+    kprintf("[ETH] MAC refreshed: %02x:%02x:%02x:%02x:%02x:%02x\n",
+            our_mac[0], our_mac[1], our_mac[2],
+            our_mac[3], our_mac[4], our_mac[5]);
+}
+
 void eth_init(void) {
     nic_get_mac(our_mac);
     eth_handler_count = 0;

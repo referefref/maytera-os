@@ -26,6 +26,8 @@
 #include "../fs/bootlog.h"   // #205: audiolog_write() -> /AUDIOLOG.TXT
 #include "dpmi_rmcs.h"  // #740: DPMI 0300h + the guest-memory chokepoint
 #include "dos4gw.h"
+#include "doslinger.h"   // the post-exit linger policy (rustkern/doslinger.rs)
+#include "dosfmq.h"      // (#fmbridge) THE FM event queue, behind a ring-neutral seam
 #include "../exec/go32.h"     // #740: the DOS/4GW guest bridge (rustkern/dos4gw.rs)
 #include "../exec/le.h"      // #740: LE parse/load
 #include "../exec/x86_32.h"  // #740: the 32-bit protected-mode core
@@ -43,6 +45,7 @@
 #include "../drivers/keyboard.h"  // KEY_MOD_* and the shared scancode-to-char table
 #include "../sync/spinlock.h"     // the shared irqsave spinlock (host-window handover)
 #include "../sync/waitq.h"        // #181: the ONE blocking primitive (#426)
+#include "../gui/fb_syscall.h"    // g_fb_flip_wq: the "screen updated" wake source
 #include "../drivers/audio.h"     // #181: audio_is_available(), the shared resampler
 #include "../drivers/audio_pcm.h" // #181: the ONE PCM sink door, kernel side
 #include "../drivers/usb_audio.h" // #181: uac_is_ready(), part of the sink test
@@ -60,8 +63,115 @@ extern int  win16_host_create(const char *title, int x, int y, int w, int h,
                               struct window **out_win);
 extern int  win16_host_content_rect(int slot, int *ox, int *oy, int *ow, int *oh);
 extern void win16_host_invalidate(int slot);
+// (#flipfix) The framebuffer present count, through the SAME narrow
+// win16_host_* seam this file already uses for the window geometry, rather than
+// as a direct read of gui/fb_syscall.c's g_fb_flip_count.
+//
+// WHY IT HAD TO STOP BEING A VARIABLE. These sources are compiled BYTE-
+// IDENTICALLY into the Ring-3 DOS host (userland/apps/dosring3), which is the
+// whole point of that port: one implementation of DOS semantics, so the two
+// paths cannot drift into guest-visible disagreement. A Ring-3 process cannot
+// read a kernel variable, and a variable READ cannot be turned into a syscall,
+// so the shim had to define a symbol of that name - and it was a stub that
+// nothing could ever write. dos_frame_due() below then saw a screen that had
+// never once moved on, skipped every frame, and left the 200 ms staleness
+// backstop as the only thing publishing anything: 5.005 flips/s measured,
+// against 24.98 for the identical guest in-kernel.
+//
+// A CALL is answerable by different code in each ring with this file none the
+// wiser. Ring 0 (proc/syscall.c) returns the same global this file used to
+// read, so nothing about the in-kernel path changes but the call. Ring 3
+// (dosring3/shim/kshim.c) asks the kernel through SYS_FB_FLIP_COUNT, which
+// returns that same one global - there is still exactly one counter of this
+// event in the system.
+extern uint64_t win16_host_flip_count(void);
+
 extern void win16_host_destroy(int slot);
 extern void win16_host_route_close_to_dos(int slot);
+
+// ---------------------------------------------------------------------------
+// (no-ticket) THE POST-EXIT LINGER, and the two facts it is built on.
+//
+// This used to be `if (t->running) proc_sleep(2000);` at the top of the
+// teardown, under a comment saying "keep the final frame visible for a
+// moment". See rustkern/doslinger.rs for what was wrong with that and what
+// the policy is now; the two pieces of KERNEL state it needs live here.
+//
+// g_dos_publish_flip / g_dos_published: the present counter at the moment the
+// DOS layer last told the WM its window was dirty, and whether it ever did.
+// "The final frame is on the glass" is exactly "the compositor has presented
+// at least once SINCE that moment", and that is a condition, not a duration,
+// so it can be waited for instead of slept through.
+//
+// One guest runs at a time (g_dos_busy enforces it), so file scope is the
+// right scope and a torn read of the pair is harmless: the worst case is one
+// exit paying the 250 ms backstop.
+static volatile uint64_t g_dos_publish_flip = 0;
+static volatile int      g_dos_published    = 0;
+
+// Woken by dos_request_close() (the titlebar X). ALWAYS ARMED for the whole
+// linger, which is the point: before this the X did nothing at all once the
+// run loop had exited, so a self-exited guest's window sat there for two
+// seconds refusing to close - the exact "reads as a hang" the old comment
+// warned about for the other path.
+static wait_queue_head_t g_dos_exit_wq = { .head = NULL, .lock = SPINLOCK_INIT };
+
+// Record "the DOS layer has just published a frame". Called at every
+// win16_host_invalidate() site (16-bit loop, halt path, and the DOS/4GW
+// loop), so a 32-bit guest is not silently excluded the way a per-loop frame
+// counter would have excluded it.
+static inline void dos_publish_mark(void) {
+    g_dos_publish_flip = win16_host_flip_count();
+    g_dos_published    = 1;
+}
+
+// The linger itself. self_exit is 1 when the guest stopped by itself and 0
+// when the user asked for the window to close.
+//
+// #426 SHAPE, stated explicitly because a reviewer should not have to infer
+// it: there are two waits and NEITHER is a poll.
+//   1. "has the final frame reached the screen" - a real condition with a
+//      real, always-armed wake (sys_fb_flip wakes g_fb_flip_wq after every
+//      present). The timeout is a BACKSTOP for a compositor that never
+//      presents, which is a fault, so it is logged loudly and durably.
+//   2. the deliberate visible hold - here the timeout IS the intent, not a
+//      workaround for a missing wake, and the wake exists to CUT IT SHORT
+//      when the user clicks the X.
+// Neither is paced off timer_ticks: sched_now_ms() is the TSC-backed clock.
+static void dos_exit_linger(int self_exit) {
+    if (!dos_linger_wanted_rs(self_exit, g_dos_published ? 1u : 0u)) return;
+
+    uint64_t mark = g_dos_publish_flip;
+    uint64_t t0   = sched_now_ms();
+
+    int rc = wait_event_timeout(&g_fb_flip_wq,
+                                dos_linger_frame_done_rs(win16_host_flip_count() - mark),
+                                wq_ms_to_ticks(dos_linger_frame_backstop_ms_rs()));
+    if (rc != WAIT_OK) {
+        // DURABLE, not just serial: serial is silent in GUI mode, and this
+        // firing means the compositor did not present for a quarter of a
+        // second while a window was dirty, which is worth knowing about on a
+        // machine that has no serial cable.
+        kprintf("[dos] exit linger: NO present within %u ms of the final frame "
+                "(flip=%lu mark=%lu) - tearing down anyway\n",
+                (unsigned)dos_linger_frame_backstop_ms_rs(),
+                (unsigned long)win16_host_flip_count(), (unsigned long)mark);
+        bootlog_write("[dos] exit linger: no present within %u ms of the final "
+                      "frame (flip=%lu mark=%lu)",
+                      (unsigned)dos_linger_frame_backstop_ms_rs(),
+                      (unsigned long)win16_host_flip_count(),
+                      (unsigned long)mark);
+    }
+
+    dos_linger_arm_hold_rs(sched_now_ms());
+    (void)wait_event_timeout(&g_dos_exit_wq,
+                             dos_linger_hold_done_rs(sched_now_ms()),
+                             wq_ms_to_ticks(dos_linger_hold_ms_rs()));
+
+    kprintf("[dos] exit linger %lu ms (frame-wait %s)\n",
+            (unsigned long)(sched_now_ms() - t0),
+            rc == WAIT_OK ? "ok" : "TIMED OUT");
+}
 // #156: does OUR host window currently hold compositor focus? See the
 // definition in proc/syscall.c for why this is the one authoritative focus
 // register rather than a second notion the DOS layer would have to keep in
@@ -80,6 +190,121 @@ _Static_assert(sizeof(dos_rect_t) == 16, "dos_rect_t must match Rust DosRect");
 extern int dos_letterbox_rs(int32_t cw, int32_t ch, int32_t aw, int32_t ah,
                             dos_rect_t *out);
 extern int dos_letterbox_selftest_rs(void);
+
+// (#dosfs) HOW BIG the picture is, which dos_letterbox_rs() alone never asked.
+// The policy, the pixel budget and the whole argument for both live in
+// rustkern/doswin.rs; this is only the seam. Both the DRAW path and the INPUT
+// path go through dos_present_geom() below, which is the single caller, for the
+// same reason #745 made dos_letterbox_rs() the single geometry function: a
+// scaled picture with unscaled input is worse than no scaling.
+typedef struct { int32_t budget_px, integer, max_w, max_h, aspect, frameskip; } dos_view_policy_t;
+_Static_assert(sizeof(dos_view_policy_t) == 24,
+               "dos_view_policy_t must match Rust DosViewPolicy");
+extern int dos_present_rect_rs(int32_t cw, int32_t ch, int32_t aw, int32_t ah,
+                               int32_t gw, int32_t gh,
+                               const dos_view_policy_t *pol, dos_rect_t *out);
+extern int dos_view_parse_rs(const uint8_t *buf, uint32_t len,
+                             dos_view_policy_t *pol);
+extern int dos_view_selftest_rs(void);
+// (#dosfs) `aspect=crt`: correct the fixed 8:5 box to the 4:3 the original
+// hardware displayed it at. Applied inside dos_present_aspect() below, which is
+// the ONE source of the box for both the draw path and the input path, so the
+// two cannot end up disagreeing about the shape of the picture.
+extern int dos_aspect_apply_rs(int32_t aspect, int32_t *aw, int32_t *ah);
+
+// THE DEFAULT LIVES IN RUST AND ONLY IN RUST (blame.md, the #mickey re-home
+// interval: a Rust `pub const` mirrored by a C `#define` that the C side then
+// assigned over the top, so changing the constant did nothing and cost a whole
+// verification run). This C copy is initialised from the Rust constant by
+// dos_view_init() and is only ever written where DOSVIEW.CFG actually asked.
+extern int32_t dos_view_default_budget_rs(void);
+// (no-ticket) The cap on the OPENING WINDOW, which is a different question from
+// the budget that governs the PICTURE. See rustkern/doswin.rs.
+extern int32_t dos_view_open_budget_rs(int32_t picture_budget);
+static dos_view_policy_t g_dos_view = { 0, 1, 0, 0, 0, 1 };
+
+// (no-ticket) THE DISPLAY-RATE BACK PRESSURE. The logic, and the measurement
+// that motivated it, are in rustkern/dosdisp.rs; this is the seam and the one
+// instance of the state.
+typedef struct { uint64_t last_flips, last_present_ms, presented, skipped; } dosdisp_state_t;
+_Static_assert(sizeof(dosdisp_state_t) == 32,
+               "dosdisp_state_t must match Rust DosDispState");
+extern void dosdisp_reset_rs(dosdisp_state_t *st);
+extern int  dosdisp_should_present_rs(dosdisp_state_t *st, int32_t enabled,
+                                      int32_t force, uint64_t flips, uint64_t now_ms);
+extern int  dosdisp_selftest_rs(void);
+static dosdisp_state_t g_dosdisp;
+// gui/fb_syscall.c: the monotonic count of framebuffer presents, already read
+// by [FLIPPROF] in main.c. Read here rather than counted again: a second
+// counter of the same event is the fork the reuse rule forbids. Reached through
+// win16_host_flip_count() (declared at the top of this file) so that the Ring-3
+// host, which compiles this file unchanged, can answer it too - see there.
+
+static int g_dos_view_loaded = 0;
+
+// The screen minus the dock/taskbar insets, through the SAME narrow
+// win16_host_* seam this file already uses for the window's content rect. Not a
+// local copy of rect_t: a mirrored struct definition is the private fork of a
+// shared type that the reuse rule exists to prevent, and it would agree with
+// gui/window.h right up until the day rect_t gained a field. Defined in
+// proc/syscall.c beside win16_host_content_rect().
+extern int win16_host_work_area(int *ox, int *oy, int *ow, int *oh);
+
+// (#dosfs) WHAT THE PRESENT ACTUALLY COSTS, in REAL microseconds.
+//
+// mono_us(), never timer_ticks: blame.md records that timer_ticks counts ticks
+// DELIVERED and that KVM replays lost ticks in bursts, so an elapsed time
+// derived from it under-counts exactly when the machine is busiest, which is
+// exactly when this is being measured. There is no floating point anywhere near
+// it either - the kernel is built -mno-sse and a %f in a kprintf silently
+// prints 0.00 (blame.md, #740 VESA), so every ratio below is integer.
+//
+// Reported on the existing /CONFIG/DOSSPEED.CFG gate rather than a new one: a
+// second perf flag would be a second thing to remember to arm, and this belongs
+// beside the delivered-instruction-rate line it explains.
+static uint64_t g_dosv_us_tot, g_dosv_us_max, g_dosv_n, g_dosv_bars;
+static int32_t  g_dosv_pw, g_dosv_ph;      // the picture size last presented
+static uint64_t g_dosv_report_ms;
+
+// (#dosfs) LOAD THE VIEW POLICY. Idempotent and called from BOTH the window
+// sizing (which needs it before the window exists) and the launch self-test
+// block (which reports it), because a policy that is read after the window has
+// already been created would size the window from the compiled-in default and
+// then silently disagree with the file for the rest of the session.
+static void dos_view_init(int *read_out, int *applied_out) {
+    if (g_dos_view_loaded) {
+        if (read_out) *read_out = -1;
+        if (applied_out) *applied_out = -1;
+        return;
+    }
+    g_dos_view_loaded = 1;
+    // The present-cost counters are file statics, so unlike everything in
+    // dos_task_t they survive the memset at launch. Reset them here so a second
+    // guest in one session does not report the first one's average.
+    g_dosv_us_tot = 0; g_dosv_us_max = 0; g_dosv_n = 0;
+    g_dosv_bars = 0; g_dosv_report_ms = 0;
+    g_dosv_pw = 0; g_dosv_ph = 0;
+    g_dos_view.budget_px = dos_view_default_budget_rs();
+    g_dos_view.integer   = 1;
+    g_dos_view.max_w     = 0;
+    g_dos_view.max_h     = 0;
+    g_dos_view.aspect    = 0;   // square pixels: what has always shipped
+    // /CONFIG is on the ext2 ROOT, not the FAT ESP; fat_read_file() routes it
+    // there through fat_path_on_ext2(). This uses the same call as the three
+    // DOS config files beside it rather than a private one, because blame.md
+    // records autorun_worker() hardcoding a path the ESP has no CONFIG
+    // directory for, leaving it unreachable on every two-partition golden.
+    uint32_t vz = 0;
+    void *vc = fat_read_file(&g_fat_fs, "/CONFIG/DOSVIEW.CFG", &vz);
+    int applied = 0;
+    if (vc) {
+        applied = dos_view_parse_rs((const uint8_t *)vc, vz, &g_dos_view);
+        kfree(vc);
+    }
+    if (read_out) *read_out = vc ? 1 : 0;
+    if (applied_out) *applied_out = applied;
+}
+
 
 // #163: displayed rows from the CRTC's vertical timing. See rustkern/doswin.rs.
 extern uint32_t dos_vga_rows_rs(const uint8_t *crtc, uint32_t ncrtc);
@@ -367,80 +592,25 @@ extern uint8_t  dos_dma_set_played_rs(dos_dma_t *d, uint8_t chan, uint32_t playe
 // ahead than this would read bytes the guest has not written yet.
 #define DOS_SB_LEAD       8192u
 // ===========================================================================
-// (#182) THE FM BRIDGE. Mirrors rustkern/fmq.rs, sizeof- and offsetof-locked
-// below for the same reason dos_bus_t is: a silent drift here would not crash,
-// it would feed the synthesiser garbage register writes and the machine would
-// play wrong notes with nothing anywhere saying why.
+// (#182/#fmbridge) THE FM BRIDGE lives in dos/dosfmq.c now, and this file
+// reaches it only through the dos/dosfmq.h seam included above.
 //
-// The kernel does NOT synthesise. It timestamps the guest's OPL2 register
-// writes and queues them for Ring 3, where the one FM core lives
-// (userland/lib/opl2). See rustkern/fmq.rs for why the timestamps are mono_us()
-// and not timer_ticks, and why the drain is non-blocking.
+// It used to be right here: dos_fm_queue_t, its offsetof locks, the
+// rustkern/fmq.rs externs, `static dos_fm_queue_t g_dos_fmq` and its
+// spinlock. That is correct in Ring 0 and unfixable in Ring 3, because THIS
+// FILE IS ALSO COMPILED INTO /APPS/DOSUSER (userland/apps/dosring3), where a
+// file-scope static is a SECOND queue in a SECOND address space. The guest's
+// OPL2 writes filled it correctly and nothing ever drained it, because
+// /APPS/FMSYNTH drains the KERNEL's queue through SYS_DOS_FM_EVENTS. Ring-3
+// DOS guests therefore had no music, and fm_launch_synth() returned -1 so the
+// chip would at least report ABSENT honestly rather than advertise a
+// synthesiser with nothing behind it.
+//
+// A variable access cannot become a syscall (the #flipfix lesson), so it
+// becomes a CALL. dos/dosfmq.h explains why the transport is a PUSH here
+// where #flipfix chose a PULL, and dos/dosfmq.c is the one owner of the one
+// queue.
 // ===========================================================================
-#define DOS_FMQ_CAP 1024
-typedef struct {
-    uint64_t t_us;
-    uint8_t  reg;
-    uint8_t  val;
-    uint8_t  flags;
-    uint8_t  _pad;
-    uint32_t seq;
-} dos_fm_event_t;
-_Static_assert(sizeof(dos_fm_event_t) == 16, "dos_fm_event_t must match rustkern/fmq.rs FmEvent");
-_Static_assert(__builtin_offsetof(dos_fm_event_t, t_us)  == 0,  "FmEvent.t_us");
-_Static_assert(__builtin_offsetof(dos_fm_event_t, reg)   == 8,  "FmEvent.reg");
-_Static_assert(__builtin_offsetof(dos_fm_event_t, val)   == 9,  "FmEvent.val");
-_Static_assert(__builtin_offsetof(dos_fm_event_t, flags) == 10, "FmEvent.flags");
-_Static_assert(__builtin_offsetof(dos_fm_event_t, seq)   == 12, "FmEvent.seq");
-
-typedef struct {
-    uint32_t head;
-    uint32_t tail;
-    uint32_t dropped;
-    uint32_t next_seq;
-    uint8_t  active;
-    uint8_t  pending_reset;
-    uint8_t  _pad[2];
-    uint32_t n_pushed;
-    uint32_t hi_used;      // (#187) high-water queue depth; see rustkern/fmq.rs
-    uint32_t _pad2;        // keeps ev[] 8-byte aligned (FmEvent leads with u64)
-    dos_fm_event_t ev[DOS_FMQ_CAP];
-} dos_fm_queue_t;
-_Static_assert(sizeof(dos_fm_queue_t) == 32 + 16 * DOS_FMQ_CAP,
-               "dos_fm_queue_t must match rustkern/fmq.rs FmQueue");
-_Static_assert(__builtin_offsetof(dos_fm_queue_t, head)          == 0,  "FmQueue.head");
-_Static_assert(__builtin_offsetof(dos_fm_queue_t, tail)          == 4,  "FmQueue.tail");
-_Static_assert(__builtin_offsetof(dos_fm_queue_t, dropped)       == 8,  "FmQueue.dropped");
-_Static_assert(__builtin_offsetof(dos_fm_queue_t, next_seq)      == 12, "FmQueue.next_seq");
-_Static_assert(__builtin_offsetof(dos_fm_queue_t, active)        == 16, "FmQueue.active");
-_Static_assert(__builtin_offsetof(dos_fm_queue_t, pending_reset) == 17, "FmQueue.pending_reset");
-_Static_assert(__builtin_offsetof(dos_fm_queue_t, n_pushed)      == 20, "FmQueue.n_pushed");
-_Static_assert(__builtin_offsetof(dos_fm_queue_t, hi_used)       == 24, "FmQueue.hi_used");
-_Static_assert(__builtin_offsetof(dos_fm_queue_t, ev)            == 32, "FmQueue.ev");
-
-extern void     dos_fmq_open_rs(dos_fm_queue_t *q);
-extern void     dos_fmq_close_rs(dos_fm_queue_t *q);
-extern int      dos_fmq_push_rs(dos_fm_queue_t *q, uint8_t reg, uint8_t val, uint64_t t_us);
-extern uint32_t dos_fmq_drain_rs(dos_fm_queue_t *q, dos_fm_event_t *out, uint32_t max);
-extern uint64_t dos_fmq_status_rs(const dos_fm_queue_t *q);
-extern int      dos_fmq_selftest_rs(dos_fm_queue_t *q, dos_fm_event_t *scratch, uint32_t n);
-
-// Defined HERE, beside the type, rather than beside the policy that reads it.
-// dos_on_terminate() closes the queue and sits roughly 1500 lines ABOVE that
-// policy, so putting the definition next to its most interesting reader instead
-// of above ALL of them is a forward declaration waiting to be needed.
-// The queue is a SINGLETON: there is one OPL2 in this machine and one Ring-3
-// synthesiser draining it. Guarded by its own irqsave spinlock rather than
-// borrowing the DOS window lock, because the producer runs in the guest's
-// interpreter and the consumer in an unrelated process's syscall, and coupling
-// those two to the compositor handover lock would be a lock-ordering trap for
-// no benefit.
-//
-// 16 KB of .bss. It is not allocated per DOS task on purpose: a per-task queue
-// would need the consumer to discover which task to drain, and the consumer is
-// a separate process that has no business knowing about dos_task_t.
-static dos_fm_queue_t g_dos_fmq;
-static spinlock_t     g_dos_fmq_lock = SPINLOCK_INIT;
 
 
 extern void     dos_opl2_addr_rs(void *o, uint8_t val);
@@ -708,7 +878,46 @@ static uint16_t ega_mem_r(struct x86_16_cpu *c, uint32_t lin, int width);
 // the catch-up headroom: the host tick is 250 Hz (4 ms), so a sleep asked for in
 // ms can land a tick late, and the burst after it must be allowed to be several
 // ms long or the cap would under-deliver instead of hitting its target.
-#define DOS_THROTTLE_BURST_MS   12u
+//
+// (#speedcap) 60, NOT 12, AND THE OLD VALUE MADE THE CAP DELIVER A THIRD OF WHAT
+// IT PROMISED. The paragraph above states the correct requirement and 12 did not
+// meet it. MEASURED on golden 2300, Commander Keen 5, /CONFIG/DOSSPEED.CFG armed,
+// SPEED.CFG=3000:
+//
+//   [dos] #232 speed: 1006932 insn/s (1006 cycles) target=3000 cycles credit=36000
+//   [DOSFRAME] wall=2027ms | interp 3.6% (n=98) | present 1.2% | resid 94.8%
+//
+// Two numbers give the whole diagnosis. `credit=36000` is EXACTLY the old
+// 3000 * 12 ceiling, i.e. the account was PINNED at the clamp on every pass, so
+// entitlement the guest had genuinely earned was being discarded rather than
+// spent. And `resid 94.8%` with n=98 passes over 2027 ms says a pass takes about
+// 20 ms of wall clock, essentially all of it inside the throttle's own
+// proc_sleep(): a sleep ASKED for in single milliseconds returns about 20 ms
+// later, because the host tick is 4 ms and the ready queue now has a PRIO_HIGH
+// compositor in it. The account is designed to absorb exactly that (an over-long
+// sleep earns a proportionally longer next burst), and a 12 guest-ms ceiling
+// silently defeated the compensation for any sleep longer than 12 ms, which was
+// every single one of them.
+//
+// So the delivered rate was not `cycles`, it was `cycles * BURST_MS /
+// pass_wall_ms`, about a third. This was #232's behaviour as shipped, on BOTH
+// run loops, and it means the two values in the tree before this change were
+// also wrong in practice: SimCity asked for 6000 and got about 2000.
+//
+// WHY 60 AND NOT "BIG". It has to exceed the worst legitimate sleep, and
+// DOS_THROTTLE_SLEEP_MAX is 25 ms, so 60 is that plus better than 2x headroom for
+// scheduler overshoot. It is still a real bound: the reason a bound exists at all
+// is that an idle stretch must not bank unlimited credit and spend it in one
+// burst, and 60 guest-ms is a small fraction of a second.
+//
+// AND THE WALL-CLOCK COST IS NOT 60 ms. This ceiling is in GUEST time; the wall
+// time a burst costs is guest_ms * cap / host_rate. On this hardware the
+// interpreter runs at about 18,000 cycles, so a 60 guest-ms burst at a 3000-cycle
+// cap is 180,000 instructions and about 10 ms of wall clock, which is under one
+// present interval. A cap high enough for 60 guest-ms to be a long WALL time is
+// by definition a cap at or above what the interpreter can deliver, and such a
+// cap never binds, so it never issues a long burst either.
+#define DOS_THROTTLE_BURST_MS   60u
 #define DOS_THROTTLE_BURST_MIN  64u       // never issue a zero-length burst
 #define DOS_THROTTLE_SLEEP_MAX  25u       // longest single sleep, ms
 // The furthest into DEBT the account may go, in guest milliseconds. A guest
@@ -722,6 +931,16 @@ static uint16_t ega_mem_r(struct x86_16_cpu *c, uint32_t lin, int width);
 #define DOS_IRQ_RETURN_CHUNK    128UL
 // Diagnostic only (/CONFIG/DOSSPEED.CFG), off in the golden.
 #define DOS_SPEED_REPORT_MS     2000u
+// #778 LIVE SPEED CONTROL: how often the run loop re-reads the SAME
+// dos_speed_cycles_for() chain it read at launch, so a per-window Speed
+// control (compositor) can change a running guest without a relaunch. This is
+// a periodic re-check inside a loop that is already iterating every
+// DOS_SLICE_MS (never a new wait/sleep of its own - see the call site in the
+// per-slice bookkeeping block, which already runs unconditionally), so it
+// adds no #426 busy-wait or blocking. 500 ms is fast enough that a slider
+// drag feels live and slow enough that the FAT/ext2 read it costs is noise
+// next to the guest's own I/O.
+#define DOS_SPEED_LIVE_POLL_MS  500u
 
 #define DOS_MEM_SIZE   0x100000          // 1 MiB real-mode address space
 // (#211) How many of the guest's most recent service calls the ring keeps.
@@ -731,6 +950,13 @@ static uint16_t ega_mem_r(struct x86_16_cpu *c, uint32_t lin, int width);
 
 #define DOS_PSP_SEG    0x0100            // PSP paragraph (so image loads at 0x0110)
 #define DOS_LOAD_SEG   (DOS_PSP_SEG + 0x10) // program load segment (PSP is 0x100 bytes)
+// (#digrun) The 16-bit guest's ENVIRONMENT BLOCK, at a paragraph below the PSP.
+// Segments 0x0050-0x00FF are the region a real DOS keeps its own data in and
+// nothing in this file writes there: the only sub-PSP writer is the BIOS data
+// area at 0x0040. 0x0C00-0x0FFF leaves 1 KiB, and dos32_build_env() writes
+// about 120 bytes.
+#define DOS_ENV_SEG    0x00C0
+#define DOS_ENV_LIN    ((uint32_t)DOS_ENV_SEG << 4)
 #define VGA_A000       0xA0000           // mode-13h linear framebuffer base (linear)
 #define VGA_A000_END   0xB0000           // end of the 64KB EGA aperture
 #define MODE13_W       320
@@ -762,6 +988,13 @@ static uint16_t ega_mem_r(struct x86_16_cpu *c, uint32_t lin, int width);
 // constants above rather than written out, so it cannot drift from them.
 #define DOS4GW_PM_IRET_LIN  (((uint32_t)0xF000u << 4) + DOS_IRET_STUB)
 #define DOS_MEVRET_STUB 0xFF58           // EB FE         (JMP $)
+// (#dpmi301) The far-return landing pad for a DPMI 0300h that EXECUTES a
+// real-mode vector the guest published itself. Its own pad rather than a reuse
+// of DOS_MEVRET_STUB: a mouse upcall and a 0300h are both "run 16-bit code from
+// a slice boundary and detect the return", and sharing one pad would leave them
+// unable to nest without silently stealing each other's return address. Two
+// bytes, and there is room before DOS_BIOSTIMER_STUB at 0xFF60.
+#define DOS_RMCALLRET_STUB 0xFF5C        // EB FE         (JMP $)
 // (#740) The BIOS TIMER handler, and it must NOT be the bare IRET stub.
 //
 // A real BIOS INT 8 ends by invoking INT 1Ch, the documented user tick. Games
@@ -971,6 +1204,33 @@ typedef struct {
     // Keyboard hardware emulation for INT 9 delivery (#202 Keen).
     uint8_t      kbd_port60;            // last scancode latched at port 0x60
     int          kbd_has_int9;         // guest installed its own INT 9 vector
+    // (rakbd) The 32-bit path delivers ONE scancode per pass and must not lose
+    // it if the guest happens to have interrupts off at that instant, so the
+    // byte in flight is latched here until a delivery actually succeeds.
+    int          k9_pending;           // a scancode is latched and not yet delivered
+    uint8_t      k9_code;              // the latched scancode
+    int          k9_route_said;        // the "keyboard ISR route" line is one-shot
+    int          k9_none_said;         // (rakbd2) the "no ISR at all" line is its OWN
+                                       // one-shot. Sharing k9_route_said made the two
+                                       // mutually exclusive: the NONE line fires on the
+                                       // first pass, BEFORE any guest has had a chance
+                                       // to install anything, and then permanently
+                                       // suppressed the line that says which route was
+                                       // eventually found. MEASURED: with the free-vector
+                                       // fix in, the run printed "kbd ISR route: NONE"
+                                       // and never printed the 0205h route it then used.
+    int          kbd_int9_pm;          // (rakbd2) guest installed INT 9 via DPMI 0205h
+    int          k9_first_said;        // the first-delivery bootlog line is one-shot
+    int          focus_said;           // the "#156 first pass" line is one-shot
+    // (rakbd) THE 8042 OUTPUT BUFFER, for a guest that polls the controller
+    // instead of installing an INT 9 handler. Fed by dos_keyq_pump(), which
+    // runs only while the guest has NOT hooked INT 9, so this FIFO and
+    // dos_deliver_int9()'s replay can never both be live.
+    uint8_t      p60_fifo[64];
+    uint8_t      p60_rd, p60_wr;
+    uint32_t     p60_reads, p64_reads;  // evidence, not control flow
+    uint32_t     keyq_pushes;           // keys actually placed in the BIOS ring
+    uint32_t     int16_calls;           // guest INT 16h invocations
     int          has_int8;             // guest installed its own INT 8 (timer) vector
     int          has_int1c;            // guest installed its own INT 1Ch (BIOS user tick)
     uint32_t     int8_accum;           // accumulator for INT 8 rate division
@@ -1114,6 +1374,15 @@ typedef struct {
     uint32_t     sb_irq_deliv;        // census: IRQs pushed into the guest
     uint32_t     sb_irq_unacked;      // census: guest never read base+0xE
     uint32_t     sb_open_fail;        // census: sink refused (EBUSY/ENODEV)
+    // (#sbirq32) One-shot reporting for the 32-bit guest's IRQ5 route. Three
+    // separate flags, not one, for the reason k9_none_said records: "this guest
+    // has no handler" and "this guest has one and here is where" are different
+    // facts that need opposite fixes, and a shared flag silences whichever
+    // happens second.
+    int          sb_route_said;       // the "SB IRQ route" line is one-shot
+    int          sb_none_said;        // the "no handler in any table" line is its own
+    int          sb_first_said;       // the first-delivery bootlog line is one-shot
+    uint32_t     sb_irq_latched;      // census: passes with an IRQ up and no handler
 
     // window host
     int          host_slot;
@@ -1132,6 +1401,25 @@ typedef struct {
     uint32_t    *pend_free[DOS_PEND_FREE_MAX];  // old buffers WE must free
     int          pend_free_n;
     int          presenting;              // this thread is inside dos_present()
+    // (#dosfs) THE SURROUND, PAINTED ONCE. dos_fill_bars() used to repaint the
+    // whole letterbox margin every frame, on the stated grounds that it was "a
+    // few percent of the pixels the scale itself writes". That was true while
+    // the picture filled the window. Under the pixel budget the picture is
+    // deliberately SMALLER than a large window, so on a maximised 3840x2160
+    // one the margin is 5.99 Mpx against the picture's 2.30 Mpx: the margin
+    // becomes the majority of the frame and repainting it every time would
+    // spend most of the saving on drawing black over black.
+    //
+    // So it is painted when it CHANGES, and the cache key is everything that
+    // can change it: the buffer it was painted into, that buffer's size, and
+    // the picture rectangle inside it. Nothing else writes outside the picture.
+    // The one case a value-only key would miss is a recycled allocation (the WM
+    // frees a buffer and kmalloc hands the same address back at the same size),
+    // so dos_present() clears bars_buf at the handover rather than relying on
+    // the pointer having changed.
+    uint32_t    *bars_buf;
+    int          bars_w, bars_h;
+    dos_rect_t   bars_pic;
 
     volatile int running;
 
@@ -1144,6 +1432,10 @@ typedef struct {
     // it replaces is the loader and the interpreter, which is exactly the part
     // that differs. dos/dos4gw.h has the memory map and why it is one buffer.
     int             le_active;      // this task is running an LE, not an MZ
+    // (#67/#168) Frames dos4gw_run() presented. It exists because the run
+    // summary below is printed by the SHARED teardown, which cannot see a
+    // 32-bit run loop local. See the note on that kprintf.
+    uint32_t        le_frames;
     x86_32_cpu_t    le_cpu;
     le_module_t     le_mod;
     dpmi_arena_t    le_arena;       // the first megabyte of le_cpu's own space
@@ -1229,6 +1521,20 @@ static uint16_t dos_vec_seed_stub(uint8_t vec);
 // (raplay) rustkern/dpmi.rs: seed one entry of the DPMI host's real-mode vector
 // shadow (0200h/0201h) so it agrees with the stub we write into the arena.
 extern void dpmi_rmvec_seed_rs(uint8_t vec, uint16_t seg, uint16_t off);
+// (#dpmi301) Is this real-mode vector one the GUEST published with DPMI 0201h,
+// as opposed to a stub this host seeded? Returns 1 and fills seg/off if so.
+// The provenance bit it reads is set ONLY by the 0201h arm; see the comment on
+// RMVEC_GUEST in rustkern/dpmi.rs for why a value comparison cannot answer it.
+extern int dpmi_rmvec_guest_rs(uint8_t vec, uint16_t *seg, uint16_t *off);
+// (#sbirq32) Deliver a pending Sound Blaster end-of-block IRQ to a 32-bit
+// DOS/4GW guest. Declared here because dos4gw_rm_exec_guest() calls it and runs
+// ~1500 lines earlier in this file than the vector-routing code it is built on.
+// `nested` = 1 means "we are already inside a 16-bit run on t->cpu".
+static void dos4gw_sb_irq(dos_task_t *t, int nested);
+// (#sbirq32) Publish the BIOS 18.2 Hz tick at 0040:006C. Declared here for the
+// same reason: dos4gw_rm_exec_guest() must keep it moving while it runs a
+// guest handler, and it is defined next to dos4gw_timebase(), its other caller.
+static void dos4gw_bios_tick(dos_task_t *t);
 static inline void     wr8 (dos_task_t *t, uint16_t s, uint16_t o, uint8_t v){ x86_16_wr8 (&t->cpu,s,o,v);}
 static inline void     wr16(dos_task_t *t, uint16_t s, uint16_t o, uint16_t v){ x86_16_wr16(&t->cpu,s,o,v);}
 
@@ -1574,6 +1880,57 @@ static uint32_t dos_cycles_from_conf(const char *b, uint32_t n) {
     return 0xFFFFFFFFu;
 }
 
+// (#speedcap) MAKE THE FILE THE SPEED DIALOG HAS TO REWRITE ACTUALLY WRITABLE.
+//
+// THE BUG THIS FIXES, MEASURED, NOT INFERRED. On golden 2300 the #778 per-window
+// Speed dialog opens, renders, reads the current value and accepts a preset, and
+// then its Save DOES NOTHING, silently. The kernel says why:
+//
+//   [PERMS-DENY] proc=COMPOSIT uid=1000 gid=1000 want=-wx path=/DOS/KEEN5
+//
+// /DOS/<GAME> is root-owned 0755 on purpose (a user who can rewrite the
+// executable hands the next user a different program), the compositor runs as
+// the logged-in desktop user, and dosspeed.c's ds_write_cycles() returns without
+// a word when the open fails. So the control changed a number on screen and
+// nothing else, which is the exact failure mode #778's own CHANGELOG entry
+// admitted had never been tested.
+//
+// THE FIX IS THE FILE, NOT THE DIRECTORY. sys_open()'s rule (proc/syscall.c) is
+// "creating a NAME is a write to the parent directory; writing an EXISTING file
+// is a write to that file". So a SPEED.CFG that already exists and is mode 0666
+// is rewritable by the desktop session while the directory and the executable
+// beside it stay root-owned 0755 and the blast radius does not move. That is why
+// this pairs with shipping a SPEED.CFG for every title: the default is what makes
+// the control work, not merely what sets the initial speed.
+//
+// GENERAL, NOT A PER-TITLE LIST. Nothing here names a game, which is the property
+// dos_speed_cycles_for()'s own comment insists on; the path is derived from the
+// binary being launched. Applied on EVERY launch rather than once, the same way
+// dos_overlay_prepare() re-applies its 0750, so a file written before this
+// existed is corrected rather than left wrong forever.
+//
+// Precedent, not a new policy: /DOS/NETHACK/RECORD and /GAMES/SIMCITY already
+// ship writable-by-everyone for exactly this reason (perms_shared_state_seed[]
+// in fs/perms.c). The difference is that this one needs no entry per game.
+static void dos_speed_cfg_make_writable(const char *path) {
+    if (!path) return;
+    char fp[224];
+    uint32_t last = 0, k = 0;
+    for (uint32_t i = 0; path[i] && i < sizeof(fp) - 16; i++) {
+        fp[i] = path[i];
+        if (path[i] == '/') last = i + 1;
+    }
+    k = last;
+    static const char nm[] = "SPEED.CFG";
+    for (uint32_t j = 0; j < sizeof(nm) - 1 && k < sizeof(fp) - 1; j++) fp[k++] = nm[j];
+    fp[k] = 0;
+    // Only an EXISTING file. Creating one here would invent a cap nobody asked
+    // for, and an absent SPEED.CFG is a legitimate state (the title's number may
+    // come from START.bat or from the system default).
+    if (!fat_exists(&g_fat_fs, fp)) return;
+    perms_set(fp, 0, 0, 0666);
+}
+
 static uint32_t dos_speed_cycles_for(const char *path, const char **src_out) {
     char dir[192];
     uint32_t dl = 0, last = 0;
@@ -1649,8 +2006,33 @@ static uint32_t dos_emu_hz(void) {
 // each of the four call sites is what stops the 32-bit guest ending up with a
 // working IRQ0 pace and a PIT counter on ports 0x40/0x43 that never moved, or
 // the reverse: both are derived from this, so they cannot disagree.
+// (#sbirq32) AND SINCE #dpmi301 A TASK DOES RUN BOTH, SO THE CLOCK MUST COUNT
+// BOTH. The paragraph above says "a task runs EITHER the 16-bit interpreter or
+// the 32-bit one and never both". That was true when it was written and stopped
+// being true when DPMI 0300h began EXECUTING a guest's own real-mode handler on
+// t->cpu (dos4gw_rm_exec_guest). While one of those runs, le_cpu.insn_count is
+// frozen, so this function returned a CONSTANT and every clock derived from it
+// - dos_emu_pit_now(), dos_bios_tick_now(), the 0040:006C dword, the 0x3DA beam
+// - stopped dead for the whole call.
+//
+// MEASURED consequence, Discworld II: SBLASTER.DIG's hardware probe (AIL
+// function 0304h) waits for the BIOS tick to change with
+//     mov ax,[es:0x046C] ; L: cmp ax,[es:0x046C] ; jz L
+// which has no escape at all, twice over, and then checks whether its IRQ
+// handler fired. With the tick frozen the first of those two spins can never
+// end: 2,000,000 instructions and ZERO port I/O, cut off by the budget, AX
+// still holding the tick value it read. The driver's own CX=10 timeout was
+// unreachable, so even the "no card" answer could not be produced.
+//
+// Summing is the correct answer and not a patch: both counters count THIS
+// guest's retired instructions, the sum is monotonically non-decreasing (which
+// is the only property a clock derived from it needs), and dos_emu_rebase()
+// captures its base through this same function, so nothing can disagree with
+// it.
 static unsigned long dos_emu_insns(const dos_task_t *t) {
-    return t->le_active ? (unsigned long)t->le_cpu.insn_count : t->cpu.insn_count;
+    return t->le_active
+        ? (unsigned long)(t->le_cpu.insn_count + t->cpu.insn_count)
+        : t->cpu.insn_count;
 }
 
 // The emulated clock, in PIT ticks. Monotonic BY CONSTRUCTION: only the part of
@@ -2150,11 +2532,8 @@ static void dos_on_terminate(dos_svc_ctx_t *ctx, int code) {
     // inactive), so the final note-off of the session is never lost. Losing it
     // would leave the last note of a game sounding forever, which is a real
     // failure mode and the reason the ordering is this way round.
-    {   uint64_t _fl = spinlock_acquire_irqsave(&g_dos_fmq_lock);
-        dos_fmq_close_rs(&g_dos_fmq);
-        uint32_t drop = g_dos_fmq.dropped;
-        uint32_t push = g_dos_fmq.n_pushed;
-        spinlock_release_irqrestore(&g_dos_fmq_lock, _fl);
+    {   uint32_t push = 0, drop = 0;
+        dos_fmq_host_close(&push, &drop);
         kprintf("[dos] (#182) FM bridge: %u register writes carried to Ring 3, "
                 "%u DROPPED%s\n", push, drop,
                 drop ? " (the ring overflowed; expect wrong or stuck notes)" : "");
@@ -3299,6 +3678,7 @@ static void dos_keyq_push(dos_task_t *t, uint8_t scan, uint8_t ascii) {
     if (next == head) return;          // full: real BIOS beeps and drops
     wr16(t, BDA_SEG, tail, (uint16_t)(((uint16_t)scan << 8) | ascii));
     wr16(t, BDA_SEG, BDA_KB_TAIL, next);
+    t->keyq_pushes++;   // (rakbd) evidence that a key reached the guest's ring
 }
 
 static int dos_keyq_peek(dos_task_t *t, uint16_t *out) {
@@ -3326,6 +3706,31 @@ static void dos_keyq_pump(dos_task_t *t) {
         int sc = dos_scancode_get();
         if (sc < 0) break;
         uint8_t b = (uint8_t)sc;
+        // (rakbd) EVERY RAW BYTE ALSO GOES TO THE 8042 OUTPUT BUFFER, BEFORE
+        // the BIOS-ring filtering below throws most of them away.
+        //
+        // This pump used to be the ONLY consumer of the raw ring for a guest
+        // with no INT 9 handler, and it published its result in exactly one
+        // place: the BIOS keyboard ring that INT 16h and a direct BDA read
+        // look at. A guest that instead polls the 8042 - reads port 0x64 for
+        // "data ready" and port 0x60 for the scancode - saw NOTHING, because
+        // t->kbd_port60 is written only by dos_deliver_int9(), which by
+        // definition does not run for a guest with no INT 9 handler. So the
+        // byte at port 0x60 was the memset zero for the whole run.
+        //
+        // MEASURED on Red Alert: it installs no INT 09h handler by either the
+        // low vector table or DPMI 0205h (the "[4GW] kbd ISR route: NONE" line
+        // says so), reaches a live mission map, and ignores every key.
+        //
+        // The BREAK codes and the E0 prefix are kept here and dropped below on
+        // purpose: the BIOS ring holds cooked make codes, and a raw poller
+        // wants the byte stream the hardware would have produced, including
+        // releases, or it cannot maintain a key-down table.
+        uint8_t nx = (uint8_t)((t->p60_wr + 1u) % (uint8_t)sizeof t->p60_fifo);
+        if (nx != t->p60_rd) {           // full: drop, exactly as the 8042 does
+            t->p60_fifo[t->p60_wr] = b;
+            t->p60_wr = nx;
+        }
         if (b == 0xE0 || b == 0xE1) continue;   // extended prefix: the NEXT byte
                                                 // carries the same make code the
                                                 // BIOS reports in AH
@@ -3531,7 +3936,7 @@ static int dos_int_handler_inner(x86_16_cpu_t *c, uint8_t intno) {
     case 0x21: dos_svc_int21(&t->svc, &t->cpu); return 0;
     case 0x10: int10(t); return 0;
     case 0x33: int33(t); return 0;
-    case 0x16: int16(t); return 0;
+    case 0x16: t->int16_calls++; int16(t); return 0;
     case 0x1A: {  // (#234a) BIOS time-of-day. Was: CX=DX=0, unconditionally.
         // Read from the SAME four bytes at 0040:006C that a guest reading the
         // BDA directly sees, so the two cannot disagree. The run loop keeps
@@ -3592,6 +3997,8 @@ static int dos_int_handler_inner(x86_16_cpu_t *c, uint8_t intno) {
         return 0;
     }
     case 0x2F: // multiplex: XMS install check + MSCDEX (#196)
+        kprintf("[CDTRACE] 2Fh IN ax=%04x bx=%04x cx=%04x dx=%04x es=%04x\n",
+                c->ax, c->bx, c->cx, c->dx, c->es);
         // AX=4300h: XMS driver install check. Real HIMEM returns AL=0x80. We
         // have no XMS, so return AL!=0x80 to report "not installed" (Keen then
         // falls back to conventional memory).
@@ -3692,6 +4099,8 @@ static int dos_int_handler_inner(x86_16_cpu_t *c, uint8_t intno) {
             case 0x1500:   // installation check: BX = #drives, CX = first drive
                 c->bx = (uint16_t)mi.count;
                 c->cx = (uint16_t)mi.first;
+                kprintf("[CDTRACE] 2F/1500 -> bx=%u(count) cx=%u(first)\n",
+                        (unsigned)mi.count, (unsigned)mi.first);
                 return 0;
             case 0x1501:   // get driver header list -> ES:BX array of headers.
                 // We have no real device driver header to hand out. Leave the
@@ -3712,6 +4121,8 @@ static int dos_int_handler_inner(x86_16_cpu_t *c, uint8_t intno) {
                 for (uint32_t k = 0; k < mi.count && k < sizeof mi.letters; k++)
                     if ((uint16_t)mi.letters[k] == c->cx) is_cd = 1;
                 c->ax = (uint16_t)(is_cd ? 1 : 0);
+                kprintf("[CDTRACE] 2F/150B cx=%u -> is_cd=%d\n",
+                        (unsigned)c->cx, is_cd);
                 return 0; }
             case 0x150C:   // get version -> BH.BL
                 c->bx = have ? 0x020A : 0x0000;   // MSCDEX 2.10
@@ -3735,6 +4146,7 @@ static int dos_int_handler_inner(x86_16_cpu_t *c, uint8_t intno) {
             }
         }
         // All other 2Fh multiplex calls: not handled.
+        kprintf("[CDTRACE] 2Fh ax=%04x NOT HANDLED (fall-through)\n", c->ax);
         return 0;
     case 0x15:
         // (#252) BIOS misc services. EXACTLY ONE function is serviced: AH=86h,
@@ -4260,10 +4672,7 @@ static uint8_t sb_installed_policy(void) {
     return audio_is_available() ? 1 : 0;
 }
 
-// The pid allowed to drain. Latched by the FIRST caller, the same pattern the
-// compositor framebuffer latch uses, so an unrelated app cannot starve the
-// synthesiser by draining events out from under it.
-static uint32_t       g_dos_fm_pid = 0;
+// (#fmbridge) The drain latch moved to dos/dosfmq.c with the queue it guards.
 // #205: the pid of the /APPS/FMSYNTH we launched, so its exit can be noticed.
 static uint32_t       g_dos_fm_synth_pid = 0;
 
@@ -4317,6 +4726,25 @@ static int dos_fm_launch(void) {
     return 1;
 }
 
+// (#fmbridge) THE ONE PLACE THAT DECIDES WHETHER A SYNTHESISER IS RUNNING,
+// now that the Ring-3 DOS host can ask for one too (SYS_DOS_FM_HOST LAUNCH,
+// dos/dosfmq.c).
+//
+// It must not be a second copy of dos_fm_launch(): that function owns
+// g_dos_fm_ready and g_dos_fm_synth_pid, the pair whose staleness WAS #205. If
+// the syscall called fm_launch_synth() directly it would spawn a SECOND
+// /APPS/FMSYNTH beside a live one; the drain latch means the newcomer gets
+// EPERM and exits, so it is not a correctness bug, but it is a process spawned
+// for nothing and a second thing that believes it is the synthesiser.
+//
+// Returns the pid of a LIVE synthesiser, launching one if there is none, or <=0
+// if one cannot be started (no audio sink on this machine, or /APPS/FMSYNTH
+// missing - both of which keep the OPL2 honestly ABSENT).
+int dos_fm_synth_ensure(void) {
+    if (dos_fm_launch()) return (int)g_dos_fm_synth_pid;
+    return -1;
+}
+
 // #205: the durable half of the FM-bridge exit summary. See the forward
 // declaration near dos_on_terminate() for why it lives down here.
 static void dos_fm_report_exit(uint32_t pushed, uint32_t dropped) {
@@ -4334,10 +4762,12 @@ static void dos_fm_report_exit(uint32_t pushed, uint32_t dropped) {
 void dos_fm_proc_exit(uint32_t pid) {
     if (!pid) return;
     int was_synth = 0, was_drainer = 0;
-    uint64_t fl = spinlock_acquire_irqsave(&g_dos_fmq_lock);
     if (g_dos_fm_synth_pid == pid) { g_dos_fm_synth_pid = 0; g_dos_fm_ready = 0; was_synth = 1; }
-    if (g_dos_fm_pid == pid)       { g_dos_fm_pid = 0; was_drainer = 1; }
-    spinlock_release_irqrestore(&g_dos_fmq_lock, fl);
+    // (#fmbridge) The queue's own latches are released by their owner. That is
+    // also what catches a Ring-3 DOS host that DIED without closing the queue:
+    // without it the queue stays active forever, FMSYNTH never sees ENODEV,
+    // never renders its tail and never exits.
+    was_drainer = dos_fmq_host_release_pid(pid);
     if (was_synth || was_drainer) {
         audiolog_write("[FM] the FM synthesiser (pid %u) exited%s. The OPL2 goes "
                        "back to ABSENT until the next guest launches a fresh one.",
@@ -4347,38 +4777,16 @@ void dos_fm_proc_exit(uint32_t pid) {
 
 // #182: called from dos_out on every guest write to port 0x389. Never waits.
 static inline void dos_fm_note_write(dos_task_t *t, uint8_t val) {
-    if (!g_dos_fmq.active) return;   // cheap unlocked pre-check; re-tested under the lock
+    if (!dos_fmq_host_active()) return;   // cheap pre-check; re-tested at the queue
     uint8_t reg = t->opl2.addr;
     uint64_t now = mono_us();
-    uint64_t fl = spinlock_acquire_irqsave(&g_dos_fmq_lock);
-    dos_fmq_push_rs(&g_dos_fmq, reg, val, now);
-    spinlock_release_irqrestore(&g_dos_fmq_lock, fl);
+    dos_fmq_host_push(reg, val, now);
 }
 
-// #182: SYS_DOS_FM_EVENTS. Copies at most `max` events into the KERNEL buffer
-// `out`; the caller (proc/syscall.c) owns the copy to Ring 3.
-//
-// Returns the count, or DOS_FM_ENODEV when the guest is gone AND the queue is
-// empty, which is how /APPS/FMSYNTH learns to render its tail and exit rather
-// than feeding the sink silence forever.
-#define DOS_FM_ENODEV (-6)
-#define DOS_FM_EPERM  (-5)
-int dos_fm_drain(dos_fm_event_t *out, uint32_t max, uint32_t pid, uint32_t *dropped) {
-    if (!out || max == 0) return -1;
-    uint64_t fl = spinlock_acquire_irqsave(&g_dos_fmq_lock);
-    if (g_dos_fm_pid == 0) g_dos_fm_pid = pid;
-    if (g_dos_fm_pid != pid) {
-        spinlock_release_irqrestore(&g_dos_fmq_lock, fl);
-        return DOS_FM_EPERM;
-    }
-    uint32_t n = dos_fmq_drain_rs(&g_dos_fmq, out, max);
-    uint8_t  active = g_dos_fmq.active;
-    if (dropped) *dropped = g_dos_fmq.dropped;
-    spinlock_release_irqrestore(&g_dos_fmq_lock, fl);
-    if (n == 0 && !active) return DOS_FM_ENODEV;
-    return (int)n;
-}
-size_t dos_fm_event_size(void) { return sizeof(dos_fm_event_t); }
+// (#fmbridge) dos_fm_drain() and dos_fm_event_size() - the SYS_DOS_FM_EVENTS
+// backend - moved to dos/dosfmq.c with the queue and the drain latch they
+// operate on. They are Ring-0-only by nature (they hand kernel memory to a
+// syscall) and were the last thing here that needed the struct.
 
 // The AdLib base. MEASURED, not assumed: #175 was filed saying the probe is at
 // port 0x218 and it is not. 0x218 is the OPL alias of a Sound Blaster based at
@@ -4642,7 +5050,23 @@ static void dos_sb_pump(void *arg) {
         // because the wake belongs to the sink and a dead sink must not wedge
         // the guest.
         uint32_t ms = (written * 1000u) / DOS_SB_SINK_RATE + 1000u;
-        (void)audio_pcm_wait_consumed_kernel(h, start_cons + written, ms);
+        uint64_t tail_t0 = sched_now_ms();
+        int tw = audio_pcm_wait_consumed_kernel(h, start_cons + written, ms);
+        uint64_t tail_ms = sched_now_ms() - tail_t0;
+        // (#sbirq32) HOW LONG THE ACKNOWLEDGE ACTUALLY TOOK, for the first few
+        // blocks of every run. A guest cannot see how long we took to raise its
+        // end-of-block interrupt, and a DRIVER PROBE CAN: SBLASTER.DIG's detect
+        // arms a SIXTEEN-BYTE transfer and gives up after twenty BIOS ticks, so
+        // "the interrupt is correct but late" and "there is no card" are the
+        // same observation from inside the guest. This is the number that tells
+        // the two apart, and it costs six lines once per run.
+        if (t->sb_blocks < 6) {
+            kprintf("[dos] (#181) SB block %u ack: %u guest bytes at %u Hz -> "
+                    "%u sink frames, tail wait %s after %llu ms (bound %u ms)\n",
+                    t->sb_blocks, total, rate, written,
+                    tw == WAIT_OK ? "SATISFIED" : "TIMED OUT",
+                    (unsigned long long)tail_ms, ms);
+        }
         (void)dos_dma_set_played_rs(&t->dma, chan, total);
         t->sb_blocks++;
         dos_sb_raise_irq_rs(&t->sb);
@@ -4799,8 +5223,46 @@ static uint16_t dos_in(x86_16_cpu_t *c, uint16_t port, int width) {
         }
         return st;
     }
-    if (port == 0x60) return t->kbd_port60;       // keyboard data port (last scancode)
-    if (port == 0x64) return 0x14;                 // 8042 status: output buffer full + system flag
+    // (rakbd) THE 8042, AND THE CONSTANT THAT SAID THE OPPOSITE OF WHAT IT MEANT.
+    //
+    // Port 0x64 returned a flat 0x14 with the comment "output buffer full +
+    // system flag". 0x14 is 0b0001_0100: bit 2 (system flag) and bit 4
+    // (keyboard not inhibited). BIT 0 IS THE OUTPUT-BUFFER-FULL FLAG AND IT IS
+    // CLEAR. So the status byte said "there is no data" on every read, forever,
+    // while its own comment claimed the reverse. A guest that polls the
+    // controller the documented way -
+    //
+    //     wait:  in al, 0x64 ; test al, 1 ; jz wait ; in al, 0x60
+    //
+    // - could never leave that loop, and a guest that skipped the status check
+    // read a port 0x60 that nothing had written since the memset. Both halves
+    // of the polled path were dead, which is the whole of why Red Alert reaches
+    // gameplay and ignores the keyboard.
+    //
+    // SCOPED TO THE GUESTS THAT MUST POLL. A guest with its own INT 9 handler
+    // keeps the previous behaviour byte for byte: its ISR is entered by
+    // dos_deliver_int9(), which latches the scancode into kbd_port60 first, and
+    // Commander Keen's Galaxy engine reads 0x60 in exactly that context without
+    // consulting 0x64. Changing the status byte underneath a working ISR to fix
+    // a poller would have been trading one broken guest for another.
+    if (port == 0x60) {
+        t->p60_reads++;
+        // (rakbd2) ...and a 0205h guest is an ISR-driven guest, so it reads the
+        // byte dos4gw_deliver_int9() latched, not the poller FIFO.
+        if (!t->kbd_has_int9 && !t->kbd_int9_pm && t->p60_rd != t->p60_wr) {
+            t->kbd_port60 = t->p60_fifo[t->p60_rd];
+            t->p60_rd = (uint8_t)((t->p60_rd + 1u) % (uint8_t)sizeof t->p60_fifo);
+        }
+        return t->kbd_port60;                      // keyboard data port
+    }
+    if (port == 0x64) {
+        t->p64_reads++;
+        // 0x14 keeps the system flag and the not-inhibited bit exactly as
+        // before; bit 0 now tells the truth about whether a byte is waiting.
+        if (!t->kbd_has_int9 && !t->kbd_int9_pm)
+            return (uint16_t)(0x14u | ((t->p60_rd != t->p60_wr) ? 0x01u : 0x00u));
+        return 0x14;                               // ISR-driven guest: unchanged
+    }
     // (#181) The Sound Blaster DSP, and the 8237 that feeds it. BOTH are gated
     // on the same installed flag: the DMA controller is emulated here only in
     // order to serve this card, and decoding it for a machine with no card
@@ -5358,12 +5820,36 @@ static void dos_present_text(dos_task_t *t, const dos_rect_t *r) {
     }
 }
 
-// Paint the letterbox margin. Unconditional rather than "only when the
-// geometry changed": it is a few percent of the pixels the scale itself writes,
-// and a cached-geometry flag is one more piece of state that can be stale after
-// a mode change or a rebind. Cheap correctness beats a saved memset.
+// Paint the letterbox margin.
+//
+// (#dosfs) NOW CONDITIONAL, and the comment this replaces argued the opposite
+// case honestly enough that it is worth saying what changed rather than just
+// deleting it. It read: "Unconditional rather than 'only when the geometry
+// changed': it is a few percent of the pixels the scale itself writes, and a
+// cached-geometry flag is one more piece of state that can be stale after a
+// mode change or a rebind. Cheap correctness beats a saved memset."
+//
+// The premise was "a few percent", and the pixel budget falsifies it: a
+// maximised 3840x2160 window now holds a 1920x1200 picture, so the margin is
+// 5.99 Mpx against 2.30 Mpx of picture, i.e. 72% of the frame. It is no longer
+// a saved memset, it is most of the work.
+//
+// The staleness worry was the right worry, so the key is EVERY input that can
+// change the margin - the buffer, its size, and the picture rectangle - and a
+// mode change reaches it through the rectangle, which dos_present_geom()
+// recomputes from scratch every frame. The recycled-allocation case that a
+// value-only key cannot see is closed at the source: dos_present() clears
+// bars_buf when it adopts a buffer from the WM.
 static void dos_fill_bars(dos_task_t *t, const dos_rect_t *r) {
     int W = t->win_w, H = t->win_h;
+    if (t->bars_buf == t->win_buf && t->bars_w == W && t->bars_h == H &&
+        t->bars_pic.x == r->x && t->bars_pic.y == r->y &&
+        t->bars_pic.w == r->w && t->bars_pic.h == r->h)
+        return;
+    t->bars_buf = t->win_buf;
+    t->bars_w = W; t->bars_h = H;
+    t->bars_pic = *r;
+    g_dosv_bars++;
     for (int y = 0; y < H; y++) {
         uint32_t *row = t->win_buf + (size_t)y * W;
         if (y < r->y || y >= r->y + r->h) {
@@ -5618,13 +6104,73 @@ static void dos_present_aspect(const dos_task_t *t, int32_t *aw, int32_t *ah) {
     // is the entire reason a game chose it over 320x200; presenting it into the
     // 8:5 box would squash the artwork by a fifth. Every chained mode keeps the
     // 8:5 box, so nothing that ships today changes shape by one pixel.
-    if (!dos_modex_active(t)) return;
+    if (!dos_modex_active(t)) {
+        // (#dosfs) The 8:5 box, and the ONE place `aspect=crt` can change it.
+        // Placed after the VBE early return above and before the Mode X arm
+        // below on purpose: those two modes carry their OWN true aspect
+        // (640x480 and 320x240 are 4:3 on square pixels, which is exactly why a
+        // game picked them), so correcting them would be a second, wrong
+        // correction of something already right. dos_aspect_apply_rs() checks
+        // the 8:5 cross-multiply itself and refuses anything else, so this is
+        // belt and braces rather than the only guard.
+        dos_aspect_apply_rs(g_dos_view.aspect, aw, ah);
+        return;
+    }
     dos_modex_geom_t mg;
     if (dos_modex_geom_rs(t->crtc, t->seq_reg[4], &mg)
         && mg.aspect_w > 0 && mg.aspect_h > 0) {
         *aw = mg.aspect_w;
         *ah = mg.aspect_h;
     }
+}
+
+// (#dosfs) THE GUEST'S OWN RESOLUTION, which is neither the aspect box nor the
+// window size. dos_present_aspect() above answers "what SHAPE is the picture";
+// this answers "how many pixels does the guest actually have", and the
+// integer-scale policy needs both: the shape decides the rectangle, the pixel
+// count decides which whole multiples of it exist.
+//
+// It is ONE function called from ONE place (dos_present_geom, below), for
+// exactly the reason dos_present_aspect() is: the draw path and the input path
+// must not be able to disagree about where the picture is.
+static void dos_native_res(const dos_task_t *t, int32_t *gw, int32_t *gh) {
+    if (t->vbe.mode) {
+        *gw = (int32_t)t->vbe.width; *gh = (int32_t)t->vbe.height; return;
+    }
+    if (dos_text_is(t)) {
+        // The GLYPH GRID is the native picture here. dos_present_text() scales
+        // 80x25 cells of the shared 8x16 font, so 640x400 is what a 1:1 present
+        // draws and 2x is whole 8x16 cells - the same arithmetic that
+        // dos_run_file() sizes the default window by.
+        *gw = TEXT_COLS * FONT_WIDTH; *gh = TEXT_ROWS * FONT_HEIGHT; return;
+    }
+    if (dos_modex_active(t)) {
+        dos_modex_geom_t mg;
+        if (dos_modex_geom_rs(t->crtc, t->seq_reg[4], &mg) && mg.w > 0 && mg.h > 0) {
+            *gw = mg.w; *gh = mg.h; return;
+        }
+    }
+    *gw = t->gfx_w ? t->gfx_w : MODE13_W;
+    *gh = t->gfx_h ? t->gfx_h : MODE13_H;
+    // #163: every presenter draws the CRTC's derived row count in preference to
+    // the mode's nominal height, so the scale decision must read the SAME
+    // number or it would pick a whole multiple of a height nothing draws. The
+    // Incredible Machine is the measured case: 400 rows out of a nominal 480,
+    // which at a 2.4 Mpx budget is the difference between a 3x and a 2x fit.
+    uint32_t rows = dos_vga_rows_rs(t->crtc, (uint32_t)sizeof(t->crtc));
+    if (rows) *gh = (int32_t)rows;
+}
+
+// (#dosfs) THE ONE geometry call, and the only caller of dos_present_aspect(),
+// dos_native_res() and dos_present_rect_rs(). Present and input both come here
+// and nowhere else. `cw x ch` is the caller's own idea of the content area
+// (the buffer size on the draw path, the WM's content rect on the input path),
+// which are the same thing except transiently across a resize.
+static int dos_present_geom(const dos_task_t *t, int cw, int ch, dos_rect_t *r) {
+    int32_t aw, ah, gw, gh;
+    dos_present_aspect(t, &aw, &ah);
+    dos_native_res(t, &gw, &gh);
+    return dos_present_rect_rs(cw, ch, aw, ah, gw, gh, &g_dos_view, r);
 }
 
 // (#740) Present an 8bpp packed VESA mode.
@@ -5666,9 +6212,8 @@ static void dos_present_inner(dos_task_t *t) {
     // every present from the CURRENT buffer size rather than cached, so a
     // resize cannot leave the draw path and the input path disagreeing.
     dos_rect_t r;
-    int32_t aw, ah;
-    dos_present_aspect(t, &aw, &ah);
-    if (!dos_letterbox_rs(t->win_w, t->win_h, aw, ah, &r)) return;
+    if (!dos_present_geom(t, t->win_w, t->win_h, &r)) return;
+    g_dosv_pw = r.w; g_dosv_ph = r.h;
     if (g_x86_dbgring) {
         // DOSDIAG-gated, and only when the geometry actually changes: the one
         // line that says where the picture is, so a resize can be checked
@@ -5808,7 +6353,7 @@ static void dos_iocost_periodic(dos_task_t *t) {
         last_ticks = t->bus.ticks_charged; last_pit = dos_emu_pit_now(t);
         last_insn = dos_emu_insns(t);
         last_sat = t->bus_saturated;
-        last_push = g_dos_fmq.n_pushed;   // (#187)
+        dos_fmq_host_stats(&last_push, 0, 0, 0);   // (#187)
         return;
     }
     if (now - last_ms < 5000) return;
@@ -5854,6 +6399,39 @@ static void dos_iocost_periodic(dos_task_t *t) {
             (unsigned long)dms, per_s,
             (unsigned long)dtick, (unsigned long)dpit, permil, kips,
             satmsg);
+    // (rakbd) WHERE THE GUEST LOOKS FOR THE KEYBOARD, as a number.
+    //
+    // "It ignores every key" has at least four distinct causes (no scancode
+    // reaching the ring, no ISR installed, an ISR we cannot reach, or a guest
+    // polling a controller we answer wrongly) and they need opposite fixes.
+    // These two counters separate the polled path from the rest in one line:
+    // a guest that polls the 8042 shows thousands of p60/p64 reads, and a guest
+    // that uses INT 16h shows zero. Guessing which one Red Alert was cost most
+    // of this ticket.
+    // (rakbd) ONLY WHEN IT CHANGES. A line every 5 s for every DOS guest is
+    // noise on a shipping golden; a line only when one of these counters moves
+    // is a keyboard trace. The FIRST call always prints, so "all zero" - the
+    // answer for Red Alert, and the whole finding - is stated rather than
+    // inferred from an absent line. That distinction is what cost this ticket
+    // its longest detour.
+    {
+        static uint32_t l60, l64, l16, lpush; static int said;
+        if (said && l60 == t->p60_reads && l64 == t->p64_reads &&
+            l16 == t->int16_calls && lpush == t->keyq_pushes) goto kbdio_done;
+        said = 1; l60 = t->p60_reads; l64 = t->p64_reads;
+        l16 = t->int16_calls; lpush = t->keyq_pushes;
+    }
+    // (rakbd2) int9_pm is here because its ABSENCE is what made the previous
+    // reading of this line wrong. "int9_hooked=0" was true and complete for the
+    // low table and said nothing about the 0205h table, so a guest that had
+    // installed a keyboard ISR read as a guest that had not.
+    kprintf("[KBDIO] port60=%lu port64=%lu int16=%lu ringpush=%lu int9_hooked=%d "
+            "int9_pm=%d bda_head=%04x bda_tail=%04x\n",
+            (unsigned long)t->p60_reads, (unsigned long)t->p64_reads,
+            (unsigned long)t->int16_calls, (unsigned long)t->keyq_pushes,
+            t->kbd_has_int9, t->kbd_int9_pm,
+            rd16(t, BDA_SEG, BDA_KB_HEAD), rd16(t, BDA_SEG, BDA_KB_TAIL));
+kbdio_done: ;
     // (#187) FM QUEUE PRESSURE, on the SAME 5 s cadence and the same frame
     // path, so it adds no timer and no waiting.
     //
@@ -5871,11 +6449,8 @@ static void dos_iocost_periodic(dos_task_t *t) {
     // music from one that merely loaded an instrument bank and then went quiet.
     // Those two look IDENTICAL in every other counter on this line, and the
     // difference is the whole cost being measured.
-    {   uint32_t q_push, q_drop, q_peak, q_used;
-        uint64_t qfl = spinlock_acquire_irqsave(&g_dos_fmq_lock);
-        q_push = g_dos_fmq.n_pushed; q_drop = g_dos_fmq.dropped;
-        q_peak = g_dos_fmq.hi_used;  q_used = g_dos_fmq.head - g_dos_fmq.tail;
-        spinlock_release_irqrestore(&g_dos_fmq_lock, qfl);
+    {   uint32_t q_push = 0, q_drop = 0, q_peak = 0, q_used = 0;
+        dos_fmq_host_stats(&q_push, &q_drop, &q_peak, &q_used);
         // (#252) i15w/i15us ride along here rather than getting a line of
         // their own, because the question they answer is always asked next to
         // this one: "the guest is writing FM registers, is its BIOS wait
@@ -5884,7 +6459,7 @@ static void dos_iocost_periodic(dos_task_t *t) {
         kprintf("[FMQ] pushed=%u (+%u in %lums) drop=%u peak=%u/%u now=%u "
                 "i15w=%u i15us=%lu\n",
                 q_push, q_push - last_push, (unsigned long)dms,
-                q_drop, q_peak, (unsigned)DOS_FMQ_CAP, q_used,
+                q_drop, q_peak, (unsigned)dos_fmq_host_capacity(), q_used,
                 (unsigned)g_dos_int15_waits, (unsigned long)g_dos_int15_wait_us);
         last_push = q_push;
     }
@@ -5923,18 +6498,266 @@ static void dos_iotrace_periodic(void) {
 static unsigned long g_dos_redraw_n = 0;
 static uint32_t      g_dos_redraw_h = 0;
 
+// A change detector, not a checksum, so it samples rather than reads every
+// byte. A fixed SAMPLE COUNT rather than a fixed stride, because the buffers
+// below differ by 16x in size and a stride tuned for 128 KB would either crawl
+// over 1 MB of VESA VRAM or skip most of a 64 KB plane.
+#define DOS_REDRAW_SAMPLES 32768u
+
+static void dos_redraw_hash(uint32_t *h, const uint8_t *p, uint32_t len) {
+    if (!p || !len) return;
+    uint32_t stride = len / DOS_REDRAW_SAMPLES;
+    if (stride < 4) stride = 4;   // any redraw touching a sprite touches >> 4 bytes
+    for (uint32_t a = 0; a < len; a += stride)
+        *h = (*h ^ p[a]) * 16777619u;
+}
+
+// (no-ticket) HASH WHERE THE PIXELS ACTUALLY ARE, NOT WHERE THEY USED TO BE.
+//
+// This hashed t->mem[0xA0000..0xC0000] unconditionally. That is the real-mode
+// VGA aperture, and it is the right buffer for exactly TWO of the five modes
+// this file presents - chained mode 13h, and text. It is the WRONG buffer for
+// the other three, silently:
+//
+//   VESA          the pixels are in t->vbe_vram. dos_vga_write() stores there
+//                 and RETURNS; it never touches t->mem in a VBE mode at all.
+//   EGA planar
+//   and Mode X    the pixels are in t->ega_plane[0..3].
+//
+// So for a VESA guest this was hashing a region the guest never writes:
+// constant for the entire run, and the counter therefore reported ZERO frames,
+// forever, while looking like a working instrument. #232 was developed against
+// Joust, which is chained mode 13h, so nothing ever exercised the other arms.
+//
+// IT COST THIS TICKET A WRONG CONCLUSION. Discworld II's instruction rate
+// (41-47 M/s) was measured, looked healthy, and was reported as evidence that
+// the guest was fine - while the one instrument that could have contradicted
+// it was structurally incapable of reporting anything. An instruction rate is
+// not a frame rate for a VESA guest: a single `rep movsd` retires as ONE
+// instruction and can carry up to 16,384 per-byte calls into dos_vga_write().
+//
+// The dispatch below is in the SAME ORDER as dos_present_inner's, because the
+// two answer the same question - where is the picture - and a second ordering
+// is how they come to disagree.
+// (dosplay 2026-08-28) CALLED ON THE PRESENT *CADENCE*, NOT FROM dos_present().
+//
+// This used to be the first line of dos_present(), which was correct while
+// every 14 ms tick presented. dos_frame_due() (rustkern/dosdisp.rs) can now
+// DECLINE a present, so the sampler inherited the DISPLAY's rate and stopped
+// reporting the GUEST's. MEASURED on golden 2267, Aladdin on its animated title
+// screen with the compositor frozen: the guest was publishing at the 200 ms
+// staleness floor, and this counter dutifully read "4.9 redraw/s" for a guest
+// that was retiring 20.7 M instructions a second. That is the same shape of
+// fault dos_view_report() records against itself two screens up - an instrument
+// that quietly starts measuring something else the moment the thing upstream of
+// it changes - and it is worse here, because a frame RATE is the exact number
+// the "is the guest slow, or is the picture slow" question turns on.
+//
+// So the sampler keeps its own 14 ms clock and runs whether or not the frame is
+// presented. It stays gated on /CONFIG/DOSSPEED.CFG (the golden pays nothing)
+// and it is the same strided FNV as before: no new logic, only a new call site.
 static void dos_redraw_sample(dos_task_t *t) {
     if (!g_dos_speedlog || !t->mem) return;
     uint32_t h = 2166136261u;
-    // Stride 4: a change detector, not a checksum. Any redraw that touches a
-    // sprite touches far more than four consecutive bytes.
-    for (uint32_t a = 0xA0000; a < 0xC0000; a += 4)
-        h = (h ^ t->mem[a]) * 16777619u;
+    if (t->vbe.mode && t->vbe_vram) {
+        // The VISIBLE page, not all of VRAM: 4F07h can park several pages in a
+        // 1 MB buffer and a change to one that is not being displayed is not a
+        // frame. Same bytes dos_present_vbe() reads.
+        uint32_t start = t->vbe.disp_start;
+        if (start < t->vbe.vram) {
+            uint32_t vis = t->vbe.bpl * (uint32_t)t->vbe.height;
+            if (vis > t->vbe.vram - start) vis = t->vbe.vram - start;
+            dos_redraw_hash(&h, t->vbe_vram + start, vis);
+        }
+    } else if (t->video_mode == 0x0D || t->video_mode == 0x0E ||
+               t->video_mode == 0x10 || t->video_mode == 0x12 ||
+               dos_modex_active(t)) {
+        for (int pl = 0; pl < 4; pl++)
+            dos_redraw_hash(&h, t->ega_plane[pl], EGA_PLANE_SIZE);
+    } else {
+        dos_redraw_hash(&h, &t->mem[0xA0000], 0xC0000u - 0xA0000u);
+    }
     if (h != g_dos_redraw_h) { g_dos_redraw_h = h; g_dos_redraw_n++; }
 }
 
+// Mean and worst-case microseconds per present, the picture size that produced
+// them, and the fraction of ONE CORE the present path is using at the current
+// cadence - because on the target machine there IS one core
+// (g_smp_user_sched = 0) and a per-frame microsecond figure means nothing until
+// it is divided by the frame interval.
+//
+// CALLED FROM dos_present(), NOT FROM THE 16-BIT RUN LOOP, and that is the
+// whole point of it being a function. It was first written inline beside the
+// #232 speed line in dos_run_file()'s loop, and MEASURED on Red Alert
+// (/DOS/RA/GAME.DAT) that reported NOTHING AT ALL: a DOS/4GW guest is an LE
+// module driven by its own 32-bit loop, which presents through the same
+// dos_present() but never reaches the 16-bit loop's reporting block. The
+// instrument was therefore blind to exactly the "Red Alert era" guests the
+// pixel budget was asked for. Every present path calls dos_present(); nothing
+// else is common to all of them.
+static void dos_view_report(void) {
+    if (!g_dos_speedlog || !g_dosv_n) return;
+    uint64_t now = sched_now_ms();
+    if (g_dosv_report_ms && now - g_dosv_report_ms < DOS_SPEED_REPORT_MS) return;
+    uint64_t prev = g_dosv_report_ms;
+    g_dosv_report_ms = now;
+    uint64_t mean = g_dosv_us_tot / g_dosv_n;
+    // Permille of one core, integer (the kernel is -mno-sse and a %f in a
+    // kprintf silently prints 0.00).
+    //
+    // MEASURED AGAINST THE REAL INTERVAL, NOT AGAINST DOS_PRESENT_MS. This
+    // divided the mean present cost by the 14 ms cadence, which assumed a
+    // present every 14 ms. That was true while nothing could decline one; since
+    // dos_frame_due() can, the assumption became a fabrication, and it was
+    // caught reporting "5.7% of one core" for a guest that had presented TEN
+    // times in two seconds and was actually using 0.4%. An instrument that
+    // states a rate it did not measure will lie the moment anything upstream of
+    // it changes, which is exactly what happened here to the instrument's own
+    // author. It now divides the ACTUAL total by the ACTUAL elapsed time.
+    uint64_t iv_ms = (prev && now > prev) ? (now - prev) : (uint64_t)DOS_SPEED_REPORT_MS;
+    uint64_t permille = (g_dosv_us_tot * 1000ull) / (iv_ms * 1000ull);
+    kprintf("[dos] #dosfs present: %llu us mean, %llu us max, %llu presents, "
+            "pic=%dx%d (%llu kpx), bars painted %llu since launch, "
+            "%llu.%llu%% of one core over the last %llu ms\n",
+            (unsigned long long)mean,
+            (unsigned long long)g_dosv_us_max,
+            (unsigned long long)g_dosv_n,
+            g_dosv_pw, g_dosv_ph,
+            (unsigned long long)(((uint64_t)g_dosv_pw * (uint64_t)g_dosv_ph) / 1000ull),
+            (unsigned long long)g_dosv_bars,
+            (unsigned long long)(permille / 10ull),
+            (unsigned long long)(permille % 10ull),
+            (unsigned long long)iv_ms);
+    g_dosv_us_tot = 0; g_dosv_us_max = 0; g_dosv_n = 0;
+}
+
+// ---- #dw2perf: WHERE THE DOS FRAME'S TIME ACTUALLY GOES -------------------
+//
+// The accumulators and their logic live in rustkern/dosprof.rs (2026-07-16
+// rule). What is here is the SEAM: the phase boundaries only exist in this
+// file's two run loops, and a timestamp taken anywhere else would be timing a
+// different thing. Every microsecond the DOS thread spends is charged to
+// exactly one bucket, and what is left over is printed as `resid` rather than
+// hidden, so the profile can admit to being incomplete.
+//
+// Gated on /CONFIG/DOSSPEED.CFG, the gate the #232 speed line already uses:
+// with it absent (the golden) dosprof_t0() returns 0 and every t1() is a
+// single predictable branch.
+extern void dosprof_add_rs(uint32_t bucket, uint64_t us);
+extern void dosprof_add_publish_bytes_rs(uint64_t bytes);
+#define DOSPROF_INTERP  0u
+#define DOSPROF_PRESENT 1u
+#define DOSPROF_PUBLISH 2u
+#define DOSPROF_INPUT   3u
+#define DOSPROF_YIELD   4u
+#define DOSPROF_NBUCK   5u
+typedef struct {
+    uint64_t us[DOSPROF_NBUCK];
+    uint64_t n[DOSPROF_NBUCK];
+    uint64_t max_us[DOSPROF_NBUCK];
+    uint64_t publish_bytes;
+} dosprof_report_t;
+_Static_assert(sizeof(dosprof_report_t) == 8u * (3u * DOSPROF_NBUCK + 1u),
+               "dosprof_report_t must match rustkern/dosprof.rs DosProfReport");
+extern int dosprof_report_rs(dosprof_report_t *out);
+extern int dosprof_selftest_rs(void);
+
+static inline uint64_t dosprof_t0(void) {
+    return (g_dos_speedlog && mono_ready()) ? mono_us() : 0;
+}
+// t0 == 0 means "not armed", which is also the only value mono_us() can never
+// legitimately return at a point we would want to measure, so one test covers
+// both the gate and a clock that is not ready yet.
+static inline void dosprof_t1(uint32_t bucket, uint64_t t0) {
+    if (t0) dosprof_add_rs(bucket, mono_us() - t0);
+}
+
+// Present unless the compositor has not yet shown the frame we published last.
+// `force` covers the two cases where a frame is not optional: a pending content
+// buffer from a resize (which also carries the surround repaint), and a halted
+// guest whose current picture is the last one it will ever draw.
+static inline int dos_frame_due(dos_task_t *t, uint64_t now_ms, int force) {
+    return dosdisp_should_present_rs(&g_dosdisp, g_dos_view.frameskip,
+                                     (force || t->pend_new) ? 1 : 0,
+                                     win16_host_flip_count(), now_ms);
+}
+
+static uint64_t g_dosprof_wall0;
+
+// ONE LINE, not one per bucket. A profile spread over six serial lines cannot
+// be read as a table at a glance, and on a busy log the lines get separated by
+// other subsystems' output and stop being one measurement.
+// Takes the task because the two numbers everyone actually wants - the guest's
+// instruction rate and its FRAME rate - are per-guest, and until now the frame
+// rate was printed only on the 16-bit loop's #232 line. A DOS/4GW guest
+// therefore reported no frame rate at all, anywhere, which is why nobody had
+// ever measured Discworld II's.
+static void dos_prof_report(dos_task_t *t) {
+    if (!g_dos_speedlog || !mono_ready()) return;
+    uint64_t now = mono_us();
+    if (!g_dosprof_wall0) { g_dosprof_wall0 = now; return; }
+    if (now - g_dosprof_wall0 < (uint64_t)DOS_SPEED_REPORT_MS * 1000ull) return;
+    uint64_t wall = now - g_dosprof_wall0;
+    g_dosprof_wall0 = now;
+    dosprof_report_t r;
+    if (dosprof_report_rs(&r) != 0) return;
+    if (!wall) return;
+    uint64_t sum = 0;
+    for (unsigned i = 0; i < DOSPROF_NBUCK; i++) sum += r.us[i];
+    // Permille, integer: the kernel is -mno-sse and a %f in a kprintf silently
+    // prints 0.00 (the same reason dos_view_report() does this).
+    uint64_t pm[DOSPROF_NBUCK];
+    for (unsigned i = 0; i < DOSPROF_NBUCK; i++) pm[i] = (r.us[i] * 1000ull) / wall;
+    uint64_t resid = (sum < wall) ? (wall - sum) : 0;
+    uint64_t rpm   = (resid * 1000ull) / wall;
+    // Publish bandwidth in KB/s, so the figure is comparable with FLIPPROF's.
+    uint64_t kbs = (r.publish_bytes / 1024ull) * 1000000ull / wall;
+    // Read-and-reset, so this line describes its own interval like every other
+    // number on it. Straight field reads: single writer, this thread.
+    uint64_t d_pres = g_dosdisp.presented, d_skip = g_dosdisp.skipped;
+    g_dosdisp.presented = 0; g_dosdisp.skipped = 0;
+    // THE GUEST'S OWN NUMBERS, from the ONE accessor that knows which
+    // interpreter is running (dos_emu_insns), so this cannot disagree with the
+    // emulated clock about whose instructions they are.
+    static unsigned long s_insn0; static unsigned long s_redraw0;
+    unsigned long insn_now = t ? dos_emu_insns(t) : 0;
+    unsigned long d_insn = (insn_now >= s_insn0) ? (insn_now - s_insn0) : 0;
+    s_insn0 = insn_now;
+    unsigned long d_redraw = (g_dos_redraw_n >= s_redraw0)
+                             ? (g_dos_redraw_n - s_redraw0) : 0;
+    s_redraw0 = g_dos_redraw_n;
+    uint64_t insn_s   = (uint64_t)d_insn   * 1000000ull / wall;
+    // Tenths of a frame per second: Discworld II on the owner's hardware is
+    // reported at one frame every 3-5 seconds, i.e. 0.2-0.3, and an integer
+    // frames-per-second would print that as 0.
+    uint64_t redraw_ds = (uint64_t)d_redraw * 10000000ull / wall;
+    kprintf("[DOSFRAME] wall=%llums | interp %llu.%llu%% (%lluus n=%llu max=%llu) "
+            "| present %llu.%llu%% (%lluus n=%llu max=%llu) "
+            "| publish %llu.%llu%% (%lluus n=%llu max=%llu %lluKB/s) "
+            "| input %llu.%llu%% | yield %llu.%llu%% | resid %llu.%llu%% "
+            "| frames shown %llu skipped %llu "
+            "| GUEST %llu insn/s, %llu.%llu redraw/s\n",
+            (unsigned long long)(wall / 1000ull),
+            (unsigned long long)(pm[DOSPROF_INTERP] / 10ull),  (unsigned long long)(pm[DOSPROF_INTERP] % 10ull),
+            (unsigned long long)r.us[DOSPROF_INTERP],  (unsigned long long)r.n[DOSPROF_INTERP],  (unsigned long long)r.max_us[DOSPROF_INTERP],
+            (unsigned long long)(pm[DOSPROF_PRESENT] / 10ull), (unsigned long long)(pm[DOSPROF_PRESENT] % 10ull),
+            (unsigned long long)r.us[DOSPROF_PRESENT], (unsigned long long)r.n[DOSPROF_PRESENT], (unsigned long long)r.max_us[DOSPROF_PRESENT],
+            (unsigned long long)(pm[DOSPROF_PUBLISH] / 10ull), (unsigned long long)(pm[DOSPROF_PUBLISH] % 10ull),
+            (unsigned long long)r.us[DOSPROF_PUBLISH], (unsigned long long)r.n[DOSPROF_PUBLISH], (unsigned long long)r.max_us[DOSPROF_PUBLISH],
+            (unsigned long long)kbs,
+            (unsigned long long)(pm[DOSPROF_INPUT] / 10ull),   (unsigned long long)(pm[DOSPROF_INPUT] % 10ull),
+            (unsigned long long)(pm[DOSPROF_YIELD] / 10ull),   (unsigned long long)(pm[DOSPROF_YIELD] % 10ull),
+            (unsigned long long)(rpm / 10ull), (unsigned long long)(rpm % 10ull),
+            (unsigned long long)d_pres, (unsigned long long)d_skip,
+            (unsigned long long)insn_s,
+            (unsigned long long)(redraw_ds / 10ull),
+            (unsigned long long)(redraw_ds % 10ull));
+}
+
 static void dos_present(dos_task_t *t) {
-    dos_redraw_sample(t);
+    // dos_redraw_sample() used to be here; it is now on its own 14 ms cadence in
+    // both run loops, so that it measures the GUEST's frame rate rather than the
+    // display's. See the comment on dos_redraw_sample().
     dos_iotrace_periodic();
     dos_iocost_periodic(t);   // (#176)
     dos_opl2_report_silence(t);
@@ -5946,6 +6769,13 @@ static void dos_present(dos_task_t *t) {
         t->win_w   = t->pend_w;
         t->win_h   = t->pend_h;
         t->pend_new = 0;
+        // (#dosfs) A FRESH BUFFER HAS UNDEFINED CONTENTS, so the surround must
+        // be repainted into it even if the pointer, the size and the picture
+        // rectangle all happen to match what was painted last time. kmalloc can
+        // and does hand back an address it just freed; keying the bar cache on
+        // the pointer alone would then skip the paint and leave whatever the
+        // previous owner of that memory wrote showing around the picture.
+        t->bars_buf = 0;
     }
     for (int i = 0; i < t->pend_free_n && nfree < DOS_PEND_FREE_MAX; i++)
         tofree[nfree++] = t->pend_free[i];
@@ -5955,7 +6785,15 @@ static void dos_present(dos_task_t *t) {
 
     for (int i = 0; i < nfree; i++) kfree(tofree[i]);
 
+    uint64_t _pt0 = mono_ready() ? mono_us() : 0;
     dos_present_inner(t);
+    if (_pt0) {
+        uint64_t d = mono_us() - _pt0;
+        g_dosv_us_tot += d;
+        if (d > g_dosv_us_max) g_dosv_us_max = d;
+        g_dosv_n++;
+    }
+    dos_view_report();
 
     fl = spinlock_acquire_irqsave(&g_dos_win_lock);
     t->presenting = 0;
@@ -5977,9 +6815,7 @@ static void dos_pump_input(dos_task_t *t) {
         // mode with a different aspect cannot desync present from input
         // either.
         dos_rect_t r;
-        int32_t aw, ah;
-        dos_present_aspect(t, &aw, &ah);
-        if (!dos_letterbox_rs(ow, oh, aw, ah, &r)) return;
+        if (!dos_present_geom(t, ow, oh, &r)) return;
         int cx = (int)mouse_x - ox - r.x;
         int cy = (int)mouse_y - oy - r.y;
         if (cx < 0) cx = 0;
@@ -6112,6 +6948,56 @@ static uint16_t dos_vec_seed_stub(uint8_t vec) {
     return DOS_IRET_STUB;
 }
 
+// (rakbd2) THE OTHER HALF OF THE SAME QUESTION: WHICH VECTORS MUST READ BACK AS
+// 0000:0000, i.e. FREE.
+//
+// dos_vec_seed_stub() answers "which stub does this vector get". raplay derived
+// the rule "seed a vector-specific stub only where the vector's VALUE is
+// something the guest INSPECTS", and got 33h right. It missed the complementary
+// case: a guest can inspect a vector expecting to find NOTHING there, and a
+// stub is then exactly as wrong as an IRET was for the mouse.
+//
+// 60h-66h are the DOS "user interrupt" vectors. DOS does not initialise them
+// and the BIOS does not either, so on a real machine they are 0000:0000 until a
+// TSR claims one. That is not a detail: it is the documented way a program
+// FINDS a vector it may use.
+//
+// MEASURED, Red Alert 1.04 DOS (GAME.DAT, LE object 1 at runtime base
+// 0x00110000). Install_Keyboard_Interrupt allocates a DOS memory block (DPMI
+// 0100h), locks it (0600h), copies its real-mode-callable ISR into it, and then
+// looks for a free user vector to publish it at:
+//
+//   00250b6f  mov  bl, 0x60          ; first user vector
+//   00250b71  mov  bh, 6             ; try 60h..65h
+//   00250b73  mov  eax, 0x200        ; DPMI: get REAL-MODE interrupt vector
+//   00250b78  int  0x31
+//   00250b7a  jb   0x250d40          ; -> failure exit
+//   00250b80  or   cx, dx            ; CX:DX == 0000:0000 ?
+//   00250b83  je   0x250b90          ; yes -> this one is free, take it
+//   00250b85  inc  bl
+//   00250b87  dec  bh
+//   00250b89  jne  0x250b78
+//   00250b8b  jmp  0x250d40          ; all six taken -> FAILURE
+//
+//   00250d40  xor  eax, eax  ...  ret      ; returns 0, installs nothing
+//
+// Because every one of 60h..65h answered F000:FF53, the loop exhausted and the
+// routine returned at 0x250d40 BEFORE the code at 0x250c17 that actually
+// installs the keyboard: 0204h/0200h (save the old INT 9), 0205h (set the
+// protected-mode INT 9 handler to obj1+0x141707 = runtime 0x00251707, the ISR
+// that does `in al,0x60` at 0x00251782), then 0201h. The DPMI census of the
+// failing run shows exactly that shape: 0100h, 0200h, 0600h, 0601h present and
+// 0204h, 0205h, 0201h NEVER CALLED, and the guest reported
+// "[4GW] kbd ISR route: NONE". Three delivery-side fixes (#779, #779b, #779c)
+// were correct and none of them could ever have helped: the game never asked.
+//
+// The range is 60h-66h and stops there deliberately. 67h is EMS on a machine
+// with an EMM, 68h-6Fh are unused but are not what the documented scan uses,
+// and widening the set turns a stray INT into a wild jump for no measured gain.
+static int dos_vec_seed_free(uint8_t vec) {
+    return (vec >= 0x60 && vec <= 0x66);
+}
+
 // (raplay) THE SAME CHOICE, IN THE 32-BIT GUEST'S ENCODING.
 //
 // A protected-mode client's vector table holds a FLAT address, so the stub a
@@ -6215,10 +7101,20 @@ static void dos_refresh_vector_hooks(dos_task_t *t) {
 // allows cannot be capped to that value by any amount of sleeping.
 static unsigned long g_dos_irq_insns = 0;
 
-static void dos_deliver_int(dos_task_t *t, uint8_t vec, unsigned long budget) {
+// (#sbirq32) THE HANDLER ADDRESS IS NOW A PARAMETER, because a second vector
+// table holds handlers this one cannot see.
+//
+// dos_deliver_int() reads the arena's low IVT and nothing else. A DPMI client
+// has THREE vector spaces (the low table, the 0201h real-mode shadow, the 0205h
+// protected-mode table) and a real-mode driver published through 0201h lives in
+// one this function cannot address at all. Splitting the address out is the
+// same move dos4gw_deliver_at() made for the 32-bit core, and for the same
+// reason: every check below (the null refusal, the IRET detection, the #232
+// accounting) applies identically to a handler from any table, and forking the
+// function would have meant the second route silently lacking them.
+static void dos_deliver_int_at(dos_task_t *t, uint16_t vseg, uint16_t voff,
+                               unsigned long budget) {
     x86_16_cpu_t *c = &t->cpu;
-    uint16_t voff = rd16(t, 0x0000, (uint16_t)(vec * 4));
-    uint16_t vseg = rd16(t, 0x0000, (uint16_t)(vec * 4 + 2));
     if (vseg == 0 && voff == 0) return;
     dos_push16(t, c->flags);
     dos_push16(t, c->cs);
@@ -6269,6 +7165,12 @@ static void dos_deliver_int(dos_task_t *t, uint8_t vec, unsigned long budget) {
         if (c->ss == ss0 && (uint16_t)(c->sp - sp0) < 0x8000u) break;  // returned
     }
     g_dos_irq_insns += c->insn_count - i0;
+}
+
+static void dos_deliver_int(dos_task_t *t, uint8_t vec, unsigned long budget) {
+    uint16_t voff = rd16(t, 0x0000, (uint16_t)(vec * 4));
+    uint16_t vseg = rd16(t, 0x0000, (uint16_t)(vec * 4 + 2));
+    dos_deliver_int_at(t, vseg, voff, budget);
 }
 // #163: deliver the INT 33h 0Ch/14h user event handler.
 //
@@ -6504,7 +7406,10 @@ static void dos_guest_title(const char *path, char *out, int outlen) {
     out[i] = 0;
 }
 
-static void dos_build_psp(dos_task_t *t) {
+static void dos32_dospath(const char *path, char cur_drive, char *out, int outlen);
+static uint32_t dos32_build_env(dos_task_t *t, uint32_t env_lin, const char *argv0);
+
+static void dos_build_psp(dos_task_t *t, const char *path) {
     // PSP[0..1] = INT 20h (CD 20), PSP[0x80] = cmdline length, PSP[0x81]= CR.
     wr8(t, DOS_PSP_SEG, 0x00, 0xCD);
     wr8(t, DOS_PSP_SEG, 0x01, 0x20);
@@ -6520,13 +7425,38 @@ static void dos_build_psp(dos_task_t *t) {
     } else {
         wr8(t, DOS_PSP_SEG, 0x81, 0x0D);
     }
+
+    // (#digrun) PSP:2Ch - THE ENVIRONMENT SEGMENT. It was left at zero, and a
+    // zero there is not 'no environment', it is 'your environment is the
+    // interrupt vector table'.
+    //
+    // MEASURED on The Dig's IMUSE.EXE (a Rational DOS/16M bundle): the loader
+    // stub reads PSP:2Ch, walks the block to the double-NUL, skips the WORD
+    // count and reads the ASCIIZ program path DOS 3.0+ puts there, so that it
+    // can REOPEN ITS OWN FILE and read the extender out of it. With segment 0
+    // it opened '/WINDIR/DRIVE_C/<one garbage byte>' and then
+    // '<garbage>.ETX', both failed, and it exited 0 after 4751 instructions
+    // looking exactly like a program that had decided not to run.
+    //
+    // The block layout is dos32_build_env()'s, deliberately: it is the same
+    // layout the two 32-bit loaders hand their guests, and a second copy of a
+    // layout is how two loaders come to disagree about where the WORD count
+    // goes (the comment on that function says so about ITS two callers; this
+    // is the third).
+    if (path) {
+        char dospath[128];
+        dos32_dospath(path, t->svc.cur_drive, dospath, (int)sizeof dospath);
+        dos32_build_env(t, DOS_ENV_LIN, dospath);
+        wr16(t, DOS_PSP_SEG, 0x2C, DOS_ENV_SEG);
+    }
 }
 
 // (#740 digsel) SHARED BY BOTH 32-BIT LOADERS, defined with the go32 loader
-// below because that is where they were written. Forward-declared here so
+// below because that is where they were written. Forward-declared so
 // dos4gw_prepare() calls the SAME two functions rather than growing its own.
-static void dos32_dospath(const char *path, char cur_drive, char *out, int outlen);
-static uint32_t dos32_build_env(dos_task_t *t, uint32_t env_lin, const char *argv0);
+// (#digrun) The declarations MOVED UP, to just above dos_build_psp(), because
+// the 16-bit PSP builder is now the THIRD caller and it is defined earlier in
+// this file than they were declared.
 
 // ---- run -----------------------------------------------------------------
 
@@ -6665,6 +7595,201 @@ static void dos4gw_rm_regs_out(const dos_task_t *t, x86_16_cpu_t *f) {
     for (int i = 0; i < 8; i++) f->exhi[i] = t->cpu.exhi[i];
 }
 
+// (#dpmi301) DPMI 0300h ON A VECTOR THE GUEST ITSELF PUBLISHED: EXECUTE IT.
+//
+// WHAT THIS IS FOR, AND WHY IT IS NOT 0301h.
+// -------------------------------------------------------------------------
+// This was scoped as "implement the DPMI 03xx family so the Miles Sound System
+// can far-call its 16-bit driver", on the inference that a protected-mode
+// client reaches a real-mode driver through 0301h. MEASURED on Discworld II
+// (golden 2270, run3-inifmt), that inference is wrong: the guest never issues
+// 0301h, 0302h, 0303h or 0304h even once. What Miles actually does is
+//
+//   INT 21h AH=3Dh   open SBLASTER.DIG          (an AIL3DIG driver blob)
+//   INT 21h AH=3Fh   read all 3125 bytes
+//   INT 31h AX=0100  allocate 0xC4 paragraphs of DOS memory, copy it down
+//   INT 21h AH=35h   get real-mode vector 66h   (is this user vector free?)
+//   INT 31h AX=0201  SET real-mode vector 66h to the driver's entry point
+//   INT 31h AX=0300  simulate INT 66h, AX = the AIL function number
+//
+// i.e. it publishes the driver as a real-mode interrupt handler and then calls
+// it through the ordinary simulate-real-mode-interrupt service. The AX values
+// observed were 0300h, 0301h and 0304h, which are AIL FUNCTION numbers and NOT
+// DPMI ones; that coincidence is precisely how this was read as a missing DPMI
+// 03xx family. The whole 03xx family could have been implemented perfectly and
+// this title would not have moved one instruction.
+//
+// Before this function, 0300h answered INT 66h with the documented MISS
+// (CF=1, AX=0001) because dos4gw_rm_routable() correctly declines a vector no
+// HOST service implements. That answer was right about the host and wrong
+// about the guest: nothing in this kernel implements INT 66h, but the GUEST
+// does, and it said so with 0201h. The MISS is only correct for a vector whose
+// provenance is ours.
+//
+// WHY RUNNING 16-BIT CODE HERE NEEDS NO NEW INFRASTRUCTURE:
+//   * t->cpu is ALREADY bound to this guest's arena and already carries the
+//     hooks (dos_int_handler, dos_in, dos_out, the EGA memory hook), because
+//     the 32-bit core routes its own port I/O through dos_in/dos_out with
+//     &t->cpu as the carrier (X32_EXIT_IO_IN/OUT in dos4gw_run). So an OUT to
+//     0x22C from driver code reaches the SAME Sound Blaster emulation the
+//     32-bit path reaches, with no new wiring and no second copy of anything.
+//   * t->cpu is scratch under an LE guest: no 16-bit program exists, which is
+//     the same reason dos4gw_rm_dispatch() may already write it freely.
+//   * The driver image lives in DOS memory the guest allocated through 0100h,
+//     i.e. inside the low megabyte the 16-bit interpreter addresses.
+//
+// HOW THE RETURN IS DETECTED. A handler published as an interrupt vector ends
+// with IRET, so an interrupt frame is pushed whose CS:IP is a two-byte `JMP $`
+// landing pad in the BIOS stub area. The handler's IRET lands there and the
+// loop stops on CS:IP, which is dos_mouse_events()'s proven idiom rather than a
+// new one. The instruction budget is a BACKSTOP for a handler that never
+// returns, not the normal exit: a budget used as the normal exit is how
+// dos_deliver_int() came to run 19,975 instructions of mainline code inside an
+// interrupt helper (#232).
+//
+// ORDERING, AND THE REGRESSION STORY. This is tried only AFTER
+// dos4gw_rm_routable() has declined, so for every vector this host already
+// services the behaviour is byte-identical to before and no baselined guest can
+// change. A real DPMI host would prefer the client's own handler even for a
+// vector it services; that is deliberately NOT done here, because it would put
+// every existing guest's INT 10h/16h/1Ah/2Fh/33h on a new path to buy
+// correctness nothing has yet asked for.
+//
+// Returns 1 if the handler was executed (the frame then carries its result),
+// 0 if this vector is not the guest's and the caller should MISS as before.
+// THE BACKSTOP FOR A HANDLER THAT NEVER RETURNS, EXPRESSED IN GUEST TIME.
+//
+// (#sbirq32) It used to be a flat 2,000,000 instructions, and that number means
+// a different length of time on every host and a different number of BIOS TICKS
+// at every dos_emu_hz(). MEASURED on Discworld II from the call that eventually
+// succeeded - 8,699,264 instructions bought 8 BIOS ticks - the old ceiling was
+// 1.8 ticks of GUEST time, and separately 74 ms of real time at the ~27 million
+// instructions a second delivered here. SBLASTER.DIG's probe waits for TWO tick
+// edges before it even looks at whether its interrupt arrived, and its no-card
+// path wants twenty, so the old ceiling could not have been survived by a
+// correct driver no matter what the emulation did. A bound that a legitimate
+// handler cannot fit inside is not a backstop, it is the behaviour. The
+// guest-tick count is the load-bearing number: a guest counts ticks, not
+// seconds, so real time is the wrong unit for deciding whether its own timeout
+// can elapse.
+//
+// Stated in milliseconds of GUEST time and converted through the same
+// dos_emu_hz() every other clock in this file uses, so it means the same thing
+// everywhere. The floor keeps it from collapsing before the interpreter has
+// measured a rate; the ceiling keeps a pathological hz from removing the bound.
+// It is NOT a pace: the loop exits the instant the handler IRETs onto the
+// landing pad, so this costs nothing for a handler that returns.
+#define DOS_RMEXEC_MS        2000UL
+#define DOS_RMEXEC_INSN_MIN  2000000UL
+#define DOS_RMEXEC_INSN_MAX  200000000UL
+
+static unsigned long dos_rmexec_budget(void) {
+    uint64_t n = ((uint64_t)dos_emu_hz() * DOS_RMEXEC_MS) / 1000ull;
+    if (n < DOS_RMEXEC_INSN_MIN) n = DOS_RMEXEC_INSN_MIN;
+    if (n > DOS_RMEXEC_INSN_MAX) n = DOS_RMEXEC_INSN_MAX;
+    return (unsigned long)n;
+}
+static int dos4gw_rm_exec_guest(dos_task_t *t, uint8_t intno, x86_16_cpu_t *frame) {
+    uint16_t vseg = 0, voff = 0;
+    if (!dpmi_rmvec_guest_rs(intno, &vseg, &voff)) return 0;
+
+    x86_16_cpu_t *c = &t->cpu;
+    dos4gw_rm_regs_in(t, frame);
+
+    // The marshaller substitutes a host stack when the client passes SS:SP =
+    // 0:0, so there is normally always a real stack to push onto. If there is
+    // not, refuse rather than push onto 0000:0000, which is the interrupt
+    // vector table.
+    if (c->ss == 0 && c->sp == 0) {
+        kprintf("[4GW] 0300h INT %02Xh: guest handler at %04x:%04x but SS:SP is 0:0 "
+                "after marshalling; refusing to execute on a null stack\n",
+                (unsigned)intno, (unsigned)vseg, (unsigned)voff);
+        return 0;
+    }
+
+    dos_push16(t, c->flags);
+    dos_push16(t, 0xF000);
+    dos_push16(t, DOS_RMCALLRET_STUB);
+    c->flags &= ~0x0200;        // IF clear inside the handler, as a real INT does
+    c->cs = vseg;
+    c->ip = voff;
+
+    unsigned long i0 = c->insn_count;
+    uint64_t rt0 = sched_now_ms();
+    uint32_t bt0 = dos_bios_tick_now(t);
+    int returned = 0;
+    unsigned long budget = dos_rmexec_budget();
+    unsigned long left = budget;
+    // (#sbirq32) THE HARDWARE INTERRUPT THAT THIS CODE IS WAITING FOR.
+    //
+    // A driver function published on a real-mode vector and invoked through
+    // 0300h is not a pure computation: SBLASTER.DIG's 0304h arms an 8-bit DMA
+    // transfer and then spins on a flag its own IRQ5 handler sets. Without a
+    // delivery point inside THIS loop that flag can never change, and the only
+    // possible outcome is the budget exhausting - which is exactly what was
+    // MEASURED (2,000,000 instructions, zero port I/O in all of them).
+    //
+    // The cap is a backstop, not a pace. Each delivery is one raised IRQ and
+    // the pump raises one per block PLAYED, i.e. at real-time rate, so a single
+    // burst can legitimately see only a handful. A larger number means the card
+    // is being re-armed inside the ISR, and 64 of them bounds the ISR
+    // instructions this loop can retire without letting a runaway handler hide
+    // behind a budget that only counts the mainline.
+    int sb_deliveries = 0;
+    while (left) {
+        if (c->cs == 0xF000 && c->ip == DOS_RMCALLRET_STUB) { returned = 1; break; }
+        if (sb_deliveries < 64 && dos_sb_irq_pending_rs(&t->sb)) {
+            sb_deliveries++;
+            dos4gw_sb_irq(t, 1);
+            if (c->cs == 0xF000 && c->ip == DOS_RMCALLRET_STUB) { returned = 1; break; }
+        }
+        // (#sbirq32) AND THE GUEST'S CLOCK KEEPS RUNNING. dos_emu_insns() now
+        // counts this core too, so the emulated PIT advances while we are here;
+        // this is what PUBLISHES it where a real-mode driver reads it. Without
+        // it the tick dword holds whatever dos4gw_timebase() last wrote, which
+        // is what SBLASTER.DIG's probe spun on forever.
+        dos4gw_bios_tick(t);
+        unsigned long chunk = left < DOS_IRQ_RETURN_CHUNK ? left : DOS_IRQ_RETURN_CHUNK;
+        if (x86_16_run(c, chunk) != 1) break;   // halted, stopped, or a MISS
+        left -= chunk;
+    }
+    if (!returned && c->cs == 0xF000 && c->ip == DOS_RMCALLRET_STUB) returned = 1;
+
+    // FIRST CALL PER VECTOR IS LOUD, and a handler that does not return is
+    // ALWAYS loud. A driver that faults on its second instruction and a driver
+    // that runs correctly are indistinguishable from outside, and this
+    // project's recorded failure mode is exactly a feature that executes and
+    // produces nothing.
+    {
+        static uint8_t logged[256];
+        // (#sbirq32) GUEST TIME AND REAL TIME, SIDE BY SIDE, because the whole
+        // question this call raises is whether they agree. A guest that spends
+        // twenty of its own BIOS ticks waiting for a device gives that device
+        // twenty ticks of REAL time only if the two clocks run at the same
+        // rate, and the emulated PIT is derived from retired instructions, not
+        // from a wall clock. Printing one without the other is how "the driver
+        // timed out" and "we were too slow" stay indistinguishable.
+        if (!logged[intno] || !returned || g_x86_dbgring) {
+            logged[intno] = 1;
+            kprintf("[4GW] 0300h EXECUTED guest INT %02Xh handler at %04x:%04x "
+                    "(AX=%04x in), %s after %lu of %lu instructions (a %lu ms "
+                    "guest-time budget); %lu guest ticks in %llu real ms "
+                    "(emu_hz %lu); AX=%04x CF=%u out\n",
+                    (unsigned)intno, (unsigned)vseg, (unsigned)voff,
+                    (unsigned)frame->ax,
+                    returned ? "IRETed" : "DID NOT RETURN (budget exhausted)",
+                    c->insn_count - i0, budget, DOS_RMEXEC_MS,
+                    (unsigned long)(dos_bios_tick_now(t) - bt0),
+                    (unsigned long long)(sched_now_ms() - rt0),
+                    (unsigned long)dos_emu_hz(),
+                    (unsigned)c->ax, (unsigned)(c->flags & 1u));
+        }
+    }
+
+    dos4gw_rm_regs_out(t, frame);
+    return 1;
+}
+
 static int dos4gw_rm_dispatch(void *user, uint8_t intno, struct x86_16_cpu *frame) {
     dos_task_t *t = (dos_task_t *)user;
     if (!t || !frame) return 0;
@@ -6673,7 +7798,13 @@ static int dos4gw_rm_dispatch(void *user, uint8_t intno, struct x86_16_cpu *fram
     // so there is exactly one code path into it from here.
     if (intno == 0x21) return dpmi_rmcs_dos_dispatch(&t->svc, intno, frame);
 
-    if (!dos4gw_rm_routable(intno)) return 0;   // -> the marshaller's MISS
+    if (!dos4gw_rm_routable(intno)) {
+        // (#dpmi301) Nothing HERE services this vector, but the guest may have
+        // published its own real-mode handler on it with 0201h, in which case
+        // the honest answer is to run it rather than to report it missing.
+        if (dos4gw_rm_exec_guest(t, intno, (x86_16_cpu_t *)frame)) return 1;
+        return 0;   // -> the marshaller's MISS
+    }
 
     // t->cpu is SCRATCH under an LE guest: no 16-bit code executes, and
     // dos4gw_service_int() already uses it exactly this way for the guest's own
@@ -6837,7 +7968,7 @@ static int dos4gw_prepare(dos_task_t *t, const char *path,
     t->mem = arena;
     t->cpu.mem = arena;          // the 16-bit frame's view, still the low MiB
     t->le_arena_size = total;
-    dos_build_psp(t);            // rebuild it in the new buffer
+    dos_build_psp(t, path);      // rebuild it in the new buffer
 
     x86_32_init(&t->le_cpu, arena, 0, total);
     t->le_cpu.owner = t;
@@ -7306,7 +8437,7 @@ static int go32_prepare(dos_task_t *t, const char *path, const uint8_t *file,
     t->mem = arena;
     t->cpu.mem = arena;
     t->le_arena_size = total;
-    dos_build_psp(t);
+    dos_build_psp(t, path);
 
     x86_32_init(&t->le_cpu, arena, 0, total);
     t->le_cpu.owner = t;
@@ -7735,8 +8866,14 @@ static void dos4gw_service_int_inner(dos_task_t *t, uint32_t vec) {
         return;
     }
 
+    if (vec == 0x2F)
+        kprintf("[CDTRACE] 32-bit guest INT 2Fh eax=%08x ebx=%08x ecx=%08x\n",
+                t->le_cpu.regs[X32_EAX], t->le_cpu.regs[X32_EBX],
+                t->le_cpu.regs[X32_ECX]);
     if (!dos4gw_int_pre_rs(t->le_state, &t->le_cpu,
                            (struct x86_16_cpu *)&t->cpu, vec)) {
+        if (vec == 0x2F)
+            kprintf("[CDTRACE] 32-bit INT 2Fh REFUSED by the bridge (MISS)\n");
         t->cpu.flags = save_flags;
         return;
     }
@@ -7885,12 +9022,53 @@ static uint32_t dos4gw_pm_vector(dos_task_t *t, uint8_t vec) {
 // flag latched inside AH=25h. Same reasoning as dos_refresh_vector_hooks() for
 // the 16-bit path: a guest may install a handler by writing the table directly,
 // and it may put it back on the way out. One line per genuine edge.
+static int dos4gw_pmvec_flat(uint8_t vec, uint32_t *out);
+
 static void dos4gw_refresh_hooks(dos_task_t *t) {
+    // (rakbd2) THE SECOND VECTOR SPACE HAS TO BE REFRESHED HERE TOO, BECAUSE
+    // THIS FLAG IS WHAT DECIDES WHO DRAINS THE RAW SCANCODE RING.
+    //
+    // kbd_has_int9 answers "did the guest hook INT 9 in the LOW table". #779b
+    // added a second, equally real way to hook it (DPMI 0205h) and a delivery
+    // path for it, but nothing taught the OWNERSHIP question about it. So for a
+    // 0205h guest kbd_has_int9 stayed 0, dos_keyq_pump() ran on every pass and
+    // drained up to 16 scancodes into the BIOS ring, and dos4gw_deliver_int9()
+    // then found dos_scancode_get() empty. Two consumers, one stream, and the
+    // one that owns the hardware lost every byte.
+    //
+    // MEASURED on Red Alert with the free-user-vector fix in place and this one
+    // absent: "[dpmi] INT 09h PROTECTED-MODE handler installed by the guest
+    // (0205h) -> 0000:00251707" and, for the same three keystrokes,
+    // "[KBDIO] port60=0 ... ringpush=3 ... bda_tail=0024" - delivered to the
+    // ring, consumed by the pump, never seen by the ISR that was installed.
+    //
+    // It is a SEPARATE flag from kbd_has_int9 on purpose: dos4gw_deliver_int9()
+    // uses kbd_has_int9 to choose the LOW-table handler, so folding the two
+    // would send a 0205h guest's scancodes to whatever the low table holds.
+    {
+        uint32_t h9 = 0;
+        int pm9 = (dos4gw_pmvec_flat(0x09, &h9) == 0);
+        if (pm9 != t->kbd_int9_pm) {
+            t->kbd_int9_pm = pm9;
+            kprintf("[4GW] INT 09h %s in the DPMI 0205h vector table -> flat 0x%08x "
+                    "(the guest now owns the raw scancode stream: BIOS-ring pump %s)\n",
+                    pm9 ? "installed" : "removed", h9, pm9 ? "OFF" : "ON");
+            bootlog_write("[4GW] INT 09h PM route %s handler=0x%08x",
+                          pm9 ? "INSTALLED" : "removed", h9);
+        }
+    }
     // (#211) kbd_has_int9 decides which of the two consumers drains the raw
     // scancode stream, so it has to be refreshed here too now that the 32-bit
     // loop pumps the BIOS ring. dos_vec_hooked() is THE predicate for both
     // loops and both encodings; there is no 32-bit copy of the question.
-    t->kbd_has_int9 = dos_vec_hooked(t, 0x09);
+    // (rakbd) The pre-assignment that used to be here made the INT 09h edge
+    // UNREPORTABLE. It set the flag to the very value the loop below then
+    // compares against, so `now != *flag` was false on the one pass that
+    // mattered and the "INT 09h hooked" line never printed for any 32-bit
+    // guest. The loop already refreshes 0x09 from dos_vec_hooked() exactly like
+    // the other two vectors; letting it do so gives both the correct value AND
+    // a visible edge. A diagnostic that is structurally incapable of firing is
+    // worse than none, because its silence reads as evidence of absence.
     static const uint8_t vecs[3] = { 0x08, 0x09, 0x1C };
     for (int i = 0; i < 3; i++) {
         uint32_t h = dos4gw_pm_vector(t, vecs[i]);
@@ -7912,9 +9090,17 @@ static void dos4gw_refresh_hooks(dos_task_t *t) {
 
 // Deliver one interrupt. Returns the X32_INJ_* code so the caller can tell a
 // masked tick (drop it, the guest is inside a cli region) from a broken one.
-static int dos4gw_deliver(dos_task_t *t, uint8_t vec) {
-    if (!dos_vec_hooked(t, vec)) { t->irq_novec++; return X32_INJ_FAULT; }
-    uint32_t h = dos4gw_pm_vector(t, vec);
+// (rakbd) Deliver `vec` to an EXPLICIT flat handler address.
+//
+// Split out of dos4gw_deliver() rather than copied, because a second route to
+// the same guest now exists (the DPMI 0205h protected-mode vector table) and
+// every one of the checks below applies to it identically: the arena bound, the
+// vector-table bound, the masked/no-fit distinction, and the first-delivery
+// line that separates "the mechanism ran" from "the mechanism linked". Forking
+// them would have meant the PM route silently lacking the two refusals that
+// exist because delivering to a bad pointer once cost 6.5 million instructions
+// between cause and symptom.
+static int dos4gw_deliver_at(dos_task_t *t, uint8_t vec, uint32_t h) {
     // A HANDLER OUTSIDE THE ARENA IS REFUSED HERE, not discovered by the guest
     // faulting on its first instruction. A protected-mode client's handler is a
     // flat address in its own space by definition, so one that is not in the
@@ -7968,6 +9154,453 @@ static int dos4gw_deliver(dos_task_t *t, uint8_t vec) {
     return r;
 }
 
+// The ORIGINAL route: the handler is a flat 32-bit address the guest wrote into
+// the low table with INT 21h AH=25h, which dos_vec_hooked() can see.
+static int dos4gw_deliver(dos_task_t *t, uint8_t vec) {
+    if (!dos_vec_hooked(t, vec)) { t->irq_novec++; return X32_INJ_FAULT; }
+    return dos4gw_deliver_at(t, vec, dos4gw_pm_vector(t, vec));
+}
+
+// (rakbd) THE 32-BIT KEYBOARD ISR, and why dos_deliver_int9() could not simply
+// be called from the 32-bit loop the way the other three input calls were.
+//
+// WHAT WAS BROKEN. #211 gave dos4gw_run() the input pump it had never had, and
+// its own comment says it makes "the SAME four calls the 16-bit loop makes".
+// It makes three. dos_deliver_int9() is the fourth and it was never added, and
+// grep agreed: the only call site in the whole file was the 16-bit loop's.
+//
+// That is not a cosmetic gap, because the two consumers are MUTUALLY EXCLUSIVE
+// by design. dos_keyq_pump() feeds the BIOS ring that INT 16h reads and runs
+// only while kbd_has_int9 is clear; dos_deliver_int9() runs the guest's own ISR
+// and runs only while it is set. dos4gw_refresh_hooks() maintains that flag for
+// 32-bit guests too (it is called from dos4gw_timebase() on every pass), so the
+// instant a protected-mode guest hooked INT 9 the pump switched ITSELF off and
+// nothing replaced it. Both keyboard channels were dead at once, and the guest
+// that caused the switch-off is the one that triggered it.
+//
+// A guest that reads keys through INT 16h was unaffected, which is exactly why
+// this survived #211's verification: NetHack does, and it was the guest the fix
+// was tested on. Action titles hook INT 9 instead. MEASURED symptom on Red
+// Alert: it reaches gameplay and no key does anything.
+//
+// WHY NOT JUST CALL dos_deliver_int9(). It reads the REAL-MODE IVT with rd16(),
+// pushes a real-mode interrupt frame and runs x86_16_run() to completion against
+// t->cpu. A DOS/4GW client's INT 9 is none of those things: the handler is a
+// flat 32-bit address in the protected-mode vector table that dos4gw_pm_vector()
+// reads, and it is entered by x86_32_inject_int(), which returns immediately and
+// lets the handler run in the next interpreter burst. Same question, different
+// core, different frame - the same relationship dos4gw_mouse_events() has to
+// dos_mouse_events().
+//
+// ONE SCANCODE PER PASS, DELIBERATELY. dos4gw_timebase() delivers up to four
+// IRQ0s in a row because nesting timer frames is harmless. A keyboard cannot do
+// that: port 0x60 holds ONE byte (dos_in(): port 0x60 -> t->kbd_port60) and the
+// guest's handler does not read it until it actually runs, so injecting a second
+// scancode before the first handler has executed would overwrite the first and
+// lose it. Deliver one, return, let the guest run it. The loop is back within a
+// slice, so held or fast typing drains at interpreter speed, not at the user's.
+//
+// AND THE BYTE IS LATCHED UNTIL DELIVERY SUCCEEDS. A guest inside a cli region
+// returns X32_INJ_MASKED, which is normal and transient; taking the scancode off
+// the ring and dropping it there would lose precisely the keystrokes pressed
+// while the game was in a critical section.
+// (rakbd) THE SECOND ROUTE, and the one Red Alert actually uses.
+//
+// MEASURED on Red Alert reaching gameplay (build 2295): it hooks INT 08h
+// through INT 21h AH=25h, so "[4GW] INT 08h hooked ... -> PM handler
+// 0x0027687d" prints and its timer works, and it NEVER hooks INT 09h that way.
+// dos_vec_hooked(0x09) is therefore false, kbd_has_int9 stays 0, and the route
+// above cannot fire. The game reached a live mission map and ESC opened
+// nothing.
+//
+// A DPMI client has THREE vector spaces and only one of them is the low table.
+// rustkern/dpmi.rs says so and says what it costs: 0205h stores a
+// protected-mode handler "FAITHFULLY" and "nothing in this kernel ever DELIVERS
+// to them". From the guest's side a faithful store is indistinguishable from a
+// working install - it can even read its own handler back with 0204h and get
+// the right answer - so the install SUCCEEDS and the interrupt never arrives.
+//
+// Resolving it is the same shape as any far pointer: the selector through the
+// descriptor table the guest's own code uses (dpmi_sel_lookup_rs, the one
+// x86_32 is bound to), plus the offset, gives the flat address that
+// dos4gw_deliver_at() then bounds-checks exactly as it does for the low-table
+// route. There is no second set of rules for a PM-installed handler.
+static int dos4gw_pmvec_flat(uint8_t vec, uint32_t *out) {
+    extern int dpmi_pmvec_get_rs(uint8_t vec, uint16_t *out_sel, uint32_t *out_off);
+    uint16_t sel = 0; uint32_t off = 0, base = 0;
+    if (dpmi_pmvec_get_rs(vec, &sel, &off) != 0) return -1;
+    // (rakbd2) A SELECTOR THAT IS NOT ONE OF OURS IS FLAT, BASE 0, AND SAYING
+    // OTHERWISE MADE THIS WHOLE ROUTE UNREACHABLE.
+    //
+    // DPMI 0205h takes CX = the handler's code selector, and a DOS/4GW client
+    // passes its own CS. Our LE guests run with CS = 0000: the 32-bit core is
+    // flat and dpmi_sel_lookup_rs() only knows LDT selectors, which are
+    // (index << 3) | 7, so TI is set. Selector 0 has TI clear, idx_of_live()
+    // rejects it, the lookup failed and this function reported "no protected
+    // mode handler" for a guest that had just installed one.
+    //
+    // MEASURED on Red Alert with the free-user-vector fix in: the host logged
+    // "[dpmi] INT 09h PROTECTED-MODE handler installed by the guest (0205h) ->
+    // 0000:00251707" and, in the very same run, "[4GW] kbd ISR route: NONE".
+    // Both lines were true of their own table and the pair was nonsense.
+    //
+    // The rule is not new and is not invented here: rustkern/dpmi.rs's
+    // resolve_es_edi() already says "A TI=0 selector is a GDT selector, which
+    // under a real DOS/4GW is one of the extender's own flat selectors with
+    // base 0, so the flat address is EDI." Same question, same answer, and now
+    // in both places rather than one.
+    if ((sel & 4) != 0) {
+        if (dpmi_sel_lookup_rs(sel, &base, 0, 0) != 0) {
+            static uint8_t said[256];
+            if (!said[vec]) {
+                said[vec] = 1;
+                kprintf("[4GW] INT %02Xh has a DPMI 0205h handler at %04x:%08x but "
+                        "selector %04x is not a live LDT descriptor: cannot resolve a "
+                        "flat address, so nothing will be delivered to it\n",
+                        vec, sel, off, sel);
+            }
+            return -1;
+        }
+    }
+    *out = base + off;
+    return 0;
+}
+
+static void dos4gw_deliver_int9(dos_task_t *t) {
+    // WHICH ROUTE OWNS THE KEYBOARD THIS PASS. The low table first, because a
+    // guest that used AH=25h expects that handler; the DPMI 0205h table only
+    // when the low table has nothing, so a guest that installed both cannot be
+    // delivered to twice for one scancode.
+    uint32_t handler = 0;
+    int via_pm = 0;
+    if (t->kbd_has_int9) {
+        handler = dos4gw_pm_vector(t, 0x09);
+    } else if (dos4gw_pmvec_flat(0x09, &handler) == 0) {
+        via_pm = 1;
+    } else {
+        // NEITHER ROUTE. Said once, because "the guest has no keyboard handler
+        // at all" and "the guest has one and we cannot reach it" look identical
+        // from outside and need opposite fixes. Silence used to be the only
+        // report of both.
+        if (!t->k9_none_said) {
+            t->k9_none_said = 1;
+            kprintf("[4GW] no keyboard ISR installed by this guest: neither the "
+                    "low vector table nor DPMI 0205h has INT 09h. Keys go to the "
+                    "BIOS ring for INT 16h and nowhere else.\n");
+            bootlog_write("[4GW] kbd ISR route: NONE (no INT 09h in either table)");
+        }
+        return;
+    }
+
+    if (!t->k9_pending) {
+        int sc = dos_scancode_get();
+        if (sc < 0) return;
+        t->k9_code    = (uint8_t)sc;
+        t->k9_pending = 1;
+    }
+    // The byte the guest's `in al,0x60` will read (dos_in(): 0x60 ->
+    // kbd_port60). Set BEFORE delivery, because the handler reads it as its
+    // first act.
+    t->kbd_port60 = t->k9_code;
+
+    // (rakbd) AND IT GOES TO /BOOTLOG.TXT AS WELL AS SERIAL.
+    //
+    // The owner's laptop HAS NO SERIAL PORT. Every DOS diagnostic in this file
+    // is a kprintf, so his durable log from a real boot of the build that
+    // showed this bug contains not one [dos], int21 or keyq line: the question
+    // "does Red Alert have a keyboard ISR on YOUR machine" was unanswerable
+    // from the only evidence his hardware can produce, and it had to be
+    // reproduced in a VM instead. That is the third time this shape has cost a
+    // round trip; #NETDIAG already fixed it the same way for the network.
+    //
+    // These are ONE-SHOT lines, one per guest launch, so they are free and are
+    // deliberately NOT gated behind /CONFIG/DOSDIAG.CFG: a diagnostic that has
+    // to be armed in advance is no use for the boot that already happened.
+    if (!t->k9_route_said) {
+        t->k9_route_said = 1;
+        const char *rname = via_pm ? "DPMI 0205h protected-mode vector"
+                                   : "low vector table (INT 21h AH=25h)";
+        kprintf("[4GW] keyboard ISR route: %s (handler 0x%08x)\n", rname, handler);
+        bootlog_write("[4GW] kbd ISR route: %s handler=0x%08x", rname, handler);
+    }
+    int dr = dos4gw_deliver_at(t, 0x09, handler);
+    if (dr == X32_INJ_DELIVERED) {
+        t->k9_pending = 0;
+        if (!t->k9_first_said) {
+            t->k9_first_said = 1;
+            bootlog_write("[4GW] first scancode 0x%02x DELIVERED to the guest "
+                          "keyboard ISR", (unsigned)t->k9_code);
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// (#sbirq32) THE SOUND BLASTER IRQ FOR A 32-BIT DOS/4GW GUEST.
+// ---------------------------------------------------------------------------
+//
+// WHAT WAS BROKEN. dos_sb_irq_pending_rs() had exactly ONE consumer in this
+// file, the 16-bit run loop. dos4gw_run() never asked, so no protected-mode
+// guest could ever be told that its sound card had finished a block. This is
+// the same shape #779 found one vector along (dos4gw_run() never called
+// dos_deliver_int9(), so a 32-bit guest that hooked INT 9 lost the keyboard),
+// and it is fixed the same way: ask the question in the loop that was not
+// asking it.
+//
+// IT IS NOT ONLY THE SAME SHAPE, THOUGH, AND THE DIFFERENCE IS THE WHOLE POINT.
+// MEASURED on Discworld II (golden 2270, /ssdmirror/dpmi301/run9-wav): the
+// Miles Sound System driver is a 16-bit real-mode blob, SBLASTER.DIG, which the
+// game loads into DOS memory, publishes as real-mode vector 66h with DPMI
+// 0201h, and then CALLS with DPMI 0300h. So the code that waits for the
+// interrupt does not run in the 32-bit core at all: it runs inside
+// dos4gw_rm_exec_guest(), a nested 16-bit interpreter burst. Its function 0304h
+// programmed the 8237 for channel 1, wrote six DSP bytes, wrote 0xDF to port
+// 0x21 (IRQ5 UNMASKED, which is how we know which vector it wants), and then
+// executed 2,000,000 instructions with ZERO further port I/O before the budget
+// cut it off. Zero port I/O means it is spinning on a MEMORY flag, and the only
+// thing that sets that flag is its own interrupt handler.
+//
+// A fix that only touched dos4gw_run() would therefore have changed nothing:
+// the run loop is not running while 0304h spins. That is why dos4gw_sb_irq()
+// takes a `nested` flag and is called from BOTH places.
+//
+// THE THREE VECTOR TABLES, AND WHY THE LOW ONE IS AMBIGUOUS.
+// A DPMI client has three places an INT 0Dh handler can live, and this guest
+// can plausibly use any of them:
+//   * the arena's low vector table, written by 16-bit driver code (a real-mode
+//     seg:off) or by the 32-bit game through INT 21h AH=25h under DPMI (a FLAT
+//     address, packed into the same four bytes by rustkern/dos4gw.rs vec_pack);
+//   * the DPMI 0201h real-mode shadow, which dos_vec_hooked() cannot see;
+//   * the DPMI 0205h protected-mode table, which #779b made readable.
+// The low table's four bytes do NOT say which encoding they are in. They are
+// disambiguated the only way they can be without tracking the writer: a flat
+// address that is inside this arena and above the vector table itself IS a
+// usable protected-mode handler and is treated as one; anything else cannot be,
+// so it is read as a real-mode seg:off. dos4gw_deliver_at() already refuses the
+// out-of-arena case loudly, so before this rule the only outcome for a
+// real-mode-written vector was that refusal.
+//
+// AND INSIDE A NESTED 16-BIT RUN THERE IS NO AMBIGUITY AT ALL: the code that
+// installed the handler was 16-bit real-mode code and the code that must run it
+// is the 16-bit interpreter. Injecting into the 32-bit core there would vector
+// a guest that is suspended mid-INT-31h. So `nested` disables the two
+// protected-mode routes outright rather than merely deprioritising them.
+//
+// A PENDING IRQ WITH NO HANDLER IS LATCHED, NOT DROPPED. The 16-bit loop drops
+// an unacknowledged interrupt after one delivery, and that is right: a handler
+// that never reads base+0x0E would otherwise be re-entered forever. It is NOT
+// right for an interrupt that was never delivered to anything. Real hardware
+// holds the line asserted until the card is acknowledged, and the case that
+// matters here is precisely the race this fix exists for: the driver arms the
+// transfer, the pump thread finishes the block and raises the IRQ, and the
+// driver installs its handler a few hundred instructions later. Dropping the
+// interrupt in that window would hang the wait we are trying to end. So the
+// drop-and-count happens only after a delivery was actually attempted.
+enum dos_sb_route {
+    SBROUTE_NONE = 0,
+    SBROUTE_RM_LOW,   // arena low vector table, read as a real-mode seg:off
+    SBROUTE_RM_201,   // DPMI 0201h real-mode vector shadow
+    SBROUTE_PM_LOW,   // arena low vector table, read as a flat PM address
+    SBROUTE_PM_205    // DPMI 0205h protected-mode vector
+};
+
+static const char *dos_sb_route_name(int r) {
+    switch (r) {
+    case SBROUTE_RM_LOW: return "real-mode handler in the low vector table";
+    case SBROUTE_RM_201: return "real-mode handler published with DPMI 0201h";
+    case SBROUTE_PM_LOW: return "protected-mode handler in the low vector table "
+                                "(INT 21h AH=25h)";
+    case SBROUTE_PM_205: return "protected-mode handler installed with DPMI 0205h";
+    default:             return "none";
+    }
+}
+
+// Resolve the route ONCE per delivery, from the tables rather than from a flag
+// latched at install time, for the reason dos4gw_refresh_hooks() states: a guest
+// may write a vector table directly and may put it back on the way out.
+static int dos4gw_sb_route(dos_task_t *t, int nested,
+                           uint16_t *rseg, uint16_t *roff, uint32_t *pmflat) {
+    uint16_t off = rd16(t, 0x0000, (uint16_t)(DOS_SB_IRQ_VEC * 4));
+    uint16_t seg = rd16(t, 0x0000, (uint16_t)(DOS_SB_IRQ_VEC * 4 + 2));
+    int low = dos_vec_hooked(t, DOS_SB_IRQ_VEC);
+    uint32_t flat = ((uint32_t)seg << 16) | off;
+
+    if (!nested) {
+        // Could these four bytes be a protected-mode handler in THIS arena?
+        // The two bounds are dos4gw_deliver_at()'s own refusals, applied here
+        // as a test instead of as a rejection, so a real-mode vector falls
+        // through to the real-mode route rather than being reported as broken.
+        if (low && flat >= 0x400u && flat < t->le_arena_size) {
+            *pmflat = flat;
+            return SBROUTE_PM_LOW;
+        }
+        uint32_t h = 0;
+        if (dos4gw_pmvec_flat(DOS_SB_IRQ_VEC, &h) == 0 &&
+            h >= 0x400u && h < t->le_arena_size) {
+            *pmflat = h;
+            return SBROUTE_PM_205;
+        }
+    }
+    if (low) { *rseg = seg; *roff = off; return SBROUTE_RM_LOW; }
+    {
+        uint16_t s2 = 0, o2 = 0;
+        if (dpmi_rmvec_guest_rs(DOS_SB_IRQ_VEC, &s2, &o2) && (s2 || o2)) {
+            *rseg = s2; *roff = o2;
+            return SBROUTE_RM_201;
+        }
+    }
+    return SBROUTE_NONE;
+}
+
+// The ISR's instruction budget. The same 20000 the 16-bit run loop passes to
+// dos_deliver_int() for this exact vector; a Sound Blaster end-of-block handler
+// that needs more than that is not returning, and the budget is a BACKSTOP for
+// that case rather than the normal exit (#232).
+#define DOS_SB_ISR_BUDGET 20000UL
+
+static void dos4gw_sb_irq(dos_task_t *t, int nested) {
+    if (!t || !t->le_active) return;
+    if (!dos_sb_irq_pending_rs(&t->sb)) return;
+
+    uint16_t rseg = 0, roff = 0;
+    uint32_t pmflat = 0;
+    int route = dos4gw_sb_route(t, nested, &rseg, &roff, &pmflat);
+
+    if (route == SBROUTE_NONE) {
+        t->sb_irq_latched++;
+        if (!t->sb_none_said) {
+            t->sb_none_said = 1;
+            kprintf("[4GW] Sound Blaster IRQ%u (INT %02Xh) is asserted and this guest "
+                    "has NO handler for it in any of its three vector tables (low "
+                    "table %04x:%04x, no DPMI 0201h, no DPMI 0205h). The interrupt "
+                    "stays LATCHED, as the card's line would, so a handler installed "
+                    "later still receives it.\n",
+                    (unsigned)DOS_SB_IRQ, (unsigned)DOS_SB_IRQ_VEC,
+                    rd16(t, 0x0000, (uint16_t)(DOS_SB_IRQ_VEC * 4 + 2)),
+                    rd16(t, 0x0000, (uint16_t)(DOS_SB_IRQ_VEC * 4)));
+            bootlog_write("[4GW] SB IRQ route: NONE (no INT %02Xh handler in any table)",
+                          (unsigned)DOS_SB_IRQ_VEC);
+        }
+        return;
+    }
+
+    if (!t->sb_route_said) {
+        t->sb_route_said = 1;
+        if (route == SBROUTE_PM_LOW || route == SBROUTE_PM_205)
+            kprintf("[4GW] Sound Blaster IRQ route: %s, flat 0x%08x\n",
+                    dos_sb_route_name(route), pmflat);
+        else
+            kprintf("[4GW] Sound Blaster IRQ route: %s, %04x:%04x\n",
+                    dos_sb_route_name(route), rseg, roff);
+        bootlog_write("[4GW] SB IRQ route: %s (%04x:%04x / flat 0x%08x)",
+                      dos_sb_route_name(route), rseg, roff, pmflat);
+    }
+
+    // THE FLAG THE GUEST WILL BE JUDGED BY, CAPTURED BEFORE DELIVERY AND FROM
+    // THE RIGHT CORE. A real-mode route is entered from t->cpu and a
+    // protected-mode one from t->le_cpu, and reading the wrong one gives a
+    // number that is not wrong-looking, just wrong: the 16-bit scratch frame
+    // under an LE guest holds whatever the last 0300h left in it.
+    int if_before = (route == SBROUTE_PM_LOW || route == SBROUTE_PM_205)
+                  ? ((t->le_cpu.eflags & 0x200u) != 0)
+                  : ((t->cpu.flags   & 0x200u) != 0);
+    int delivered = 0;
+    if (route == SBROUTE_PM_LOW || route == SBROUTE_PM_205) {
+        int r = dos4gw_deliver_at(t, DOS_SB_IRQ_VEC, pmflat);
+        if (r != X32_INJ_DELIVERED) {
+            // MASKED means the guest is inside a cli region, which is normal
+            // and transient; a refusal has already been reported once by
+            // dos4gw_deliver_at(). Either way the interrupt stays latched and
+            // is re-offered, exactly as dos4gw_deliver_int9() re-offers a
+            // scancode rather than losing it.
+            t->sb_irq_latched++;
+            return;
+        }
+        delivered = 1;
+    } else {
+        x86_16_cpu_t *c = &t->cpu;
+        if (nested) {
+            // The driver's OWN live real-mode stack is the right one: we are
+            // interrupting its wait loop exactly where the card's IRQ line
+            // would have.
+            dos_deliver_int_at(t, rseg, roff, DOS_SB_ISR_BUDGET);
+        } else {
+            // At a slice boundary t->cpu is scratch under an LE guest and its
+            // SS:SP is whatever the last DPMI 0300h reflection left there.
+            // Point it at the same host real-mode stack dpmi_rmcs_call_rs()
+            // and dos_mouse_events() use, and restore the frame afterwards,
+            // carrying insn_count/halted FORWARD rather than restoring them:
+            // the emulated PIT is derived from insn_count and rewinding it
+            // moves guest time backwards.
+            x86_16_cpu_t save = *c;
+            c->ss = (uint16_t)(DOS4GW_XFER_LIN >> 4);
+            c->sp = (uint16_t)(DOS4GW_XFER_LEN - 0x100);
+            dos_deliver_int_at(t, rseg, roff, DOS_SB_ISR_BUDGET);
+            unsigned long insns = c->insn_count;
+            int halted = c->halted, exit_code = c->exit_code;
+            *c = save;
+            c->insn_count = insns;
+            c->halted = halted;
+            c->exit_code = exit_code;
+        }
+        delivered = 1;
+    }
+
+    if (delivered) {
+        t->sb_irq_deliv++;
+        if (!t->sb_first_said) {
+            t->sb_first_said = 1;
+            // IF IS REPORTED, NOT ENFORCED. The 16-bit loop delivers this
+            // vector without consulting IF and this path stays symmetrical with
+            // it. But dos4gw_rm_exec_guest() enters a 0300h handler with IF
+            // CLEAR ("as a real INT does"), and a driver that waits on an
+            // interrupt must have re-enabled them, so the flag's value at the
+            // first delivery is the cheap evidence for whether that entry
+            // convention is right. A number in a log beats a rule nobody has
+            // measured.
+            kprintf("[4GW] first Sound Blaster INT %02Xh delivered (%s, nested=%d, "
+                    "guest IF was %d at delivery)\n",
+                    (unsigned)DOS_SB_IRQ_VEC, dos_sb_route_name(route), nested,
+                    if_before);
+            bootlog_write("[4GW] first SB INT %02Xh DELIVERED route=%s nested=%d",
+                          (unsigned)DOS_SB_IRQ_VEC, dos_sb_route_name(route), nested);
+        }
+        // Now, and only now, the 16-bit loop's rule applies: a handler that did
+        // not read base+0x0E has not acknowledged the card, and re-entering it
+        // forever would turn a silent interrupt storm into a hang. Drop it once
+        // and COUNT it, so "the guest's ISR does not acknowledge" is a number in
+        // the exit census rather than an unexplained freeze.
+        if (dos_sb_irq_pending_rs(&t->sb)) {
+            t->sb.irq_pending = 0;
+            t->sb_irq_unacked++;
+        }
+    }
+}
+
+// The BIOS 18.2065 Hz tick at 0040:006C, one per 65536 PIT ticks, which is the
+// exact hardware relationship. A DOS/4GW client reads it through its own flat
+// DS, so it is the same four bytes of the same arena.
+//
+// (#sbirq32) SPLIT OUT OF dos4gw_timebase() BECAUSE THE TICK HAS A SECOND
+// CALLER THAT MUST NOT HAVE THE REST. dos4gw_rm_exec_guest() runs a guest's own
+// real-mode handler for up to a second of guest time, during which the run loop
+// - and therefore dos4gw_timebase() - is not running at all, and a driver that
+// waits on this dword waits forever. It needs the tick and it must NOT get the
+// IRQ0 delivery beside it: for a 32-bit guest the low vector table's INT 08h
+// holds a FLAT protected-mode address (rustkern/dos4gw.rs vec_pack), and
+// vectoring the 16-bit interpreter at it as a real-mode seg:off would run
+// whatever bytes sit at seg*16+off. So the tick moves, and IRQ0 does not fire,
+// for the duration of a 0300h. That is a deliberate and stated asymmetry.
+static void dos4gw_bios_tick(dos_task_t *t) {
+    uint32_t bt = dos_bios_tick_now(t);     // (#234a) time of day, not uptime
+    if (bt != t->bios_tick_last) {
+        t->bios_tick_last = bt;
+        uint8_t b[4] = { (uint8_t)bt, (uint8_t)(bt >> 8),
+                         (uint8_t)(bt >> 16), (uint8_t)(bt >> 24) };
+        x86_32_write_guest(&t->le_cpu, 0x46C, b, 4);
+    }
+}
+
 // One pass of the timebase, called at an instruction boundary once per slice.
 //
 // The catch-up is BOUNDED and the debt is DROPPED, exactly as the 16-bit path
@@ -7998,16 +9631,7 @@ static void dos4gw_timebase(dos_task_t *t) {
     if (now_pit >= t->next_irq0_pit)
         t->next_irq0_pit = now_pit + div;      // still behind: resync, drop the debt
 
-    // The BIOS 18.2065 Hz tick at 0040:006C, one per 65536 PIT ticks, which is
-    // the exact hardware relationship. A DOS/4GW client reads it through its own
-    // flat DS, so it is the same four bytes of the same arena.
-    uint32_t bt = dos_bios_tick_now(t);     // (#234a) time of day, not uptime
-    if (bt != t->bios_tick_last) {
-        t->bios_tick_last = bt;
-        uint8_t b[4] = { (uint8_t)bt, (uint8_t)(bt >> 8),
-                         (uint8_t)(bt >> 16), (uint8_t)(bt >> 24) };
-        x86_32_write_guest(&t->le_cpu, 0x46C, b, 4);
-    }
+    dos4gw_bios_tick(t);
 }
 
 
@@ -8353,9 +9977,28 @@ static void dos4gw_dump_derail(dos_task_t *t) {
     if (x86_32_btrace_on()) go32_trace_dump(t);
 }
 
-static void dos4gw_run(dos_task_t *t, uint64_t max_insns) {
+// (#speedcap, extends #232/#778) THE CAP, NOW ON THIS LOOP TOO.
+//
+// #232 capped only the 16-bit interpreter and #778 gave only that loop a live
+// re-poll; dos4gw_run() was explicitly excluded, on the stated ground that "no
+// shipped DOS/4GW title has been shown to need it, and every one of them is
+// 386-era software that paces itself off the timer". Both halves of that turned
+// out to be the wrong test. Red Alert and NetHack are the two heaviest guests in
+// the catalog and are precisely the ones that starve the compositor, and "paces
+// itself off the timer" is a statement about the GUEST's animation, not about
+// how much of the host it consumes: an uncapped interpreter burns every cycle it
+// is given whatever the guest does with them.
+//
+// `cap` is the value dos_run_file() already resolved and already printed, passed
+// in rather than re-resolved, so the launch line and the enforced cap cannot
+// disagree. `path` is kept only for the #778 live re-poll, which must run the
+// SAME dos_speed_cycles_for() chain the launch did or the compositor's Speed
+// dialog would move 16-bit guests and silently not 32-bit ones.
+static void dos4gw_run(dos_task_t *t, uint64_t max_insns, const char *path,
+                       uint32_t cap) {
     uint64_t run_t0 = sched_now_ms();
     uint64_t last_present_ms = 0;
+    uint64_t last_sample_ms  = 0;   // #dosplay redraw sampler, independent of the present
     uint64_t last_alive_ms = 0;      // (#740 digplay) alive sampler
     unsigned alive_n = 0;
     // Seeded from the same constant the 16-bit loop seeds from, and re-sized
@@ -8375,6 +10018,18 @@ static void dos4gw_run(dos_task_t *t, uint64_t max_insns) {
     // on the next pass, or -1. See the note at the re-issue site below.
     int      retry_vec   = -1;
     uint32_t input_waits = 0;
+    // (#speedcap) The SAME entitlement account the 16-bit loop keeps, over the
+    // SAME constants, against t->le_cpu.insn_count instead of t->cpu.insn_count.
+    // Deliberately the same shape and not a second scheme: the reason the 16-bit
+    // cap delivers its target rate rather than merely bounding it (a 250 Hz host
+    // tick means proc_sleep(1) really sleeps ~4 ms, so a fixed burst plus a fixed
+    // sleep under-delivers by 4x) applies identically here.
+    uint32_t thr_cycles     = cap;
+    const char *thr_src     = "launch";
+    int64_t  thr_credit     = 0;
+    uint64_t thr_last_ms    = run_t0;
+    unsigned long thr_last_insns = 0;
+    uint64_t thr_live_poll_ms = run_t0;
 
     // Point the guest's vector table at a protected-mode no-op BEFORE the first
     // instruction, so a vector it saves and later chains to is an address it can
@@ -8458,7 +10113,40 @@ static void dos4gw_run(dos_task_t *t, uint64_t max_insns) {
             t->le_cpu.exit_arg = (uint32_t)retry_vec;
             retry_vec = -1;
         } else {
+            if (thr_cycles) {
+                // Entitlement accounting, identical to the 16-bit loop's (see
+                // the long note there for why the debt is REMEMBERED rather than
+                // forgiven once a second). One sleep and one re-read per pass,
+                // never a loop: every pass still retires at least
+                // DOS_THROTTLE_BURST_MIN instructions of real forward progress,
+                // which is what keeps this out of the busy-wait class CLAUDE.md
+                // bans (#426).
+                uint64_t tnow = sched_now_ms();
+                thr_credit += (int64_t)((tnow - thr_last_ms) * (uint64_t)thr_cycles);
+                thr_last_ms = tnow;
+                thr_credit -= (int64_t)((unsigned long)t->le_cpu.insn_count - thr_last_insns);
+                thr_last_insns = (unsigned long)t->le_cpu.insn_count;
+                int64_t maxc = (int64_t)thr_cycles * (int64_t)DOS_THROTTLE_BURST_MS;
+                int64_t maxd = -(int64_t)thr_cycles * (int64_t)DOS_THROTTLE_DEBT_MS;
+                if (thr_credit > maxc) thr_credit = maxc;
+                if (thr_credit < maxd) thr_credit = maxd;
+                if (thr_credit <= 0) {
+                    uint64_t ahead = (uint64_t)(-thr_credit) / thr_cycles + 1u;
+                    if (ahead > DOS_THROTTLE_SLEEP_MAX) ahead = DOS_THROTTLE_SLEEP_MAX;
+                    proc_sleep((uint32_t)ahead);
+                    tnow = sched_now_ms();
+                    thr_credit += (int64_t)((tnow - thr_last_ms) * (uint64_t)thr_cycles);
+                    thr_last_ms = tnow;
+                    if (thr_credit > maxc) thr_credit = maxc;
+                }
+                int64_t b = thr_credit > 0 ? thr_credit : 0;
+                if (b > maxc) b = maxc;
+                if (b < (int64_t)DOS_THROTTLE_BURST_MIN) b = (int64_t)DOS_THROTTLE_BURST_MIN;
+                slice = (unsigned long)b;
+            }
+            uint64_t _pt = dosprof_t0();
             r = x86_32_run(&t->le_cpu, slice);
+            dosprof_t1(DOSPROF_INTERP, _pt);
         }
 
         if (r == X32_EXIT_INT) {
@@ -8535,6 +10223,26 @@ static void dos4gw_run(dos_task_t *t, uint64_t max_insns) {
         // returns.
         {
             int now_focused = win16_host_is_focused(t->host_slot);
+            // (rakbd) THE FIRST PASS IS STATED, NOT INFERRED FROM AN ABSENT EDGE.
+            //
+            // This block reports only EDGES, which is right for a steady stream
+            // and wrong for the one question that mattered: "was the tap ever
+            // armed at all?" With last_focused starting at 0 (the task is
+            // memset), a guest that is never focused produces NO line, and a
+            // guest that is focused from the start produces one - so silence
+            // meant "never armed" and it took a 16-bit control run to establish
+            // that, because the 16-bit path seeds last_focused=1 and its silence
+            // means the OPPOSITE. Two paths whose identical silence means
+            // opposite things is not a diagnostic. Say it once, explicitly.
+            if (!t->focus_said) {
+                t->focus_said = 1;
+                kprintf("[4GW] #156 first pass: host_slot=%d win16_host_is_focused=%d "
+                        "(input tap %s)\n", t->host_slot, now_focused,
+                        now_focused ? "ARMED" : "NOT ARMED - the guest will receive "
+                                                "no keystrokes at all");
+                bootlog_write("[4GW] #156 first pass slot=%d focused=%d",
+                              t->host_slot, now_focused);
+            }
             if (now_focused != t->last_focused) {
                 dos_scancode_clear();
                 dos_keyq_reset(t);
@@ -8546,8 +10254,14 @@ static void dos4gw_run(dos_task_t *t, uint64_t max_insns) {
             }
             g_dos_scancode_tap = now_focused;
             if (now_focused) {
-                if (!t->kbd_has_int9) dos_keyq_pump(t);
-                dos_pump_input(t);
+                // (rakbd2) EITHER route means the guest owns the raw stream.
+                if (!t->kbd_has_int9 && !t->kbd_int9_pm) dos_keyq_pump(t);
+                { uint64_t _pt = dosprof_t0(); dos_pump_input(t); dosprof_t1(DOSPROF_INPUT, _pt); }
+                // (rakbd) THE FOURTH CALL, the one the comment above said this
+                // loop already made and did not. Drains the same raw scancode
+                // ring dos_keyq_pump() would have, for exactly the guests where
+                // that pump is switched off.
+                dos4gw_deliver_int9(t);
                 // (raplay) THE 0Ch UPCALL, AND WHY IT IS NOW CONDITIONAL RATHER
                 // THAN ABSENT.
                 //
@@ -8616,12 +10330,30 @@ static void dos4gw_run(dos_task_t *t, uint64_t max_insns) {
         // stack writes, so wq_assert_may_block() has nothing to fire on and the
         // concurrency lint has no loop to object to.
         dos4gw_timebase(t);
+        // (#sbirq32) And the card's end-of-block interrupt, at the same
+        // instruction boundary and for the same reason. NOT inside the focus
+        // gate above: a window that has lost focus must stop receiving KEYS,
+        // but its sound card has not stopped playing, and a driver waiting on
+        // the interrupt would hang the guest for as long as another window is
+        // in front of it.
+        dos4gw_sb_irq(t, 0);
 
         {   uint64_t pnow = sched_now_ms();
-            if (pnow - last_present_ms >= DOS_PRESENT_MS) {
+            // The guest's own frame rate, on its own clock, whether or not this
+            // frame is going to be shown. Diagnostic-gated inside.
+            if (pnow - last_sample_ms >= DOS_PRESENT_MS) {
+                last_sample_ms = pnow;
+                dos_redraw_sample(t);
+            }
+            if (pnow - last_present_ms >= DOS_PRESENT_MS && dos_frame_due(t, pnow, 0)) {
                 last_present_ms = pnow;
-                dos_present(t);
-                if (t->host_slot >= 0) win16_host_invalidate(t->host_slot);
+                { uint64_t _pt = dosprof_t0(); dos_present(t); dosprof_t1(DOSPROF_PRESENT, _pt); }
+                if (t->host_slot >= 0) {
+                    uint64_t _pt = dosprof_t0();
+                    win16_host_invalidate(t->host_slot); dos_publish_mark();
+                    dosprof_t1(DOSPROF_PUBLISH, _pt);
+                    if (_pt) dosprof_add_publish_bytes_rs((uint64_t)t->win_w * (uint64_t)t->win_h * 4ull);
+                }
                 frames++;
             }
         }
@@ -8667,7 +10399,15 @@ static void dos4gw_run(dos_task_t *t, uint64_t max_insns) {
         // nothing a wait_event() could be armed on; converting this to one
         // would be wrong for the same reason the 16-bit loop's own yield is
         // allowlisted (concurrency-lint allowlist.txt, #dospace 2026-08-07).
-        proc_yield();
+        //
+        // (#speedcap) Skipped entirely while CAPPED, exactly as the 16-bit loop
+        // skips its own: the cap's proc_sleep() above is a strictly better
+        // handoff than a yield (it parks the thread on the timer instead of
+        // re-entering the ready queue, so a capped guest gives its core back),
+        // and yielding as well would only add a scheduler round trip between the
+        // sleep and the burst.
+        if (!thr_cycles) { uint64_t _pt = dosprof_t0(); proc_yield(); dosprof_t1(DOSPROF_YIELD, _pt); }
+        dos_prof_report(t);
 
         {   // CLOSE THE LOOP, the same way the 16-bit loop does: measure the
             // rate the guest ACTUALLY got and re-size the next burst to
@@ -8676,6 +10416,30 @@ static void dos4gw_run(dos_task_t *t, uint64_t max_insns) {
             // clock: the PIT tick count is instructions * PIT_HZ / rate, so a
             // rate that is wrong by 10x makes a 35 Hz game timer tick at 3.5 Hz.
             uint64_t now = sched_now_ms();
+            // (#778, extended by #speedcap to this loop) LIVE SPEED CONTROL.
+            // Re-runs the SAME dos_speed_cycles_for() chain the launch did, so
+            // the compositor's per-window Speed dialog moves a RUNNING 32-bit
+            // guest exactly as it already moved a 16-bit one. One small file
+            // read every DOS_SPEED_LIVE_POLL_MS, inside a block that already
+            // runs once per already-scheduled burst, so it adds no wait of its
+            // own (#426).
+            if (path && now - thr_live_poll_ms >= DOS_SPEED_LIVE_POLL_MS) {
+                thr_live_poll_ms = now;
+                const char *new_src = "default";
+                uint32_t newc = dos_speed_cycles_for(path, &new_src);
+                if (newc != thr_cycles) {
+                    kprintf("[4GW] #778 CPU cap changed live: %u -> %u cycles "
+                            "(now from %s)\n", thr_cycles, newc, new_src);
+                    thr_cycles = newc;
+                    thr_src = new_src;
+                    // The new cap pays in from THIS instant, exactly as a fresh
+                    // launch would: neither a windfall credit nor a debt run up
+                    // under the old target carries across.
+                    thr_credit = 0;
+                    thr_last_ms = now;
+                    thr_last_insns = (unsigned long)t->le_cpu.insn_count;
+                }
+            }
             if (now - rate_t0 >= DOS_RATE_SAMPLE_MS) {
                 uint64_t di = t->le_cpu.insn_count - rate_i0;
                 uint64_t dt = now - rate_t0;
@@ -8687,7 +10451,15 @@ static void dos4gw_run(dos_task_t *t, uint64_t max_insns) {
                 // `ch` drives the CLOCK, `hz` still sizes the SLICE.
                 uint32_t ch = dos_emu_clock_rate(t, (unsigned long)di, dt,
                                                  &rate_b0, hz);
-                if (hz > 100000u) {
+                // (#speedcap) THE SAME FLOOR BUG #232 HAD TO FIX IN THE 16-BIT
+                // LOOP. A bare 100 kHz floor is ABOVE a legitimately capped
+                // guest at any cap under 400 cycles, and rejecting the sample
+                // would leave g_dos_emu_hz at the old UNCAPPED value, so the
+                // guest's PIT would then run tens of times fast: the cap would
+                // have broken the one thing this subsystem guarantees. Scale the
+                // floor to the cap, exactly as the 16-bit loop does.
+                uint32_t hz_floor = thr_cycles ? (thr_cycles * 1000u / 4u) : 100000u;
+                if (hz > hz_floor) {
                     // (#176) see the 16-bit loop: a saturated window is a
                     // discontinuity and must not be blended into the average.
                     uint32_t nh = (g_dos_emu_hz && !t->bus_sat_now && !bus_sat_prev)
@@ -8695,11 +10467,18 @@ static void dos4gw_run(dos_task_t *t, uint64_t max_insns) {
                         : ch;
                     bus_sat_prev = t->bus_sat_now;
                     dos_emu_rebase(t, nh);      // adopt WITHOUT moving past instants
-                    unsigned long ns =
-                        (unsigned long)(((uint64_t)hz * DOS_SLICE_MS) / 1000ull);
-                    if (ns < DOS_SLICE_MIN) ns = DOS_SLICE_MIN;
-                    if (ns > DOS_SLICE_MAX) ns = DOS_SLICE_MAX;
-                    slice = ns;
+                    // (#speedcap) The burst size belongs to the CAP while there
+                    // is one, same reasoning as the 16-bit loop: DOS_SLICE_MIN
+                    // is 20,000 instructions, which at a 500-cycle cap is 40 ms
+                    // of guest time in one go, so input and presents would be
+                    // sampled 25 times a second instead of ~250.
+                    if (!thr_cycles) {
+                        unsigned long ns =
+                            (unsigned long)(((uint64_t)hz * DOS_SLICE_MS) / 1000ull);
+                        if (ns < DOS_SLICE_MIN) ns = DOS_SLICE_MIN;
+                        if (ns > DOS_SLICE_MAX) ns = DOS_SLICE_MAX;
+                        slice = ns;
+                    }
                 }
                 rate_t0 = now; rate_i0 = t->le_cpu.insn_count;
             }
@@ -8707,14 +10486,26 @@ static void dos4gw_run(dos_task_t *t, uint64_t max_insns) {
     }
 
     dos_present(t);
-    if (t->host_slot >= 0) win16_host_invalidate(t->host_slot);
+    if (t->host_slot >= 0) { win16_host_invalidate(t->host_slot); dos_publish_mark(); }
 
     go32_trace_dump(t);
     go32_cost_dump(t);
     go32_dump_text_page(t);
+    t->le_frames = frames;   // for the shared teardown summary below
     kprintf("[4GW] FINISHED: %s. %u instructions retired, %u frames presented.\n",
             why, (uint32_t)t->le_cpu.insn_count, frames);
     kprintf("[4GW] #221 blocking key-read waits: %u\n", input_waits);
+    // (#speedcap) The cap this run ACTUALLY enforced, printed unconditionally
+    // and at the end, so an exit census says whether the guest was capped
+    // without needing the DOSSPEED diagnostic gate armed. "none" is a real
+    // answer and is printed, because the absence of a line cannot distinguish
+    // "uncapped" from "this kernel does not cap 32-bit guests at all", which is
+    // exactly the ambiguity this change removes.
+    if (thr_cycles)
+        kprintf("[4GW] #232 CPU cap enforced: %u cycles (%u insn/s) from %s\n",
+                thr_cycles, thr_cycles * 1000u, thr_src);
+    else
+        kprintf("[4GW] #232 CPU cap enforced: none (uncapped, host speed)\n");
     {   uint32_t div = t->pit[0].divisor ? t->pit[0].divisor : 65536u;
         kprintf("[4GW] IRQ delivery: INT 08h x%u, INT 09h x%u, INT 1Ch x%u; "
                 "masked(IF=0) %u, no-fit %u, no-handler %u\n",
@@ -8754,9 +10545,65 @@ static void dos4gw_run(dos_task_t *t, uint64_t max_insns) {
     dpmi_bind_dosmem_rs(0, 0, 0);
 }
 
+// (#fmbridge) THE WRAPPER EXISTS SO THAT NO EXIT CAN LEAK THE ARMED FM QUEUE.
+//
+// MEASURED, not theorised. dos_run_file_inner() calls dos_fmq_host_open() early
+// (the queue must be armed before the chip is constructed, or a guest's opening
+// instrument bank is dropped), and then has SIX early `return -1` paths for a
+// file it cannot read, an image it cannot load, an LE or DOS/4GW prepare that
+// fails, or an out-of-memory. Every one of them left the queue ACTIVE forever:
+// /APPS/FMSYNTH then never sees ENODEV, never renders its tail, never exits, and
+// holds a PCM stream for the rest of the boot. That is the #205 failure with a
+// different cause, and it is exactly what a harness run hit - the canonical way
+// to arm a Ring-3 guest (dosring3run.py) points DOSRUN.CFG at a path that does
+// not exist, so the in-kernel launcher armed the queue and then failed to load,
+// and the Ring-3 host that followed was refused a queue nobody was using.
+//
+// FIX THE MECHANISM, NOT THE SIX INSTANCES. Closing at each early return would
+// work today and leak again the first time a seventh is added; this cannot.
+// The close is idempotent (dos_fmq_close_rs clears only `active`, and the
+// counters survive until the next open), so the normal path - which closes in
+// dos_on_terminate() and prints the session summary there - is unaffected.
+static int dos_run_file_inner(const char *path);
+
 int dos_run_file(const char *path) {
+    int rc = dos_run_file_inner(path);
+    dos_fmq_host_close(0, 0);
+    // AND g_dos_busy, WHICH IS THE BIGGER HALF OF THE SAME LEAK.
+    //
+    // dos_launch_common() sets g_dos_busy = 1 before proc_create(), and the
+    // ONLY places that clear it are the tail of dos_run_file_inner() and the
+    // proc_create-failed branch. So every one of the six early returns below
+    // leaves it SET - and dos_launch_common() refuses to start anything while
+    // it is set (`[dos] busy (a DOS task is already running)`), as does
+    // proc/dosroute.c:199 when deciding whether a guest may go to Ring 3.
+    //
+    // READ FROM THE CODE, not observed at runtime: ONE DOS program that fails
+    // to load - a missing file, a corrupt image, an LE/DOS4GW prepare that
+    // fails, an OOM - wedges the ENTIRE DOS subsystem, BOTH paths, for the rest
+    // of the boot. Nothing in the tree resets it. The FM queue leak this
+    // wrapper was written for is the same bug in a smaller variable, which is
+    // why both are cleared in the same place rather than in six.
+    //
+    // Idempotent on the normal path: dos_run_file_inner() already ends with
+    // g_dos_busy = 0, and a second store of 0 is a no-op. Safe against a
+    // concurrent launch, because there cannot be one: this runs on the guest's
+    // own thread, after that guest has finished, and the launcher that would
+    // start the next one is exactly the thing this unblocks.
+    g_dos_busy = 0;
+    return rc;
+}
+
+static int dos_run_file_inner(const char *path) {
     dos_task_t *t = &g_dos;
     memset(t, 0, sizeof(*t));
+    // (#dosfs) RE-READ THE VIEW POLICY ON EVERY LAUNCH, not once per boot. The
+    // flag inside dos_view_init() only exists to stop the two callers within a
+    // single launch (the window sizing, then the self-test report) from reading
+    // the file twice; clearing it here is what makes editing DOSVIEW.CFG and
+    // relaunching the game enough, with no reboot. A knob that needs a reboot to
+    // try is a knob nobody tries.
+    g_dos_view_loaded = 0;
 
     t->mem = (uint8_t *)kmalloc(DOS_MEM_SIZE);
     if (!t->mem) { kprintf("[dos] OOM allocating 1MB\n"); return -1; }
@@ -8881,10 +10728,7 @@ int dos_run_file(const char *path) {
                     g_dos_fm_force_off ? "FORCED OFF (measurement arm)" : "enabled");
         }
     }
-    {   uint64_t _fl = spinlock_acquire_irqsave(&g_dos_fmq_lock);
-        dos_fmq_open_rs(&g_dos_fmq);
-        spinlock_release_irqrestore(&g_dos_fmq_lock, _fl);
-    }
+    dos_fmq_host_open();
     // The queue is open BEFORE the synthesiser starts, so the synthesiser
     // cannot miss a write that arrives while it is still loading.
     dos_fm_launch();
@@ -9034,7 +10878,7 @@ int dos_run_file(const char *path) {
     // was never the bug on its own; taking the cpu pointer and THROWING IT
     // AWAY was, because it made "whose guest is this?" unanswerable.
     t->cpu.owner = t;
-    dos_build_psp(t);
+    dos_build_psp(t, path);
     {   // #740: WHICH FORMAT IS THIS?
         //
         // A wbind-ed DOS/4GW binary IS an MZ: the extender's 16-bit stub is a
@@ -9106,20 +10950,91 @@ int dos_run_file(const char *path) {
     // and one row in 20. At an 8x16 cell that is the difference between "Shareware"
     // and "Sharcwarc". Measure the decoration once and ask again, so the content is
     // EXACTLY 640x400: an integer 2x for 320x200 and whole 8x16 cells for 80x25.
-    const int want_w = TEXT_COLS * FONT_WIDTH;    // 640 == MODE13_W * WIN_SCALE
-    const int want_h = TEXT_ROWS * FONT_HEIGHT;   // 400 == MODE13_H * WIN_SCALE
+    int want_w = TEXT_COLS * FONT_WIDTH;    // 640 == MODE13_W * WIN_SCALE
+    int want_h = TEXT_ROWS * FONT_HEIGHT;   // 400 == MODE13_H * WIN_SCALE
+    // (#dosfs) AND THEN OPEN IT AS BIG AS THE ERA-APPROPRIATE POLICY ALLOWS.
+    //
+    // The owner's request was that DOS games "open in a full screen view
+    // that's using a 640x480 or 800x600 resolution". 640x400 of content is an
+    // eighth of a 3840x2160 panel by area, so the window opened postage-stamp
+    // sized and every user had to resize it by hand before anything looked
+    // right. This asks the SAME policy the present path uses (rustkern/
+    // doswin.rs) how big a picture it would allow on THIS screen, and opens the
+    // window at exactly that, centred.
+    //
+    // WHY NOT NATIVE FULLSCREEN. window_fullscreen_enter() would be the literal
+    // reading of the request, and it is deliberately not used: it requires the
+    // window to hold FOCUS to stay fullscreen (wm_fullscreen_active()), it is
+    // policed by a compositor watchdog keyed on the content-COMMIT sequence
+    // that this subsystem does not use (it invalidates instead), and the
+    // fullscreen/maximise scaling path is under active repair elsewhere. A
+    // plain, correctly sized window needs none of that machinery and cannot be
+    // dragged into its failure modes. The user can still maximise or fullscreen
+    // it by hand and the present path handles either, because the geometry is
+    // recomputed from the CURRENT buffer size every frame.
+    //
+    // 80x25 TEXT IS THE RIGHT MODE TO SIZE FROM, even though most guests are
+    // about to switch away from it: it is the mode every guest starts in, and
+    // sizing from a mode the guest has not chosen yet would be a guess. The
+    // window stays put across the mode change and the picture inside it is
+    // re-fitted every present, so a 320x200 game in a window sized for 640x400
+    // simply lands on a larger whole multiple (6x rather than 3x).
+    {
+        dos_view_init(0, 0);
+        int wax, way, waw, wah;
+        win16_host_work_area(&wax, &way, &waw, &wah);
+        (void)wax; (void)way;
+        // The work area is the screen minus the dock/taskbar insets, and it is
+        // already clamped non-empty, so no zero check is needed. Leave a margin
+        // so the frame's own decoration cannot push the window off it.
+        int32_t aw = (int32_t)waw - 64, ah = (int32_t)wah - 96;
+        dos_view_policy_t open_pol = g_dos_view;
+        // integer=ALWAYS for the OPENING SIZE specifically. Everywhere else the
+        // default is "integer only when a limit binds", so that no window size
+        // that ships today changes by a pixel; but here there is no existing
+        // size to preserve, and a window whose content is an exact multiple of
+        // 640x400 is the one that renders the 80x25 text grid on whole 8x16
+        // cells - the same argument that made the original 640x400 window
+        // exactly 640x400 (see just above: "Sharcwarc").
+        open_pol.integer = 2;
+        // (no-ticket) AND ITS OWN CAP, not the picture's. One number governing
+        // both is what let a budget raise multiply the DEFAULT window sixteen-
+        // fold on a 3840x2160 panel while nobody was looking: the opening size
+        // is not something the user asked for, and the budget is.
+        open_pol.budget_px = dos_view_open_budget_rs(g_dos_view.budget_px);
+        dos_rect_t orect;
+        if (aw > 0 && ah > 0 &&
+            dos_present_rect_rs(aw, ah, want_w, want_h, want_w, want_h,
+                                &open_pol, &orect) &&
+            orect.w >= want_w && orect.h >= want_h) {
+            want_w = orect.w;
+            want_h = orect.h;
+        }
+    }
     // (#234d) NAME THE WINDOW AFTER THE PROGRAM. Every DOS guest used to open a
     // window and a taskbar button labelled "DOS", so with two of them up you
     // could not tell Rogue from NetHack without looking inside, and with one up
     // the taskbar told you the subsystem rather than the thing you launched.
     char wtitle[40];
     dos_guest_title(path, wtitle, (int)sizeof(wtitle));
-    t->host_slot = win16_host_create(wtitle, 80, 60, want_w, want_h,
+    // (#dosfs) CENTRED, not at a fixed (80,60). A 1920x1200 window pinned to
+    // the top-left of a 3840x2160 panel is not what "full screen view" means,
+    // and the old constant only ever looked right because the window was small.
+    int win_x = 80, win_y = 60;
+    {
+        int wax, way, waw, wah;
+        win16_host_work_area(&wax, &way, &waw, &wah);
+        int32_t cx = (int32_t)wax + ((int32_t)waw - want_w) / 2;
+        int32_t cy = (int32_t)way + ((int32_t)wah - want_h) / 2;
+        if (cx > win_x) win_x = (int)cx;
+        if (cy > win_y) win_y = (int)cy;
+    }
+    t->host_slot = win16_host_create(wtitle, win_x, win_y, want_w, want_h,
                                      &t->win_buf, &t->win_w, &t->win_h, 0);
     if (t->host_slot >= 0 && (t->win_w != want_w || t->win_h != want_h)) {
         int dw = want_w - t->win_w, dh = want_h - t->win_h;
         win16_host_destroy(t->host_slot);
-        t->host_slot = win16_host_create(wtitle, 80, 60, want_w + dw, want_h + dh,
+        t->host_slot = win16_host_create(wtitle, win_x, win_y, want_w + dw, want_h + dh,
                                          &t->win_buf, &t->win_w, &t->win_h, 0);
     }
     if (t->host_slot < 0) {
@@ -9146,6 +11061,39 @@ int dos_run_file(const char *path) {
         int bad = dos_letterbox_selftest_rs();
         kprintf("[dos] letterbox selftest: %s (%d failing)\n",
                 bad == 0 ? "PASS" : "FAIL", bad);
+        {   // (#dosfs) THE VIEW POLICY: load it, prove it, and PRINT THE
+            // EFFECTIVE VALUE. All three, because blame.md records the #mickey
+            // re-home interval that had a Rust default, a mirrored C default and
+            // no line saying which one won - so a changed constant did nothing
+            // and it cost a whole verification run to find out.
+            //
+            // The default comes from Rust and is only overwritten where the
+            // config file actually asked. An absent DOSVIEW.CFG is the NORMAL
+            // state (it is not in the golden) and says nothing beyond the
+            // effective line below.
+            //
+            // /CONFIG is on the ext2 ROOT, not the FAT ESP. fat_read_file()
+            // routes it there via fat_path_on_ext2(), which is why this uses the
+            // same call the three DOS config files beside it use rather than a
+            // private one (blame.md: autorun_worker() hardcoded a path that the
+            // ESP has no CONFIG directory for, and has been unreachable on every
+            // two-partition golden since).
+            int _vread = 0, _vn = 0;
+            dos_view_init(&_vread, &_vn);   // already done by the window sizing
+            int vbad = dos_view_selftest_rs();
+            kprintf("[dos] (#dosfs) view selftest: %s (%d failing)\n",
+                    vbad == 0 ? "PASS" : "FAIL", vbad);
+            kprintf("[dos] (#dosfs) view policy EFFECTIVE: budget=%d px "
+                    "integer=%s max=%dx%d aspect=%s (DOSVIEW.CFG %s%s)\n",
+                    g_dos_view.budget_px,
+                    g_dos_view.integer == 2 ? "always"
+                                            : (g_dos_view.integer ? "on" : "off"),
+                    g_dos_view.max_w, g_dos_view.max_h,
+                    g_dos_view.aspect ? "crt(4:3)" : "square",
+                    _vread > 0 ? "read" : (_vread == 0 ? "absent, defaults"
+                                                        : "loaded at window sizing"),
+                    _vread > 0 ? (_vn ? ", applied" : ", nothing parsed") : "");
+        }
         // (#mickey) The mouse-counter model, driven against a MODEL OF THE
         // GUEST taken from The Dig's own handler (integrate the differences,
         // clamp to the box). It asserts the reported defect directly: a host
@@ -9210,14 +11158,12 @@ int dos_run_file(const char *path) {
             // The postcondition stays in the Rust (a self-test must not leave a
             // device armed); the knowledge that a guest is starting lives HERE,
             // so the restore lives here too.
-            static dos_fm_event_t _fmscratch[8];
-            int fbad = dos_fmq_selftest_rs(&g_dos_fmq, _fmscratch, 8);
-            kprintf("[dos] #182 FM bridge selftest: %s (%d failing)\n",
+            // (#fmbridge) the re-open is part of dos_fmq_host_selftest() now,
+            // beside the close that makes it necessary, so both rings get it.
+            int fbad = dos_fmq_host_selftest();
+            kprintf("[dos] #182 FM bridge selftest: %s (%d failing); queue "
+                    "re-opened after the selftest closed it\n",
                     fbad == 0 ? "PASS" : "FAIL", fbad);
-            uint64_t _rl = spinlock_acquire_irqsave(&g_dos_fmq_lock);
-            dos_fmq_open_rs(&g_dos_fmq);
-            spinlock_release_irqrestore(&g_dos_fmq_lock, _rl);
-            kprintf("[dos] #182 FM queue re-opened after the selftest closed it\n");
         }
         int obad = dos_opl2_selftest_rs();
         kprintf("[dos] #175 OPL2 detect selftest: %s (%d failing)\n",
@@ -9390,6 +11336,10 @@ int dos_run_file(const char *path) {
         // dos_mouse_events().
         wr8(t, 0xF000, DOS_MEVRET_STUB,     0xEB);  // JMP $
         wr8(t, 0xF000, DOS_MEVRET_STUB + 1, 0xFE);
+        // (#dpmi301) the landing pad a 0300h-executed real-mode handler IRETs
+        // to. See dos4gw_rm_exec_guest().
+        wr8(t, 0xF000, DOS_RMCALLRET_STUB,     0xEB);  // JMP $
+        wr8(t, 0xF000, DOS_RMCALLRET_STUB + 1, 0xFE);
         // (#740) The BIOS timer handler. See DOS_BIOSTIMER_STUB.
         wr8(t, 0xF000, DOS_BIOSTIMER_STUB,     0xCD);  // INT 1Ch
         wr8(t, 0xF000, DOS_BIOSTIMER_STUB + 1, 0x1C);
@@ -9404,6 +11354,18 @@ int dos_run_file(const char *path) {
             // F000:FF53 for vector 33h and every protected-mode guest that ran
             // the documented mouse-driver test was told there is no mouse.
             // One chooser, two consumers; see the note at RMVEC.
+            //
+            // (rakbd2) ...EXCEPT THE VECTORS WHOSE CORRECT CONTENT IS NOTHING.
+            // dos_vec_seed_free() names them and is the only place that does,
+            // so the shadow, the arena and dos_vec_hooked() cannot come to
+            // disagree about whether 60h is taken. Leaving the arena entry at
+            // 0000:0000 is not "skipping" it: 0000:0000 is what a real DOS
+            // leaves there, and it is what Red Alert reads to find a vector it
+            // may use.
+            if (dos_vec_seed_free((uint8_t)v)) {
+                dpmi_rmvec_seed_rs((uint8_t)v, 0x0000, 0x0000);
+                continue;
+            }
             dpmi_rmvec_seed_rs((uint8_t)v, 0xF000, dos_vec_seed_stub((uint8_t)v));
             uint16_t off = rd16(t, 0x0000, (uint16_t)(v * 4));
             uint16_t seg = rd16(t, 0x0000, (uint16_t)(v * 4 + 2));
@@ -9521,6 +11483,12 @@ int dos_run_file(const char *path) {
             if (_sc) {
                 kfree(_sc);
                 g_dos_speedlog = 1;
+                // #dw2perf: a self-test nobody has watched go red is
+                // indistinguishable from one that is not wired up (#514/#665).
+                kprintf("[DOSFRAME] dosprof selftest: %d failure(s) (0 = pass)\n",
+                        dosprof_selftest_rs());
+                kprintf("[DOSFRAME] dosdisp selftest: %d failure(s) (0 = pass)\n",
+                        dosdisp_selftest_rs());
                 kprintf("[dos] #232 speed log ARMED (one line every %ums)\n",
                         DOS_SPEED_REPORT_MS);
             }
@@ -9608,22 +11576,24 @@ int dos_run_file(const char *path) {
     uint64_t rate_acc_ms = 0;        // ms since the last printed line
     uint64_t run_t0 = rate_t0;       // wall clock at which this program started
     uint64_t last_present_ms = 0;    // present cadence, independent of the pacing
+    uint64_t last_sample_ms  = 0;    // #dosplay redraw sampler, independent of the present
     int dbg_last_frame = -1;         // de-dup for the @frame trace below
     // #232 guest CPU speed cap. thr_cycles == DOS_CYCLES_OFF means "uncapped",
     // which is what every guest gets unless a config says otherwise, so this is
     // a no-op for every title that does not opt in.
     const char *thr_src = "default";
     uint32_t thr_cycles = dos_speed_cycles_for(path, &thr_src);
-    // SCOPE, STATED RATHER THAN IMPLIED: the cap is enforced in the 16-bit
-    // interpreter loop below and NOT in the DOS/4GW (32-bit LE) loop, which is
-    // a separate run loop in dos4gw_run(). Forced off here rather than left
-    // resolved-but-unenforced, because a launch line that announces a cap the
-    // guest is not actually subject to is worse than no line. Extending it
-    // there is mechanical (the same entitlement block against t->le_cpu's
-    // insn_count) and is deliberately not done blind: no shipped DOS/4GW title
-    // has been shown to need it, and every one of them is 386-era software that
-    // paces itself off the timer.
-    if (t->le_active) { thr_cycles = DOS_CYCLES_OFF; thr_src = "n/a (DOS/4GW)"; }
+    // (#speedcap) See the note at this function: without it the per-window Speed
+    // dialog's Save is refused by perms and fails silently.
+    dos_speed_cfg_make_writable(path);
+    // SCOPE, STATED RATHER THAN IMPLIED (#speedcap): the cap is now enforced in
+    // BOTH run loops. A 16-bit guest is throttled by the entitlement block in
+    // the loop below; a 32-bit DOS/4GW or go32 guest is throttled by the
+    // identical block inside dos4gw_run(), which is handed this same resolved
+    // value below so the launch line and the enforced cap cannot disagree. The
+    // previous version forced the cap OFF here for le_active guests, which
+    // excluded Red Alert and NetHack, the two heaviest titles in the catalog and
+    // the two most able to starve the compositor.
     int64_t  thr_credit = 0;                         // signed instruction account
     uint64_t thr_last_ms = rate_t0;                  // when it was last paid in
     unsigned long thr_last_insns = 0;                // insn_count at that instant
@@ -9631,6 +11601,11 @@ int dos_run_file(const char *path) {
     unsigned long thr_report_i0 = 0;
     unsigned long thr_report_irq0 = 0;
     unsigned long thr_report_rd0 = 0;
+    // #778: cadence for the LIVE re-read below, independent of the (usually
+    // off) DOSSPEED.CFG diagnostic report above - this one runs unconditionally
+    // so the compositor's Speed control works whether or not that diagnostic
+    // is armed.
+    uint64_t thr_live_poll_ms = rate_t0;
     if (thr_cycles) {
         kprintf("[dos] #232 CPU cap: %u cycles (%u insn/s, ~%s) from %s\n",
                 thr_cycles, thr_cycles * 1000u,
@@ -9667,7 +11642,7 @@ int dos_run_file(const char *path) {
                                     (uint32_t)budget);
             }
         }
-        dos4gw_run(t, budget);
+        dos4gw_run(t, budget, path, thr_cycles);
         if (t->le_state) { kfree(t->le_state); t->le_state = 0; }
         t->cpu.halted = 1;
     }
@@ -9704,8 +11679,9 @@ int dos_run_file(const char *path) {
             // Feed INT 16h while the guest has no INT 9 handler of its own.
             // When it does have one, dos_deliver_int9() consumes the same raw
             // stream, so only one of the two ever drains it.
-            if (!t->kbd_has_int9) dos_keyq_pump(t);
-            dos_pump_input(t);
+            // (rakbd2) EITHER route means the guest owns the raw stream.
+            if (!t->kbd_has_int9 && !t->kbd_int9_pm) dos_keyq_pump(t);
+            { uint64_t _pt = dosprof_t0(); dos_pump_input(t); dosprof_t1(DOSPROF_INPUT, _pt); }
             dos_mouse_deliver(t, 0);   // #163/#mickey: the 0Ch upcall, homed
             dos_deliver_int9(t);   // synthesize keyboard IRQs for the guest ISR (#202)
         }
@@ -9913,7 +11889,9 @@ int dos_run_file(const char *path) {
                 if (b < (int64_t)DOS_THROTTLE_BURST_MIN) b = (int64_t)DOS_THROTTLE_BURST_MIN;
                 slice = (unsigned long)b;
             }
+            uint64_t _pt = dosprof_t0();
             r = x86_16_run(&t->cpu, slice);
+            dosprof_t1(DOSPROF_INTERP, _pt);
         }
         prev_cs2 = prev_cs; prev_ip2 = prev_ip;
         prev_cs = t->cpu.cs; prev_ip = t->cpu.ip;
@@ -9921,13 +11899,34 @@ int dos_run_file(const char *path) {
         // 640x400 scale-and-convert blit (a divide per destination pixel); doing
         // it once per burst tied its cost to the burst size, so shortening the
         // burst would have spent the reclaimed CPU on redundant blits instead of
-        // on the guest. 70 Hz is at or above the compositor's refresh, so nothing
-        // is lost visually.
+        // on the guest.
+        //
+        // "70 Hz is at or above the compositor's refresh, so nothing is lost
+        // visually" IS WHAT THIS COMMENT USED TO SAY, AND IT WAS FALSE ON THE
+        // MACHINE THAT MATTERS. MEASURED on golden 2259 at 2560x1600, Aladdin
+        // maximised: the guest presented ~65 frames a second and the FRAMEBUFFER
+        // was presented 13-16 times a second ([FLIPPROF] flips, [COMPIDLE]
+        // ticks=407(13/s) busy=27%), because on ONE core (g_smp_user_sched = 0)
+        // the compositor's full-screen composite costs ~20 ms and it is
+        // competing with an interpreter taking 80% of the machine. Four frames
+        // in five were scaled, published (a full-window memcpy, 920 MB/s) and
+        // overwritten before anything composited them: 11-12% of a core in the
+        // publish plus 4.4-4.8% in the scaler, thrown away. dos_frame_due()
+        // below is the correction, and the sentence above is left here in the
+        // negative because a confident wrong sentence is what stopped anyone
+        // looking.
         {
             uint64_t pnow = sched_now_ms();
-            if (pnow - last_present_ms >= DOS_PRESENT_MS || t->cpu.halted) {
+            // The guest's own frame rate, on its own clock, whether or not this
+            // frame is going to be shown. Diagnostic-gated inside.
+            if (pnow - last_sample_ms >= DOS_PRESENT_MS) {
+                last_sample_ms = pnow;
+                dos_redraw_sample(t);
+            }
+            if ((pnow - last_present_ms >= DOS_PRESENT_MS || t->cpu.halted) &&
+                dos_frame_due(t, pnow, t->cpu.halted)) {
                 last_present_ms = pnow;
-                dos_present(t);
+                { uint64_t _pt = dosprof_t0(); dos_present(t); dosprof_t1(DOSPROF_PRESENT, _pt); }
                 // AND THEN TELL THE WM. dos_present() only fills the window's
                 // content buffer; the compositor blits that buffer when the
                 // window's region is dirty, and nothing here was dirtying it.
@@ -9941,7 +11940,12 @@ int dos_run_file(const char *path) {
                 // were not being presented. This is the same call a userland app
                 // makes after painting (sys_win_invalidate), through the same
                 // function, so the two cannot drift.
-                if (t->host_slot >= 0) win16_host_invalidate(t->host_slot);
+                if (t->host_slot >= 0) {
+                    uint64_t _pt = dosprof_t0();
+                    win16_host_invalidate(t->host_slot); dos_publish_mark();
+                    dosprof_t1(DOSPROF_PUBLISH, _pt);
+                    if (_pt) dosprof_add_publish_bytes_rs((uint64_t)t->win_w * (uint64_t)t->win_h * 4ull);
+                }
                 frames++;
             }
         }
@@ -10020,11 +12024,45 @@ int dos_run_file(const char *path) {
         // ready queue, so a capped guest gives its core back rather than
         // holding it. Yielding as well would only add a scheduler round trip
         // between the burst and the sleep.
-        if (!thr_cycles) proc_yield();
+        if (!thr_cycles) { uint64_t _pt = dosprof_t0(); proc_yield(); dosprof_t1(DOSPROF_YIELD, _pt); }
+        dos_prof_report(t);
 
         {   // CLOSE THE LOOP: measure what the guest actually got, then re-size
             // the next burst to hit DOS_SLICE_MS of wall clock at that rate.
             uint64_t now = sched_now_ms();
+            // #778 LIVE SPEED CONTROL: re-run the SAME resolution
+            // dos_speed_cycles_for() did at launch (SPEED.CFG in the program
+            // dir, else a START.bat `cycles=` line, else /CONFIG/DOSCYCLES.CFG,
+            // else uncapped) so a per-window Speed control can change a
+            // running guest. Unconditional (not gated on g_dos_speedlog, unlike
+            // the diagnostic report just below) because the feature must work
+            // whether or not that diagnostic is armed. One small file read
+            // every DOS_SPEED_LIVE_POLL_MS is not a busy-wait: this whole block
+            // already runs once per already-scheduled burst, so the poll adds
+            // no new wait/sleep of its own (#426).
+            // (#speedcap) The !le_active test is belt and braces, not a scope
+            // limit: a 32-bit guest never reaches this loop (dos4gw_run() runs
+            // first and then sets t->cpu.halted), and it now carries its own
+            // copy of this re-poll.
+            if (!t->le_active && now - thr_live_poll_ms >= DOS_SPEED_LIVE_POLL_MS) {
+                thr_live_poll_ms = now;
+                const char *new_src = "default";
+                uint32_t newc = dos_speed_cycles_for(path, &new_src);
+                if (newc != thr_cycles) {
+                    kprintf("[dos] #778 CPU cap changed live: %u -> %u cycles "
+                            "(now from %s)\n", thr_cycles, newc, new_src);
+                    thr_cycles = newc;
+                    thr_src = new_src;
+                    // Reset the entitlement account rather than let a huge swing
+                    // (e.g. 486-class down to 8088) show up as either a windfall
+                    // credit or a debt run up under the OLD target - the new cap
+                    // starts paying in from this instant, exactly as it would at
+                    // a fresh launch.
+                    thr_credit = 0;
+                    thr_last_ms = now;
+                    thr_last_insns = t->cpu.insn_count;
+                }
+            }
             // #232 /CONFIG/DOSSPEED.CFG: one line every DOS_SPEED_REPORT_MS
             // saying what the guest is ACTUALLY getting against what it was
             // told to get. Same diagnostic-gate family as DOSDIAG/DOSRING/
@@ -10114,16 +12152,41 @@ int dos_run_file(const char *path) {
         }
     }
 
+    // (#67/#168) THROUGH dos_emu_insns(), NOT t->cpu.insn_count.
+    //
+    // This line is the shared teardown, reached by BOTH engines, and it used
+    // to read the 16-BIT register file unconditionally. A DOS/4GW or go32
+    // guest runs dos4gw_run() and then sets t->cpu.halted to make the 16-bit
+    // loop below a no-op, so t->cpu.insn_count is still zero from
+    // x86_16_init(): every 32-bit guest that ever exited reported
+    // 'insns=0 frames=0' however far it had actually got. MEASURED: NetHack
+    // retired 661362 instructions and presented 10 frames in the same run
+    // this line called 0 and 0, and tools/dos-harness/doscorpus.py PREFERS
+    // this line over the '[4GW] alive' counter when a guest exits
+    // (best_insns(): "exact (guest exited)"), so the wrong number was the
+    // one the oracle recorded. dos_emu_insns() is the accessor that already
+    // answers 'which counter' once for the whole file; this was the one
+    // reader that had not been routed through it.
     kprintf("[dos] '%s' finished exit=%d insns=%lu frames=%d mode=0x%02x\n",
-            path, t->cpu.exit_code, t->cpu.insn_count, frames, t->video_mode);
+            path, t->cpu.exit_code, dos_emu_insns(t),
+            t->le_active ? (int)t->le_frames : frames, t->video_mode);
 
-    // Keep the final frame visible for a moment, then tear down. NOT when the
-    // user asked to close: a window that sits there for two more seconds after
-    // you click its X reads as a hang. t->running is still 1 on every self-exit
-    // path (guest halted, interpreter error, run cap) and 0 only on a close
-    // request, so the flag distinguishes the two without a second one.
-    if (t->running) proc_sleep(2000);
+    // (no-ticket) Keep the final frame visible for a moment, then tear down.
+    // t->running is still 1 on every self-exit path (guest halted, interpreter
+    // error, run cap) and 0 only on a close request, so the flag distinguishes
+    // the two without a second one.
+    //
+    // This WAS `if (t->running) proc_sleep(2000);`, a fixed two-second delay
+    // standing in for the condition "the final frame has reached the screen".
+    // dos_exit_linger() waits for that condition instead, on the shared
+    // wait-queue primitives, and can be cut short by the titlebar X - which
+    // did nothing at all during the old sleep. See rustkern/doslinger.rs.
+    //
+    // The tap is disarmed BEFORE the linger now, not after. The guest is
+    // already gone; there is no reason to keep mirroring every scancode into
+    // a ring whose only consumer was the interpreter that has just exited.
     g_dos_scancode_tap = 0;
+    dos_exit_linger(t->running ? 1 : 0);
     // #736 Stage 1b: these now clear THIS task's cpu, not a process-wide slot,
     // so tearing a DOS guest down can no longer disarm a Win16 guest's hooks
     // (or, as it did, leave the DOS guest running on the Win16 guest's).
@@ -10180,10 +12243,11 @@ int dos_run_file(const char *path) {
         for (int i = 0; i < 256; i++) if (t->sb.cmd_hist[i]) used++;
         kprintf("[dos] (#181) SB census: %u resets, %u distinct DSP commands, "
                 "%u unknown, %u blocks, %llu guest bytes, %u IRQs delivered "
-                "(%u unacknowledged), %u sink-open failures\n",
+                "(%u unacknowledged), %u sink-open failures, %u latched with no "
+                "handler\n",
                 t->sb.resets, used, t->sb.cmd_unknown, t->sb_blocks,
                 (unsigned long long)t->sb_bytes, t->sb_irq_deliv,
-                t->sb_irq_unacked, t->sb_open_fail);
+                t->sb_irq_unacked, t->sb_open_fail, t->sb_irq_latched);
         // Which commands, by value. This is the measurement that answers "what
         // does the corpus actually need" instead of the guess this ticket
         // would otherwise have had to make.
@@ -10287,7 +12351,21 @@ static void dos_deferred_entry(void *arg) {
 // and clears g_dos_busy so the next DOS program can launch. No wait queue is
 // involved and none is wanted: the run loop is not waiting for anything, it is
 // executing guest instructions, and this is a request to stop doing that.
-void dos_request_close(void) { g_dos.running = 0; }
+void dos_request_close(void) {
+    g_dos.running = 0;
+    // (no-ticket) AND end the post-exit linger. Clearing g_dos.running is only
+    // half a close: nothing but the run loop reads that flag, so once the loop
+    // had exited the X was inert and the window ignored it for the whole
+    // two-second linger. Latch it where the linger can see it, then wake.
+    //
+    // Only g_dos_exit_wq is woken here. The frame-wait parks on g_fb_flip_wq,
+    // which every present wakes, so a click that lands during that phase is
+    // seen on the next present and at worst after its 250 ms backstop; the
+    // WM/compositor thread has no business reaching into the framebuffer
+    // layer's wait queue to shave that.
+    dos_linger_close_rs();
+    wake_up_all(&g_dos_exit_wq);
+}
 
 // (#745 local 105) The window manager reallocated this window's content buffer.
 //
@@ -10342,6 +12420,77 @@ void dos_start_deferred_launch(void) {
     proc_create("dosrun", dos_deferred_entry, NULL, PRIO_HIGH);
 }
 
+// (#67/#168) The PROGRAM half of a launch line, as a pure function.
+//
+// Lifted out of dos_split_launch_line() below because the ROUTING layer
+// (proc/dosroute.c) has to decide where a guest runs from its program path
+// alone, before any launch happens, and must not write the g_dos_* statics to
+// find it out. Matching a routing rule against the whole line instead would
+// make an override depend on the arguments a title happened to be launched
+// with. Same rule, one definition, per #172 - which is the ticket that exists
+// because two copies of this split disagreed.
+//
+// Returns the index into `line` just past the program half, so the caller can
+// carry on parsing the tail from there without re-deriving it.
+int dos_launch_program_half(const char *line, char *out, int outsz) {
+    if (!out || outsz <= 0) return 0;
+    out[0] = '\0';
+    if (!line) return 0;
+    int i = 0;
+    for (; i < outsz - 1 && line[i]
+           && line[i] != ' ' && line[i] != '\t'; i++)
+        out[i] = line[i];
+    out[i] = '\0';
+    return i;
+}
+
+// (#67/#168) Is an in-kernel DOS guest running? The routing layer needs this to
+// keep "one guest at a time" true ACROSS both paths: g_dos_busy is static to
+// this file and guards only the in-kernel launcher, so a Ring-3 launch could
+// otherwise start beside a running in-kernel guest and the two would fight over
+// the raw-scancode tap and the host window.
+int dos_is_busy(void) { return g_dos_busy ? 1 : 0; }
+
+// (#172, extended #67/#168) THE <path>[ <tail>] SPLIT, in ONE function.
+//
+// It used to live inline in dos_launch_common(), with the comment "Splitting
+// HERE rather than in each caller is deliberate: two copies of this rule is how
+// the DOSRUN.CFG path and the syscall path came to disagree in the first
+// place." A THIRD launch path then appeared that is not a caller of
+// dos_launch_common() at all: the Ring-3 host (/APPS/DOSUSER) is already a
+// process, so it has no proc_create() to sit in front of and calls
+// dos_run_file() directly. It therefore did no split, and a guest launched
+// down that path lost its command tail silently - the exact failure #172
+// existed to end, e.g. Stunts' LOAD.EXE without `/u MCGA` exits 1 at 36,738
+// instructions instead of 0 at 68,818.
+//
+// Lifting the rule into a function that BOTH paths call keeps one definition.
+// Writes g_dos_cmdtail unconditionally, INCLUDING the empty case: it is a
+// static that outlives a run, so a launch with no arguments must clear the
+// previous guest's tail rather than inherit it.
+static void dos_split_launch_line(const char *line) {
+    int i = dos_launch_program_half(line, g_dos_path, (int)sizeof(g_dos_path));
+    int j = i;
+    while (line[j] == ' ' || line[j] == '\t') j++;
+    int a = 0;
+    for (; line[j] && a < (int)sizeof(g_dos_cmdtail) - 1; j++)
+        g_dos_cmdtail[a++] = line[j];
+    g_dos_cmdtail[a] = '\0';
+    if (a) kprintf("[dos] command tail = '%s'\n", g_dos_cmdtail);
+}
+
+// Blocking run of a whole LAUNCH LINE, for a caller that has no
+// dos_launch_common() in front of it. The Ring-3 host is the only one: it is
+// handed the raw line from /CONFIG/DOSRING3.CFG and would otherwise treat a
+// tail as part of the filename. Same split, same statics, same runner - so the
+// in-kernel and Ring-3 paths cannot disagree about what a launch line means.
+int dos_run_line(const char *line) {
+    if (!line || !line[0]) return -1;
+    dos_split_launch_line(line);
+    if (!g_dos_path[0]) return -1;
+    return dos_run_file(g_dos_path);
+}
+
 // #708: the two launchers differ ONLY in where the guest's identity comes
 // from, and they are separate functions for the reason win16_launch /
 // win16_launch_kernel already are: the distinction is a property of the
@@ -10387,24 +12536,15 @@ static int dos_launch_common(const char *path, int from_session) {
     // disagree in the first place. The reader now hands over the whole line.
     // Safe for every existing caller: no DOS path in the tree contains a
     // space (8.3 names on FAT and on the ext2 /DOS tree alike).
-    int i = 0;
-    for (; i < (int)sizeof(g_dos_path) - 1 && path[i]
-           && path[i] != ' ' && path[i] != '\t'; i++)
-        g_dos_path[i] = path[i];
-    g_dos_path[i] = '\0';
-    {
-        int j = i;
-        while (path[j] == ' ' || path[j] == '\t') j++;
-        int a = 0;
-        for (; path[j] && a < (int)sizeof(g_dos_cmdtail) - 1; j++)
-            g_dos_cmdtail[a++] = path[j];
-        g_dos_cmdtail[a] = '\0';
-        // Written unconditionally, INCLUDING the empty case: g_dos_cmdtail is a
-        // static that outlives a run, so a launch with no arguments must clear
-        // the previous guest's tail rather than inherit it.
-        if (a) kprintf("[dos] command tail = '%s'\n", g_dos_cmdtail);
-    }
+    dos_split_launch_line(path);
     g_dos_busy = 1;
+    // (no-ticket) A close request and a publish mark belong to ONE guest.
+    // Carrying either into the next launch would cancel its linger before it
+    // began, which is the process-wide-latch bug shape #736 removed elsewhere
+    // in this file.
+    dos_linger_reset_rs();
+    g_dos_publish_flip = 0;
+    g_dos_published    = 0;
     // PRIO_NORMAL, NOT PRIO_HIGH. The interpreter loop no longer sleeps between
     // bursts; it yields. The ready queue is strictly priority-ordered, so a
     // PRIO_HIGH thread that yields is re-inserted ahead of every peer and picked

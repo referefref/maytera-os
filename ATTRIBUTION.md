@@ -182,6 +182,8 @@ no entry a reader has to cross-reference elsewhere to find out doesn't apply.
 | System Monitor | `MONITOR.ICN` | `cil-speedometer.svg` |
 | Feeds | `RSS.ICN` | `cil-rss.svg` |
 | Snapshot | `SNAPSHOT.ICN` | `cil-camera.svg` |
+| Wizard power corner: Shut Down | `POWER.ICN` | `cil-power-standby.svg` |
+| Wizard power corner: Restart | `RESTART.ICN` | `cil-reload.svg` |
 
 If any icon above is republished, retain attribution to CoreUI
 (https://coreui.io/icons/) and the CC BY 4.0 license linked above.

@@ -4,17 +4,31 @@
 // taskbar with the mouse: this is the keyboard-first switcher.
 //
 //   Tab / Down       next window          Enter / Space   focus + dismiss
-//   Up               previous window      M               minimize selected
-//   R                refresh list         Esc             dismiss
-//   mouse hover/click also work; list auto-refreshes while open.
+//   Shift+Tab / Up   previous window      M               minimize selected
+//   R                refresh list         Esc             dismiss (restores
+//   mouse hover/click also work; list auto-refreshes while open.  original)
+//
+// #alttab: launched by the compositor (userland/apps/compositor/main.c) the
+// moment Tab is pressed while Alt is held, and normally driven ENTIRELY by
+// held-Alt semantics from there: further Tab/Shift+Tab presses in the same
+// hold reach this window through the ordinary focus-routed key path (this
+// window takes focus on win_create(), so nothing needs to address it
+// specially), and releasing Alt commits the highlighted window (see the
+// EVENT_KEY_UP case below) exactly like pressing Enter does. The Enter/
+// Space/click/1-9/R/M/Esc bindings above all still work too, so this is a
+// perfectly usable app on its own (e.g. launched from the Accessories start
+// menu) for anyone who would rather click than hold a chord.
 //
 // Self-contained companion app: uses only existing syscalls
 // (wm_get_windows / wm_focus / wm_minimize, win_set_nochrome, fb_info)
-// plus the shared theme palette + TTF text, per docs/UI_STYLE_GUIDE.md.
+// plus the shared theme palette + TTF text, per docs/UI_STYLE_GUIDE.md, and
+// the shared modifier tracker (gui_mods.h) for Shift+Tab and Alt-release -
+// nobody needs, or should write, a second one of those.
 
 #include "syscall.h"
 #include "gui.h"
 #include "gui_style.h"
+#include "gui_mods.h"
 #include "string.h"
 #include "stdio.h"
 
@@ -244,7 +258,7 @@ static void draw_all(void) {
     int fy = ly + body + 4;
     gui_draw_hline(g_win, PAD, fy, WIN_W - PAD * 2, COL_BORDER);
     win_draw_text_ttf(g_win, PAD + 4, fy + 5,
-        "Tab/Up/Down select   Enter focus   M minimize   1-9 jump   Esc close",
+        "Tab/Shift+Tab select   Enter or release Alt focus   M min   Esc close",
         12, COL_DIM);
 
     win_invalidate(g_win);
@@ -254,8 +268,17 @@ static void draw_all(void) {
 // Actions
 // ---------------------------------------------------------------------------
 static void focus_selected(void) {
-    if (g_sel < 0 || g_sel >= g_count) return;
-    wm_focus(g_wins[g_sel].id);
+    // #alttab: this is now also the Alt-release commit path (see the
+    // EVENT_KEY_UP case in main()), not just Enter/Space/click/1-9. With
+    // ZERO other windows open g_count is 0 and g_sel is clamped to 0 by
+    // refresh_windows(), so `g_sel >= g_count` is true and this function
+    // used to return here WITHOUT closing the overlay - Enter, and now
+    // releasing Alt, would leave the switcher stuck open forever with
+    // nothing to select. There is nothing to focus in that case, but the
+    // overlay must still dismiss: skip wm_focus(), never skip the close.
+    if (g_sel >= 0 && g_sel < g_count) {
+        wm_focus(g_wins[g_sel].id);
+    }
     win_destroy(g_win);
     sys_exit(0);
 }
@@ -301,13 +324,37 @@ int main(int argc, char **argv) {
     // Creating our own window changed the list (and stole focus); re-query so
     // the "current" tag still points at the window the user came from.
     refresh_windows(g_count ? g_wins[g_sel].id : -1);
+
+    // #alttab: seed the shared modifier tracker from LIVE physical state
+    // (gui_mods.h) rather than waiting for an event, and handle the race a
+    // held-Alt launch has by construction: the compositor spawns this app on
+    // the FIRST Tab of an Alt+Tab hold, but spawning is async (fork+exec),
+    // so a very fast tap-and-release can have Alt already back up by the
+    // time this window exists and takes focus - no EVENT_KEY_UP for Alt will
+    // ever arrive here in that case, because the kernel already delivered it
+    // (to whatever had focus a moment ago, before this window existed).
+    // Rather than leave the overlay open with no way to commit, treat "Alt
+    // already up at startup" the same as "Alt released": commit immediately
+    // to the MRU target (index 1, preselected by refresh_windows() above).
+    // A normal held Alt+Tab never takes this branch (gui_mods_is is false).
+    gui_mods_resync();
+    // #alttab BUGFIX: gui_mods_is() is an EXACT chord match (by design, see
+    // gui_mods.h - it is what tells Ctrl+C apart from Ctrl+Shift+C), so it
+    // requires the held set to be Alt and ONLY Alt. That is wrong here: Alt
+    // is by definition always the base of this whole gesture, and a user is
+    // free to also be holding Shift (Alt+Shift+Tab, straight into reverse)
+    // the instant this window opens. A plain bitwise test of gui_mods_get()
+    // is what "is Alt currently held, regardless of what else is" means.
+    if (!(gui_mods_get() & GUI_MOD_ALT)) {
+        focus_selected();   // never returns: wm_focus + win_destroy + exit
+    }
     draw_all();
 
     gui_event_t ev;
     int running = 1;
     int ticks = 0;
     while (running) {
-        int et = win_get_event(g_win, &ev, 250);
+        int et = gui_mods_next_event(g_win, &ev, 250);
         if (et == 0) {
             // Periodic refresh keeps the overlay honest while it is open.
             if (++ticks >= 2) {
@@ -356,6 +403,20 @@ int main(int argc, char **argv) {
                 if (ev.scroll_delta > 0) move_sel(-1); else move_sel(1);
                 draw_all();
                 break;
+            case EVENT_KEY_UP: {
+                // #alttab: releasing Alt COMMITS, same as Enter, so "hold
+                // Alt, tap Tab (any number of times), release" behaves the
+                // way every other Alt-Tab implementation does. gui_mods_feed()
+                // (called by gui_mods_next_event() above) already folded this
+                // into the tracker's state; GUI_KEY_ALT_DELIVERED_REL is the
+                // value SYS_INJECT_KEY actually delivers for an Alt release
+                // (equal to the press code, #232 - see keys.h), not the raw
+                // GUI_KEY_ALT_UP the kernel pushes into the cooked ring.
+                if (ev.keycode == GUI_KEY_ALT_DELIVERED_REL) {
+                    focus_selected();   // never returns
+                }
+                break;
+            }
             case EVENT_KEY_DOWN: {
                 uint32_t kc = ev.keycode;
                 char c = ev.key_char;
@@ -365,8 +426,24 @@ int main(int argc, char **argv) {
                     focus_selected(); break;                              // Enter/Space
                 }
                 if (kc == 0x80) { move_sel(-1); draw_all(); break; }      // Up
-                if (kc == 0x81 || kc == 0x0F || c == '\t') {              // Down/Tab
-                    move_sel(1); draw_all(); break;
+                if (kc == 0x81) { move_sel(1); draw_all(); break; }       // Down
+                if (kc == GUI_KEY_TAB || c == '\t') {                     // Tab
+                    // #alttab: Shift+Tab walks backwards, via the shared
+                    // modifier tracker fed by gui_mods_next_event() above -
+                    // Tab itself carries no shift information in key_char
+                    // (Tab has no shifted ASCII form), so this is the only
+                    // reliable way to tell the two apart.
+                    // #alttab BUGFIX (MEASURED on a live VM): gui_mods_is()
+                    // is an EXACT chord match, and Alt is ALWAYS also held
+                    // for every Tab this app ever sees (that is the whole
+                    // gesture), so gui_mods_is(GUI_MOD_SHIFT) can never be
+                    // true here - it requires Shift and ONLY Shift. Reverse
+                    // cycling silently never fired until this was changed to
+                    // a plain bitwise "is the Shift bit set, regardless of
+                    // Alt" test.
+                    if (gui_mods_get() & GUI_MOD_SHIFT) move_sel(-1);
+                    else move_sel(1);
+                    draw_all(); break;
                 }
                 if (c == 'm' || c == 'M') { minimize_selected(); draw_all(); break; }
                 if (c == 'r' || c == 'R') {

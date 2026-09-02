@@ -104,6 +104,8 @@
 #define SYS_WIN_BLIT        35  // Blit bitmap
 #define SYS_WIN_GET_EVENT   36  // Get window event
 #define SYS_WIN_INVALIDATE  37  // Invalidate window (request redraw)
+// #DOSRING3 Stage 1: focus-scoped raw set-1 scancodes (see gui/fb_syscall.c).
+#define SYS_WIN_GET_SCANCODES 416
 #define SYS_WIN_GET_SIZE    38  // Get window content dimensions
 
 // Console I/O
@@ -336,6 +338,10 @@
 #define SYS_AUDIO_PCM_OPEN      315  // (rate, channels, format) -> handle >=1, or <0
 #define SYS_AUDIO_PCM_WRITE     316  // (handle, const void *pcm, frames) -> frames accepted, or <0
 #define SYS_AUDIO_PCM_CLOSE     317
+// (#181 Ring-3 audio) The counters and the two #426 waits a real-time PCM
+// producer needs, for a stream the CALLING process owns. Ops in
+// drivers/audio_pcm.h (AUDIO_PCM_CTL_*). Scalar-only: no argtab descriptor.
+#define SYS_AUDIO_PCM_CTL       417
 
 // ---- #487/#349 Ring-3 process introspection (Task Manager / Process Explorer)
 // The userland Task Manager (/apps/taskmgr) is the app the Start menu actually
@@ -1184,7 +1190,117 @@ typedef struct {
 #define AEQ_POS_FLAT  50
 #define AEQ_RANGE_DB10 120
 
-#define SYS_MAX                        414  // SYS_AUDIO_EQ=413 is the new top, so the sentinel is 414
+// #198v2: real per-pixel window content alpha for a Ring-3 app that wants to
+// draw a genuinely antialiased overlay (a glyph, a soft shadow/halo) directly
+// on the desktop wallpaper, blended against whatever is ACTUALLY drawn
+// underneath at composite time, not a caller-guessed background color. See
+// WINDOW_FLAG_ALPHA_CONTENT (kernel/gui/window.h) for the full rationale and
+// user_window_draw_handler (syscall.c) for the blend itself. First caller:
+// the wizard's power-corner Restart/Shut Down icons (docs/WIZARD_POWER_CORNER.html
+// revision 2) - previously an opaque box because no primitive existed to
+// blend real alpha against a live photograph background.
+// NUMBER CHOICE: 414, the SYS_MAX sentinel's own value and therefore the
+// first genuinely unallocated number, with SYS_MAX bumped to 415 in the same
+// edit. Checked against both kernel/proc/syscall.h and userland/libc/syscall.h
+// at the time of this change: neither used 414.
+#define SYS_WIN_SET_ALPHA_CONTENT      414
+
+// (#flipfix) THE FRAMEBUFFER PRESENT COUNTER, READ-ONLY, FOR RING 3.
+//
+// gui/fb_syscall.c increments g_fb_flip_count once per present. It is the
+// signal rustkern/dosdisp.rs gates on: publish a DOS frame only if the screen
+// has moved on since the last one, because otherwise the new frame merely
+// overwrites a frame nobody ever saw. In Ring 0 the DOS layer reads that global
+// directly. The Ring-3 DOS host cannot - a variable read cannot become a
+// syscall - so its shim carried a stub that was zero forever, the gate answered
+// "no" on every frame, and the only thing still delivering pictures was
+// DOSDISP_STALE_MS, the 200 ms occluded-window backstop. 200 ms is 5 Hz, and
+// 5.005 flips/s is what was measured.
+//
+// PULL, NOT PUSH, and the reason is correctness rather than cost. This counter
+// is a KERNEL global with a single writer, so it survives a compositor exit and
+// relaunch untouched and goes on climbing; a value pushed from the compositor
+// would freeze at whatever it last sent the moment the pusher died, which is
+// the exact failure being fixed here. Cost did not decide it either way: one
+// zero-arg syscall per DOS frame at ~70 Hz is nothing.
+//
+// Zero args, read-only, no argtab.rs entry needed: a descriptor-less syscall is
+// simply not pointer-validated, which is correct here (nothing to validate).
+// Returns the count as a NON-NEGATIVE int64_t. The counter would need ~2.9e11
+// years at 1000 flips/s to reach the sign bit, so the narrowing is not a real
+// range limit; a negative return is reserved for "this kernel does not have the
+// call", which is how the Ring-3 shim tells a missing syscall from a screen
+// that is genuinely not flipping.
+// NUMBER CHOICE: 418, the SYS_MAX sentinel's own value and therefore the first
+// genuinely unallocated number, with SYS_MAX bumped to 419 in the same edit.
+// Checked against both kernel/proc/syscall.h and userland/libc/syscall.h at the
+// time of this change: neither used 418.
+#define SYS_FB_FLIP_COUNT              418
+
+// (#fmbridge) SYS_DOS_FM_HOST - THE PRODUCER DOOR FOR THE RING-3 DOS HOST.
+//
+// SYS_DOS_FM_EVENTS (377) has been the CONSUMER door since #182:
+// /APPS/FMSYNTH drains the kernel's OPL2 event queue through it and renders the
+// music. This is its counterpart, and it exists because dos/dosexec.c is
+// compiled TWICE from the same bytes - into kernel.elf and into /APPS/DOSUSER,
+// the Ring-3 DOS host - and the queue it used to reach as a file-scope static
+// was therefore a SECOND queue in a SECOND address space when a guest ran in
+// Ring 3. The guest's register writes were queued perfectly and drained by
+// nobody. Ring-3 DOS guests had no music at all; fm_launch_synth() returned -1
+// in that build so the OPL2 would at least report ABSENT honestly.
+//
+// PUSH, AND THE #flipfix ARGUMENT DOES NOT INVERT IT. #flipfix chose PULL for
+// the framebuffer flip counter because a counter has a CURRENT VALUE that can
+// be sampled, so a pushed copy goes silently stale when the pusher dies. An
+// OPL2 register write has no current value: it is a discrete occurrence, and
+// nothing can pull an event that has not happened yet. The staleness hazard is
+// absent, and its analogue is handled explicitly - a producer that stops is not
+// a stale reading, it is the queue's `active` flag being cleared, which reaches
+// the consumer as ENODEV and is how FMSYNTH learns to render its tail and exit.
+// A pull design would also have had to invent a Ring-3-to-Ring-3 transport,
+// i.e. a SECOND kernel-mediated buffer beside the one that already exists,
+// which is the fork the reuse rule forbids.
+//
+// COST DID NOT DECIDE IT AND COULD NOT HAVE: Mutant Space Bats of Doom, whose
+// audio is entirely FM music, makes 179 OPL2 register writes in a 145 s
+// session. At ~134 ns per syscall that is 24 microseconds of syscall.
+//
+// ALL ARGUMENTS AND RETURNS ARE SCALARS, so like SYS_FB_FLIP_COUNT it needs no
+// rustkern/argtab.rs descriptor: a descriptor-less syscall is simply not
+// pointer-validated, which is correct when there is no pointer. Every success
+// returns >= 0; every failure returns < 0.
+//
+// OWNERSHIP. Any Ring-3 process can issue this call, so OPEN latches the
+// caller's pid and every other op requires it. Without that latch any app could
+// inject OPL2 writes that FMSYNTH renders (arbitrary noise on the machine's
+// speakers) or close the queue under a running guest. An in-kernel guest
+// holding the queue refuses a Ring-3 opener outright, preserving the
+// one-guest-at-a-time invariant proc/dosroute.c is built on. The latch is
+// released on CLOSE, and by dos_fmq_host_release_pid() from proc_exit() when a
+// host dies without one.
+//
+// NUMBER CHOICE: 423, the SYS_MAX sentinel's own value and therefore the first
+// genuinely unallocated number, with SYS_MAX bumped to 424 in the same edit.
+// Checked against both kernel/proc/syscall.h and userland/libc/syscall.h at the
+// time of this change: neither used 423.
+#define SYS_DOS_FM_HOST                423
+
+// The op selector, arg1. Mirrored in userland/libc/syscall.h beside the same
+// syscall number. Split into one op per counter rather than packing several
+// into one return, so that "error" stays an unambiguous negative value.
+#define DOS_FM_HOST_OPEN           0   // arm the queue for a starting guest
+#define DOS_FM_HOST_PUSH           1   // arg2=reg, arg3=val, arg4=t_us (mono)
+#define DOS_FM_HOST_CLOSE          2   // the guest is gone; drain-then-ENODEV
+#define DOS_FM_HOST_ACTIVE         3   // is the queue accepting writes?
+#define DOS_FM_HOST_STAT_PUSHED    4   // cumulative register writes this session
+#define DOS_FM_HOST_STAT_DROPPED   5   // events lost to ring overflow
+#define DOS_FM_HOST_STAT_PEAK      6   // high-water depth (#187)
+#define DOS_FM_HOST_STAT_USED      7   // depth right now
+#define DOS_FM_HOST_CAPACITY       8   // what PEAK/USED are out of
+#define DOS_FM_HOST_SELFTEST       9   // rustkern/fmq.rs self-test, then re-open
+#define DOS_FM_HOST_LAUNCH        10   // gui/desktop.c fm_launch_synth() -> pid
+
+#define SYS_MAX                        424  // #fmbridge: SYS_DOS_FM_HOST=423 is the new top, so the sentinel is 424
 
 // ============================================================================
 // Syscall Register Convention (AMD64 System V ABI)
@@ -1330,6 +1446,7 @@ int64_t sys_win_create_bg(const char *title, int x, int y, int width, int height
 int64_t sys_wm_set_work_area(int32_t left, int32_t top, int32_t right, int32_t bottom);
 int64_t sys_win_set_nochrome(int handle);
 int64_t sys_win_set_nochrome_bg(int handle);   // #216: nochrome without the focus grab
+int64_t sys_win_set_alpha_content(int handle);   // #198v2: real per-pixel content alpha, see WINDOW_FLAG_ALPHA_CONTENT (window.h)
 int64_t sys_win_destroy(int handle);
 int64_t sys_win_draw_rect(int handle, int x, int y, int w, int h, uint32_t color);
 int64_t sys_win_draw_text(int handle, int x, int y, const char *text, uint32_t color);
@@ -1536,6 +1653,25 @@ int64_t sys_drag_end(void);
 #define SYS_DRAG_ACCEPT   404
 #define SYS_DRAG_RELEASE  405
 #define SYS_DRAG_END      406
+
+// ---- #affinity: PERSISTENT PER-PROCESS CPU AFFINITY -----------------------
+// SYS_SET_AFFINITY(pid, mask)      pid 0 means "me". mask bit N = core N is
+//                                  PREFERRED. Returns 0, or a negative errno.
+//                                  A mask of 0 is REFUSED: it would be a
+//                                  request to hang the process.
+// SYS_GET_AFFINITY(pid)            the mask, or all-ones if none is set.
+//                                  Returns the mask as a positive value; a
+//                                  negative return is an error.
+// SYS_GET_MIGRATIONS(pid, &mig, &switchins)
+//                                  per-process migration accounting, the
+//                                  number an affinity change has to move.
+//
+// The mask is a SOFT preference: placement drops it entirely rather than
+// strand a task on a core that is not consuming (rustkern/schedwatch.rs).
+// Setting another process's affinity requires root; setting your own does not.
+#define SYS_SET_AFFINITY   420
+#define SYS_GET_AFFINITY   421
+#define SYS_GET_MIGRATIONS 422
 
 // Payload kinds. Mirrored in userland/libc/syscall.h and rustkern/dragsess.rs.
 #define DRAG_KIND_TERMTAB 0x1

@@ -85,9 +85,23 @@ log()  { printf 'mports: %s\n' "$*"; }
 # ---------------------------------------------------------------------------
 # Flags come from ports.mk and are never re-spelled here (see that file).
 # ---------------------------------------------------------------------------
+# --no-print-directory IS LOAD-BEARING, do not drop it as noise.
+#
+# This captures make's stdout INTO A VARIABLE that becomes CFLAGS. `-C` turns on
+# --print-directory, and `-s` normally suppresses that again, but MAKEFLAGS
+# INHERITED FROM A PARENT MAKE OVERRIDES THE LOCAL `-s`. So this call is clean
+# when a human runs mports.sh by hand and polluted when it is reached the way
+# the public build actually reaches it, `./build.sh` -> `make -C
+# userland/apps/terminal` -> here. The captured value then reads
+#   make: Entering directory '.../ports'  <flags>  make: Leaving directory ...
+# and every one of those words is passed to gcc as an input file:
+#   gcc: error: Entering: linker input file not found
+# The emptiness guard below cannot catch it, because the polluted value is not
+# empty. Measured: 8 of the 11 apps that failed the public build, terminal
+# among them, failed only for this reason.
 mk_var() {
   local v
-  v="$(make -s -C "$PORTS_DIR" -f ports.mk "print-$1" 2>/dev/null)" \
+  v="$(make -s --no-print-directory -C "$PORTS_DIR" -f ports.mk "print-$1" 2>/dev/null)" \
     || die "cannot read $1 from ports.mk (is make installed, is ports.mk present?)"
   [ -n "$v" ] || die "ports.mk defines $1 as empty; refusing to build with no flags"
   printf '%s' "$v"

@@ -305,6 +305,23 @@ void stickies_release(void) {
 int stickies_is_dragging(void) { return s_drag >= 0; }
 int stickies_editing(void) { return s_edit >= 0; }
 
+#ifdef MAYTERA_TESTHOOK
+// #keydrop verification-only accessors, gated identically to the rest of the
+// TESTHOOK-only surface (never compiled into a shipping COMPOSIT). Lets the
+// testhook.c STICKY/STICKYTXT verbs read back what actually landed in the
+// note being edited, straight from in-memory state - no disk round trip, no
+// racing the compositor's own live filesystem cache.
+int stickies_edit_index(void) { return s_edit; }
+int stickies_edit_len(void) {
+    if (s_edit < 0 || !g_st[s_edit].used) return -1;
+    return g_st[s_edit].len;
+}
+const char *stickies_edit_text(void) {
+    if (s_edit < 0 || !g_st[s_edit].used) return "";
+    return g_st[s_edit].text;
+}
+#endif
+
 // Keyboard input while a note is focused. Returns 1 if the key was consumed.
 int stickies_handle_key(int key) {
     if (s_edit < 0 || !g_st[s_edit].used) return 0;

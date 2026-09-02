@@ -12,6 +12,7 @@
 #include "../proc/process.h"
 #include "../mm/heap.h"
 #include "../serial.h"
+#include "../sync/spinlock.h"
 
 // ============================================================================
 // struct file lifecycle
@@ -139,16 +140,69 @@ struct wait_queue_head *file_poll_wq(file_t *f, int events) {
 // Per-process fd table
 // ============================================================================
 //
-// NOTE: Access to current_proc->fds[] is not protected by a lock. This is
-// acceptable today because the kernel is single-CPU and fd-table mutations
-// happen either in-syscall (current process cannot be preempted out of a
-// syscall into another syscall on itself) or during fork/exit (where the
-// target is not running). When SMP lands, this table needs a per-process
-// spinlock.
+// LOCKING (#SMPGLOBALS, 2026-08-30). Every process_t carries its own fd_lock
+// (proc/process.h). It protects exactly two things: that process's fds[] slots
+// and its fd_cloexec bitmap.
+//
+// IT IS THE SHARED spinlock_t FROM sync/spinlock.h. No private lock type was
+// invented for the fd layer.
+//
+// IRQSAVE, because the table is mutated with interrupts already off:
+// proc_exit() calls fd_close_all() under cli().
+//
+// LEAF: nothing is called while it is held that takes another lock or can
+// sleep. file_put() is ALWAYS called after the lock is dropped, because a
+// final put runs the description's release op, and for a file-backed
+// description that writes to disk. Every function below is therefore the same
+// shape: claim or clear the slot under the lock, remember what was evicted,
+// drop the lock, then put.
+//
+// WHAT THIS BUYS, AND WHAT IT DOES NOT. Stated plainly, because a locking
+// comment that overstates its reach is how the next person builds on sand:
+//
+//   IT DOES fix slot mutation. Two contexts can no longer both claim the same
+//   fd, a close racing a close can no longer double-put one description, and
+//   a reader walking another process's table (the Task Manager, procinfo.c)
+//   can no longer see a slot mid-swap.
+//
+//   IT DOES NOT make fd_get()'s returned pointer safe to use after the lock is
+//   dropped. The caller gets a raw file_t* and holds no reference, so closing
+//   that description on another core while a first core is inside file_read()
+//   on it is STILL a use-after-free. Closing that needs fd_get() to take a
+//   reference and every one of its ~10 callers to put it back, which is a
+//   wider change than this one and is deliberately NOT done here.
+//
+//   IT DOES NOT protect file_t::refcount itself, which is a plain ++/-- shared
+//   between every process that inherited the description across fork. Two
+//   cores putting the same description can still lose a decrement.
+//
+// The previous comment here said the table was unlocked, that this was
+// "acceptable today because the kernel is single-CPU", and that "when SMP
+// lands, this table needs a per-process spinlock". This is that spinlock.
 
-int fd_alloc(int min) {
-    process_t *p = proc_current();
-    if (!p) return -1;
+// ---------------------------------------------------------------------------
+// The lock goes through these two macros for one reason: `make FDRACETEST=1`
+// arms a RED arm in which fdrace_test.c can turn the lock OFF at run time and
+// re-run the identical code, so the harness can be SEEN to go red on the
+// pre-2026-08-30 behaviour. A test that has only ever been observed passing
+// says nothing about the thing it points at.
+//
+// In a normal build g_fdlock_off does not exist and these expand to the bare
+// spinlock calls: no branch, no flag, no cost.
+// ---------------------------------------------------------------------------
+#ifdef FDRACE_TEST
+int g_fdlock_off = 0;   // set from /FDLOCKOFF.TXT by main.c, FDRACETEST build only
+#define FDL_ACQ(pp)     (g_fdlock_off ? (uint64_t)0 : spinlock_acquire_irqsave(&(pp)->fd_lock))
+#define FDL_REL(pp, fl) do { if (!g_fdlock_off) spinlock_release_irqrestore(&(pp)->fd_lock, (fl)); } while (0)
+#else
+#define FDL_ACQ(pp)     spinlock_acquire_irqsave(&(pp)->fd_lock)
+#define FDL_REL(pp, fl) spinlock_release_irqrestore(&(pp)->fd_lock, (fl))
+#endif
+
+// The find half of an allocation, with the lock already held. Split out so
+// fd_alloc_install() can do find-and-claim atomically instead of racing
+// itself between two locked sections.
+static int fd_alloc_locked(process_t *p, int min) {
     if (min < 0) min = 0;
     if (min >= MAX_FDS) return -1;
     for (int i = min; i < MAX_FDS; i++) {
@@ -157,80 +211,145 @@ int fd_alloc(int min) {
     return -1;
 }
 
+// ADVISORY. It reports a free slot, it does not reserve one: the slot can be
+// taken again before the caller installs into it. Locking the read only stops
+// it tearing against a concurrent mutation. Callers that mean "give me an fd
+// for this description" must use fd_alloc_install(), which claims under one
+// lock and cannot race.
+int fd_alloc(int min) {
+    process_t *p = proc_current();
+    if (!p) return -1;
+    uint64_t fl = FDL_ACQ(p);
+    int fd = fd_alloc_locked(p, min);
+    FDL_REL(p, fl);
+    return fd;
+}
+
 int fd_install(int fd, file_t *f) {
     process_t *p = proc_current();
     if (!p) return -1;
     if (fd < 0 || fd >= MAX_FDS) return -1;
-    // If the slot is already occupied, close the old one first. This matches
-    // dup2 semantics; ordinary callers should target an empty slot.
-    if (p->fds[fd]) {
+
+    // If the slot is already occupied, close the old one. This matches dup2
+    // semantics; ordinary callers should target an empty slot.
+    uint64_t fl = FDL_ACQ(p);
+    file_t *evicted = p->fds[fd];
+    p->fds[fd] = f;
+    FDL_REL(p, fl);
+
+    if (evicted) {
         // #695: slot eviction must SUCCEED even when the evicted description's
-        // final flush failed, or dup2 / shell redirection would start failing on
-        // a full disk. There is no recipient for this error here; log and go on.
-        int frc = file_put(p->fds[fd]);
+        // final flush failed, or dup2 / shell redirection would start failing
+        // on a full disk. There is no recipient for this error here; log and
+        // go on. Outside the lock: this can write to disk.
+        int frc = file_put(evicted);
         if (frc != 0)
             kprintf("[VFS] fd_install: evicted fd %d final flush failed rc=%d\n", fd, frc);
-        p->fds[fd] = NULL;
     }
-    p->fds[fd] = f;
     return 0;
 }
 
+// See the "WHAT THIS BUYS" note above: the lock makes the READ of the slot
+// atomic against a concurrent swap, it does NOT give the caller a reference.
 file_t *fd_get(int fd) {
     process_t *p = proc_current();
     if (!p) return NULL;
     if (fd < 0 || fd >= MAX_FDS) return NULL;
-    return p->fds[fd];
+    uint64_t fl = FDL_ACQ(p);
+    file_t *f = p->fds[fd];
+    FDL_REL(p, fl);
+    return f;
+}
+
+// Find AND claim under ONE lock. Two of these racing used to be able to return
+// the same fd twice, with the loser's description leaked and both callers
+// writing to one file.
+//
+// Split from its proc_current() wrapper so fdrace_test.c can drive this exact
+// body against a chosen PCB from two cores. The shipping path is the wrapper;
+// there is no second copy of the logic.
+int fd_alloc_install_on(process_t *p, file_t *f) {
+    if (!p) return -1;
+    uint64_t fl = FDL_ACQ(p);
+    int fd = fd_alloc_locked(p, 3);
+#ifdef FDRACE_TEST
+    // The find-then-store window, held open on purpose so fs/fdrace_test.c can
+    // show what walks into it when the lock is off. Absent from a normal build.
+    { extern void fdrace_window(void); fdrace_window(); }
+#endif
+    if (fd >= 0) p->fds[fd] = f;
+    FDL_REL(p, fl);
+    return fd;
 }
 
 int fd_alloc_install(file_t *f) {
     // Start at 3 to preserve the traditional 0/1/2 reservation until Phase A2
     // pre-opens /dev/console on them.
-    int fd = fd_alloc(3);
-    if (fd < 0) return -1;
-    process_t *p = proc_current();
-    p->fds[fd] = f;
-    return fd;
+    return fd_alloc_install_on(proc_current(), f);
 }
 
-int fd_close(int fd) {
-    process_t *p = proc_current();
+// Same split as fd_alloc_install_on(), same reason.
+int fd_close_on(process_t *p, int fd) {
     if (!p) return -1;
     if (fd < 0 || fd >= MAX_FDS) return -1;
+
+    // Claiming the slot under the lock is what makes a close racing a close
+    // safe: exactly one of them comes away with the pointer, so exactly one
+    // put happens.
+    uint64_t fl = FDL_ACQ(p);
     file_t *f = p->fds[fd];
+    if (f) {
+        p->fds[fd] = NULL;
+        p->fd_cloexec &= ~(1ULL << fd);
+    }
+    FDL_REL(p, fl);
+
     if (!f) return -1;
-    p->fds[fd] = NULL;
-    // Clear CLOEXEC bit for this fd.
-    p->fd_cloexec &= ~(1ULL << fd);
     // #695 Phase 2: THIS is the close() a user program sees (sys_close routes
     // here for every per-process fd), so the final flush status propagates.
     return file_put(f);
 }
 
+int fd_close(int fd) { return fd_close_on(proc_current(), fd); }
+
 // #695 Phase 2: proc_exit() calls this, under cli(), with nobody left to tell.
 // It therefore LOGS AND CONTINUES and stays void on purpose: propagating from
 // here would turn "the disk is full" into a fault on every process exit, and
 // stopping early would leak every remaining description.
+//
+// One slot per lock acquisition, deliberately. Snapshotting all 64 pointers
+// under one acquire would need a 512-byte array on the exiting task's ring-0
+// stack; taking and dropping the lock 64 times at process exit costs nothing
+// that matters and keeps file_put() outside it.
 void fd_close_all(void) {
     process_t *p = proc_current();
     if (!p) return;
     for (int i = 0; i < MAX_FDS; i++) {
-        if (p->fds[i]) {
-            int frc = file_put(p->fds[i]);
+        uint64_t fl = FDL_ACQ(p);
+        file_t *f = p->fds[i];
+        p->fds[i] = NULL;
+        FDL_REL(p, fl);
+        if (f) {
+            int frc = file_put(f);
             if (frc != 0)
                 kprintf("[VFS] proc exit: fd %d final flush failed rc=%d (data lost)\n", i, frc);
-            p->fds[i] = NULL;
         }
     }
+    uint64_t fl = FDL_ACQ(p);
     p->fd_cloexec = 0;
+    FDL_REL(p, fl);
 }
 
+// file_get() is a bare refcount increment with no release op behind it, so it
+// is the one thing that may run inside the lock.
 void fd_refcount_all_plus_plus(void) {
     process_t *p = proc_current();
     if (!p) return;
+    uint64_t fl = FDL_ACQ(p);
     for (int i = 0; i < MAX_FDS; i++) {
         if (p->fds[i]) file_get(p->fds[i]);
     }
+    FDL_REL(p, fl);
 }
 
 // ============================================================================
@@ -241,15 +360,20 @@ int fd_dup(int oldfd, int min) {
     process_t *p = proc_current();
     if (!p) return -1;
     if (oldfd < 0 || oldfd >= MAX_FDS) return -1;
+
+    // Read, find and claim under ONE acquire. Split across two, the slot
+    // fd_alloc_locked() reported could be taken before we install into it.
+    uint64_t fl = FDL_ACQ(p);
     file_t *f = p->fds[oldfd];
-    if (!f) return -1;
-    int newfd = fd_alloc(min < 0 ? 0 : min);
-    if (newfd < 0) return -1;
-    file_get(f);
-    p->fds[newfd] = f;
-    // dup() never inherits CLOEXEC; F_DUPFD_CLOEXEC sets it at the syscall
-    // layer after this call returns.
-    p->fd_cloexec &= ~(1ULL << newfd);
+    int newfd = f ? fd_alloc_locked(p, min < 0 ? 0 : min) : -1;
+    if (newfd >= 0) {
+        file_get(f);
+        p->fds[newfd] = f;
+        // dup() never inherits CLOEXEC; F_DUPFD_CLOEXEC sets it at the syscall
+        // layer after this call returns.
+        p->fd_cloexec &= ~(1ULL << newfd);
+    }
+    FDL_REL(p, fl);
     return newfd;
 }
 
@@ -258,21 +382,27 @@ int fd_dup2(int oldfd, int newfd) {
     if (!p) return -1;
     if (oldfd < 0 || oldfd >= MAX_FDS) return -1;
     if (newfd < 0 || newfd >= MAX_FDS) return -1;
+    // POSIX: dup2 with oldfd == newfd is a no-op that returns newfd, but only
+    // if oldfd is open. The open test is done under the lock below.
+    uint64_t fl = FDL_ACQ(p);
     file_t *f = p->fds[oldfd];
+    file_t *evicted = NULL;
+    if (f && oldfd != newfd) {
+        evicted = p->fds[newfd];
+        file_get(f);
+        p->fds[newfd] = f;
+        p->fd_cloexec &= ~(1ULL << newfd);
+    }
+    FDL_REL(p, fl);
+
     if (!f) return -1;
-    // POSIX: dup2 with oldfd == newfd is a no-op that returns newfd.
-    if (oldfd == newfd) return newfd;
-    if (p->fds[newfd]) {
+    if (evicted) {
         // #695: same rule as fd_install - dup2 must still succeed when the
         // description it evicts could not be flushed.
-        int frc = file_put(p->fds[newfd]);
+        int frc = file_put(evicted);
         if (frc != 0)
             kprintf("[VFS] dup2: evicted fd %d final flush failed rc=%d\n", newfd, frc);
-        p->fds[newfd] = NULL;
     }
-    file_get(f);
-    p->fds[newfd] = f;
-    p->fd_cloexec &= ~(1ULL << newfd);
     return newfd;
 }
 
@@ -280,16 +410,26 @@ int fd_dup2(int oldfd, int newfd) {
 // the image. Same reasoning as fd_close_all: log and continue, stay void.
 void fd_close_cloexec(void) {
     process_t *p = proc_current();
-    if (!p || p->fd_cloexec == 0) return;
+    if (!p) return;
+    // Same one-slot-per-acquire shape as fd_close_all(), for the same reason:
+    // file_put() must not run with the lock held.
     for (int i = 0; i < MAX_FDS; i++) {
+        uint64_t fl = FDL_ACQ(p);
+        file_t *f = NULL;
         if ((p->fd_cloexec & (1ULL << i)) && p->fds[i]) {
-            int frc = file_put(p->fds[i]);
-            if (frc != 0)
-                kprintf("[VFS] execve: cloexec fd %d final flush failed rc=%d (data lost)\n", i, frc);
+            f = p->fds[i];
             p->fds[i] = NULL;
         }
+        FDL_REL(p, fl);
+        if (f) {
+            int frc = file_put(f);
+            if (frc != 0)
+                kprintf("[VFS] execve: cloexec fd %d final flush failed rc=%d (data lost)\n", i, frc);
+        }
     }
+    uint64_t fl = FDL_ACQ(p);
     p->fd_cloexec = 0;
+    FDL_REL(p, fl);
 }
 
 // ---------------------------------------------------------------------------

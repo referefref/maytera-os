@@ -74,9 +74,11 @@ static int deliver_segv_handler(process_t *p, interrupt_frame_t *frame, uint64_t
     if (handler == SIG_DFL || handler == SIG_IGN) {
         return -1;  // no catchable handler -> default action
     }
-    extern uint64_t g_sig_trampoline;
-    if (g_sig_trampoline == 0) {
-        return -1;  // libc never registered a trampoline
+    // #SMPGLOBALS: THIS process's trampoline (process_t::sig_trampoline), not a
+    // machine-wide global. Under PIE the global meant delivering a SIGSEGV by
+    // jumping into another process's image.
+    if (p->sig_trampoline == 0) {
+        return -1;  // this process's libc never registered a trampoline
     }
 
     // The user stack must be present+writable in the faulting address space,
@@ -128,7 +130,7 @@ static int deliver_segv_handler(process_t *p, interrupt_frame_t *frame, uint64_t
     // #19/#645: one qword to the USER stack, through the primitive.
     user_rsp -= 8;
     {
-        uint64_t tramp = g_sig_trampoline;
+        uint64_t tramp = p->sig_trampoline;
         if (copy_to_user((void *)user_rsp, &tramp, sizeof(tramp)) != 0) {
             return -1;
         }

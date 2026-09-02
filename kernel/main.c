@@ -7,6 +7,8 @@
 #include "cpu/idt.h"
 #include "cpu/pic.h"
 #include "cpu/mono.h"
+#include "cpu/inputlat.h"   // #affinity: the [INPUTLAT] responsiveness line
+#include "proc/affinity.h"   // #affinity: per-process CPU affinity + migration counts
 #include "cpu/isr.h"
 #include "cpu/sse.h"
 #include "mm/pmm.h"
@@ -32,6 +34,7 @@
 #include "fs/bootlog.h"           // #307 real-hw: persistent /BOOTLOG.TXT
 #include "fs/bootstage.h"         // #ASUSDIAG: named checkpoints to every channel that exists yet
 #include "fs/cfgread.h"           // #192: config-read log policy + its ABI lock
+#include "drivers/usbport.h"      // #307/#433: xHCI root-port give-up governor + its ABI lock
 #include "cpu/tickwatch.h"        // #745 (#62): is the periodic tick delivered?
 #include "fs/blockdev.h"          // #307: ATA vs USB MSC root routing
 #include "drivers/usb_msc.h"      // #307: USB thumb-drive root selection
@@ -381,6 +384,133 @@ static void heartbeat_worker(void *arg) {
             uint64_t _dnet = g_flip_net_tot_cyc - _p_net;  _p_net = g_flip_net_tot_cyc;
             uint64_t _dcpy = g_flip_cpy_tot_cyc - _p_cpy;  _p_cpy = g_flip_cpy_tot_cyc;
             uint64_t _dpkts = g_net_poll_pkts - _p_pkts;   _p_pkts = g_net_poll_pkts;
+            // #affinity: PER-PROCESS MIGRATIONS, the number an affinity change
+            // has to move. The pre-existing [CPUOBS] line reports a SYSTEM-WIDE
+            // migration total, and a system-wide total cannot answer the only
+            // question a pin raises: did the migrations of THE PINNED PROCESS
+            // drop. mig/sw is the rate, and the denominator is there because a
+            // raw migration count cannot be compared between two runs of
+            // different length.
+            //
+            // Ranked by ABSOLUTE migrations, top four, plus every process
+            // carrying a non-default mask unconditionally. The line stays one
+            // line: a report that scrolls is a report nobody reads.
+            {
+                uint32_t apid[64]; uint64_t amig[64], asw[64], amask[64];
+                uint32_t an = affinity_walk_rs(64, apid, amig, asw, amask);
+                char ab[256]; int ao = 0; int shown = 0;
+                ao += snprintf(ab + ao, sizeof(ab) - (size_t)ao, "[AFFMIG]");
+                // RANKED BY ABSOLUTE MIGRATIONS, NOT BY RATE.
+                //
+                // The first version of this line ranked by mig/switchins, and
+                // the very first run showed why that is wrong: it filled with
+                // processes reading "2/2(100%)" - two switch-ins, both on a
+                // different core, a rate of 100% and a total that means nothing -
+                // while the COMPOSITOR, the one process this ticket is about,
+                // did not appear at all. A rate with a denominator of 2 is not a
+                // measurement. Absolute count is what a before/after comparison
+                // actually compares, and AFFMIG_MIN_SW keeps a process out of
+                // the ranking until it has enough switch-ins for its rate to
+                // mean anything.
+                //
+                // The pinned process is printed UNCONDITIONALLY below whatever
+                // its rank, because "the pinned process is not in the top five"
+                // is not an answer to "did the pin work".
+                #define AFFMIG_MIN_SW 10u
+                for (int k = 0; k < 4; k++) {
+                    uint32_t best = 0xFFFFFFFFu; uint64_t bestmig = 0;
+                    for (uint32_t i = 0; i < an; i++) {
+                        if (amig[i] == 0 || asw[i] < AFFMIG_MIN_SW) continue;
+                        if (best == 0xFFFFFFFFu || amig[i] > bestmig) { best = i; bestmig = amig[i]; }
+                    }
+                    if (best == 0xFFFFFFFFu) break;
+                    if (ao < (int)sizeof(ab) - 44)
+                        ao += snprintf(ab + ao, sizeof(ab) - (size_t)ao,
+                                       " pid%u=%llu/%llu(%llu%%)",
+                                       apid[best], (unsigned long long)amig[best],
+                                       (unsigned long long)asw[best],
+                                       (unsigned long long)(amig[best] * 100ull /
+                                           (asw[best] ? asw[best] : 1)));
+                    amig[best] = 0;   // consumed
+                    shown++;
+                }
+                // Every process carrying a NON-DEFAULT mask, whatever its rank.
+                // This is the row the affinity work is judged on.
+                for (uint32_t i = 0; i < an; i++) {
+                    if (amask[i] == AFFINITY_ALL) continue;
+                    if (ao < (int)sizeof(ab) - 52)
+                        ao += snprintf(ab + ao, sizeof(ab) - (size_t)ao,
+                                       " PINNED:pid%u=%llu/%llu mask=0x%llx",
+                                       apid[i], (unsigned long long)amig[i],
+                                       (unsigned long long)asw[i],
+                                       (unsigned long long)amask[i]);
+                    shown++;
+                }
+                // skips vs escapes are printed as a PAIR because they mean
+                // opposite things. skips rising while migrations fall is the
+                // mask working. escapes rising means the starvation ceiling is
+                // firing, i.e. the mask is fighting the placement rather than
+                // agreeing with it, which is a tuning fault and would be
+                // invisible if only a single combined total were recorded.
+                if (shown) {
+                    extern volatile uint64_t g_aff_skips, g_aff_escapes, g_aff_steal_skips;
+                    // aff= names the ARM on every line. A log that does not
+                    // say which arm it is cannot be compared to another one,
+                    // and two logs that look alike is exactly the situation
+                    // this whole A/B exists to avoid.
+                    kprintf("%s live=%u full=%llu evicted=%llu skip=%llu/%llusteal esc=%llu aff=%s\n",
+                            ab, an,
+                            (unsigned long long)affinity_full_rs(),
+                            (unsigned long long)affinity_evicted_rs(),
+                            (unsigned long long)g_aff_skips,
+                            (unsigned long long)g_aff_steal_skips,
+                            (unsigned long long)g_aff_escapes,
+                            affinity_disabled_rs() ? "OFF" : "ON");
+                }
+                #undef AFFMIG_MIN_SW
+            }
+
+            // #affinity: THE RESPONSIVENESS LINE. Every other number on this
+            // report is throughput; this one is latency, and it is the only
+            // one that can distinguish "60 fps and instant" from "60 fps and
+            // every keystroke waits 200ms for the compositor to be scheduled".
+            //
+            // n= is the sample count and it is the FIRST thing to read: all
+            // three stages report 0us when nobody has typed, and 0us with n=0
+            // means NO DATA, not zero latency. keys= localises a loss - a gap
+            // between scancodes and pushed is normal (prefixes and release
+            // codes make no cooked key), a gap between pushed and delivered
+            // means keys are queueing with nobody draining them.
+            //
+            // S_PRESENT is a LOWER BOUND on true input-to-photon; see
+            // rustkern/inputlat.rs for the three reasons and for why it is
+            // named for what it measures. area= is the damaged pixel count of
+            // the present that closed the last sample, so a suspiciously fast
+            // close can be checked against "a cursor-only frame closed it".
+            {
+                uint64_t wn=0,wp50=0,wp95=0,wmax=0,wmin=0,wmean=0;
+                uint64_t pn=0,pp50=0,pp95=0,pmax=0,pmin=0,pmean=0;
+                uint64_t sc=0,pu=0,de=0,cl=0,co=0,ro=0,ar=0;
+                inputlat_stage_rs(INPUTLAT_S_INPUT, &wn,&wp50,&wp95,&wmax,&wmin,&wmean);
+                inputlat_stage_rs(INPUTLAT_S_PRESENT, &pn,&pp50,&pp95,&pmax,&pmin,&pmean);
+                inputlat_counts_rs(&sc,&pu,&de,&cl,&co,&ro,&ar);
+                if (sc) kprintf("[INPUTLAT] in: n=%llu p50=%lluus p95=%lluus "
+                        "mean=%lluus min=%lluus max=%lluus | present: n=%llu "
+                        "p50=%lluus p95=%lluus mean=%lluus max=%lluus "
+                        "| keys=%llu/%llu/%llu closed=%llu coalesced=%llu "
+                        "ringover=%llu area=%llu inject=%lluus\n",
+                        (unsigned long long)wn, (unsigned long long)wp50,
+                        (unsigned long long)wp95, (unsigned long long)wmean,
+                        (unsigned long long)wmin, (unsigned long long)wmax,
+                        (unsigned long long)pn, (unsigned long long)pp50,
+                        (unsigned long long)pp95, (unsigned long long)pmean,
+                        (unsigned long long)pmax,
+                        (unsigned long long)sc, (unsigned long long)pu,
+                        (unsigned long long)de, (unsigned long long)cl,
+                        (unsigned long long)co, (unsigned long long)ro,
+                        (unsigned long long)ar,
+                        (unsigned long long)g_inputlat_inject_us);
+            }
             uint64_t _dnp = g_net_poll_calls - _p_npoll;   _p_npoll = g_net_poll_calls;
             // #COMPIDLE: the workload behind the cost. flips= alone cannot
             // tell a whole-screen present from a 40x16 clock rect, and on
@@ -440,6 +570,35 @@ static void heartbeat_worker(void *arg) {
                     (unsigned long long)(dcalls ? (dtot * 1000ULL / _khz2) / dcalls : 0),
                     (unsigned long long)(mx * 1000ULL / _khz2),
                     (unsigned long long)dpx,
+                    (unsigned long long)(cpp_x1000 / 1000ULL),
+                    (unsigned long long)(cpp_x1000 % 1000ULL));
+        }
+        // #halfres: the measured cost of the integer present-scale
+        // replication copy, mirroring [ROTPROF] immediately above. Silent on
+        // every machine that never enabled this (fb_get_present_scale() == 1
+        // means fb_present_rect_scaled() is never called). src_px is what the
+        // compositor actually composited THIS interval - the number this
+        // feature exists to shrink; dst_px is physical pixels written, which
+        // does not shrink (the present still touches the whole panel either
+        // way - see presentscale.h).
+        if (fb_get_present_scale() > 1) {
+            static uint64_t _p_scl_tot, _p_scl_calls, _p_scl_src, _p_scl_dst;
+            uint64_t tot, mx, calls, srcpx, dstpx;
+            fb_scale_profile_get(&tot, &mx, &calls, &srcpx, &dstpx);
+            uint64_t _khz3 = mono_tsc_khz(); if (!_khz3) _khz3 = 1;
+            uint64_t dtot   = tot   - _p_scl_tot;   _p_scl_tot   = tot;
+            uint64_t dcalls = calls - _p_scl_calls; _p_scl_calls = calls;
+            uint64_t dsrc   = srcpx - _p_scl_src;   _p_scl_src   = srcpx;
+            uint64_t ddst   = dstpx - _p_scl_dst;   _p_scl_dst   = dstpx;
+            uint64_t cpp_x1000 = dsrc ? (dtot * 1000ULL) / dsrc : 0;
+            kprintf("[SCALEPROF] present_scale=%dx calls=%llu avg=%lluus "
+                    "max=%lluus src_px=%llu dst_px=%llu cyc/px(src)=%llu.%03llu\n",
+                    fb_get_present_scale(),
+                    (unsigned long long)dcalls,
+                    (unsigned long long)(dcalls ? (dtot * 1000ULL / _khz3) / dcalls : 0),
+                    (unsigned long long)(mx * 1000ULL / _khz3),
+                    (unsigned long long)dsrc,
+                    (unsigned long long)ddst,
                     (unsigned long long)(cpp_x1000 / 1000ULL),
                     (unsigned long long)(cpp_x1000 % 1000ULL));
         }
@@ -554,9 +713,86 @@ static void heartbeat_worker(void *arg) {
             // was already ~200 chars: at 256 the new fields would have been
             // silently truncated by snprintf, which is exactly the failure mode
             // where you conclude the counters are zero.
-            static char _ndbuf[384];
-            if (net_diag_line(_ndbuf, sizeof(_ndbuf)) > 0)
+            // browsenet 2026-09-01: 512, not 384. The line gained the #549
+            // breaker's own state (trip=, nfail=, ntrip=, nrec=, nprobe=).
+            // The #155 note directly above is exactly why this is bumped when
+            // fields are added: at too small a cap snprintf truncates in
+            // silence and you conclude the new counters read zero.
+            static char _ndbuf[512];
+            if (net_diag_line(_ndbuf, sizeof(_ndbuf)) > 0) {
                 kprintf("[NETDIAG] %s\n", _ndbuf);
+                // AND DURABLY (no ticket, 2026-08-29). [NETDIAG] is the one
+                // line in this kernel that answers 'is the network actually
+                // working': it carries state=, ip=, gwarp= (gateway ARP
+                // RESOLVED/UNRESOLVED), rx=/tx=/txfail= and the whole
+                // USB-Ethernet pipeline (usbrx/usbdry/usbfd/usbrsy/usbref).
+                //
+                // It was kprintf-only, i.e. SERIAL ONLY, and the machine it
+                // matters on is a laptop with NO SERIAL PORT. So on golden 2277
+                // the owner's /BOOTLOG.TXT contained a DHCP retry burst, an
+                // address, and not one byte about whether a single frame ever
+                // crossed that adapter afterwards. An investigation was then
+                // opened into why his CDC-ECM 'passed no traffic', when the
+                // counters that would have answered it in one line had been
+                // computed every 2 seconds and thrown away 300 times.
+                //
+                // net/dhcp.c already carries this exact lesson in prose ('Two
+                // diagnostics shipped this week reached only serial and were
+                // useless for the same reason'). This is the third. A
+                // diagnostic that cannot reach the machine it was written for
+                // is not a diagnostic.
+                //
+                // COST. bootlog_write() rewrites the whole growing file, which
+                // is why the heartbeat stopped using it (see the note at the
+                // top of this function). So this is NOT a per-heartbeat write:
+                // it fires only when the QUALITATIVE half of the line changes
+                // (driver, carrier, state, config source, dhcp, ip, gw, gwarp,
+                // dns), plus a slow periodic sample so the traffic counters can
+                // be seen MOVING rather than only at their transitions, and the
+                // whole thing is capped for the boot. A quiet, working machine
+                // costs a handful of lines; a broken one spends its budget
+                // exactly where the transitions are.
+                static char _ndprev[512];
+                static int  _ndlines = 0;
+                static uint64_t _ndlast = 0;
+                #define NETDIAG_DURABLE_MAX 24
+                if (_ndlines < NETDIAG_DURABLE_MAX) {
+                    // Qualitative prefix = everything before the counters.
+                    // strstr is not available freestanding here; find ' rx='
+                    // by hand. If it is absent, compare the whole line.
+                    int cut = 0;
+                    for (int i = 0; _ndbuf[i] && _ndbuf[i + 1] &&
+                                    _ndbuf[i + 2] && _ndbuf[i + 3]; i++) {
+                        if (_ndbuf[i] == ' ' && _ndbuf[i + 1] == 'r' &&
+                            _ndbuf[i + 2] == 'x' && _ndbuf[i + 3] == '=') {
+                            cut = i;
+                            break;
+                        }
+                    }
+                    int changed = 0;
+                    if (cut == 0) {
+                        changed = (strcmp(_ndbuf, _ndprev) != 0);
+                    } else {
+                        for (int i = 0; i < cut; i++) {
+                            if (_ndbuf[i] != _ndprev[i]) { changed = 1; break; }
+                        }
+                        // A shorter previous line that is a prefix of this one
+                        // still counts as changed.
+                        if (!changed && _ndprev[cut] != _ndbuf[cut]) changed = 1;
+                    }
+                    // Slow periodic sample: ~every 60s (heartbeat is ~2s).
+                    int periodic = (n - _ndlast) >= 30;
+                    if (changed || periodic || _ndlines == 0) {
+                        _ndlines++;
+                        _ndlast = n;
+                        for (int i = 0; i < (int)sizeof(_ndprev); i++)
+                            _ndprev[i] = _ndbuf[i];
+                        _ndprev[sizeof(_ndprev) - 1] = 0;
+                        bootlog_write("[NETDIAG] %s", _ndbuf);
+                    }
+                }
+                #undef NETDIAG_DURABLE_MAX
+            }
         }
         // #167: enq=refused/lost/dropped/fixed and sweep=.
         //   refused  owed enqueues the #75 funnel deferred
@@ -932,6 +1168,257 @@ extern uint64_t g_xhci_cmd_noblock_refused; // #134
 // stack-smash panic the moment it returned. It never returns in practice, but
 // depending on that would be depending on an accident.
 __attribute__((no_stack_protector))
+// ===========================================================================
+// #pid0desk (2026-08-29): THE GUI SESSION IS A PROCESS, NOT PID 0.
+// ===========================================================================
+//
+// This is the #566 login-gate loop, moved verbatim out of kernel_main() so it
+// can run as an ordinary scheduled process instead of on the boot thread.
+//
+// WHY IT HAD TO MOVE. kernel_main() called desktop_run() inline, so the whole
+// GUI ran as pid 0 -- which proc_init() also installs as g_cpu_idle[0], the
+// BSP idle process. add_to_ready_queue() refuses to enqueue an idle process
+// (the #130 guard, proc/process.c), so EVERY proc_sleep() in desktop_run()
+// had its wake-up silently DROPPED. The desktop only ran again when
+// sched_schedule() happened to find the ready queue completely empty and fell
+// through to its g_cpu_idle[] fallback. With an idle machine that window is
+// constant and nothing looks wrong; with a busy DOS guest (dos/dosexec.c
+// yields about every 4ms and deliberately keeps the queue non-empty) it
+// becomes vanishingly rare, and the desktop STARVES.
+//
+// MEASURED before this change: desktop_run()'s own periodic log line went
+// silent for 175+ seconds while, on the same core in the same guest, the
+// 'heartbeat' kernel worker (an ordinary proc_create'd process doing
+// proc_sleep(2000)) ticked every ~2s without missing one. Same scheduler,
+// same core, same load: the only difference is that heartbeat is a real
+// process and the desktop was the idle process.
+//
+// Note what this does NOT mean: the #130 guard is not wrong. It fixed a real
+// SMP corruption (two cores running pid 0 on one kernel stack). It is correct
+// for genuine idle processes, and it stays. What was wrong is that the GUI
+// was running AS one.
+//
+// The loop body is unchanged. Everything it touches is either file-scope or
+// declared inside it; it used nothing from kernel_main()'s frame except
+// login_result, which is declared on the first line here and used only here.
+// ===========================================================================
+static void desktop_session_thread(void *arg) {
+    (void)arg;
+    login_result_t login_result;
+    for (;;) {
+    // Run login screen before desktop
+    kprintf("[GUI] Starting login screen...\n");
+    login_init();
+    // #157: login_init() no longer releases the display (it moved to the
+    // first frame login_draw() actually paints), so from here to the
+    // compositor's first present these lines REACH THE SCREEN. On an
+    // autologin image login_run() returns without drawing anything, and
+    // before #157 that made every one of the following stages invisible.
+    // #SB: the block-write staging counters, printed every boot whether or
+    // not anything is wrong. seal_broken MUST be 0. A non-zero value means
+    // the medium is being handed bytes the filesystem did not write, which
+    // is the fault that destroyed an ext2 primary superblock on golden
+    // build 2215. Printed here because by now the boot has done all of its
+    // ext2 metadata, bootlog, heartbeat and PROPDATE writes.
+    blk_stage_report();
+#ifdef BLKSTAGE_TEST
+    blk_stage_selftest();
+#endif
+    gfx_boot_log("[BOOT] Starting login screen...");
+    boot_stage(BSTAGE_LOGIN);
+    login_run(&login_result);
+    {
+        char _lb[96];
+        snprintf(_lb, sizeof(_lb),
+                 "[BOOT] Login complete (user '%s', uid %u), starting desktop...",
+                 login_result.username[0] ? login_result.username : "?",
+                 (unsigned)login_result.uid);
+        gfx_boot_log(_lb);
+    }
+
+    // Set session identity and create home directory
+    desktop_set_session(login_result.uid, login_result.gid);
+    if (login_result.home[0]) {
+        fat_mkdir(&g_fat_fs, login_result.home);
+        // #745: mkdir alone left the home ROOT-OWNED, so at uid 0 it worked
+        // by accident and at any other uid the user could not write their
+        // own home. Claim it for the session user, but only when it is not
+        // already theirs: perms_set marks PERMS.DB dirty, and rewriting it
+        // on every single login is a disk write for nothing.
+        //
+        // Deliberately not applied to root's home "/": the filesystem root
+        // is not a home directory and must keep its own 0755 root ownership.
+        if (!(login_result.home[0] == '/' && login_result.home[1] == '\0')) {
+            uint32_t howner = 0, hgroup = 0; uint16_t hmode = 0;
+            int have = perms_get(login_result.home, &howner, &hgroup, &hmode);
+            if (have != 0 || howner != login_result.uid || hgroup != login_result.gid) {
+                perms_set(login_result.home, login_result.uid, login_result.gid, 0750);
+                bootlog_write("[SESSION] home '%s' claimed for %u:%u (#745)",
+                              login_result.home,
+                              (unsigned)login_result.uid, (unsigned)login_result.gid);
+            }
+            // The skeleton subdirectories are created no-op-if-present and
+            // are stamped with the same ownership, so a home that predates
+            // this change is repaired rather than left half-owned.
+            users_make_home_skeleton(login_result.home,
+                                     login_result.uid, login_result.gid);
+        }
+    }
+
+    // #PERMSKIP: THE DEFINITIVE RUN OF THE PERMISSION SELF-TEST.
+    //
+    // perms_init() calls perms_selftest() far above, before users_init(),
+    // before any session: at that point the only homes it can test are
+    // whatever /CONFIG/PERMS.DB already happens to hold. Until this change
+    // it did not even do that - it looked up the literal string
+    // "/HOME/ADMIN" and printed
+    //
+    //     [PERMS-SELFTEST] SKIP traversal vectors (/HOME/ADMIN not 1000:0750)
+    //
+    // forever, on every CORRECTLY PROVISIONED machine, because the wizard
+    // lets the owner name the account and the owner is not called "admin".
+    //
+    // HERE is where the kernel knows who is actually logged in and where
+    // their home actually is, and it has just claimed that home for them
+    // three lines above, so this is the run that tests the real thing:
+    // the real user's real home, under the real uid/gid, whatever it is
+    // called. A session that cannot be tested (root, whose home is "/" and
+    // is not a home directory; or a home with no PERMS.DB entry) is
+    // reported as a LOUD not-run through the register, not as a quiet SKIP.
+    perms_selftest_session(login_result.home,
+                           login_result.uid, login_result.gid);
+
+    // And the one line that says whether anything on this machine declined
+    // to verify itself this boot. Placed after the last self-test, because
+    // this is the last point at which a group can still declare itself.
+    selftest_notrun_report();
+
+    // #684: PROVISION the AI key from the seed, ONCE, as root.
+    //
+    // The user's decision is that /CONFIG/KIMI.KEY is a deployment SEED,
+    // not something an app reads: "this kimi.key file should only be used
+    // to write that value to settings (in a way that's protected from other
+    // users and apps) not be called directly by the ai chat app". So this,
+    // running in Ring 0 at session start, is the ONLY reader of that file
+    // in the whole system, and it copies the value into the user's own
+    // protected settings.
+    //
+    // Every branch here is a no-op on a normal deployment: the seed is
+    // ABSENT (nothing to do), or the user already has settings (never
+    // overwrite what they typed into Settings). It is deliberately not a
+    // "sync": a user who clears their key must not have it restored on the
+    // next login.
+    //
+    // #OOBEAUTH GUARD: skip entirely when there is no home yet. This is
+    // the #OOBEAUTH first-boot bootstrap session (login_result.home is
+    // deliberately "" - see gui/login.c) running as uid FIRST_ADMIN_UID
+    // with no matching user-table entry, and userconf_kpath() resolves an
+    // unknown uid's home to "/" - root's own home. Without this guard a
+    // deployment that ships /CONFIG/KIMI.KEY would have this bootstrap
+    // session write and chmod a path under /CONFIG (fat_mkdir + perms_
+    // on_create on the fallback "/" + "/CONFIG" join) as uid 1000, which
+    // is exactly the kind of write this whole change is supposed to keep
+    // out of that session's reach. The seed is simply provisioned one
+    // boot later, at the first REAL login this account makes (same
+    // no-op-if-already-set logic applies then), which costs nothing:
+    // nobody can read Settings during a session with no desktop chrome
+    // anyway (g_setup_pending).
+    if (login_result.home[0]) provision_ai_key(&login_result);
+
+    // #95: build the background services registry now (parses
+    // /CONFIG/SERVICES.CFG). Actually starting the services is deferred
+    // to desktop_run(), after the compositor has launched: spawning a
+    // user process this early (before any other user process exists)
+    // lands on physical pages that are not yet safely writable through
+    // the kernel identity map, faulting in elf_load_user. Once the
+    // compositor is up the allocator is in the same steady state used
+    // for every on-demand app launch, so service spawns are safe.
+    // Guarded: build the registry once, not on every login-gate iteration.
+    { static int s_svc_inited = 0; if (!s_svc_inited) { svc_init(); s_svc_inited = 1; } }
+gfx_boot_log("[BOOT] Background services registry built");
+    // #157: the last kernel stage before the Ring-3 handoff. If the machine
+    // stops with THIS as the final line, the fault is in desktop_init()/
+    // desktop_run() before the compositor spawn; if it stops on one of
+    // desktop_run()'s own lines, the fault is past it. That distinction did
+    // not exist before #157 - everything from login_init() onward presented
+    // as the same frozen "Starting desktop services..." screen.
+    gfx_boot_log("[BOOT] Entering desktop environment...");
+
+#ifdef SECTEST_CV_FETCH
+    // ------------------------------------------------------------------
+    // #510 VERIFICATION BUILD ONLY (-DSECTEST_CV_FETCH via `make CVTEST=1`;
+    // compiled out of every normal/golden kernel). Drives a REAL TLS 1.3
+    // handshake to each real host BEFORE the desktop starts, so the
+    // CertificateVerify verdict is observable on serial without needing the
+    // GUI or the (keyboard-only, desktop-owned) kernel_shell.
+    //
+    // Paired with `make CVTAMPER=1`, which flips one bit of the server's
+    // CertificateVerify signature: with the tamper on, every fetch here MUST
+    // abort. That pairing is the whole point - a positive-only result cannot
+    // distinguish a working check from no check at all.
+    // ------------------------------------------------------------------
+    {
+        extern int dhcp_get_state(void);
+        extern void net_poll(void);
+        // Bounded wait for a DHCP lease, mirroring the idiom this same file
+        // already uses for the shell `net` command. Test-only code.
+        kprintf("[CV-FETCH] waiting for DHCP lease...\n");
+        for (int i = 0; i < 4000 && dhcp_get_state() != 3; i++) {
+            net_poll();
+            for (int j = 0; j < 20000; j++) io_wait();
+        }
+        // Settle: a bound lease is not the same as a usable route/DNS. The
+        // first run of this test fetched before the lease landed and got
+        // DNS -3 on the first two hosts, which reads exactly like a TLS
+        // failure in the RESULT line but is not one. Wait, then re-poll.
+        for (int i = 0; i < 400; i++) {
+            net_poll();
+            for (int j = 0; j < 20000; j++) io_wait();
+        }
+        kprintf("[CV-FETCH] dhcp_state=%d (3=BOUND)\n", dhcp_get_state());
+
+        static const char *cv_urls[] = {
+            // TLS 1.3 (this task). The 2x2 that matters: the transcript hash
+            // is the CIPHER SUITE's, the signature hash is the SCHEME's, and
+            // on 3 of these they DIFFER (SHA384 suite signing with SHA256).
+            "https://feeds.bbci.co.uk/news/rss.xml",  // SHA384 suite, ECDSA 0x0403
+            "https://lobste.rs/",                     // SHA256 suite, ECDSA 0x0403
+            "https://www.reddit.com/",                // SHA256 suite, RSA-PSS 0x0804
+            "https://lwn.net/",                       // SHA384 suite, ECDSA 0x0403
+            "https://api.moonshot.ai/",               // SHA384 suite, RSA-PSS 0x0804
+            // TLS 1.2 (#502) - regression control. These do NOT go through
+            // the 1.3 CertificateVerify path at all; they must keep working
+            // exactly as before, proving #510 stayed inside the 1.3 branch.
+            "https://xkcd.com/rss.xml",               // 1.2, 0xc02f
+            "https://hnrss.org/frontpage",            // 1.2, 0xc030, secp384r1
+        };
+        for (int i = 0; i < 7; i++) {
+            uint8_t *cvb = NULL; uint32_t cvl = 0; int cvst = 0;
+            int cvr = https_get(cv_urls[i], &cvb, &cvl, &cvst);
+            kprintf("[CV-FETCH] RESULT %s ret=%d status=%d len=%u\n",
+                    cv_urls[i], cvr, cvst, cvl);
+            if (cvb) kfree(cvb);
+        }
+        kprintf("[CV-FETCH] done\n");
+    }
+#endif
+
+    // Start GUI desktop
+    kprintf("[GUI] Starting desktop environment...\n");
+    syslog_log(LOG_INFO, "Desktop environment starting");
+    boot_stage(BSTAGE_DESKTOP);
+    desktop_run();
+
+    // #566 decision 3: the desktop process exited. DO NOT fall through to an
+    // unauthenticated Ring-0 shell. Loop back to the login gate so the next
+    // thing on screen is authentication, exactly like a fresh boot. On a
+    // framebuffer machine this loop never terminates.
+    kprintf("[GUI] Desktop exited; returning to login gate (no shell fallback)\n");
+    syslog_log(LOG_INFO, "Desktop exited; returning to login gate");
+    gfx_boot_log("[BOOT] Desktop exited; re-showing login gate");
+    } // end #566 login-gate for(;;)
+}
+
 void kernel_main(boot_info_t *boot_info) {
     // #ASUSDIAG: TAKE THE SCREEN BEFORE ANYTHING ELSE CAN GO WRONG.
     //
@@ -1665,6 +2152,58 @@ void kernel_main(boot_info_t *boot_info) {
         bootlog_write("[CFG] log-policy selftest %s checks=%u abi=%s",
                       crc == 0 ? "PASS" : "FAIL", cchecks,
                       cabi == 0 ? "OK" : "MISMATCH");
+
+        // #307/#433: the xHCI root-port give-up governor, and the ABI lock
+        // between drivers/usbport.h's constants and rustkern/usbport.rs's.
+        //
+        // This one is worth a boot line because BOTH of its failure modes are
+        // silent. If it never retires a port, the owner's laptop goes back to
+        // 2046 Address Device attempts per half hour on a dead port and nothing
+        // says so. If it retires one too eagerly - or the two ideas of the
+        // table geometry drift so a port index lands in the wrong cell - a
+        // WORKING port stops being enumerated, and on a machine that boots from
+        // USB that is the root filesystem. The self-test proves it retires a
+        // connected port at the budget and NOT before, revives it only on a
+        // connect-status change, refuses to revive a config-disabled one, and
+        // FAILS OPEN on an out-of-range port.
+        uint32_t uchecks = 0;
+        int32_t urc  = usbport_selftest_rs(&uchecks);
+        int32_t uabi = usbport_abi_check_rs(USBPORT_MAX_CTRL, USBPORT_MAX_PORT,
+                                           USBPORT_GIVEUP_BUDGETS,
+                                           USBPORT_ST_ACTIVE, USBPORT_ST_TERMINAL,
+                                           USBPORT_ST_CFGOFF, USBPORT_MAX_RETIRES,
+                                           USBPORT_ST_HARD);
+        kprintf("[USBPORT] port-governor selftest %s (%u checks); C/Rust ABI %s\n",
+                urc == 1 ? "PASS" : "FAIL", uchecks,
+                uabi == 1 ? "OK" : "MISMATCH");
+        bootlog_write("[USBPORT] port-governor selftest %s checks=%u abi=%s "
+                      "budgets=%d retires=%d maxattempts=%d",
+                      urc == 1 ? "PASS" : "FAIL", uchecks,
+                      uabi == 1 ? "OK" : "MISMATCH", USBPORT_GIVEUP_BUDGETS,
+                      USBPORT_MAX_RETIRES,
+                      USBPORT_MAX_RETIRES * USBPORT_GIVEUP_BUDGETS * 4);
+        // Split off deliberately. The single-line version of this was 330
+        // characters and the VM run showed it being cut at 255, INSIDE the
+        // change whose entire purpose is to stop log lines being cut. Writing a
+        // line that does not fit is the easiest mistake in this file to make.
+        bootlog_write("[USBPORT] a connected root port that fails to enumerate "
+                      "%d times stops being re-scanned until a connect-status "
+                      "change; after %d such rounds a connect-status change "
+                      "stops re-arming it too. A reboot re-arms it. Override in "
+                      "/USBPORT.CFG.",
+                      USBPORT_GIVEUP_BUDGETS, USBPORT_MAX_RETIRES);
+
+        // deadport: the give-up line this governor emits is ~700 characters and
+        // every bootlog line is capped at 256, so on golden 2277 the operator
+        // got "...(unplug/replug). Thi" and NOTHING about the override file.
+        // The cap now stamps "~CUT n~" into any line it shortens; this reports
+        // the aggregate so a truncation regression is visible without anyone
+        // having to measure line lengths in a log by hand.
+        bootlog_write("[BOOTLOG] line-length audit AT THIS POINT IN BOOT: %u line(s) "
+                      "truncated, %u byte(s) lost. This is an early sample, NOT a "
+                      "verdict on the boot: the xHCI heartbeat re-reports it about "
+                      "once a minute and only when the number moves.",
+                      bootlog_truncated_lines(), bootlog_truncated_bytes());
     }
 
     // #135: the RTC codec self-test AND the chip's actual mode, both to serial
@@ -2188,6 +2727,71 @@ void kernel_main(boot_info_t *boot_info) {
                 bootlog_write("[SMP] gate: /SMPSCHED.TXT absent -> AP user "
                               "scheduling OFF (BSP only)");
             }
+#ifdef FDRACE_TEST
+            /* #SMPGLOBALS: fd-table lock negative control. Present ONLY in a
+             * `make FDRACETEST=1` kernel, so a shipping golden cannot be
+             * talked into running unlocked by dropping a file on the ESP. */
+            {
+                extern int  g_fdlock_off;
+                extern void fdrace_selftest(void);
+                if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/FDLOCKOFF.TXT")) {
+                    g_fdlock_off = 1;
+                    kprintf("[FDRACE] /FDLOCKOFF.TXT present: the per-process "
+                            "fd_lock is DISABLED. RED ARM.\n");
+                    bootlog_write("[FDRACE] arm: LOCK OFF (RED)");
+                } else {
+                    bootlog_write("[FDRACE] arm: LOCK ON (GREEN)");
+                }
+                /* The CHECKS do not run here. This point is ~900 lines BEFORE
+                 * proc_init(), so there is no process table, no scheduler and
+                 * no proc_current(): measured, the first version reported
+                 * "fd_alloc(3) -> -1 and -1" (no current process) and
+                 * "rc=-110 claims=0" (the hammer threads could never run), and
+                 * both verdicts printed INCONCLUSIVE. A harness that runs
+                 * before the thing it tests exists reports nothing and looks
+                 * like a clean pass. The worker is created after proc_init(),
+                 * further down. */
+            }
+#endif
+#ifdef SIGFRAME_DIFF
+            /* #SMPGLOBALS RED ARM. Present ONLY in a `make SIGFRAMEDIFF=1`
+             * kernel, so a shipping golden cannot be talked into it by
+             * dropping a file. With /SIGFRAMEBUG.TXT on the ESP,
+             * sys_rt_sigreturn() goes back to reading the deleted global
+             * g_syscall_saved_frame, restoring the pre-fix behaviour exactly.
+             * Same one-binary-two-arms shape as /SMPSCHED.TXT above: a fix
+             * that has only ever been seen passing proves nothing about the
+             * thing it points at. */
+            {
+                extern int g_sigframe_legacy_arm;
+                if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/SIGFRAMEBUG.TXT")) {
+                    g_sigframe_legacy_arm = 1;
+                    kprintf("[SIGFRAME] /SIGFRAMEBUG.TXT present: RED ARM. "
+                            "rt_sigreturn will use the DELETED global. This "
+                            "kernel is a reproducer, not a fix.\n");
+                    bootlog_write("[SIGFRAME] arm: LEGACY (RED) - reproducer");
+                } else {
+                    kprintf("[SIGFRAME] arm: PERTASK (GREEN). "
+                            "process_t::syscall_frame is live.\n");
+                    bootlog_write("[SIGFRAME] arm: PERTASK (GREEN)");
+                }
+            }
+#endif
+            // #75: /NOSCHEDBKL.TXT restores the pre-2026-08-29 behaviour, in
+            // which an AP called sched_schedule() holding no lock at all. Kept
+            // as a control so the fix can be measured against its own absence
+            // with ONE binary, exactly as /SMPSCHED.TXT gates AP scheduling.
+            {
+                extern int g_sched_bkl_serialize;
+                if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/NOSCHEDBKL.TXT")) {
+                    g_sched_bkl_serialize = 0;
+                    kprintf("[MAIN] #75: /NOSCHEDBKL.TXT present, AP scheduler "
+                            "calls are NOT serialised by the BKL (control arm)\n");
+                    bootlog_write("[SMP] #75: AP sched_schedule NOT BKL-serialised (control)");
+                } else {
+                    bootlog_write("[SMP] #75: AP sched_schedule serialised by the BKL");
+                }
+            }
             // #167 CONTROL GATE. The defect under test is a lost wakeup in the
             // deferred-enqueue path, so the fix has to be testable against the
             // SAME binary, on the same image, in the same boot order. Dropping
@@ -2203,6 +2807,24 @@ void kernel_main(boot_info_t *boot_info) {
                                 "fix OFF (control arm)");
               } else {
                   bootlog_write("[167] gate: deferred-wake fix ON (default)");
+              } }
+            // #wakelag CONTROL GATE. wake_sleeping_procs() is reachable only
+            // from sched_schedule(), which the 250 Hz tick reaches only when the
+            // running slice expires (TIME_SLICE_TICKS=10, 40 ms). Every timed
+            // sleep therefore had 40 ms resolution, not the 4 ms the tick rate
+            // implies. Default ON; an empty /NOWAKELAG.TXT on the ESP restores
+            // the 40 ms behaviour for that boot, SAME BINARY, so the control arm
+            // is a file and not a second build.
+            { extern int g_wakelag_fix;
+              if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/NOWAKELAG.TXT")) {
+                  g_wakelag_fix = 0;
+                  kprintf("[MAIN] #wakelag: /NOWAKELAG.TXT present, per-tick "
+                          "sleeper wake is DISABLED for this boot (control arm); "
+                          "sleep resolution reverts to one time slice\n");
+                  bootlog_write("[wakelag] gate: /NOWAKELAG.TXT PRESENT -> "
+                                "per-tick sleeper wake OFF (control arm)");
+              } else {
+                  bootlog_write("[wakelag] gate: per-tick sleeper wake ON (default)");
               } }
             // #75 CONTROL GATE 1: refusing to queue a task another core has
             // already SELECTED (pop -> switch window). Default ON; a boot with
@@ -2252,6 +2874,141 @@ void kernel_main(boot_info_t *boot_info) {
             { extern void wakeloss_selftest(void); wakeloss_selftest(); }  // #167
             sched_smp_selftest();   // policy self-test, both gate states
             { extern void schedrace_selftest(void); schedrace_selftest(); }  // #75
+            // #smpfix: prove the wrong-stack save detector on this build before
+            // any silence from it is read as evidence.
+            { extern void stacksave_selftest(void); stacksave_selftest(); }
+            // #smpfix CONTROL GATE. An empty /NOAPIDLEBACKOFF.TXT on the FAT
+            // ESP restores the pre-fix AP idle loop (re-enter the scheduler
+            // immediately after a pass that switched nothing), so the control
+            // and fix arms of the measurement are the SAME kernel.elf and
+            // differ by one file, the way the TLB shootdown proof was done.
+            // #smpfix (#75) CONTROL GATE for the SYSRET-tail interrupt mask.
+            // With this file present the kernel returns to Ring 3 exactly as
+            // it did before the fix: RSP is loaded with the user stack pointer
+            // while still at CPL 0 and with IF set, so an interrupt at that
+            // one-instruction boundary lands on the user stack. That is the
+            // control arm; [IRQUSTACK] counts it going in and [STACKSAVE]
+            // counts the corruption coming out.
+            // #smpfix (#75) REPRODUCER GATE. Holds the one-instruction
+            // SYSRET-tail window open for a few microseconds so the hazard is
+            // entered many times a second instead of once every few minutes.
+            // Pair it with /NOSYSRETCLI.TXT for the RED arm; on its own (with
+            // the fix armed) it is the arm that proves the fix rather than the
+            // absence of the event, because the window is wide and the counter
+            // must still read zero.
+            { extern volatile uint8_t g_sysret_widen;
+              if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/SYSRETWIDEN.TXT")) {
+                  g_sysret_widen = 1;
+                  kprintf("[MAIN] #smpfix: /SYSRETWIDEN.TXT present, the SYSRET "
+                          "tail will hold its user-stack window open (400 pause "
+                          "instructions) - REPRODUCER BUILD BEHAVIOUR\n");
+                  bootlog_write("[smpfix] gate: sysret window WIDENED (reproducer)");
+              } }
+            { extern int g_sysret_cli;
+              if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/NOSYSRETCLI.TXT")) {
+                  g_sysret_cli = 0;
+                  kprintf("[MAIN] #smpfix: /NOSYSRETCLI.TXT present, the SYSRET "
+                          "tail will NOT mask interrupts before loading the user "
+                          "stack pointer (CONTROL ARM, #75 window OPEN)\n");
+                  bootlog_write("[smpfix] gate: sysret-tail cli OFF (control arm)");
+              } else {
+                  bootlog_write("[smpfix] gate: sysret-tail cli ON (default)");
+              } }
+            // #smpfix (#67/#168) CONTROL GATE for the parking BKL waiter.
+            // With this file present a contended waiter pause-loops for the
+            // whole hold, exactly as before, so the two arms of the proof are
+            // one kernel.elf and one file.
+            { extern int g_bkl_park;
+              if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/NOBKLPARK.TXT")) {
+                  g_bkl_park = 0;
+                  kprintf("[MAIN] #smpfix: /NOBKLPARK.TXT present, a contended "
+                          "BKL waiter will PAUSE-LOOP for the whole hold "
+                          "instead of parking (CONTROL ARM)\n");
+                  bootlog_write("[smpfix] gate: BKL waiter parking OFF (control arm)");
+              } else {
+                  if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/BKLPARK.TXT"))
+                      kprintf("[MAIN] #smpfix: /BKLPARK.TXT present, which is now "
+                              "the DEFAULT; the control arm is /NOBKLPARK.TXT\n");
+                  bootlog_write("[smpfix] gate: BKL waiter parking ON (default)");
+              } }
+            // #wakeipi NEGATIVE CONTROL for the wake-IPI measurement, and the
+            // arm that makes the numbers quotable. With this file present the
+            // release path still COUNTS every wake IPI it would have sent and
+            // issues NONE of them, so [WAKEDIAG] end_ipi must be ZERO on every
+            // core and end_other must carry every park. An instrument that
+            // reads the same in both arms is not measuring what it says it is;
+            // this tree has shipped a truncation detector structurally unable
+            // to fire and a per-core meter that read 0% in the one
+            // configuration it existed for, so the check is shown to go red
+            // rather than asserted to work. Same kernel.elf, one file.
+            // #bklfair (#168) EXPERIMENT GATE, and note which way round it is.
+            // The FAIR ticket BKL is DEFAULT OFF, on 29 measured boots: it is
+            // genuinely fairer (4-vCPU wait spread 1.91x -> 1.49x) and costs
+            // about 12% of the present rate while changing input-to-photon not
+            // at all. See the long comment above g_bkl_fair in cpu/smp.c for
+            // the numbers and for why fairness cannot be the mechanism of the
+            // SMP regression. It is kept, gated, because it will matter once
+            // the lock is narrowed (#168 step 3).
+            //
+            // /BKLUNFAIR.TXT is still accepted so the campaign scripts that
+            // named it keep meaning what they meant; it is now a no-op that
+            // says so rather than silently doing nothing.
+            { extern int g_bkl_fair;
+              if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/BKLFAIR.TXT")) {
+                  g_bkl_fair = 1;
+                  kprintf("[MAIN] #bklfair: /BKLFAIR.TXT present, the BKL is a "
+                          "FAIR TICKET LOCK - acquisition is FIFO with ticket "
+                          "inheritance and a stale-turn bypass (EXPERIMENT)\n");
+                  bootlog_write("[bklfair] gate: BKL fairness ON (ticket, experiment)");
+              } else {
+                  if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/BKLUNFAIR.TXT"))
+                      kprintf("[MAIN] #bklfair: /BKLUNFAIR.TXT present, which is "
+                              "now the DEFAULT and not a control; the fair lock "
+                              "is armed by /BKLFAIR.TXT\n");
+                  bootlog_write("[bklfair] gate: BKL fairness OFF (test-and-test-and-set, default)");
+              } }
+            // #blitnarrow (#168 step 3) EXPERIMENT GATE. sys_win_blit() runs
+            // its row loop with the BKL DROPPED. It is the worst BKL holder in
+            // the kernel: MEASURED on golden 2330, one process held the lock
+            // for 157 of a 230-second boot in 41,722 acquires, 3.8 ms each,
+            // and its whole body is a blit loop; 85-88% of ALL BKL hold time
+            // that boot was inside syscall bodies. DEFAULT OFF, because this
+            // removes the giant lock from a region that also decides the
+            // lifetime of a heap buffer - the shape of a latent use-after-free
+            // - so it is measured before it is shipped.
+            { extern int g_blit_narrow;
+              if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/NOBLITNARROW.TXT")) {
+                  g_blit_narrow = 0;
+                  kprintf("[MAIN] #blitnarrow: /NOBLITNARROW.TXT present, "
+                          "SYS_WIN_BLIT's row loop runs under the GIANT LOCK "
+                          "again (CONTROL ARM)\n");
+                  bootlog_write("[blitnarrow] gate: blit row loop under the BKL (control arm)");
+              } else {
+                  if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/BLITNARROW.TXT"))
+                      kprintf("[MAIN] #blitnarrow: /BLITNARROW.TXT present, which "
+                              "is now the DEFAULT; the control arm is "
+                              "/NOBLITNARROW.TXT\n");
+                  bootlog_write("[blitnarrow] gate: blit row loop UNLOCKED (default)");
+              } }
+            { extern int g_bkl_wake_off;
+              if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/BKLWAKEOFF.TXT")) {
+                  g_bkl_wake_off = 1;
+                  kprintf("[MAIN] #wakeipi: /BKLWAKEOFF.TXT present, BKL wake "
+                          "IPIs are COUNTED BUT NOT SENT (negative control)\n");
+                  bootlog_write("[wakeipi] gate: BKL wake IPI send SUPPRESSED (negative control)");
+              } else {
+                  bootlog_write("[wakeipi] gate: BKL wake IPI send ON (default)");
+              } }
+            { extern int g_apidle_backoff;
+              if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/NOAPIDLEBACKOFF.TXT")) {
+                  g_apidle_backoff = 0;
+                  kprintf("[MAIN] #smpfix: /NOAPIDLEBACKOFF.TXT present, AP idle "
+                          "loop will re-enter the scheduler after a pass that "
+                          "achieved nothing (CONTROL ARM)\n");
+                  bootlog_write("[smpfix] gate: AP idle backoff OFF (control arm)");
+              } else {
+                  bootlog_write("[smpfix] gate: AP idle backoff ON (default)");
+              } }
             { extern void bkl_probe_selftest(void); extern int g_smp_bkl_full;
               if (g_smp_bkl_full) bkl_probe_selftest(); }   // #67 pass 9
             // #121: the syscall profiler is independent of the BKL, so its
@@ -2273,7 +3030,51 @@ void kernel_main(boot_info_t *boot_info) {
                 }
                 kprintf("[MAIN] #67: %u of %u cores online\n",
                         smp_get_online_count(), smp_get_cpu_count());
-                smp_selftest();
+                smp_selftest();                // ---------------------------------------------------------
+                // #404 CROSS-CPU TLB SHOOTDOWN: gates, proof of delivery, and
+                // the stale-TLB reproducer. Placed here because it is the first
+                // point at which a peer core exists to shoot down to.
+                // ---------------------------------------------------------
+                {
+                    extern int g_tlb_shootdown_enable;
+                    extern int tlb_selftest(void);
+                    extern void tlb_stress_start(void);
+                    // NEGATIVE CONTROL, same binary. /NOTLBSHOOT.TXT restores
+                    // the pre-#404 behaviour for that boot: the initiating core
+                    // still invalidates its own entry, and no other core is
+                    // told anything. Exactly the shape /NOSCHEDBKL.TXT uses for
+                    // #75 and /SMPSCHED.TXT for the AP scheduler.
+                    if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/NOTLBSHOOT.TXT")) {
+                        g_tlb_shootdown_enable = 0;
+                        kprintf("[MAIN] #404: /NOTLBSHOOT.TXT present, cross-CPU "
+                                "TLB shootdown DISABLED (control arm)\n");
+                        bootlog_write("[TLB] gate: shootdown DISABLED (control arm)");
+                    } else {
+                        bootlog_write("[TLB] gate: shootdown ENABLED");
+                    }
+                    // THIRD ARM: /TLBNOIPI.TXT suppresses the IPI so that only
+                    // the cooperative poll points can deliver. Proves the
+                    // redundant second arm actually works instead of leaving it
+                    // as code that has never been observed to run.
+                    { extern int g_tlb_no_ipi;
+                      if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/TLBNOIPI.TXT")) {
+                          g_tlb_no_ipi = 1;
+                          kprintf("[MAIN] #404: /TLBNOIPI.TXT present, shootdown "
+                                  "IPI SUPPRESSED (cooperative-delivery-only arm)\n");
+                          bootlog_write("[TLB] gate: IPI suppressed, cooperative delivery only");
+                      } }
+                    // Prove the receiver fires BEFORE anything relies on it.
+                    // Prints PASS or FAIL either way; never silent.
+                    (void)tlb_selftest();
+                    // The reproducer only runs when explicitly asked for: it
+                    // occupies every AP for a few seconds.
+                    if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/TLBSTRESS.TXT")) {
+                        kprintf("[MAIN] #404: /TLBSTRESS.TXT present, running the "
+                                "stale-TLB reproducer\n");
+                        tlb_stress_start();
+                    }
+                }
+
             } else {
                 kprintf("[MAIN] #67: AP user scheduling OFF (default); user "
                         "processes run on the BSP only. Add /SMPSCHED.TXT to "
@@ -2398,7 +3199,44 @@ void kernel_main(boot_info_t *boot_info) {
     // first region that is not an ISO 9660 volume (an unwritten tail is zeros,
     // which is rejected). See dos/usbvol.h and rustkern/usbvol.rs.
     { extern void usbvol_selftest(void); usbvol_selftest(); }
+    // [no-ticket] CD/ISO read path: the readahead policy, the resolved-extent
+    // memo and the round-trip accounting all decide how many USB commands a
+    // streaming disc read costs, so they are proved before the first disc is
+    // mounted rather than after something has gone wrong.
+    {
+        extern int imgra_selftest_rs(unsigned int *);
+        extern int isomemo_selftest_rs(unsigned int *);
+        extern int blkhist_selftest_rs(unsigned int *);
+        unsigned int c1 = 0, c2 = 0, c3 = 0;
+        int f1 = imgra_selftest_rs(&c1);
+        int f2 = isomemo_selftest_rs(&c2);
+        int f3 = blkhist_selftest_rs(&c3);
+        kprintf("[CDREAD] self-test: imgra %u checks/%d fail, isomemo %u/%d, "
+                "blkhist %u/%d\n", c1, f1, c2, f2, c3, f3);
+        bootlog_write("[CDREAD] self-test: imgra %u/%d isomemo %u/%d blkhist %u/%d",
+                      c1, f1, c2, f2, c3, f3);
+    }
+    // [no-ticket] The escape hatch, applied BEFORE anything is mounted so it
+    // covers the mount's own reads too. /CONFIG/CDRAOFF.CFG restores exactly
+    // the pre-change behaviour: one cache block per miss, and a full ISO
+    // directory walk on every read. It exists because this path is on the
+    // medium the machine BOOTS from.
+    {
+        extern void imgfile_readahead_set_disabled(int);
+        extern void isomemo_set_disabled(int);
+        uint32_t _rz = 0;
+        void *_rc = fat_read_file(&g_fat_fs, "/CONFIG/CDRAOFF.CFG", &_rz);
+        if (_rc) {
+            kfree(_rc);
+            imgfile_readahead_set_disabled(1);
+            isomemo_set_disabled(1);
+            kprintf("[CDREAD] /CONFIG/CDRAOFF.CFG: disc readahead + resolve memo OFF\n");
+            bootlog_write("[CDREAD] CDRAOFF.CFG: readahead + memo OFF");
+        }
+    }
     { extern void usbvol_probe_and_mount(void); usbvol_probe_and_mount(); }
+    { extern void cdprobe_report(void); cdprobe_report(); }
+    { extern void cdbench_maybe_run(void); cdbench_maybe_run(); }
 
     // #404 / #479 Phase B: prove the Rust ip_checksum == the C ip_checksum on
     // THIS build before the network stack (which now computes/validates IP
@@ -2877,6 +3715,14 @@ void kernel_main(boot_info_t *boot_info) {
     extern void usb_desc_rust_selftest(void);
     usb_desc_rust_selftest();
 
+    // Hot-plug NIC attach handoff self-test (no ticket, 2026-08-28). Runs here,
+    // before net_init(), and saves/restores the statics so it cannot perturb the
+    // real attach path. One durable [NETATTACH-SELFTEST] line.
+    {
+        extern void netattach_selftest(void);
+        netattach_selftest();
+    }
+
     gfx_boot_log("[BOOT] Initializing network stack...");
     boot_stage(BSTAGE_NET);
     if (net_init() == 0) {
@@ -3002,6 +3848,17 @@ void kernel_main(boot_info_t *boot_info) {
     gfx_boot_log("[BOOT] Initializing process manager...");
     boot_stage(BSTAGE_PROC);
     proc_init();
+
+#ifdef FDRACE_TEST
+    /* #SMPGLOBALS: the fd-lock negative control, created HERE because it needs
+     * a process table, a scheduler and a proc_current(). It sleeps until the
+     * desktop is up so it measures a machine in steady state rather than one
+     * still in boot. FDRACETEST builds only. */
+    {
+        extern void fdrace_boot_worker(void *arg);
+        proc_create_ex("fdrace", fdrace_boot_worker, 0, PRIO_LOW, 64 * 1024);
+    }
+#endif
 
     /* #745 (#75) MEASURED, build 1876: WITHOUT THIS, /SMPSCHED.TXT DOES NOTHING.
      *
@@ -3355,6 +4212,78 @@ void kernel_main(boot_info_t *boot_info) {
     // deterministically, bypassing QEMU's lossy PS/2 model, with a serial ACK.
     { extern void testinput_init(void); testinput_init(); }
 
+    // #affinity: ARM THE NEGATIVE CONTROL for the [INPUTLAT] instrument.
+    //
+    // WHY THIS EXISTS AND WHY IT IS NOT A UNIT TEST. inputlat_selftest_rs()
+    // proves the bucketing and the percentiles, and it would pass IDENTICALLY
+    // if keyboard_process_scancode() never called the hook, because a self-test
+    // calls the accounting functions itself. This tree has shipped a truncation
+    // detector structurally unable to fire, a panic harness that scored 65 panic
+    // lines as a pass, and a per-core meter that read 0% on every AP in exactly
+    // the configuration it existed for. A green self-test is not evidence that
+    // an instrument is CONNECTED.
+    //
+    // So: /INPUTLAT.TXT on the FAT ESP, holding a bare number of MICROSECONDS,
+    // same marker-file convention as /TESTINPUT.TXT, /UISCALE.TXT and
+    // /BATTTEST.TXT. It busy-delays that long inside keyboard_get_char() before
+    // the delivery timestamp, so S_WAIT and S_INPUT MUST rise by about that
+    // amount. Boot once without the file for the baseline and once with it for
+    // the control: same kernel bytes, one variable, and a number that does not
+    // move is a dead hook rather than good news.
+    //
+    // ABSENT ON EVERY SHIPPING GOLDEN, so g_inputlat_inject_us stays 0 and the
+    // cost is one load of a never-written global per key drain.
+    // #affinity: THE A/B GATE. /NOAFF.TXT makes the affinity mask inert, so the
+    // before/after for this feature comes from ONE kernel.elf with one variable
+    // rather than from two builds that differ in unknown other ways as well.
+    // Same marker-file convention as /SMPSCHED.TXT and /INPUTLAT.TXT, and
+    // absent on every shipping golden.
+    {
+        if (fat_exists(&g_fat_fs, "/NOAFF.TXT") == 1) {
+            affinity_set_disabled_rs(1);
+            kprintf("[AFFINITY] A/B GATE: /NOAFF.TXT present, the affinity mask "
+                    "is INERT this boot. Masks are still stored and still "
+                    "reported, so [AFFMIG] stays comparable line for line with "
+                    "the armed arm; only the two read paths are gated.\n");
+            bootlog_write("[AFFINITY] A/B gate: mask DISABLED (/NOAFF.TXT)");
+        } else {
+            bootlog_write("[AFFINITY] A/B gate: mask ARMED (no /NOAFF.TXT)");
+        }
+    }
+
+    {
+        if (fat_exists(&g_fat_fs, "/INPUTLAT.TXT") == 1) {
+            uint32_t sz = 0;
+            char *buf = (char *)fat_read_file(&g_fat_fs, "/INPUTLAT.TXT", &sz);
+            if (buf) {
+                uint64_t v = 0; int digits = 0;
+                for (uint32_t i = 0; i < sz && i < 32; i++) {
+                    if (buf[i] >= '0' && buf[i] <= '9') {
+                        v = v * 10 + (uint64_t)(buf[i] - '0');
+                        if (++digits > 9) break;    // cap at ~1e9 us
+                    } else if (digits) break;
+                }
+                kfree(buf);
+                if (digits) {
+                    g_inputlat_inject_us = v;
+                    kprintf("[INPUTLAT] NEGATIVE CONTROL ARMED: /INPUTLAT.TXT "
+                            "injects %lluus into the key DELIVERY path. S_WAIT "
+                            "and S_INPUT must both rise by about this much; if "
+                            "they do not, the stamps are not on the live path "
+                            "and every [INPUTLAT] number is fiction. This file "
+                            "must NOT be present on a shipping image.\n",
+                            (unsigned long long)v);
+                    bootlog_write("[INPUTLAT] negative control armed: inject=%lluus",
+                                  (unsigned long long)v);
+                } else {
+                    kprintf("[INPUTLAT] /INPUTLAT.TXT exists but holds no "
+                            "number; put a bare microsecond count in it, "
+                            "e.g. 20000\n");
+                }
+            }
+        }
+    }
+
     // #372 (restored b713): start the Bluetooth worker thread. Gated behind
     // g_bt_enable (default 0); nothing here touches the radio, so it can never
     // affect boot. The worker makes the enable decision post-boot. Dropped in
@@ -3378,6 +4307,16 @@ void kernel_main(boot_info_t *boot_info) {
     {
         extern void dos_start_deferred_launch(void);
         dos_start_deferred_launch();
+    }
+
+    // #DOSRING3: the same harness for the RING-3 DOS host, gated on
+    // /CONFIG/DOSRING3.CFG. Deliberately SEPARATE from the line above rather
+    // than a branch inside it: the in-kernel path stays exactly as it was and
+    // remains the default, and both can be armed on one boot so the same guest
+    // can be run down both paths and their retired-instruction counts compared.
+    {
+        extern void dosring3_start_deferred_launch(void);
+        dosring3_start_deferred_launch();
     }
 
     // #692: prove the spawn-identity policy is LIVE on this build before
@@ -3517,6 +4456,72 @@ void kernel_main(boot_info_t *boot_info) {
     // properties a wrong answer here would break silently: that /DOS/RANGER is
     // not treated as living under /DOS/RA, and that an undersized buffer fails
     // closed instead of truncating into a shorter path naming another directory.
+    // #DOSRING3 Stage 1: the focus-scoped raw-scancode gate. Its self-test has
+    // TWO NEGATIVE ARMS on purpose - it pushes a byte with nobody subscribed
+    // and requires nothing back, and again after disarming - because a
+    // positive-only test cannot tell a GATE from a WIRE. A build in which
+    // rawsc_push_rs() ignored the subscription entirely would sail through any
+    // "subscribe, push, receive" check, and that build is exactly the keylogger
+    // this scoping exists to prevent. (Same lesson as the BKL hold-sum
+    // self-test, blame.md 2026-08-29: build the arm that can go red.)
+    {
+        extern int rawsc_selftest_rs(void);
+        int rok = rawsc_selftest_rs();
+        kprintf("[RAWSC] self-test %s (focus-scoped raw scancodes for Ring-3 DOS)\n",
+                rok ? "PASS" : "FAIL");
+        bootlog_write("[RAWSC] self-test %s", rok ? "PASS" : "FAIL");
+    }
+
+    // #affinity: the responsiveness instrument's ACCOUNTING, both arms.
+    //
+    // The green arm proves the bucketing and the percentiles are right. The red
+    // arm proves the suite can go red at all, which is the check this tree
+    // keeps discovering it did not have: a truncation detector structurally
+    // unable to fire, a panic harness that scored 65 panic lines as a pass.
+    //
+    // NEITHER ARM PROVES THE STAMPS ARE WIRED UP, and this is said out loud
+    // because it is the easy mistake to make with a green line on the console.
+    // A self-test calls the accounting functions itself, so it would pass
+    // identically if keyboard_process_scancode() never called the hook. That
+    // half is proven only on hardware, by setting g_inputlat_inject_us to a
+    // known value and watching [INPUTLAT] p50 rise by that amount.
+    {
+        int ilf = inputlat_selftest_rs();
+        int ilneg = inputlat_selftest_negative_rs();
+        kprintf("[INPUTLAT] self-test %s (fail=0x%x) discriminating=%s "
+                "(stamps NOT proven by this: use g_inputlat_inject_us)\n",
+                ilf == 0 ? "PASS" : "FAIL", (unsigned)ilf,
+                ilneg == 0 ? "yes" : "NO-THIS-SUITE-CANNOT-FAIL");
+        bootlog_write("[INPUTLAT] self-test %s fail=0x%x discriminating=%d",
+                      ilf == 0 ? "PASS" : "FAIL", (unsigned)ilf, ilneg == 0);
+    }
+
+    // #affinity: the affinity table, the mask semantics and the per-process
+    // migration rule. BOTH arms.
+    //
+    // The check that carries the weight is the one asserting a mask EXCLUDES:
+    // an affinity_allows_rs() that returned 1 unconditionally would pass every
+    // other check in the suite, and would look exactly like a working
+    // implementation on every counter until someone asked why the pinned
+    // process still migrates.
+    {
+        int af = affinity_selftest_rs();
+        int aneg = affinity_selftest_negative_rs();
+        kprintf("[AFFINITY] self-test %s (fail=0x%x) discriminating=%s\n",
+                af == 0 ? "PASS" : "FAIL", (unsigned)af,
+                aneg == 0 ? "yes" : "NO-THIS-SUITE-CANNOT-FAIL");
+        bootlog_write("[AFFINITY] self-test %s fail=0x%x discriminating=%d",
+                      af == 0 ? "PASS" : "FAIL", (unsigned)af, aneg == 0);
+    }
+
+    // (#67/#168) The DOS routing policy matcher. BOTH arms, always: the green
+    // arm alone cannot distinguish a suite that passes from a suite whose
+    // checks cannot fail, which is the shape this tree keeps getting burned by.
+    {
+        extern void dosroute_selftest(void);
+        dosroute_selftest();
+    }
+
     {
         extern unsigned int dosovl_selftest_rs(void);
         unsigned int ofails = dosovl_selftest_rs();
@@ -3631,219 +4636,40 @@ void kernel_main(boot_info_t *boot_info) {
         // #566 LOGIN GATE LOOP. Once any session authenticates this boot, an
         // exited/dead desktop returns HERE (re-show login), never to the
         // unauthenticated Ring-0 kernel_shell() below (decision 3, design 3.3a).
-        login_result_t login_result;
-        for (;;) {
-        // Run login screen before desktop
-        kprintf("[GUI] Starting login screen...\n");
-        login_init();
-        // #157: login_init() no longer releases the display (it moved to the
-        // first frame login_draw() actually paints), so from here to the
-        // compositor's first present these lines REACH THE SCREEN. On an
-        // autologin image login_run() returns without drawing anything, and
-        // before #157 that made every one of the following stages invisible.
-        // #SB: the block-write staging counters, printed every boot whether or
-        // not anything is wrong. seal_broken MUST be 0. A non-zero value means
-        // the medium is being handed bytes the filesystem did not write, which
-        // is the fault that destroyed an ext2 primary superblock on golden
-        // build 2215. Printed here because by now the boot has done all of its
-        // ext2 metadata, bootlog, heartbeat and PROPDATE writes.
-        blk_stage_report();
-#ifdef BLKSTAGE_TEST
-        blk_stage_selftest();
-#endif
-        gfx_boot_log("[BOOT] Starting login screen...");
-        boot_stage(BSTAGE_LOGIN);
-        login_run(&login_result);
+        // #pid0desk: run the GUI session as a REAL process. See
+        // desktop_session_thread() above for why this cannot stay inline.
+        //
+        // STACK: 256 KB, deliberately. Inline, this code ran on the 64 KB
+        // static boot stack (entry.asm), and the 16 KB proc_create() default
+        // would have been a REDUCTION on a call tree that includes the window
+        // manager, every app on_draw callback and the image decoders. 256 KB is
+        // the size the other heavy kernel workers already use (osinstall,
+        // cron, devtest, smbtest), so this is 4x MORE headroom than the code
+        // has today, not less.
         {
-            char _lb[96];
-            snprintf(_lb, sizeof(_lb),
-                     "[BOOT] Login complete (user '%s', uid %u), starting desktop...",
-                     login_result.username[0] ? login_result.username : "?",
-                     (unsigned)login_result.uid);
-            gfx_boot_log(_lb);
+            extern int proc_create_ex(const char *name, void (*entry)(void *),
+                                      void *arg, process_priority_t priority,
+                                      uint32_t stack_size);
+            int spid = proc_create_ex("session", desktop_session_thread, 0,
+                                      PRIO_NORMAL, 256 * 1024);
+            if (spid > 0) {
+                kprintf("[GUI] desktop session started as pid %d "
+                        "(no longer pid 0/idle)\n", spid);
+                gfx_boot_log("[BOOT] Desktop session started as its own process");
+                // The boot thread is pid 0. Its correct destination is the idle
+                // loop it was always supposed to reach. Does not return.
+                extern void sched_bsp_idle_enter(void);
+                sched_bsp_idle_enter();
+            }
+            // FALLBACK: if the process could not be created there is no session
+            // and no login gate, which is a dead machine. Run it inline exactly
+            // as before instead -- degraded (this is the starvation path), but
+            // a starved desktop beats no desktop.
+            kprintf("[GUI] WARNING: could not create the session process (%d); "
+                    "running the desktop inline on pid 0 as before. The "
+                    "#pid0desk starvation applies on this boot.\n", spid);
+            desktop_session_thread(0);
         }
-
-        // Set session identity and create home directory
-        desktop_set_session(login_result.uid, login_result.gid);
-        if (login_result.home[0]) {
-            fat_mkdir(&g_fat_fs, login_result.home);
-            // #745: mkdir alone left the home ROOT-OWNED, so at uid 0 it worked
-            // by accident and at any other uid the user could not write their
-            // own home. Claim it for the session user, but only when it is not
-            // already theirs: perms_set marks PERMS.DB dirty, and rewriting it
-            // on every single login is a disk write for nothing.
-            //
-            // Deliberately not applied to root's home "/": the filesystem root
-            // is not a home directory and must keep its own 0755 root ownership.
-            if (!(login_result.home[0] == '/' && login_result.home[1] == '\0')) {
-                uint32_t howner = 0, hgroup = 0; uint16_t hmode = 0;
-                int have = perms_get(login_result.home, &howner, &hgroup, &hmode);
-                if (have != 0 || howner != login_result.uid || hgroup != login_result.gid) {
-                    perms_set(login_result.home, login_result.uid, login_result.gid, 0750);
-                    bootlog_write("[SESSION] home '%s' claimed for %u:%u (#745)",
-                                  login_result.home,
-                                  (unsigned)login_result.uid, (unsigned)login_result.gid);
-                }
-                // The skeleton subdirectories are created no-op-if-present and
-                // are stamped with the same ownership, so a home that predates
-                // this change is repaired rather than left half-owned.
-                users_make_home_skeleton(login_result.home,
-                                         login_result.uid, login_result.gid);
-            }
-        }
-
-        // #PERMSKIP: THE DEFINITIVE RUN OF THE PERMISSION SELF-TEST.
-        //
-        // perms_init() calls perms_selftest() far above, before users_init(),
-        // before any session: at that point the only homes it can test are
-        // whatever /CONFIG/PERMS.DB already happens to hold. Until this change
-        // it did not even do that - it looked up the literal string
-        // "/HOME/ADMIN" and printed
-        //
-        //     [PERMS-SELFTEST] SKIP traversal vectors (/HOME/ADMIN not 1000:0750)
-        //
-        // forever, on every CORRECTLY PROVISIONED machine, because the wizard
-        // lets the owner name the account and the owner is not called "admin".
-        //
-        // HERE is where the kernel knows who is actually logged in and where
-        // their home actually is, and it has just claimed that home for them
-        // three lines above, so this is the run that tests the real thing:
-        // the real user's real home, under the real uid/gid, whatever it is
-        // called. A session that cannot be tested (root, whose home is "/" and
-        // is not a home directory; or a home with no PERMS.DB entry) is
-        // reported as a LOUD not-run through the register, not as a quiet SKIP.
-        perms_selftest_session(login_result.home,
-                               login_result.uid, login_result.gid);
-
-        // And the one line that says whether anything on this machine declined
-        // to verify itself this boot. Placed after the last self-test, because
-        // this is the last point at which a group can still declare itself.
-        selftest_notrun_report();
-
-        // #684: PROVISION the AI key from the seed, ONCE, as root.
-        //
-        // The user's decision is that /CONFIG/KIMI.KEY is a deployment SEED,
-        // not something an app reads: "this kimi.key file should only be used
-        // to write that value to settings (in a way that's protected from other
-        // users and apps) not be called directly by the ai chat app". So this,
-        // running in Ring 0 at session start, is the ONLY reader of that file
-        // in the whole system, and it copies the value into the user's own
-        // protected settings.
-        //
-        // Every branch here is a no-op on a normal deployment: the seed is
-        // ABSENT (nothing to do), or the user already has settings (never
-        // overwrite what they typed into Settings). It is deliberately not a
-        // "sync": a user who clears their key must not have it restored on the
-        // next login.
-        //
-        // #OOBEAUTH GUARD: skip entirely when there is no home yet. This is
-        // the #OOBEAUTH first-boot bootstrap session (login_result.home is
-        // deliberately "" - see gui/login.c) running as uid FIRST_ADMIN_UID
-        // with no matching user-table entry, and userconf_kpath() resolves an
-        // unknown uid's home to "/" - root's own home. Without this guard a
-        // deployment that ships /CONFIG/KIMI.KEY would have this bootstrap
-        // session write and chmod a path under /CONFIG (fat_mkdir + perms_
-        // on_create on the fallback "/" + "/CONFIG" join) as uid 1000, which
-        // is exactly the kind of write this whole change is supposed to keep
-        // out of that session's reach. The seed is simply provisioned one
-        // boot later, at the first REAL login this account makes (same
-        // no-op-if-already-set logic applies then), which costs nothing:
-        // nobody can read Settings during a session with no desktop chrome
-        // anyway (g_setup_pending).
-        if (login_result.home[0]) provision_ai_key(&login_result);
-
-        // #95: build the background services registry now (parses
-        // /CONFIG/SERVICES.CFG). Actually starting the services is deferred
-        // to desktop_run(), after the compositor has launched: spawning a
-        // user process this early (before any other user process exists)
-        // lands on physical pages that are not yet safely writable through
-        // the kernel identity map, faulting in elf_load_user. Once the
-        // compositor is up the allocator is in the same steady state used
-        // for every on-demand app launch, so service spawns are safe.
-        // Guarded: build the registry once, not on every login-gate iteration.
-        { static int s_svc_inited = 0; if (!s_svc_inited) { svc_init(); s_svc_inited = 1; } }
-    gfx_boot_log("[BOOT] Background services registry built");
-        // #157: the last kernel stage before the Ring-3 handoff. If the machine
-        // stops with THIS as the final line, the fault is in desktop_init()/
-        // desktop_run() before the compositor spawn; if it stops on one of
-        // desktop_run()'s own lines, the fault is past it. That distinction did
-        // not exist before #157 - everything from login_init() onward presented
-        // as the same frozen "Starting desktop services..." screen.
-        gfx_boot_log("[BOOT] Entering desktop environment...");
-
-#ifdef SECTEST_CV_FETCH
-        // ------------------------------------------------------------------
-        // #510 VERIFICATION BUILD ONLY (-DSECTEST_CV_FETCH via `make CVTEST=1`;
-        // compiled out of every normal/golden kernel). Drives a REAL TLS 1.3
-        // handshake to each real host BEFORE the desktop starts, so the
-        // CertificateVerify verdict is observable on serial without needing the
-        // GUI or the (keyboard-only, desktop-owned) kernel_shell.
-        //
-        // Paired with `make CVTAMPER=1`, which flips one bit of the server's
-        // CertificateVerify signature: with the tamper on, every fetch here MUST
-        // abort. That pairing is the whole point - a positive-only result cannot
-        // distinguish a working check from no check at all.
-        // ------------------------------------------------------------------
-        {
-            extern int dhcp_get_state(void);
-            extern void net_poll(void);
-            // Bounded wait for a DHCP lease, mirroring the idiom this same file
-            // already uses for the shell `net` command. Test-only code.
-            kprintf("[CV-FETCH] waiting for DHCP lease...\n");
-            for (int i = 0; i < 4000 && dhcp_get_state() != 3; i++) {
-                net_poll();
-                for (int j = 0; j < 20000; j++) io_wait();
-            }
-            // Settle: a bound lease is not the same as a usable route/DNS. The
-            // first run of this test fetched before the lease landed and got
-            // DNS -3 on the first two hosts, which reads exactly like a TLS
-            // failure in the RESULT line but is not one. Wait, then re-poll.
-            for (int i = 0; i < 400; i++) {
-                net_poll();
-                for (int j = 0; j < 20000; j++) io_wait();
-            }
-            kprintf("[CV-FETCH] dhcp_state=%d (3=BOUND)\n", dhcp_get_state());
-
-            static const char *cv_urls[] = {
-                // TLS 1.3 (this task). The 2x2 that matters: the transcript hash
-                // is the CIPHER SUITE's, the signature hash is the SCHEME's, and
-                // on 3 of these they DIFFER (SHA384 suite signing with SHA256).
-                "https://feeds.bbci.co.uk/news/rss.xml",  // SHA384 suite, ECDSA 0x0403
-                "https://lobste.rs/",                     // SHA256 suite, ECDSA 0x0403
-                "https://www.reddit.com/",                // SHA256 suite, RSA-PSS 0x0804
-                "https://lwn.net/",                       // SHA384 suite, ECDSA 0x0403
-                "https://api.moonshot.ai/",               // SHA384 suite, RSA-PSS 0x0804
-                // TLS 1.2 (#502) - regression control. These do NOT go through
-                // the 1.3 CertificateVerify path at all; they must keep working
-                // exactly as before, proving #510 stayed inside the 1.3 branch.
-                "https://xkcd.com/rss.xml",               // 1.2, 0xc02f
-                "https://hnrss.org/frontpage",            // 1.2, 0xc030, secp384r1
-            };
-            for (int i = 0; i < 7; i++) {
-                uint8_t *cvb = NULL; uint32_t cvl = 0; int cvst = 0;
-                int cvr = https_get(cv_urls[i], &cvb, &cvl, &cvst);
-                kprintf("[CV-FETCH] RESULT %s ret=%d status=%d len=%u\n",
-                        cv_urls[i], cvr, cvst, cvl);
-                if (cvb) kfree(cvb);
-            }
-            kprintf("[CV-FETCH] done\n");
-        }
-#endif
-
-        // Start GUI desktop
-        kprintf("[GUI] Starting desktop environment...\n");
-        syslog_log(LOG_INFO, "Desktop environment starting");
-        boot_stage(BSTAGE_DESKTOP);
-        desktop_run();
-
-        // #566 decision 3: the desktop process exited. DO NOT fall through to an
-        // unauthenticated Ring-0 shell. Loop back to the login gate so the next
-        // thing on screen is authentication, exactly like a fresh boot. On a
-        // framebuffer machine this loop never terminates.
-        kprintf("[GUI] Desktop exited; returning to login gate (no shell fallback)\n");
-        syslog_log(LOG_INFO, "Desktop exited; returning to login gate");
-        gfx_boot_log("[BOOT] Desktop exited; re-showing login gate");
-        } // end #566 login-gate for(;;)
     }
 
     // The kernel shell is reachable ONLY when there is no framebuffer at all

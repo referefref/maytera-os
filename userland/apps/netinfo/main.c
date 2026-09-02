@@ -25,13 +25,57 @@ static int s_len(const char *s){ int n=0; while(s[n]) n++; return n; }
 static char up1(char c){ return (c>='a'&&c<='z')?(char)(c-32):c; }
 static int str_eq2(const char *a,const char *b){ int i=0; while(a[i]&&b[i]){ if(a[i]!=b[i]) return 0; i++; } return a[i]==b[i]; }
 
+
+// ---------------------------------------------------------------------------
+// browsenet 2026-09-01: WHO PRODUCES THE EVIDENCE THAT CLEARS NET_FAULTY?
+//
+// The #549 connectivity breaker clears itself when a transfer COMPLETES, and it
+// admits one re-probe per 30s to make that possible. `net/net.c` records the
+// earlier form of this bug in its own header: "the gate suppressed the only
+// evidence that could clear the gate: the state was SELF-LATCHING".
+//
+// The paced probe made recovery POSSIBLE. It did not make it HAPPEN, because
+// both autostarted network services gate on sys_net_is_up(), which reports DOWN
+// while FAULTY: haservice (main.c:385) sleeps 5s and re-checks, and this file
+// backs off 30..480s and attempts nothing. So once tripped, nobody takes the
+// probe. The fault then persists until a human opens an app, which is exactly
+// the owner's golden-2317 symptom: link up, lease held, gateway ARP resolved,
+// resolver known, state=FAULTY, and the browser refusing every page.
+//
+// This function is the one deliberate exception. It says: if the WIRE looks
+// usable (a NIC, carrier, an address) and the ONLY reason net_is_up() is false
+// is the breaker, then this service may still attempt ONE fetch, so that the
+// probe the kernel is holding open is actually taken.
+//
+// IT DOES NOT WIDEN THE BUDGET, and that is the whole argument. The kernel
+// still admits at most one request per 30s (net_fetch_probe_take), and this
+// service's own backoff is >=30s and grows to 8 minutes. What #549 stopped was
+// haservice retrying every 10s where each USB send busy-polled the xHCI for up
+// to 40ms; one attempt per >=30s is the ~1000x smaller duty cycle net/net.c
+// already argues is acceptable. haservice is deliberately NOT changed: it is
+// the fast poller and the one that caused the storm.
+static int net_probe_allowed(void) {
+    net_status_t ns;
+    if (sys_net_status(&ns) != 0) return 0;
+    if (!ns.faulty) return 0;            // not the breaker; respect net_is_up()
+    if (!ns.driver || !ns.link_up) return 0;   // no NIC / no carrier: really down
+    if (ns.ip == 0) return 0;                  // no address: nothing to send from
+    return 1;
+}
+
 static int fetch(const char *url){
     // #374: hard network-up gate. Never attempt a fetch (DNS/TCP/TLS) when the
     // network is down - the kernel fast-fails anyway, but skipping here avoids
     // the inter-attempt sleeps and lets the service back off cleanly.
-    if (!sys_net_is_up()) return -1;
-    for (int a=0; a<2; a++){   // #374 2 attempts (was 4); kernel now bounds each
-        if (!sys_net_is_up()) return -1;   // link may drop mid-cycle
+    int probe = 0;
+    if (!sys_net_is_up()) {
+        // browsenet: the ONE exception, see net_probe_allowed(). A single
+        // attempt, so the kernel's held-open re-probe is actually taken.
+        if (!net_probe_allowed()) return -1;
+        probe = 1;
+    }
+    for (int a=0; a < (probe ? 1 : 2); a++){   // #374 2 attempts (was 4); kernel now bounds each
+        if (!probe && !sys_net_is_up()) return -1;   // link may drop mid-cycle
         // Space out every attempt: the kernel TCP socket pool is small and a
         // just-closed socket lingers briefly, so back-to-back fetches otherwise
         // fail with "Failed to create socket". This also backs off rate limits.
@@ -277,6 +321,34 @@ static void update_stocks(void){
 
 int main(int argc,char**argv){
     (void)argc;(void)argv;
+    // browsenet 2026-09-01: SLEEP IN SLICES, so a trip that happens mid-cycle is
+    // noticed within one slice instead of up to thirty minutes later.
+    //
+    // MEASURED on VM <vmid>, golden 2321, with haservice pointed at an
+    // unreachable LAN address: the breaker tripped 40s into the boot and the
+    // machine then sat at `nprobe=0/6` -- SIX refusals, ZERO grants -- for the
+    // whole observation window. Nobody ever took the re-probe the kernel was
+    // holding open, so the interface stayed FAULTY indefinitely with a working
+    // internet connection behind it. netinfo was the intended taker and it was
+    // inside a single 600000ms sleep; between the three staggered sleeps the
+    // first opportunity to notice was up to half an hour away.
+    //
+    // The slice is the kernel's own probe interval. This cannot become a retry
+    // storm at that rate: net_fetch_probe_take() admits at most ONE request per
+    // 30s across the whole machine, so the slice is an upper bound on how often
+    // we ASK, not on how often anything reaches the wire.
+    #define NETINFO_PROBE_SLICE_MS 30000u
+    #define STAGGER_SLEEP(ms) do {                                            \
+        unsigned _rem = (ms);                                                 \
+        while (_rem) {                                                        \
+            unsigned _sl = _rem > NETINFO_PROBE_SLICE_MS                      \
+                         ? NETINFO_PROBE_SLICE_MS : _rem;                     \
+            sys_sleep(_sl);                                                   \
+            _rem -= _sl;                                                      \
+            if (net_probe_allowed()) update_crypto();                         \
+        }                                                                     \
+    } while (0)
+
     // First pass immediately so the widget cards have data right after boot
     // (each update_* is net-up-gated internally, so this is a cheap no-op offline).
     update_crypto();
@@ -292,15 +364,23 @@ int main(int argc,char**argv){
         if(!sys_net_is_up()){
             unsigned shift = down_backoff < 4 ? down_backoff : 4;
             if(down_backoff < 4) down_backoff++;
-            sys_sleep(30000u << shift);   // 30s,60s,120s,240s,480s
+            // browsenet: while the ONLY reason we are "down" is the #549
+            // breaker, still make ONE attempt per slice, so the re-probe the
+            // kernel holds open is taken by somebody. A success calls
+            // net_report_reach_ok() and clears the fault machine-wide, which is
+            // what the browser and the weather widget are waiting on. A failure
+            // changes nothing: the interface stays FAULTY. STAGGER_SLEEP does
+            // the probing, so a genuinely down link still backs off to 8min of
+            // silence (net_probe_allowed() is false without carrier/address).
+            STAGGER_SLEEP(30000u << shift);   // 30s,60s,120s,240s,480s
             continue;
         }
         down_backoff = 0;
-        sys_sleep(NETINFO_STAGGER_MS);   // +10 min
+        STAGGER_SLEEP(NETINFO_STAGGER_MS);   // +10 min
         update_crypto();
-        sys_sleep(NETINFO_STAGGER_MS);   // +20 min
+        STAGGER_SLEEP(NETINFO_STAGGER_MS);   // +20 min
         update_stocks();
-        sys_sleep(NETINFO_STAGGER_MS);   // +30 min
+        STAGGER_SLEEP(NETINFO_STAGGER_MS);   // +30 min
         update_weather();
     }
     return 0;

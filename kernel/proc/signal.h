@@ -112,6 +112,10 @@ uint64_t sig_deliverable(struct process *target);
 // the exec-pending swap. Safe to call with return_work == 0.
 void return_work_handler(void *user_frame);
 
+// #SMPGLOBALS: report the per-task syscall-frame guard counters (and, in a
+// SIGFRAMEDIFF build, the differential against the deleted global).
+void sigframe_report(void);
+
 // #161: "is the next deliverable signal one that terminates outright?" - the
 // predicate the INTERRUPT return path uses to make SIGKILL work on a process
 // that is not making syscalls. Returns the signal number, or 0. See the full

@@ -169,6 +169,43 @@ pub extern "C" fn sched_place_rs(
     prio: i32,
     prev_cpu: u32,
 ) -> i32 {
+    // #affinity: the unmasked form is the masked one with every core allowed,
+    // so there is ONE placement policy and not two that can drift. Existing
+    // callers keep their exact behaviour, bit for bit.
+    sched_place_masked_rs(cores, ncpu, prio, prev_cpu, u64::MAX)
+}
+
+/// Placement with a PER-PROCESS AFFINITY MASK. Bit N set = core N is allowed.
+///
+/// WHAT THIS ADDS OVER `sched_place_rs`. That function already honours affinity
+/// as a HINT, in two places: an idle core that is also `prev_cpu` wins outright
+/// (step 1), and `prev_cpu` is the final tie-break when queueing (step 3). What
+/// it has never had is any affinity term in step 2, PREEMPTION, which picks the
+/// core running the weakest victim with no reference to where the arriving task
+/// last ran. On a machine where the compositor is the only PRIO_HIGH process,
+/// step 2 is the step the compositor takes on almost every wake, so the
+/// existing hint was being bypassed on the single most latency-sensitive path
+/// in the system. Applying the mask inside `ok()` covers all three steps at
+/// once, which is why it goes there rather than at each step.
+///
+/// THE MASK IS SOFT, AND THIS FUNCTION IS WHERE THAT IS DECIDED. If no allowed
+/// core is a consumer, the mask is DROPPED and placement proceeds over every
+/// consumer core. A task must never be stranded to honour a preference: a hard
+/// pin that leaves a core idle while its task waits is worse than the migration
+/// it prevents, and it is exactly how an affinity feature earns a reputation
+/// for causing hangs. The fallback is deliberate, it is tested below, and it
+/// means a caller can pass any mask at all without being able to hang a task.
+///
+/// `allowed` of 0 or !0 both mean "no constraint", so a caller that has no mask
+/// need not special-case anything.
+#[no_mangle]
+pub extern "C" fn sched_place_masked_rs(
+    cores: *const SchedCoreState,
+    ncpu: u32,
+    prio: i32,
+    prev_cpu: u32,
+    allowed: u64,
+) -> i32 {
     if cores.is_null() || ncpu == 0 {
         return -1;
     }
@@ -178,7 +215,35 @@ pub extern "C" fn sched_place_rs(
     // sched_rq_push(), filled under the run-queue lock). Every access below goes
     // through this slice, so the indexing is bounds-checked.
     let c: &[SchedCoreState] = unsafe { core::slice::from_raw_parts(cores, n) };
-    let ok = |i: usize| (c[i].flags & CORE_CONSUMER) != 0;
+
+    // #affinity: does the mask leave any CONSUMER core standing? Asked ONCE,
+    // before any policy runs, because the answer decides whether the mask is
+    // applied at all. A mask that excludes every consumer is dropped rather
+    // than obeyed - see the soft-affinity note on this function.
+    let mut any_masked_consumer = false;
+    if allowed != 0 && allowed != u64::MAX {
+        let mut i = 0usize;
+        while i < n {
+            if (c[i].flags & CORE_CONSUMER) != 0 && i < 64 && (allowed & (1u64 << i)) != 0 {
+                any_masked_consumer = true;
+                break;
+            }
+            i += 1;
+        }
+    }
+    let apply_mask = any_masked_consumer;
+
+    let ok = |i: usize| {
+        if (c[i].flags & CORE_CONSUMER) == 0 {
+            return false;
+        }
+        if !apply_mask {
+            return true;
+        }
+        // A core index too wide for a 64-bit mask is ALLOWED, never excluded:
+        // a mask that cannot express a core must not be read as forbidding it.
+        i >= 64 || (allowed & (1u64 << i)) != 0
+    };
 
     // 1. An idle consumer core. Prefer affinity among idle cores, then lowest.
     let mut idle_pick: Option<usize> = None;
@@ -459,6 +524,68 @@ pub extern "C" fn sched_watch_selftest_rs() -> u32 {
     if sched_place_rs(f.as_ptr(), 2, NORM, 9) != 0 {
         fail |= 1 << 10;
     }
+    // ---- #affinity: THE MASK. ----------------------------------------------
+    // Every check here is written so that a sched_place_masked_rs() which
+    // IGNORED its mask entirely would fail it, because that is the failure this
+    // suite exists to catch: a mask parameter that is accepted, plumbed and
+    // never consulted looks identical to a working one on every other metric.
+    {
+        // Two idle consumer cores. Unmasked, prev_cpu decides. Masked to cpu1
+        // only, cpu1 must be chosen even when prev_cpu says cpu0.
+        let m = [cs(0, 0, PRIO_NONE, true), cs(0, 0, PRIO_NONE, true)];
+        if sched_place_masked_rs(m.as_ptr(), 2, NORM, 0, 0b11) != 0 {
+            fail |= 1 << 12; // unconstrained: prev_cpu 0 wins
+        }
+        if sched_place_masked_rs(m.as_ptr(), 2, NORM, 0, 0b10) != 1 {
+            fail |= 1 << 13; // THE check a no-op mask fails
+        }
+        if sched_place_masked_rs(m.as_ptr(), 2, NORM, 1, 0b01) != 0 {
+            fail |= 1 << 14; // and in the other direction
+        }
+
+        // PREEMPTION honours the mask. cpu0 runs LOW and cpu1 runs NORM, so
+        // unmasked a RT arrival preempts cpu0 (the weakest victim). Masked to
+        // cpu1, it must preempt cpu1 instead. This is the step the pre-existing
+        // prev_cpu hint never covered, and the compositor takes it on almost
+        // every wake.
+        let pm = [cs(0, 0, LOW, true), cs(0, 0, NORM, true)];
+        if sched_place_masked_rs(pm.as_ptr(), 2, RT, 9, u64::MAX) != (0 | PLACE_PREEMPT) {
+            fail |= 1 << 15;
+        }
+        if sched_place_masked_rs(pm.as_ptr(), 2, RT, 9, 0b10) != (1 | PLACE_PREEMPT) {
+            fail |= 1 << 16;
+        }
+
+        // SOFT, NOT HARD. A mask naming only a NON-CONSUMER core must be
+        // DROPPED, not obeyed: the task goes to a consumer rather than being
+        // stranded to honour a preference. A hard implementation returns -1
+        // here and hangs the task; that is the bug this check exists for.
+        let sc = [cs(4, 4, RT, true), cs(0, 0, PRIO_NONE, false)];
+        if sched_place_masked_rs(sc.as_ptr(), 2, NORM, 9, 0b10) != 0 {
+            fail |= 1 << 17;
+        }
+        // Same rule when the mask names a core that does not exist at all.
+        if sched_place_masked_rs(m.as_ptr(), 2, NORM, 9, 1u64 << 40) < 0 {
+            fail |= 1 << 18;
+        }
+
+        // A mask of 0 and a mask of all-ones both mean "no constraint", so a
+        // caller with nothing to say need not special-case anything.
+        if sched_place_masked_rs(m.as_ptr(), 2, NORM, 1, 0)
+            != sched_place_masked_rs(m.as_ptr(), 2, NORM, 1, u64::MAX)
+        {
+            fail |= 1 << 19;
+        }
+
+        // The unmasked wrapper must be EXACTLY the all-ones masked call, or the
+        // two policies have already drifted.
+        if sched_place_rs(pm.as_ptr(), 2, RT, 9)
+            != sched_place_masked_rs(pm.as_ptr(), 2, RT, 9, u64::MAX)
+        {
+            fail |= 1 << 20;
+        }
+    }
+
     if sched_place_rs(f.as_ptr(), 2, NORM, 1) != 0 {
         fail |= 1 << 11; // affinity to a non-consumer must not strand either
     }

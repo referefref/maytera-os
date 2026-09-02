@@ -421,6 +421,21 @@ int main(int argc, char **argv) {
                             term_redraw();
                         }
                     }
+                    else if (keycode == GUI_KEY_TAB) {
+                        // [tabcomp]: command/path completion. Previously
+                        // unhandled here (keycode 0x09, and key_char '\t' is
+                        // below ' ' so it also missed the printable-char
+                        // branch below) - Tab was a silent no-op. Nothing
+                        // upstream of this switch (term_menu_event/
+                        // term_search_key_event/term_layout_event, all
+                        // checked above) claims GUI_KEY_TAB either; the only
+                        // other GUI_KEY_TAB use in this app is term_prefs.c's
+                        // own modal Preferences dialog, a separate event
+                        // loop. See term_shell.c's term_shell_complete() for
+                        // the completion rules and why they are what they
+                        // are.
+                        term_shell_complete();
+                    }
                     else if (keycode == GUI_KEY_PGUP) {
                         // #206: page back through scrollback. Deliberately
                         // NOT routed through gui_scroll_key() - that function

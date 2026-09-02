@@ -5,13 +5,18 @@
 
 #include "../types.h"
 #include "async_io.h"
-
-// ============================================================================
-// Memory Barriers
-// ============================================================================
-
-// Compiler barrier (prevent reordering)
-#define compiler_barrier() __asm__ volatile("" ::: "memory")
+// #SMPGLOBALS 2026-08-30: USE THE SHARED BARRIER, DO NOT FORK IT.
+// This header used to #define its own zero-arg compiler_barrier() macro, one
+// line with the same body as sync/spinlock.h's compiler_barrier(void) inline.
+// A macro and a function of one name cannot coexist, so any translation unit
+// that reached both failed to compile - which is why proc/process.h documents
+// (at its proc_mm_lock() declaration) that it deliberately does NOT include
+// sync/spinlock.h, and why a per-process lock could not be a plain
+// spinlock_t field in the PCB. A forked one-line copy of a shared primitive
+// had shaped the locking design of an unrelated subsystem.
+// Deleting the copy removes the collision by construction rather than by
+// everyone routing around it.
+#include "../sync/spinlock.h"
 
 // Store fence (ensure all stores are visible)
 #define smp_store_release(p, v) do {    \

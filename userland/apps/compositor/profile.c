@@ -683,7 +683,59 @@ static unsigned int profile_hash_buf(const char *buf, int len) {
 // because only the write advances the reference. That also fixes the OTHER
 // call sites for free (main.c:400 startup, main.c:1615 widget-drag release),
 // which likewise wrote the file without touching the old baseline.
+// (#wizdock) main.c's compositor.h typedef is "typedef int bool" - a 4-byte
+// int, NOT the 1-byte _Bool that profile.c gets from pwd.h/unistd.h's
+// stdbool.h. Declaring this extern as "bool" here would read one byte of a
+// four-byte object (or the reverse) depending on struct layout luck. It is
+// declared as the int it actually is, matching main.c's real storage, not
+// the name it is spelled with there.
+extern int g_setup_pending;
+
 void profile_tick(void) {
+    // (#wizdock) THE WIZARD IS THE AUTHORITATIVE WRITER DURING FIRST BOOT.
+    //
+    // write_dock_style() (userland/apps/setup/main.rs) appends a
+    // "dock_style: N" line DIRECTLY to /UIPROFIL.YML on purpose (see its own
+    // comment: root's home during OOBE is "/", the same fallback path
+    // profile_load() already uses, so a fresh account's first session picks
+    // it up without needing a real per-user home to exist yet). It is a raw
+    // append, not a call through this file's machinery, because at that
+    // point there IS no real account yet for profile_save() to attribute the
+    // write to.
+    //
+    // profile_save() does not know about that append. It does not read the
+    // old file and merge; it REBUILDS the whole file from this process's
+    // OWN live state (profile_build()) and replaces it. If this function's
+    // periodic tick fires between the wizard's write_dock_style_live()
+    // (which only takes effect once dock_style_poll() next runs, throttled
+    // to every 10 ticks - #387) and that poll catching up, g_dock_style is
+    // still the OLD value in THIS process's memory. Any profile_save() in
+    // that window - and one is likely, since the very next wizard substep
+    // sets the wallpaper via a real, SYNCHRONOUS syscall (SYS_SET_WALLPAPER)
+    // that changes profile_build()'s hash on the next frame, which is
+    // exactly what wakes this function up - rewrites the ENTIRE file from
+    // that stale memory and erases the wizard's own correct, already-landed
+    // append. REPORTED by the owner (2026-08-27): dock style reverted to
+    // the Maytera default the instant the wizard finished. This mechanism is
+    // CODE-TRACED, not independently timed live: it is the only path found
+    // that explains the report without contradicting anything already
+    // measured about profile_load()/profile_save() sharing the correct
+    // fallback path.
+    //
+    // The fix is not a tighter poll (that shrinks the window, it does not
+    // close it) and not a merge-on-write (that reintroduces the "two
+    // sources of truth" shape #231 already removed). It is ownership: while
+    // the wizard is up, IT is the one persisting choices to this exact file,
+    // on purpose, synchronously, per choice. This function's OWN periodic
+    // full-rewrite has nothing useful to say yet (the compositor's live
+    // desktop state here is a generic pre-personalisation default, not the
+    // user's choices) and every time it fires in this window it can only
+    // make things worse. Suppressed for exactly the wizard's lifetime;
+    // profile_tick() resumes the instant g_setup_pending clears (Apply, or
+    // the reduced #126 flow's own finish), which is also when this
+    // process's own live state has actually caught up to being personal.
+    if (g_setup_pending) return;
+
     static int throttle = 0;
     if (++throttle < 30) return;            // ~ once a second
     throttle = 0;

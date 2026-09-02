@@ -362,6 +362,36 @@ struct FarPtr {
 const FARPTR_NULL: FarPtr = FarPtr { sel: 0, off: 0 };
 
 static mut PMVEC: [FarPtr; 256] = [FARPTR_NULL; 256];
+// (rakbd) One "installed" line per vector per run; see the 0205h arm.
+static mut PMVEC_LOGGED: [bool; 256] = [false; 256];
+
+/// (rakbd) Read back the protected-mode handler a client installed with
+/// DPMI 0205h, for the ONE caller that now needs to DELIVER to it.
+///
+/// Until this existed, PMVEC was write-only from the host's point of view: the
+/// file's own comment two hundred lines up says "nothing in this kernel ever
+/// DELIVERS to them", and that was the whole reason a DOS/4GW guest which
+/// installs its keyboard ISR this way received nothing. A faithful store is
+/// indistinguishable from a working install from the guest's side, which is why
+/// the gap survived so long.
+///
+/// Returns 0 and fills sel/off when a non-null handler is installed for `vec`,
+/// -1 otherwise. An unset vector reads back as selector 0 offset 0, which is
+/// not a handler, so it is reported as absent rather than delivered to.
+#[no_mangle]
+pub unsafe extern "C" fn dpmi_pmvec_get_rs(vec: u8, out_sel: *mut u16, out_off: *mut u32) -> i32 {
+    let h = unsafe { PMVEC[vec as usize] };
+    if h.sel == 0 && h.off == 0 {
+        return -1;
+    }
+    if !out_sel.is_null() {
+        unsafe { *out_sel = h.sel };
+    }
+    if !out_off.is_null() {
+        unsafe { *out_off = h.off };
+    }
+    0
+}
 static mut EXCVEC: [FarPtr; 32] = [FARPTR_NULL; 32];
 
 // (#211) 0E01: what the client last asked for. Recorded so the request is
@@ -386,7 +416,100 @@ static mut NPX_EMU_CALLS: u32 = 0;
 // arena, so a vector nobody has set reads back as a real address holding a
 // real IRET.
 const RMVEC_INIT: u32 = (0xF000u32 << 16) | 0xFF53u32;
-static mut RMVEC: [u32; 256] = [RMVEC_INIT; 256];
+
+/// (rakbd2) THE VECTORS WHOSE CORRECT DEFAULT IS NOTHING AT ALL.
+///
+/// 60h-66h are the DOS "user interrupt" vectors. Neither the BIOS nor DOS ever
+/// writes them, so on a real machine 0200h answers 0000:0000 for each of them
+/// until a TSR claims one, and a program that wants a vector of its own SCANS
+/// them for exactly that value.
+///
+/// Seeding them with the IRET stub, as every other vector legitimately is,
+/// tells such a program that all six are taken. MEASURED on Red Alert 1.04 DOS:
+/// its Install_Keyboard_Interrupt scans 60h..65h with 0200h, exhausts the loop,
+/// and returns failure WITHOUT ever calling 0204h/0205h/0201h to install its
+/// INT 9 handler. The keyboard was never installed, so no amount of delivery
+/// work on our side could be reached; see dos/dosexec.c dos_vec_seed_free() for
+/// the disassembly and the census that proves it.
+///
+/// This is the same shape as the 33h mouse bug (raplay): a blanket default
+/// defeats a guest that INSPECTS a vector's value. There the wrong answer was
+/// "an IRET is there"; here it is "something is there". One predicate, stated
+/// once, so the answer cannot depend on which of the two seeding paths ran.
+const fn rmvec_default(v: usize) -> u32 {
+    if v >= 0x60 && v <= 0x66 {
+        0
+    } else {
+        RMVEC_INIT
+    }
+}
+
+const fn rmvec_defaults() -> [u32; 256] {
+    let mut t = [RMVEC_INIT; 256];
+    let mut v = 0usize;
+    while v < 256 {
+        t[v] = rmvec_default(v);
+        v += 1;
+    }
+    t
+}
+
+static mut RMVEC: [u32; 256] = rmvec_defaults();
+
+/// (#dpmi301) WHICH VECTORS THE GUEST INSTALLED ITSELF, as opposed to the stub
+/// this host seeded.
+///
+/// The two cannot be told apart by VALUE. dpmi_rmvec_seed_rs() overwrites RMVEC
+/// for every vector at launch with whatever bytes dos_vec_seed_stub() chose, so
+/// comparing an entry against rmvec_default() would classify every seeded
+/// vector as guest-installed and hand our own IRET stub to an interpreter as
+/// though it were a driver. A one-bit provenance flag is exact and needs no
+/// heuristic: it is set ONLY by the 0201h arm, i.e. only where a
+/// protected-mode client deliberately published a real-mode entry point.
+///
+/// WHY THIS EXISTS, MEASURED on Discworld II (build 2270, run3-inifmt):
+/// the Miles Sound System does NOT reach its real-mode digital-audio driver
+/// with DPMI 0301h, and never issues 0301h at all. It reads DIG.INI, loads
+/// SBLASTER.DIG into DOS memory with 0100h, publishes the driver's real-mode
+/// entry point as INT 66h with 0201h, and then calls the driver with 0300h,
+/// carrying the AIL function number in AX (0300h, 0301h and 0304h were the
+/// three observed, which are AIL function numbers and NOT DPMI ones: that
+/// coincidence is exactly how this was misread as a missing DPMI 03xx family).
+/// Without this flag a host cannot tell that request apart from a request to
+/// simulate a BIOS service it happens not to implement, and answers the
+/// documented MISS, which is what left DIG_DRIVER at zero.
+static mut RMVEC_GUEST: [u8; 256] = [0u8; 256];
+
+/// Report a real-mode vector the GUEST published with 0201h.
+///
+/// Returns 1 and fills `seg`/`off` when this vector carries guest code, 0 when
+/// it does not (a host stub, or never set). A zero return means "do not
+/// execute": it is the difference between running a driver and running our own
+/// IRET.
+///
+/// # Safety
+/// `seg` and `off` may each be NULL; any non-NULL one must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn dpmi_rmvec_guest_rs(vec: u8, seg: *mut u16, off: *mut u16) -> i32 {
+    let v = vec as usize;
+    if RMVEC_GUEST[v] == 0 {
+        return 0;
+    }
+    let packed = RMVEC[v];
+    // A guest that published 0000:0000 published "nothing is here". Executing
+    // address zero is the interrupt vector table, so this is refused rather
+    // than treated as code.
+    if packed == 0 {
+        return 0;
+    }
+    if !seg.is_null() {
+        *seg = (packed >> 16) as u16;
+    }
+    if !off.is_null() {
+        *off = lo16(packed);
+    }
+    1
+}
 
 // (raplay) AND "THE F000:FF53 IRET STUB" IS NOT WHAT THE ARENA HOLDS FOR EVERY
 // VECTOR, WHICH IS THE WHOLE OF THIS BUG.
@@ -417,7 +540,13 @@ static mut RMVEC: [u32; 256] = [RMVEC_INIT; 256];
 // come from the same decision and cannot drift apart again.
 #[no_mangle]
 pub extern "C" fn dpmi_rmvec_seed_rs(vec: u8, seg: u16, off: u16) {
-    unsafe { RMVEC[vec as usize] = ((seg as u32) << 16) | (off as u32) };
+    // (#dpmi301) Seeding is the HOST writing a stub, so it CLEARS the
+    // guest-provenance bit. Without this a relaunch would inherit the previous
+    // guest's claim on a vector that now holds our own stub bytes.
+    unsafe {
+        RMVEC[vec as usize] = ((seg as u32) << 16) | (off as u32);
+        RMVEC_GUEST[vec as usize] = 0;
+    };
 }
 static mut LOCK_CALLS: u32 = 0;
 static mut UNLOCK_CALLS: u32 = 0;
@@ -765,7 +894,14 @@ pub unsafe extern "C" fn dpmi_int31_rs(r: *mut DpmiRegs) {
             census(ax, CLS_SERVICED);
             let v = (r.ebx & 0xFF) as usize;
             let packed = ((lo16(r.ecx) as u32) << 16) | (lo16(r.edx) as u32);
-            unsafe { RMVEC[v] = packed };
+            // (#dpmi301) THE PROVENANCE BIT. Set here and nowhere else: this is
+            // the one call by which a client states "there is real-mode code of
+            // mine at this vector", which is exactly the fact 0300h needs in
+            // order to EXECUTE it rather than MISS it.
+            unsafe {
+                RMVEC[v] = packed;
+                RMVEC_GUEST[v] = 1;
+            };
             succeed(r);
         }
 
@@ -1087,6 +1223,28 @@ pub unsafe extern "C" fn dpmi_int31_rs(r: *mut DpmiRegs) {
             census(ax, CLS_SERVICED);
             let v = (r.ebx & 0xFF) as usize;
             unsafe { PMVEC[v] = FarPtr { sel: lo16(r.ecx), off: r.edx } };
+            // (rakbd) SAY WHICH VECTOR, ONCE PER VECTOR.
+            //
+            // Before this, a protected-mode client could install an interrupt
+            // handler and the whole event left NO trace anywhere: 0205h stored
+            // it, 0204h could read it back, and nothing else in the kernel ever
+            // looked. So "does this guest own INT 9?" was unanswerable from a
+            // serial log, and the honest answer for Red Alert (it does, through
+            // THIS call and not through the low table dos_vec_hooked() reads)
+            // could not be reached without a custom build. One line per vector
+            // per run is cheap and it is the line that settles the question.
+            unsafe {
+                if !PMVEC_LOGGED[v] {
+                    PMVEC_LOGGED[v] = true;
+                    kprintf(
+                        b"[dpmi] INT %02Xh PROTECTED-MODE handler installed by the guest (0205h) -> %04x:%08x\n\0"
+                            .as_ptr(),
+                        v as u32,
+                        lo16(r.ecx) as u32,
+                        r.edx,
+                    );
+                }
+            }
             succeed(r);
         }
 
@@ -1619,7 +1777,12 @@ pub unsafe extern "C" fn dpmi_host_reset_rs() {
         }
         let mut i = 0;
         while i < 256 {
-            RMVEC[i] = RMVEC_INIT;
+            // (rakbd2) NOT one constant for all 256: rmvec_default() is the one
+            // place that decides, so a reset cannot re-introduce the "every
+            // user vector is taken" answer the static initialiser no longer
+            // gives.
+            RMVEC[i] = rmvec_default(i);
+            RMVEC_GUEST[i] = 0;   // (#dpmi301) provenance resets with the table
             i += 1;
         }
         SEEN_N = 0;
@@ -1644,6 +1807,7 @@ pub unsafe extern "C" fn dpmi_host_reset_rs() {
         let mut v = 0;
         while v < 256 {
             PMVEC[v] = FARPTR_NULL;
+            PMVEC_LOGGED[v] = false;   // (rakbd) a second launch must log again
             v += 1;
         }
         let mut e = 0;
@@ -2131,6 +2295,28 @@ pub unsafe extern "C" fn dpmi_selftest_rs(out_checks: *mut u32) -> i32 {
         st_check(!cf(&r), b"0200 set CF\0".as_ptr());
         st_check(lo16(r.ecx) == 0xF000, b"0200 unset vector CX != F000\0".as_ptr());
         st_check(lo16(r.edx) == 0xFF53, b"0200 unset vector DX != FF53\0".as_ptr());
+
+        // (rakbd2) ...AND THE USER INTERRUPT VECTORS READ BACK AS FREE.
+        // 60h-66h must answer 0000:0000, because that is what a real DOS
+        // machine answers and it is what a guest scanning for a vector of its
+        // own is looking for. Asserted for the WHOLE range and for 5Fh/67h on
+        // either side of it, so a fencepost cannot pass this test.
+        let mut v = 0x5Fu32;
+        while v <= 0x67 {
+            let mut r = blank();
+            r.eax = 0x0200;
+            r.ebx = v;
+            call31(&mut r);
+            st_check(!cf(&r), b"0200 user-vector scan set CF\0".as_ptr());
+            let free = (0x60..=0x66).contains(&v);
+            let packed = ((lo16(r.ecx) as u32) << 16) | (lo16(r.edx) as u32);
+            if free {
+                st_check(packed == 0, b"0200 user vector 60h-66h is not free\0".as_ptr());
+            } else {
+                st_check(packed == RMVEC_INIT, b"0200 vector outside 60h-66h lost its stub\0".as_ptr());
+            }
+            v += 1;
+        }
 
         let mut r = blank();
         r.eax = 0x0201;

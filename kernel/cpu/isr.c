@@ -1,6 +1,8 @@
 // isr.c - Interrupt Service Routines implementation
 #include "isr.h"
+#include "../drivers/keymap.h"   // #DOSRING3: THE shared set-1 keymap
 #include "mono.h"
+#include "inputlat.h"   // #affinity: input-to-present latency instrument
 #include "pic.h"
 #include "apic.h"        // #62: lapic_eoi() for the redundant tick source
 #include "../fs/bootlog.h"  // #62: the arming result must reach the stick
@@ -18,6 +20,20 @@ volatile int interrupt_requested = 0;
 
 // Keyboard buffer
 #define KEYBOARD_BUFFER_SIZE 256
+
+// #affinity: the arrival-timestamp FIFO in rustkern/inputlat.rs is paired
+// one-to-one with THIS ring, so it must be at least as deep or a burst would
+// overflow it while this ring still accepts and the pairing would skew. Locked
+// here rather than asserted in a comment; see rustkern/cpuobs.rs on #143 for
+// what happens when two constants agree only because prose says they do.
+_Static_assert(KEYBOARD_BUFFER_SIZE <= 256,
+               "inputlat: INPUTLAT_RING (256) must be >= KEYBOARD_BUFFER_SIZE");
+
+// #affinity NEGATIVE CONTROL. See cpu/inputlat.h. 0 = off, and off is the only
+// shipping value. Non-zero busy-delays that many REAL microseconds inside
+// keyboard_get_char() before the delivery stamp, so a working instrument MUST
+// report S_WAIT rising by that amount and a non-working one will not move.
+volatile uint64_t g_inputlat_inject_us = 0;
 // #243: SIXTEEN bits wide, not eight. The cooked-code namespace ran out of
 // byte: 0x00-0x7F is ASCII, 0x80-0x8F is arrows+F-keys, 0x90-0x9D is releases
 // and modifiers, 0xA0-0xFE is `printable | 0x80` releases. There was no free
@@ -41,6 +57,11 @@ static void kb_push(uint16_t code) {
     if (next_write != kb_read_idx) {   // full: drop, as before
         keyboard_buffer[kb_write_idx] = code;
         kb_write_idx = next_write;
+        // #affinity: stamp the arrival time of the scancode that produced this
+        // cooked key. INSIDE the accept branch deliberately: the drop path
+        // above must drop here too, or the FIFO pairing that makes S_WAIT an
+        // exact per-key interval would skew by one on every overflow.
+        inputlat_push_rs();
     }
 }
 
@@ -63,6 +84,8 @@ volatile uint64_t g_kbd_irq_scancodes = 0;
 // own INT 9 ISR that reads port 0x60 and maintains a Keyboard[] scancode array.
 #define DOS_SC_RING 256
 volatile int      g_dos_scancode_tap = 0;
+// #DOSRING3: rustkern/rawsc.rs, the focus-scoped Ring-3 raw scancode ring.
+extern void rawsc_push_rs(uint8_t b);
 static volatile uint8_t  dos_sc_ring[DOS_SC_RING];
 static volatile uint16_t dos_sc_rd = 0, dos_sc_wr = 0;
 // #763: the ring used to have exactly ONE producer (the IRQ1 ISR), so an
@@ -186,60 +209,32 @@ int dos_scancode_get(void) {
 }
 void dos_scancode_clear(void) { dos_sc_rd = dos_sc_wr = 0; }
 
-// US keyboard scancode to ASCII mapping (set 1)
-static const char scancode_to_ascii[128] = {
-    0,    27,  '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
-    '\t', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', '[', ']', '\n',
-    0,    'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', ';', '\'', '`',
-    0,    '\\', 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '/', 0,
-    '*',  0,   ' ', 0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
-    0,    0,   0,   0,   0,   0,   '-', 0,   0,   0,   '+', 0,   0,
-    0,    0,   0,   0,   0,   0,   0,   0,   0,
-};
-
-// Shifted characters
-static const char scancode_to_ascii_shift[128] = {
-    0,    27,  '!', '@', '#', '$', '%', '^', '&', '*', '(', ')', '_', '+', '\b',
-    '\t', 'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P', '{', '}', '\n',
-    0,    'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L', ':', '"', '~',
-    0,    '|', 'Z', 'X', 'C', 'V', 'B', 'N', 'M', '<', '>', '?', 0,
-    '*',  0,   ' ', 0,   0,   0,   0,   0,   0,   0,   0,   0,   0,
-    0,    0,   0,   0,   0,   0,   '-', 0,   0,   0,   '+', 0,   0,
-    0,    0,   0,   0,   0,   0,   0,   0,   0,
-};
+// The set-1 keymap now lives in drivers/keymap.c so the Ring-3 DOS host
+// (#DOSRING3) links the SAME table rather than re-typing it. The ISR's modifier
+// STATE stays here, below: that is hardware state, not a mapping.
 
 // ---------------------------------------------------------------------------
-// The two shared keyboard primitives. drivers/keyboard.h has DECLARED both
-// since the driver was written and NOTHING EVER DEFINED THEM, so the first
-// caller to use one got a link error rather than a working function. That is
-// why the tables above have no other consumer: everything that needed a
-// scancode-to-character mapping had no shared one to call.
+// KEYBOARD MODIFIER STATE. This is the live hardware state the IRQ path
+// maintains, and it stays here.
 //
-// They are defined HERE, in the same translation unit as the tables and the
-// modifier state, so a caller can never see a keymap that disagrees with the
-// one the ISR itself uses. Declared in drivers/keyboard.h; the forward
-// declarations of the statics below keep them where they already are.
+// Its companion, keyboard_scancode_to_char(), used to be defined here too, on
+// the reasoning that keeping it beside the tables and this state meant a caller
+// could never see a keymap disagreeing with the ISR's own. That property is
+// preserved and strengthened by moving the tables to drivers/keymap.c: there is
+// still exactly ONE table, and now code that CANNOT compile cpu/isr.c - the
+// Ring-3 DOS host, #DOSRING3 - links that same one instead of re-typing it.
+// A second, re-typed table is how the Ring-0 and Ring-3 DOS paths would come to
+// disagree about what the user pressed, with no test catching it until a guest
+// read the wrong character.
+//
+// keyboard_get_modifiers() stays here because it reads THIS state; only the
+// pure (scancode, modifiers) -> char function is shared.
 // ---------------------------------------------------------------------------
 static volatile uint8_t shift_pressed;
 static volatile uint8_t ctrl_pressed;
 static volatile uint8_t alt_pressed;
 static volatile uint8_t caps_lock;
 
-char keyboard_scancode_to_char(uint8_t scancode, uint32_t modifiers) {
-    if (scancode >= 128) return 0;
-    char c = (modifiers & KEY_MOD_SHIFT) ? scancode_to_ascii_shift[scancode]
-                                         : scancode_to_ascii[scancode];
-    if ((modifiers & KEY_MOD_CAPS) && c >= 'a' && c <= 'z')
-        c = (char)(c - 'a' + 'A');
-    else if ((modifiers & KEY_MOD_CAPS) && (modifiers & KEY_MOD_SHIFT) &&
-             c >= 'A' && c <= 'Z')
-        c = (char)(c - 'A' + 'a');
-    if (modifiers & KEY_MOD_CTRL) {
-        if (c >= 'a' && c <= 'z')      c = (char)(c - 'a' + 1);
-        else if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 1);
-    }
-    return c;
-}
 
 uint32_t keyboard_get_modifiers(void) {
     uint32_t m = 0;
@@ -617,6 +612,20 @@ void tick_redundant_arm(void) {
 // as the real PS/2 keyboard. This runs in thread or IRQ context and must NOT
 // touch the PIC/EOI (the caller owns that).
 void keyboard_process_scancode(uint8_t scancode) {
+    // #affinity: T0 for the responsiveness instrument. THIS function, and not
+    // the PS/2 IRQ1 handler, because this file already documents it as the one
+    // function every scancode source funnels through (PS/2 IRQ1, the polled
+    // i8042 drain, USB HID, Bluetooth HID, the #334 serial test channel). The
+    // real iMac's keyboard is USB and never touches IRQ1, so a stamp in the
+    // PS/2 ISR would measure nothing on the machine that matters most.
+    //
+    // mono_us() is TSC-backed and valid with interrupts off, which this needs:
+    // this runs in ISR context. timer_ticks would be WRONG here for the reason
+    // cpu/mono.h gives, it counts ticks DELIVERED and not time ELAPSED, and
+    // under KVM it leaps in bursts exactly when the machine is busy, i.e.
+    // exactly when this measurement is being taken.
+    inputlat_scancode_rs(mono_us());
+
     // Ignore keyboard controller response bytes (ACK, resend, self-test pass, etc.)
     // These arrive during keyboard initialization and are not real keypresses.
     if (scancode == 0xFA || scancode == 0xFE || scancode == 0xFC ||
@@ -634,6 +643,20 @@ void keyboard_process_scancode(uint8_t scancode) {
     // #162: same ring, same bytes, minus the three media keys - see
     // dos_scancode_tap() above for why a DOS guest must not receive them.
     dos_scancode_tap(scancode);
+
+    // #DOSRING3: the SAME byte, for a RING-3 DOS host. Placed immediately
+    // beside the in-kernel tap deliberately: keyboard_process_scancode() is
+    // the one function every scancode source funnels through (PS/2 IRQ1, the
+    // polled i8042, USB HID, Bluetooth HID, the #334 test channel), which is
+    // the property #763 relied on, and putting both taps here means the Ring-0
+    // and Ring-3 DOS paths can never see different keys. rawsc_push_rs() is a
+    // single relaxed atomic load when nobody is subscribed, which is the
+    // common case, and it drops the byte rather than buffering it.
+    //
+    // NOTE this is AFTER the media-key filter above for the same reason the
+    // DOS tap is: a guest reading port 0x60 itself treats 0xE0 as a prefix it
+    // ignores and would see volume-up as a phantom 'B'.
+    rawsc_push_rs(scancode);
 
     // Handle extended scancode prefix (0xE0)
     if (scancode == 0xE0) {
@@ -720,9 +743,9 @@ void keyboard_process_scancode(uint8_t scancode) {
             if (key < 128) {
                 char base_char;
                 if (shift_pressed) {
-                    base_char = scancode_to_ascii_shift[key];
+                    base_char = keymap_set1_ascii_shift[key];
                 } else {
-                    base_char = scancode_to_ascii[key];
+                    base_char = keymap_set1_ascii[key];
                 }
                 // Only emit release events for printable ASCII (0x20-0x7E).
                 // Control chars (Backspace 0x08, Tab 0x09, Enter 0x0A, ESC 0x1B)
@@ -902,9 +925,9 @@ void keyboard_process_scancode(uint8_t scancode) {
             // Convert scancode to ASCII
             char c;
             if (shift_pressed) {
-                c = scancode_to_ascii_shift[scancode];
+                c = keymap_set1_ascii_shift[scancode];
             } else {
-                c = scancode_to_ascii[scancode];
+                c = keymap_set1_ascii[scancode];
             }
             // Apply Caps Lock: inverts case for alphabetic characters only
             if (caps_lock) {
@@ -1012,12 +1035,24 @@ int keyboard_get_char(void) {
         return 0;  // No character available
     }
 
+    // #affinity NEGATIVE CONTROL, default OFF (see cpu/inputlat.h). Burning the
+    // core here is exactly the #426 anti-pattern, and that is the point: it is
+    // a deliberate, operator-armed fault injection whose only job is to make
+    // the instrument move by a KNOWN amount, so that a number which does not
+    // move can be recognised as a dead hook rather than as good news. The cost
+    // on a shipping boot is one load of a global that nothing ever writes.
+    if (g_inputlat_inject_us) mono_busy_delay_us(g_inputlat_inject_us);
+
     // #243: the ring element is uint16_t, so this widens rather than truncates;
     // KEY_HOME (0x100) and friends survive the trip. The old `(unsigned char)`
     // cast would have silently masked them to 0x00.
     int c = (int)keyboard_buffer[kb_read_idx];
     kb_read_idx = (kb_read_idx + 1) % KEYBOARD_BUFFER_SIZE;
     g_kbd_consumed++;   // #334: an injected or real key was actually CONSUMED
+    // #affinity: T1. Stamped AFTER the ring read has committed, so the interval
+    // covers the whole time the key spent queued and unavailable to its
+    // consumer, which is the part a scheduling change can move.
+    inputlat_deliver_rs(mono_us());
     return c;
 }
 
@@ -1033,10 +1068,10 @@ int keyboard_buffer_depth(void) {
 // sets *need_shift, or -1 if the char is not typeable from these tables.
 int keyboard_ascii_to_scancode(char c, int *need_shift) {
     for (int sc = 0; sc < 128; sc++) {
-        if (scancode_to_ascii[sc] == c) { if (need_shift) *need_shift = 0; return sc; }
+        if (keymap_set1_ascii[sc] == c) { if (need_shift) *need_shift = 0; return sc; }
     }
     for (int sc = 0; sc < 128; sc++) {
-        if (scancode_to_ascii_shift[sc] == c) { if (need_shift) *need_shift = 1; return sc; }
+        if (keymap_set1_ascii_shift[sc] == c) { if (need_shift) *need_shift = 1; return sc; }
     }
     if (need_shift) *need_shift = 0;
     return -1;

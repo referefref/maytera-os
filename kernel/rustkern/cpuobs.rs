@@ -85,6 +85,19 @@ pub extern "C" fn sched_cpuobs_note_rs(pid: u32, from_cpu: i32, to_cpu: u32) {
     }
     SEEN_MASK.fetch_or(1u64 << to_cpu, Ordering::Relaxed);
     SWITCHINS.fetch_add(1, Ordering::Relaxed);
+
+    // #affinity: the SAME event, broken down PER PROCESS.
+    //
+    // The counters above are system-wide totals, and a system-wide total cannot
+    // answer the only question an affinity change raises: did the migrations of
+    // THE PINNED PROCESS drop. This call is the entire measurement half of that
+    // ticket, and it costs proc/process.c nothing, because the scheduler was
+    // already handing this function (pid, from_cpu, to_cpu) on every switch-in.
+    //
+    // Bounded work: a hash plus at most 4 probe slots (rustkern/affinity.rs),
+    // lock-free and allocation-free, which it must be - this runs inside
+    // sched_schedule()'s cli() region next to the context_switch call.
+    crate::affinity::note_switchin(pid, from_cpu, to_cpu);
     // from_cpu < 0 is "never run before", which is a first dispatch and not a
     // migration. Counting it as one would make the migration total meaningless
     // on a boot that simply started a lot of processes.

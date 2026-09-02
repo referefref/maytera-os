@@ -50,6 +50,7 @@
 #define CTX_ACTION_DOCK_PIN          206   // Pin to Dock (RUNNING, identity resolved)
 #define CTX_ACTION_DOCK_UNPIN        207   // Unpin from Favorites (PINNED/MERGED)
 #define CTX_ACTION_DOCK_CHANGE_ICON  208
+#define CTX_ACTION_DOCK_SPEED        209   // #778: DOS guest windows only
 
 // #250 removable-volume icon actions (contextmenu_open_for_volume() mode).
 // Own disjoint range, same discipline as the MI_* and DOCK_* blocks above.
@@ -76,6 +77,11 @@ static int       g_ctx_dock_win_id;               // -1 = no window (pinned, not
 static char      g_ctx_dock_app_id[32];            // "" = no resolvable pid
 static char      g_ctx_dock_exec_path[128];        // "" = no resolvable identity
 static icon_id_t g_ctx_dock_icon_id;                // meaningful iff exec_path[0]
+// #778: set at contextmenu_open_for_dock() time by the SAME detector
+// taskbar.c's simpler tbmenu popup uses (dosspeed_window_is_dos()), so there
+// is one place that decides "is this a DOS guest window", not two.
+static bool g_ctx_dock_is_dos;
+static char g_ctx_dock_game[40];
 
 // #250 VOLUME mode target: which desktop icon the menu was opened on.
 // The icon index and not the kernel volume index, because desktop.c owns the
@@ -429,6 +435,10 @@ bool contextmenu_handle_mouse(int32_t x, int32_t y, bool clicked) {
             case CTX_ACTION_DOCK_CHANGE_ICON:
                 iconpicker_open(g_ctx_dock_exec_path, g_ctx_dock_icon_id);
                 break;
+            case CTX_ACTION_DOCK_SPEED:
+                // #778: g_ctx_dock_game was captured at open time above.
+                dosspeed_open(g_ctx_dock_win_id, g_ctx_dock_game);
+                break;
 
             default:
                 break;
@@ -596,12 +606,20 @@ void contextmenu_open_for_dock(int32_t x, int32_t y, int win_id, bool maximized,
         g_ctx_dock_exec_path[sizeof(g_ctx_dock_exec_path) - 1] = '\0';
     }
     g_ctx_dock_icon_id = icon_id;
+    // #778: resolved once here, at open time - never re-derived per frame.
+    // Covers exactly the "RUNNING, identity NOT resolved" case this file's
+    // own comment above describes for a DOS guest (app_id is the shared
+    // kernel-owned host name, exec_path is empty), which is why this cannot
+    // reuse exec_path/app_id and needs its own detector.
+    g_ctx_dock_is_dos = win_id >= 0 &&
+        dosspeed_window_is_dos(win_id, g_ctx_dock_game, (int)sizeof(g_ctx_dock_game)) != 0;
 
     g_ctx_item_count = 0;
     if (win_id >= 0) {
         ctx_push_action("Show Window", CTX_ACTION_DOCK_SHOW);
         ctx_push_action("Minimize",    CTX_ACTION_DOCK_MINIMIZE);
         ctx_push_action(maximized ? "Restore" : "Maximize", CTX_ACTION_DOCK_MAXIMIZE);
+        if (g_ctx_dock_is_dos) ctx_push_action("Speed...", CTX_ACTION_DOCK_SPEED);
         ctx_push_sep();
         ctx_push_action("Close", CTX_ACTION_DOCK_CLOSE);
         if (g_ctx_dock_app_id[0]) ctx_push_action("Force Quit", CTX_ACTION_DOCK_FORCE_QUIT);

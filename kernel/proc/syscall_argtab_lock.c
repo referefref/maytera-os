@@ -167,6 +167,16 @@ _Static_assert(sizeof(gfs_edge_view_t) == 48,
 _Static_assert(sizeof(diskimg_info_t) == 288,
                "#739 argtab: SZ_DISKIMG_INFO in rustkern/argtab.rs is stale");
 
+// #VOLAPI: dimg_vol_t rides the SAME argtab entry and therefore the same
+// 288-byte validated write window. That is a deliberate width lock, not a
+// coincidence: the reserved[] tail exists to hold it. If someone "tidies up"
+// the padding, this assert fires here rather than the validator silently
+// proving 288 writable bytes for a struct that is now 150, and letting the two
+// commands disagree about how much of the user buffer is theirs.
+_Static_assert(sizeof(dimg_vol_t) == 288,
+               "#VOLAPI: dimg_vol_t must stay 288 bytes; it shares syscall 361's "
+               "SZ_DISKIMG_INFO argtab entry with diskimg_info_t");
+
 // #306: SZ_INST_TARGET in rustkern/argtab.rs is 16. If inst_target_t grows and
 // that constant does not, the validator would prove fewer bytes user-writable
 // than sys_inst_enum() actually writes, which is exactly the hole this lock

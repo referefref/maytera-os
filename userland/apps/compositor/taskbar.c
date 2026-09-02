@@ -648,6 +648,28 @@ static int tb_icon_miss_should_log(const char *title) {
 // three legacy taskbar styles' task-list tiles ever called
 // tb_icon_for_title() directly).
 static icon_id_t tb_icon_for_window(const wm_window_info_t *w) {
+    // (#dosicon) THE #223 app_id CHECK BELOW (a few lines down) NEVER FIRES
+    // FOR A DOS GUEST WINDOW, and never has. MEASURED (throwaway VM, TESTHOOK=1
+    // build, Commander Keen 5 launched via the Start menu): kernel/gui/window.c's
+    // sys_wm_get_windows() leaves buf[n].app_id empty unless win->owner_pid != 0
+    // (see its own "owner_pid == 0 is 'no Ring-3 owner' by construction"
+    // comment), and kernel/dos/dosexec.c - which owns every DOS guest window,
+    // both dos_launch() and dos_launch_kernel(), i.e. a real Start-menu click
+    // and this project's own MENUITEM test verb alike - never sets owner_pid
+    // on the window it creates. So w->app_id is "", not "dos"/"dosrun", for
+    // every DOS window that has ever existed; the serial log confirms it:
+    // "[taskbar] icon: ... window 3 ('KEEN5 (DOS)', app_id='<empty>') ...".
+    // The #223 fix a few lines down was verified against a claim, not this
+    // log line, and never actually fired.
+    //
+    // Use the SAME shared detector #778's per-window Speed dialog already had
+    // to build for this identical "RUNNING, identity NOT resolved" case
+    // (dosspeed.c's dosspeed_window_is_dos(), matching the " (DOS)" title
+    // suffix dos_guest_title() appends - the one piece of identity a DOS
+    // window actually carries) rather than inventing a second detector here.
+    if (dosspeed_window_is_dos(w->id, NULL, 0)) {
+        return ICON_DOSAPP;
+    }
     if (w->app_id[0]) {
         sm_fav_info_t info;
         if (startmenu_find_by_app_id(w->app_id, &info)) {
@@ -1645,6 +1667,25 @@ static void tray_draw_battery(int x, int y, int pct, int state) {
 // class as the performance popup (g_perf_open) this file already has).
 // ---------------------------------------------------------------------------
 static int     g_batt_card_open = 0;
+// g_bc_x/y/w/h are the FINALIZED (clamped) on-screen rect, recomputed by
+// draw_battery_card() every frame and read back by the hit-test below - they
+// are an OUTPUT of that function, not state that should feed its own next
+// computation.
+//
+// #battpop: g_bc_anchor_x is the fixed tray-icon-center anchor, set ONCE by
+// battery_card_toggle() and never written anywhere else. Before this fix,
+// draw_battery_card() read its anchor from g_bc_x itself (the PREVIOUS
+// frame's finalized LEFT EDGE, not a center) and then wrote g_bc_x back to
+// that same left edge - so each redraw recomputed "center - w/2" against a
+// value that was already a left edge, walking the card left by w/2 every
+// single frame (draw_battery_card() runs every frame the card is open,
+// gated only by g_batt_card_open, not by g_needs_redraw) until the
+// left-edge clamp pinned it at ui_px(4). That is the reported "drifts left,
+// flashing, until it reaches the far left and stops" bug - a pure
+// self-referential state bug in the anchor variable, present at any
+// ui_scale/present_scale (not a scale-conversion bug, though it was
+// verified at both anyway per the bug report's suspicion).
+static int32_t g_bc_anchor_x = 0;
 static int32_t g_bc_x = 0, g_bc_y = 0, g_bc_w = 0, g_bc_h = 0;
 
 static const char *battery_state_label(int state) {
@@ -1660,7 +1701,7 @@ static void battery_card_toggle(int anchor_x) {
     if (g_batt_card_open) { g_batt_card_open = 0; g_needs_redraw = true; return; }
     if (g_batt_present != 1) return;   // nothing to show; should not be reachable (icon is hidden)
     g_batt_card_open = 1;
-    g_bc_x = anchor_x;   // finalized (clamped) in draw_battery_card()
+    g_bc_anchor_x = anchor_x;   // fixed for the life of this open card; see comment above
     g_needs_redraw = true;
 }
 
@@ -1697,13 +1738,15 @@ static void draw_battery_card(void) {
     if (g_bc_w < ui_px(120)) g_bc_w = ui_px(120);
     g_bc_h = PAD * 2 + LINE_H * 2;
 
-    int32_t x = g_bc_x - g_bc_w / 2;
+    // #battpop: always derive from the fixed anchor, never from g_bc_x
+    // itself (see the field comments above for why the old version drifted).
+    int32_t x = g_bc_anchor_x - g_bc_w / 2;
     if (x < ui_px(4)) x = ui_px(4);
     if (x + g_bc_w > g_fb_width - ui_px(4)) x = g_fb_width - ui_px(4) - g_bc_w;
     int32_t y = g_tray_bar_top ? (g_tray_bar_y + g_tray_bar_h + ui_px(4))
                                 : (g_tray_bar_y - g_bc_h - ui_px(4));
     if (y < ui_px(2)) y = ui_px(2);
-    g_bc_x = x; g_bc_y = y;
+    g_bc_x = x; g_bc_y = y;   // finalized rect for this frame; hit-test reads these
 
     draw_fill_rect(x + ui_px(3), y + ui_px(3), g_bc_w, g_bc_h, CLR_MENU_SHADOW);
     draw_fill_rect(x, y, g_bc_w, g_bc_h, CLR_MENU_BG);
@@ -2184,7 +2227,18 @@ static bool taskbar_handle_default(int32_t x, int32_t y, bool clicked) {
 // hit-test the launcher, running-app switcher, and tray. They keep the desktop
 // work area correct via taskbar_top_inset()/taskbar_bottom_inset().
 
-int g_dock_style = DOCK_DEFAULT;
+// (#wizdock) Owner decision 2026-08-27: the compiled-in starting layout is
+// Marble (DOCK_XFCE), not DOCK_DEFAULT ("classic", 0). DOCK_DEFAULT itself is
+// UNCHANGED - it still names the classic bar, and every "== DOCK_DEFAULT"
+// comparison elsewhere in this file still means exactly that. Only the
+// INITIAL VALUE of the variable changes, which is what a fresh install with
+// no /UIPROFIL.YML yet actually starts from. A machine with an existing
+// profile is unaffected: profile_load() overwrites this the moment it reads
+// a "dock_style:" key, so this line only governs the pre-personalisation
+// default (and the first-boot wizard's Finish step, which persists whatever
+// this session's g_dock_style is if the Appearance page was never visited -
+// see userland/apps/setup/main.rs's matching default).
+int g_dock_style = DOCK_XFCE;
 extern int g_draw_blend;   // draw.c global alpha (255 = opaque)
 
 // (Layout metrics LUMINA_*/CLASSIC_UNIX_*/RETRO_BENCH_* are #defined at the top of this file.)
@@ -3261,6 +3315,33 @@ void taskbar_test_open_perf_popup(int gauge) {
     g_perf_sel = gauge;
     g_needs_redraw = true;
 }
+
+// (#battpop) verification-only: click the tray battery icon by the REAL hit
+// test (unlike taskbar_test_open_perf_popup above, this does NOT bypass it) -
+// enters taskbar_handle_mouse() at the tray's live-computed battery slot
+// center, exactly the path a physical click on the icon takes, so a wrong
+// slot index/width fails here the same way DOCKCLICKSLOT would for the dock.
+// Returns 0 if the battery icon is not currently in the tray (no battery
+// present - g_tray_x[TRAY_BATTERY] is parked off-screen in that case, see
+// tray_render_core()'s slot-assignment loop).
+int taskbar_test_click_battery_tray(void) {
+    if (g_batt_present != 1) return 0;
+    int32_t x = g_tray_x[TRAY_BATTERY] + TRAY_ICON_W / 2;
+    int32_t y = g_tray_y + g_tray_h / 2;
+    return taskbar_handle_mouse(x, y, true) ? 1 : 0;
+}
+
+// (#battpop) verification-only: the battery info card's CURRENT finalized
+// rect (post-clamp) plus whether it is open at all. Lets a test script print
+// the rect on consecutive frames and assert it is identical - the direct
+// proof that draw_battery_card() is idempotent (see g_bc_anchor_x's comment
+// for the drift bug this replaced). Returns 0 if the card is closed (out
+// params left untouched).
+int taskbar_test_battery_card_rect(int32_t *x, int32_t *y, int32_t *w, int32_t *h) {
+    if (!g_batt_card_open) return 0;
+    if (x) *x = g_bc_x; if (y) *y = g_bc_y; if (w) *w = g_bc_w; if (h) *h = g_bc_h;
+    return 1;
+}
 #endif
 
 static void taskbar_render_xfce_dock(void) {
@@ -3638,17 +3719,25 @@ static bool taskbar_handle_xfce(int32_t x, int32_t y, bool clicked) {
 static int32_t g_tbmenu_win_id = -1;
 static bool    g_tbmenu_open = false;
 static int32_t g_tbmenu_x, g_tbmenu_y; // anchor point (click position)
+// #778: this popup's target is a DOS guest window, resolved once at open time
+// (taskbar_handle_right_click() below) via the SAME detector contextmenu.c's
+// richer CTX_MODE_DOCK menu uses, so a "Speed..." item can be offered here too
+// - the non-XFCE dock styles have no other per-window menu to put it in.
+static bool    g_tbmenu_is_dos = false;
+static char    g_tbmenu_game[40];
 
 bool taskbar_menu_is_open(void) { return g_tbmenu_open; }
 
 static int32_t tbmenu_width(void) {
     int32_t w = text_width("Close") + 24;
+    int32_t w2 = text_width("Speed...") + 24;
+    if (w2 > w) w = w2;
     return w < TBMENU_W ? TBMENU_W : w;
 }
 
 static void taskbar_menu_geom(int32_t *mx, int32_t *my, int32_t *h) {
     int32_t mw = tbmenu_width();
-    int32_t hh = TBMENU_IH + 4;   // one item
+    int32_t hh = TBMENU_IH * (g_tbmenu_is_dos ? 2 : 1) + 4;
     int32_t x = g_tbmenu_x, y = g_tbmenu_y;
     if (x + mw > g_fb_width)  x = g_fb_width - mw;
     if (x < 0) x = 0;
@@ -3663,6 +3752,9 @@ void taskbar_menu_render(void) {
     int32_t w = tbmenu_width();
     draw_fill_rect(x, y, w, h, CLR_MENU_BG);
     draw_rect_outline(x, y, w, h, CLR_MENU_BORDER);
+    if (g_tbmenu_is_dos) {
+        draw_text(x + 12, y + 4 + 5 + TBMENU_IH, "Speed...", CLR_MENU_TEXT);
+    }
     draw_text(x + 12, y + 4 + 5, "Close", CLR_MENU_TEXT);
 }
 
@@ -3806,6 +3898,12 @@ bool taskbar_menu_handle(int32_t x, int32_t y, int click) {
     int32_t w = tbmenu_width();
     if (x >= mx && x < mx + w && y >= my + 2 && y < my + 2 + TBMENU_IH) {
         taskbar_close_window(g_tbmenu_win_id);
+    } else if (g_tbmenu_is_dos && x >= mx && x < mx + w &&
+               y >= my + 2 + TBMENU_IH && y < my + 2 + TBMENU_IH * 2) {
+        // #778: opens the true-modal Speed dialog, which takes over input
+        // gating from here (g_modal_grabs[] "dos-speed" row) - this popup
+        // itself is a lightweight click-away one, so it closes normally below.
+        dosspeed_open(g_tbmenu_win_id, g_tbmenu_game);
     }
     g_tbmenu_open = false;
     g_tbmenu_win_id = -1;
@@ -3887,6 +3985,9 @@ bool taskbar_handle_right_click(int32_t x, int32_t y) {
     if (win_id < 0) return false;   // no app tile under the cursor
     g_tbmenu_win_id = win_id;
     g_tbmenu_x = x; g_tbmenu_y = y;
+    // #778: resolved once here, at open time, exactly like `maximized` above -
+    // never re-derived from stale per-frame state.
+    g_tbmenu_is_dos = dosspeed_window_is_dos(win_id, g_tbmenu_game, (int)sizeof(g_tbmenu_game)) != 0;
     g_tbmenu_open = true;
     g_needs_redraw = true;
     return true;

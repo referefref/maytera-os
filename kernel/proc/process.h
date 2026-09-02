@@ -3,6 +3,7 @@
 #define PROCESS_H
 
 #include "../types.h"
+#include "../sync/spinlock.h"   // #SMPGLOBALS: process_t::fd_lock
 
 // Forward declarations so we can embed pointers into other subsystems in
 // the PCB without dragging their headers into every caller of process.h.
@@ -102,6 +103,15 @@ typedef struct process {
     // memsets the whole PCB, so a recycled slot starts disarmed.
     uint64_t alarm_time;
 
+    // #wakelag: mono_ms() at which wake_sleeping_procs() moved this sleeper to
+    // READY, 0 = not a pending sleep-wake. Read once at the switch commit in
+    // sched_schedule() to time the SECOND stage (READY -> RUNNING) separately
+    // from the first (deadline -> READY). Two stages, because "the wake is
+    // late" and "the wake was on time and the dispatch is late" are different
+    // defects with different fixes, and a single end-to-end number cannot tell
+    // them apart.
+    uint64_t wl_ready_ms;
+
     // ---- #254/#601 scheduler anti-starvation ----
     //
     // ready_since: the sched tick at which this PCB was last placed on the
@@ -197,6 +207,26 @@ typedef struct process {
     // stdin/stdout/stderr (Phase A2 pre-opens them on /dev/console).
     struct file *fds[MAX_FDS];
 
+    // ---- #SMPGLOBALS: the fd table's lock ---------------------------------
+    //
+    // Guards EXACTLY this process's fds[] slots and its fd_cloexec bitmap,
+    // and nothing else. The canonical shared spinlock (sync/spinlock.h); no
+    // private lock type was invented for this.
+    //
+    // IRQSAVE, because the table is mutated with interrupts already off:
+    // proc_exit() calls fd_close_all() under cli().
+    //
+    // LEAF: nothing is called while it is held that takes another lock or can
+    // sleep. file_put() in particular is always called AFTER the release,
+    // because a final put runs the description's release op, which for a
+    // file-backed description writes to disk.
+    //
+    // Until 2026-08-30 there was no lock here at all; fs/vfs.c said so and
+    // said "when SMP lands, this table needs a per-process spinlock". It was
+    // safe only because the Big Kernel Lock serialised every syscall, so
+    // narrowing that lock without this one would have uncovered it.
+    spinlock_t fd_lock;
+
     // FD_CLOEXEC bitmap (Phase A3): bit i is set if fd i should be closed
     // by exec(). Currently unused by any consumer; Phase A3 adds
     // fcntl(F_SETFD, FD_CLOEXEC) and makes execve honor it.
@@ -221,6 +251,45 @@ typedef struct process {
     uint64_t sig_flags[64];         // SA_* flags per signal (D2)
     uint64_t sig_handler_mask[64];  // mask applied during handler run (D2)
     uint32_t return_work;
+
+    // ---- #SMPGLOBALS: this process's signal trampoline ---------------------
+    //
+    // The Ring-3 address the kernel pushes as the return address a signal
+    // handler will `ret` to; libc smuggles it in sigaction's __reserved field.
+    //
+    // WAS A SINGLE SYSTEM-WIDE GLOBAL (g_sig_trampoline), latched from the
+    // FIRST sigaction call made by ANY process on the machine and then used to
+    // build the frame for EVERY process. Userland is PIE, so every image is
+    // loaded at a different base and one process's trampoline address is
+    // meaningless in another. MEASURED on build 2284: two processes with
+    // different image bases (0x802ae00000 and 0x8020400000) both took a page
+    // fault at the SAME RIP 0x80372da390, which lies inside neither image,
+    // because both were handed a trampoline registered by an earlier process.
+    // Signal delivery was therefore broken for every process except whichever
+    // one happened to install a handler first.
+    uint64_t sig_trampoline;
+
+    // ---- #SMPGLOBALS: this task's ring-0 syscall frame -------------------
+    //
+    // The register+IRET frame that SYSRET will pop, published by
+    // syscall_check_return_work() on the way out of every syscall. It REPLACES
+    // the single global g_syscall_saved_frame that proc/syscall.asm used to
+    // write, which sys_rt_sigreturn() then read.
+    //
+    // WHY THAT GLOBAL WAS WRONG, and not only under SMP. It held the frame of
+    // the LAST syscall to finish ANYWHERE in the system. Every task has its own
+    // ring-0 stack, so the address differs per task; a rt_sigreturn issued by
+    // task A after task B had completed a syscall read B's frame and rewrote
+    // B's saved registers, RIP and user RSP with A's signal context. On one
+    // core that needs only a context switch between the two syscalls; on four
+    // it needs nothing at all. Per-CPU storage does not fix it either, because
+    // both tasks share a core's slot on a single-CPU boot and a task may
+    // migrate between the publish and the read.
+    //
+    // Held per TASK, which is the granularity that is actually correct: clone()
+    // gives every thread its own process_t and its own ring-0 stack
+    // (proc_clone(), process.c).
+    uint64_t syscall_frame;
 
     // ---- Phase D4: process groups + sessions ----
     //
@@ -419,6 +488,22 @@ typedef struct process {
     int32_t  enq_running_owner;
     uint8_t  enq_probe_tag;        // ENQ_PROBE_SELFTEST only: which construction
 
+    // #smpfix (#75): WHO SAVED THIS TASK'S KERNEL rsp, AND ON WHAT STACK.
+    //
+    // reason 1 ("rsp outside the incoming task's kernel stack") is detected at
+    // the READ side, by whichever core later selects the task. That is one
+    // switch and usually one CORE too late to say who wrote the bad value, and
+    // three campaigns have now read that dump without being able to name the
+    // writer. These fields are stamped at sched_publish_cpu(), the last point
+    // on every switch path before the switch asm executes the store of the
+    // outgoing stack pointer, so
+    // the value that is ABOUT to be saved (the live rsp, a few hundred bytes
+    // off) is recorded together with the core and the scheduler's caller.
+    uint64_t rsp_save_live;   // RSP inside sched_schedule() at the save point
+    uint64_t rsp_save_ra;     // return address of sched_schedule()'s caller
+    int32_t  rsp_save_cpu;    // core that performed the save, -1 = never saved
+    uint32_t rsp_save_n;      // how many times this task's rsp has been saved
+
     // ---- #67 pass 2: run-queue membership ----
     // 1 while this PCB is linked into some core's run queue. Set and cleared
     // ONLY under g_rq_lock, and checked by sched_rq_push() before inserting.
@@ -611,13 +696,18 @@ extern uint8_t g_dummy_fpu_area[1024];
 // whole-kernel mechanism is what was being avoided.
 //
 // Exposed as two plain functions rather than `extern spinlock_t
-// g_proc_mm_lock` so that process.h (included very widely: fs/, gui/,
-// drivers/, io/, ipc/, net/...) does NOT have to pull in sync/spinlock.h.
-// That was tried first and broke the build: io/io_ring.h #defines its own
-// zero-arg `compiler_barrier()` macro before including process.h, which
-// collides with spinlock.h's real `compiler_barrier(void)` inline function
-// of the same name. Keeping the lock itself private to process.c and
-// exporting only these two calls avoids the collision entirely.
+// g_proc_mm_lock`, historically because process.h (included very widely:
+// fs/, gui/, drivers/, io/, ipc/, net/...) could not pull in
+// sync/spinlock.h: io/io_ring.h #defined its own zero-arg
+// `compiler_barrier()` macro, which collided with spinlock.h's real
+// `compiler_barrier(void)` inline of the same name.
+//
+// THAT OBSTACLE IS GONE (#SMPGLOBALS, 2026-08-30). The private macro was a
+// forked one-line copy of the shared primitive; it has been deleted and
+// io_ring.h now includes sync/spinlock.h like everyone else, so process.h
+// includes it too and process_t carries a real spinlock_t (see fd_lock
+// above). These two functions are kept as-is because the mm lock is a single
+// global, not a per-PCB field, and nothing is improved by exposing it.
 void proc_mm_lock(void);
 void proc_mm_unlock(void);
 
@@ -1002,5 +1092,10 @@ void sched_self_running(void *vp);
 // reschedule and pokes it with an IPI so a halted core wakes; the target
 // consumes the flag in its own sched_tick().
 void sched_request_resched(uint32_t cpu);
+
+/* (rakbd) Live per-core busy-tick counter (BSP sched_tick + AP
+   sched_tick_ap), in BSP-tick units. See the definition in process.c
+   for why cpu/smp.c's own g_core_busy_ticks[] is not sufficient. */
+uint64_t sched_core_busy_ticks(uint32_t cpu);
 
 #endif // PROCESS_H

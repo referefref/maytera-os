@@ -1,5 +1,6 @@
 // syscall.c - System call implementation for MayteraOS
 #include "syscall.h"
+#include "affinity.h"   // #affinity: per-process CPU affinity + migration counts
 #include "../gui/uiscale.h"
 #include "../drivers/battery.h"   // #battmeter
 
@@ -29,9 +30,11 @@ int64_t sys_win_draw_image(int, int, int, int, int, uint32_t *);
 #include "../sync/waitq.h"   // #453: wait-queue for win_get_event blocking
 #include "../drivers/audio_pcm.h"  // Ring-3 PCM push (Ring-0 media exit, phase 1)
 // (#182) The DOS OPL2 -> Ring-3 FM bridge. dos_fm_event_t is defined in
-// dos/dosexec.c beside dos_task_t (which is where the queue lives); it is
-// mirrored here rather than moved, and the two are locked together by the
-// _Static_asserts in dosexec.c and by the size check below.
+// dos/dosfmq.c, which owns the queue (#fmbridge moved it out of dos/dosexec.c
+// because that file is compiled into the Ring-3 DOS host too, where a
+// file-scope static is a second queue nobody drains); it is mirrored here
+// rather than moved, and the two are locked together by the _Static_asserts in
+// dosfmq.c and by the size check below.
 typedef struct {
     uint64_t t_us;
     uint8_t  reg;
@@ -43,6 +46,10 @@ typedef struct {
 _Static_assert(sizeof(dos_fm_event_t) == 16, "#182 dos_fm_event_t must stay 16 bytes");
 extern int    dos_fm_drain(dos_fm_event_t *out, uint32_t max, uint32_t pid, uint32_t *dropped);
 extern size_t dos_fm_event_size(void);
+// (#fmbridge) The PRODUCER door, dos/dosfmq.c. Scalars only, so there is no
+// user pointer for this syscall to validate or fault on.
+extern int64_t dos_fm_host_call(uint32_t op, uint64_t a1, uint64_t a2,
+                                uint64_t a3, uint32_t pid);
 #include "../security/validate.h" // #500: spawn_impl argv two-level deref + SYS_IOCTL boundary
 #include "../security/aiguard.h"  // #745: LLM prompt-injection screen (nova.c + aiguard.rs)
 #include "../version.h"
@@ -327,6 +334,53 @@ static int g_screensaver_type = 22;  // #124 SS_PLASMACLASSIC; see screensaver.c
 // userland/apps/settings/main.c); they must agree.
 static int g_screensaver_delay = 600;  // (#115/#652) activation delay, seconds
 int g_win_blit_suppressed = 0;   // set by compositor while the screensaver owns the FB
+
+// #blitnarrow (#168 step 3). DEFAULT ON, ON THE MEASUREMENT BELOW. It shipped
+// default-OFF for exactly one build, because removing the giant lock from a
+// region that also decides the lifetime of a heap buffer is the shape of a
+// latent use-after-free and deserved to be measured before it was trusted.
+//
+// MEASURED, golden 2332, 16 A/B boots plus 4 more in the parking soak, one
+// kernel.elf byte-identical on all four ESP paths, arms swapped between two
+// VMs, SMP ON in every arm:
+//
+//   present/s      2 vCPU    4 vCPU    8 vCPU
+//   under the BKL    15        8.5       8.5
+//   NARROWED         34       30.5      31.5
+//
+//   host cores       1.92 -> 1.81   3.61 -> 2.79   6.69 -> 4.42
+//   BKL occupancy    93.6% -> 71.9   96.7% -> 72.6   96.6% -> 73.0
+//   contention       12.7% ->  5.4   40.2% -> 19.4   50.8% -> 24.8
+//   input-to-photon p50 32768 -> 8192 us, p95 65536 -> 32768 us (n=1492/arm)
+//
+// THE MONOTONIC COLLAPSE WITH CORE COUNT IS GONE. That collapse - 46/15/10/7
+// per second at 1/2/4/8 vCPU - is the signature this whole effort was opened
+// about, and a fair ticket lock (#168 step 1) did not bend it at all. The
+// narrowed kernel reads 34 / 30.5 / 31.5 at 2 / 4 / 8: flat.
+//
+// AND IT DROPS NO WORK. Across 12 narrowed boots and roughly 130,000 unlocked
+// blits, `stale`, `gone`, `deferred` and `nested` are ALL EXACTLY ZERO: not one
+// frame was discarded because another core moved the window underneath the
+// loop, and the deferred-free path never had to fire. The pin is correct AND it
+// is not being leaned on. Zero [PANIC] and zero [WQBLOCK] in every arm.
+//
+// /NOBLITNARROW.TXT restores the giant lock for the row loop (the control arm).
+int g_blit_narrow = 1;
+volatile uint64_t g_blitnarrow_unlocked = 0;  // row loops run with the BKL DROPPED
+volatile uint64_t g_blitnarrow_locked   = 0;  // row loops run the old way
+volatile uint64_t g_blitnarrow_nested   = 0;  // ... because another blit held the pin
+volatile uint64_t g_blitnarrow_stale    = 0;  // buffer swapped under us: frame dropped
+volatile uint64_t g_blitnarrow_gone     = 0;  // window destroyed under us: frame dropped
+volatile uint64_t g_blitnarrow_deferred = 0;  // frees the pin deferred and we did
+volatile uint64_t g_blitnarrow_us       = 0;  // total us spent OUTSIDE the BKL
+
+// #blitnarrow: the two BKL primitives this needs. Declared here rather than by
+// including cpu/smp.h, which pulls the whole SMP surface into a file that has
+// no other use for it. They are the SAME pair the scheduler uses across a
+// context switch (proc/process.c), not a private copy.
+uint32_t bkl_release_all(void);
+void     bkl_reacquire(uint32_t depth);
+
 // (#116) Live mouse-cursor style/size. Settings sets these via SYS_SET_CURSOR; the
 // compositor reads them every frame via SYS_GET_CURSOR (same live-apply pattern as
 // theme/opacity), so changing the cursor in Settings updates it without a reboot.
@@ -359,6 +413,13 @@ static void win16_proc_entry(void *arg) {
 // host window (non-blocking). Declared here so the SYS_DOS_RUN dispatch (#208)
 // can call it without pulling in dos/dosexec.h.
 int dos_launch(const char *path);
+// (#67/#168) Defined in proc/dosroute.c: the same launch, but ROUTED - it asks
+// rustkern/dospolicy.rs whether this guest belongs on the in-kernel Ring-0
+// interpreter or in the Ring-3 host (/APPS/DOSUSER), then calls dos_launch()
+// or spawns the host. Same contract as dos_launch(); in-kernel is the default
+// and the absent-config answer, so wiring it changes nothing until the owner
+// writes /CONFIG/DOSROUTE.CFG. Declared here for the same reason as above.
+int dosroute_launch(const char *line);
 
 int win16_launch(const char *upath, int mode) {
     if (g_win16_busy) return -1;
@@ -1349,6 +1410,16 @@ static int64_t sys_pkg_write_stream(const char kp[SC_PATH_MAX], const void *udat
 #define DIMG_CMD_MOUNT  1   // path, letter (or -1 auto) -> letter index
 #define DIMG_CMD_EJECT  2   // letter -> 0
 #define DIMG_CMD_MAX_MOUNTS 3   // -> DISKIMG_MAX_MOUNTS
+// #VOLAPI: the mediated volume view. letter -> *out (dimg_vol_t). Read-only,
+// capability-filtered, and it is the ONLY new surface this feature adds.
+//
+// WHY IT IS A COMMAND ON 361 AND NOT A NEW SYSCALL NUMBER. It shares this
+// multiplexer's table, its out-buffer width (rustkern/argtab.rs validates
+// syscall 361's third argument as a fixed 288-byte writable region, and
+// dimg_vol_t is locked to exactly that width) and its permission story. Taking
+// a new number would have meant a second argtab entry that could drift from
+// this one, for no behaviour that is different in kind.
+#define DIMG_CMD_VOLINFO 4   // letter -> *out, filtered by perms_check
 
 static int64_t sys_diskimg(long cmd, const char *upath, void *uout, long letter) {
     switch (cmd) {
@@ -1378,6 +1449,54 @@ static int64_t sys_diskimg(long cmd, const char *upath, void *uout, long letter)
         }
         int want = (letter < 0) ? DISKIMG_LETTER_AUTO : (int)letter;
         return diskimg_mount_idx(want, kpath);
+    }
+
+    // ===================================================================
+    // #VOLAPI: "which mounted volumes may I use, and what are they?"
+    //
+    // THE FILTER IS THE CONTRACT. A volume is describable to this caller
+    // exactly when the caller could traverse and read its VFS root, decided by
+    // perms_check() - the SAME function that will decide every subsequent
+    // open() beneath that root. Enumeration and access therefore cannot
+    // disagree: there is no way to be told about a volume you cannot then open,
+    // and no way to open one you were not told about, because both questions
+    // are answered by one predicate over one database.
+    //
+    // Reusing perms_check() rather than inventing a volume-capability scheme is
+    // the point. A second scheme would be a second thing to keep in step with
+    // /CONFIG/PERMS.DB, and the tree already records what that costs (#739:
+    // three files each holding their own drive-letter constants, agreeing only
+    // in being wrong the same way).
+    //
+    // FAIL CLOSED, and distinguish the two refusals: -1 for "no such letter"
+    // (a bad index) and -13 for "not yours" (a real letter this caller may not
+    // see). An app that cannot tell them apart cannot report anything useful.
+    //
+    // Ring 0 and root are not filtered, exactly as perms_check() itself does
+    // not filter them; the bypass lives in one place rather than two.
+    // ===================================================================
+    case DIMG_CMD_VOLINFO: {
+        if (letter < 0 || letter > 25) return -1;
+        if (!uout) return -1;
+        dimg_vol_t vi;
+        if (diskimg_volinfo((int)letter, &vi) != 0) return -1;
+
+        process_t *p = proc_current();
+        if (p && p->privilege == PRIV_USER) {
+            char root[64];
+            // Ask about the SAME string the app will be handed, not a
+            // reconstruction of it: diskimg_vol_root() is the one definition of
+            // the spelling, so the path that is CHECKED here is provably the
+            // path that gets opened later.
+            if (diskimg_vol_root((int)letter, root, (int)sizeof(root)) != 0)
+                return -1;
+            if (perms_check(root, p->euid, p->egid, R_OK | X_OK) != 0) {
+                kprintf("[volapi] %s refused to uid %u\n", root, (unsigned)p->euid);
+                return -13;   // EACCES
+            }
+        }
+        if (copy_to_user(uout, &vi, sizeof(vi)) != 0) return -14;
+        return 0;
     }
 
     case DIMG_CMD_EJECT: {
@@ -1410,6 +1529,23 @@ static int64_t sys_diskimg(long cmd, const char *upath, void *uout, long letter)
 static int64_t syscall_dispatch_inner(uint64_t num, uint64_t arg1, uint64_t arg2,
                                       uint64_t arg3, uint64_t arg4, uint64_t arg5,
                                       uint64_t arg6);
+// #affinity: is the SPAWN-TIME consumption hook present in this build?
+//
+// SYS_RUN_NEXT_ON_AP records a one-shot affinity request; the code that
+// CONSUMES it lives in proc_create_user_as() (proc/process.c) and is deferred
+// while that file is being worked concurrently. This flag exists so the syscall
+// can report failure honestly instead of returning the success that the dead
+// `migratable` flag returned for eight months. The process.c hunk sets it to 1
+// in the same change that adds the consumption; grep this name to find both
+// halves.
+// SET TO 1 by the change that added the consumption hook in
+// proc_create_user_as() (proc/process.c). It was 0 for exactly one commit, the
+// one that recorded the request but could not yet honour it, so that
+// SYS_RUN_NEXT_ON_AP returned -1 rather than the success the dead `migratable`
+// flag had been returning for months. There was deliberately no build in
+// between in which it lied.
+volatile int g_affinity_spawn_hook_live = 1;
+
 int64_t syscall_dispatch(uint64_t num, uint64_t arg1, uint64_t arg2,
                          uint64_t arg3, uint64_t arg4, uint64_t arg5,
                          uint64_t arg6) {
@@ -1613,7 +1749,16 @@ static int64_t syscall_dispatch_inner(uint64_t num, uint64_t arg1, uint64_t arg2
             if (sc_bounce_str((const char *)arg1, kdospath, sizeof(kdospath)) != 0)
                 return -1;
             if (!kdospath[0]) return -1;
-            return dos_launch(kdospath);
+            // (#67/#168) THE routing chokepoint. All five Ring-3 DOS
+            // launch call sites across four subsystems (Start menu item
+            // dispatch and startmenu_launch_path(), the terminal's foreign-exec
+            // kind dispatch, and the AI launcher) reach dos_run() and therefore
+            // converge on THIS line, so one decision here covers every one of
+            // them with zero userland changes. dosroute_launch() keeps
+            // dos_launch()'s exact contract (0 on launch, <0 on refusal) and
+            // falls back to it whenever the policy says in-kernel, which is the
+            // shipping default and the absent-config state.
+            return dosroute_launch(kdospath);
         }
         case SYS_WIN16_ACTIVE: {
             // (#200 SkiFree) Report whether a Win16 app currently owns the
@@ -1882,6 +2027,10 @@ static int64_t syscall_dispatch_inner(uint64_t num, uint64_t arg1, uint64_t arg2
             return sys_win_get_event((int)arg1, (void *)arg2, (int)arg3);
         case SYS_WIN_INVALIDATE:
             return sys_win_invalidate((int)arg1);
+        // #DOSRING3 Stage 1: focus-scoped raw set-1 scancodes for a Ring-3 DOS
+        // host. Ownership + focus are checked inside; see gui/fb_syscall.c.
+        case SYS_WIN_GET_SCANCODES:
+            return sys_win_get_scancodes((int)arg1, (uint8_t *)arg2, (int)arg3);
         case SYS_WIN_GET_SIZE:
             return sys_win_get_size((int)arg1, (int *)arg2, (int *)arg3);
         // #221: this window's own state (minimized / focused / visible).
@@ -2589,12 +2738,30 @@ static int64_t syscall_dispatch_inner(uint64_t num, uint64_t arg1, uint64_t arg2
         case SYS_DOS_FM_EVENTS:
             return sys_dos_fm_events((void *)arg1, (uint32_t)arg2);
 
+        // (#fmbridge) The other half of the same bridge: the Ring-3 DOS host
+        // feeding the SAME queue the in-kernel interpreter feeds. All scalars,
+        // so no argtab.rs descriptor and nothing to copy from user memory. The
+        // caller's pid is taken HERE rather than trusted from an argument -
+        // it is the whole basis of the ownership latch in dos/dosfmq.c.
+        case SYS_DOS_FM_HOST: {
+            process_t *fmp = proc_current();
+            if (!fmp) return -1;
+            return dos_fm_host_call((uint32_t)arg1, arg2, arg3, arg4, fmp->pid);
+        }
+
         case SYS_AUDIO_PCM_OPEN:
             return sys_audio_pcm_open((uint32_t)arg1, (uint32_t)arg2, (uint32_t)arg3);
         case SYS_AUDIO_PCM_WRITE:
             return sys_audio_pcm_write((int)arg1, (const void *)arg2, (uint32_t)arg3);
         case SYS_AUDIO_PCM_CLOSE:
             return sys_audio_pcm_close((int)arg1);
+        // (#181 Ring-3 audio) The counters and the two #426 waits that pace a
+        // real-time PCM producer. Scalar-only; the handle is gated to a stream
+        // this process owns by pcm_lookup() inside audio_pcm_ctl().
+        case SYS_AUDIO_PCM_CTL: {
+            extern int64_t audio_pcm_ctl(int handle, uint32_t op, uint32_t a, uint32_t b);
+            return audio_pcm_ctl((int)arg1, (uint32_t)arg2, (uint32_t)arg3, (uint32_t)arg4);
+        }
         case SYS_AUDIO_POS_MS: {
             // #335: elapsed ms of the current USB-DAC stream = frames/rate.
             extern int uac_is_ready(void);
@@ -2687,11 +2854,105 @@ static int64_t syscall_dispatch_inner(uint64_t num, uint64_t arg1, uint64_t arg2
             return sys_wm_set_work_area((int32_t)arg1, (int32_t)arg2,
                                         (int32_t)arg3, (int32_t)arg4);
         case SYS_RUN_NEXT_ON_AP: {
-            // #279: mark the next user process this caller spawns as
-            // migratable so the scheduler routes it to an application
-            // processor (GUI `runap` / RC `launchap`).
-            extern void proc_set_next_migratable(int v);
-            proc_set_next_migratable(1);
+            // #affinity: THIS SYSCALL WAS A LIE, AND THIS IS THE FIX.
+            //
+            // It called proc_set_next_migratable(1), which set
+            // g_next_user_migratable, which proc_create_user_as() ZEROES three
+            // lines before it would be read - because the consumption test is
+            // `int __mig = 0;`, a literal, so the branch that would have used it
+            // is unreachable. It has therefore returned SUCCESS for a request
+            // that was discarded on every call since #67 pass 2. `runap` in msh
+            // and `launchap` in the RC file have both been no-ops that reported
+            // success. This is the same family as the memory-sync function with
+            // zero callers and the stop-all-cores IPI with no handler.
+            //
+            // The old mechanism was the migration queue, and #67 removed it for
+            // a good reason: it bypassed the scheduler, so anything on it was
+            // out of reach of preemption, aging and stealing. Reviving THAT
+            // would be a regression. The right mechanism is an affinity MASK,
+            // so the request is now recorded as a one-shot, owner-checked
+            // affinity request (rustkern/affinity.rs) that the next spawn by
+            // this process consumes.
+            //
+            // AND IT NO LONGER CLAIMS SUCCESS IT CANNOT DELIVER. The consuming
+            // hook is in proc_create_user_as() (proc/process.c) and is LIVE, so
+            // g_affinity_spawn_hook_live is 1 and this returns 0. The gate is
+            // kept rather than deleted because it is the thing that made the
+            // one intermediate commit honest: for exactly one commit the
+            // request could be recorded but not honoured, and this returned -1
+            // instead of the success the dead `migratable` flag had returned
+            // for months. Grep this symbol to find both halves.
+            process_t *me = proc_current();
+            if (!me) return -1;
+            extern uint32_t smp_get_cpu_count(void);
+            uint64_t apmask = affinity_ap_mask_rs(smp_get_cpu_count());
+            if (apmask == 0) {
+                // Uniprocessor, or SMP not up: there is no application
+                // processor to run it on. Refuse rather than pretend.
+                return -1;
+            }
+            if (affinity_next_spawn_set_rs(me->pid, apmask) != 0) return -1;
+            if (!g_affinity_spawn_hook_live) {
+                static int warned_ap = 0;
+                if (!warned_ap) {
+                    warned_ap = 1;
+                    kprintf("[AFFINITY] SYS_RUN_NEXT_ON_AP: request recorded "
+                            "(pid=%u mask=0x%llx) but the consuming hook in "
+                            "proc_create_user_as() is not present in this "
+                            "build, so it CANNOT be honoured. Returning -1 "
+                            "rather than the success this call used to report "
+                            "for a request that was silently discarded.\n",
+                            me->pid, (unsigned long long)apmask);
+                }
+                return -1;
+            }
+            return 0;
+        }
+
+        // #affinity: PERSISTENT PER-PROCESS CPU AFFINITY.
+        //
+        // A SOFT preference. Placement drops the mask rather than strand a task
+        // on a core that is not consuming, so no value passed here can hang a
+        // process. A mask of 0 is refused outright: it would be a request that
+        // no core may run this.
+        case SYS_SET_AFFINITY: {
+            process_t *me = proc_current();
+            if (!me) return -1;
+            uint32_t target = (uint32_t)arg1;
+            uint64_t mask   = (uint64_t)arg2;
+            if (target == 0) target = me->pid;          // 0 means "me"
+            // Setting your OWN affinity is unprivileged: it is a request about
+            // your own scheduling and cannot take work away from anyone else,
+            // because the mask is soft. Setting SOMEONE ELSE'S is a way to
+            // influence another process's scheduling and needs root.
+            if (target != me->pid && me->euid != 0) return -1;
+            return (int64_t)affinity_set_rs(target, mask);
+        }
+
+        case SYS_GET_AFFINITY: {
+            process_t *me = proc_current();
+            if (!me) return -1;
+            uint32_t target = (uint32_t)arg1;
+            if (target == 0) target = me->pid;
+            // Readable by anyone: it is scheduling metadata, not a secret, and
+            // Task Manager needs it for every process it lists.
+            return (int64_t)affinity_get_rs(target);
+        }
+
+        case SYS_GET_MIGRATIONS: {
+            process_t *me = proc_current();
+            if (!me) return -1;
+            uint32_t target = (uint32_t)arg1;
+            if (target == 0) target = me->pid;
+            uint64_t mig = 0, sw = 0;
+            int rc = (int)affinity_stats_rs(target, &mig, &sw, 0, 0);
+            if (rc != 0) return -1;
+            // Both halves or neither: a migration count without its switch-in
+            // denominator cannot be compared across runs of different length,
+            // and handing back only the numerator is how a measurement becomes
+            // a talking point.
+            if (arg2) { if (copy_to_user((void *)arg2, &mig, sizeof(mig)) != 0) return -1; }
+            if (arg3) { if (copy_to_user((void *)arg3, &sw,  sizeof(sw))  != 0) return -1; }
             return 0;
         }
         case SYS_GET_MOUSE_SCROLL: {
@@ -2705,6 +2966,8 @@ static int64_t syscall_dispatch_inner(uint64_t num, uint64_t arg1, uint64_t arg2
             return sys_win_set_nochrome((int)arg1);
         case SYS_WIN_SET_NOCHROME_BG:
             return sys_win_set_nochrome_bg((int)arg1);
+        case SYS_WIN_SET_ALPHA_CONTENT:   // #198v2
+            return sys_win_set_alpha_content((int)arg1);
         case SYS_WIN_SET_SHADOW:
             return sys_win_set_shadow((int)arg1);
         case SYS_DNS_START:
@@ -2760,6 +3023,7 @@ static int64_t syscall_dispatch_inner(uint64_t num, uint64_t arg1, uint64_t arg2
         case SYS_FB_MAP:      return sys_fb_map();
         case SYS_FB_INFO:     return sys_fb_info((fb_info_user_t *)arg1);
         case SYS_FB_FLIP:     return sys_fb_flip();
+        case SYS_FB_FLIP_COUNT: return sys_fb_flip_count();
         case SYS_FB_DAMAGE:   return sys_fb_damage((int)arg1, (int)arg2, (int)arg3, (int)arg4);
         case SYS_GET_MOUSE:   return sys_get_mouse((int32_t *)arg1, (int32_t *)arg2, (uint32_t *)arg3);
         case SYS_SET_MOUSE:   return sys_set_mouse((int)arg1, (int)arg2);
@@ -3634,17 +3898,34 @@ static int64_t spawn_impl(const char *path, char **argv, int argc,
             // output goes to serial instead of the terminal window.
             // Only for argv spawns (msh/terminal); compositor/desktop apps keep
             // their own console (#75).
+            //
+            // #SMPGLOBALS: this writes ANOTHER process's fd table (the child's)
+            // while reading our own. Both are locked, and NEVER at the same
+            // time: taking two fd_locks at once would be a lock-ordering rule
+            // this kernel does not have and does not need. Snapshot the
+            // parent's three descriptions with a reference each, drop that
+            // lock, then install them into the child under the child's.
+            // file_put() of what the child was born with stays outside both.
             if (parent && argv) {
-                for (int fi = 0; fi < 3; fi++) {
-                    if (parent->fds[fi]) {
-                        // Close the /dev/console fd that init_proc opened
-                        if (child->fds[fi])
-                            IGNORE_RESULT("execve close-on-exec sweep: no recipient exists mid-exec, and failing here would break exec on a full disk (#695)",
-                                          file_put(child->fds[fi]));
-                        // Replace with parent's fd (same PTY slave)
-                        child->fds[fi] = parent->fds[fi];
-                        file_get(parent->fds[fi]);
+                file_t *inh[3] = { NULL, NULL, NULL };
+                { uint64_t __fl = spinlock_acquire_irqsave(&parent->fd_lock);
+                  for (int fi = 0; fi < 3; fi++) {
+                    if (parent->fds[fi]) { inh[fi] = parent->fds[fi]; file_get(inh[fi]); }
+                  }
+                  spinlock_release_irqrestore(&parent->fd_lock, __fl); }
+                file_t *ev[3] = { NULL, NULL, NULL };
+                { uint64_t __fl = spinlock_acquire_irqsave(&child->fd_lock);
+                  for (int fi = 0; fi < 3; fi++) {
+                    if (inh[fi]) {
+                        ev[fi] = child->fds[fi];   // the /dev/console fd init_proc opened
+                        child->fds[fi] = inh[fi];  // same PTY slave as the parent
                     }
+                  }
+                  spinlock_release_irqrestore(&child->fd_lock, __fl); }
+                for (int fi = 0; fi < 3; fi++) {
+                    if (ev[fi])
+                        IGNORE_RESULT("stdio inherit evicts the /dev/console description the child was born with; no recipient exists here and failing would break spawn on a full disk (#695)",
+                                      file_put(ev[fi]));
                 }
             }
 
@@ -3652,19 +3933,22 @@ static int64_t spawn_impl(const char *path, char **argv, int argc,
             // opened in step 1 override the inherited PTY fds. On child exit
             // fd_close_all() releases them, which commits a buffered write to
             // disk (ext2_write_file / FAT).
-            if (redir_out) {
-                if (child->fds[1])
+            // #SMPGLOBALS: same shape - swap under the child's fd_lock, put the
+            // evicted description after dropping it.
+            {
+                file_t *ev_out = NULL, *ev_in = NULL;
+                uint64_t __fl = spinlock_acquire_irqsave(&child->fd_lock);
+                if (redir_out) { ev_out = child->fds[1]; child->fds[1] = redir_out; }
+                if (redir_in)  { ev_in  = child->fds[0]; child->fds[0] = redir_in;  }
+                spinlock_release_irqrestore(&child->fd_lock, __fl);
+                if (redir_out) redir_out = NULL;   // ownership handed to the child
+                if (redir_in)  redir_in  = NULL;
+                if (ev_out)
                     IGNORE_RESULT("redirect install evicts the replaced description; dup2 and shell redirection must still succeed on a full disk (#695)",
-                                  file_put(child->fds[1]));
-                child->fds[1] = redir_out;
-                redir_out = NULL;          // ownership handed to the child
-            }
-            if (redir_in) {
-                if (child->fds[0])
+                                  file_put(ev_out));
+                if (ev_in)
                     IGNORE_RESULT("redirect install evicts the replaced description (#695)",
-                                  file_put(child->fds[0]));
-                child->fds[0] = redir_in;
-                redir_in = NULL;
+                                  file_put(ev_in));
             }
         }
     }
@@ -4525,11 +4809,14 @@ int64_t sys_net_unmount(const char *u_server, const char *u_share) {
 // on 4xx/5xx. A transport failure (r<0 and no status: DNS/connect/recv timeout,
 // nobody answered) reports a reach-failure toward the NET_FAULTY trip. Neutral
 // otherwise. Cheap; safe from the fetch worker threads.
-static void net_fetch_report(int r, int status) {
+// browsenet 2026-09-01: `url` is carried purely so a trip can NAME the host
+// whose failure completed the streak. It is not dereferenced beyond copying the
+// host substring, and 0 is accepted.
+static void net_fetch_report(const char *url, int r, int status) {
     extern void net_report_reach_ok(void);
-    extern void net_report_reach_fail(void);
+    extern void net_report_reach_fail_rc(const char *url, int rc);
     if (status > 0)  net_report_reach_ok();
-    else if (r < 0)  net_report_reach_fail();
+    else if (r < 0)  net_report_reach_fail_rc(url, r);
 }
 // #549: once the interface is NET_FAULTY, no fetch touches the wire again (this is
 // what makes the USB busy-poll storm stop mid-cycle and CPU fall to ~0). Recovery
@@ -4563,7 +4850,7 @@ int64_t sys_http_fetch(const char *uurl, char *ubuf, uint32_t max_len, uint32_t 
     int https = (url[0]=='h'&&url[1]=='t'&&url[2]=='t'&&url[3]=='p'&&url[4]=='s');
     int r = https ? https_get(url, &body, &blen, &status)
                   : wget_fetch(url, &body, &blen, &status);
-    net_fetch_report(r, status);
+    net_fetch_report(url, r, status);
     kfree(url);
     if (r < 0 || !body) {
         if (body) kfree(body);
@@ -4616,7 +4903,7 @@ static int64_t sys_http_fetch_hdr_inner(const char *uurl, const char *uheaders,
     int https = (url[0]=='h'&&url[1]=='t'&&url[2]=='t'&&url[3]=='p'&&url[4]=='s');
     int r = https ? https_get_hdr(url, headers ? headers : "", &body, &blen, &status)
                   : wget_fetch_hdr(url, headers ? headers : "", &body, &blen, &status);
-    net_fetch_report(r, status);
+    net_fetch_report(url, r, status);
     kfree(url); if (headers) kfree(headers);
     if (ustatus && copy_to_user(ustatus, &status, sizeof(status)) != 0) { if (body) kfree(body); return -14; }
     if (r < 0 || !body) { if (body) kfree(body); return -1; }
@@ -4718,7 +5005,7 @@ static void async_fetch_worker(void *arg) {
     int r = https ? https_get(j->url, &body, &len, &status)
                   : wget_fetch(j->url, &body, &len, &status);
     proc_current()->net_progress = 0;
-    net_fetch_report(r, status);   // #549 circuit-breaker
+    net_fetch_report(j->url, r, status);   // #549 circuit-breaker
     j->status = status;
     if (r >= 0 && body) { j->body = body; j->len = len; j->state = 1; }
     else { if (body) kfree(body); j->len = 0; j->state = 2; }
@@ -4924,7 +5211,7 @@ static void async_post_worker(void *arg) {
             int r = https_post(j->url, j->headers ? j->headers : "",
                                j->reqbody ? j->reqbody : "",
                                &body, &len, &status);
-            net_fetch_report(r, status);   // #549 circuit-breaker
+            net_fetch_report(j->url, r, status);   // #549 circuit-breaker
             j->status = status;
             if (r >= 0 && body) { j->body = body; j->len = len; }
             else { if (body) kfree(body); j->len = 0; }
@@ -5219,7 +5506,7 @@ static int64_t sys_http_post_k(const char *url, const char *headers, const char 
     uint8_t *rbody = 0; uint32_t blen = 0; int status = 0;
     int r = https ? https_post(url, headers, body, &rbody, &blen, &status)
                   : wget_post_hdr(url, headers ? headers : "", body ? body : "", &rbody, &blen, &status);
-    net_fetch_report(r, status);   // #549
+    net_fetch_report(url, r, status);   // #549
     if (r < 0) { if (rbody) kfree(rbody); if (status_out) *status_out = status; return -1; }
     uint32_t n = (blen < max_len) ? blen : max_len;
     if (rbody && n) memcpy(kbuf, rbody, n);
@@ -5321,7 +5608,7 @@ int64_t sys_http_post(const char *uurl, const char *uheaders, const char *ubody,
     uint8_t *rbody = 0; uint32_t blen = 0; int status = 0;
     int r = https ? https_post(kurl, khdr, kbody, &rbody, &blen, &status)
                   : wget_post_hdr(kurl, khdr, kbody, &rbody, &blen, &status);
-    net_fetch_report(r, status);   // #549
+    net_fetch_report(kurl, r, status);   // #549
 
     __asm__ volatile("pushfq; pop %0" : "=r"(flags));
     __asm__ volatile("cli");
@@ -5952,11 +6239,70 @@ typedef struct {
     // no boundary to transform; and the compositor is excluded because it is
     // the one Ring 3 process that must think in real screen pixels.
     int scale_on;
+    // ==================================================================
+    // #blitnarrow (#168 step 3): THE CONTENT-BUFFER PIN.
+    //
+    // sys_win_blit() runs its row loop with the BIG KERNEL LOCK DROPPED. It
+    // is the worst BKL holder in the kernel by a wide margin: MEASURED on
+    // golden 2330, one process held the BKL for 157 of a 230-second boot in
+    // 41,722 acquires - 3.8 MILLISECONDS EACH - and that process's whole body
+    // is a SYS_WIN_BLIT loop. 85-88% of ALL BKL hold time in that boot was
+    // inside syscall bodies. A giant lock around the entire body of every
+    // syscall makes the kernel single-threaded by construction, and no amount
+    // of scheduler or lock-ordering work can change that: fairness was tried
+    // first (#168 step 1) and moved nothing.
+    //
+    // WHAT THE ROW LOOP ACTUALLY NEEDS. It reads USER memory through
+    // copy_from_user(), which is TOCTOU-safe by construction (validate, then
+    // a fault-fixup copy that returns -EFAULT if the page goes bad mid-copy -
+    // #509), and the exception table is a static RIP RANGE, not per-CPU
+    // state, so the copy is safe even if this thread migrates mid-loop. It
+    // writes ONE kernel buffer: this window's content_buffer. It calls
+    // nothing else. So the only thing the giant lock was buying is that
+    // content_buffer cannot be freed or reallocated underneath it.
+    //
+    // AND THAT IS WHAT THESE THREE FIELDS BUY INSTEAD, WITHOUT WAITING.
+    // blit_pin is raised under the BKL before it is dropped and lowered under
+    // the BKL after it is retaken. While it is raised, uw_retire_content()
+    // does not free the pinned buffer, it DEFERS it into retired_buffer; the
+    // blitter frees it on the way out. Nothing blocks, nothing spins, and no
+    // waiter is added to a path (window destroy) that must stay non-blocking.
+    // The blitter then re-checks that content_buffer is STILL the buffer it
+    // pinned and that uw->window is still the window it started with; if
+    // either changed - resize, destroy, or the handle being recycled by
+    // another process - it drops the frame instead of publishing a torn one.
+    //
+    // ONLY ONE BLIT PER WINDOW RUNS UNLOCKED AT A TIME. A second concurrent
+    // blit to the same window finds blit_pin already raised and runs the old
+    // way, with the lock held. Two threads interleaving rows into one buffer
+    // would be a NEW tearing mode that the giant lock used to prevent, and a
+    // narrowing must not buy throughput with a correctness regression.
+    // ==================================================================
+    int blit_pin;                 // >0: a row loop is running unlocked
+    uint32_t *pinned_buffer;      // exactly the buffer that loop is writing
+    uint32_t *retired_buffer;     // freed on its behalf when the pin drops
 #ifdef RACE155_DETECT
     // #155 measurement only (-DRACE155_DETECT), never in a shipped kernel.
     uint64_t last_write_ms;   // #131(150)'s own predicate input
 #endif
 } user_window_t;
+
+// #blitnarrow: THE ONE PLACE A CONTENT BUFFER IS RELEASED. Every site that
+// used to `kfree(uw->content_buffer)` calls this instead, so the pin cannot be
+// defeated by a future site that forgets it exists. Called with the BKL held.
+void uw_retire_content(user_window_t *uw, uint32_t *old) {
+    extern void kfree(void *ptr);
+    if (!old) return;
+    if (uw && uw->blit_pin && old == uw->pinned_buffer) {
+        // A row loop is writing into this buffer right now with the lock
+        // dropped. Freeing it here is the use-after-free this whole mechanism
+        // exists to prevent. Hand it to the blitter to free on its way out.
+        uw->retired_buffer = old;
+        g_blitnarrow_deferred++;
+        return;
+    }
+    kfree(old);
+}
 
 static user_window_t user_windows[MAX_USER_WINDOWS];
 
@@ -6070,6 +6416,12 @@ static void uw155_mark_written(int handle) {
 // process (never the compositor's), so it cannot ever block the compositor
 // draw thread (#426) - the compositor is not involved until the SEPARATE
 // read path below runs, on its own thread, later.
+// #resizescale: forward decl - the real definition (gated on /RESIZELOG.TXT,
+// same convention as /TESTINPUT.TXT) lives near g_uwresize_calls further
+// down this file, alongside the rest of the #resizelag diagnostic counters
+// it extends. uw_commit_content() below needs it earlier than that.
+static int resizelog_on(void);
+
 static void uw_commit_content(user_window_t *uw) {
     if (!uw->content_buffer || uw->content_width <= 0 || uw->content_height <= 0) return;
     size_t need = (size_t)uw->content_width * (size_t)uw->content_height * sizeof(uint32_t);
@@ -6099,6 +6451,22 @@ static void uw_commit_content(user_window_t *uw) {
     memcpy(uw->content_presented, uw->content_buffer, need);
     seqlock_write_end(&uw->content_seq);
     if (old) kfree(old);
+
+    // #resizescale: PERSISTED diagnostic (see the g_resizelog_enabled comment
+    // near g_uwresize_calls below). This is the ONE chokepoint every content
+    // publish goes through - both the kernel-side resize-drag commits AND the
+    // app's own post-redraw commit (sys_win_invalidate() -> here) - so logging
+    // here, not just in user_window_handle_resize(), is what lets a real
+    // hardware capture see whether a reported "still growing after mouse-up"
+    // is actually the APP taking a long time to redraw and re-publish, not a
+    // kernel-side commit still running. uw - user_windows is safe: it is a
+    // fixed-size array (not an array of pointers), never reallocated.
+    if (resizelog_on()) {
+        bootlog_write("[RESIZELOG] present handle=%d t_us=%llu w=%d h=%d seq=%u",
+                      (int)(uw - user_windows), (unsigned long long)mono_us(),
+                      uw->content_width, uw->content_height,
+                      (unsigned)uw->content_seq.seq);
+    }
 }
 
 // Forward declaration for event handler
@@ -6110,6 +6478,44 @@ static void user_window_queue_event(int handle, gui_event_t *event) {
     if (handle < 0 || handle >= MAX_USER_WINDOWS || !user_windows[handle].window) return;
 
     user_window_t *uw = &user_windows[handle];
+
+    // #resizelag: EVENT_RESIZE carries STATE ("the window is now this
+    // size"), not an OCCURRENCE, so only the LATEST one queued is ever
+    // meaningful - an app that falls behind a resize storm (a fast drag, a
+    // maximize/restore, a DPI change) should reflow once, to the size it
+    // is actually at when it gets around to it, not replay every
+    // intermediate size it never had time to draw. If the event already
+    // sitting at the tail is ALSO an EVENT_RESIZE, overwrite it in place
+    // instead of appending a new one: queue depth does not grow, ordering
+    // against any OTHER interleaved event is untouched (only two ADJACENT
+    // EVENT_RESIZE entries ever merge), and the app that later dequeues it
+    // sees exactly one EVENT_RESIZE carrying the current size.
+    //
+    // THIS IS DELIBERATELY NOT DONE FOR ANY OTHER EVENT TYPE.
+    // EVENT_KEY_DOWN / EVENT_MOUSE_DOWN / EVENT_MOUSE_UP are OCCURRENCES -
+    // each one is an independent fact ("the user pressed this key") that
+    // coalescing would silently DROP. This is not hypothetical: #keydrop
+    // (concurrent branch, same day) fixed EXACTLY this overwrite-in-place
+    // shape one layer up, in the compositor - userland/apps/compositor/
+    // main.c process_input() did `s_last_key = key;` on every matching key
+    // read in one tick, so a burst landing inside one compositor pass
+    // silently collapsed to whichever key was read LAST, dropping every
+    // other key of the burst for every compositor-native modal typing
+    // surface (start-menu search, sticky notes, the lock screen, ...).
+    // The fix there replaced the single overwritten slot with a bounded
+    // per-tick queue drained in order - i.e. the OPPOSITE of what this
+    // function does for EVENT_RESIZE, because a keypress is an occurrence
+    // and a resize is state. See blame.md "coalescing is for state, not
+    // occurrences" (#resizelag) for the full contrast.
+    if (event->type == EVENT_RESIZE && uw->event_count > 0) {
+        uint32_t tail_idx = (uw->event_tail + USER_EVENT_QUEUE_SIZE - 1) % USER_EVENT_QUEUE_SIZE;
+        if (uw->events[tail_idx].type == EVENT_RESIZE) {
+            uw->events[tail_idx] = *event;
+            wake_up(&uw->event_wq);
+            return;
+        }
+    }
+
     if (uw->event_count >= USER_EVENT_QUEUE_SIZE) {
         // Queue full, drop oldest event
         uw->event_head = (uw->event_head + 1) % USER_EVENT_QUEUE_SIZE;
@@ -6249,6 +6655,19 @@ static void user_window_draw_handler(void *app_data) {
 
             extern void fb_blit(uint32_t x, uint32_t y, uint32_t w, uint32_t h, const uint32_t *data);
             uint8_t op = win->opacity ? win->opacity : 255;
+            // #198v2: ALPHA_CONTENT windows carry a REAL per-pixel alpha in
+            // the top byte of every source word, instead of (or in addition
+            // to) the uniform per-window `op` above. This is what lets a
+            // window be almost entirely transparent with only a handful of
+            // real, antialiased pixels (a glyph, a soft shadow) genuinely
+            // blended against whatever the compositor actually drew
+            // underneath - see WINDOW_FLAG_ALPHA_CONTENT (window.h) for the
+            // full rationale. It forces the per-pixel path below even when
+            // op==255, because the fast fb_blit() path writes source pixels
+            // verbatim and would otherwise paint the fully-opaque-alpha-byte
+            // convention's "transparent" pixels as solid black/whatever the
+            // RGB bits happen to be.
+            bool alpha_content = (win->flags & WINDOW_FLAG_ALPHA_CONTENT) != 0;
             // CLIP to presented_width/height (the buffer actually being
             // read), NOT content_width/height (the app's write-side size,
             // which can differ mid-resize) - see the struct comment.
@@ -6257,7 +6676,7 @@ static void user_window_draw_handler(void *app_data) {
             int clean = 0;
             for (int attempt = 0; attempt < UW_BLIT_MAX_RETRY; attempt++) {
                 uint32_t s0 = seqlock_read_begin(&uw->content_seq);
-                if (op >= 255) {
+                if (op >= 255 && !alpha_content) {
                     if (sw == bw) {
                         fb_blit(wx, wy, bw, bh, src);   // stride matches
                     } else {
@@ -6266,17 +6685,28 @@ static void user_window_draw_handler(void *app_data) {
                             fb_blit(wx, wy + ry, bw, 1, &src[ry * sw]);
                     }
                 } else {
-                    // Per-window transparency: alpha-blend content over what's behind it.
+                    // Per-window transparency and/or #198v2 per-pixel alpha:
+                    // blend content over what's behind it. `a` is the
+                    // EFFECTIVE alpha for this one pixel: the source's own
+                    // top byte (alpha_content) combined with the window's
+                    // uniform opacity, or just the uniform opacity for a
+                    // plain transparent window (alpha_content unset, so
+                    // every pixel's own top byte - normally unused/0xFF
+                    // opaque BGRA - is treated as fully opaque, unchanged
+                    // from this function's pre-#198v2 behaviour).
                     extern uint32_t fb_get_pixel(uint32_t x, uint32_t y);
                     extern void fb_put_pixel(uint32_t x, uint32_t y, uint32_t color);
-                    uint32_t inv = 255u - op;
                     for (int ry = 0; ry < bh; ry++) {
                         for (int rx = 0; rx < bw; rx++) {
                             uint32_t sp = src[ry * sw + rx];
+                            uint32_t pa = alpha_content ? ((sp >> 24) & 0xFF) : 255u;
+                            uint32_t a = (pa * op) / 255u;
+                            if (a == 0) continue;   // fully transparent: leave the pixel under it untouched
+                            uint32_t inv = 255u - a;
                             uint32_t dp = fb_get_pixel((uint32_t)(wx + rx), (uint32_t)(wy + ry));
-                            uint32_t r = (((sp >> 16) & 0xFF) * op + ((dp >> 16) & 0xFF) * inv) / 255;
-                            uint32_t g = (((sp >> 8)  & 0xFF) * op + ((dp >> 8)  & 0xFF) * inv) / 255;
-                            uint32_t b = (( sp        & 0xFF) * op + ( dp        & 0xFF) * inv) / 255;
+                            uint32_t r = (((sp >> 16) & 0xFF) * a + ((dp >> 16) & 0xFF) * inv) / 255;
+                            uint32_t g = (((sp >> 8)  & 0xFF) * a + ((dp >> 8)  & 0xFF) * inv) / 255;
+                            uint32_t b = (( sp        & 0xFF) * a + ( dp        & 0xFF) * inv) / 255;
                             fb_put_pixel((uint32_t)(wx + rx), (uint32_t)(wy + ry), (r << 16) | (g << 8) | b);
                         }
                     }
@@ -6370,6 +6800,13 @@ extern long drag_end_rs(void);
 static void drag_post_end(int src_win, int accepted_by, int sx, int sy);
 
 void cleanup_user_windows_for_process(uint32_t pid) {
+    // #DOSRING3: drop any raw-scancode subscription this process held, FIRST.
+    // The syscall re-checks ownership and focus on every call, so a dead pid
+    // could never actually read bytes; this stops the keyboard path buffering
+    // for a process that no longer exists, and matches the liveness-backstop
+    // discipline is_compositor() already applies to the framebuffer latch.
+    { extern void rawsc_disarm_rs(uint32_t pid); rawsc_disarm_rs(pid); }
+
     // Destroy all windows owned by the exiting process.
     // This runs at proc_exit() time (interrupts may be disabled, so keep it simple).
     for (int i = 0; i < MAX_USER_WINDOWS; i++) {
@@ -6387,7 +6824,8 @@ void cleanup_user_windows_for_process(uint32_t pid) {
             }
             // Free content buffer
             if (user_windows[i].content_buffer) {
-                kfree(user_windows[i].content_buffer);
+                uw_retire_content(&user_windows[i],           // #blitnarrow
+                                  user_windows[i].content_buffer);
                 user_windows[i].content_buffer = NULL;
             }
             // #131 (local 151): free the compositor's read-side snapshot too.
@@ -6510,13 +6948,44 @@ static void drag_post_drop(int win, int sx, int sy) {
 // Does the calling process own this window handle? Every drag syscall that
 // acts FOR a window goes through this, so a process cannot begin a drag from,
 // register a drop target on, or claim a payload for somebody else's window.
-static int drag_caller_owns(int win) {
+// #DOSRING3: promoted from `static int drag_caller_owns()` to the ONE
+// definition of "does the calling process own this window handle". It was
+// already the drag syscalls' gate; sys_win_get_scancodes() needs exactly the
+// same question answered, and a second copy of this five-line check is how the
+// two would eventually disagree about a destroyed window or a stale handle.
+int uw_caller_owns_window(int win) {
     process_t *p = proc_current();
     if (!p) return 0;
     if (win < 0 || win >= MAX_USER_WINDOWS) return 0;
     if (!user_windows[win].window) return 0;
-    return user_windows[win].owner_pid == p->pid;
+    // A THREAD OF THE OWNER IS THE OWNER.
+    //
+    // This compared p->pid directly, and in this kernel a thread is a
+    // process_t of its own: `[PROC] Cloned thread of 'DOSUSER' (PID 32 ->
+    // tid 33)`. So owner_pid (the pid that called win_create) never equals a
+    // WORKER THREAD's pid, and every window-owning check from a worker thread
+    // failed - silently, because the syscalls involved return -1 and a -1 from
+    // "may I?" is indistinguishable from "no".
+    //
+    // MEASURED: the Ring-3 DOS host's input pump runs on a cloned thread, so
+    // SYS_WIN_GET_SCANCODES was refused on every call and the raw-scancode
+    // subscription was never armed (census: armed=0 for the whole run) - the
+    // guest sat on "press any key" forever.
+    //
+    // `p->tgid ? p->tgid : p->pid` is the canonical "which PROCESS am I" idiom
+    // in this kernel (proc/fdlayer.c:229, proc/process.c:4149/4191), so this
+    // uses it rather than inventing a second spelling.
+    //
+    // THIS ALSO FIXES A PRE-EXISTING BUG IT DID NOT CAUSE: the drag syscalls
+    // (sys_drag_begin and friends) have used this same check since before it
+    // was promoted out of drag_caller_owns(), so a multi-threaded app could
+    // never start a drag, register a drop target, or claim a payload from any
+    // thread but its first one.
+    uint32_t me = p->tgid ? p->tgid : p->pid;
+    return user_windows[win].owner_pid == me;
 }
+
+static int drag_caller_owns(int win) { return uw_caller_owns_window(win); }
 
 int64_t sys_drag_begin(int win, unsigned int kind, const void *payload,
                        int plen, const char *label, int llen) {
@@ -6780,6 +7249,68 @@ static int64_t sys_wm_fullscreen_status(void) {
     return ((int64_t)w->id << 32) | (int64_t)seq;
 }
 
+// #resizelag: MEASURED cost of a single user_window_handle_resize() call
+// (kmalloc + background fill + memcpy of the whole content buffer), read by
+// the testinput RSTAT command so a host-driven resize drag can be timed
+// without waiting on a heartbeat interval. mono_us()-backed (cpu/mono.h),
+// never timer_ticks (see mono.h: ticks are delivered, not elapsed).
+uint64_t g_uwresize_calls = 0;
+uint64_t g_uwresize_total_us = 0;
+uint64_t g_uwresize_max_us = 0;
+int32_t  g_uwresize_last_cw = 0;
+int32_t  g_uwresize_last_ch = 0;
+
+// #resizescale: real-hardware diagnostic aid for the owner-reported
+// "terminal content visibly scales up in steps for 3-4s AFTER the resize
+// drag ends" symptom (iMac14,4, golden 2317, build 2334 - the exact commit
+// this file is on). The #resizelag throttle+coalesce fix (4c25b79b) was
+// re-verified end-to-end on a VM at this exact commit (testinput
+// MDOWN/MOVE/MUP + RSTAT/WINQ, docs/GUI_TEST_INPUT.md): every content
+// commit lands DURING the drag, none after mouse-up (RSTAT calls stopped
+// advancing the instant MUP was sent), and screenshots taken 0s/1s/3s after
+// MUP are pixel-identical - no staged growth reproduces on this VM. Since
+// the VM is orders of magnitude faster than the reported hardware, this
+// does not rule out a pure PERFORMANCE explanation: the #resizelag commit's
+// own cost model (kmalloc + O(cw*ch) fill + memcpy) was measured on a fast
+// VM and extrapolated to real resolutions, never checked against actual
+// iMac timings. This flag exists so the NEXT real-hardware reproduction
+// produces MEASURED numbers instead of another round of guessing: drop an
+// empty /RESIZELOG.TXT on the FAT ESP before booting, reproduce the resize,
+// then read the persisted /BOOTLOG.TXT afterward (no live serial needed).
+// Off by default (fat_exists() check, same convention as /TESTINPUT.TXT):
+// zero cost and zero log growth on a shipping golden.
+int g_resizelog_enabled = 0;
+static int g_resizelog_checked = 0;
+static int resizelog_on(void) {
+    if (!g_resizelog_checked) {
+        g_resizelog_checked = 1;
+        if (g_fat_fs.mounted && fat_exists(&g_fat_fs, "/RESIZELOG.TXT"))
+            g_resizelog_enabled = 1;
+    }
+    return g_resizelog_enabled;
+}
+
+// #resizelag: debug-only window bounds query for the testinput RSTAT/drag
+// probes - lets a host-side script find the REAL outer bounds of a live
+// window (title bar included) instead of guessing pixel coordinates off a
+// screenshot. Returns 1 and fills *x/*y/*w/*h (OUTER bounds, same units
+// SYS_WIN_CREATE takes) for slot `idx` if it holds a live window, else 0.
+int testinput_win_query(int idx, int32_t *x, int32_t *y, int32_t *w, int32_t *h,
+                        char *title, int titlesz) {
+    if (idx < 0 || idx >= MAX_USER_WINDOWS) return 0;
+    window_t *win = user_windows[idx].window;
+    if (!win) return 0;
+    if (x) *x = win->bounds.x;
+    if (y) *y = win->bounds.y;
+    if (w) *w = win->bounds.width;
+    if (h) *h = win->bounds.height;
+    if (title && titlesz > 0) {
+        strncpy(title, win->title, titlesz - 1);
+        title[titlesz - 1] = 0;
+    }
+    return 1;
+}
+
 // Called from window_resize() in window.c to reallocate the content buffer
 // and notify the user-mode app via EVENT_RESIZE.
 void user_window_handle_resize(window_t *win) {
@@ -6795,6 +7326,8 @@ void user_window_handle_resize(window_t *win) {
 
             // Skip if dimensions haven't actually changed
             if (cw == uw->content_width && ch == uw->content_height) return;
+
+            uint64_t _uwr_t0 = mono_us();
 
             // Reallocate content buffer at the new size
             extern void *kmalloc(size_t size);
@@ -6870,7 +7403,25 @@ void user_window_handle_resize(window_t *win) {
             // DOS layer DID claim it, it is mid-blit into it and will free it
             // itself at the next safe point; freeing it here would be the
             // use-after-free this change removes, just with a smaller window.
-            if (old_buf && !old_buf_taken) kfree(old_buf);
+            // #blitnarrow: and the SECOND claimant of this buffer is a
+            // sys_win_blit() row loop running with the BKL dropped. Same
+            // hazard, same shape, so it goes through the same one release
+            // point rather than growing a second ad-hoc flag: uw_retire_content
+            // defers the free when the blitter has this exact buffer pinned.
+            if (old_buf && !old_buf_taken) uw_retire_content(uw, old_buf);
+
+            // #resizelag: stop the clock here - EVERYTHING above is the
+            // synchronous, unconditional cost paid on THIS mouse-move sample
+            // (kmalloc + O(cw*ch) background fill + memcpy of the old content).
+            // The EVENT_RESIZE queue below is an O(1) enqueue; the app's own
+            // reflow/redraw work happens later, off this thread, and is NOT
+            // included (that is the userland side, timed separately).
+            uint64_t _uwr_dt = mono_us() - _uwr_t0;
+            g_uwresize_calls++;
+            g_uwresize_total_us += _uwr_dt;
+            if (_uwr_dt > g_uwresize_max_us) g_uwresize_max_us = _uwr_dt;
+            g_uwresize_last_cw = cw;
+            g_uwresize_last_ch = ch;
 
             // Queue EVENT_RESIZE so the app can redraw at the new size
             uw->redraw_pending = 1;   // #453: force a REDRAW after the resize
@@ -6888,6 +7439,16 @@ void user_window_handle_resize(window_t *win) {
             snprintf(log_msg, sizeof(log_msg),
                      "[WM] Resize window %d: new content %dx%d", i, cw, ch);
             syslog_log(1, log_msg);
+            // #resizescale: PERSISTED (see the flag comment above) - this is
+            // the throttled-or-final KERNEL-SIDE commit only. The app's own
+            // subsequent redraw commit (sys_win_invalidate() -> uw_commit_content())
+            // is logged separately below, so a real-hardware capture can tell
+            // the two apart on the timeline instead of guessing which one ran long.
+            if (resizelog_on()) {
+                bootlog_write("[RESIZELOG] wm_commit handle=%d t_us=%llu dt_us=%llu cw=%d ch=%d",
+                              i, (unsigned long long)mono_us(),
+                              (unsigned long long)_uwr_dt, cw, ch);
+            }
             break;
         }
     }
@@ -6936,13 +7497,112 @@ static void dos_host_close_handler(window_t *win, gui_event_t *event) {
     dos_request_close();
 }
 
-// Re-route an already-created host window's X to the DOS teardown path. A
-// slot-indexed setter rather than a create variant, so the DOS layer needs no
-// window_t of its own and win16_host_create() keeps ONE definition.
+// (#fmzombie) THE TITLEBAR X ON AN ORDINARY RING-3 WINDOW REACHED NOBODY.
+//
+// MEASURED on golden 2320: a Ring-3 DOS guest's window was closed by a real
+// synthetic click on its close button (`OK CLICK 825 195 ... routed=1 hit=1`),
+// the window vanished from the screendump - and DOSUSER went on burning 94-98%
+// of a core for the rest of the run, with its FM queue still armed and
+// /APPS/FMSYNTH still alive. The guest was never told.
+//
+// WHY. wm_handle_mouse() (gui/window.c:1663) does two things on a close click:
+// it calls wm_queue_event(), which appends to the WM's OWN global queue - the
+// one the in-kernel desktop loop drains, which no Ring-3 process can see - and
+// then, if the window has no on_close, it calls window_hide(). A Ring-3
+// window's per-window event queue, the one SYS_WIN_GET_EVENT reads and the one
+// user_window_event_handler() fills from win->on_event, is never touched. So
+// EVENT_WINDOW_CLOSE is defined in userland/libc/gui.h, apps can switch on it,
+// and until now it could never arrive.
+//
+// THIS IS WHY THE TWO BESPOKE HANDLERS ABOVE EXIST. win16_host_close_handler
+// (#215) and dos_host_close_handler (#745) are the only two calls to
+// window_set_close_handler in the whole kernel, and each was written because
+// its own subsystem discovered, separately, that the X did nothing. #745's
+// comment even records the measurement: "the click landed on the button, the
+// window stayed open, and the scheduler still reported top=dos:85". Two
+// per-client patches for a missing generic route is the shape CLAUDE.md names:
+// fix the MECHANISM, not the third instance. The Ring-3 DOS host was that third
+// instance, and every other Ring-3 app is still living with it.
+//
+// WHAT THIS PRESERVES. Installing an on_close SUPPRESSES the WM's default, so
+// this handler does the default's exact work - window_hide() + wm_invalidate_-
+// all() - and then ALSO delivers the event. Every app that ignores the event
+// therefore behaves byte-for-byte as it did; an app that handles it now can.
+// Nothing here blocks or allocates: it runs on the WM/compositor thread and
+// does one queue append and one hide, which is the same contract the two
+// handlers above already meet.
+static void user_window_close_handler(window_t *win, gui_event_t *event) {
+    for (int i = 0; i < MAX_USER_WINDOWS; i++) {
+        if (user_windows[i].window != win) continue;
+        gui_event_t ev = *event;
+        ev.type = EVENT_WINDOW_CLOSE;
+        user_window_queue_event(i, &ev);
+        break;
+    }
+    window_hide(win);
+    wm_invalidate_all();
+}
+
+// Re-route an already-created host window's X to the DOS teardown path, and
+// stamp the window with the process that owns it. A slot-indexed setter rather
+// than a create variant, so the DOS layer needs no window_t of its own and
+// win16_host_create() keeps ONE definition.
+//
+// (#dosowner) WHY THE owner_pid STAMP IS HERE AND NOT IN window_create().
+//
+// window_create() (gui/window.c) sets win->owner_pid ONLY for a PRIV_USER
+// creator, and that is deliberate: it is the #pid0desk fix of 2026-08-29. Once
+// desktop_run() stopped running on pid 0, every kernel-desktop fallback window
+// (installer, recyclebin, clock, terminal, ...) would otherwise have been
+// stamped with the live "session" pid and reported app_id="session" to the
+// dock. The ring test is the right default and must stay.
+//
+// The in-kernel DOS interpreter loses that test for a reason that does not
+// apply to it. It is a Ring-0 worker (dos/dosexec.c: proc_create("dos",
+// dos_proc_entry, ...), and "dosrun" for the /CONFIG/DOSRUN.CFG harness) but it
+// genuinely IS this window's owner in every sense the field is read for: it
+// creates the window, it drives every frame into it, it destroys it on exit
+// (win16_host_destroy at the end of dos_run_file_inner), and session teardown
+// already has to special-case it BY NAME (gui/desktop.c, #compkill) precisely
+// because nothing else identifies it. So the answer is not to weaken the ring
+// test for everyone, it is to say the true thing at the ONE site that knows it:
+// this hook, which exists only because a window belongs to DOS.
+//
+// MEASURED CONSEQUENCE, and the reason this was not a one-line change: with
+// owner_pid non-zero, sys_wm_get_windows() starts populating app_id ("dos" /
+// "dosrun"), which is what makes gui/window.c's window_title_icon() work - and
+// ALSO what makes the compositor's dock right-click menu offer "Force Quit"
+// (contextmenu.c gates that item on app_id being non-empty). Force Quit sends
+// SIGKILL by name, and #compkill measured that SIGKILL against a Ring-0 worker
+// is a permanent silent no-op. Rather than ship a button that cannot work,
+// sys_kill() (proc/signal.c) now routes a terminating signal aimed at the DOS
+// worker into the same dos_request_close() the titlebar X and session teardown
+// already use. Both halves are part of this change; neither is correct alone.
+//
+// The Ring-3 host (/APPS/DOSUSER) does NOT come through here: its
+// win16_host_create() is the shim in userland/apps/dosring3/shim/kshim.c, whose
+// win16_host_route_close_to_dos() is a no-op, and its window is made by an
+// ordinary SYS_WIN_CREATE from a PRIV_USER process, so window_create() has
+// always stamped owner_pid for it. Its app_id is "DOSUSER" (the name
+// dosroute_spawn_ring3() passes to proc_create_user_as), which is why
+// window_title_icon() has to know that name too.
 void win16_host_route_close_to_dos(int slot) {
     if (slot < 0 || slot >= MAX_USER_WINDOWS) return;
     if (!user_windows[slot].window) return;
     window_set_close_handler(user_windows[slot].window, dos_host_close_handler);
+
+    // Only window_t.owner_pid (identity + lifetime owner). NOT
+    // user_windows[slot].owner_pid, which stays 0: THAT field is the
+    // permission check for the window syscalls (sys_win_* compare it against
+    // proc_current()->pid), and a Ring-0 worker makes no syscalls, so putting
+    // its pid there would widen a Ring-3 authorisation check for no gain.
+    process_t *cur = proc_current();
+    if (cur) {
+        user_windows[slot].window->owner_pid = cur->pid;
+        kprintf("[dos] host window slot=%d owner_pid=%u name='%s' "
+                "(app_id will resolve; #dosowner)\n",
+                slot, (unsigned)cur->pid, cur->name);
+    }
 }
 
 int win16_host_create(const char *title, int x, int y, int w, int h,
@@ -7041,6 +7701,46 @@ int win16_host_content_rect(int slot, int *ox, int *oy, int *ow, int *oh) {
     return 0;
 }
 
+// (#dosfs) THE WORK AREA, through the same narrow seam. dos/dosexec.c needs it
+// to open a guest window at a sensible size on a large panel, and it
+// deliberately does not include gui/window.h - it reaches the window manager
+// only through these win16_host_* functions. The alternative was a mirrored
+// copy of rect_t inside dosexec.c, which is the private-fork-of-a-shared-type
+// that the reuse rule exists to prevent: the two definitions would agree until
+// the day rect_t gained a field.
+//
+// wm_get_work_area() already clamps its result non-empty, so a caller can use
+// what it returns without a zero check; this only unpacks it.
+int win16_host_work_area(int *ox, int *oy, int *ow, int *oh) {
+    rect_t wa;
+    wm_get_work_area(&wa);
+    if (ox) *ox = (int)wa.x;
+    if (oy) *oy = (int)wa.y;
+    if (ow) *ow = (int)wa.width;
+    if (oh) *oh = (int)wa.height;
+    return 0;
+}
+
+// (#flipfix) THE FRAMEBUFFER PRESENT COUNT, through the same narrow seam.
+//
+// dos/dosexec.c used to read g_fb_flip_count as a variable, in seven places.
+// That is correct in Ring 0 and unfixable in Ring 3: the Ring-3 DOS host
+// compiles these exact sources, and a variable read cannot become a syscall, so
+// its shim's copy of the symbol sat at zero forever. The frame gate then saw no
+// progress on any frame and every picture the guest drew came out of the 200 ms
+// staleness backstop, measured at 5.005 flips/s against 24.98 in-kernel.
+//
+// Turning the read into a call is what makes the two rings answerable by
+// different code without dosexec.c knowing which ring it is in - exactly what
+// win16_host_content_rect() and win16_host_work_area() above already do for the
+// window geometry. This side is the trivial one: it reads the same global the
+// same file used to read, so the Ring-0 path gains a function call per DOS
+// frame and nothing else.
+uint64_t win16_host_flip_count(void) {
+    extern volatile uint64_t g_fb_flip_count;   // gui/fb_syscall.c
+    return g_fb_flip_count;
+}
+
 // #156: does this Win16/DOS host window slot currently hold compositor
 // keyboard/mouse focus? This is the SAME wm_state.focused_window the
 // compositor's own SYS_INJECT_KEY -> wm_dispatch_event path already keys
@@ -7085,7 +7785,8 @@ void win16_host_destroy(int slot) {
         wm_unregister_app((int)(reg - wm_get_app_by_id(0)));
     }
     extern void kfree(void *ptr);
-    if (uw->content_buffer) { kfree(uw->content_buffer); uw->content_buffer = NULL; }
+    if (uw->content_buffer) { uw_retire_content(uw, uw->content_buffer);   // #blitnarrow
+                              uw->content_buffer = NULL; }
     // #131 (local 151): free the compositor's read-side snapshot too.
     if (uw->content_presented) { kfree(uw->content_presented); uw->content_presented = NULL; }
     uw->presented_width = 0;
@@ -7150,7 +7851,7 @@ static int64_t sys_win_set_nochrome_impl(int handle, int focus) {
     uint32_t *nb = kmalloc((size_t)nb_bytes);
     if (!nb) return -1;
     for (uint64_t i = 0; i < nb_bytes / 4u; i++) nb[i] = 0xFFF5F5F5;
-    if (uw->content_buffer) kfree(uw->content_buffer);
+    if (uw->content_buffer) uw_retire_content(uw, uw->content_buffer);   // #blitnarrow
     uw->content_buffer = nb;
     uw->content_width  = ww;
     uw->content_height = wh;
@@ -7165,6 +7866,15 @@ static int64_t sys_win_set_nochrome_impl(int handle, int focus) {
 
     // borderless panels still need keyboard focus to accept typing - but only
     // when the CALLER says this one actually wants it right now (#216).
+    // #198v2: persist the caller's focus intent as a flag, not just a
+    // one-time skip of the grab above - window_set_focus() (the single
+    // focus chokepoint, window.c) refuses WINDOW_FLAG_NO_FOCUS windows, so
+    // a LATER click cannot re-focus a panel that was deliberately created
+    // non-interactive (see the flag's comment in window.h for the bug this
+    // closes: F11 maximising the wizard power corner after a stray click).
+    // Cleared when focus=1 so a window that legitimately becomes focusable
+    // later (aichat's DOCK_COLLAPSED -> DOCK_OPEN) is not left stuck.
+    if (focus) win->flags &= ~WINDOW_FLAG_NO_FOCUS; else win->flags |= WINDOW_FLAG_NO_FOCUS;
     if (focus) { extern void wm_focus_window(window_t *w); wm_focus_window(win); }
 
     wm_invalidate_all();
@@ -7183,6 +7893,20 @@ int64_t sys_win_set_nochrome(int handle) {
 // grabs it back anyway.
 int64_t sys_win_set_nochrome_bg(int handle) {
     return sys_win_set_nochrome_impl(handle, 0);
+}
+
+// #198v2: mark this window's content_buffer as carrying REAL per-pixel alpha
+// in the top byte of every BGRA word, rather than that byte being ignored.
+// See WINDOW_FLAG_ALPHA_CONTENT (window.h) for the full contract and
+// user_window_draw_handler below for the blend it enables. A pure flag set;
+// it does not touch content_buffer itself, so the caller controls exactly
+// when its own drawing (rect fills, SYS_WIN_DRAW_IMAGE) starts carrying
+// meaningful alpha.
+int64_t sys_win_set_alpha_content(int handle) {
+    if (handle < 0 || handle >= MAX_USER_WINDOWS || !user_windows[handle].window)
+        return -1;
+    user_windows[handle].window->flags |= WINDOW_FLAG_ALPHA_CONTENT;
+    return 0;
 }
 
 // Focus a user window addressed by the SLOT handle win_create() returns, but
@@ -7318,6 +8042,11 @@ static int64_t sys_win_create_impl(const char *utitle, int x, int y,
         return -1;
     }
 
+    // (#fmzombie) Deliver this window's own titlebar X to the process that owns
+    // it. See user_window_close_handler above: without this the X was a hide
+    // and nothing else, and the app was never told its window had gone.
+    window_set_close_handler(win, user_window_close_handler);
+
     window_show(win);
     // #148 (local 164): the one line that differs between the two syscalls.
     // SYS_WIN_CREATE_BG (focus=0) leaves whatever window currently holds
@@ -7360,8 +8089,8 @@ int64_t sys_win_destroy(int handle) {
 
     // Free content buffer
     if (uw->content_buffer) {
-        extern void kfree(void *ptr);
-        kfree(uw->content_buffer);
+        extern void kfree(void *ptr); (void)kfree;
+        uw_retire_content(uw, uw->content_buffer);   // #blitnarrow
         uw->content_buffer = NULL;
 
         char log_msg[128];
@@ -7776,6 +8505,40 @@ int64_t sys_win_invalidate(int handle) {
         return -1;
     }
 
+    // #appsdirty: PER-WINDOW INVALIDATE-RATE INSTRUMENT (no-ticket).
+    //
+    // Added to answer a specific question from the owner-reported "4k is"
+    // "unusable on one core" #COMPIDLE capture. apps_dirty (SYS_WM_APPS_DIRTY,
+    // wm_is_dirty()) was pinned true on every tick with ZERO input, and the
+    // ONLY thing that can set that flag for an open window is this syscall
+    // (plus window create/resize/focus/close, which are one-shot). If a
+    // window calls win_invalidate() every tick forever regardless of whether
+    // its content actually changed, apps_dirty can never clear, and the
+    // #rinpin circuit breaker (main.c) papers over it rather than fixing it.
+    //
+    // Rate-limited to one bootlog line per window per 5s, so a legitimately
+    // busy window (a game calling this every frame via SDL_GL_SwapWindow)
+    // costs one line every 5s, not one per call - cheap enough to leave on
+    // permanently rather than gate behind a build flag, and it directly names
+    // the handle/pid/title, which is the whole point: a counter that cannot
+    // say WHO is not an answer.
+    {
+        static uint32_t s_wi_count[MAX_USER_WINDOWS];
+        static uint64_t s_wi_last_log[MAX_USER_WINDOWS];
+        s_wi_count[handle]++;
+        extern uint32_t g_timer_hz;
+        uint32_t hz = g_timer_hz ? g_timer_hz : 250;
+        uint64_t now = (uint64_t)timer_ticks;
+        if (now - s_wi_last_log[handle] >= 5ull * hz) {
+            uint32_t n = s_wi_count[handle];
+            s_wi_count[handle] = 0;
+            s_wi_last_log[handle] = now;
+            bootlog_write("[WINVAL] handle=%d pid=%u title='%.32s' %u invalidate(s)/5s",
+                          handle, user_windows[handle].owner_pid,
+                          user_windows[handle].window->title, n);
+        }
+    }
+
     // #564: do NOT set redraw_pending here (removed the #453 line that did).
     // redraw_pending exists to tell the APP "please repaint" - the KERNEL-
     // initiated direction, armed only by window create/resize (win_create()/
@@ -8128,7 +8891,7 @@ int64_t sys_win_blit(int handle, int __attribute__((unused)) x, int __attribute_
                           ? (uint32_t *)kmalloc((size_t)nbz) : NULL;
         if (new_buf) {
             for (uint64_t i = 0; i < nbz / 4u; i++) new_buf[i] = 0xFF000000;
-            if (uw->content_buffer) kfree(uw->content_buffer);
+            if (uw->content_buffer) uw_retire_content(uw, uw->content_buffer);  // #blitnarrow
             uw->content_buffer = new_buf;
             uw->content_width  = new_w;
             uw->content_height = new_h;
@@ -8155,16 +8918,116 @@ int64_t sys_win_blit(int handle, int __attribute__((unused)) x, int __attribute_
         return -1;
     }
 
-    // The bounce is only needed when the row has to be resampled. row_bytes is
-    // src_w * 4, so the allocation is O(width) whatever the image height is.
+    // #fsscale: the bounce buffer holds a CHUNK of consecutive source rows,
+    // not just one. THE DEFECT THIS REPLACES: blitguard (#blitguard) made the
+    // scaled path safe by bouncing every source row through copy_from_user()
+    // instead of a raw dereference, but it bounced ONE ROW per call. A caller
+    // that upscales a whole-window source into a much bigger destination -
+    // exactly what maximise/fullscreen does - visits every source row exactly
+    // once as sy advances (nearest-neighbour scale_y_fp is monotonic in dy, so
+    // sy never goes backwards and never repeats once it has moved on), so the
+    // row-per-call design meant one copy_from_user() PER SOURCE ROW: 800 calls
+    // for a 1280x800 app blitting to a 3840x2160 screen. MEASURED (#fsscale):
+    // with MAYTERA ARENA doing exactly that blit continuously at 3840x2160/
+    // 200%, the compositor's bounded seqlock read (UW_BLIT_MAX_RETRY, a small
+    // FIXED count, #426: it must never wait) landed mid-write so often that it
+    // logged "blit-retry-exhausted" continuously rather than occasionally,
+    // which means the screen was left showing the last frame that DID read
+    // cleanly while the app kept presenting new ones underneath - a stretched
+    // but STALE frame, which is what "full screen isn't following the app
+    // anymore" looks like from the user's chair. The fix is not to touch the
+    // seqlock or the commit (uw_commit_content() and its critical section are
+    // untouched, and neither is winblit_plan_rs's refusal/clamp policy): it is
+    // to spend less wall-clock time getting to the commit, by making fewer,
+    // bigger copy_from_user() calls instead of many small ones.
+    //
+    // The allocation stays bounded exactly the way #blitguard already bounded
+    // a single row: WINBLIT_CHUNK_BYTES (65536, the same number the original
+    // comment already named as this function's per-chunk cap) is the ceiling
+    // on the bounce buffer NOW TOO, just spread over multiple rows instead of
+    // one. rows_per_chunk is therefore O(1) work to compute and the resulting
+    // kmalloc is O(chunk), never O(height) - the #137/#567 rule this file has
+    // followed throughout is unchanged by this. A single row that is itself
+    // wider than the chunk cap (only possible near WINBUF_MAX_DIM) degrades
+    // rows_per_chunk to 1, i.e. exactly the pre-existing per-row behaviour for
+    // that extreme case; nothing gets slower, some things get faster.
+    //
+    // sy is monotonic non-decreasing in dy (scale_y_fp >= 0), so a chunk is
+    // read once, consumed forward, and never revisited: total bytes copied
+    // from Ring 3 is the same as before (each source row read exactly once for
+    // an upscale), only the NUMBER of copy_from_user() calls drops, roughly by
+    // the chunk row count. For a downscale (dst smaller than src) some rows
+    // inside a fetched chunk may end up skipped by the next sy jump; that is a
+    // bounded, O(chunk) amount of wasted read, never unbounded, and downscale
+    // is not the case this measurement was about.
+    const uint32_t WINBLIT_CHUNK_BYTES = 65536u;
     uint32_t *ksrc = NULL;
+    int rows_per_chunk = 1;
     if (!plan.one_to_one) {
-        ksrc = (uint32_t *)kmalloc((size_t)plan.row_bytes);
+        rows_per_chunk = (int)(WINBLIT_CHUNK_BYTES / (uint32_t)plan.row_bytes);
+        if (rows_per_chunk < 1) rows_per_chunk = 1;
+        if (rows_per_chunk > plan.src_h) rows_per_chunk = plan.src_h;
+        ksrc = (uint32_t *)kmalloc((size_t)rows_per_chunk * (size_t)plan.row_bytes);
         if (!ksrc) return -1;
     }
 
+    // ==================================================================
+    // #blitnarrow (#168 step 3): DROP THE BIG KERNEL LOCK FOR THE ROW LOOP.
+    //
+    // Everything below until the matching reacquire touches exactly two
+    // things: USER memory through copy_from_user() (TOCTOU-safe by
+    // construction, #509 - it validates and then does a fault-fixup copy that
+    // returns -EFAULT if the page goes bad mid-copy, and the fixup is a static
+    // RIP-range exception table, not per-CPU state, so a mid-loop migration is
+    // safe), and ONE kernel buffer, `pinbuf`, whose lifetime the pin below
+    // guarantees. It calls no scheduler function and reads no run queue.
+    //
+    // THE SELECT-AND-PUBLISH INVARIANT IS UNTOUCHED, AND THAT IS SAID HERE
+    // RATHER THAN LEFT IMPLICIT. 30050aa9 fixed a two-core race by having the
+    // AP idle loop hold the BKL around sched_schedule(); narrowing is exactly
+    // the change that could reopen it. It does not, because this change
+    // removes the lock from a region that contains NO sched_schedule() call,
+    // NO run-queue access and NO current-process publish. Every path that
+    // reaches the scheduler still holds the BKL across it, unchanged: the AP
+    // idle loop takes it itself, and a preemption arriving during this region
+    // enters through isr_handler(), which acquires the BKL BEFORE it dispatches
+    // (cpu/idt.c). So a context switch out of this row loop is still made
+    // under the lock, exactly as it was when the whole syscall held it - the
+    // only difference is that this thread is not the one holding it.
+    //
+    // WHAT WE GIVE UP, stated: another core may now mutate window state while
+    // this loop runs. That is handled by dropping the frame rather than by
+    // preventing it - see the revalidation after the reacquire.
+    // ==================================================================
+    uint32_t *pinbuf   = uw->content_buffer;
+    window_t *pinwin   = win;
+    uint32_t  bkldepth = 0;
+    int       unlocked = 0;
+    uint64_t  unlock_t0 = 0;
+    if (g_blit_narrow && uw->blit_pin == 0) {
+        uw->blit_pin  = 1;
+        uw->pinned_buffer = pinbuf;
+        uw->retired_buffer = NULL;
+        unlock_t0 = mono_us();
+        bkldepth = bkl_release_all();
+        // depth 0 means we did not hold it (SMP whole-kernel locking off, or
+        // a caller that never took it). Then there is nothing to narrow and
+        // nothing to retake, and the pin is dropped again below.
+        unlocked = (bkldepth != 0);
+        if (!unlocked) { uw->blit_pin = 0; uw->pinned_buffer = NULL; }
+        else g_blitnarrow_unlocked++;
+    } else {
+        g_blitnarrow_locked++;
+        // A second blit to the SAME window while the first runs unlocked.
+        // Interleaving rows into one buffer is a tearing mode the giant lock
+        // used to prevent; a narrowing must not buy throughput with a
+        // correctness regression. This one runs the old way.
+        if (g_blit_narrow) g_blitnarrow_nested++;
+    }
+
     int64_t rc = 0;
-    int last_sy = -1;
+    int chunk_start_sy = -1;   // -1: no chunk loaded yet
+    int chunk_rows = 0;
     for (int dy = 0; dy < plan.dst_h; dy++) {
         int sy = (dy * plan.scale_y_fp) >> 8;
         // Both clamps are kept, but they can no longer produce a negative row:
@@ -8191,7 +9054,13 @@ int64_t sys_win_blit(int handle, int __attribute__((unused)) x, int __attribute_
         // and sys_win_blit() was the one place using dst_w. content_width only
         // ever grows, so any window that had been made SMALLER was blitted at a
         // stride narrower than the buffer it was writing into, i.e. sheared.
-        uint32_t *drow = uw->content_buffer + (size_t)dy * (size_t)plan.dst_stride;
+        // #blitnarrow: `pinbuf`, NOT a fresh read of uw->content_buffer. With
+        // the lock dropped another core can swap that field mid-loop, and
+        // re-reading it would move the destination out from under a half-drawn
+        // frame. pinbuf is the buffer whose lifetime the pin guarantees, and
+        // the staleness check after the reacquire is what decides whether the
+        // frame drawn into it is publishable.
+        uint32_t *drow = pinbuf + (size_t)dy * (size_t)plan.dst_stride;
 
         if (plan.one_to_one) {
             // No horizontal resampling: the source row IS the destination row.
@@ -8202,17 +9071,63 @@ int64_t sys_win_blit(int handle, int __attribute__((unused)) x, int __attribute_
                 rc = -14; break;
             }
         } else {
-            if (sy != last_sy) {
-                if (copy_from_user(ksrc, src_buffer + srow_off,
-                                   (size_t)plan.row_bytes) != 0) {
+            // #fsscale: fetch a CHUNK starting at sy, not just row sy, when sy
+            // has moved outside the chunk already in hand. sy only moves
+            // forward (see the block comment above), so this never re-fetches
+            // a row it already has.
+            if (chunk_start_sy < 0 || sy < chunk_start_sy ||
+                sy >= chunk_start_sy + chunk_rows) {
+                int rows_avail = plan.src_h - sy;
+                if (rows_avail > rows_per_chunk) rows_avail = rows_per_chunk;
+                size_t chunk_off = (size_t)sy * (size_t)plan.src_w;
+                if (copy_from_user(ksrc, src_buffer + chunk_off,
+                                   (size_t)rows_avail * (size_t)plan.row_bytes) != 0) {
                     rc = -14; break;
                 }
-                last_sy = sy;
+                chunk_start_sy = sy;
+                chunk_rows = rows_avail;
             }
-            winblit_scale_row_rs(drow, plan.dst_w, ksrc, plan.src_w, plan.scale_x_fp);
+            const uint32_t *krow = ksrc + (size_t)(sy - chunk_start_sy) * (size_t)plan.src_w;
+            winblit_scale_row_rs(drow, plan.dst_w, krow, plan.src_w, plan.scale_x_fp);
         }
     }
     if (ksrc) kfree(ksrc);
+
+    // ==================================================================
+    // #blitnarrow: RETAKE THE LOCK, THEN REVALIDATE EVERYTHING WE CACHED.
+    // Nothing below this point may use `win`, `uw->content_buffer` or
+    // `plan.*` without having passed these checks first.
+    // ==================================================================
+    if (unlocked) {
+        bkl_reacquire(bkldepth);
+        g_blitnarrow_us += mono_us() - unlock_t0;
+        uw->blit_pin = 0;
+        uw->pinned_buffer = NULL;
+        if (uw->retired_buffer) {
+            // Somebody freed this buffer while we were writing into it and
+            // uw_retire_content() held the free for us. It is ours now.
+            extern void kfree(void *ptr);
+            kfree(uw->retired_buffer);
+            uw->retired_buffer = NULL;
+            g_blitnarrow_stale++;
+            return 0;      // the frame we drew is into a buffer nobody owns
+        }
+        // The handle may have been destroyed and RECYCLED by another process
+        // while we were unlocked, in which case uw is a live struct describing
+        // a different window. Both checks are needed: the buffer can be
+        // swapped without the window changing (resize), and the window can be
+        // replaced without the buffer pointer changing (a recycled slot that
+        // kmalloc happened to hand the same block).
+        if (uw->window != pinwin || !uw->window) {
+            g_blitnarrow_gone++;
+            return 0;
+        }
+        if (uw->content_buffer != pinbuf) {
+            g_blitnarrow_stale++;
+            return 0;
+        }
+    }
+
     if (rc != 0) {
         winblit_refuse(WINBLIT_REJ_EFAULT, src_buffer, src_w, src_h);
         return rc;   // do NOT publish a frame built from a failed copy

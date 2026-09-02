@@ -813,6 +813,25 @@ static inline int win_invalidate(int handle) {
     return (int)syscall1(SYS_WIN_INVALIDATE, handle);
 }
 
+// #DOSRING3 Stage 1: drain RAW set-1 make/break scancodes for `handle`.
+//
+// For guests that read the keyboard hardware themselves rather than through a
+// cooked event: a DOS program's own INT 9 handler reads port 0x60 and keeps its
+// own Keyboard[] array (id Software's Galaxy engine does exactly this). The
+// bytes include 0xE0 prefixes and break codes, which EVENT_KEY_DOWN cannot
+// express - gui_event_t has no scancode field.
+//
+// SCOPED, and the scope is the point: the kernel delivers only while THIS
+// process owns `handle` AND that window has focus, re-checked on every call.
+// Returns bytes written (0 when not focused, which also drops the subscription
+// and flushes the ring so keys typed elsewhere are never handed back), or -1 if
+// the caller does not own the window. Call it unconditionally in your event
+// loop; arming is idempotent and needs no setup call.
+#define SYS_WIN_GET_SCANCODES 416
+static inline int win_get_scancodes(int handle, unsigned char *buf, int cap) {
+    return (int)syscall3(SYS_WIN_GET_SCANCODES, handle, (long)buf, cap);
+}
+
 // (#704) Compositor-only: force every open app window to repaint its content
 // on the next event loop tick (not just recomposite stale pixels). Call this
 // once, edge-triggered, when a theme change is detected (index switch or a
@@ -1389,6 +1408,13 @@ static inline long get_cursor_theme(void) {
 #define SYS_FB_INFO             201
 #define SYS_FB_FLIP             202
 #define SYS_FB_DAMAGE           203
+// (#flipfix) The monotonic count of framebuffer presents (kernel
+// gui/fb_syscall.c g_fb_flip_count). Read-only, zero args. Use it to pace work
+// against what the SCREEN is actually managing rather than against a constant:
+// a value that has not moved since your last paint means your last paint has
+// not been composited yet, so painting again only overwrites a frame nobody
+// saw. First caller: the Ring-3 DOS host's frame gate (rustkern/dosdisp.rs).
+#define SYS_FB_FLIP_COUNT       418
 #define SYS_GET_MOUSE           210
 #define SYS_SET_MOUSE           211
 #define SYS_GET_KEY             212
@@ -1476,6 +1502,11 @@ typedef struct { int x, y, dx, dy; unsigned int buttons; int scroll; unsigned lo
 static inline long     fb_map(void)           { return syscall0(SYS_FB_MAP); }
 static inline int      fb_info(fb_info_t *i)  { return (int)syscall1(SYS_FB_INFO, (long)i); }
 static inline int      fb_flip(void)          { return (int)syscall0(SYS_FB_FLIP); }
+// (#flipfix) Presents since boot, or a NEGATIVE value on a kernel that does not
+// have the call. Callers must distinguish those two: a screen that is genuinely
+// not flipping and a syscall that is not there both look like "no progress",
+// and only one of them is a reason to stop drawing.
+static inline long     fb_flip_count(void)    { return syscall0(SYS_FB_FLIP_COUNT); }
 static inline int      fb_damage(int x, int y, int w, int h) {
     return (int)syscall4(SYS_FB_DAMAGE, x, y, w, h); }
 static inline int      get_mouse_evt(mouse_evt_t *m) { return (int)syscall1(SYS_GET_MOUSE, (long)m); }
@@ -1776,10 +1807,46 @@ static inline int sys_play_wav(const char *path) {
 #define SYS_DOS_FM_EVENTS   377
 #endif
 
+// (#fmbridge) SYS_DOS_FM_HOST - the producer door into the kernel's ONE OPL2
+// event queue, for /APPS/DOSUSER (the Ring-3 DOS host). Its counterpart
+// SYS_DOS_FM_EVENTS (377) is the consumer door /APPS/FMSYNTH already uses.
+//
+// Only the process that OPENs the queue may push to, close, self-test or launch
+// against it; every other caller gets -13. That latch is not decoration: it is
+// what stops any app injecting OPL2 register writes that the FM synthesiser
+// renders on the machine's speakers.
+//
+// Scalars only, in and out. Success is >= 0, failure < 0.
+#define SYS_DOS_FM_HOST         423
+// The op selector, arg1. Mirrored in kernel/proc/syscall.h beside the same
+// syscall number, where the full argument is written down.
+#define DOS_FM_HOST_OPEN           0
+#define DOS_FM_HOST_PUSH           1   // a=reg, b=val, c=t_us (monotonic)
+#define DOS_FM_HOST_CLOSE          2
+#define DOS_FM_HOST_ACTIVE         3
+#define DOS_FM_HOST_STAT_PUSHED    4
+#define DOS_FM_HOST_STAT_DROPPED   5
+#define DOS_FM_HOST_STAT_PEAK      6
+#define DOS_FM_HOST_STAT_USED      7
+#define DOS_FM_HOST_CAPACITY       8
+#define DOS_FM_HOST_SELFTEST       9
+#define DOS_FM_HOST_LAUNCH        10
+static inline long sys_dos_fm_host(int op, long a, long b, long c) {
+    return syscall4(SYS_DOS_FM_HOST, (long)op, a, b, c); }
+
 #ifndef SYS_AUDIO_PCM_OPEN
 #define SYS_AUDIO_PCM_OPEN  315
 #define SYS_AUDIO_PCM_WRITE 316
 #define SYS_AUDIO_PCM_CLOSE 317
+// (#181 Ring-3 audio) One scalar ctl call carrying the five per-stream
+// accessors a real-time PCM producer needs, plus the device-present question.
+#define SYS_AUDIO_PCM_CTL   417
+#define AUDIO_PCM_CTL_CONSUMED      0
+#define AUDIO_PCM_CTL_QUEUED        1
+#define AUDIO_PCM_CTL_UNDERRUNS     2
+#define AUDIO_PCM_CTL_WAIT_BELOW    3
+#define AUDIO_PCM_CTL_WAIT_CONSUMED 4
+#define AUDIO_PCM_CTL_AVAIL         5
 #endif
 static inline int sys_audio_pcm_open(unsigned rate, unsigned channels, unsigned format) {
     return (int)syscall3(SYS_AUDIO_PCM_OPEN, (long)rate, (long)channels, (long)format); }
@@ -1787,6 +1854,8 @@ static inline int sys_audio_pcm_write(int handle, const void *pcm, unsigned fram
     return (int)syscall3(SYS_AUDIO_PCM_WRITE, (long)handle, (long)pcm, (long)frames); }
 static inline int sys_audio_pcm_close(int handle) {
     return (int)syscall1(SYS_AUDIO_PCM_CLOSE, (long)handle); }
+static inline long sys_audio_pcm_ctl(int handle, unsigned op, unsigned a, unsigned b) {
+    return (long)syscall4(SYS_AUDIO_PCM_CTL, (long)handle, (long)op, (long)a, (long)b); }
 static inline int sys_get_cpu_usage(void) {
     return (int)syscall0(SYS_GET_CPU_USAGE); }
 
@@ -1856,6 +1925,15 @@ static inline int sys_wm_set_work_area(int left, int top, int right, int bottom)
 static inline int win_set_nochrome(int handle) { return (int)syscall1(SYS_WIN_SET_NOCHROME, (long)handle); }
 #define SYS_WIN_SET_NOCHROME_BG 398
 static inline int win_set_nochrome_bg(int handle) { return (int)syscall1(SYS_WIN_SET_NOCHROME_BG, (long)handle); }  // #216: nochrome, no focus grab
+#define SYS_WIN_SET_ALPHA_CONTENT 414
+// #198v2: mark a window's content_buffer as carrying REAL per-pixel alpha
+// (top byte of every BGRA word) that the compositor blends against the live
+// framebuffer at blit time, instead of ignoring that byte. See
+// WINDOW_FLAG_ALPHA_CONTENT (kernel/gui/window.h) for the full contract.
+// Fill the areas you want fully transparent with alpha 0 (e.g. a
+// win_draw_rect() of 0x00000000) before drawing any real content - a
+// freshly created window's buffer starts OPAQUE (0xFFF5F5F5).
+static inline int win_set_alpha_content(int handle) { return (int)syscall1(SYS_WIN_SET_ALPHA_CONTENT, (long)handle); }
 // #745: opt in to the compositor-drawn soft drop shadow around this window.
 // One-way; see kernel/gui/window.h WINDOW_FLAG_SHADOW for why it is opt-in.
 #define SYS_WIN_SET_SHADOW   376
@@ -1870,6 +1948,29 @@ static inline int get_global_mouse(int *x, int *y, unsigned int *buttons) {
 
 #define SYS_RUN_NEXT_ON_AP 261
 static inline int sys_run_next_on_ap(void) { return (int)syscall0(SYS_RUN_NEXT_ON_AP); }
+
+// ---- #affinity: per-process CPU affinity ---------------------------------
+// A SOFT preference, not a pin: the scheduler drops the mask rather than
+// strand a task on a core that is not running work. pid 0 means "me". A mask
+// of 0 is refused (it would be a request to hang). Setting another process's
+// affinity requires root.
+#define SYS_SET_AFFINITY   420
+#define SYS_GET_AFFINITY   421
+#define SYS_GET_MIGRATIONS 422
+static inline int sched_setaffinity_maytera(int pid, unsigned long long mask) {
+    return (int)syscall2(SYS_SET_AFFINITY, (long)pid, (long)mask);
+}
+static inline long long sched_getaffinity_maytera(int pid) {
+    return (long long)syscall1(SYS_GET_AFFINITY, (long)pid);
+}
+// Migrations and switch-ins for pid, the pair that says whether an affinity
+// change achieved anything. A migration count without its switch-in
+// denominator cannot be compared between two runs of different length.
+static inline int sched_getmigrations(int pid, unsigned long long *migrations,
+                                      unsigned long long *switchins) {
+    return (int)syscall3(SYS_GET_MIGRATIONS, (long)pid, (long)migrations,
+                         (long)switchins);
+}
 static inline int sys_inject_key(int key) {
     return (int)syscall1(SYS_INJECT_KEY, (long)key); }
 #define SYS_SPAWN_ARGS      198
@@ -2574,6 +2675,7 @@ static inline long sys_hda_dbg(int op, long a, long b, long c) {
 #define DISKIMG_CMD_MOUNT       1   // (path, letter or AUTO) -> letter index
 #define DISKIMG_CMD_EJECT       2   // (letter) -> 0
 #define DISKIMG_CMD_MAX_MOUNTS  3   // () -> how many images may be mounted at once
+#define DISKIMG_CMD_VOLINFO     4   // (letter) -> *out, mediated + capability-filtered
 
 #define DISKIMG_LETTER_AUTO  (-1)
 
@@ -2638,6 +2740,81 @@ static inline int sys_diskimg_eject(int letter) {
 static inline int sys_diskimg_max_mounts(void) {
     return (int)syscall4(SYS_DISKIMG, DISKIMG_CMD_MAX_MOUNTS, 0, 0, 0);
 }
+
+// ===========================================================================
+// #VOLAPI: THE MEDIATED VOLUME GATEWAY, FOR ORDINARY USERLAND APPS.
+//
+// The requirement was "a proxy/gateway/api to allow virtual cd access to
+// usermode apps". This is that API, and it is deliberately two-thirds nothing:
+//
+//   1. sys_vol_info() tells you WHAT a volume is - its class, whether it is a
+//      CD-ROM, whether it is read-only, its geometry, the disc's own LABEL, and
+//      one VFS path (`root`).
+//   2. Everything else is ORDINARY FILE I/O beneath that root. open(), read(),
+//      lseek(), close(), opendir()/readdir(). There is no vol_open(), no
+//      vol_read() and no volume file-descriptor family, because the files are
+//      already in the namespace and every credential check already applies to
+//      them. A second handle family would only have been a second place to
+//      forget a check.
+//
+// SO THE WHOLE USAGE IS:
+//
+//     dimg_vol_t v;
+//     for (int i = 0; i < 26; i++) {
+//         if (sys_vol_info(i, &v) != 0) continue;        // not yours, or none
+//         if (!(v.flags & DISKIMG_F_MOUNTED)) continue;  // no disc in it
+//         if (v.cls != DISKIMG_CLASS_CDROM) continue;    // "is this a CD?"
+//         if (strcmp(v.label, "CD1") != 0)   continue;   // find it BY LABEL
+//         char p[256]; snprintf(p, sizeof p, "%s/MAIN.MIX", v.root);
+//         int fd = open(p, O_RDONLY, 0);                 // ordinary open()
+//     }
+//
+// WHAT YOU CANNOT DO THROUGH IT, by construction rather than by check:
+//   - reach the block device (there is no LBA, no channel, no drive number, and
+//     blk_read is not exposed to Ring 3 at all);
+//   - reach a volume you were not granted (sys_vol_info() refuses with -13 for a
+//     root your credentials cannot traverse, and the files under it would refuse
+//     identically, because it is one perms_check() answering both);
+//   - escape the volume (`root` is a normal path and ".." is canonicalised by
+//     the same path chokepoint every other syscall uses);
+//   - write to it (read-only media is refused in fs/fat.c, for root too).
+//
+// GENERIC, NOT DOS-SPECIFIC. The Ring-3 DOS host is the first consumer, not the
+// intended only one: a file manager, a media player or an installer wanting the
+// mounted disc gets the same three fields it needs (is it a CD, what is it
+// called, where are its files) with no DOS concepts in sight.
+// ===========================================================================
+
+// Mirrors dimg_vol_t in kernel/dos/diskimg.h. The kernel _Static_asserts its
+// size at 288 so it can share syscall 361's argtab entry with diskimg_info_t;
+// keep the two in step or the validator's write window stops matching.
+typedef struct {
+    unsigned int   letter;               // 0 = A: .. 25 = Z:
+    unsigned int   cls;                  // DISKIMG_CLASS_* (is it a CD-ROM?)
+    unsigned int   fmt;                  // DISKIMG_FMT_*
+    unsigned int   flags;                // DISKIMG_F_*
+    unsigned int   gen;                  // which disc this is; changes on swap
+    unsigned int   bytes_per_sector;     // 2048 on ISO 9660
+    unsigned int   sectors_per_cluster;  // 1 on ISO 9660
+    unsigned int   total_clusters;       // clamped to 0xFFFF, as DOS reports it
+    unsigned long long size;             // media bytes, 0 if nothing mounted
+    char           label[40];            // the disc's OWN name, "" if none
+    char           root[64];             // "/WINDIR/DRIVE_E": where its files are
+    unsigned char  reserved[144];        // width lock; always zero
+} dimg_vol_t;
+
+// Describe drive letter index `letter` (0 = A: .. 25 = Z:).
+// Returns 0 and fills *out; -1 for a bad index; -13 when your credentials may
+// not traverse that volume's root; -14 on a bad output pointer.
+//
+// A letter with NO disc in it still returns 0, with DISKIMG_F_MOUNTED clear and
+// an empty label. That is on purpose: "there is a drive here and it is empty" is
+// a different fact from "there is no such drive", and an app that cannot tell
+// them apart cannot offer to insert anything.
+static inline int sys_vol_info(int letter, dimg_vol_t *out) {
+    return (int)syscall4(SYS_DISKIMG, DISKIMG_CMD_VOLINFO, 0, (long)out, letter);
+}
+
 
 
 // ===========================================================================

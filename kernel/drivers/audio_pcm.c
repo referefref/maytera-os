@@ -71,6 +71,10 @@ typedef struct {
     // "owned by pid 0" and "owned by no process" must not be the same value.
     volatile int      kernel_src;
     uint32_t          owner_pid;
+    // (#181) The opener's THREAD GROUP. See pcm_lookup(): a pthread has its own
+    // pid, so pid alone would scope a stream to one thread rather than to the
+    // process that owns it.
+    uint32_t          owner_tgid;
     char              owner_name[32];   // #205: so EBUSY can name the holder
     uint32_t          rate;
     uint32_t          ch;
@@ -172,8 +176,23 @@ static pcm_stream_t *pcm_lookup(int handle) {
     // Ownership gate: a stream belongs to the process that opened it. Without
     // this, any Ring-3 process could write into or close another's stream.
     // SYS_PLAY_WAV has no such notion because it owns nothing; this does.
+    // (#181 Ring-3 audio) THREAD GROUP, not thread. A pthread in MayteraOS is a
+    // separate process_t with its OWN pid (proc_clone: `child->pid =
+    // next_pid++`) that shares the address space and carries the leader in
+    // `tgid`. A pid-only gate therefore means "the stream belongs to the one
+    // THREAD that opened it", so an app that opens PCM on one thread and writes
+    // from another gets EINVAL and plays silence, with nothing in the failure
+    // that points at threads.
+    //
+    // That is a live hazard for the Ring-3 DOS host: its SB pump is a dedicated
+    // thread, and it only works today because open, write and close all happen
+    // inside that same thread. Moving the open one frame outwards would silence
+    // it. Widening to the thread group removes the landmine and is strictly no
+    // more permissive ACROSS processes, which is what the gate is actually for.
     process_t *cur = proc_current();
-    if (!cur || cur->pid != s->owner_pid) return NULL;
+    if (!cur) return NULL;
+    uint32_t cur_tg = cur->tgid ? cur->tgid : cur->pid;
+    if (cur->pid != s->owner_pid && cur_tg != s->owner_tgid) return NULL;
     return s;
 }
 
@@ -942,6 +961,12 @@ static int64_t pcm_open_common(uint32_t rate, uint32_t channels, uint32_t format
     s->underruns     = 0;
     s->frames_pushed = 0;
     s->owner_pid     = owner_pid;
+    {   // Record the thread group alongside the pid, so any thread of the
+        // owning process can drive the stream it opened.
+        process_t *op = proc_current();
+        s->owner_tgid = (op && op->tgid) ? op->tgid
+                                         : (op ? op->pid : owner_pid);
+    }
     s->kernel_src    = kernel_src;
     s->rs_dev_rate   = 0;              // forces the mixer to compute the step
     s->rs_step       = 0;
@@ -1038,9 +1063,31 @@ int64_t audio_pcm_open_kernel(uint32_t rate, uint32_t channels, uint32_t format)
 static int64_t pcm_write_common(pcm_stream_t *s, const int16_t *src,
                                 uint32_t frames, int from_user) {
     uint32_t done = 0;
+    int stopped = 0;
+
+#ifdef FMSPIN_PLANT
+    // (#fmzombie) DIAGNOSTIC PLANT, NEVER IN A SHIPPED BUILD - there is no
+    // default and no config file, only `make CFLAGS+=-DFMSPIN_PLANT=<frames>`.
+    //
+    // WHY IT EXISTS. The owner's 89%-of-a-core report was reproduced as far as
+    // the ZOMBIE (a Ring-3 DOS guest survives its own window close) but the
+    // SPIN was not reproduced on a QEMU intel-hda rig: the trigger for it is a
+    // stream that is stopped while its writer is still live, which on that rig
+    // is released within one mixer pass. Rather than argue the mechanism from
+    // code, this reproduces the exact CONTRACT that caused it - a write that
+    // returns 0 without blocking, which is what this function returned for an
+    // already-stopped stream before this ticket - so a consumer's handling of
+    // it can be measured in both arms instead of asserted.
+    //
+    // Scoped to the FM synthesiser by name so the boot chime, the compositor
+    // and the DOS SB pump are untouched and the arms differ in one thing only.
+    if (s->owner_name[0] == 'F' && s->owner_name[1] == 'M' &&
+        s->frames_pushed > (uint64_t)(FMSPIN_PLANT))
+        return 0;
+#endif
 
     while (done < frames) {
-        if (s->stop) break;             // pump gone: stop accepting
+        if (s->stop) { stopped = 1; break; }   // pump gone: stop accepting
 
         uint32_t space = pcm_space(s);
         if (space == 0) {
@@ -1111,6 +1158,31 @@ static int64_t pcm_write_common(pcm_stream_t *s, const int16_t *src,
         wake_up_all(&g_mix_wq);
     }
 
+    // (#fmzombie) A STOPPED STREAM THAT ACCEPTED NOTHING RETURNS AN ERROR, NOT
+    // ZERO.
+    //
+    // This function is the ONLY thing pacing every producer that writes to it:
+    // it blocks in wq_space while the stream is live, so a caller's loop is
+    // timed by the sink. When the stream is stopped it returns immediately, and
+    // returning 0 for that made "the sink is gone" indistinguishable from "I
+    // wrote nothing, try again". A caller that tests only for a negative then
+    // has NO pacing left and spins at the speed of the CPU.
+    //
+    // Every C caller in the kernel already worked around this by hand -
+    // drivers/audio.c:262 `if (w <= 0) break; // stream gone; do not spin on
+    // it`, media/audio_decode.c:493 `if (w <= 0) ... // stream torn down`,
+    // dos/dosexec.c's `if (wr > 0)`. Three independent callers all knew a zero
+    // meant death, which is the sign that the CONTRACT was wrong rather than
+    // the callers. /APPS/FMSYNTH tested `w < 0` and burned 89% of a core.
+    //
+    // So say it. A partial write still returns its count (the caller must offer
+    // the remainder and will get the error on the next pass); only a write that
+    // moved NOTHING because the stream is stopped becomes AUDIO_PCM_ENODEV.
+    // That is strictly more information than before: no caller can now read
+    // "gone" as "retry", and the four existing `<= 0` tests are unaffected
+    // because a negative satisfies them exactly as the zero did.
+    if (done == 0 && stopped) return (int64_t)AUDIO_PCM_ENODEV;
+
     return (int64_t)done;
 }
 
@@ -1131,10 +1203,44 @@ int64_t audio_pcm_write_kernel(int handle, const int16_t *kbuf, uint32_t frames)
     return pcm_write_common(s, kbuf, frames, 0);
 }
 
+// ---------------------------------------------------------------------------
+// THE COUNTERS AND THE TWO #426 WAITS, ONCE, BEHIND TWO DOORS.
+//
+// (#181 Ring-3 audio) These were written as _kernel-only entry points because
+// the DOS Sound Blaster pump was the only caller and it ran in Ring 0. That
+// pump now also runs as a Ring-3 THREAD inside /APPS/DOSUSER, and it needs the
+// identical semantics: the sink's own consume counter is what the emulated
+// 8237's word count is derived from, so approximating it from a wall clock in
+// Ring 3 would make the two DOS paths disagree about when a block finished.
+//
+// So the bodies moved into these three statics and BOTH doors call them. The
+// only difference between the doors remains the one audio_pcm.h already
+// documents: which lookup validates the handle. pcm_lookup_k() accepts only a
+// kernel-owned stream, pcm_lookup() only a stream owned by the CALLING pid, so
+// neither door can reach the other's stream.
+static uint32_t pcm_consumed_of(pcm_stream_t *s) {
+    return s ? s->r : 0;
+}
+static int pcm_wait_below_of(pcm_stream_t *s, uint32_t max_used, uint32_t ms) {
+    if (!s) return WAIT_TIMEOUT;
+    // #426: the wake source is the pump's wake_up_all(&s->wq_space), fired on
+    // EVERY consume and on every teardown path, so the timeout is a backstop
+    // for a dead sink and not the mechanism.
+    return wait_event_timeout(&s->wq_space,
+                              pcm_used(s) <= max_used || s->stop,
+                              wq_ms_to_ticks(ms));
+}
+static int pcm_wait_consumed_of(pcm_stream_t *s, uint32_t target, uint32_t ms) {
+    if (!s) return WAIT_TIMEOUT;
+    // Signed difference: r is free-running and wraps, and a plain r >= target would
+    // be wrong for exactly one window of 2^31 frames after every wrap.
+    return wait_event_timeout(&s->wq_space,
+                              (int32_t)(s->r - target) >= 0 || s->stop,
+                              wq_ms_to_ticks(ms));
+}
+
 uint32_t audio_pcm_consumed_kernel(int handle) {
-    pcm_stream_t *s = pcm_lookup_k(handle);
-    if (!s) return 0;
-    return s->r;
+    return pcm_consumed_of(pcm_lookup_k(handle));
 }
 
 uint64_t audio_pcm_underruns_kernel(int handle) {
@@ -1150,24 +1256,51 @@ uint32_t audio_pcm_queued_kernel(int handle) {
 }
 
 int audio_pcm_wait_below_kernel(int handle, uint32_t max_used, uint32_t ms) {
-    pcm_stream_t *s = pcm_lookup_k(handle);
-    if (!s) return WAIT_TIMEOUT;
-    // #426: the wake source is the pump's wake_up_all(&s->wq_space), fired on
-    // EVERY consume and on every teardown path, so the timeout is a backstop
-    // for a dead sink and not the mechanism.
-    return wait_event_timeout(&s->wq_space,
-                              pcm_used(s) <= max_used || s->stop,
-                              wq_ms_to_ticks(ms));
+    return pcm_wait_below_of(pcm_lookup_k(handle), max_used, ms);
 }
 
 int audio_pcm_wait_consumed_kernel(int handle, uint32_t target, uint32_t ms) {
-    pcm_stream_t *s = pcm_lookup_k(handle);
-    if (!s) return WAIT_TIMEOUT;
-    // Signed difference: r is free-running and wraps, and `r >= target` would
-    // be wrong for exactly one window of 2^31 frames after every wrap.
-    return wait_event_timeout(&s->wq_space,
-                              (int32_t)(s->r - target) >= 0 || s->stop,
-                              wq_ms_to_ticks(ms));
+    return pcm_wait_consumed_of(pcm_lookup_k(handle), target, ms);
+}
+
+// ---------------------------------------------------------------------------
+// (#181 Ring-3 audio) SYS_AUDIO_PCM_CTL - the Ring-3 door to the above.
+//
+// ONE syscall rather than five, because all five are scalar-in/scalar-out
+// accessors on the same handle and five numbers would be five argtab entries,
+// five dispatch cases and five libc wrappers for no added expressiveness.
+// Scalar arguments only, so this needs no argtab descriptor: there is no
+// pointer for a Ring-3 caller to aim at kernel memory.
+//
+// AUDIO_PCM_CTL_AVAIL is the odd one and takes no handle: it answers the
+// question the DOS interpreter asks BEFORE it decides whether to advertise a
+// Sound Blaster to the guest (sb_installed_policy()). It must be answered by
+// the kernel because only the kernel can see whether a codec or a USB DAC
+// exists, and answering it wrongly is the fabrication #175 refused to ship: a
+// card that reports PRESENT with nothing behind it.
+//
+// The two WAITs block on the stream's existing wq_space. A Ring-3 caller can
+// therefore sleep here, which is correct and is the whole point: the caller is
+// a dedicated pump THREAD, never an interpreter or a draw thread. The ms bound
+// is clamped so a caller cannot park a thread indefinitely on a dead sink.
+#define PCM_CTL_MS_MAX 10000u
+int64_t audio_pcm_ctl(int handle, uint32_t op, uint32_t a, uint32_t b) {
+    if (op == AUDIO_PCM_CTL_AVAIL) {
+        extern int uac_is_ready(void);
+        if (uac_is_ready()) return 1;
+        return audio_is_available() ? 1 : 0;
+    }
+    pcm_stream_t *s = pcm_lookup(handle);
+    if (!s) return AUDIO_PCM_EINVAL;
+    if (b > PCM_CTL_MS_MAX) b = PCM_CTL_MS_MAX;
+    switch (op) {
+        case AUDIO_PCM_CTL_CONSUMED:      return (int64_t)pcm_consumed_of(s);
+        case AUDIO_PCM_CTL_QUEUED:        return (int64_t)pcm_used(s);
+        case AUDIO_PCM_CTL_UNDERRUNS:     return (int64_t)s->underruns;
+        case AUDIO_PCM_CTL_WAIT_BELOW:    return pcm_wait_below_of(s, a, b);
+        case AUDIO_PCM_CTL_WAIT_CONSUMED: return pcm_wait_consumed_of(s, a, b);
+        default:                          return AUDIO_PCM_EINVAL;
+    }
 }
 
 // #205: the close no longer JOINS a per-stream pump, because there is no
@@ -1214,9 +1347,48 @@ int64_t audio_pcm_close(int handle) {
     return pcm_close_common(s, 1);
 }
 
-void audio_pcm_proc_exit(uint32_t pid) {
+void audio_pcm_proc_exit(uint32_t owner_tgid) {
     // Called from proc_exit() under cli(). MUST NOT block: it only sets flags
-    // and wakes. The pump thread does the actual teardown and frees the ring.
+    // and wakes. The mixer thread does the actual teardown and frees the ring.
+    //
+    // #181: MATCH THE THREAD GROUP, NOT THE THREAD, AND ONLY ON A GROUP-LEADER
+    // EXIT. This used to take `me->pid` and compare it against `s->owner_pid`,
+    // i.e. it tore a stream down when the one THREAD that happened to call
+    // open() exited. That was the exact mirror image of the bug #181 fixed one
+    // layer up: pcm_lookup() was widened from the thread to the thread group so
+    // that an app may open PCM on one thread and write from another, and this
+    // teardown was left thread-scoped. The two halves then disagreed about who
+    // owns a stream, which is worse than either rule on its own, and it broke
+    // in BOTH directions:
+    //
+    //   (a) OPENER-THREAD EXIT KILLS A LIVE PROCESS'S AUDIO. Open on a setup
+    //       thread, let that thread finish, keep writing from a worker: the
+    //       setup thread's proc_exit() set stop=1 and drain_req=1 on a stream
+    //       the process was still legitimately using. The writer then got
+    //       AUDIO_PCM_EINVAL from a handle that had been valid a moment
+    //       earlier, and the app went silent with nothing naming threads as
+    //       the cause. #181 made this reachable by construction: opening off
+    //       the main thread is now a SUPPORTED pattern, so this is no longer
+    //       theoretical.
+    //
+    //   (b) A NON-LEADER-OPENED STREAM LEAKED ITS SLOT FOR EVER. sys_kill()
+    //       (proc/signal.c) raises a signal on ONE process_t and there is no
+    //       exit_group() anywhere in proc/, so killing a threaded app runs
+    //       proc_exit() for the LEADER only. With a pid-exact match, a stream
+    //       opened by a worker thread was never matched by any exiting pid, so
+    //       in_use stayed 1 with its owner gone. Four of those exhaust
+    //       PCM_MAX_STREAMS and every later open on the machine gets EBUSY
+    //       until reboot: one dead app silently becomes a machine-wide mute.
+    //       The comment at the proc_exit() call site already records that the
+    //       music player SIGKILLs its /APPS/MUSICPLR --play helper on a manual
+    //       track switch, so the kill-without-close path is NORMAL here.
+    //
+    // The rule now matches the one its two neighbours in proc_exit() already
+    // use (fdown_proc_exit, async_http_proc_exit): the resource belongs to the
+    // thread GROUP, so only a group-leader exit releases it, and a worker
+    // thread exiting releases nothing. The !shares_vm gate lives at the call
+    // site with theirs; owner_tgid is what open() already recorded for exactly
+    // this ownership question, so there is no new state.
     for (int i = 0; i < PCM_MAX_STREAMS; i++) {
         pcm_stream_t *s = &g_pcm[i];
         // #181: a kernel-owned stream has no owning process and must not be
@@ -1224,7 +1396,10 @@ void audio_pcm_proc_exit(uint32_t pid) {
         // exiting (or any pid matching the zeroed owner_pid) would kill the
         // DOS guest's audio.
         if (s->kernel_src) continue;
-        if (s->in_use && s->owner_pid == pid) {
+        // owner_tgid is never 0 for a Ring-3 stream (pcm_open_common falls back
+        // to the opener's own pid when it has no tgid), so a zeroed slot cannot
+        // be matched by a real caller.
+        if (s->in_use && s->owner_tgid != 0 && s->owner_tgid == owner_tgid) {
             s->stop      = 1;
             s->drain_req = 1;
             wake_up_all(&s->wq_space);

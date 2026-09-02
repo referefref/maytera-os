@@ -8,6 +8,7 @@
 #include "../../libc/gui_menu.h"
 #include "../../libc/userconf.h"   // #743: checked whole-file write + per-user paths
 #include "../../libc/keys.h"   // #243: GUI_KEY_* nav codes
+#include "../../libc/theme.h"  // [no-ticket] editor uplift: theme_color()/theme_metric()
 
 // Editor dimensions
 static int g_ed_w = 640, g_ed_h = 480;  // live content size (EVENT_RESIZE)
@@ -71,9 +72,20 @@ static void ed_apply_font(void) {
 #define ED_CHROME_H     24
 #define BORDER_INSET    2
 
+// [no-ticket] Scrollbar width, derived from the theme's own metric instead of
+// a hardcoded literal. Every caller that needs the scrollbar's width (the
+// content-area reservation AND the two draw-time rects) goes through this one
+// function, so they cannot drift apart the way CONTENT_W's old "-16" and the
+// draw-time "14"/"10" literals did (a real, currently-shipping mismatch: see
+// CHANGELOG). theme_metric() already applies the live UI-scale factor; do not
+// multiply by scale again here.
+static int ed_scrollbar_w(void) {
+    return theme_metric_or(THEME_METRIC_SCROLLBAR_W, 16);
+}
+
 // Content area dimensions (recomputed per-frame so the find bar can push it down)
 #define CONTENT_X       LINE_NUM_WIDTH
-#define CONTENT_W       (EDITOR_WIDTH - LINE_NUM_WIDTH - 16)  // -16 for scrollbar
+#define CONTENT_W       (EDITOR_WIDTH - LINE_NUM_WIDTH - ed_scrollbar_w())
 
 // Buffer limits
 #define MAX_BUFFER      (64 * 1024)  // 64KB text buffer
@@ -82,78 +94,77 @@ static void ed_apply_font(void) {
 #define MAX_FIND        128
 #define MAX_CLIP        (16 * 1024)
 
-// Colors (theme-driven at runtime; see apply_theme()). Dark defaults shown.
+// Colors (theme-driven at runtime; see apply_theme()). [no-ticket] editor
+// uplift: these used to be five hand-picked hex palettes (Dark/Light/Classic/
+// Ocean/Nord) baked into a switch on get_theme(). Replaced with reads from
+// the real shared theme system (theme_color()), so the editor now inherits
+// all 12 shipped themes instead of 5, and picks up any future theme with no
+// editor-side change. Initial values here are placeholders overwritten by the
+// first apply_theme() call in main(); they exist only so the file compiles
+// with sane values before that call runs.
 static uint32_t BG_COLOR       = 0x001E1E1E;  // text content background
 static uint32_t TEXT_COLOR     = 0x00D4D4D4;  // body text
 static uint32_t LINE_NUM_COLOR = 0x00858585;  // gutter line numbers (dim)
 static uint32_t LINE_NUM_BG    = 0x00252525;  // gutter/panel background
 static uint32_t SELECTION_BG   = 0x00264F78;  // selection highlight
+static uint32_t SELECTION_FG   = 0x00FFFFFF;  // text ink drawn over SELECTION_BG
 static uint32_t CURSOR_COLOR   = 0x00AEAFAD;  // caret
 static uint32_t MENU_BG        = 0x00333333;  // menu bar / find bar panel
 static uint32_t MENU_TEXT      = 0x00FFFFFF;  // menu / button text
 static uint32_t MENU_HINT      = 0x00AAAAAA;  // secondary/dim text on chrome
-static uint32_t STATUS_BG      = 0x00007ACC;  // status bar / focus accent
+static uint32_t STATUS_BG      = 0x00007ACC;  // status bar background
 static uint32_t STATUS_TEXT    = 0x00FFFFFF;  // status bar text
 static uint32_t FIND_BG        = 0x002D2D30;  // find bar background
 static uint32_t FIND_FIELD_BG  = 0x003C3C3C;  // input field background
-static uint32_t FIND_BORDER    = 0x00505050;  // field border / scrollbar thumb
+static uint32_t FIND_BORDER    = 0x00505050;  // field border
 static uint32_t BUTTON_BG      = 0x00505050;  // find-bar prev/next buttons
 static uint32_t SCROLL_TRACK   = 0x00303030;  // scrollbar track
 static uint32_t SCROLL_THUMB   = 0x00686868;  // scrollbar thumb
 static uint32_t CUR_LINE_BG    = 0x002A2D2E;  // current-line highlight
-static uint32_t MATCH_BG       = 0x00504000;  // highlight for all matches
-static uint32_t MATCH_CUR_BG   = 0x00B58900;  // highlight for the active match
-static uint32_t TRAIL_WS_BG    = 0x00552222;  // trailing-whitespace flag
-static uint32_t BRACKET_BG     = 0x00405E40;  // matched-bracket highlight
-static uint32_t WARN_COLOR     = 0x00FFCC00;  // unbalanced-bracket warning
+static uint32_t MATCH_CUR_BG   = 0x00B58900;  // fill for the active match
+static uint32_t MATCH_CUR_FG   = 0x00000000;  // text ink drawn over MATCH_CUR_BG
+static uint32_t BRACKET_OUTLINE = 0x00405E40; // matched-bracket outline
+static uint32_t MATCH_OUTLINE  = 0x00FFCC00;  // all-matches outline
+static uint32_t TRAIL_WS_DOT   = 0x00858585;  // trailing-whitespace dot glyph
+static uint32_t WARN_COLOR     = 0x00FFCC00;  // unbalanced-bracket / save-fail warning
 
-// Live theme tracking. get_theme(): 1=Dark 2=Light 4=Classic 5=Ocean 9=Nord.
+// Live theme tracking. get_theme() returns the active theme index (0-11).
 static int g_theme_last = -1;
 
+// [no-ticket] editor uplift: reads the real theme tokens instead of a bespoke
+// 5-way switch. See CHANGELOG for the full old-var -> theme_color() mapping.
+// No per-pixel alpha exists in this renderer, so the old MATCH_BG (all-
+// matches fill) / BRACKET_BG / TRAIL_WS_BG flat-fill colors were dropped
+// rather than invented as new literals that could collide with selection or
+// current-line fills under z-order: matches and bracket pairs are now drawn
+// as an OUTLINE on top of the fills (gui_draw_rect_outline), and trailing
+// whitespace as a small centered dot glyph, both reusing existing tokens.
 static void apply_theme(void) {
-    int kt = get_theme();
-    switch (kt) {
-        case 2:  // Light
-            BG_COLOR=0x00FFFFFF; TEXT_COLOR=0x00202020; LINE_NUM_COLOR=0x00999999;
-            LINE_NUM_BG=0x00F0F0F0; SELECTION_BG=0x00D6E4FB; CURSOR_COLOR=0x00202020;
-            MENU_BG=0x00F0F0F0; MENU_TEXT=0x00202020; MENU_HINT=0x00606060;
-            STATUS_BG=0x002D6CDF; STATUS_TEXT=0x00FFFFFF; FIND_BG=0x00F8F8F8;
-            FIND_FIELD_BG=0x00FFFFFF; FIND_BORDER=0x00CCCCCC; BUTTON_BG=0x00E0E0E0;
-            SCROLL_TRACK=0x00E8E8E8; SCROLL_THUMB=0x00BBBBBB; CUR_LINE_BG=0x00EEF3FC;
-            break;
-        case 4:  // Classic
-            BG_COLOR=0x00FFFFFF; TEXT_COLOR=0x00000000; LINE_NUM_COLOR=0x00808080;
-            LINE_NUM_BG=0x00C0C0C0; SELECTION_BG=0x00000080; CURSOR_COLOR=0x00000000;
-            MENU_BG=0x00C0C0C0; MENU_TEXT=0x00000000; MENU_HINT=0x00404040;
-            STATUS_BG=0x00000080; STATUS_TEXT=0x00FFFFFF; FIND_BG=0x00C0C0C0;
-            FIND_FIELD_BG=0x00FFFFFF; FIND_BORDER=0x00000000; BUTTON_BG=0x00D0D0D0;
-            SCROLL_TRACK=0x00C0C0C0; SCROLL_THUMB=0x00808080; CUR_LINE_BG=0x00E8E8E8;
-            break;
-        case 5:  // Ocean
-            BG_COLOR=0x00183040; TEXT_COLOR=0x00E0F0FF; LINE_NUM_COLOR=0x00607080;
-            LINE_NUM_BG=0x001A3A4A; SELECTION_BG=0x00305060; CURSOR_COLOR=0x0040C0E0;
-            MENU_BG=0x001E4050; MENU_TEXT=0x00E0F0FF; MENU_HINT=0x0090B0C0;
-            STATUS_BG=0x0040C0E0; STATUS_TEXT=0x00183040; FIND_BG=0x001E4050;
-            FIND_FIELD_BG=0x00183040; FIND_BORDER=0x00406070; BUTTON_BG=0x00254555;
-            SCROLL_TRACK=0x001A3A4A; SCROLL_THUMB=0x00406070; CUR_LINE_BG=0x00224455;
-            break;
-        case 9:  // Nord
-            BG_COLOR=0x002B303B; TEXT_COLOR=0x00ECEFF4; LINE_NUM_COLOR=0x00707A8C;
-            LINE_NUM_BG=0x002E3440; SELECTION_BG=0x00434C5E; CURSOR_COLOR=0x0088C0D0;
-            MENU_BG=0x00343B49; MENU_TEXT=0x00ECEFF4; MENU_HINT=0x00AEB6C5;
-            STATUS_BG=0x0088C0D0; STATUS_TEXT=0x002B303B; FIND_BG=0x00343B49;
-            FIND_FIELD_BG=0x002B303B; FIND_BORDER=0x004C566A; BUTTON_BG=0x00343B49;
-            SCROLL_TRACK=0x002E3440; SCROLL_THUMB=0x004C566A; CUR_LINE_BG=0x003B4252;
-            break;
-        default: // Dark
-            BG_COLOR=0x001E1E1E; TEXT_COLOR=0x00D4D4D4; LINE_NUM_COLOR=0x00858585;
-            LINE_NUM_BG=0x00252525; SELECTION_BG=0x00264F78; CURSOR_COLOR=0x00AEAFAD;
-            MENU_BG=0x00333333; MENU_TEXT=0x00FFFFFF; MENU_HINT=0x00AAAAAA;
-            STATUS_BG=0x00007ACC; STATUS_TEXT=0x00FFFFFF; FIND_BG=0x002D2D30;
-            FIND_FIELD_BG=0x003C3C3C; FIND_BORDER=0x00505050; BUTTON_BG=0x00505050;
-            SCROLL_TRACK=0x00303030; SCROLL_THUMB=0x00686868; CUR_LINE_BG=0x002A2D2E;
-            break;
-    }
+    BG_COLOR        = theme_color(THEME_COLOR_TEXTBOX_BG);
+    TEXT_COLOR       = theme_color(THEME_COLOR_TEXTBOX_TEXT);
+    LINE_NUM_COLOR   = theme_color(THEME_COLOR_MUTED);
+    LINE_NUM_BG      = theme_color(THEME_COLOR_SURFACE_RAISED);
+    SELECTION_BG     = theme_color(THEME_COLOR_SELECTION);
+    SELECTION_FG     = theme_color(THEME_COLOR_SELECTION_TEXT);
+    CURSOR_COLOR     = theme_color(THEME_COLOR_TEXTBOX_CURSOR);
+    MENU_BG          = theme_color(THEME_COLOR_MENU_BG);
+    MENU_TEXT        = theme_color(THEME_COLOR_MENU_TEXT);
+    MENU_HINT        = theme_color(THEME_COLOR_MUTED);
+    STATUS_BG        = theme_color(THEME_COLOR_SURFACE_RAISED);
+    STATUS_TEXT      = theme_color(THEME_COLOR_MUTED);
+    FIND_BG          = theme_color(THEME_COLOR_SURFACE_RAISED);
+    FIND_FIELD_BG    = theme_color(THEME_COLOR_TEXTBOX_BG);
+    FIND_BORDER      = theme_color(THEME_COLOR_TEXTBOX_BORDER);
+    BUTTON_BG        = theme_color(THEME_COLOR_BUTTON_FACE);
+    SCROLL_TRACK     = theme_color(THEME_COLOR_SCROLLBAR_BG);
+    SCROLL_THUMB     = theme_color(THEME_COLOR_SCROLLBAR_THUMB);
+    CUR_LINE_BG      = theme_color(THEME_COLOR_WINDOW_BG);
+    MATCH_CUR_BG     = theme_color(THEME_COLOR_ACCENT);
+    MATCH_CUR_FG     = theme_color(THEME_COLOR_ON_ACCENT);
+    BRACKET_OUTLINE  = theme_color(THEME_COLOR_FOCUS_RING);
+    MATCH_OUTLINE    = theme_color(THEME_COLOR_WARNING);
+    TRAIL_WS_DOT     = theme_color(THEME_COLOR_MUTED);
+    WARN_COLOR       = theme_color(THEME_COLOR_WARNING);
 }
 
 // Editor state
@@ -619,6 +630,20 @@ static void ed_save_font(void) {
 
 static void ed_load_font(void) {
     memset(&g_font, 0, sizeof(g_font));
+    // [no-ticket] editor uplift: this used to default to an EMPTY family,
+    // which resolves to face 0 (DejaVu Sans, a PROPORTIONAL face). Combined
+    // with ed_apply_font() measuring 'M's advance as if it were fixed pitch,
+    // that is why unthemed text looked double-wide / letter-spaced. Do NOT
+    // change ed_apply_font()'s measurement formula: it is correct once the
+    // face genuinely IS monospace (every glyph shares one advance, so
+    // measuring 'M' gives the right number for every column). The fix is
+    // only this default. Same family lineage as the OS default UI face
+    // (visual consistency), ships real Bold/Oblique/BoldOblique, and is what
+    // the tree's own font regression checks are measured against. This only
+    // changes the default for an install with no saved EDFONT.CFG - a saved
+    // preference below still wins, unchanged. Inconsolata and IBM Plex Mono
+    // stay fully selectable via the existing Font... menu item.
+    strncpy(g_font.family, "DejaVu Sans Mono", GUI_FONT_NAME_MAX - 1);
     g_font.size = 16;
     strncpy(g_font.style, "Regular", GUI_FONT_STYLE_MAX - 1);
     // #743: per-user copy first, falling back to the legacy path so an existing
@@ -648,46 +673,34 @@ static void ed_load_font(void) {
     ed_apply_font();
 }
 
-// Refresh g_menu's colors from the editor's own theme palette (called after
-// apply_theme(), which sets MENU_BG/MENU_TEXT/etc.). gui_menu is deliberately
-// colour-agnostic (see gui_menu.h) so the editor keeps its existing
-// VSCode-style look instead of switching to the kernel THEME_COLOR_* palette.
-static void sync_menu_theme(void) {
-    gui_menu_palette_t p;
-    p.bar_bg             = MENU_BG;
-    p.bar_text            = MENU_TEXT;
-    p.bar_hover_bg        = gui_lighten(MENU_BG, 24);
-    // Hover and OPEN are separate states in the widget now (they shared one
-    // token, so a hovered label and a label with its menu down looked the
-    // same). The editor's open state uses its own accent, the same pair the
-    // status bar uses, rather than the kernel theme accent the widget defaults
-    // to - this app keeps its VSCode-style chrome on purpose (see below).
-    // EVERY FIELD OF gui_menu_palette_t IS ASSIGNED HERE BY NAME: `p` is an
-    // uninitialised local, so a field added to the struct and not assigned here
-    // is not "the old colour", it is stack garbage.
-    p.bar_open_bg         = STATUS_BG;
-    p.bar_open_text       = STATUS_TEXT;
-    p.popup_bg            = MENU_BG;
-    p.popup_border        = MENU_HINT;
-    p.item_text           = MENU_TEXT;
-    p.item_text_disabled  = MENU_HINT;
-    p.item_hover_bg       = STATUS_BG;      // accent fill, matches the style
-    p.item_hover_text     = STATUS_TEXT;    // guide's menu hover contract
-    p.shortcut_text       = MENU_HINT;
-    p.separator           = MENU_HINT;
-    gui_menu_set_palette(&g_menu, &p);
-}
+// [no-ticket] editor uplift: this used to be sync_menu_theme(), which built a
+// custom gui_menu_palette_t by hand every time (a "VSCode-style" override of
+// the shared widget's default theming). Deleted in favour of the shared
+// widget's own default: gui_menu_bar_init()'s doc comment says "A bar is
+// themed by DEFAULT... gui_menu_set_palette() remains the override for an app
+// with its own chrome identity (Editor)" - we are explicitly removing that
+// override so the editor's menu bar tracks the same theme-driven palette,
+// metrics, and layout every other app's menu bar does. Both call sites below
+// now call gui_menu_sync_theme(&g_menu, -1) directly instead.
 
 // Draw the menu bar
+// [no-ticket] editor uplift: this used to also draw a right-aligned hint
+// string ("Ctrl+F Find  Ctrl+H Replace  Ctrl+S Save"). Removed outright, to
+// match Settings/Files, neither of which decorates its menu bar with
+// shortcut hints. Nothing replaces it; the right side is deliberately empty.
+// gui_menu_bar_draw() already draws TTF internally, so there is nothing
+// bitmap-drawn left in this function to convert.
 static void draw_menu_bar(void) {
     win_draw_rect(window_handle, 0, 0, EDITOR_WIDTH, MENU_HEIGHT, MENU_BG);
     gui_menu_bar_draw(window_handle, &g_menu);
-
-    // Compact hint on the right.
-    const char *hint = "Ctrl+F Find  Ctrl+H Replace  Ctrl+S Save";
-    int hw = gui_string_width(hint);
-    win_draw_text_small(window_handle, EDITOR_WIDTH - hw / 2 - 12, 7, hint, MENU_HINT);
 }
+
+// [no-ticket] editor uplift: body text size (docs/UI_STYLE_GUIDE.md 4.x
+// type.body) and caption size (type.caption), used for every TTF draw/measure
+// pair in this file so a draw call and its matching gui_ttf_width() measure
+// can never drift to different sizes.
+#define ED_TTF_BODY     14
+#define ED_TTF_CAPTION  11
 
 // Draw the find / replace bar
 static void draw_find_bar(void) {
@@ -696,7 +709,7 @@ static void draw_find_bar(void) {
     win_draw_rect(window_handle, 0, y, EDITOR_WIDTH, FIND_HEIGHT, FIND_BG);
 
     // Label
-    win_draw_text(window_handle, 6, y + 5, "Find:", MENU_TEXT);
+    win_draw_text_ttf(window_handle, 6, y + 5, "Find:", ED_TTF_BODY, MENU_TEXT);
 
     // Find field
     int fx = 56, fw = 200, fh = 18;
@@ -704,9 +717,12 @@ static void draw_find_bar(void) {
     win_draw_rect(window_handle, fx, y + 4, fw, fh, fb);
     gui_draw_rect_outline(window_handle, fx, y + 4, fw, fh,
                           (find_field == 0) ? STATUS_BG : FIND_BORDER);
-    win_draw_text(window_handle, fx + 4, y + 5, find_text, TEXT_COLOR);
+    win_draw_text_ttf(window_handle, fx + 4, y + 5, find_text, ED_TTF_BODY, TEXT_COLOR);
     if (find_field == 0) {
-        int cx = fx + 4 + gui_string_width(find_text);
+        // Caret-alignment proof point: the caret x MUST come from the same
+        // measure (gui_ttf_width at the SAME size) as the draw call just
+        // above it, or the caret drifts off the end of the typed glyphs.
+        int cx = fx + 4 + gui_ttf_width(find_text, ED_TTF_BODY);
         win_draw_rect(window_handle, cx, y + 5, 1, CHAR_H - 2, CURSOR_COLOR);
     }
 
@@ -719,14 +735,14 @@ static void draw_find_bar(void) {
     } else {
         snprintf(mc, sizeof(mc), "%d of %d", match_index, match_count);
     }
-    win_draw_text(window_handle, fx + fw + 10, y + 5, mc, MENU_HINT);
+    win_draw_text_ttf(window_handle, fx + fw + 10, y + 5, mc, ED_TTF_BODY, MENU_HINT);
 
     // Prev / Next buttons
     int bx = fx + fw + 110;
     win_draw_rect(window_handle, bx, y + 4, 24, fh, BUTTON_BG);
-    win_draw_text(window_handle, bx + 8, y + 5, "<", MENU_TEXT);
+    win_draw_text_ttf(window_handle, bx + 8, y + 5, "<", ED_TTF_BODY, MENU_TEXT);
     win_draw_rect(window_handle, bx + 28, y + 4, 24, fh, BUTTON_BG);
-    win_draw_text(window_handle, bx + 36, y + 5, ">", MENU_TEXT);
+    win_draw_text_ttf(window_handle, bx + 36, y + 5, ">", ED_TTF_BODY, MENU_TEXT);
 
     if (replace_mode) {
         // Replace row is drawn within the same bar height by re-using vertical
@@ -736,20 +752,20 @@ static void draw_find_bar(void) {
         // line at the bottom of the bar.
         // Simpler: show replace field to the right.
         int rx = bx + 60;
-        win_draw_text(window_handle, rx, y + 5, "Repl:", MENU_TEXT);
+        win_draw_text_ttf(window_handle, rx, y + 5, "Repl:", ED_TTF_BODY, MENU_TEXT);
         int rfx = rx + 44, rfw = 150;
         uint32_t rb = (find_field == 1) ? gui_lighten(FIND_FIELD_BG, 16) : FIND_FIELD_BG;
         win_draw_rect(window_handle, rfx, y + 4, rfw, fh, rb);
         gui_draw_rect_outline(window_handle, rfx, y + 4, rfw, fh,
                               (find_field == 1) ? STATUS_BG : FIND_BORDER);
-        win_draw_text(window_handle, rfx + 4, y + 5, repl_text, TEXT_COLOR);
+        win_draw_text_ttf(window_handle, rfx + 4, y + 5, repl_text, ED_TTF_BODY, TEXT_COLOR);
         if (find_field == 1) {
-            int cx = rfx + 4 + gui_string_width(repl_text);
+            int cx = rfx + 4 + gui_ttf_width(repl_text, ED_TTF_BODY);
             win_draw_rect(window_handle, cx, y + 5, 1, CHAR_H - 2, CURSOR_COLOR);
         }
-        // Replace hint
-        win_draw_text_small(window_handle, rfx + rfw + 6, y + 8,
-                            "Enter=Repl  Ctrl+Enter=All", MENU_HINT);
+        // Replace hint (caption role: size 11)
+        win_draw_text_ttf(window_handle, rfx + rfw + 6, y + 8,
+                          "Enter=Repl  Ctrl+Enter=All", ED_TTF_CAPTION, MENU_HINT);
     }
 }
 
@@ -767,11 +783,13 @@ static void draw_line_numbers(void) {
 
         gui_itoa(line_num, num_str, 8);
 
-        int text_w = gui_string_width(num_str);
+        // Gutter numerals are caption role, right-aligned (UI_STYLE_GUIDE.md
+        // 4.4: "List/table rows... numerals right-aligned").
+        int text_w = gui_ttf_width(num_str, ED_TTF_CAPTION);
         int x = LINE_NUM_WIDTH - text_w - 8;
 
         uint32_t color = (scroll_line + (uint32_t)row == cursor_line) ? TEXT_COLOR : LINE_NUM_COLOR;
-        win_draw_text(window_handle, x, y, num_str, color);
+        win_draw_text_ttf(window_handle, x, y, num_str, ED_TTF_CAPTION, color);
     }
 }
 
@@ -803,38 +821,70 @@ static void draw_content(void) {
 
             int x = CONTENT_X + col * CHAR_W;
 
-            // Cell background priority: selection > active match > matches >
-            // bracket-match > trailing whitespace.
+            // [no-ticket] editor uplift: fills first (selection > active-match
+            // fill; current-line fill was already drawn for the whole row
+            // above), THEN outlines on top (bracket-pair, all-matches), THEN
+            // the trailing-ws dot glyph drawn alongside the text. The old
+            // "all matches" and "matched bracket" cell BACKGROUNDS are gone:
+            // this renderer has no per-pixel alpha, so a 4th/5th flat fill
+            // color risked colliding with the selection/current-line fills
+            // under z-order. An outline reuses tokens that already exist
+            // instead of inventing new ones.
+            bool sel_here = pos_in_selection(pos);
             uint32_t cell_bg = 0;
             bool have_bg = false;
-            if (pos_in_selection(pos)) { cell_bg = SELECTION_BG; have_bg = true; }
+            if (sel_here) { cell_bg = SELECTION_BG; have_bg = true; }
             else if (find_len > 0 && have_cur_match && pos >= cur_match_pos && pos < cur_match_pos + find_len) {
                 cell_bg = MATCH_CUR_BG; have_bg = true;
-            } else if (find_len > 0) {
-                // is pos within ANY match? check the start of the match window
+            }
+            if (have_bg) win_draw_rect(window_handle, x, y, CHAR_W, CHAR_H, cell_bg);
+
+            bool is_active_match = (find_len > 0 && have_cur_match &&
+                                    pos >= cur_match_pos && pos < cur_match_pos + find_len);
+            if (find_len > 0 && !is_active_match) {
+                // Is pos within ANY (non-active) match? Check the start of the
+                // match window, same scan the old fill branch used.
                 uint32_t s = (pos >= find_len - 1) ? pos - (find_len - 1) : 0;
                 for (uint32_t m = s; m <= pos; m++) {
-                    if (match_at(m) && pos < m + find_len) { cell_bg = MATCH_BG; have_bg = true; break; }
+                    if (match_at(m) && pos < m + find_len) {
+                        gui_draw_rect_outline(window_handle, x, y, CHAR_W, CHAR_H, MATCH_OUTLINE);
+                        break;
+                    }
                 }
             }
-            if (!have_bg && have_bracket_match &&
+            if (have_bracket_match &&
                 (pos == bracket_match_pos ||
                  (cursor_pos > 0 && pos == cursor_pos - 1 && (is_open_bracket(c) || is_close_bracket(c))) ||
-                 (pos == cursor_pos && (is_open_bracket(c) || is_close_bracket(c))))) {
-                if (is_open_bracket(c) || is_close_bracket(c)) { cell_bg = BRACKET_BG; have_bg = true; }
+                 (pos == cursor_pos && (is_open_bracket(c) || is_close_bracket(c)))) &&
+                (is_open_bracket(c) || is_close_bracket(c))) {
+                gui_draw_rect_outline(window_handle, x, y, CHAR_W, CHAR_H, BRACKET_OUTLINE);
             }
-            if (!have_bg && is_trailing_ws(pos, line)) { cell_bg = TRAIL_WS_BG; have_bg = true; }
-
-            if (have_bg) win_draw_rect(window_handle, x, y, CHAR_W, CHAR_H, cell_bg);
 
             if (c == '\t') {
                 // render tab as a faint marker, advance is still 1 cell here
             } else if (c >= ' ' && c < 127) {
                 char str[2] = { c, '\0' };
                 // Face-aware: honours the family/style/size from gui_font_dialog().
+                // Selected text swaps to SELECTION_FG so contrast against
+                // SELECTION_BG is guaranteed on every theme, active-match
+                // cells swap to MATCH_CUR_FG the same way.
+                uint32_t ink = sel_here ? SELECTION_FG : (is_active_match ? MATCH_CUR_FG : TEXT_COLOR);
                 win_draw_text_ttf_ex(window_handle, x, y, str,
                                      g_font.face, g_font.size, g_font.style_bits,
-                                     TEXT_COLOR);
+                                     ink);
+            }
+
+            // Trailing whitespace: a small centered dot glyph, not a filled
+            // cell. Blended against whatever this cell's actual fill is (the
+            // renderer has no per-pixel alpha, so gui_fill_circle_aa needs the
+            // real background to anti-alias against).
+            if (is_trailing_ws(pos, line)) {
+                uint32_t dot_bg = have_bg ? cell_bg
+                                 : ((line == cursor_line) ? CUR_LINE_BG : BG_COLOR);
+                int d = 3;
+                int dx = x + (CHAR_W - d) / 2;
+                int dy = y + (CHAR_H - d) / 2;
+                gui_fill_circle_aa(window_handle, dx, dy, d, TRAIL_WS_DOT, dot_bg);
             }
         }
     }
@@ -847,15 +897,24 @@ static void draw_content(void) {
         win_draw_rect(window_handle, cx, cyy, 2, CHAR_H, CURSOR_COLOR);
     }
 
-    // Vertical scrollbar
+    // Vertical scrollbar. [no-ticket] editor uplift: track width, thumb width
+    // and CONTENT_W's reservation ALL now trace to the one ed_scrollbar_w()
+    // call - previously CONTENT_W reserved a hardcoded 16px while the track
+    // drew at 14px and the thumb at 10px, none of which matched, which is
+    // exactly the class of bug ("magic constants that can silently drift
+    // apart") this pass exists to remove. Thumb is inset 2px each side,
+    // matching gui_scroll.c's convention (GUI_SCROLL_W - 4).
+    // DISPLAY-ONLY in this pass: no click-drag, no hit-testing. That gap
+    // already existed before this change; not adding real interactivity here.
     if ((int)line_count > rows) {
+        int sb_w = ed_scrollbar_w();
         int sb_x = CONTENT_X + CONTENT_W;
-        win_draw_rect(window_handle, sb_x, cy, 14, ch, SCROLL_TRACK);
+        win_draw_rect(window_handle, sb_x, cy, sb_w, ch, SCROLL_TRACK);
         int thumb_h = rows * ch / (int)line_count;
         if (thumb_h < 16) thumb_h = 16;
         int range = (int)line_count - rows;
         int thumb_y = cy + (range > 0 ? (int)scroll_line * (ch - thumb_h) / range : 0);
-        win_draw_rect(window_handle, sb_x + 2, thumb_y, 10, thumb_h, SCROLL_THUMB);
+        win_draw_rect(window_handle, sb_x + 2, thumb_y, sb_w - 4, thumb_h, SCROLL_THUMB);
     }
 }
 
@@ -874,7 +933,7 @@ static void draw_status_bar(void) {
     } else {
         snprintf(left, sizeof(left), "%s%s", f, modified ? " *" : "");
     }
-    win_draw_text(window_handle, 8, y + 2, left, STATUS_TEXT);
+    win_draw_text_ttf(window_handle, 8, y + 2, left, ED_TTF_CAPTION, STATUS_TEXT);
 
     // Center: lint cue
     char mid[64];
@@ -893,9 +952,9 @@ static void draw_status_bar(void) {
         snprintf(mid, sizeof(mid), "SAVE FAILED - document NOT written to disk");
 
     if (mid[0]) {
-        int mw = gui_string_width(mid);
+        int mw = gui_ttf_width(mid, ED_TTF_CAPTION);
         uint32_t mc = (bracket_balance != 0 || save_failed) ? WARN_COLOR : STATUS_TEXT;
-        win_draw_text(window_handle, (EDITOR_WIDTH - mw) / 2, y + 2, mid, mc);
+        win_draw_text_ttf(window_handle, (EDITOR_WIDTH - mw) / 2, y + 2, mid, ED_TTF_CAPTION, mc);
     }
 
     // Right: line:col + total lines
@@ -903,8 +962,8 @@ static void draw_status_bar(void) {
     snprintf(info, sizeof(info), "Ln %u, Col %u  |  %u lines",
              (unsigned)(cursor_line + 1), (unsigned)(cursor_col + 1),
              (unsigned)line_count);
-    int info_w = gui_string_width(info);
-    win_draw_text(window_handle, EDITOR_WIDTH - info_w - 16, y + 2, info, STATUS_TEXT);
+    int info_w = gui_ttf_width(info, ED_TTF_CAPTION);
+    win_draw_text_ttf(window_handle, EDITOR_WIDTH - info_w - 16, y + 2, info, ED_TTF_CAPTION, STATUS_TEXT);
 }
 
 // Full redraw
@@ -1304,7 +1363,7 @@ int main(int argc, char **argv) {
 
     gui_menu_bar_init(&g_menu, EDITOR_MENUS, EDITOR_MENU_COUNT, 0, 0, MENU_HEIGHT);
     apply_theme();
-    sync_menu_theme();
+    gui_menu_sync_theme(&g_menu, -1);
     g_theme_last = get_theme();
 
     file_new();
@@ -1324,7 +1383,7 @@ int main(int argc, char **argv) {
         // Live-apply a theme change made in Settings while we are running.
         {
             int th = get_theme();
-            if (th != g_theme_last) { g_theme_last = th; apply_theme(); sync_menu_theme(); editor_redraw(); }
+            if (th != g_theme_last) { g_theme_last = th; apply_theme(); gui_menu_sync_theme(&g_menu, -1); editor_redraw(); }
         }
 
         if (event_type == 0) {

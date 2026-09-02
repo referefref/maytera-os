@@ -52,6 +52,33 @@ _Static_assert(sizeof(mscdex_info_t) == 40, "#739 FFI: MscdexInfo is 2xu32 + 32 
 
 #define ISO_SECT 2048u
 
+// [no-ticket] rustkern/isomemo.rs. The struct is shared by value; the width
+// lock is below the definition, where sizeof is available.
+#define ISOMEMO_PATH_MAX 128
+#define ISOMEMO_WAYS     4
+typedef struct isomemo_ent {
+    uint8_t  path[ISOMEMO_PATH_MAX];
+    uint32_t lba, ext, isdir, multi, valid, lru;
+} isomemo_ent_t;
+typedef struct isomemo {
+    isomemo_ent_t e[ISOMEMO_WAYS];
+    uint32_t clock, _pad;
+    uint64_t n_hit, n_miss;
+} isomemo_t;
+extern void isomemo_reset_rs(isomemo_t *m);
+extern int  isomemo_lookup_rs(isomemo_t *m, const char *path, uint32_t *lba,
+                              uint32_t *ext, int *isdir, int *multi);
+extern void isomemo_store_rs(isomemo_t *m, const char *path, uint32_t lba,
+                             uint32_t ext, int isdir, int multi);
+extern void isomemo_stats_rs(const isomemo_t *m, uint64_t *hit, uint64_t *miss);
+
+// [no-ticket] The memo's own off switch, for the same two reasons as
+// imgfile_readahead_set_disabled(): it is the control arm of the A/B in
+// dos/cdbench.c, and it is the escape hatch if a disc ever needs the full walk.
+static int g_memo_off = 0;
+void isomemo_set_disabled(int off) { g_memo_off = off ? 1 : 0; }
+int  isomemo_disabled(void) { return g_memo_off; }
+
 typedef struct {
     int       fmt;              // DISKIMG_FMT_*
     char      name[64];         // basename, for the UI
@@ -88,7 +115,18 @@ typedef struct {
     // construction and cannot be lost.
     volatile uint32_t busy;
     wait_queue_head_t wq;
+
+    // [no-ticket] RESOLVED-EXTENT MEMO. read_range_inner() used to call
+    // iso_resolve() on every read, and a DOS guest reads 4 KB at a time, so a
+    // 105 MB streamed file re-walked the directory tree from the volume root
+    // ~26,000 times. Touched only by a reader holding the turnstile above, so
+    // it needs no lock of its own. rustkern/isomemo.rs owns the policy and the
+    // bounded path handling.
+    isomemo_t memo;
 } diskimg_t;
+_Static_assert(sizeof(isomemo_ent_t) == 152, "[no-ticket] FFI: IsoMemoEnt is 128 bytes of path plus six u32");
+_Static_assert(sizeof(isomemo_t) == 152 * 4 + 8 + 16,
+               "[no-ticket] FFI: IsoMemo is four ways, two u32 and two u64");
 
 // ---------------------------------------------------------------------------
 // THE TABLE. 26 letters, A: at index 0. A slot holds a POINTER, not a struct by
@@ -680,6 +718,7 @@ static diskimg_t *img_build(const char *imgpath, int *err) {
 
     if (iso_probe(im)) {
         im->fmt = DISKIMG_FMT_ISO9660;
+        isomemo_reset_rs(&im->memo);   // the memset above already did this; say so
         return im;
     }
     // #184: it WAS an ISO, and its root directory is not in the file. Say that,
@@ -1209,7 +1248,18 @@ static int64_t read_range_inner(diskimg_t *im, const char *relpath,
     if (!dst) return -1;
     if (im->fmt == DISKIMG_FMT_ISO9660) {
         uint32_t lba, elen; int isdir, multi;
-        if (!iso_resolve(im, relpath, &lba, &elen, &isdir, &multi)) return -1;
+        // [no-ticket] The same relpath arrives thousands of times in a row when
+        // a guest streams a file, and an ISO volume is read-only within one
+        // mount, so the walk is done once. A miss falls through to the full
+        // resolve and is stored; nothing here can answer for a disc that is no
+        // longer in the drive, because diskimg_read_range_gen has already
+        // checked the mount generation before this is reached.
+        if (g_memo_off ||
+            !isomemo_lookup_rs(&im->memo, relpath, &lba, &elen, &isdir, &multi)) {
+            if (!iso_resolve(im, relpath, &lba, &elen, &isdir, &multi)) return -1;
+            if (!g_memo_off)
+                isomemo_store_rs(&im->memo, relpath, lba, elen, isdir, multi);
+        }
         if (isdir) return -1;
         // A multi-extent file would need its continuation records followed; we
         // do not, so refuse rather than hand back a silently truncated file.
@@ -1401,4 +1451,67 @@ int diskimg_readdir_n(char letter, const char *relpath, unsigned index,
                       int *isdir_out, unsigned *size_out) {
     return diskimg_readdir_n_gen(letter, 0, relpath, index, name_out, name_cap,
                                  isdir_out, size_out);
+}
+
+// ===========================================================================
+// #VOLAPI: the mediated view. See the long contract note on dimg_vol_t in
+// diskimg.h; this is only its implementation.
+//
+// BUILT ON THE EXISTING ACCESSORS ON PURPOSE. diskimg_query(),
+// diskimg_volume_label() and diskimg_geometry() each already take the table
+// lock and the image refcount correctly, and each is already the ONE answer to
+// its question. Composing them here means the mediated view cannot disagree
+// with the view the mount UI and the DOS layer see, which is exactly the
+// failure mode #739 fixed when three files each held their own drive-letter
+// constants. The cost is three short lock acquisitions instead of one; this is
+// called once per volume at app start, not on a hot path.
+// ===========================================================================
+int diskimg_vol_root(int idx, char *out, int cap) {
+    // The spelling lives here and NOWHERE else. rustkern/drvmap.rs's
+    // drvmap_windir_split_rs() is the authority on PARSING this shape back into
+    // a letter; this is the authority on WRITING it. Sixteen bytes plus the NUL.
+    static const char PFX[] = "/WINDIR/DRIVE_";
+    if (!out || cap < (int)sizeof(PFX) + 1) return -1;
+    if (idx < 0 || idx > 25) return -1;
+    int i = 0;
+    for (; PFX[i]; i++) out[i] = PFX[i];
+    out[i++] = (char)('A' + idx);
+    out[i]   = '\0';
+    return 0;
+}
+
+int diskimg_volinfo(int idx, dimg_vol_t *out) {
+    if (idx < 0 || idx > 25 || !out) return -1;
+    memset(out, 0, sizeof(*out));
+
+    diskimg_info_t q;
+    if (diskimg_query(idx, &q) != 0) return -1;
+    out->letter = q.letter;
+    out->cls    = q.cls;
+    out->fmt    = q.fmt;
+    out->gen    = q.gen;
+    out->size   = q.size;
+    // Deliberately NOT copied: q.name and q.path. Those name the HOST-side
+    // backing file, which is not the app's business and is not part of the
+    // contract. The app is given a VFS root, not a provenance.
+    out->flags  = q.flags;
+
+    // The root folder exists whether or not a disc is in the drive, so it is
+    // written unconditionally: an app that is told "no disc on E:" can still be
+    // told where E: will appear when one is inserted.
+    if (diskimg_vol_root(idx, out->root, (int)sizeof(out->root)) != 0)
+        out->root[0] = '\0';
+
+    if (q.flags & DISKIMG_F_MOUNTED) {
+        char letter = (char)('A' + idx);
+        // The disc's OWN name. This is the field the whole feature turns on:
+        // a DOS guest of the Red Alert generation finds its disc by matching a
+        // volume LABEL through INT 21h 4Eh attr 8, not by drive letter, so an
+        // API that exposed files but not labels would not answer the question
+        // the guest actually asks.
+        (void)diskimg_volume_label(letter, out->label, (int)sizeof(out->label));
+        (void)diskimg_geometry(letter, &out->bytes_per_sector,
+                               &out->sectors_per_cluster, &out->total_clusters);
+    }
+    return 0;
 }

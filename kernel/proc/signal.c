@@ -12,6 +12,7 @@
 #include "syscall.h"
 #include "../security/validate.h"  // #509: copy_*_user adoption
 #include "../serial.h"
+#include "../string.h"   // #dosowner: strcmp() for the Ring-0 DOS-worker name match in sys_kill
 #include "../sync/waitq.h"   // #426: sys_pause() parks instead of yield-spinning
 #include "../cpu/mono.h"      // #483/#499: sched_now_ms() for the alarm deadline
 
@@ -38,6 +39,65 @@ typedef struct saved_frame {
     uint64_t rbp, rdi, rsi, rdx, rcx, rbx, rax;
     uint64_t rip, cs, rflags, user_rsp, ss;
 } saved_frame_t;
+
+// ===========================================================================
+// #SMPGLOBALS (2026-08-30): locating the frame SYSRET will pop.
+// ===========================================================================
+//
+// syscall_entry (proc/syscall.asm) reloads rsp from gs:0 on EVERY syscall.
+// gs:0 is written only by cpu_set_kernel_stack(), which every scheduler path
+// calls with (stack_base + stack_size) of the task it is switching to. The
+// stub then pushes exactly the 5 IRET qwords and 15 GPRs below. So the frame
+// is always at the very top of THIS task's ring-0 stack, and nowhere else.
+//
+// That makes it a property of the TASK, which is what the old code got wrong:
+// it read a single global that the asm wrote on every syscall return on every
+// core, i.e. the frame of whichever task finished a syscall most recently
+// anywhere in the system. Per-CPU storage would not have fixed it (both tasks
+// share cpu 0's slot on the shipping single-CPU boot, and a task can migrate
+// between the publish and the read); per-task does.
+_Static_assert(sizeof(saved_frame_t) == 20 * 8,
+               "saved_frame_t must be the 5 IRET qwords + 15 GPRs that "
+               "syscall_entry pushes; see proc/syscall.asm");
+
+// Always compiled, never gated: a guard whose counter cannot be read is a
+// guard nobody can trust. Reported by sigframe_report().
+uint64_t g_sigframe_calls        = 0;  // rt_sigreturn calls
+uint64_t g_sigframe_refused      = 0;  // .. with no derivable frame
+uint64_t g_sigframe_publish_odd  = 0;  // asm frame != derived frame (would mean
+                                       // syscall_entry's push list changed)
+
+// Derive this task's syscall frame. Correct on any core, and after any
+// migration, because it reads only the task's own stack bounds.
+static saved_frame_t *task_syscall_frame(process_t *p) {
+    if (!p || !p->stack_base || p->stack_size < sizeof(saved_frame_t)) return 0;
+    uint64_t top = (uint64_t)p->stack_base + p->stack_size;
+    return (saved_frame_t *)(top - sizeof(saved_frame_t));
+}
+
+#ifdef SIGFRAME_DIFF
+// -------- differential / RED arm. make SIGFRAMEDIFF=1 only. ---------------
+// g_syscall_saved_frame is the deleted global, kept alive here so the fix can
+// be MEASURED against the behaviour it replaces instead of argued about.
+extern uint64_t g_syscall_saved_frame;
+extern process_t *sigframe_owner_of(uint64_t frame_addr, uint64_t frame_bytes);
+int g_sigframe_legacy_arm = 0;        // set by main.c when /SIGFRAMEBUG.TXT
+uint64_t g_sigframe_legacy_wrong = 0; // legacy global named the WRONG frame
+uint64_t g_sigframe_legacy_foreign = 0; // .. and it belonged to another task
+#endif
+
+void sigframe_report(void) {
+    kprintf("[SIGFRAME] rt_sigreturn calls=%llu refused=%llu publish_odd=%llu\n",
+            (unsigned long long)g_sigframe_calls,
+            (unsigned long long)g_sigframe_refused,
+            (unsigned long long)g_sigframe_publish_odd);
+#ifdef SIGFRAME_DIFF
+    kprintf("[SIGFRAME] DIFF arm=%s legacy_wrong=%llu legacy_foreign=%llu\n",
+            g_sigframe_legacy_arm ? "LEGACY(RED)" : "PERTASK(GREEN)",
+            (unsigned long long)g_sigframe_legacy_wrong,
+            (unsigned long long)g_sigframe_legacy_foreign);
+#endif
+}
 
 // ============================================================================
 // Public: queue / query
@@ -212,8 +272,10 @@ static void deliver_signal(saved_frame_t *sf, process_t *p, int signo) {
     // in which case we assume the libc registered a trampoline and panic
     // if it didn't (the process will crash, which is the right failure
     // mode in development).
-    extern uint64_t g_sig_trampoline;  // set by sys_sigaction on first install
-    uint64_t trampoline = g_sig_trampoline;
+    // #SMPGLOBALS: THIS process's trampoline. It used to be one global latched
+    // from whichever process called sigaction first, which under PIE handed
+    // every other process an address inside somebody else's image.
+    uint64_t trampoline = p->sig_trampoline;
     if (trampoline == 0) {
         // No trampoline registered; fall back to terminating the process
         // rather than jumping to zero.
@@ -291,15 +353,42 @@ void return_work_handler(void *user_frame) {
 void syscall_check_return_work(void *user_frame) {
     process_t *p = proc_current();
     if (!p) return;
+
+    // #SMPGLOBALS: publish THIS task's syscall frame. The asm used to store
+    // rsp into one global here; the pointer it stored is the rdi we were just
+    // handed, so this costs the hot path nothing extra.
+    //
+    // The value is constant for a task (top of its own ring-0 stack), so the
+    // body runs ONCE per task and is a predicted-not-taken compare after that.
+    // When it does run it cross-checks the asm against the derivation, so a
+    // change to syscall_entry's push list is caught on the first syscall after
+    // it rather than the next time somebody handles a signal.
+    if (__builtin_expect(p->syscall_frame != (uint64_t)user_frame, 0)) {
+        p->syscall_frame = (uint64_t)user_frame;
+        saved_frame_t *derived = task_syscall_frame(p);
+        if ((uint64_t)derived != (uint64_t)user_frame) {
+            g_sigframe_publish_odd++;
+            if (g_sigframe_publish_odd <= 8)
+                kprintf("[SIGFRAME] pid=%u '%s' asm frame 0x%llx != derived "
+                        "0x%llx (kstack 0x%llx size 0x%llx)\n",
+                        p->pid, p->name,
+                        (unsigned long long)(uint64_t)user_frame,
+                        (unsigned long long)(uint64_t)derived,
+                        (unsigned long long)(uint64_t)p->stack_base,
+                        (unsigned long long)p->stack_size);
+        }
+    }
+
     if (p->return_work == 0) return;
     return_work_handler(user_frame);
 }
 
 // ============================================================================
-// Trampoline registration (set by sigaction on first install)
+// Trampoline registration: PER PROCESS, in process_t::sig_trampoline. See the
+// field's comment in proc/process.h for what the global that used to live here
+// did to every process that was not the first to install a handler.
 // ============================================================================
 
-uint64_t g_sig_trampoline = 0;
 
 // ============================================================================
 // Syscalls
@@ -322,6 +411,52 @@ int64_t sys_kill(int pid, int signo) {
     // corpse waiting for its parent to reap it. The UI can now say so.
     if (tgt->state == PROC_STATE_ZOMBIE) return -3;  // -ESRCH
     sig_raise(tgt, signo);
+
+    // (#dosowner) A TERMINATING SIGNAL AIMED AT THE RING-0 DOS WORKER NEEDS A
+    // SECOND, NON-SIGNAL ROUTE, OR IT IS A SILENT NO-OP THAT RETURNS SUCCESS.
+    //
+    // sig_raise() above only sets a pending bit. That bit is consumed at
+    // exactly two chokepoints, both of which are RETURNS TO RING 3:
+    // syscall_check_return_work() on the way out of a syscall (syscall.asm)
+    // and sig_async_terminate_pending() on an interrupt return (cpu/idt.c,
+    // #161). The in-kernel DOS interpreter is a Ring-0 kernel worker
+    // (dos/dosexec.c: proc_create("dos", dos_proc_entry, ...)); it never
+    // executes SYSCALL and every interrupt frame it takes has cs&3 == 0, so it
+    // reaches NEITHER. #compkill measured this: SIGKILL against it does
+    // nothing at all, forever, while this function returns 0 for success.
+    //
+    // gui/desktop.c's session_end_teardown() already solved this once, for the
+    // same worker, by calling the SAME stop request the titlebar X uses. This
+    // is the second call site for that decision, not a second mechanism:
+    // dos_request_close() is idempotent (a flag set plus a wake of a possibly
+    // empty wait queue) and is a safe no-op when no guest is running.
+    //
+    // WHY IT MATTERS NOW rather than as a standing latent bug: stamping
+    // owner_pid on the DOS host window (proc/syscall.c
+    // win16_host_route_close_to_dos) makes sys_wm_get_windows() populate
+    // app_id, and the compositor's dock right-click menu gates its "Force
+    // Quit" item on app_id being non-empty (contextmenu.c). Force Quit
+    // dispatches by process NAME through SYS_KILL (taskbar.c
+    // tb_force_quit_dispatch). Without this, the icon fix would have shipped a
+    // brand new menu item whose only possible outcome is nothing happening -
+    // strictly worse than the wrong icon it replaced. Task Manager's End Task
+    // on the same row was already broken in exactly this way and is fixed by
+    // the same lines.
+    //
+    // Scoped to terminating signals: a non-terminating signal (or a signal
+    // with a handler, which a kernel worker cannot have) must not tear a guest
+    // down. Matched by NAME because a Ring-0 worker carries no window, fd or
+    // session this could key off instead - the same identity, and the same
+    // reason, session_end_teardown() already uses.
+    if ((signo == SIGKILL || signo == SIGTERM) &&
+        tgt->privilege != PRIV_USER &&
+        (strcmp(tgt->name, "dos") == 0 || strcmp(tgt->name, "dosrun") == 0)) {
+        extern void dos_request_close(void);
+        dos_request_close();
+        kprintf("[dos] sig %d on Ring-0 worker pid %u '%s': SIGKILL cannot "
+                "reach it (#compkill), also sent dos_request_close()\n",
+                signo, (unsigned)tgt->pid, tgt->name);
+    }
     return 0;
 }
 
@@ -406,8 +541,8 @@ int64_t sys_sigaction(int signo, const void *new_act, void *old_act) {
 
         // The first sigaction call with a real handler carries the trampoline
         // address in __reserved; latch it. Subsequent calls may pass 0.
-        if (na.__reserved != 0 && g_sig_trampoline == 0) {
-            g_sig_trampoline = na.__reserved;
+        if (na.__reserved != 0 && p->sig_trampoline == 0) {
+            p->sig_trampoline = na.__reserved;
         }
     }
     return 0;
@@ -463,26 +598,59 @@ int64_t sys_rt_sigreturn(void) {
     process_t *p = proc_current();
     if (!p) return -1;
 
-    // To get at the kernel-saved frame, we rely on a helper: the syscall
-    // asm passed a pointer to its own saved frame to syscall_check_return_work.
-    // For rt_sigreturn we instead read our user_rsp from the current
-    // syscall's saved frame. The easiest way is to have the asm expose a
-    // per-CPU pointer; for MVP we inline a re-read via a kernel helper
-    // that walks up from a known offset. That's too fragile. Instead we
-    // take a simpler route: use the current kernel RSP to locate the frame.
-    //
-    // The frame is immediately above the saved C-call padding: at the
-    // syscall entry we pushed 15 GPRs + IRET frame then args. By the time
-    // we're in sys_rt_sigreturn, rsp has moved beyond the syscall C call
-    // frame, but the saved frame is at a fixed offset from tss.rsp0
-    // (the kernel stack top).
-
-    // Read the syscall saved frame through the pointer syscall.asm
-    // publishes at the hook point. Single-CPU: this is always the frame
-    // of the currently-executing syscall (rt_sigreturn's own frame).
-    extern uint64_t g_syscall_saved_frame;
-    saved_frame_t *sf = (saved_frame_t *)g_syscall_saved_frame;
-    if (!sf) return -1;
+    // #SMPGLOBALS: derive rt_sigreturn's OWN frame from THIS task's ring-0
+    // stack. See the writeup above task_syscall_frame(). The global this used
+    // to read named whichever task last finished a syscall anywhere in the
+    // system, so rt_sigreturn rewrote a bystander's saved registers, RIP and
+    // user RSP whenever that was not us.
+    g_sigframe_calls++;
+    saved_frame_t *sf = task_syscall_frame(p);
+    if (!sf) {
+        g_sigframe_refused++;
+        kprintf("[SIG] pid=%u rt_sigreturn: no ring-0 stack recorded "
+                "(base=0x%llx size=0x%llx); refusing\n", p->pid,
+                (unsigned long long)(uint64_t)p->stack_base,
+                (unsigned long long)p->stack_size);
+        return -1;
+    }
+#ifdef SIGFRAME_DIFF
+    {
+        uint64_t legacy = g_syscall_saved_frame;
+        // Print the RAW pair for the first 20 calls, match or not. Three
+        // reproducer attempts read legacy_wrong=0 and the counter alone could
+        // not say whether that meant "the global was right" or "the instrument
+        // is not seeing what I think". Show the numbers.
+        // Sample ACROSS the run, not just the first 20 calls: the first 20 are
+        // all inside sigprobe's phase-1 tight loop, where nothing else is
+        // scheduled, so they answer a question nobody was asking.
+        static uint64_t dbg_n = 0;
+        if ((g_sigframe_calls % 97) == 0 && dbg_n < 60) {
+            dbg_n++;
+            process_t *own = sigframe_owner_of(legacy, sizeof(saved_frame_t));
+            kprintf("[SIGFRAME-RAW] #%llu pid=%u '%s' legacy=0x%llx own=0x%llx "
+                    "owner=%s kstack=[0x%llx,+0x%llx)\n",
+                    (unsigned long long)dbg_n, p->pid, p->name,
+                    (unsigned long long)legacy, (unsigned long long)(uint64_t)sf,
+                    own ? own->name : "(none)",
+                    (unsigned long long)(uint64_t)p->stack_base,
+                    (unsigned long long)p->stack_size);
+        }
+        if (legacy != (uint64_t)sf) {
+            g_sigframe_legacy_wrong++;
+            process_t *victim = sigframe_owner_of(legacy, sizeof(saved_frame_t));
+            if (victim && victim != p) g_sigframe_legacy_foreign++;
+            if (g_sigframe_legacy_wrong <= 24)
+                kprintf("[SIGFRAME] pid=%u '%s' rt_sigreturn: legacy global "
+                        "0x%llx != own frame 0x%llx -> would rewrite %s\n",
+                        p->pid, p->name, (unsigned long long)legacy,
+                        (unsigned long long)(uint64_t)sf,
+                        victim ? victim->name : "(no live task owns it)");
+        }
+        // RED arm: reproduce the pre-fix behaviour exactly, so the corruption
+        // can be SEEN rather than inferred from a counter.
+        if (g_sigframe_legacy_arm && legacy) sf = (saved_frame_t *)legacy;
+    }
+#endif
 
     // User RSP currently points at the sigframe.
     // #19/#645: read it into KERNEL memory through the primitive first. This

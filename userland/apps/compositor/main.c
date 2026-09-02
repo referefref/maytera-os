@@ -418,12 +418,51 @@ static bool s_left_released = false;
 static bool s_right_pressed = false;
 static bool s_dbl_click     = false;
 static int  s_last_key      = -1;
+// #keydrop: the per-tick keyboard queue. process_input()'s read loop below
+// used to do `s_last_key = key;` on every matching press it read, so a burst
+// that landed inside one compositor pass silently collapsed to whichever key
+// happened to be read LAST that tick - every compositor-native typing
+// surface (g_modal_grabs[] typing tier: start-menu search, sticky notes, the
+// AI launcher, widget-settings fields, the icon picker, the Speed dialog,
+// the confirm prompts, the notification centre; plus the lock-screen/
+// elevate-prompt exclusive tier and the Super+L/Super+Space chords) lost
+// every key of a burst but the last one. Regular app windows were NEVER
+// affected by this: process_input()'s loop forwards every key it reads to
+// sys_inject_key() -> the kernel's 64-deep per-window ring (gui/window.c)
+// independently of this array, one call per key, inside the same loop.
+// MAX_KEYS_PER_TICK is deliberately the SAME constant as the read loop's own
+// per-tick cap (see the `for` loop in process_input()) - the queue can never
+// be asked to hold more entries than the loop can ever read in one pass, so
+// there is no separate capacity to keep in sync by hand.
+#define MAX_KEYS_PER_TICK 8
+static int  s_key_queue[MAX_KEYS_PER_TICK];
+static int  s_key_queue_n   = 0;
 static bool s_dragging_sheep = false;
 static bool s_dragging_dog = false;
 static bool s_dragging_widget = false;
 static bool s_dragging_sticky = false;    // sticky-note title-bar drag (#270)
 static bool s_dragging_desktop = false;   // icon drag / rubber-band in progress
 static bool s_dragging_settings = false;  // #419b settings-modal title-bar / scrollbar drag
+static bool s_dragging_dosspeed = false;  // #778 Speed dialog slider drag
+// #alttab: physical Alt-held state, tracked from the raw cooked-ring codes
+// (GUI_KEY_ALT 0x9A press / GUI_KEY_ALT_UP 0x9C release) directly inside the
+// per-key read loop in process_input(), NOT via s_last_key. s_last_key keeps
+// only the last key of a tick, so a burst of Tab presses under load would
+// collapse to one; the raw loop below sees every individual key event in
+// order, which is what "hold Alt, tap Tab repeatedly" needs. Both Alt keys
+// (left and real/AltGr right) route to the same KEY_ALT/KEY_ALT_UP codes
+// (kernel/cpu/isr.c, Word6 divergence catalog #2), so there is one flag, not
+// two, matching every other modifier tracker in this tree (see gui_mods.h -
+// this is the compositor's own equivalent, kept local because it needs the
+// RAW pre-SYS_INJECT_KEY codes gui_mods.h explicitly does not use).
+static bool s_alt_held = false;
+// Spawns the switcher at most once per Alt hold (Alt down .. Alt up), so a
+// burst of Tab presses in one hold does not launch a second overlay; reset
+// on Alt release. After the first Tab, further Tabs/Shift+Tabs reach the
+// switcher's own window through the NORMAL focus-routed sys_inject_key path
+// below (win_create() gives a new window focus), so nothing further needs
+// forwarding here.
+static bool s_alttab_spawned_this_hold = false;
 // #566 Super+L lock hotkey. The kernel key model sends KEY_SUPER (0x9B) as a
 // single one-shot event with no held/modifier state (see the s_last_key
 // comment below on why 0x9B lives in the release-code range) - there is no
@@ -539,6 +578,7 @@ static const modal_grab_t g_modal_grabs[] = {
     { "force-quit-confirm", taskbar_force_quit_confirm_open, taskbar_force_quit_confirm_handle_key, NULL,   MG_ALL,  0,  1 },
     { "icon-picker",     iconpicker_is_open,      iconpicker_handle_key,              NULL,              MG_ALL,  0,  1 },
     { "widget-settings", widget_settings_is_open, widget_settings_handle_key,         NULL,              MG_ALL,  0,  1 },
+    { "dos-speed",       dosspeed_is_open,        dosspeed_handle_key,                NULL,              MG_ALL,  0,  1 },
     { "sticky-editor",   stickies_editing,        stickies_handle_key,                NULL,              MG_ALL,  0,  1 },
     { "start-menu",      mg_startmenu_open,       startmenu_handle_key,               NULL,              MG_ALL,  0,  1 },
     /* docs/NOTIFICATIONS_DESIGN.html sect;5: the notification centre is being
@@ -655,6 +695,11 @@ static void dbl_click_threshold_push(void) {
 }
 
 static bool fullscreen_app_on_top(void);   // (local 79) defined below
+// #alttab: launch_app() is defined later in this file (with the other app
+// launchers); process_input()'s raw key loop needs it to spawn /APPS/WINSWTCH
+// on the first Tab of an Alt+Tab hold, same forward-declare pattern as
+// fullscreen_app_on_top() immediately above and for the same reason.
+static void launch_app(const char *path);
 
 // #158 NATIVE FULLSCREEN forward declarations - bodies defined near
 // render_frame() below (they call cursor_render/apply_display_effects/
@@ -678,6 +723,7 @@ static void process_input(void)
     s_right_pressed = false;
     s_dbl_click     = false;
     s_last_key      = -1;
+    s_key_queue_n   = 0;   // #keydrop: clear last tick's queue, not just s_last_key
 
     // Read absolute mouse position from kernel.
     // The kernel's SYS_GET_MOUSE returns absolute screen coordinates
@@ -757,13 +803,33 @@ static void process_input(void)
     g_tick_motion    = (mx != 0 || my != 0);
     g_tick_nonmotion = (buttons != prev);
     idleprof_motion(mx, my);   // #COMPIDLE: raw device chatter vs real input
-    for (int i = 0; i < 8; i++) {
+    // #rinpin: mot=0/0 on the real 4K laptop already proved recent_input is
+    // not being pinned by raw pointer motion; record the two remaining
+    // candidates separately so the next capture says which one it actually
+    // is instead of leaving both folded into one "nonmotion" bucket.
+    if (buttons != prev) idleprof_input_kind(IP_IN_BUTTON);
+    bool s_key_counted_this_tick = false;
+    for (int i = 0; i < MAX_KEYS_PER_TICK; i++) {
         int key = sys_get_keyboard();
         if (key < 0) {
             break;
         }
         got_input = true;
         g_tick_nonmotion = true;   // a key event can change window content
+        if (!s_key_counted_this_tick) { s_key_counted_this_tick = true; idleprof_input_kind(IP_IN_KEY); }
+        // #alttab: track physical Alt-held state from the RAW cooked-ring
+        // codes (kernel/cpu/isr.c pushes GUI_KEY_ALT 0x9A on Alt-down and
+        // GUI_KEY_ALT_UP 0x9C on Alt-up, unconditionally, regardless of which
+        // window has focus or which modal owns the keyboard). Done here,
+        // before every early `continue` below, so the flag never gets stuck
+        // true because a release arrived while e.g. the elevation modal
+        // happened to own the keyboard.
+        if (key == GUI_KEY_ALT) {
+            s_alt_held = true;
+        } else if (key == GUI_KEY_ALT_UP) {
+            s_alt_held = false;
+            s_alttab_spawned_this_hold = false;
+        }
         // Forward every key (press and release) to app windows - EXCEPT while
         // the session is locked (#566 3.2): a locked session must not leak
         // ANY keystroke to an app window (password characters included). The
@@ -804,7 +870,55 @@ static void process_input(void)
         // settings field was ALSO delivered to the focused app window.
         // g_modal_grabs[] (above) is now the only definition of who owns a
         // key, and process_events() dispatches from that same table.
-        if (!modal_key_grab(key)) {
+        bool alttab_grabbed = modal_key_grab(key);
+        // #alttab: Alt+Tab task switching. Same priority tier as every other
+        // global chord in this file (Super+L, Super+Space): stands down for
+        // ANY open modal surface (modal_key_grab() above is the one table
+        // that answers "does something already own the keyboard", so reusing
+        // its result here is the same check process_events() uses, not a
+        // second one that could drift), and for a full-screen app on top -
+        // see the long fs_owns_kbd note at the top of process_events() for
+        // why. elevate_modal_open() is not re-checked: the `continue` above
+        // already guarantees this line is unreached while it is open.
+        //
+        // WHY THIS LIVES HERE AND NOT IN process_events(): that function
+        // dispatches from s_last_key, which is the LAST key of the tick.
+        // Holding Alt and tapping Tab twice in one tick would collapse to a
+        // single Tab there. This loop sees every individual key event in
+        // order, so "hold Alt, press Tab repeatedly" is counted correctly.
+        //
+        // ONLY THE FIRST Tab of a hold is intercepted (spawns the overlay,
+        // s_alttab_spawned_this_hold latches until Alt goes up). Every
+        // subsequent Tab / Shift+Tab in the same hold is NOT intercepted: it
+        // falls through to sys_inject_key() below exactly like any other key,
+        // and reaches the switcher's own window through the ordinary
+        // focus-routed path, because win_create() gives a newly created
+        // window focus (userland/apps/winswitch/main.c relies on this, and
+        // re-queries the window list once it has focus to prove it). That
+        // keeps this file from needing any new way to address a keystroke at
+        // a specific window - the one mechanism (focus routing) that already
+        // exists is reused, per the standing "reuse, do not reinvent" rule.
+        if (key == GUI_KEY_TAB && s_alt_held && !alttab_grabbed &&
+            !fullscreen_app_on_top() && sys_wm_fullscreen_status() < 0) {
+            if (!s_alttab_spawned_this_hold) {
+                // FIRST Tab of this hold: the switcher does not exist yet, so
+                // there is nothing to forward this keystroke TO. Spawn it and
+                // consume the key.
+                s_alttab_spawned_this_hold = true;
+                launch_app("/APPS/WINSWTCH");
+                continue;   // do not forward this Tab to the still-focused app
+            }
+            // #alttab BUGFIX: every later Tab/Shift+Tab of the SAME hold used
+            // to hit this same `continue` unconditionally, which suppressed
+            // sys_inject_key() for them too - so the switcher's own window
+            // never received the 2nd, 3rd, ... Tab of a hold, and multi-tap
+            // cycling silently did nothing past the first tap (MEASURED: a
+            // held Alt + two Tabs stayed on the first entry). Only the
+            // TRIGGERING tap has nothing to forward to; every later one must
+            // fall through to the normal forwarding path below so the
+            // switcher (which now has focus) actually receives it.
+        }
+        if (!alttab_grabbed) {
             sys_inject_key(key);
         }
         // Track key-down events for compositor shortcuts.
@@ -819,14 +933,24 @@ static void process_input(void)
         // because every byte there is already taken (several of them by more
         // than one meaning; see isr.c).
         // #243: and the nav/editing block at 0x100-0x105, which is ABOVE every
-        // byte code listed above. process_events() dispatches s_last_key to
-        // whichever modal owns the keyboard (start-menu search, sticky notes,
-        // widget settings fields), and those are text fields that want Home/
-        // End/Delete. Before #243 they received G/O/S there.
+        // byte code listed above. process_events() dispatches the queued keys
+        // (#keydrop: was s_last_key, singular) to whichever modal owns the
+        // keyboard (start-menu search, sticky notes, widget settings fields),
+        // and those are text fields that want Home/End/Delete. Before #243
+        // they received G/O/S there.
+        // #keydrop: PUSH, don't overwrite - this used to be `s_last_key =
+        // key;`, which meant the LAST matching key read in this same loop
+        // silently discarded every one before it. The bound check is
+        // defensive only: this loop itself never reads more than
+        // MAX_KEYS_PER_TICK events in the first place, so the queue can
+        // never actually fill past this point.
         if ((key >= 0 && key <= 0x8F) || key == 0x9B /* KEY_SUPER */
             || key == 0x9D /* KEY_PRINTSCREEN */
             || (key >= GUI_KEY_HOME && key <= GUI_KEY_DEL)) {
             s_last_key = key;
+            if (s_key_queue_n < MAX_KEYS_PER_TICK) {
+                s_key_queue[s_key_queue_n++] = key;
+            }
         }
     }
 
@@ -1337,8 +1461,17 @@ static void process_events(void)
     // ends up consuming it, so the Super+L chord check further down always
     // sees an up-to-date window even if the start menu (or another modal)
     // intercepts the key first.
-    if (s_last_key == 0x9B /* KEY_SUPER */ && !fs_owns_kbd) {
-        s_super_press_ms = uptime_ms();
+    // #keydrop: scan the WHOLE queued burst for a Super press, not just
+    // whichever key the old single s_last_key slot happened to hold - the
+    // exclusive tier right below can still swallow every key this tick, so
+    // the timestamp has to be captured up front exactly as before.
+    if (!fs_owns_kbd) {
+        for (int s_kq_super = 0; s_kq_super < s_key_queue_n; s_kq_super++) {
+            if (s_key_queue[s_kq_super] == 0x9B /* KEY_SUPER */) {
+                s_super_press_ms = uptime_ms();
+                break;
+            }
+        }
     }
 
     // #566: while the session is locked, ALL input goes to the lock overlay
@@ -1359,19 +1492,50 @@ static void process_events(void)
     // how the list of input owners came to differ from the list of things that
     // suppress sys_inject_key(). Both now come from the one table, so a row
     // cannot be in one and missing from the other.
+    // #keydrop: drain the WHOLE queue into the exclusive surface, in order,
+    // instead of just s_last_key - a lock-screen password field is exactly
+    // the kind of compositor-native typing surface this fix is about, and it
+    // must not lose characters to a slow pass either. (elevate-prompt, the
+    // other exclusive-tier row, never reaches this: process_input()'s read
+    // loop hands it every key directly and `continue`s before this queue is
+    // ever populated - see the comment at that call site - so this loop is
+    // simply empty whenever elevate-prompt is the open exclusive surface.)
     {
         const modal_grab_t *mg = modal_grab_exclusive();
         if (mg) {
-            if (s_last_key >= 0 && mg->handle_key) {
-                mg->handle_key(s_last_key);
-                s_last_key = -1;
+            if (mg->handle_key) {
+                for (int s_kq_excl = 0; s_kq_excl < s_key_queue_n; s_kq_excl++) {
+                    mg->handle_key(s_key_queue[s_kq_excl]);
+                }
             }
+            s_last_key = -1;
             if (s_left_pressed && mg->handle_mouse) {
                 mg->handle_mouse(g_mouse_x, g_mouse_y, 1);
             }
             return;
         }
     }
+
+    // #keydrop: everything from here down through the end of the "Keyboard:
+    // global shortcuts" block used to run ONCE, against the single
+    // s_last_key slot. It now runs once per queued key, IN ORDER, so a burst
+    // that lands within one compositor pass is delivered in full instead of
+    // collapsing to its last element - this is the fix for the reported
+    // dropped-keypress defect. Every `s_last_key` read/write inside this
+    // loop is UNCHANGED from before; s_last_key is simply reloaded from the
+    // queue at the top of each iteration, so it means "the key this
+    // iteration is processing", same as it always meant "the key this tick
+    // is processing" when there could only ever be one.
+    //
+    // A `return` inside this loop (Super+L, Super+Space) still exits
+    // process_events() for the WHOLE tick, exactly as it did with one key -
+    // a global chord is still meant to consume the rest of the tick, so any
+    // keys still queued behind it are deliberately abandoned. That matches
+    // the pre-existing "one global chord ends the input tick" behaviour; it
+    // is not a new truncation, it is the same one, now only reachable by an
+    // actual chord instead of by every key after the first.
+    for (int s_kq_i = 0; s_kq_i < s_key_queue_n; s_kq_i++) {
+    s_last_key = s_key_queue[s_kq_i];
 
     // #566 Super+L: highest priority after the lock gate itself, so it fires
     // even if the start menu (opened by the Super press moments earlier) or
@@ -1561,6 +1725,7 @@ static void process_events(void)
         // who owns a keystroke - it does not get a second, ungated call site here.
         }   // end else (widget Settings dialog not open)
     }
+    }   // #keydrop: end per-tick key-queue loop (opened above the Super+L check)
 
     // Mouse event processing: work top-to-bottom through the UI stack.
     // Each handler returns true if it consumed the event.
@@ -1619,6 +1784,11 @@ static void process_events(void)
         if (g_mouse_buttons & 1) { widget_settings_drag_to(g_mouse_x, g_mouse_y); }
         else { widget_settings_drag_end(); s_dragging_settings = false; }
         consumed = true;
+    } else if (s_dragging_dosspeed) {
+        // #778: dragging the Speed dialog's cycles slider.
+        if (g_mouse_buttons & 1) { dosspeed_drag_to(g_mouse_x, g_mouse_y); }
+        else { dosspeed_drag_end(); s_dragging_dosspeed = false; }
+        consumed = true;
     } else if (s_dragging_sticky) {
         if (g_mouse_buttons & 1) { stickies_drag_to(g_mouse_x, g_mouse_y); }
         else { stickies_release(); s_dragging_sticky = false; }
@@ -1652,6 +1822,19 @@ static void process_events(void)
     // #44 "Change Icon" file picker: also a true modal, same priority.
     if (!consumed && iconpicker_is_open()) {
         consumed = iconpicker_handle_mouse(g_mouse_x, g_mouse_y, s_left_pressed);
+    }
+
+    // #778 the per-window DOS Speed dialog: also a true modal, same priority.
+    // A press on the cycles slider starts a drag (continued above, same shape
+    // as the settings-modal drag); anything else (preset buttons, Save,
+    // Cancel) is a normal one-shot click handled inside dosspeed_handle_mouse.
+    if (!consumed && dosspeed_is_open()) {
+        if (s_left_pressed && dosspeed_press(g_mouse_x, g_mouse_y)) {
+            s_dragging_dosspeed = true;
+        } else {
+            dosspeed_handle_mouse(g_mouse_x, g_mouse_y, s_left_pressed ? 1 : 0);
+        }
+        consumed = true;
     }
 
     // #419b: while the settings modal is open, the mouse wheel scrolls its
@@ -2559,17 +2742,25 @@ static void apply_display_effects(void);
 // unclipped kernel window composite when no window intersects the damage rect.
 static void render_frame_body(bool draw_windows)
 {
+    // #compthread: phase-breakdown instrumentation (idleprof.h IP_PH_*) -
+    // measures WHERE the composite cost goes before any thread is added, see
+    // blame.md #compthread entry.
+    idleprof_phase_begin();
     // Layer order (back to front):
     wallpaper_render_background();   // 1. Background / wallpaper
+    idleprof_phase_mark(IP_PH_WALLPAPER);
     if (!g_setup_pending) {
         desktop_render();            // 2. Desktop icons
         desktop_render_version();    // 3. Version string overlay
     }
     if (!g_setup_pending) widgets_render();  // 3b. Desktop widgets (clock/calendar/pet)
     stickies_render();               // 3b2. Desktop sticky notes (#270)
+    idleprof_phase_mark(IP_PH_DESKTOP);
     windows_render_shadows();        // 3c. opt-in drop shadows (#745; blanket shadows stay off per #189)
+    idleprof_phase_mark(IP_PH_SHADOWS);
     if (draw_windows)
         compositor_render_windows(); // 4. Kernel draws app windows on our FB
+    idleprof_phase_mark(IP_PH_WINWM);   // #compthread: single kernel syscall, see idleprof.h
     desktop_render_overlay();        // 4b. Rubber-band selection rectangle
     // Fullscreen app on top -> hide desktop chrome (taskbar/start/dock/clock).
     bool fs = fullscreen_app_on_top();
@@ -2612,6 +2803,7 @@ static void render_frame_body(bool draw_windows)
     if (!fs && !g_setup_pending) widget_menu_render();  // 9b. Per-widget right-click menu
     if (!fs) taskbar_menu_render();  // 9b2. Taskbar-tile right-click menu (Close)
     if (!fs && !g_setup_pending) widget_settings_render();// 9c. Per-widget Settings dialog
+    if (!fs && !g_setup_pending) dosspeed_render();       // 9c1. #778 per-window DOS Speed dialog
     if (!fs) launcher_render();      // 9c2. Command launcher (Spotlight) overlay
     notif_render();                  // 9d. Notification toasts + center (#168)
     volosd_render();                 // 9d2. #162 volume OSD (self-gating)
@@ -2623,8 +2815,10 @@ static void render_frame_body(bool draw_windows)
     elevate_render();                // 9e. #745 elevation modal: scrim + panel
                                      //     over EVERYTHING, drawn last before
                                      //     the cursor so nothing can cover it.
+    idleprof_phase_mark(IP_PH_CHROME);
     cursor_render();                 // 10. Hardware cursor drawn last
     apply_display_effects();         // 10b. Brightness / night-light
+    idleprof_phase_mark(IP_PH_CURSOR);
 }
 
 // perf62: render_frame()'s own full-composite present (below) is reached from
@@ -2981,6 +3175,143 @@ static void render_frame_chrome(const wm_window_info_t *wins, int nwins)
     g_widgets_draw_only = 0;
     idleprof_flip();   // #COMPIDLE: timed present                       // single present
     perfframe_mark("chrome");   // perf62: windows-open-but-static chrome-only present
+}
+
+// ============================================================================
+// render_frame_windowed (no-ticket, #compositor-partial): DIRTY-RECT present
+// for the apps_dirty STEADY STATE - an open window's CONTENT changed
+// (win_invalidate() / win16_host_invalidate(), #379) while every window's
+// geometry is unchanged from the last frame this compositor actually drew.
+//
+// THE MEASURED PROBLEM. [FLIPPROF] on a DOS guest reported `px full=32
+// part=0`: apps_dirty (SYS_WM_APPS_DIRTY) is a level-triggered BOOLEAN - the
+// kernel already tracks a real per-rect dirty_region_t (kernel/gui/window.c
+// wm_get_dirty_region()/wm_invalidate_rect_async()), but SYS_WM_APPS_DIRTY
+// collapses it to one bit before this compositor ever sees it, so every
+// apps_dirty tick fell through to render_frame()'s unconditional whole-screen
+// composite regardless of how small the actual change was.
+//
+// THE FIX DOES NOT NEED THE KERNEL'S RECT LIST. win_invalidate() (SYS_WIN_-
+// INVALIDATE) and win16_host_invalidate() both mark AT MOST the invalidating
+// window's own bounds dirty (kernel/proc/syscall.c:
+// wm_invalidate_rect_async(&window->bounds)) - never anything outside them.
+// This compositor already fetches every window's bounds every tick via
+// wm_get_windows() (the `_w`/`_n` array in the main loop). So "every visible,
+// non-minimized window's bounds, each as its own damage rect" is a PROVABLE
+// superset of whatever content actually changed, with zero kernel changes -
+// layer 2 (uw_commit_content's own full-window memcpy, and the exact sub-rect
+// IT publishes) is untouched; see this change's CHANGELOG/blame.md entry for
+// why that boundary is deliberate.
+//
+// THE CORRECTNESS GUARD. A window's bounds are a safe superset of its OWN
+// content damage ONLY while nothing about the window LIST changed since the
+// last frame drawn: a move/resize/create/close/minimize/restore/focus-reorder
+// vacates or exposes pixels OUTSIDE the window's current bounds too (the
+// classic "old + new rect" problem render_frame_cursor already solves for the
+// pointer), and this path does not compute an old rect. windowed_geometry_-
+// stable() (below) demands the id, position, size, visible, minimized,
+// focused and maximized flags of EVERY window - not just whichever one is
+// dirty, since SYS_WM_APPS_DIRTY does not say which - plus their ARRAY ORDER
+// (z-order; wm_focus_window() reorders on every focus change), be identical
+// to the snapshot taken after the last frame. Any mismatch at all falls back
+// to render_frame() (the existing, always-correct full path) for that one
+// tick; the snapshot resyncs immediately after, so the very next stable tick
+// uses this path again. A missed region is a visibly stale screen, which the
+// ticket that produced this change is explicit is worse than a slow one -
+// hence auditing the WHOLE list, not just the dirty window's own rect.
+//
+// Chrome damage (taskbar gauges/clock, notification toasts) rides along on
+// the SAME present via taskbar_collect_damage()/notif_collect_damage(),
+// exactly as render_frame_chrome() already does for the idle-desktop case, so
+// a DOS game running flat out does not freeze the taskbar clock behind it.
+// ============================================================================
+
+#define WFP_MAX_WIN 16
+
+typedef struct {
+    int id, x, y, w, h;
+    int visible, minimized, focused, maximized;
+} wfp_snap_t;
+
+static wfp_snap_t s_wfp_prev[WFP_MAX_WIN];
+static int s_wfp_prev_n = -1;   // -1: no snapshot taken yet -> always unstable
+
+static bool windowed_geometry_stable(const wm_window_info_t *wins, int nwins)
+{
+    if (nwins < 0 || nwins > WFP_MAX_WIN) return false;
+    if (s_wfp_prev_n != nwins) return false;
+    for (int i = 0; i < nwins; i++) {
+        if (s_wfp_prev[i].id        != wins[i].id        ||
+            s_wfp_prev[i].x         != wins[i].x         ||
+            s_wfp_prev[i].y         != wins[i].y         ||
+            s_wfp_prev[i].w         != wins[i].width     ||
+            s_wfp_prev[i].h         != wins[i].height    ||
+            s_wfp_prev[i].visible   != wins[i].visible   ||
+            s_wfp_prev[i].minimized != wins[i].minimized ||
+            s_wfp_prev[i].focused   != wins[i].focused   ||
+            s_wfp_prev[i].maximized != wins[i].maximized)
+            return false;
+    }
+    return true;
+}
+
+// Called EVERY tick (any render path), so the NEXT apps_dirty tick always
+// compares against the geometry as of the frame just drawn, not a stale one.
+static void windowed_geometry_snapshot(const wm_window_info_t *wins, int nwins)
+{
+    if (nwins < 0 || nwins > WFP_MAX_WIN) { s_wfp_prev_n = -1; return; }
+    for (int i = 0; i < nwins; i++) {
+        s_wfp_prev[i].id        = wins[i].id;
+        s_wfp_prev[i].x         = wins[i].x;
+        s_wfp_prev[i].y         = wins[i].y;
+        s_wfp_prev[i].w         = wins[i].width;
+        s_wfp_prev[i].h         = wins[i].height;
+        s_wfp_prev[i].visible   = wins[i].visible;
+        s_wfp_prev[i].minimized = wins[i].minimized;
+        s_wfp_prev[i].focused   = wins[i].focused;
+        s_wfp_prev[i].maximized = wins[i].maximized;
+    }
+    s_wfp_prev_n = nwins;
+}
+
+static void render_frame_windowed(const wm_window_info_t *wins, int nwins)
+{
+    damage_reset();
+    for (int i = 0; i < nwins; i++) {
+        if (wins[i].visible && !wins[i].minimized)
+            damage_add(wins[i].x, wins[i].y, wins[i].width, wins[i].height);
+    }
+    if (!fullscreen_app_on_top()) taskbar_collect_damage();
+    notif_collect_damage();
+
+    int n = damage_count();
+    if (n <= 0) { damage_reset(); return; }   // defensive: caller only gets here on apps_dirty
+
+    g_widgets_draw_only = 1;         // widgets draw without re-advancing state
+    g_glass_live = 0;                // clipped pass: cached glass strip only
+    unsigned long total_px = 0;
+    for (int i = 0; i < n; i++) {
+        int x, y, w, h;
+        if (!damage_get(i, &x, &y, &w, &h)) continue;
+        bool need_windows = false;
+        for (int k = 0; k < nwins && !need_windows; k++) {
+            if (wins[k].visible && !wins[k].minimized)
+                need_windows = rects_intersect(x, y, w, h,
+                                               wins[k].x, wins[k].y,
+                                               wins[k].width, wins[k].height);
+        }
+        draw_set_clip(x, y, w, h);
+        fb_damage(x, y, w, h);       // kernel presents ONLY this rect
+        render_frame_body(need_windows);
+        vnc_mark_rect_dirty(x, y, w, h);   // #440 parity: same rect to VNC
+        total_px += (unsigned long)w * (unsigned long)h;
+    }
+    draw_clear_clip();
+    g_widgets_draw_only = 0;
+    damage_reset();
+    idleprof_damage_px(total_px);   // #COMPIDLE: real cost, not fb_width*fb_height
+    idleprof_flip();   // #COMPIDLE: timed present
+    perfframe_mark("windowed");   // perf62: apps_dirty, geometry-stable partial present
 }
 
 // ============================================================================
@@ -3459,6 +3790,59 @@ int main(int argc, char **argv)
         }
     }
 
+    // #rootcomp (2026-08-30): VERIFICATION-ONLY ADVERSARIAL PROBE, gated and
+    // OFF on every normal boot. Nothing writes /PROBEPERMS.TXT as part of the
+    // wizard, the installer, or any shipped default, so this block is dead
+    // weight (one failed sys_open()) on a real machine.
+    //
+    // WHY THIS EXISTS: the owner reported "vm <vmid> is on the root compositor
+    // again". Investigation found the session-identity mechanism itself
+    // correct (this process's real uid is stamped by desktop_set_session()
+    // and launch_userspace_app() -> proc_as_session() BEFORE this binary is
+    // loaded, so it cannot be uid 0 unless the session actually authenticated
+    // as root), but the earlier #745 fix proved that once, and this OS has
+    // since acquired new code paths that could, in principle, hand this
+    // process root without anyone noticing (a new spawn site, a changed
+    // default, a regressed OOBEAUTH guard). Rather than re-trust the '#745
+    // fixed it' finding, this repeats the DOSUSER adversarial proof (see
+    // kernel/proc/dosring3.c and blame.md) FROM THIS BINARY, because a
+    // refusal proven on a different process proves nothing about this one.
+    //
+    // The result line is UNFORGEABLE by this process: it is a plain printf(),
+    // which reaches /BOOTLOG.TXT and serial via sys_bootlog(), tagged
+    // "[USERSPACE uid=N]" by the KERNEL (proc/syscall.c:5668) from the
+    // caller's REAL euid, not anything this binary can claim about itself.
+    {
+        extern int printf(const char *fmt, ...);
+        int __pg = sys_open("/PROBEPERMS.TXT", 0);
+        if (__pg >= 0) {
+            sys_close(__pg);
+            static const char *neg[] = {
+                "/CONFIG/SHADOW", "/CONFIG/KIMI.KEY", "/CONFIG/AUTHKEYS",
+                "/CONFIG/../CONFIG/SHADOW", "/../CONFIG/SHADOW", NULL };
+            // Positive controls: shipped asset-base files that exist before
+            // any wizard runs and are NOT owner-restricted, so a probe that
+            // refuses everything (a broken instrument) is distinguishable
+            // from one that is actually enforcing an owner-only ACL.
+            static const char *pos[] = {
+                "/CONFIG/CACERTS.PEM", "/CONFIG/AUTHKEYS.PUB", NULL };
+            printf("[PROBEPERMS] compositor adversarial probe starting\n");
+            for (int i = 0; neg[i]; i++) {
+                int fd = sys_open(neg[i], 0);
+                printf("[PROBEPERMS] NEG open(%s) -> %d (%s)\n", neg[i], fd,
+                       fd >= 0 ? "OPENED -- SHOULD NOT HAPPEN" : "refused (expected)");
+                if (fd >= 0) sys_close(fd);
+            }
+            for (int i = 0; pos[i]; i++) {
+                int fd = sys_open(pos[i], 0);
+                printf("[PROBEPERMS] POS open(%s) -> %d (%s)\n", pos[i], fd,
+                       fd >= 0 ? "opened (expected)" : "REFUSED -- PROBE IS BROKEN");
+                if (fd >= 0) sys_close(fd);
+            }
+            printf("[PROBEPERMS] compositor adversarial probe done\n");
+        }
+    }
+
     // (#565) Restore the persisted active theme from /CONFIG/THEME.CFG at
     // compositor startup, not just when Settings happens to be opened. The
     // kernel's own boot-time default is always index 0 (Retro UNIX) since it
@@ -3856,7 +4240,11 @@ int main(int argc, char **argv)
             // T0 #578: everything that forces a FULL composite, EXCEPT plain
             // recent pointer input. When only recent_input is set and this tick
             // was pointer-motion-only, the cheap cursor-rect path handles it.
-            bool other_interactive = apps_dirty ||
+            // #rinpin: split out from `other_interactive` (below) so the
+            // apps_dirty circuit breaker just below can ask "is anything OTHER
+            // than apps_dirty keeping this tick busy" without re-deriving the
+            // whole list a second time.
+            bool ui_busy =
                         s_dragging_sheep || s_dragging_dog || s_dragging_widget ||
                         s_dragging_sticky || stickies_editing() ||
                         s_dragging_desktop || widget_menu_is_open() ||
@@ -3864,7 +4252,7 @@ int main(int argc, char **argv)
                         g_wallpaper_picker_open || g_tray_menu_open ||
                         g_launcher_open ||
                         startmenu_power_confirm_open() || startmenu_properties_open() ||
-                        widget_settings_is_open() || taskbar_popup_active() ||
+                        widget_settings_is_open() || dosspeed_is_open() || taskbar_popup_active() ||
                         g_session_locked ||   // #566: always full-render so the lock screen's clock visibly ticks
                         // (#745) DOCK_XFCE hover ease in flight: without this,
                         // pure pointer motion over the dock (no menu, no drag)
@@ -3903,6 +4291,193 @@ int main(int argc, char **argv)
                         // not ghosted - see screenshot.c) until something
                         // UNRELATED forced the next tick.
                         screenshot_fs_toast_active();
+            bool other_interactive = apps_dirty || ui_busy;
+
+            // (dosplay 2026-08-28) COULD THIS TICK TAKE THE CHEAP PARTIAL PATH?
+            //
+            // Hoisted OUT of windowed_dirty_only (below) so the #rinpin circuit
+            // breaker can ask it. Every term here except apps_dirty itself is
+            // unchanged, and windowed_dirty_only is now literally
+            // apps_dirty && partial_possible, so this is a pure refactor for
+            // every tick the breaker does not touch.
+            bool partial_possible = !ui_busy && !g_needs_redraw &&
+                                    !g_screensaver_active && !g_tick_motion &&
+                                    !volosd_visible() &&
+                                    !fullscreen_in_list(_w, _n) &&
+                                    windowed_geometry_stable(_w, _n);
+
+            // #rinpin (2026-08-28): APPS_DIRTY CIRCUIT BREAKER.
+            //
+            // #COMPIDLE captures from a real 4K laptop (golden 2246) showed
+            // `dirty=` (this same apps_dirty flag) pinned at 100% of ticks for
+            // over a thousand seconds straight, INCLUDING a 30s window where
+            // `rin=0` too (no input at all) - so the full-screen composite was
+            // not being driven by anything a human could see or do anything
+            // about. This is the exact symptom #564's blame.md entry ("An
+            // in-session redraw_pending re-arm... apps_dirty=1 stuck forever")
+            // already named once: an app that keeps calling win_invalidate()
+            // in response to a REDRAW it should not have received forms a
+            // permanent ping-pong the compositor cannot break out of on its
+            // own, because apps_dirty is a level, not an edge, and every full
+            // render legitimately re-reads it as still true.
+            //
+            // This session searched hard for a live reproduction (AICHAT's
+            // docked panel, a DOS game closed via the titlebar X, and a Win16
+            // (FreeCell) app closed via the titlebar X - see CHANGELOG/blame.md
+            // for the three separate VM runs) and every one of them settled to
+            // `dirty=0` within one tick of the window closing, so the exact
+            // trigger was NOT reproduced here. Shipping silence instead of a
+            // fix is not acceptable for a "the desktop is unusable" report, so
+            // this is a SAFE backstop rather than a guess at the trigger:
+            //
+            //   - It only engages when apps_dirty is the ENTIRE story: no
+            //     drag/menu/lock/dock-animation/toast (ui_busy) AND no recent
+            //     input AND no fullscreen app on screen (a real fullscreen
+            //     game that legitimately redraws every frame - AssaultCube,
+            //     DOOM, Arena - is explicitly exempt, same carve-out #158 uses
+            //     everywhere else in this file).
+            //   - It only trips after the window LIST has been perfectly
+            //     STABLE (same count, same ids, in the same order) for
+            //     APPSDIRTY_STREAK_TRIP consecutive ticks under that
+            //     condition - long enough that no legitimate one-shot
+            //     "still catching up" redraw could still be pending, short
+            //     enough (a few seconds) that the fix is felt immediately
+            //     rather than after minutes.
+            //   - When it trips: log the FULL window list once (id/title/
+            //     app_id/visible/minimized) so the NEXT capture from the
+            //     affected machine says exactly which window's content
+            //     handling is looping, force this tick onto the cheap idle
+            //     path (apps_dirty=false locally), and re-arm so a genuine
+            //     NEW change (any window created/destroyed/moved, or even one
+            //     that legitimately keeps animating - the fingerprint does
+            //     not change, but see the busy=/note below) is never
+            //     silently swallowed twice: the breaker only ever forces ONE
+            //     idle tick before checking the condition fresh.
+            //
+            // This does NOT paper over a genuinely animating foreground app:
+            // ui_busy and fullscreen both exempt it, and if apps_dirty is
+            // legitimately true because of REAL new content every tick, the
+            // window's own bounds/flags do not need to change for that to be
+            // correct - but a desktop the user has walked away from (no
+            // input, no fullscreen app, no menu/drag) has no reason to need a
+            // full composite every single tick forever, and #564's own
+            // history says the likeliest explanation is exactly this
+            // ping-pong, not a legitimate render.
+            {
+                static uint32_t s_ad_streak     = 0;
+                static uint32_t s_ad_fp         = 0;
+                static bool     s_ad_reported   = false;
+                // LATCHED, not a one-shot: a single forced-idle tick every
+                // APPSDIRTY_STREAK_TRIP ticks is invisible in the aggregate
+                // (measured: 673/676 ticks still full= with a one-shot
+                // release, because the very next tick re-enters the same
+                // stuck state and has to re-accumulate the whole streak
+                // before tripping again). Once tripped, STAY suppressed for
+                // as long as the exact same quiet-context+window-fingerprint
+                // condition holds, and only lift it when something REAL
+                // changes (input, a menu/drag, a fullscreen app, or the
+                // window list itself) - see #ad_quiet_context below.
+                static bool     s_ad_suppressed = false;
+                #define APPSDIRTY_STREAK_TRIP 250   // a few seconds at the 8-30ms poll rates this path runs at
+                bool ad_quiet_context = apps_dirty && !ui_busy && !recent_input &&
+                                        !g_screensaver_active &&
+                                        !fullscreen_in_list(_w, _n);
+                if (ad_quiet_context) {
+                    uint32_t fp = (uint32_t)_n * 2654435761u;
+                    for (int _i = 0; _i < _n; _i++)
+                        fp = fp * 33u + (uint32_t)_w[_i].id + ((uint32_t)_w[_i].minimized << 16);
+                    if (fp == s_ad_fp) {
+                        if (s_ad_streak < 0xFFFFFFFFu) s_ad_streak++;
+                    } else {
+                        s_ad_fp = fp;
+                        s_ad_streak = 1;
+                        s_ad_reported = false;
+                        s_ad_suppressed = false;   // a real window-list change: trust apps_dirty again
+                    }
+                    if (!s_ad_suppressed && s_ad_streak >= APPSDIRTY_STREAK_TRIP) {
+                        s_ad_suppressed = true;
+                        if (!s_ad_reported) {
+                            s_ad_reported = true;
+                            idleprof_dirty_pin_report(_n, _w);
+                        }
+                    }
+                    // (dosplay 2026-08-28) SUPPRESS ONLY WHAT THIS BREAKER
+                    // WAS BUILT TO STOP: A PINNED *FULL-SCREEN* COMPOSITE.
+                    //
+                    // The trip condition above is satisfied by a perfectly
+                    // healthy WINDOWED program that legitimately redraws every
+                    // frame with nobody touching the keyboard: a DOS game, a
+                    // Win16 app, a video player. Its window list is stable by
+                    // definition (one window, not minimised), it is not
+                    // fullscreen so the fullscreen carve-out never reaches it,
+                    // and a game nobody is pressing keys at has no recent
+                    // input. So the streak ran out and the latch froze the
+                    // picture until the next keystroke. Every case the breaker
+                    // was regression-tested against was a window that STOPS
+                    // drawing (AICHAT close, DOS close, Win16 close); none was
+                    // a window that KEEPS drawing legitimately.
+                    //
+                    // MEASURED on golden 2267, one core, 2560x1600 with
+                    // present_scale=2: Aladdin at its animated title screen,
+                    // and Red Alert after its first mode-13h frame. In both
+                    // runs the compositor logged [COMPIDLE] dirty=0 flip=0
+                    // path none=239..252 for THIRTY-SECOND intervals at a time,
+                    // with this breaker's own dirty-pin report naming the guest
+                    // window. The DOS guest was running throughout at 20-21 M
+                    // instructions a second and publishing a fresh frame five
+                    // times a second; not one of them reached the screen.
+                    // Presenting resumed for 16-22 s after each injected key
+                    // and then stopped again.
+                    //
+                    // The carve-out is not a special case for guests. The
+                    // breaker's own evidence is that the owner's 4K capture was
+                    // pinned on the FULL path (full=744 of 744 ticks); that is
+                    // the expensive thing and it is untouched here. When the
+                    // tick would instead have taken the cheap partial windowed
+                    // path, suppressing it saves nothing measurable (the
+                    // interval this froze read windowed=371 full=2 busy=7%) and
+                    // costs the user the picture. So keep the streak, keep the
+                    // dirty-pin report (it is the diagnostic the next real
+                    // capture needs), and suppress only when a FULL composite
+                    // is what would otherwise happen.
+                    if (s_ad_suppressed && !partial_possible) {
+                        apps_dirty = false;
+                        other_interactive = ui_busy;
+                    }
+                } else {
+                    // Real activity resumed (input, menu, drag, fullscreen) or
+                    // apps_dirty itself went false on its own: trust it again.
+                    s_ad_streak = 0;
+                    s_ad_reported = false;
+                    s_ad_suppressed = false;
+                }
+            }
+
+            // #compositor-partial (no-ticket): apps_dirty steady-state guard.
+            // See render_frame_windowed()'s header comment (above, before
+            // "main: entry point") for the full correctness argument. Read
+            // apps_dirty AFTER the circuit breaker above, so a breaker-
+            // suppressed stuck ping-pong is treated as idle, not as a real
+            // windowed update; computed BEFORE quiet_tick/interactive below
+            // so it reflects exactly what this tick is about to render.
+            // #162: volosd (the volume OSD) is self-gating - it draws for
+            // OSD_LINGER_MS after the triggering key event WITHOUT re-setting
+            // g_needs_redraw on every one of those ticks (only on the change
+            // itself), and its screen position is not generally inside any
+            // window's bounds or the taskbar strip. render_frame() (the full
+            // path) always includes it because it always redraws everything;
+            // this partial path would silently stop touching its region the
+            // moment g_needs_redraw goes false again, leaving it frozen
+            // mid-fade instead of dismissing. Same shape as ui_busy's
+            // screenshot_fs_toast_active() carve-out just above in this file,
+            // applied here for the one overlay that is NOT already in ui_busy.
+            bool windowed_dirty_only = apps_dirty && partial_possible;
+            // Snapshot AFTER the comparison above, every tick regardless of
+            // which render path this tick takes - the next apps_dirty tick
+            // must always compare against the geometry as of the frame just
+            // computed here, never a stale one.
+            windowed_geometry_snapshot(_w, _n);
+
             // #COMPIDLE: A TICK IN WHICH NOTHING HAPPENED HAS NOTHING TO DRAW.
             //
             // `recent_input` stays true for 500ms after the last pointer or
@@ -3958,7 +4533,7 @@ int main(int argc, char **argv)
                     g_context_menu_open || g_wallpaper_picker_open ||
                     g_tray_menu_open || g_launcher_open ||
                     startmenu_power_confirm_open() || startmenu_properties_open() ||
-                    widget_settings_is_open() || taskbar_popup_active() ||
+                    widget_settings_is_open() || dosspeed_is_open() || taskbar_popup_active() ||
                     stickies_editing())       _r |= IP_R_MENU;
                 if (g_session_locked)         _r |= IP_R_LOCKED;
                 if (taskbar_dock_animating() || screenshot_fs_toast_active())
@@ -4006,6 +4581,15 @@ int main(int argc, char **argv)
                     // exact rect itself, so do NOT mark the whole screen dirty).
                     idleprof_path(IP_P_CURSOR);         // #COMPIDLE
                     render_frame_cursor(s_drawn_cursor_x, s_drawn_cursor_y, _w, _n);
+                } else if (windowed_dirty_only) {
+                    // #compositor-partial (no-ticket): apps_dirty, and every
+                    // window's geometry is unchanged since the last frame -
+                    // recomposite + present ONLY the visible windows' own
+                    // bounds plus current chrome damage (taskbar/toast), not
+                    // the whole screen. render_frame_windowed() marks VNC
+                    // per-rect itself (#440 parity), so nothing further here.
+                    idleprof_path(IP_P_WINDOWED);       // #COMPIDLE
+                    render_frame_windowed(_w, _n);
                 } else {
                     // perf62: tag the upcoming present by WHY it's happening -
                     // an app's own content changing ("windowed") versus plain

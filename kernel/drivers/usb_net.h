@@ -85,6 +85,17 @@ int usb_net_probe(xhci_controller_t *xhc, int slot_id, int speed,
 
 // Backend API for net/net.c (mirrors e1000_* / virtio_net_*).
 int  usb_eth_present(void);
+// The bound USB NIC's slot was torn down (unplug). Clears the device state and
+// arms net_worker to unbind it, so a REPLUG is a fresh attach rather than a
+// device nobody claims. Called from the xHCI slot-free path.
+void usb_net_detach_slot(int slot_id);
+// Is the USB NIC on this slot? For the xHCI port teardown's class dispatch.
+int  usb_net_owns_slot(int slot_id);
+// Attach a CDC-ECM function from a specific configuration INDEX (0 = the one
+// enumeration fetched). The index is recorded in the durable binding line so a
+// composite device's chosen configuration is evidence, not an inference.
+int  usb_ecm_attach_cfg_idx(xhci_controller_t *xhc, int slot_id, int speed,
+                            uint8_t *cfg, int total, int cfg_idx);
 int  usb_eth_start(void);                       // arm RX; 0 on success
 void usb_eth_get_mac(uint8_t *mac);
 int  usb_eth_send(const void *data, uint16_t length);

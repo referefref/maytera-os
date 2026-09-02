@@ -48,6 +48,19 @@ static battery_report_t g_rep = { -1, -1, BATT_ST_UNKNOWN, -1 };
 static uint32_t g_gen = 0;
 static uint64_t g_next_refresh_us = 0;   // internal throttle floor
 static int g_injection_logged = 0;       // log the injector's arrival once, not every refresh
+// #battpop: log the real-ACPI evaluation OUTCOME to /BOOTLOG.TXT once, not
+// every ~250ms-throttled refresh. Before this, battery_init()'s final
+// "present=... pct=... state=... minutes=..." summary went to kprintf()
+// (serial) ONLY - never bootlog_write() - so a machine that shipped
+// "unknown status unknown" with no live serial capture (the normal case for
+// an end user's own laptop) left NO durable evidence of which branch was
+// taken: self-test failure, no _BIF/_BST evaluable at all, or (the expected
+// case per this file's header - most real firmware backs _BST with an EC
+// Field read this bounded evaluator will not attempt) _BIF evaluable but
+// _BST not. /BOOTLOG.TXT is exactly the artifact this project's own "get the
+// evidence from the hardware, not from a VM" rule asks for, so it needs to
+// actually carry the answer.
+static int g_eval_logged = 0;
 
 #define BATT_REFRESH_MIN_US 250000ULL   // at most 4 real re-scans/sec, however hard a caller polls
 
@@ -179,6 +192,21 @@ static int battery_eval_from_acpi(battery_report_t *out) {
                 have_bst = (bst_n >= 3);
             }
         }
+    }
+
+    // #battpop: see g_eval_logged's declaration above for why this needs to
+    // reach /BOOTLOG.TXT and not just serial. Logged once, on the FIRST real
+    // (non-injected) evaluation only - present/have_bif/have_bst do not
+    // change without a firmware reload, so nothing is lost by not repeating
+    // this on every throttled refresh.
+    if (!g_eval_logged) {
+        g_eval_logged = 1;
+        bootlog_write("[BATTERY] ACPI eval: have_bif=%d have_bst=%d%s\n",
+                       have_bif, have_bst,
+                       (!have_bst) ? " (no usable _BST - percent/state/minutes "
+                                     "report unknown; likely an EC-backed _BST "
+                                     "this bounded evaluator will not attempt, "
+                                     "see rustkern/battery.rs)" : "");
     }
 
     battery_compute_rs(present, have_bif, bif, bif_n, have_bst, bst, bst_n, out);

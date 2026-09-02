@@ -304,6 +304,7 @@ guestfs_check_rs
 # ---------------------------------------------------------------------------
 dpmi_int31_rs
 dpmi_rmvec_seed_rs
+dpmi_rmvec_guest_rs
 dpmi_host_reset_rs
 dpmi_bind_dosmem_rs
 dpmi_set_ext_rs
@@ -311,6 +312,7 @@ dpmi_bind_arena_rs
 dpmi_bind_meminfo_rs
 dpmi_seed_desc_rs
 dpmi_sel_lookup_rs
+dpmi_pmvec_get_rs
 dpmi_report_rs
 dpmi_selftest_rs
 guestfs_selftest_rs
@@ -506,6 +508,7 @@ scprof_selfcheck
 # detector, and the failure it exists to catch is a SILENT wedge.
 sched_storm_verdict_rs
 sched_place_rs
+sched_place_masked_rs
 sched_steal_rs
 sched_core_pct_rs
 sched_watch_selftest_rs
@@ -528,6 +531,74 @@ sched_cpuobs_drops_rs
 sched_cpuobs_last_mig_rs
 sched_cpuobs_live_verdict_rs
 sched_cpuobs_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/inputlat.rs - #affinity: INPUT-TO-PRESENT LATENCY. C API in
+# cpu/inputlat.h.
+#
+# The first instrument in this kernel that measures RESPONSIVENESS rather than
+# throughput. Every other performance number we have (frame rate, IPS, per-core
+# busy %, lock occupancy) is satisfied by a compositor holding 60 fps while
+# every keystroke waits 200ms for it to be scheduled; this one is not.
+#
+# Three stages, three histograms: key queued -> dequeued (S_WAIT, the stage a
+# scheduling change moves), scancode arrival -> dequeued (S_INPUT), and scancode
+# arrival -> the first present after that dequeue (S_PRESENT, a LOWER BOUND on
+# true input-to-photon; the module comment says why).
+#
+# The three hooks run in ISR context and inside sys_fb_flip()'s interrupts-off
+# window, so they are lock-free, allocation-free and wait-free (#426).
+# inputlat_selftest_negative_rs is the arm that PROVES the self-test can fail;
+# neither arm proves the STAMPS are live, which is what g_inputlat_inject_us
+# (cpu/isr.c) is for.
+# ---------------------------------------------------------------------------
+inputlat_scancode_rs
+inputlat_push_rs
+inputlat_deliver_rs
+inputlat_present_rs
+inputlat_stage_rs
+inputlat_counts_rs
+inputlat_bucket_rs
+inputlat_bucket_lo_rs
+inputlat_reset_rs
+inputlat_selftest_rs
+inputlat_selftest_negative_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/affinity.rs - #affinity: PERSISTENT per-process CPU affinity, and the
+# PER-PROCESS migration counters. C API in proc/affinity.h.
+#
+# What already existed, so this is not mistaken for more than it is: SOFT
+# affinity is already in schedwatch.rs (process_t::last_cpu -> sched_place_rs's
+# prev_cpu, which wins among idle cores and breaks ties when queueing).
+# process_t::sched_pinned is the #75 selection pin, not affinity.
+# process_t::migratable is dead code. What did NOT exist is a persistent CPU SET
+# and any per-process migration count, and that is what these are.
+#
+# note_switchin() is fed from sched_cpuobs_note_rs (rustkern/cpuobs.rs), which
+# the scheduler already calls on every switch-in with exactly these arguments,
+# so the measurement needs no change to proc/process.c at all. It is NOT
+# exported: it is a crate-internal Rust call, deliberately, so there is no C
+# symbol tempting anyone to add a second accounting site.
+#
+# affinity_selftest_negative_rs is the arm that PROVES the suite can go red.
+# ---------------------------------------------------------------------------
+affinity_set_rs
+affinity_get_rs
+affinity_allows_rs
+affinity_clear_rs
+affinity_stats_rs
+affinity_walk_rs
+affinity_full_rs
+affinity_evicted_rs
+affinity_next_spawn_set_rs
+affinity_next_spawn_take_rs
+affinity_ap_mask_rs
+affinity_reset_stats_rs
+affinity_set_disabled_rs
+affinity_disabled_rs
+affinity_selftest_rs
+affinity_selftest_negative_rs
 
 # rustkern/rqlock.rs - #143 part 2: is the run-queue lock the bottleneck?
 # Judges one ~4s reporting window of the counters C collects at the lock.
@@ -827,6 +898,53 @@ dosovl_map_rs
 dosovl_title_rs
 dosovl_selftest_rs
 
+# rustkern/dospolicy.rs - #67/#168: WHERE a DOS guest runs. Parses
+# /CONFIG/DOSROUTE.CFG and answers "in-kernel Ring-0 interpreter, or the Ring-3
+# host /APPS/DOSUSER?" for one program path. Pure: no I/O, no logging, no
+# statics, no allocation; proc/dosroute.c does the reading and the spawning.
+# This is the whole SMP story - the in-kernel interpreter holds the BKL ~97% of
+# wall clock with SMP on, which is why turning SMP on makes a DOS guest SLOWER.
+# Owner: the DOS guest layer.
+dospolicy_parse_rs
+dospolicy_route_rs
+dospolicy_rule_text_rs
+# Both self-test arms are exported ON PURPOSE. The green arm alone cannot
+# distinguish a passing suite from a suite whose checks cannot fail; the red arm
+# is a deliberately-wrong policy that MUST report a non-zero failure count, and
+# main.c prints both so a boot log shows the difference.
+dospolicy_selftest_rs
+dospolicy_selftest_red_rs
+
+# rustkern/rawsc.rs - #DOSRING3 Stage 1: focus-scoped RAW set-1 scancode
+# delivery to a RING-3 DOS host. A DOS guest's own INT 9 handler reads port
+# 0x60 and keeps its own Keyboard[] array, so it needs make/break BYTES, which
+# gui_event_t has no field for. Delivery requires the caller to OWN the named
+# window AND that window to HAVE FOCUS, re-checked on every call and never
+# latched, which is STRICTER than the g_dos_scancode_tap ISR splice it is
+# designed to replace (that is a global flag with no window scoping at all).
+# Producer is cpu/isr.c keyboard_process_scancode(), the one funnel every
+# scancode source reaches; consumer is gui/fb_syscall.c sys_win_get_scancodes()
+# (SYS_WIN_GET_SCANCODES=416); the subscription is dropped at
+# proc/syscall.c cleanup_user_windows_for_process(). The self-test has TWO
+# NEGATIVE ARMS because a positive-only test cannot tell a gate from a wire.
+# Owner: the DOS guest layer.
+rawsc_armed_rs
+rawsc_arm_rs
+rawsc_disarm_rs
+rawsc_clear_rs
+rawsc_push_rs
+rawsc_drain_rs
+rawsc_census_rs
+rawsc_selftest_rs
+
+# rustkern/dospath.rs - The Dig (2026-08-28): collapse "." and ".." components
+# out of a resolved DOS path, with a ".." floor at /WINDIR/DRIVE_<X> so a guest
+# cannot climb out of its own drive. Sole caller is dos/dospath.c
+# (dos_resolve_path_ex, which is THE one DOS path resolver); the self-test runs
+# from dos_windir_init() at boot and prints [DOSPATH]. Owner: the DOS guest layer.
+dospath_canon_rs
+dospath_canon_selftest_rs
+
 # rustkern/usbvol.rs - #740: DATA VOLUMES in the unpartitioned tail of the boot
 # device, so a game whose data does not fit in the 1.62 GB OS image (Discworld 2
 # is 1.54 GB compressed) can be read off the stick instead. Owner: dos/usbvol.c,
@@ -845,10 +963,52 @@ usbvol_selftest_rs
 # shared by the present path and the mouse-input path so they cannot drift.
 dos_letterbox_rs
 dos_letterbox_selftest_rs
+dos_present_rect_rs
+dos_view_default_budget_rs
+# (no-ticket) The cap on the OPENING window, separate from the budget that
+# governs the picture. One number governing both let a picture-budget raise
+# multiply the default window sixteenfold on a 3840x2160 panel.
+dos_view_open_budget_rs
+
+# rustkern/dosprof.rs (no-ticket) - where a DOS guest's frame time actually
+# goes. Coarse phase buckets charged from the two run loops in dos/dosexec.c,
+# diagnostic only (/CONFIG/DOSSPEED.CFG). Exists because the two instruments
+# that came before it each timed one already-suspected phase, so the residual
+# - which is where the time was - had no name.
+dosprof_add_rs
+dosprof_add_publish_bytes_rs
+dosprof_report_rs
+dosprof_selftest_rs
+
+# rustkern/dosdisp.rs (no-ticket) - do not compute a DOS frame the compositor
+# has not shown yet. Back pressure on g_fb_flip_count, not a timer: the right
+# present cadence is a property of the host's composite cost at the current
+# resolution, which a constant cannot know.
+dosdisp_reset_rs
+dosdisp_should_present_rs
+dosdisp_selftest_rs
+dos_aspect_apply_rs
+dos_view_parse_rs
+dos_view_selftest_rs
 # #163: displayed rows from the CRTC's vertical timing (Vertical
 # Display End / Start Vertical Blank / scanlines per row).
 dos_vga_rows_rs
 dos_vga_rows_selftest_rs
+
+# rustkern/doslinger.rs - the POST-EXIT LINGER policy for a DOS guest: does a
+# guest that has just stopped get its final frame held on screen at all, and
+# for how long. Replaces a fixed proc_sleep(2000) in dos/dosexec.c with a wait
+# for the real condition (the compositor has presented since the DOS layer last
+# published a frame) plus a short, X-interruptible visible hold. The two
+# _done_rs entries are wait_event() conditions and are pure atomic reads.
+dos_linger_reset_rs
+dos_linger_close_rs
+dos_linger_wanted_rs
+dos_linger_arm_hold_rs
+dos_linger_frame_done_rs
+dos_linger_hold_done_rs
+dos_linger_frame_backstop_ms_rs
+dos_linger_hold_ms_rs
 
 # rustkern/dosmick.rs - (#mickey) what a DOS guest is TOLD the mouse did. A DOS
 # mouse driver is relative and reports mickeys; our pointer is absolute. Owns
@@ -1070,6 +1230,23 @@ rtc_selftest_rs
 sntp_build_request_rs
 sntp_parse_reply_rs
 sntp_selftest_rs
+
+# rustkern/netattach.rs - hot-plug NIC attach handoff (no ticket, 2026-08-28).
+# The one-shot, lock-free arm/take between the xHCI re-scan worker (which claims
+# a hot-plugged USB NIC and must never block) and the background net worker
+# (which binds it and lets the existing carrier down->up branch start DHCP).
+# New code, not a port: no _c twin and no -DRUST_* flag. If these go MISSING,
+# a NIC plugged in after boot silently never gets an IP address again, which is
+# exactly the defect they exist to remove.
+netattach_boot_done_rs
+netattach_boot_is_done_rs
+netattach_on_probe_rs
+netattach_take_rs
+netattach_rearm_rs
+netattach_on_detach_rs
+netattach_take_detach_rs
+netattach_stats_rs
+netattach_selftest_rs
 
 # rustkern/netstat.rs - #745 OOBE Network page: structured live IPv4 status
 # (SYS_NET_STATUS 371) and the non-blocking probe (SYS_NET_PROBE 372).
@@ -1445,6 +1622,16 @@ uiscale_mark_native_rs
 uiscale_clear_native_rs
 uiscale_is_native_rs
 
+# --- rustkern/presentscale.rs: integer PRESENT-SCALE compositing (#halfres) -
+# Pure "is this factor valid for this panel" arithmetic + its property
+# self-test, mirroring uiscale.rs one entry up. The FS/config plumbing is
+# gui/presentscale.c (C, mirroring uiscale.c); the per-pixel replication is
+# video/framebuffer.c (C, entangled with the existing rotation present path).
+presentscale_valid_rs
+presentscale_logical_w_rs
+presentscale_logical_h_rs
+presentscale_selftest_rs
+
 # rustkern/sessend.rs - #126: session teardown attribution. Which Ring 3
 # processes belonged to the desktop session that just ended (Log Out / Switch
 # User), so gui/desktop.c can end them at the login gate instead of handing a
@@ -1532,3 +1719,60 @@ selftest_notrun_overflow_rs
 selftest_ran_count_rs
 selftest_notrun_entry_rs
 selftestreg_selftest_rs
+
+# rustkern/usbport.rs (#307/#433) - the decision of when to STOP retrying an
+# xHCI root port that will never enumerate. The owner's ASUS burned 2046 Address
+# Device attempts on one faulty root port in a 34-minute boot log, one per
+# second, forever, because the pre-existing flap governor keys on confirmed
+# DISCONNECTS and this port's CCS never drops. Pure decision + state; every MMIO
+# access, command-ring TRB and log line stays in drivers/xhci.c.
+# usbport_abi_check_rs locks drivers/usbport.h's constants against this module's,
+# so the two ideas of the table geometry cannot diverge in silence.
+usbport_should_enumerate_rs
+usbport_budget_failed_rs
+usbport_enum_ok_rs
+usbport_connect_changed_rs
+usbport_config_disable_rs
+usbport_state_rs
+usbport_budgets_rs
+usbport_retires_rs
+usbport_parse_cfg_rs
+usbport_abi_check_rs
+usbport_selftest_rs
+
+# ---------------------------------------------------------------------------
+# rustkern/imgra.rs, rustkern/isomemo.rs, rustkern/blkhist.rs - [no-ticket]:
+# CD/ISO READ ROUND TRIPS. A DOS game streaming from an ISO 9660 volume in the
+# boot stick's tail (dos/usbvol.c) paid one USB command per 8 KiB, and a USB
+# mass-storage command costs a fixed ~121-148 us WHATEVER ITS SIZE (measured on
+# the owner's stick and on a real USB bridge on the build host), so the round
+# trip count was the entire cost: 99% of the block layer was the device.
+#   imgra    decides how many consecutive cache blocks a miss fetches and which
+#            consecutive run of slots to put them in, so a readahead is ONE
+#            device command and not eight.
+#   isomemo  memoises the resolved ISO extent, so streaming a file stops
+#            re-walking the directory tree from the volume root once per 4 KB.
+#            It is the PRECONDITION for imgra, not a separate optimisation:
+#            readahead evicts the directory blocks, and without the memo those
+#            walks would go to the device.
+#   blkhist  owns the bucketing and every derived rate the block-layer census
+#            and dos/cdbench.c print (sectors/xfer, xfers per MB, KB/s, and the
+#            projection onto a known per-command cost).
+# All three are new logic with no C twin, so Rust with no strangler flag.
+imgra_reset_rs
+imgra_plan_rs
+imgra_abort_rs
+imgra_victim_rs
+imgra_stats_rs
+imgra_selftest_rs
+isomemo_reset_rs
+isomemo_lookup_rs
+isomemo_store_rs
+isomemo_stats_rs
+isomemo_selftest_rs
+blkhist_bucket_rs
+blkhist_xfers_per_mb_x10_rs
+blkhist_sectors_per_xfer_x10_rs
+blkhist_kbps_rs
+blkhist_projected_ms_rs
+blkhist_selftest_rs

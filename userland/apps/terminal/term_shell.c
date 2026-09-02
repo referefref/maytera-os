@@ -653,6 +653,382 @@ static const builtin_t g_builtins[] = {
 };
 #define NUM_BUILTINS ((int)(sizeof(g_builtins) / sizeof(g_builtins[0])))
 
+// ============================================================================
+// [tabcomp] Tab completion.
+//
+// ESTABLISHED FIRST, before writing any of this: this input editor is
+// APPEND-ONLY. input_pos is always strlen(input_line) - there is no interior
+// cursor. GUI_KEY_LEFT/RIGHT reach term_layout.c's pane-focus shortcuts only
+// under Ctrl+Shift; plain Left/Right are not handled by this shell's key
+// switch at all, and term_layout.c's own comment at the GUI_KEY_HOME case
+// says so in as many words: "there is no in-line cursor movement, only
+// append/backspace". So "the token under the cursor" is always the LAST
+// whitespace/quote-delimited token in input_line. What this still has to get
+// right, and the sense in which it satisfies "completing in the middle of a
+// line, not just at the end": completing an argument that is NOT word 0
+// (`cat /APP<TAB>`), which needs the SAME verb/builtin lookup and quote
+// handling execute_command() itself uses, not just "whatever's after the
+// last space". A true interior cursor (Left/Right moving within input_line)
+// would be a separate, much larger line-editing feature this shell does not
+// have today; out of scope here.
+//
+// GUI_KEY_TAB was previously unhandled by main.c's key switch: keycode
+// 0x09 / key_char '\t' (0x09 < ' ', so it also missed the printable-char
+// branch) matched none of the existing cases and was silently dropped.
+// Nothing else in this app (term_menu_event/term_search_key_event/
+// term_layout_event, checked first each keystroke) claims it either -
+// term_prefs.c's GUI_KEY_TAB use is scoped to its own modal Preferences
+// dialog's field-cycling loop, a separate event loop entirely.
+//
+// CASE SENSITIVITY: matches are byte-for-byte against whatever readdir()
+// returns - case-sensitive, no folding. ext2 is case-sensitive on disk. The
+// FAT ESP in this build carries no lowercase names for a case-sensitive
+// match to get wrong (CLAUDE.md: wallpaper/asset names on it are uppercase
+// 8.3, and fat_readdir_inner() reassembles a VFAT LFN verbatim when one
+// exists rather than normalising case). This also matches ls's own stated
+// convention ("every other tool here is byte order in LC_ALL=C") and
+// resolve_program() above, which tries case VARIANTS only when RESOLVING an
+// already-fully-typed name - never when listing what exists, which is what
+// completion does.
+//
+// QUOTING / ROUND-TRIP: this shell has two unrelated argument conventions.
+//   - A BUILTIN (cd, dos, export, ...) gets everything after the verb as ONE
+//     raw string (execute_command()'s `args`) - no quote stripping, no
+//     whitespace splitting (builtin_cd() above never looks for a quote
+//     character, so INSERTING one would become part of the path). Spaces
+//     need no quoting here: the whole remainder is already one argument.
+//   - An EXTERNAL command's argv IS whitespace-split with '"'/'\'' quoting
+//     (the argv_ptrs parser in execute_command(), further down this file).
+//     A completed name containing a space MUST be quoted there or that
+//     tokenizer splits it into two arguments when the line is run.
+// So quoting is only ever applied completing an argument (never word 0 -
+// the verb parser has no quote handling either, so nothing could make a
+// spaced command name invocable regardless) to a command that is NOT a
+// builtin. See term_shell_complete() below for how an already-typed,
+// necessarily-unquoted token gets a quote retroactively opened around it.
+// ============================================================================
+
+#define TERM_COMPLETE_NAME_MAX 64
+#define TERM_COMPLETE_MAX      512
+
+typedef struct {
+    char name[TERM_COMPLETE_NAME_MAX];
+    int  is_dir;
+} term_complete_ent_t;
+
+// qsort() comparator, byte order (see the CASE SENSITIVITY note above) -
+// same convention as term_help_name_cmp() below.
+static int term_complete_cmp(const void *a, const void *b) {
+    return strcmp(((const term_complete_ent_t *)a)->name,
+                  ((const term_complete_ent_t *)b)->name);
+}
+
+static int term_complete_has_char(const char *s, int len, char c) {
+    for (int i = 0; i < len; i++) if (s[i] == c) return 1;
+    return 0;
+}
+
+// List `dirpath`'s entries whose name starts with `prefix` (case-sensitive).
+// Opens exactly one directory and reads it once - never recurses, never
+// touches anything outside `dirpath`, per "do not read the whole
+// filesystem". "." / ".." and any dotfile are skipped, matching
+// term_help_list_apps()'s existing convention just below. No match if the
+// directory does not exist or cannot be opened - that is "no matches",
+// handled the same as any other empty result by the caller.
+static int term_complete_scan_dir(const char *dirpath, const char *prefix,
+                                   term_complete_ent_t *ents, int max) {
+    int n = 0;
+    DIR *d = opendir(dirpath);
+    if (!d) return 0;
+    int plen = 0; while (prefix[plen]) plen++;
+    struct dirent *de;
+    while (n < max && (de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        int i = 0;
+        while (i < plen && de->d_name[i] == prefix[i]) i++;
+        if (i != plen) continue;
+        str_copy(ents[n].name, de->d_name, TERM_COMPLETE_NAME_MAX);
+        ents[n].is_dir = (de->d_type == DT_DIR);
+        n++;
+    }
+    closedir(d);
+    return n;
+}
+
+// List command names starting with `prefix`: the builtins table, then every
+// regular file in each $PATH directory (default "/APPS", the same search
+// list resolve_program() above uses) - exactly what `help`'s live /APPS
+// listing already reads, filtered to a prefix. Deliberately does NOT probe
+// the per-game /GAMES/<NAME>/<NAME>.ELF convention resolve_program() falls
+// back to: that would mean listing every /GAMES subdirectory to complete a
+// command name, which is the whole-filesystem scan this task says not to
+// do. A game still launches fine by typing its full name.
+static int term_complete_scan_commands(const char *prefix,
+                                        term_complete_ent_t *ents, int max) {
+    int n = 0;
+    int plen = 0; while (prefix[plen]) plen++;
+
+    for (int i = 0; i < NUM_BUILTINS && n < max; i++) {
+        const char *nm = g_builtins[i].name;
+        int j = 0; while (j < plen && nm[j] == prefix[j]) j++;
+        if (j != plen) continue;
+        str_copy(ents[n].name, nm, TERM_COMPLETE_NAME_MAX);
+        ents[n].is_dir = 0;
+        n++;
+    }
+
+    const char *path = getenv_local("PATH");
+    if (!path || !path[0]) path = "/APPS";
+    const char *p = path;
+    while (*p && n < max) {
+        const char *start = p;
+        while (*p && *p != ':') p++;
+        int dirlen = (int)(p - start);
+        if (dirlen > 0 && dirlen < 200) {
+            char dirbuf[210];
+            int k = 0; for (; k < dirlen; k++) dirbuf[k] = start[k];
+            dirbuf[k] = '\0';
+            DIR *d = opendir(dirbuf);
+            if (d) {
+                struct dirent *de;
+                while (n < max && (de = readdir(d)) != NULL) {
+                    if (de->d_name[0] == '.') continue;
+                    if (de->d_type == DT_DIR) continue;  // apps are files (term_help_list_apps() convention)
+                    int j = 0; while (j < plen && de->d_name[j] == prefix[j]) j++;
+                    if (j != plen) continue;
+                    int dup = 0;
+                    for (int m = 0; m < n; m++) if (str_eq(ents[m].name, de->d_name)) { dup = 1; break; }
+                    if (dup) continue;
+                    str_copy(ents[n].name, de->d_name, TERM_COMPLETE_NAME_MAX);
+                    ents[n].is_dir = 0;
+                    n++;
+                }
+                closedir(d);
+            }
+        }
+        if (*p == ':') p++;
+    }
+    return n;
+}
+
+// Erase `n` already-echoed characters back off the visible line - the same
+// backspace idiom Backspace / ESC-clear / history recall all use above.
+static void term_complete_erase(int n) {
+    for (int i = 0; i < n; i++) { term_putc('\b'); term_putc(' '); term_putc('\b'); }
+    input_pos -= n;
+    input_line[input_pos] = '\0';
+}
+
+// Append and echo `s`, bounded by the input buffer - the same growth check
+// the printable-character branch in main.c's key handler uses.
+static void term_complete_append(const char *s) {
+    for (int i = 0; s[i] && input_pos < TERM_SHELL_INPUT_MAX - 1; i++) {
+        input_line[input_pos++] = s[i];
+        term_putc(s[i]);
+    }
+    input_line[input_pos] = '\0';
+}
+static void term_complete_append_char(char c) {
+    char s[2] = { c, '\0' };
+    term_complete_append(s);
+}
+
+// Print ents[0..n) in the same sorted, column-major layout as
+// term_help_list_apps() below (`ls -C` convention: down, then across;
+// column width set by the widest match, column count by the live window
+// width in term_cols so it tracks a resize).
+static void term_complete_list(term_complete_ent_t *ents, int n) {
+    qsort(ents, (unsigned long)n, sizeof(ents[0]), term_complete_cmp);
+    int maxlen = 0;
+    for (int i = 0; i < n; i++) {
+        int l = 0; while (ents[i].name[l]) l++;
+        if (ents[i].is_dir) l++;   // the trailing '/' printed below
+        if (l > maxlen) maxlen = l;
+    }
+    int colw = maxlen + 2;
+    int cols = term_cols / colw;
+    if (cols < 1) cols = 1;
+    int rows = (n + cols - 1) / cols;
+    for (int r = 0; r < rows; r++) {
+        for (int c = 0; c < cols; c++) {
+            int idx = c * rows + r;
+            if (idx >= n) continue;
+            term_puts(ents[idx].name);
+            int l = 0; while (ents[idx].name[l]) l++;
+            if (ents[idx].is_dir) { term_puts("/"); l++; }
+            for (int pad = l; pad < colw; pad++) term_puts(" ");
+        }
+        term_puts("\n");
+    }
+}
+
+// The one entry point, wired to GUI_KEY_TAB in main.c.
+void term_shell_complete(void) {
+    input_line[input_pos] = '\0';
+
+    // Word 0 (the verb) boundaries, computed exactly as execute_command()
+    // computes them (a plain scan to the first space - no quote handling,
+    // matching that parser precisely).
+    int vstart = 0;
+    while (input_line[vstart] == ' ') vstart++;
+    int vend = vstart;
+    while (input_line[vend] && input_line[vend] != ' ') vend++;
+
+    static term_complete_ent_t ents[TERM_COMPLETE_MAX];
+    int n;
+    int tok_start;        // start of the WHOLE token/argument (before any '/')
+    int pfx_len;          // length of the CURRENT match component already typed
+    int in_quote = 0;     // 1 if the cursor is inside an unterminated quote
+    char qc = 0;           // which quote character, if in_quote
+    int quote_capable = 0; // may this argument ever need retroactive quoting?
+
+    if (input_pos <= vend) {
+        // Completing the COMMAND at word 0.
+        tok_start = vstart;
+        pfx_len = input_pos - vstart;
+        char prefix[TERM_SHELL_INPUT_MAX];
+        str_copy(prefix, input_line + tok_start, pfx_len + 1);
+        n = term_complete_scan_commands(prefix, ents, TERM_COMPLETE_MAX);
+    } else {
+        char verb[32];
+        int vl = vend - vstart; if (vl > 31) vl = 31;
+        for (int i = 0; i < vl; i++) verb[i] = input_line[vstart + i];
+        verb[vl] = '\0';
+
+        int is_builtin = 0;
+        for (int i = 0; i < NUM_BUILTINS; i++)
+            if (str_eq(verb, g_builtins[i].name)) { is_builtin = 1; break; }
+
+        int arg_start;
+        if (is_builtin) {
+            // One raw argument, exactly what execute_command() hands the
+            // builtin: everything after the verb and its following spaces.
+            arg_start = vend;
+            while (input_line[arg_start] == ' ') arg_start++;
+        } else {
+            // Quote-aware scan for the LAST token, mirroring the argv_ptrs
+            // parser in execute_command() further down this file. The
+            // cursor is always at the end of the buffer (see the header
+            // comment), so "the last token" is always the one under it.
+            int i = vstart;
+            arg_start = input_pos;
+            for (;;) {
+                while (i < input_pos && (input_line[i] == ' ' || input_line[i] == '\t')) i++;
+                if (i >= input_pos) { arg_start = i; in_quote = 0; break; }
+                if (input_line[i] == '"' || input_line[i] == '\'') {
+                    qc = input_line[i]; i++;
+                    int cstart = i;
+                    while (i < input_pos && input_line[i] != qc) i++;
+                    if (i >= input_pos) { arg_start = cstart; in_quote = 1; break; }
+                    i++;   // skip the closing quote; this token is fully closed
+                } else {
+                    int tstart = i;
+                    while (i < input_pos && input_line[i] != ' ' && input_line[i] != '\t') i++;
+                    if (i >= input_pos) { arg_start = tstart; in_quote = 0; break; }
+                }
+            }
+            quote_capable = 1;
+        }
+        tok_start = arg_start;
+
+        // Split the argument typed so far on its LAST '/' into a directory
+        // part and a name prefix.
+        int slash = -1;
+        for (int i = arg_start; i < input_pos; i++) if (input_line[i] == '/') slash = i;
+
+        char absdir[256];
+        int comp_start;
+        if (slash >= 0) {
+            int dl = slash - arg_start; if (dl > 255) dl = 255;
+            char dirpart[256];
+            for (int i = 0; i < dl; i++) dirpart[i] = input_line[arg_start + i];
+            dirpart[dl] = '\0';
+            if (dl == 0) str_copy(dirpart, "/", 256);
+            if (dirpart[0] == '/') str_copy(absdir, dirpart, 256);
+            else make_cwd_path(absdir, dirpart);
+            comp_start = slash + 1;
+        } else {
+            str_copy(absdir, cwd, 256);
+            comp_start = arg_start;
+        }
+
+        pfx_len = input_pos - comp_start;
+        char prefix[TERM_SHELL_INPUT_MAX];
+        str_copy(prefix, input_line + comp_start, pfx_len + 1);
+
+        n = term_complete_scan_dir(absdir, prefix, ents, TERM_COMPLETE_MAX);
+    }
+
+    if (n == 0) return;   // no matches: do nothing visible (no beep, no clear)
+
+    // Longest common byte-prefix across all matches (always >= pfx_len,
+    // since every match agreed with the typed prefix to get into ents[]).
+    int lcp = 0;
+    for (;;) {
+        char c = ents[0].name[lcp];
+        if (!c) break;
+        int agree = 1;
+        for (int k = 1; k < n; k++) if (ents[k].name[lcp] != c) { agree = 0; break; }
+        if (!agree) break;
+        lcp++;
+    }
+    int ext_len = lcp - pfx_len;
+    int unique = (n == 1);
+
+    // Would inserting the extension put an unquoted space into the buffer?
+    // Only asked where quoting is even possible (never word 0, never a
+    // builtin's raw single argument - see the header comment).
+    int need_quote = 0;
+    if (quote_capable && !in_quote && ext_len > 0) {
+        need_quote = term_complete_has_char(ents[0].name, lcp, ' ') ||
+                     term_complete_has_char(ents[0].name, lcp, '\t');
+    }
+
+    char ext[TERM_COMPLETE_NAME_MAX];
+    { int i = 0; for (; i < ext_len; i++) ext[i] = ents[0].name[pfx_len + i]; ext[i] = '\0'; }
+
+    if (need_quote) {
+        // Retroactively wrap the WHOLE token (not just the last path
+        // component) in quotes. Safe to erase-and-reprint unchanged: if the
+        // already-typed text contained a space it could not have reached
+        // here with in_quote == 0 (the argv tokenizer above would already
+        // have split it into two arguments), so dirpart+prefix-so-far is
+        // guaranteed space-free.
+        int already = input_pos - tok_start;
+        char saved[TERM_SHELL_INPUT_MAX];
+        str_copy(saved, input_line + tok_start, already + 1);
+        term_complete_erase(already);
+        qc = '"';
+        term_complete_append_char(qc);
+        term_complete_append(saved);
+        in_quote = 1;   // logically open now, whether or not it gets closed below
+    }
+
+    if (ext_len > 0) term_complete_append(ext);
+
+    if (unique) {
+        if (ents[0].is_dir) {
+            // Trailing separator so the next Tab continues into it. Any
+            // open quote (pre-existing or just opened above) is left open
+            // on purpose: closing it here would stop a second Tab from
+            // completing further inside the directory.
+            term_complete_append_char('/');
+        } else {
+            if (in_quote) term_complete_append_char(qc);
+            term_complete_append_char(' ');
+        }
+    } else if (n > 1) {
+        // Multiple matches: list them, then redraw the prompt with
+        // whatever the user had typed (now extended to the common prefix
+        // above) - term_begin_output()/term_end_output() (term_util.c) is
+        // the SAME primitive term_menu.c's Help rows use for exactly this
+        // "write into the pane, then restore the live prompt" shape.
+        term_begin_output();
+        term_complete_list(ents, n);
+        term_end_output();
+    }
+}
+
 static void builtin_clear(const char *args) {
     (void)args;
     term_clear();

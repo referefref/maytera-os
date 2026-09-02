@@ -143,6 +143,14 @@ void smp_send_reschedule_all(void);
 void smp_tlb_shootdown(uint64_t virt_addr);
 
 // Send halt IPI to all CPUs (for panic)
+// #75: stop every OTHER core before a panic finishes. Returns the number that
+// acknowledged; *expected receives the number that should have. A core running
+// with IF=0 cannot take the IPI and is counted in expected but not in the
+// return, which is the difference between a frozen machine and a moving one.
+uint32_t smp_panic_stop_others(uint32_t *expected);
+void bkl_snapshot(uint32_t *word, int32_t *owner, uint32_t *depth);  // #75 fault dump
+int  smp_panic_stopping(void);   // #75: a panic stop-the-world is in progress
+void smp_panic_stop_ack(void);   // #75: terminal ack + halt (never returns)
 void smp_halt_all(void);
 
 // ============================================================================

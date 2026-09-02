@@ -51,6 +51,45 @@ struct window;
 // exists to cut. At most one window holds this at a time; see g_fullscreen_win.
 #define WINDOW_FLAG_FULLSCREEN  (1 << 11)
 
+// #198v2 (2026-08-29): the wizard's power-corner Restart/Shut Down icons sit
+// over the desktop wallpaper via a win_create_bg()+win_set_nochrome_bg()
+// panel that must NEVER take keyboard focus (focus=0 at create time is only
+// half the guarantee - see the SYS_WIN_SET_NOCHROME_BG comment in syscall.c).
+// wm_handle_mouse_down() used to call window_set_focus() unconditionally for
+// ANY clicked window, NOCHROME or not, so a single click on the power corner
+// silently made it wm_state.focused_window, and the next F11 press then
+// maximised it (the user's exact reported bug: "pressing f11 maximises the
+// box holding the restart and shutdown buttons"). This flag is checked in
+// window_set_focus() itself - the ONE chokepoint every focus change already
+// passes through (its own pre-existing comment says so, for #158) - so
+// EVERY path that could focus a window (click, alt-tab, taskbar, a new
+// window stealing focus) is covered by one guard, not one per call site.
+// Set/cleared by sys_win_set_nochrome_impl() in lockstep with its own
+// `focus` argument: SYS_WIN_SET_NOCHROME_BG (focus=0) sets it,
+// SYS_WIN_SET_NOCHROME (focus=1) clears it, so a window that later legitimately
+// asks to become interactive (e.g. aichat's DOCK_COLLAPSED -> DOCK_OPEN) is
+// not left stuck unfocusable.
+#define WINDOW_FLAG_NO_FOCUS     (1 << 12)
+
+// #198v2: this window's content_buffer carries REAL per-pixel alpha in the
+// top byte of every BGRA word (0 = fully transparent, 255 = fully opaque),
+// rather than that byte being unused/ignored. Set via SYS_WIN_SET_ALPHA_CONTENT.
+// The blit path (user_window_draw_handler, kernel/proc/syscall.c) already had
+// a per-pixel fb_get_pixel()/fb_put_pixel() blend loop for uniform per-WINDOW
+// opacity (win->opacity < 255) - this flag routes into that SAME loop with a
+// PER-PIXEL alpha instead of (or combined with) the uniform one, so a window
+// can be mostly transparent with only a few real, antialiased opaque pixels
+// (a glyph, a shadow) genuinely blended against whatever is really drawn
+// underneath (wallpaper, desktop icons, widgets) at COMPOSITE time - not
+// against a caller-guessed background color the way every prior userland
+// antialiasing approximation in this tree had to (see pwr_draw_mico()'s
+// history in userland/apps/setup/main.rs and gui_fill_rounded_aa's own
+// documented limitation). THIS IS THE FIRST CALLER; any future app drawing
+// an antialiased overlay directly on the desktop (icon, cursor decoration,
+// notification glow) should use this instead of re-deriving the same
+// "no destination read-back" workaround.
+#define WINDOW_FLAG_ALPHA_CONTENT (1 << 13)
+
 // Default window flags
 #define WINDOW_FLAGS_DEFAULT (WINDOW_FLAG_VISIBLE | WINDOW_FLAG_MOVABLE | WINDOW_FLAG_CLOSABLE)
 

@@ -21,14 +21,16 @@ hardware and in virtual machines.
 
 ![MayteraOS desktop](screenshots/desktop-clean.png)
 
-**This repository: version 2.0.2, kernel build 2246.** The build number is
-stamped by the build system rather than stored in the source, so
-`kernel/version.h` in this tree reads `2213`. Treat that as a floor, not as a
-contradiction: the image built from this exact source is stamped 2246, and the
-build system takes `max(build-state, version.h) + 1`. Where this README says
-"fixed in build 2246", the checkable form is the source files named beside each
-fix. The most recent published binary release is `v1.95.0-b851`, which is much
-older than the source here. See Releases below.
+**This repository: version 2.0.2, kernel build 2285**, and the published
+release `v2.0.2-b2285` is built from **this** source, so for the first time the
+number in `kernel/version.h` and the number stamped on the downloadable image
+are the same one. Earlier releases did not have that property: the internal
+build system stamps `max(build-state, version.h) + 1`, so a README that said
+"fixed in build 2246" against a tree reading `2213` was correct and looked like
+a contradiction. That gap is closed here by building the release from the
+published source rather than from an internal golden. Where this README names a
+build number, the checkable form is still the source files named beside each
+fix. See Releases below.
 
 ## Screenshots
 
@@ -156,12 +158,12 @@ it. If you are running anything older than build 2246, these are live:
   with the pixel colour predicted in advance. Every row is now copied through
   `copy_from_user()`.
 
-**Known regression in this snapshot, stated rather than left to be found.** The
-`sys_win_blit()` fix above introduced a scaling fault: full-screen and maximised
-windows scale incorrectly. It is a rendering defect with no security
-consequence, and a fix is in progress and will land as a follow-up commit. The
-security fix is worth shipping ahead of it; the cosmetic cost is not worth
-hiding.
+**The scaling regression the previous snapshot warned about is fixed here.**
+The `sys_win_blit()` hardening above cost enough throughput that full-screen and
+maximised windows stopped scaling their contents. The scaled path now batches
+its row bounces instead of copying row by row, which restores the throughput
+without giving back the bounds check. The security fix and the rendering fix are
+both in this tree.
 
 **Explicitly NOT implemented. Do not assume otherwise:**
 
@@ -232,17 +234,35 @@ is absent from your tree is reported as skipped and the build carries on. An
 earlier revision ran step 4 (DOOM) unconditionally under `set -e`, which meant a
 missing port directory killed the whole build before any app was built.
 
-**Not everything builds from a clean clone.** `userland/apps` holds 154 app
-directories in this release, 153 of them with a Makefile (`reloctest` has
-none). The last measured figure, exactly two failures out of 145 apps on Debian
-12 with gcc 12 and rustc 1.97.0, was taken on the build that produced the
-*previous* release and has not been re-measured for build 1862. Treat the table
-below as carried over rather than as a fresh measurement:
+**Not everything builds from a clean clone, and this time the numbers are a
+fresh measurement rather than a carried-over one.** Measured on Debian 12 with
+gcc 12.2.0 and rustc 1.97.0, building exactly what you get from
+`git clone` plus `./build.sh --all-apps`:
 
-| App | Why |
+- The kernel, the UEFI bootloader, `userland/libc` and `userland/libgl` all
+  build.
+- `userland/apps` holds 185 app directories, 184 of them with a Makefile
+  (`reloctest` has none). **181 of those 184 build. Three do not**, listed
+  below with the actual reason.
+- Those 184 directories produce **184 app binaries**, because some directories
+  build more than one executable (test helpers alongside the app itself).
+
+| App | Why it does not build |
 |---|---|
-| `browser` | Needs a NetSurf port and a Duktape build that are not in this repository. Its Makefile leaves `NS` and `DUK` set to a literal `<workspace>` placeholder, so it cannot build from a clean clone. Three of its port helper scripts (`port/netsurf/build-all.sh`, `port/netsurf/cc.sh`, `port/netsurf/recompile.sh`) carry the same placeholder in a shell assignment and do not parse. Known gap. |
-| `ipc_test` | Previously failed on a missing `-isystem` flag. That flag is present in its Makefile in this release, so this row may be stale; it has not been re-measured. |
+| `browser` | Needs a NetSurf port and a Duktape build that are not in this repository. Its Makefile leaves `NS` and `DUK` set to a literal `<workspace>` placeholder, and three of its port helper scripts carry the same placeholder in a shell assignment and do not parse. Known gap, not a regression. |
+| `classicube` | Ships only the MayteraOS platform layer, deliberately. The upstream engine is fetched, not vendored: run `userland/apps/classicube/fetch-upstream.sh all` to populate `vendor/` first, as `PORT-STATUS.md` says. The build stops with "ClassiCube engine source not found". |
+| `ipc_test` | Genuinely broken, and the previous README's guess that this row was stale is now measured and wrong. It fails at link with `undefined reference to shm_info` and `undefined reference to msg_channel_info`: the test calls two libc entry points that no longer exist. |
+
+**A build defect that this release fixes, recorded because it bit exactly the
+apps a new user would try first.** `userland/ports/mports.sh` captures `make`
+output into a variable that becomes `CFLAGS`. `-C` turns on make's "Entering
+directory" messages and `-s` normally suppresses them again, but `MAKEFLAGS`
+inherited from a parent make overrides the local `-s`. So the call was clean
+when a person ran `mports.sh` by hand and polluted when `./build.sh` reached it
+through `make -C userland/apps/terminal`, at which point every word of
+`make: Entering directory ...` was handed to gcc as an input filename. Eight
+apps failed only for that reason, `terminal` among them. The fix is
+`--no-print-directory` on that one call.
 
 `stage-disk.sh` installs whatever ELF executables it finds, so an app that
 failed to build is simply absent from the image rather than silently replaced
@@ -313,17 +333,68 @@ Font License requires.
 Bootable images are published under this repository's
 [Releases](https://github.com/referefref/maytera-os/releases).
 
-The current release is `v1.95.0-b851`, a roughly 512 MB hybrid ISO built from a
-clean clone on a freshly created filesystem, which its release notes describe
-as carrying 119 native applications. It is **older than the source in this
-repository**: build 851 against build 1862 here. Build from source if you want
-what this README describes.
+The current release is **`v2.0.2-b2285`**, and it is built from the source in
+this repository at the commit it is tagged on, on a filesystem created empty for
+the purpose. Nothing is copied out of a development machine's disk image, so
+there is nothing to scrub: the image contains only the bootloader, the kernel,
+the userland binaries built from this tree, the `disk/` template, and
+open-licensed fonts with their licence text.
+
+A fresh image has **no user accounts**. It boots to first-run account creation
+and asks you to choose an administrator username and password. There are no
+default credentials to change, because none are shipped.
+
+### Two files, and which one you want
+
+| Asset | Use it when |
+|---|---|
+| `maytera-os-v2.0.2-b2285.img.gz` | You are writing to a USB stick or attaching a disk to a VM. This is the smaller download and the one to prefer. |
+| `maytera-os-v2.0.2-b2285.iso` | Your tool wants a `.iso`. It is the same image, uncompressed, with an ISO9660 wrapper so that writers which insist on the extension will accept it. |
+
+**Read this before you reach for the ISO: MayteraOS cannot boot from a CD or a
+DVD, real or virtual.** The `.iso` is a hybrid image and it boots the same way
+the `.img` does, by being written to a disk. Attaching it to a virtual **CD-ROM**
+drive will not work. This is not a packaging accident, it is a missing driver
+and a missing filesystem, and both are checkable in this tree:
+
+- `kernel/drivers/ata.c` identifies an ATAPI device but has no packet-read
+  (`0xA8`) path, and `kernel/drivers/ahci.c` records a SATAPI port as present
+  and says in as many words that it does not drive it. So there is no way to
+  read blocks off an optical device.
+- There is no ISO9660 filesystem under `kernel/fs/`. The ISO9660 parser that
+  does exist, `kernel/rustkern/iso9660.rs`, is reached only from `kernel/dos/`
+  and serves CD images mounted **for a DOS guest**. It is not a root
+  filesystem and is not on any boot path.
+
+A kernel booted from optical media therefore comes up with no root filesystem,
+no login and no desktop. Publishing a `.iso` that implies otherwise would be
+worse than publishing none, so the limitation is stated here rather than left
+for you to discover.
+
+### How to boot it
+
+```sh
+# USB stick. This DESTROYS the target disk. Check the device name twice.
+gunzip -c maytera-os-v2.0.2-b2285.img.gz | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress
+
+# Or attach it to a VM as a DISK (not a CD-ROM), with UEFI firmware:
+qemu-system-x86_64 -machine pc -cpu kvm64 -m 2G \
+    -bios /usr/share/OVMF/OVMF_CODE.fd \
+    -drive file=maytera-os-v2.0.2-b2285.img,format=raw,if=ide \
+    -serial stdio
+```
+
+Use `-cpu kvm64`, not `-cpu host`. AVX crashes the compositor.
 
 ### Verify what you downloaded
 
+Every release publishes a `SHA256SUMS` asset next to the images. Check it before
+you write anything to a disk:
+
 ```sh
-sha256sum maytera-os.iso
+sha256sum -c SHA256SUMS --ignore-missing
 ```
 
-The expected checksum is published in the release notes. Check it before you
-write the image to anything.
+The checksums are deliberately not repeated in this README. A hash copied into
+prose is a hash that goes stale silently on the next release; `SHA256SUMS` is
+generated from the artifacts themselves.

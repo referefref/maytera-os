@@ -972,8 +972,16 @@ uint64_t vmm_clone_user_space_cow(uint64_t src_pml4_phys) {
     // Without this the parent keeps a stale writable TLB entry, writes its
     // fork() return value straight into the still-shared page, and the child
     // then reads a NON-ZERO fork() return (runs the parent branch). #429.
+    // #404: and every OTHER core too. A CLONE_VM thread of this same parent can
+    // be running on another CPU right now (proc_clone() gives it a shared cr3),
+    // and it holds exactly the writable entries this loop has just demoted. A
+    // BSP-local flush leaves that peer writing into a page the child now shares,
+    // which is the #429 failure again with one more core in it.
     if (parent_pte_changed) {
-        vmm_flush_tlb();
+        extern uint32_t smp_get_online_count(void);
+        extern void tlb_flush_all(void);
+        if (smp_get_online_count() > 1) tlb_flush_all();
+        else                            vmm_flush_tlb();
     }
     return dst_pml4_phys;
 
@@ -1001,6 +1009,27 @@ void vmm_destroy_user_space(uint64_t pml4_phys) {
     // free page-table structures this address space actually OWNS: a PDPT slot
     // is owned when its value differs from the reference address space.
     uint64_t *ref_pml4 = (uint64_t*)current_pml4_phys;
+
+    // #404: STOP THE WORLD'S TLBs BEFORE THE FIRST pmm_free_page().
+    //
+    // This is the worst case in the whole shootdown audit, and it is worse than
+    // the leaf case. Below, this function frees not only the user data frames
+    // but the PAGE-TABLE PAGES THEMSELVES (the PTs, the PDs, the PDPTs and the
+    // PML4). A peer core that has cached any part of a walk through those tables
+    // keeps using it after the frames have been handed to another allocation,
+    // so the corruption is not "a stale data page" but "a stale translation
+    // built from a page table that is now somebody else's heap".
+    //
+    // The guard above (pml4_phys == current_pml4_phys) only proves THIS core is
+    // not running this address space. It says nothing about the other three,
+    // and a CLONE_VM sibling shares this exact cr3 by design. So flush
+    // everything everywhere, once, before anything is freed. This happens on
+    // process teardown, not in a hot path.
+    {
+        extern uint32_t smp_get_online_count(void);
+        extern void tlb_flush_all(void);
+        if (smp_get_online_count() > 1) tlb_flush_all();
+    }
 
     // Free user space pages only (lower half, entries 0-255)
     for (int i = 0; i < 256; i++) {
@@ -1096,6 +1125,7 @@ void vmm_destroy_user_space(uint64_t pml4_phys) {
     pmm_free_page(pml4_phys);
 }
 
+
 // Map a page in a specific address space
 
 // #522/#629: TLB-flush liveness test. `current_pml4_phys` is a SOFTWARE SHADOW
@@ -1110,7 +1140,57 @@ static inline int vmm_space_is_live(uint64_t pml4_phys) {
     return pml4_phys == (read_cr3() & VMM_ADDR_MASK) || pml4_phys == current_pml4_phys;
 }
 
+// ---------------------------------------------------------------------------
+// #404: CROSS-CPU INVALIDATION HELPERS.
+//
+// vmm_space_is_live() above answers "is the table I just edited the one THIS
+// core is running on". That question was sufficient for exactly as long as
+// there was only ever one core. It encodes two assumptions that a second
+// scheduling core destroys: that "not live here" implies no CPU holds a TLB
+// entry for it, and that "live here" implies this CPU is the only holder.
+// Neither survives CLONE_VM threads (process.c gives them a SHARED cr3) or a
+// process migrating between cores.
+//
+// So these helpers keep the old test as the SINGLE-CORE path, byte for byte,
+// and take the conservative broadcast path only once a second CPU is actually
+// online. cpus_online is 1 until an AP really comes up, so the shipping
+// one-core configuration pays exactly one predicted branch and never sends an
+// IPI, never takes a lock and never spins.
+//
+// The broadcast is unconditional in the multi-core case, deliberately: without
+// a per-mm CPU mask (this kernel has none, and mm_struct_t has no field for
+// one) the only safe answer to "which cores might have cached this" is "any of
+// them". Over-invalidation costs a TLB miss; under-invalidation costs a frame
+// that a peer keeps writing into after it has been reallocated, which is
+// silent corruption. That is a trade with only one correct side.
+static void vmm_tlb_page(uint64_t pml4_phys, uint64_t virt_addr) {
+    extern uint32_t smp_get_online_count(void);
+    extern void tlb_flush_page(uint64_t);
+    if (smp_get_online_count() > 1) { tlb_flush_page(virt_addr); return; }
+    if (vmm_space_is_live(pml4_phys)) vmm_invlpg(virt_addr);
+}
+
+// Used where a LARGE leaf was created, split or cleared. INVLPG is documented
+// to retire a large-page entry too, but the whole-TLB form removes the question
+// entirely, and every caller of this is a rare structural change, never a hot
+// path. If it is ever measured to matter, narrow it then and say so.
+static void vmm_tlb_full_all_cpus(void) {
+    extern uint32_t smp_get_online_count(void);
+    extern void tlb_flush_all(void);
+    if (smp_get_online_count() > 1) { tlb_flush_all(); return; }
+    vmm_flush_tlb();
+}
+
+// Range form, for loops that unmap many pages before anything is freed. One
+// acknowledgement round trip instead of one per page.
+static void vmm_tlb_range_all_cpus(uint64_t start, uint64_t end) {
+    extern uint32_t smp_get_online_count(void);
+    extern void tlb_flush_range(uint64_t, uint64_t);
+    if (smp_get_online_count() > 1) tlb_flush_range(start, end);
+}
+
 int vmm_map_page_in(uint64_t pml4_phys, uint64_t virt_addr, uint64_t phys_addr, uint64_t flags) {
+    int did_split = 0;   // #404: set when a live 2MB leaf is broken up below
     // #640 leg 4 step 2: NXE guard, at the ONE place every mapping passes.
     // Bit 63 is the NX bit only while EFER.NXE is set; with NXE clear it is a
     // RESERVED bit, and a PTE with a reserved bit set raises a reserved-bit
@@ -1158,6 +1238,7 @@ int vmm_map_page_in(uint64_t pml4_phys, uint64_t virt_addr, uint64_t phys_addr, 
             pt_new[j] = (huge_phys + j * 4096) | huge_flags | VMM_FLAG_PRESENT;
         }
         pd[pd_idx] = pt_phys | VMM_FLAG_PRESENT | VMM_FLAG_WRITABLE | (flags & VMM_FLAG_USER);
+        did_split = 1;   // #404: a live 2MB leaf just became a table pointer
     }
     uint64_t *pt = vmm_get_or_create_entry_in(pd, pd_idx, flags);
     if (!pt) { kprintf("[VMM] Failed at PT creation, pd_idx=%d\n", (int)pd_idx); return -1; }
@@ -1167,10 +1248,15 @@ int vmm_map_page_in(uint64_t pml4_phys, uint64_t virt_addr, uint64_t phys_addr, 
     uint64_t pt_idx = VMM_PT_INDEX(virt_addr);
     pt[pt_idx] = phys_addr | flags | VMM_FLAG_PRESENT;
 
-    // Invalidate TLB if this is the current address space
-    if (vmm_space_is_live(pml4_phys)) {
-        vmm_invlpg(virt_addr);
-    }
+    // #404: THE SINGLE HOTTEST DOWNGRADE SITE IN THE KERNEL. The store above is
+    // an UNCONDITIONAL overwrite of whatever was there, so it can change the
+    // frame or drop WRITABLE on an entry that is present right now. Every
+    // permission change in the tree reaches this line: vmm_protect_user_range(),
+    // vma_reprotect_pages() (mprotect), pte_mark_cow(), pte_mark_swapped() and
+    // demand_cow_write(). Invalidating only this core was correct while only
+    // this core existed.
+    if (did_split) vmm_tlb_full_all_cpus();
+    else           vmm_tlb_page(pml4_phys, virt_addr);
 
     return 0;
 }
@@ -1193,17 +1279,25 @@ void vmm_unmap_page_in(uint64_t pml4_phys, uint64_t virt_addr) {
     uint64_t pd_idx = VMM_PD_INDEX(virt_addr);
     if (!(pd[pd_idx] & VMM_FLAG_PRESENT)) return;
 
+    int cleared_huge = 0;
     if (pd[pd_idx] & VMM_FLAG_HUGE) {
         pd[pd_idx] = 0;
+        cleared_huge = 1;
     } else {
         uint64_t *pt = (uint64_t*)(pd[pd_idx] & VMM_ADDR_MASK);
         uint64_t pt_idx = VMM_PT_INDEX(virt_addr);
         pt[pt_idx] = 0;
     }
 
-    if (vmm_space_is_live(pml4_phys)) {
-        vmm_invlpg(virt_addr);
-    }
+    // #404: PRESENT -> NOT PRESENT, and this is the one that corrupts rather
+    // than faults. vma_teardown_pages() (mm/demand.c) calls this and then
+    // IMMEDIATELY returns the frame to the PMM; a peer core still holding a
+    // stale writable entry then writes through it into whatever that frame is
+    // reallocated to. Nothing traps, nothing logs, and the damage lands in an
+    // unrelated allocation. This shootdown must complete BEFORE this function
+    // returns, which is why the acknowledgement is not optional.
+    if (cleared_huge) vmm_tlb_full_all_cpus();
+    else              vmm_tlb_page(pml4_phys, virt_addr);
 }
 
 // Get physical address in a specific address space
@@ -1352,6 +1446,8 @@ void vmm_punch_demand_range(uint64_t pml4_phys, uint64_t start, uint64_t len) {
     if (end <= va) return;   // overflow / bogus range: do nothing
 
     uint64_t *pml4 = (uint64_t*)pml4_phys;
+    const uint64_t first_va = va;   // #404: batch the shootdown over the range
+    int punched = 0;
 
     for (; va < end; va += VMM_PAGE_SIZE_4K) {
         uint64_t pml4_idx = VMM_PML4_INDEX(va);
@@ -1390,8 +1486,17 @@ void vmm_punch_demand_range(uint64_t pml4_phys, uint64_t start, uint64_t len) {
         if ((e & VMM_FLAG_PRESENT) && !(e & VMM_FLAG_USER)) {
             pt[pt_idx] = 0;
             if (vmm_space_is_live(pml4_phys)) vmm_invlpg(va);
+            punched = 1;
         }
     }
+    // #404: ONE cross-CPU round trip for the whole range rather than one per
+    // page. Safe to defer to here precisely because this function frees NOTHING
+    // back to the PMM (the frames it drops are identity backing that stays
+    // owned); no peer can be handed a frame this loop released, so the only
+    // requirement is that no stale entry survives the RETURN from this call.
+    // Where a frame IS freed, as in vmm_unmap_page_in(), the shootdown is
+    // per-page and synchronous, and it has to be.
+    if (punched) vmm_tlb_range_all_cpus(first_va, end);
 }
 
 // Allocate and map user pages at a virtual address
@@ -1922,6 +2027,17 @@ int64_t vmm_set_memtype_range(uint64_t pml4_phys, uint64_t virt_addr,
         } else {
             vmm_flush_tlb();
         }
+    }
+
+    // #404: cacheability is a property of a TRANSLATION, so a peer core holding
+    // a stale entry keeps using the OLD memory type for the range. Getting that
+    // wrong on an MMIO / write-combining range is not a performance question,
+    // it is wrong data. One whole-TLB shootdown for the whole call: this runs
+    // at PAT setup and on framebuffer/device range changes, never in a loop.
+    {
+        extern uint32_t smp_get_online_count(void);
+        extern void tlb_flush_all(void);
+        if (done && smp_get_online_count() > 1) tlb_flush_all();
     }
 
     VMM_MEMTYPE_UNWIND();

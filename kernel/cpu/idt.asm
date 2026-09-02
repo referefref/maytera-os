@@ -8,6 +8,8 @@ section .text
 
 ; External C handler
 extern isr_handler
+extern tlb_ipi_handler          ; #404: the TLB shootdown receiver (mm/tlbflush.c)
+extern bkl_wake_ipi_handler     ; #smpfix: the BKL parked-waiter wake (cpu/smp.c)
 
 ; Export functions
 global idt_load
@@ -30,6 +32,9 @@ global irq8, irq9, irq10, irq11, irq12, irq13, irq14, irq15
 ; Export syscall stub
 global isr128
 global irq_smp_wake
+global irq_smp_stop
+global irq_smp_tlb
+global irq_bkl_wake
 global irq_hda_msi
 global irq_xhci_msi
 global irq_tick_redundant
@@ -128,6 +133,18 @@ irq_smp_wake:
     push qword 240      ; Interrupt number
     jmp isr_common
 
+; #75: SMP panic STOP IPI (vector 0xF3 / 243, IPI_VECTOR_STOP in cpu/apic.h).
+; A gate for this vector NEVER EXISTED. cpu/smp.c's smp_halt_all() broadcast it
+; anyway (with zero callers), and cpu/smp.c's own audit comment records that
+; delivering it to a live AP would hit a not-present IDT entry and raise #GP.
+; MEASURED 2026-08-29: registering only the C handler, with no stub and no gate,
+; stopped 0 of 3 other cores. A receiver is a gate plus a stub, never one of the
+; two. See smp_stop_handler().
+irq_smp_stop:
+    push qword 0        ; Dummy error code
+    push qword 243      ; Interrupt number
+    jmp isr_common
+
 ; #71: Intel HDA MSI vector (0x50 / 80). MSI is delivered straight to the
 ; Local APIC (bypasses the 8259 PIC / IOAPIC entirely), so this needs its own
 ; gate just like the SMP wake IPI above rather than one of the legacy IRQ0-15
@@ -172,6 +189,96 @@ irq_ap_tick:
     push qword 0        ; Dummy error code
     push qword 0x42     ; Interrupt number
     jmp isr_common
+
+; ---------------------------------------------------------------------------
+; #404: TLB SHOOTDOWN IPI (vector 0xF2 / 242, IPI_VECTOR_TLB in cpu/apic.h).
+;
+; THIS ONE DELIBERATELY DOES NOT "jmp isr_common", AND THAT IS THE WHOLE POINT.
+; isr_common calls isr_handler (cpu/idt.c), which calls bkl_acquire() BEFORE it
+; dispatches to any registered C handler whenever g_smp_bkl_full is set. A
+; shootdown IPI arriving at a core that is currently spinning for the Big Kernel
+; Lock would therefore block inside that wrapper and never reach the handler,
+; while the core that SENT it (which may itself hold the BKL) spins for an
+; acknowledgement that can never arrive. That is an unconditional deadlock, and
+; it is the reason this vector gets its own stub rather than the shared one.
+;
+; It is also, very probably, the mechanism behind the #75 result recorded as
+; unexplained ("1 of 3 cores stopped"): the first core to take the stop IPI
+; acquires the BKL inside the wrapper and then halts while holding it
+; (smp_panic_stop_ack never returns), after which every other core stop-IPI
+; handler blocks in bkl_acquire(). Same wrapper, same shape.
+;
+; So this stub saves only the SysV caller-saved registers, calls a handler that
+; takes no lock of any kind, and IRETQs. It keeps the two #645 entry hardenings
+; (CLD, and CLAC when SMAP is live) because those are properties of an IDT gate,
+; not of isr_common.
+irq_smp_tlb:
+    cld
+    cmp byte [rel g_smap_active], 0
+    je .tlb_smap_inert
+    clac
+.tlb_smap_inert:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    call tlb_ipi_handler
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    iretq
+
+; #smpfix (#67/#168): BKL WAKE IPI (vector 0xF4).
+;
+; This stub must NOT jmp to isr_common, and that is the whole reason it exists.
+; isr_common reaches isr_handler(), which wraps EVERY handler in bkl_acquire().
+; Waking a core that is parked waiting for the BKL with a handler that itself
+; acquires the BKL is circular: the woken core takes the interrupt, contends
+; again from inside the handler, and nests. cpu/smp.c already records exactly
+; that failure for broadcast wakes on vector 0xF0 - "a single BKL hold of
+; 2,886,374 us attributed to vector 0xF0 ... alongside 111,884,639 spin
+; iterations in one window" - a nest driven by IPIs arriving faster than it
+; unwound. Same shape and same reason as irq_smp_tlb above.
+;
+; The handler does the minimum a wake needs: acknowledge the Local APIC and
+; return. The work is done by the HLT ending, not by anything in here.
+irq_bkl_wake:
+    cld
+    cmp byte [rel g_smap_active], 0
+    je .bklw_smap_inert
+    clac
+.bklw_smap_inert:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    push r8
+    push r9
+    push r10
+    push r11
+    call bkl_wake_ipi_handler
+    pop r11
+    pop r10
+    pop r9
+    pop r8
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    iretq
 
 ; Common ISR handler
 ;

@@ -162,6 +162,11 @@ const _: () = assert!(core::mem::size_of::<WpEntry>() == 80);
 // ---------------------------------------------------------------------------
 const SYS_EXIT: i64 = 0;
 const SYS_WIN_CREATE: i64 = 30;
+// #198: second window for the bottom-right power corner (docs/
+// WIZARD_POWER_CORNER.html section 1). Read out of libc/syscall.h (393),
+// same number win_create_bg() there wraps - not guessed, per this file's own
+// standing rule for every SYS_* constant it keeps a private copy of.
+const SYS_WIN_CREATE_BG: i64 = 393;
 const SYS_WIN_DESTROY: i64 = 31;
 const SYS_WIN_DRAW_RECT: i64 = 32;
 const SYS_WIN_GET_EVENT: i64 = 36;
@@ -208,17 +213,32 @@ const SYS_FIRSTBOOT_ADMIN: i64 = 370;
 // open(O_CREAT) under /CONFIG, and /CONFIG is root-owned 0711 because it holds
 // SHADOW, AUTHKEYS, SSHD.CFG and the owner's API keys. Since #226 removed
 // autologin=root the wizard runs as the session user, so all four writes were
-// refused - including skip_to_desktop()'s, which is the ONLY way out of a step
-// that fails while the desktop chrome is gated off. See
-// kernel/rustkern/firstrun.rs.
+// refused. See kernel/rustkern/firstrun.rs.
 //
-// FR_SKIP_* and FR_HANDOVER_SET ALWAYS RETURN 0. They are bits of kernel RAM,
-// not a filesystem. Do not write a caller that gives up when one "fails": that
-// exact shape is what made the escape hatch share a failure mode with the
-// thing it existed to escape.
+// FR_HANDOVER_SET ALWAYS RETURNS 0. It is a bit of kernel RAM, not a
+// filesystem. Do not write a caller that gives up when it "fails": that exact
+// shape is what made the old #136 escape hatch (below) share a failure mode
+// with the thing it existed to escape.
+//
+// #136 REMOVED (owner request, verbatim, 2026-08-28: "remove the skip to
+// desktop option since it no longer makes sense"). FR_SKIP_SET and
+// skip_to_desktop() are gone from this file. Checked before removing, not
+// assumed safe: this control stopped being a real escape hatch at #228 (it
+// already redirected to flow_error_page() instead of reaching a desktop with
+// no account), and after an account exists the actual, robust escape is
+// skip_link_bounds()/SKIP_LABEL/skip() (F10, page_skippable() pages,
+// including Network with no working link - its default is DHCP, not a live
+// connectivity check) which runs apply() and writes /CONFIG/SETUPDONE. This
+// control instead quit WITHOUT marking the wizard done, so it silently
+// reappeared next boot. tools/dos-harness/dosharness.py's --skip-oobe is a
+// different mechanism entirely (writes /CONFIG/SETUPDONE + SETUPUSR to the
+// filesystem before the guest boots) and never called FR_SKIP_SET, so it is
+// unaffected. The kernel-side FR_SKIP_SET/GET/CLEAR primitives
+// (kernel/rustkern/firstrun.rs) and the compositor's own read of
+// FR_SKIP_GET (userland/apps/compositor/main.c) are left in place, unused -
+// kernel-side plumbing with its own self-tests, not this file's to remove.
 const SYS_FIRSTRUN: i64 = 397;
 const FR_MARK_DONE: i64 = 0;
-const FR_SKIP_SET: i64 = 1;
 const FR_HANDOVER_SET: i64 = 4;
 // #OOBEAUTH (2026-08-23): -> 1 iff THIS session may call SYS_FIRSTBOOT_ADMIN
 // right now (see machine_admin() below and firstboot_bootstrap_ok_rs() in
@@ -261,6 +281,47 @@ const SYS_UPTIME_MS: i64 = 252;          // monotonic ms since boot
 // this is that same existing power path, not a new one.
 const SYS_POWEROFF: i64 = 206;
 const SYS_REBOOT: i64 = 207;
+// #198: live theme access for the power-corner window - "OS furniture" like
+// the taskbar/volume OSD, so it reads the shared theme table instead of the
+// wizard's own bespoke WEL_BG_*/glass palette. Both numbers and every color
+// id below were grepped out of kernel/gui/theme.h and libc/syscall.h, not
+// guessed (docs/WIZARD_POWER_CORNER.html section 4). theme_id -1 means "the
+// active theme", same convention userland/apps/taskmanager/main.rs's own
+// theme_color() and libc/theme.h's theme_metric() both already use.
+const SYS_THEME_COLOR: i64 = 290;
+const SYS_THEME_METRIC: i64 = 357;
+const THEME_COLOR_BUTTON_FACE: i64 = 14;
+const THEME_COLOR_BUTTON_LIGHT: i64 = 15;
+// THEME_COLOR_BUTTON_SHADOW (id 16) intentionally not declared here: review
+// flagged it as dead code (#198 follow-up). kernel/gui/themes.c's
+// theme_color() switch returns t->button_border for BOTH case 16 (SHADOW)
+// and case 17 (DARK, declared below) - there is no separate underlying
+// value, so a THEME_COLOR_BUTTON_SHADOW const would just be a second name
+// for THEME_COLOR_BUTTON_DARK with no distinct use.
+const THEME_COLOR_BUTTON_DARK: i64 = 17;
+const THEME_COLOR_BUTTON_TEXT: i64 = 18;
+// Best-effort AA blend target for the rounded power-corner panel's outer
+// edge, which sits over an arbitrary desktop wallpaper rather than a known
+// app surface - see pwr_draw()'s own comment for why this is a bounded
+// approximation, not a read-back.
+const THEME_COLOR_DESKTOP_BG: i64 = 28;
+const THEME_METRIC_CORNER_RADIUS: i64 = 7;
+// #198v2: pwr_theme_color()/pwr_theme_metric() were removed here - the v2
+// no-box glyph-on-photograph treatment is deliberately theme-INVARIANT (pure
+// white glyph, pure black halo, per the owner's explicit request), so the
+// power corner no longer reads theme button colors/radius at all. The
+// THEME_COLOR_BUTTON_*/THEME_METRIC_CORNER_RADIUS constants above are left
+// in place as documentation of the v1 design's now-retired dependency, not
+// because anything still calls them.
+// #198: bootlog line at the corner window's click handler, mirroring the
+// exact precedent lockscreen.c ("compositor: Switch User from lock screen ->
+// clean exit for login re-entry") and login.c ("[LOGIN] power: Restart from
+// login gate") already use - a serial-visible proof the click handler was
+// reached, independent of whether the action completes. SYS_BOOTLOG_WRITE
+// (298) is already called raw elsewhere in this file (see the debug-log
+// helper above); this just names the constant instead of spelling 298 twice.
+const SYS_BOOTLOG_WRITE: i64 = 298;
+fn bootlog(msg: &[u8]) { unsafe { syscall1(SYS_BOOTLOG_WRITE, msg.as_ptr() as i64); } }
 // (#745) Present a repaint the APP started. Measured on VM <vmid>: the staged
 // connection test ran to completion (diagnostic counters proved the state
 // machine reached "reached the internet (HTTP 200)") while the SCREEN kept
@@ -279,9 +340,30 @@ fn win_create(t: &[u8], x: i32, y: i32, w: i32, h: i32) -> i32 {
     unsafe { syscall5(SYS_WIN_CREATE, t.as_ptr() as i64, x as i64, y as i64,
                       w as i64, h as i64) as i32 }
 }
+// #198: the power-corner window's own creation call. focus=0 (kernel/proc/
+// syscall.c sys_win_create_impl's shared `focus` gate) - the SAME primitive
+// aichat/main.c:952 and snapshot/main.c:1058 already use for a small
+// non-focus-stealing floating control tied to one app's lifetime. This app
+// (main.rs) issues syscalls directly rather than through libc/gui.h's
+// win_create_bg() static inline, because a no_std Rust app cannot include
+// that C header - see this file's own header comment on why every syscall
+// number here is a private copy, not an include.
+fn win_create_bg(t: &[u8], x: i32, y: i32, w: i32, h: i32) -> i32 {
+    unsafe { syscall5(SYS_WIN_CREATE_BG, t.as_ptr() as i64, x as i64, y as i64,
+                      w as i64, h as i64) as i32 }
+}
 fn win_destroy(h: i32) { unsafe { syscall1(SYS_WIN_DESTROY, h as i64); } }
 fn rect(h: i32, x: i32, y: i32, w: i32, ht: i32, c: u32) {
     let (x, y) = body_to_win(x, y);
+    unsafe { syscall6(SYS_WIN_DRAW_RECT, h as i64, x as i64, y as i64,
+                      w as i64, ht as i64, c as i64); }
+}
+// #198: window-local rect draw for the power-corner window, which owns no
+// header/footer/card chrome of its own - unlike rect() above, this must NOT
+// apply body_to_win()'s card-origin offset (ORG_X/ORG_Y, CARD_X/CARD_Y are
+// the MAIN wizard window's concepts and do not apply to a second window).
+// Same pattern as draw_image_win() below for the same reason.
+fn rect_win_local(h: i32, x: i32, y: i32, w: i32, ht: i32, c: u32) {
     unsafe { syscall6(SYS_WIN_DRAW_RECT, h as i64, x as i64, y as i64,
                       w as i64, ht as i64, c as i64); }
 }
@@ -385,15 +467,16 @@ use keys::GUI_KEY_F10 as KC_F10;
 // #136: same table (kernel/cpu/isr.c). Checked against
 // userland/apps/compositor/main.c's global-shortcut dispatch before picking
 // these: only 0x88 (F1, launcher) and 0x85 (F11, fullscreen) are intercepted
-// there and never reach the focused app; F2/F3/F9 are not claimed by
-// anything else in the kernel or the compositor and pass straight through,
-// same as F10 above. Deliberately NOT F10 itself or a new use of the word
-// "Skip" alone: F10/self.skip() already means something different (finish
-// with defaults, page_skippable() pages only) - see corner_hit()'s block
-// comment.
+// there and never reach the focused app; F2/F3 are not claimed by anything
+// else in the kernel or the compositor and pass straight through, same as
+// F10 above. Deliberately NOT F10 itself or a new use of the word "Skip"
+// alone: F10/self.skip() already means something different (finish with
+// defaults, page_skippable() pages only).
+//
+// F9 (Skip to Desktop) used to live here too; removed per owner request,
+// 2026-08-28 - see the #229 FIRST-RUN STATE comment above for the reasoning.
 use keys::GUI_KEY_F2 as KC_F2;   // Restart
 use keys::GUI_KEY_F3 as KC_F3;   // Shut Down
-use keys::GUI_KEY_F9 as KC_F9;   // Skip to Desktop
 
 // #191: these four were already RIGHT (a comment further up records them being
 // fixed off the 0x48/0x50 scancodes once before, which is why the wizard was
@@ -883,6 +966,40 @@ fn write_dock_style_live(dock_style: usize) {
     }
 }
 
+// (#wizdock) Mirrors compositor/compositor.h's DOCK_XFCE = 4 ("Marble" in
+// Settings). A plain literal, not shared via a generated header - the same
+// distance-from-source tradeoff self.dock_style's whole 0..DOCK_COUNT range
+// already accepts elsewhere in this file (KC_LEFT/KC_RIGHT clamp against a
+// literal 4 too). If DOCK_COUNT ever changes, both need revisiting; grep for
+// DOCK_XFCE_IDX.
+const DOCK_XFCE_IDX: usize = 4;
+
+// (#wizdock) Owner decision 2026-08-27: Fluent Dark is the default theme,
+// matching the new Marble default dock style (write_dock_style() above).
+// THEMES[] is populated at runtime from /THEMES/*.mtheme (gui_theme_list()),
+// so "the default theme" cannot be a compiled-in array index the way
+// DOCK_XFCE is for dock style - the same theme can load at a different
+// index depending on what is on disk. Looked up by SLUG instead, once
+// THEMES[]/nthemes are populated, and reused at both places self.theme gets
+// defaulted (initial construction and the back-navigation reset) so the two
+// cannot drift the way a hand-duplicated index would.
+fn default_theme_idx(themes: &[ThemeEntry], nthemes: usize) -> usize {
+    const WANT: &[u8] = b"fluent_dark";
+    let mut i = 0usize;
+    while i < nthemes {
+        let slug = &themes[i].slug;
+        let mut k = 0usize;
+        let mut same = true;
+        while k < WANT.len() {
+            if slug[k] != WANT[k] { same = false; break; }
+            k += 1;
+        }
+        if same && (k >= slug.len() || slug[k] == 0) { return i; }
+        i += 1;
+    }
+    0
+}
+
 fn write_dock_style(dock_style: usize) {
     unsafe {
         let mut buf: [u8; 2048] = [0; 2048];
@@ -1209,6 +1326,17 @@ fn gui_rr(h: i32, x: i32, y: i32, w: i32, ht: i32, r: i32, fill: u32, outer: u32
 // ---------------------------------------------------------------------------
 const SYS_FB_INFO: i64 = 201;             // verified against libc/syscall.h
 const SYS_WIN_SET_NOCHROME: i64 = 262;    // verified against libc/syscall.h (#185)
+// #wizfocus: nochrome WITHOUT stealing keyboard focus, the counterpart of
+// win_create_bg() above - see fn pwr_create()'s call for why the corner
+// window needs this and not win_set_nochrome(). Number verified against
+// libc/syscall.h (398) and kernel/proc/syscall.h (#216).
+const SYS_WIN_SET_NOCHROME_BG: i64 = 398;
+// #198v2: real per-pixel window content alpha (top byte of every BGRA
+// word), blended by the compositor against the LIVE framebuffer at blit
+// time. See WINDOW_FLAG_ALPHA_CONTENT (kernel/gui/window.h) and
+// pwr_composite() above for the full contract and rationale. Number
+// verified against libc/syscall.h and kernel/proc/syscall.h (414).
+const SYS_WIN_SET_ALPHA_CONTENT: i64 = 414;
 const SYS_WIN_SET_SHADOW: i64 = 376;      // verified against libc/syscall.h (#745)
 const SYS_WIN_DRAW_TTF_EX: i64 = 311;     // verified against libc/syscall.h
 const TTF_STYLE_NORMAL: i32 = 0;          // verified against kernel/gui/ttf.h
@@ -1284,7 +1412,21 @@ const SYS_FONT_STYLE: i64    = 324;   // verified against libc/syscall.h
 
 const CARD_W: i32   = 688;
 const CARD_H: i32   = 616;
-const CARD_R: i32   = 16;
+// #745 P3: was 16. Reproduced at the user's own VM config (q35/std-vga/
+// USB-xHCI, golden 1822, confirmed-live 1280x800) and the arc genuinely
+// rounds and anti-aliases correctly there (measured against both the real
+// wallpaper and an adversarial flat-grey stress fill, zero square seam
+// either way), so the two prior "square corner" fixes were real fixes for a
+// real sampling bug, not no-ops. The likeliest remaining explanation for a
+// still-square REPORT is that a 16px arc on a 688px-wide card reads as
+// square at native (no HiDPI) 1x pixel density, or under any client-side
+// view that is not an exact 1:1 pixel scale (VNC/noVNC). 24px is a
+// meaningfully bigger, harder-to-miss curve while staying inside every
+// existing bound: CORNER_PATCH_MAX=64 native px/axis, and the worst-case
+// native/screen ratio across the shipped 64-wallpaper set (all <=1280x800)
+// at the GLASS_MIN floor of 736x664 is 1280/736=1.74, so 24*1.74=42px,
+// comfortably under 64. Kept equal to CORNER_BOX below.
+const CARD_R: i32   = 24;
 const CARD_PAD: i32 = 24;    // content-box padding on all four sides
 const HDR_H: i32    = 48;    // "Step N of M"
 const FTR_H: i32    = 40;    // step dots
@@ -1376,13 +1518,14 @@ static mut WP_SRC_OFFBITS: i32 = 0;
 static mut WP_SRC_BPP: i32 = 0;
 static mut WP_SRC_COMP: i32 = 0;
 
-// One 16x16 native-resolution patch per corner, sampled directly off the full
-// wallpaper BMP through the compositor's OWN nearest-neighbor formula
-// (wp_native_rowcol()), not the 100x62 build-time thumbnail. CORNER_OK gates
-// per corner: a corner whose native patch could not be read (bad header,
-// pathological aspect ratio, short read) falls back to the thumbnail sampler
-// exactly as before, corner by corner, not as an all-or-nothing switch.
-const CORNER_BOX: i32 = 16;            // must match CARD_R, the arc's bounding square
+// One CARD_R x CARD_R native-resolution patch per corner, sampled directly
+// off the full wallpaper BMP through the compositor's OWN nearest-neighbor
+// formula (wp_native_rowcol()), not the 100x62 build-time thumbnail.
+// CORNER_OK gates per corner: a corner whose native patch could not be read
+// (bad header, pathological aspect ratio, short read) falls back to the
+// thumbnail sampler exactly as before, corner by corner, not as an
+// all-or-nothing switch. #745 P3: 16 -> 24, see CARD_R.
+const CORNER_BOX: i32 = 24;            // must match CARD_R, the arc's bounding square
 const CORNER_PATCH_MAX: i32 = 64;      // native pixel bound per axis; see corner_patch_build
 static mut CORNER_OK: [bool; 4] = [false; 4];
 static mut CORNER_PIX: [u32; (4 * CORNER_BOX * CORNER_BOX) as usize] =
@@ -2244,8 +2387,11 @@ fn card_pixel(x: i32, y: i32) -> u32 {
         let inner = card_cov(x, y, 1, CARD_R - 1);
         let ring = cov - inner;
         if ring > 0 { c = mix(c, 0xFFFFFF, ring * CARD_EDGE_A / 1000); }
-        // Top highlight, straight span only.
-        if y == 0 && x >= 16 && x < 16 + 656 { c = mix(c, 0xFFFFFF, 255 * CARD_HL_A / 1000); }
+        // Top highlight, straight span only: inset by CARD_R on each side so
+        // it stops before the rounded corners start. #745 P3: was the
+        // literal "16" (the old CARD_R) and "656" (688 - 2*16); both drifted
+        // when CARD_R changed, so this is now derived, not restated.
+        if y == 0 && x >= CARD_R && x < CARD_W - CARD_R { c = mix(c, 0xFFFFFF, 255 * CARD_HL_A / 1000); }
         c
     }
 }
@@ -2632,6 +2778,10 @@ fn real_screen_size() -> (i32, i32) {
 }
 
 fn win_set_nochrome(h: i32) { unsafe { syscall1(SYS_WIN_SET_NOCHROME, h as i64); } }
+// #wizfocus: see the SYS_WIN_SET_NOCHROME_BG comment above.
+fn win_set_nochrome_bg(h: i32) { unsafe { syscall1(SYS_WIN_SET_NOCHROME_BG, h as i64); } }
+// #198v2: see SYS_WIN_SET_ALPHA_CONTENT above.
+fn win_set_alpha_content(h: i32) { unsafe { syscall1(SYS_WIN_SET_ALPHA_CONTENT, h as i64); } }
 fn win_set_shadow(h: i32) { unsafe { syscall1(SYS_WIN_SET_SHADOW, h as i64); } }
 
 // Face-aware TTF draw (face 0 = default UI font, per kernel/gui/ttf.c: "face 0
@@ -4625,90 +4775,433 @@ fn skip_link_bounds() -> (i32, i32, i32, i32) {
     let w = unsafe { gui_ttf_width(SKIP_LABEL.as_ptr(), 11) };
     (294 - w / 2, FOOTER_Y, w, FOOTER_H)
 }
-
 // ===========================================================================
-// #136 (owner ticket): bottom-right corner controls - Skip to Desktop,
-// Restart, Shut Down. On EVERY page except the transient PG_APPLY progress
-// screen, INCLUDING Welcome and Account, which is the one thing that makes
-// this a genuinely different control from SKIP_LABEL/skip_link_bounds()
-// above:
+// #136: bottom-right corner control "Skip to Desktop" (CORNER_LABEL_SKIP /
+// CORNER_Y / CORNER_PAD / CORNER_RIGHT / CORNER_FONT / corner_layout() /
+// corner_hit() / draw_corner_controls() / skip_to_desktop() / KC_F9)
+// REMOVED, owner request verbatim 2026-08-28: "remove the skip to desktop
+// option since it no longer makes sense". Full reasoning: the #229
+// FIRST-RUN STATE comment above (SYS_FIRSTRUN/FR_MARK_DONE section).
 //
-//   - skip_link_bounds()'s link only ever appears where page_skippable() is
-//     true (i.e. AFTER an account exists), and clicking it FINISHES the
-//     wizard with defaults - it runs apply() and writes /CONFIG/SETUPDONE,
-//     so the wizard never reappears. That is correct for what it is: "I
-//     don't want to answer these last few questions right now."
-//   - This is "I don't want to be in this wizard AT ALL right now", which
-//     has to work even before an account exists (Welcome/Account have no
-//     account to defer setup INTO - see page_skippable()'s own block
-//     comment for why the old link was removed from those two pages rather
-//     than fixed). Reusing skip_link_bounds()'s contract there would mean
-//     writing SETUPDONE with no account created, which is the exact
-//     half-configured state the wizard exists to prevent.
-//
-// So skip_to_desktop() below writes a DIFFERENT, throwaway marker
-// (/CONFIG/SETUPSKIP, not /CONFIG/SETUPDONE) and writes nothing else at
-// all - no apply(), no partial config. See skip_to_desktop()'s own comment
-// for the full contract and userland/apps/compositor/main.c's
-// setup_pending_recheck() / boot-time SETUP spawn site for the other half
-// (compositor-owned; touched here only because this feature is impossible
-// without it - see the CHANGELOG entry for #136).
-//
-// Restart/Shut Down reuse the EXACT existing power path: login.c and
-// lockscreen.c already put unauthenticated Restart/Shut Down controls
-// bottom-right of the screen (same "Restart"/"Shut Down" wording, same
-// reboot()/poweroff() libc calls straight to SYS_REBOOT/SYS_POWEROFF, no
-// confirmation dialog) precisely because a session has not started yet
-// there either - this wizard is the same situation.
-//
-// Text links, not buttons: matches lockscreen.c's own choice for these two
-// controls ("Switch User / Restart / Shut Down as high-contrast shadowed
-// TEXT with no surrounds", lockscreen.c:28) and costs far less of the
-// footer-chrome strip's width than a bordered button would, which matters
-// here - see the geometry comment below.
-//
-// GEOMETRY: card-mode ONLY (CARD_MODE gates both draw and click below).
-// dk_step_dots() already draws in this same 40px FTR_H strip (body-local
-// y 480..520, see the CARD_H/CONTENT_H comment above) at y=500, and for
-// STEP_COUNT=9 its dots span body-x 224..416 (span=(9-1)*24=192, centred
-// on W/2=320) plus a few px of AA radius - so this row is placed BELOW
-// that (CORNER_Y=504, clear of the dots' own y radius) and right-aligned
-// well clear of x=416, leaving the dots undisturbed. In the legacy
-// 640x480 fallback (small-screen, no separate header/footer chrome) there
-// is no room for a fourth row at all: F2/F3/F9 (on_key) still work there,
-// this is a visual-only gap, stated rather than silently dropped.
-const CORNER_LABEL_SKIP: &[u8]     = b"Skip to Desktop\0";
-const CORNER_LABEL_RESTART: &[u8]  = b"Restart\0";
-const CORNER_LABEL_SHUTDOWN: &[u8] = b"Shut Down\0";
-const CORNER_FONT: i32 = 10;
-const CORNER_Y: i32 = 504;
-const CORNER_PAD: i32 = 8;    // hit-rect slack added around the drawn glyphs
-const CORNER_GAP: i32 = 14;   // gap between adjacent controls
-const CORNER_RIGHT: i32 = W - 20;   // matches login.c/lockscreen.c's own 20px
-                                     // right margin for this exact pair
-
-// Text origin x + width for skip/restart/shutdown, right-aligned to
-// CORNER_RIGHT. ONE function shared by draw and hit-test (same reasoning
-// as footer_bounds() above): they cannot disagree about where the controls
-// are because there is only one place either of them could read it from.
-fn corner_layout() -> [(i32, i32); 3] {
-    let sw = unsafe { gui_ttf_width(CORNER_LABEL_SHUTDOWN.as_ptr(), CORNER_FONT) };
-    let rw = unsafe { gui_ttf_width(CORNER_LABEL_RESTART.as_ptr(), CORNER_FONT) };
-    let kw = unsafe { gui_ttf_width(CORNER_LABEL_SKIP.as_ptr(), CORNER_FONT) };
-    let shutdown_x = CORNER_RIGHT - sw;
-    let restart_x  = shutdown_x - CORNER_GAP - rw;
-    let skip_x     = restart_x  - CORNER_GAP - kw;
-    [(skip_x, kw), (restart_x, rw), (shutdown_x, sw)]
-}
-
-// index: 0 = Skip to Desktop, 1 = Restart, 2 = Shut Down.
-fn corner_hit(idx: usize) -> (i32, i32, i32, i32) {
-    let (x, w) = corner_layout()[idx];
-    (x - CORNER_PAD, CORNER_Y - CORNER_PAD, w + 2 * CORNER_PAD, CORNER_FONT + 2 * CORNER_PAD)
-}
-
+// Restart/Shut Down (also formerly in this same footer row) already moved
+// out under #198, to the pwr_win power corner below - see that block
+// comment for where they live now.
 fn do_reboot()   { unsafe { syscall0(SYS_REBOOT); } }
 fn do_poweroff() { unsafe { syscall0(SYS_POWEROFF); } }
+
+// ===========================================================================
+// #198v2 (2026-08-29): the power corner - Restart/Shut Down as BARE WHITE
+// ANTIALIASED GLYPHS floating directly over the desktop wallpaper, NO button
+// box of any kind. This is a deliberate rewrite of the #198 box-button
+// design: the owner asked for exactly this treatment three times
+// ("I want the buttons to simply be white icons, antialiased, no button box,
+// just on-top of the existing image background") and the box was never the
+// design intent, it was a workaround for a missing capability - see the
+// history below and docs/WIZARD_POWER_CORNER.html revision 2 for the full
+// spec this implements numerically.
+//
+// THE MISSING CAPABILITY, AND WHAT WAS BUILT TO CLOSE IT. Drawing a real
+// antialiased white glyph over an ARBITRARY photograph requires blending
+// against the pixels that are ACTUALLY there, not a guessed color - and
+// until now no Ring-3 window could do that: SYS_WIN_DRAW_IMAGE/DRAW_RECT
+// write into a private content_buffer with no read-back, so the old
+// pwr_draw_mico() (see git history) could only fake antialiasing by
+// blending toward a caller-supplied "best guess" background, which is
+// exactly why the box existed - filling a KNOWN color (the button face) was
+// the only background this engine could honestly blend against. The new
+// primitive is WINDOW_FLAG_ALPHA_CONTENT / SYS_WIN_SET_ALPHA_CONTENT
+// (kernel/gui/window.h, kernel/proc/syscall.c): a window opting in gets its
+// content_buffer's top byte read as REAL per-pixel alpha and blended by the
+// compositor against the LIVE framebuffer at blit time (the exact same
+// fb_get_pixel()/fb_put_pixel() loop that already existed for uniform
+// per-window opacity, generalised to per-pixel). THIS IS REUSABLE: any
+// future app that wants to paint an antialiased overlay straight onto the
+// desktop (a cursor decoration, a notification glow, another icon-on-photo
+// control) should use SYS_WIN_SET_ALPHA_CONTENT instead of re-deriving this
+// same workaround a third time.
+//
+// One function draws AND hit-tests (pwr_layout(), same idiom as
+// footer_bounds()/skip_link_bounds() above) - the #188 "drawn at one rect,
+// hit-tested at a different one" bug class is structurally impossible if
+// there is only one source of the rectangles. The hit-test geometry below
+// is UNCHANGED from the box design (same 40x40 target per icon, same
+// screen-corner position) - only the PAINT changed, not the click contract.
+const PWR_BTN: i32 = 40;      // hit-target box, square (unchanged from v1)
+const PWR_ICON: i32 = 26;     // glyph draw size, logical px. Bumped from the
+// v1 box design's 22: a naked glyph with no surrounding chrome reads smaller
+// than the same glyph inside a filled box of the same size (the box itself
+// used to carry visual weight), so the spec (WIZARD_POWER_CORNER.html
+// revision 2, section 3) calls for a modest +4px to keep the same
+// perceived size. Still well inside the unchanged 40px hit cell.
+const PWR_GAP: i32 = 8;       // gap between the two buttons
+// Content box is 2*PWR_BTN + PWR_GAP = 88 wide, PWR_BTN = 40 tall. The
+// window itself is padded +8px each axis beyond that (96x48) - the durable
+// #trap lesson that SYS_WIN_CREATE/win_create_bg take the OUTER size, so
+// asking for exactly the content size clips the bottom/right row. Unlike a
+// chromed window, a NOCHROME window (which this is, via win_set_nochrome_bg()
+// right after creation) has content == outer once created, so
+// PWR_CONTENT_W/H below double as both the win_create_bg() request size AND
+// the drawn content size - there is no separate "ask the window what it
+// actually got" step, matching the existing win_create()/CARD_W/CARD_H
+// precedent in main() below. This window's ENTIRE content area is now
+// transparent (alpha 0) except the glyph+halo pixels drawn into it - see
+// pwr_draw() below.
+const PWR_CONTENT_W: i32 = 2 * PWR_BTN + PWR_GAP + 8;   // 96
+const PWR_CONTENT_H: i32 = PWR_BTN + 8;                 // 48
+// Right/bottom margin from the outer window edge to the REAL screen edge.
+// 20 reuses CORNER_RIGHT's own margin value (not the CORNER_RIGHT constant
+// itself, which is relative to W, the wizard's OWN window width - this
+// window's position is relative to the real screen, sw/sh, a different
+// space entirely). 24 reuses lockscreen.c's own bottom-right power-control
+// margin (g.pw_y = sh - g.pw_h - 24) - the sibling feature this most
+// resembles. See spec section 3.
+const PWR_MARGIN_R: i32 = 20;
+const PWR_MARGIN_B: i32 = 24;
+
+// #198v2: the halo/shadow dilation radius, logical px, and its two opacity
+// levels (WIZARD_POWER_CORNER.html revision 2, section 7 - "legibility
+// treatment"). A soft, subtly-dark halo behind the white glyph, NOT a box:
+// its shape is a max-dilation of the glyph's OWN coverage mask (so it
+// silhouettes the glyph, it is never a rectangle or a circle), and its peak
+// alpha is well short of opaque even at HOVER, so it can never read as a
+// filled shape. This is the treatment the task explicitly allows ("a subtle
+// drop shadow, a soft dark halo, or a slight outline") and it is what keeps
+// a pure-white glyph legible over a bright sky (verified: see CHANGELOG
+// screenshots over WPT_LIGHT and WPT_DARK backgrounds).
+const PWR_HALO_R: i32 = 2;         // dilation radius, logical px
+const PWR_HALO_MAX: u32 = 150;     // baseline peak halo alpha (~59%), out of 255
+const PWR_HALO_MAX_HOVER: u32 = 195; // hover peak halo alpha (~76%) - the ONLY
+// hover feedback: the halo deepens slightly, nothing box-shaped appears.
+const PWR_GLYPH_PRESS_PCT: u32 = 72; // pressed: glyph alpha scaled to 72% -
+// a visible "give" on click without any fill color change.
+// Composite buffer side length: the glyph itself plus PWR_HALO_R of halo
+// bleed on every edge.
+const PWR_BUF: i32 = PWR_ICON + 2 * PWR_HALO_R;   // 30
+
+// idx 0 = Restart (left), idx 1 = Shut Down (right, closest to the screen
+// corner) - matches the existing text order this replaces (CORNER_LABEL_
+// RESTART before CORNER_LABEL_SHUTDOWN) and lockscreen.c/login.c's own
+// convention. Content-local coordinates: pwr_win has no header/footer/card
+// origin of its own (unlike the main wizard window), so these ARE the
+// window-local coordinates events arrive in - no translation step needed.
+fn pwr_layout() -> [(i32, i32, i32, i32); 2] {
+    let pad_x = (PWR_CONTENT_W - (2 * PWR_BTN + PWR_GAP)) / 2;
+    let pad_y = (PWR_CONTENT_H - PWR_BTN) / 2;
+    let x0 = pad_x;
+    let x1 = pad_x + PWR_BTN + PWR_GAP;
+    [(x0, pad_y, PWR_BTN, PWR_BTN), (x1, pad_y, PWR_BTN, PWR_BTN)]
+}
+
+// ---- MICO .ICN loader, Rust-native re-implementation -----------------------
+// Same format as userland/apps/files/main.c's mico_get()/draw_mico() (12-byte
+// header 'MICO' + width/height u32 LE + w*h*4 BGRA), which this app cannot
+// call directly: those are private C statics, not FFI-exported (spec section
+// 8). This mirrors an existing gap (six separate C copies already exist
+// there); promoting it to a shared libc helper is out of scope here, per the
+// spec's own recommendation.
+const MICO_DIM: usize = 64;
+#[derive(Clone, Copy)]
+struct MicoIcon { w: i32, h: i32, loaded: i32, px: [u8; MICO_DIM * MICO_DIM * 4] }
+const MICO_ZERO: MicoIcon = MicoIcon { w: 0, h: 0, loaded: 0, px: [0u8; MICO_DIM * MICO_DIM * 4] };
+// index 0 = RESTART.ICN, 1 = POWER.ICN - same order as pwr_layout().
+static mut PWR_ICONS: [MicoIcon; 2] = [MICO_ZERO; 2];
+// Coverage scratch (one glyph's worth, no halo margin) and the composited
+// BGRA output scratch (glyph + halo margin) - both reused for both
+// icons/draws (one at a time).
+static mut PWR_COV: [u8; (PWR_ICON * PWR_ICON) as usize] = [0u8; (PWR_ICON * PWR_ICON) as usize];
+static mut PWR_ICON_SCRATCH: [u32; (PWR_BUF * PWR_BUF) as usize] = [0; (PWR_BUF * PWR_BUF) as usize];
+
+fn pwr_load_icon(idx: usize, path: &[u8]) {
+    let ic = unsafe { &mut PWR_ICONS[idx] };
+    if ic.loaded != 0 { return; }   // already tried (loaded or missing)
+    ic.loaded = -1;
+    let fd = unsafe { syscall3(SYS_OPEN, path.as_ptr() as i64, 0, 0) } as i32;
+    if fd < 0 { return; }
+    let mut hdr = [0u8; 12];
+    let n = unsafe { syscall3(SYS_READ, fd as i64, hdr.as_mut_ptr() as i64, 12) };
+    if n != 12 || &hdr[0..4] != b"MICO" {
+        unsafe { syscall1(SYS_CLOSE, fd as i64); }
+        return;
+    }
+    let w = (hdr[4] as i32) | ((hdr[5] as i32) << 8) | ((hdr[6] as i32) << 16) | ((hdr[7] as i32) << 24);
+    let h = (hdr[8] as i32) | ((hdr[9] as i32) << 8) | ((hdr[10] as i32) << 16) | ((hdr[11] as i32) << 24);
+    if w <= 0 || h <= 0 || w as usize > MICO_DIM || h as usize > MICO_DIM {
+        unsafe { syscall1(SYS_CLOSE, fd as i64); }
+        return;
+    }
+    let want = (w * h * 4) as usize;
+    let mut got = 0usize;
+    while got < want {
+        let n = unsafe { syscall3(SYS_READ, fd as i64, ic.px.as_mut_ptr().add(got) as i64, (want - got) as i64) };
+        if n <= 0 { break; }
+        got += n as usize;
+    }
+    unsafe { syscall1(SYS_CLOSE, fd as i64); }
+    if got != want { return; }
+    ic.w = w; ic.h = h; ic.loaded = 1;
+}
+
+// Sample icon `idx`, nearest-neighbour scaled to PWR_ICON x PWR_ICON, into
+// PWR_COV as a pure 0..255 COVERAGE mask (no color, no compositing against
+// any guessed background - that whole class of approximation is gone now
+// that the destination is real). cov = luma-derived white-glyph coverage,
+// combined with the source icon's own alpha byte, same formula the v1
+// pwr_draw_mico() used for its coverage term.
+fn pwr_sample_coverage(idx: usize) {
+    let ic = unsafe { &PWR_ICONS[idx] };
+    unsafe { PWR_COV = [0u8; (PWR_ICON * PWR_ICON) as usize]; }
+    if ic.loaded != 1 { return; }
+    let mut dy = 0i32;
+    while dy < PWR_ICON {
+        let mut sy = (dy * ic.h) / PWR_ICON; if sy >= ic.h { sy = ic.h - 1; }
+        let mut dx = 0i32;
+        while dx < PWR_ICON {
+            let mut sx = (dx * ic.w) / PWR_ICON; if sx >= ic.w { sx = ic.w - 1; }
+            let o = ((sy * ic.w + sx) * 4) as usize;
+            let b = ic.px[o] as u32; let g = ic.px[o + 1] as u32; let r = ic.px[o + 2] as u32; let a = ic.px[o + 3] as u32;
+            let cov = (r * 30 + g * 59 + b * 11) / 100;   // white glyph -> coverage
+            let cov = (a * cov) / 255;
+            unsafe { PWR_COV[(dy * PWR_ICON + dx) as usize] = cov as u8; }
+            dx += 1;
+        }
+        dy += 1;
+    }
+}
+
+// Composite the sampled glyph coverage (PWR_COV) plus its dilated halo into
+// PWR_ICON_SCRATCH as REAL BGRA-with-alpha pixels (top byte = alpha), then
+// blit the whole PWR_BUF x PWR_BUF buffer in one SYS_WIN_DRAW_IMAGE call onto
+// the window this app owns (which must already have called
+// win_set_alpha_content() - see pwr_create()). `halo_max` and
+// `glyph_pct` are the only two state-dependent knobs (hover deepens the
+// halo, press dims the glyph) - see PWR_HALO_MAX/PWR_HALO_MAX_HOVER/
+// PWR_GLYPH_PRESS_PCT above. No box, no fill, no theme color is read here:
+// the glyph is always pure white, the halo always pure black, per the
+// spec's explicit instruction (WIZARD_POWER_CORNER.html revision 2).
+fn pwr_composite(win: i32, idx: usize, cell_x: i32, cell_y: i32, halo_max: u32, glyph_pct: u32) {
+    pwr_sample_coverage(idx);
+    let r = PWR_HALO_R;
+    let buf = PWR_BUF;
+    let mut by = 0i32;
+    while by < buf {
+        let mut bx = 0i32;
+        while bx < buf {
+            // Dilate: max glyph coverage within [-r,+r] of (bx,by), where
+            // (bx,by) is expressed in the glyph's own (un-padded) coordinate
+            // space, i.e. glyph coordinate = (bx - r, by - r).
+            let gx0 = bx - r; let gy0 = by - r;
+            let mut halo_cov: u32 = 0;
+            let mut ky = -r;
+            while ky <= r {
+                let sy = gy0 + ky;
+                if sy >= 0 && sy < PWR_ICON {
+                    let mut kx = -r;
+                    while kx <= r {
+                        let sx = gx0 + kx;
+                        if sx >= 0 && sx < PWR_ICON {
+                            let c = unsafe { PWR_COV[(sy * PWR_ICON + sx) as usize] as u32 };
+                            if c > halo_cov { halo_cov = c; }
+                        }
+                        kx += 1;
+                    }
+                }
+                ky += 1;
+            }
+            // Glyph coverage AT this exact pixel (no dilation), 0 outside
+            // the glyph's own (un-padded) region.
+            let glyph_cov: u32 = if gx0 >= 0 && gx0 < PWR_ICON && gy0 >= 0 && gy0 < PWR_ICON {
+                unsafe { PWR_COV[(gy0 * PWR_ICON + gx0) as usize] as u32 }
+            } else { 0 };
+            let glyph_a = (glyph_cov * glyph_pct) / 100;
+            let halo_a = (halo_cov * halo_max) / 255;
+            // Standard source-over: halo (black) first, glyph (white) on top.
+            let out_a = glyph_a + (halo_a * (255 - glyph_a)) / 255;
+            let px = if out_a == 0 {
+                0u32
+            } else {
+                // white*glyph_a + black*halo_a*(255-glyph_a)/255, and black
+                // contributes 0 to every channel, so each channel reduces to
+                // 255*glyph_a/out_a.
+                let ch = ((255u32 * glyph_a) / out_a).min(255);
+                (out_a << 24) | (ch << 16) | (ch << 8) | ch
+            };
+            unsafe { PWR_ICON_SCRATCH[(by * buf + bx) as usize] = px; }
+            bx += 1;
+        }
+        by += 1;
+    }
+    draw_image_win(win, cell_x, cell_y, buf, buf, core::ptr::addr_of!(PWR_ICON_SCRATCH) as i64);
+}
+
+// pwr_win handle (-1 = does not currently exist), plus press/hover state for
+// the two buttons (-1 = neither). Following this file's own established
+// idiom of screen/window-derived global state as `static mut` (FB_W/FB_H/
+// CARD_MODE/CARD_X/CARD_Y below), rather than threading a field through
+// App for state that belongs to a SECOND window, not the wizard's own page
+// model.
+static mut PWR_WIN: i32 = -1;
+static mut PWR_HOVER: i32 = -1;
+static mut PWR_PRESS: i32 = -1;
+
+// Paints the whole content area TRANSPARENT (alpha 0 - see win_set_alpha_
+// content() in pwr_create()), then composites each icon's glyph+halo on top
+// via pwr_composite(). No panel fill of any kind: the window has no visible
+// footprint of its own, only the two glyphs do. See the section header
+// comment above for why this replaced the v1 box design and what primitive
+// made it possible.
+fn pwr_draw() {
+    let win = unsafe { PWR_WIN };
+    if win < 0 { return; }
+    // Clear the ENTIRE content area to fully transparent. This is the one
+    // rect fill this window ever does, and unlike every other rect fill in
+    // this file it deliberately writes alpha 0 in every pixel's top byte -
+    // SYS_WIN_DRAW_RECT passes the 32-bit color through to content_buffer
+    // verbatim (kernel/proc/syscall.c sys_win_draw_rect: `content_buffer[..] =
+    // color`), so 0x00000000 really does mean "fully transparent", not
+    // "opaque black", once win_set_alpha_content() is in effect.
+    rect_win_local(win, 0, 0, PWR_CONTENT_W, PWR_CONTENT_H, 0x0000_0000);
+    let l = pwr_layout();
+    let hover = unsafe { PWR_HOVER };
+    let press = unsafe { PWR_PRESS };
+    let mut i = 0usize;
+    while i < 2 {
+        let (bx, by, bw, bh) = l[i];
+        let halo_max = if hover == i as i32 || press == i as i32 { PWR_HALO_MAX_HOVER } else { PWR_HALO_MAX };
+        let glyph_pct = if press == i as i32 { PWR_GLYPH_PRESS_PCT } else { 100 };
+        let cx = bx + (bw - PWR_BUF) / 2;
+        let cy = by + (bh - PWR_BUF) / 2;
+        pwr_composite(win, i, cx, cy, halo_max, glyph_pct);
+        i += 1;
+    }
+    win_invalidate(win);
+}
+
+// Creates pwr_win (idempotent) at the REAL screen's bottom-right, sized/
+// positioned per docs/WIZARD_POWER_CORNER.html section 3. Small-screen
+// fallback: gated on CARD_MODE (!CARD_MODE means there is no room) - F2/F3
+// keyboard restart/shutdown still work regardless (#334: keyboard is the
+// fallback that must always work).
+fn pwr_create() {
+    if !unsafe { CARD_MODE } { return; }
+    if unsafe { PWR_WIN } >= 0 { return; }
+    let sw = unsafe { FB_W }; let sh = unsafe { FB_H };
+    let x = sw - PWR_MARGIN_R - PWR_CONTENT_W;
+    let y = sh - PWR_MARGIN_B - PWR_CONTENT_H;
+    // Empty title, not "PowerCorner": found empirically on the throwaway
+    // verification VM (#198) that a titled win_create_bg() window still gets
+    // its own taskbar tile - taskbar.c's tb_window_is_app() only skips a
+    // window "naturally" (its own comment's word) when title[0] == '\0',
+    // the same way the root/desktop window is skipped. taskbar.c also has a
+    // title-KEYED companion-window suppression list (tb_is_companion(), #341)
+    // for cases that need a title, but this window never needs one, so the
+    // simpler no-title path avoids touching a second file for the same fix.
+    let h = win_create_bg(b"\0", x, y, PWR_CONTENT_W, PWR_CONTENT_H);
+    if h < 0 { return; }
+    // #wizfocus (2026-08-28): was win_set_nochrome(h), which is
+    // SYS_WIN_SET_NOCHROME (focus=1, kernel/proc/syscall.c
+    // sys_win_set_nochrome_impl) - it unconditionally called
+    // wm_focus_window() on the power corner EVERY time pwr_create() ran
+    // (wizard startup, and again after every PG_APPLY/skip transient via
+    // pwr_destroy()+pwr_create()), stealing keyboard focus from the wizard's
+    // own window onto this borderless corner panel with no visible focus
+    // ring. The wizard then never saw another keystroke: Tab/Enter/arrow
+    // keys all went to pwr_win, which has no on_key handling for them.
+    // win_create_bg() above already correctly asked for focus=0 at CREATE
+    // time (per its own comment) but that intent was undone one line later
+    // by this call. win_set_nochrome_bg() is the exact #216 counterpart
+    // (SYS_WIN_SET_NOCHROME_BG, focus=0) already used by other background
+    // panels for this reason; it never grabs focus, so the wizard keeps it
+    // for keyboard-only navigation with no mouse (#307/#433 machine class).
+    win_set_nochrome_bg(h);
+    // #198v2: win_set_nochrome_impl() ALSO now sets WINDOW_FLAG_NO_FOCUS
+    // whenever focus=0 (kernel/gui/window.h, kernel/proc/syscall.c), so this
+    // call is what makes the corner permanently unfocusable, not just
+    // unfocused-at-create: window_set_focus() (the kernel's single focus
+    // chokepoint) refuses the window outright from then on, so a stray
+    // click can no longer make it wm_state.focused_window and no later F11
+    // can touch it. See the WINDOW_FLAG_NO_FOCUS comment for the exact bug
+    // this closes (the owner's reported "F11 maximises the power corner").
+    //
+    // #198v2: opt this window into REAL per-pixel content alpha - see the
+    // section header comment above pwr_layout() for the full rationale.
+    // Must happen AFTER win_set_nochrome_bg(), which reallocates and
+    // refills content_buffer (0xFFF5F5F5, opaque) as a side effect; setting
+    // the flag first would have no buffer to apply to yet, and setting it
+    // before that refill would just have it overwritten anyway.
+    win_set_alpha_content(h);
+    unsafe { PWR_WIN = h; PWR_HOVER = -1; PWR_PRESS = -1; }
+    pwr_load_icon(0, b"/ICONS/RESTART.ICN\0");
+    pwr_load_icon(1, b"/ICONS/POWER.ICN\0");
+    pwr_draw();
+}
+
+// Destroys pwr_win if it exists. Called before entering PG_APPLY and at the
+// wizard's own exit point - destroying (not hiding: no win_hide()/opacity
+// primitive exists, checked) is the only way to make the #188 "drawn
+// control with a live hit-test" bug class structurally impossible: if there
+// is no window, there is no click target to disagree with a stale draw.
+fn pwr_destroy() {
+    let h = unsafe { PWR_WIN };
+    if h >= 0 { win_destroy(h); }
+    unsafe { PWR_WIN = -1; PWR_HOVER = -1; PWR_PRESS = -1; }
+}
+
+// Non-blocking poll of pwr_win's own event queue (ms=0 - see main()'s event
+// loop for why this piggybacks on the existing 250ms win_get_event(win, ...)
+// cadence rather than adding a new loop: #426/#419/#420 class, no new
+// busy/spin loop). Hover updates on mouse move, press+bootlog+action fire
+// together on mouse down (matching how every OTHER control in this app
+// already fires its action from EV_MOUSE_DOWN - see main()'s event loop),
+// mouse up just clears the press highlight.
+fn pwr_pump() {
+    let win = unsafe { PWR_WIN };
+    if win < 0 { return; }
+    let mut ev = GuiEvent { ty: 0, target_id: 0, mouse_x: 0, mouse_y: 0,
+                            mouse_buttons: 0, scroll_delta: 0, keycode: 0, key_char: 0 };
+    let got = win_get_event(win, &mut ev, 0);
+    if got == 0 { return; }
+    match ev.ty {
+        EV_MOUSE_MOVE => {
+            let l = pwr_layout();
+            let mut nh: i32 = -1;
+            let mut i = 0usize;
+            while i < 2 {
+                let (bx, by, bw, bh) = l[i];
+                if ev.mouse_x >= bx && ev.mouse_x < bx + bw && ev.mouse_y >= by && ev.mouse_y < by + bh { nh = i as i32; break; }
+                i += 1;
+            }
+            if nh != unsafe { PWR_HOVER } { unsafe { PWR_HOVER = nh; } pwr_draw(); }
+        }
+        EV_MOUSE_DOWN => {
+            if ev.mouse_buttons & MOUSE_LEFT != 0 {
+                let l = pwr_layout();
+                let mut hit: i32 = -1;
+                let mut i = 0usize;
+                while i < 2 {
+                    let (bx, by, bw, bh) = l[i];
+                    if ev.mouse_x >= bx && ev.mouse_x < bx + bw && ev.mouse_y >= by && ev.mouse_y < by + bh { hit = i as i32; break; }
+                    i += 1;
+                }
+                if hit >= 0 {
+                    unsafe { PWR_PRESS = hit; }
+                    pwr_draw();
+                    if hit == 0 {
+                        bootlog(b"[SETUP] power: Restart from wizard corner\0");
+                        do_reboot();
+                    } else {
+                        bootlog(b"[SETUP] power: Shut Down from wizard corner\0");
+                        do_poweroff();
+                    }
+                }
+            }
+        }
+        EV_MOUSE_UP => {
+            if unsafe { PWR_PRESS } != -1 { unsafe { PWR_PRESS = -1; } pwr_draw(); }
+        }
+        EV_REDRAW => pwr_draw(),
+        _ => {}
+    }
+}
 
 // ===========================================================================
 // #745 task #15: PG_APPSW, "Apps and widgets" (docs/OOBE_APPS_WIDGETS.html).
@@ -4747,7 +5240,7 @@ const APPS_UI: [AppUi; 12] = [
     AppUi { label: b"Terminal\0",     path: b"/APPS/TERMINAL\0" },
     AppUi { label: b"Editor\0",       path: b"/APPS/EDITOR\0" },
     AppUi { label: b"Settings\0",     path: b"/APPS/SETTINGS\0" },
-    AppUi { label: b"App Store\0",    path: b"/APPS/APPSTORE\0" },
+    AppUi { label: b"App Repo\0",     path: b"/APPS/APPSTORE\0" },
     AppUi { label: b"Notes\0",        path: b"/APPS/NOTES\0" },
     AppUi { label: b"Calculator\0",   path: b"/APPS/CALC\0" },
     AppUi { label: b"Media Player\0", path: b"/APPS/MEDIAPLAYER\0" },
@@ -5684,8 +6177,8 @@ impl App {
         }
 
         dk_solid(win, 32, 214,
-            if net_ok { b"Every app stays in the Start menu. Pin more later, or add new ones from the App Store.\0" as &[u8] }
-            else { b"Every app stays in the Start menu. The App Store needs a network connection.\0" as &[u8] },
+            if net_ok { b"Every app stays in the Start menu. Pin more later, or add new ones from the App Repo.\0" as &[u8] }
+            else { b"Every app stays in the Start menu. The App Repo needs a network connection.\0" as &[u8] },
             12, false, DK_BODY);
 
         // ---- DESKTOP WIDGETS ----------------------------------------------
@@ -6056,19 +6549,6 @@ impl App {
         }
     }
 
-    // #136: see corner_hit()'s block comment for the full geometry/contract.
-    // CARD_MODE-only (no room in the legacy 640x480 fallback); F2/F3/F9 in
-    // on_key still work there regardless.
-    fn draw_corner_controls(&self) {
-        if self.page == PG_APPLY { return; }
-        if !unsafe { CARD_MODE } { return; }
-        let win = self.win;
-        let l = corner_layout();
-        dk_solid(win, l[0].0, CORNER_Y, CORNER_LABEL_SKIP, CORNER_FONT, false, DK_BACK_LABEL);
-        dk_solid(win, l[1].0, CORNER_Y, CORNER_LABEL_RESTART, CORNER_FONT, false, DK_BACK_LABEL);
-        dk_solid(win, l[2].0, CORNER_Y, CORNER_LABEL_SHUTDOWN, CORNER_FONT, false, DK_ERROR);
-    }
-
     fn draw(&mut self) {
         match self.page {
             // Welcome is page 0 of THIS SAME window (see the block comment
@@ -6092,14 +6572,12 @@ impl App {
             PG_DONE    => self.dk_draw_done(),
             _ => {}
         }
-        // #136: corner controls (Skip to Desktop / Restart / Shut Down) draw
-        // on top of whatever the match above just painted, on every page
-        // except PG_APPLY - see corner_hit()'s block comment. Placed here,
-        // ONE call before the win_invalidate() below rather than after each
-        // of the ten match arms, for the exact reason the comment on that
-        // call gives: this is the one place every redraw path funnels
-        // through, so a page added later cannot forget it either.
-        self.draw_corner_controls();
+        // #136's "Skip to Desktop" corner text used to draw here, on top of
+        // whatever the match above just painted; it is removed (owner
+        // request, 2026-08-28 - see the #229 FIRST-RUN STATE comment). The
+        // #198 power corner (Restart/Shut Down) is a SEPARATE window
+        // (pwr_win) with its own draw call (pwr_draw(), via pwr_pump()),
+        // not part of this window's redraw at all.
         // #155: PRESENT the repaint that was just made. Since #131 (local 151)
         // the compositor blits content_presented, published only by this call,
         // so a page drawn without it reached the content buffer and stopped
@@ -7140,8 +7618,14 @@ impl App {
         // last page, so a reduced flow would have walked past its own end.
         if flow_next(self.page).is_none() {
             self.page = PG_APPLY;
+            // #198: pwr_win is destroyed for the duration of the transient
+            // progress page and recreated on leaving it - see pwr_destroy()'s
+            // own comment for why destroying (not hiding) is the structural
+            // fix for the #188 bug class.
+            pwr_destroy();
             let ok = self.apply();
             self.page = if ok { PG_DONE } else { flow_error_page() };
+            pwr_create();
             self.focus = 0;
             return true;
         }
@@ -7171,6 +7655,7 @@ impl App {
         // not a leftover, and is kept.
         self.reset_optional_from(self.page);
         self.page = PG_APPLY;
+        pwr_destroy();   // #198: see next()'s identical pair, above
         let ok = self.apply();
         // #229: flow_error_page(), not a hardcoded PG_ACCOUNT. next()'s Apply
         // path already went through that helper; this one did not, and on a
@@ -7178,101 +7663,15 @@ impl App {
         // later" landed on a page the dots say does not exist and that Continue
         // cannot navigate out of. Two call sites, one answer.
         self.page = if ok { PG_DONE } else { flow_error_page() };
+        pwr_create();
         self.focus = 0;
         true
     }
 
-    // #136: the bottom-right "Skip to Desktop" corner control. See
-    // corner_hit()'s block comment for the full contract this exists to
-    // satisfy; in short - unlike skip() above, this must work with NO
-    // account yet, must write NOTHING durable except a throwaway per-boot
-    // marker, and must NOT write /CONFIG/SETUPDONE (that would be exactly
-    // the "half-configured, but marked done forever" failure mode the
-    // ticket calls out).
-    //
-    // Deliberately skips apply() entirely: nothing downstream ever reads a
-    // half-chosen theme/wallpaper/network/AI setting from a session that
-    // never finished, so writing any of it here would be pure risk (a
-    // stale static IP, a wrong RTC write) for zero benefit. Leaving the
-    // machine untouched is what "must not end up half-configured" means.
-    //
-    // /CONFIG/SETUPSKIP is consumed on the userland/apps/compositor/main.c
-    // side: setup_pending_recheck() treats its presence as "let the
-    // desktop chrome through for the REST OF THIS BOOT ONLY", and the
-    // boot-time SETUP spawn site (main(), where g_setup_pending is armed)
-    // deletes any stale copy before arming, so a previous skip can never
-    // mask the next boot's fresh /CONFIG/SETUPDONE-absent respawn. Returns
-    // false (same as PG_DONE's Finish/next()) so the caller's event loop
-    // breaks, win_destroy() runs and this process exits normally - that IS
-    // "reaching the desktop": nothing else needs to be launched, the
-    // compositor is already running underneath this window.
-    //
-    // #229: IT IS NOW A KERNEL FLAG AND IT CANNOT FAIL.
-    //
-    // This used to write /CONFIG/SETUPSKIP, and refuse to exit if the write
-    // failed - a refusal that was correct given the design and fatal given the
-    // permissions. /CONFIG is root-owned 0711 and the session is uid 1000, so
-    // on a virgin machine the write ALWAYS failed and the escape hatch reported
-    // "Could not reach the desktop; try again." forever. Measured on golden
-    // 2011; the kernel logged its own refusal each time,
-    // [PERMS-DENY] proc=SETUP uid=1000 gid=1000 want=-wx path=/CONFIG.
-    //
-    // An escape hatch must not share a failure mode with the thing it exists to
-    // escape. SYS_FIRSTRUN(FR_SKIP_SET) sets one bit of kernel RAM: no
-    // filesystem, no permission check, no policy in front of it, and by
-    // construction no way to return anything but 0. The return value is
-    // deliberately DISCARDED rather than checked, because there is no failure
-    // to handle and a check would only invite someone to add a refusal path
-    // back in. Returning false exits the event loop, win_destroy() runs and
-    // this process ends - which IS reaching the desktop: the compositor is
-    // already running underneath this window and clears its first-run gate off
-    // the same flag within ~330ms.
-    //
-    // #228 (found verifying #OOBEAUTH): THIS ESCAPE HATCH REACHED A DESKTOP
-    // WITH NO ACCOUNT AT ALL.
-    //
-    // Before #OOBEAUTH moved account creation out of the kernel's own login
-    // gate and into this wizard's PG_ACCOUNT + apply(), an account already
-    // existed by the time this process ever got control - the kernel gate
-    // was a mandatory, unskippable wall in front of it. So "Skip to Desktop"
-    // could only ever skip PERSONALISATION (network/time/appearance/...),
-    // never the account. #OOBEAUTH removed that wall, and this function did
-    // not gain the check it silently lost: F9 pressed on PG_WELCOME or
-    // PG_ACCOUNT still just sets the kernel flag and exits, with apply()
-    // (the only thing that ever calls SYS_FIRSTBOOT_ADMIN) never having run.
-    // MEASURED on golden 2030/2031: `/HOME` has no entry for the session's
-    // account, PERMS.DB grants it nothing, the shell's cwd is forced to
-    // `/` (no home to start in), and the only writable path anywhere on the
-    // image is /WINDIR/DRIVE_C (0777) - a desktop that cannot save a single
-    // file from any app.
-    //
-    // THE FIX ASKS THE KERNEL, LIVE, NOT A SESSION-START SNAPSHOT.
-    // FR_BOOTSTRAP_QUERY answers exactly the fact that matters: is the
-    // account table STILL empty right now. It is true only for the first-
-    // boot bootstrap session (see kernel/rustkern/firstrun.rs) and it flips
-    // false the instant SYS_FIRSTBOOT_ADMIN succeeds, so this check can never
-    // go stale - unlike MACHINE_ADMIN, which is a one-time snapshot by
-    // design and would be the wrong thing to read here.
-    //
-    // If it is still true, this is not an escape from a failing
-    // PERSONALISATION step, it is an attempt to leave before the one
-    // MANDATORY step #229 already treats as such (FR_MARK_DONE's own gate:
-    // "the machine must already have at least one active account"). Redirect
-    // to the one page that can still fix that (flow_error_page(), the same
-    // helper apply()'s own failure path already uses - one answer for "where
-    // does someone go who has not finished the mandatory step", not two)
-    // rather than reaching a homeless desktop. The escape hatch still cannot
-    // fail: it always does SOMETHING with the keypress, it just does the
-    // right something before an account exists.
-    fn skip_to_desktop(&mut self) -> bool {
-        if unsafe { syscall1(SYS_FIRSTRUN, FR_BOOTSTRAP_QUERY) } == 1 {
-            self.page = flow_error_page();
-            self.focus = 0;
-            return true;
-        }
-        unsafe { syscall1(SYS_FIRSTRUN, FR_SKIP_SET); }
-        false
-    }
+    // #136's skip_to_desktop() (the "Skip to Desktop" corner control) lived
+    // here. Removed per owner request, 2026-08-28 - see the #229 FIRST-RUN
+    // STATE comment above for the full reasoning and why nothing is
+    // stranded by its removal.
 
     // The defaults each optional page would have applied if it had been shown
     // and left alone. Restoring them explicitly matters for the fields a user
@@ -7315,7 +7714,18 @@ impl App {
         if from <= PG_TIME { self.ntp_on = false; self.clock_skip = true; }
         // Appearance and desktop picture: the first entry of each list, which
         // is what the page itself starts on.
-        if from <= PG_APPEAR { self.theme = 0; self.dock_style = 0; }
+        if from <= PG_APPEAR {
+            // (#wizdock) Re-default to the SAME choice a virgin machine
+            // starts with (Marble / Fluent Dark), not to the pre-#wizdock
+            // classic/index-0 pair. If the person had actually picked
+            // something on the Appearance page, they would not be
+            // navigating back PAST it while it still holds an unconfirmed
+            // choice from a step this far forward - PG_APPEAR is where that
+            // choice lives, so "back past PG_APPEAR" means "before the
+            // Appearance page was ever reached this pass".
+            self.theme = default_theme_idx(unsafe { &*core::ptr::addr_of!(THEMES) }, self.nthemes);
+            self.dock_style = DOCK_XFCE_IDX;
+        }
         if from <= PG_WALL { self.wall = 0; }
         // #745 task #15: apps/widgets. "I did not choose" means the system
         // keeps its shipped defaults (spec 9.3), which for apps is ZERO
@@ -7511,15 +7921,15 @@ impl App {
         // so pressing it on Welcome or Create-your-account does nothing at all,
         // which is the same answer the missing link gives.
         if ev.keycode == KC_F10 { return self.skip(); }
-        // #136: keyboard equivalents of the bottom-right corner controls,
-        // checked here for the same reason as KC_F10 just above (PG_TIME/
-        // PG_APPEAR consume every key). Unlike the mouse path, these are
-        // NOT gated on CARD_MODE - draw_corner_controls()/on_click() hide
-        // the legacy small-screen fallback's row for lack of space, but a
-        // keyboard-only path to a working Restart/Shut Down/Skip to Desktop
-        // must exist regardless of screen size (#334: mouse is unreliable,
-        // keyboard is the fallback that has to always work).
-        if ev.keycode == KC_F9 && self.page != PG_APPLY { return self.skip_to_desktop(); }
+        // #198: keyboard equivalents of the power-corner buttons, checked
+        // here for the same reason as KC_F10 just above (PG_TIME/PG_APPEAR
+        // consume every key). Unlike the mouse path (pwr_win), these are NOT
+        // gated on CARD_MODE - pwr_create()'s small-screen fallback hides
+        // the drawn row for lack of space, but a keyboard-only path to a
+        // working Restart/Shut Down must exist regardless of screen size
+        // (#334: mouse is unreliable, keyboard is the fallback that has to
+        // always work). F9 (Skip to Desktop) used to be checked alongside
+        // these; removed per owner request, 2026-08-28.
         if ev.keycode == KC_F2 { do_reboot(); return true; }
         if ev.keycode == KC_F3 { do_poweroff(); return true; }
 
@@ -7625,23 +8035,6 @@ impl App {
     }
 
     fn on_click(&mut self, mx: i32, my: i32) -> bool {
-        // #136: checked FIRST and unconditionally on self.page, because the
-        // PG_WELCOME arm immediately below returns unconditionally and would
-        // otherwise make a later check here dead code on that page - and
-        // Welcome/Account are exactly the two pages this control has to
-        // reach (see corner_hit()'s block comment).
-        if self.page != PG_APPLY && unsafe { CARD_MODE } {
-            for i in 0..3usize {
-                let (bx, by, bw, bh) = corner_hit(i);
-                if mx >= bx && mx < bx + bw && my >= by && my < by + bh {
-                    return match i {
-                        0 => self.skip_to_desktop(),
-                        1 => { do_reboot(); true }
-                        _ => { do_poweroff(); true }
-                    };
-                }
-            }
-        }
         if self.page == PG_WELCOME {
             // One control, one action. The second rect here was the "Set up
             // later" link, and it called the very same self.next() - see
@@ -8218,6 +8611,11 @@ pub extern "C" fn main() -> i32 {
     // panel, which the spec's shadow was never designed against.
     if card { win_set_shadow(win); }
 
+    // #198: the power corner's own window - a second window this SAME
+    // process owns (docs/WIZARD_POWER_CORNER.html section 1). pwr_create()
+    // itself gates on CARD_MODE (already set above).
+    pwr_create();
+
     unsafe { gui_set_style(GUI_STYLE_MODERN); }
 
     let mut app = App {
@@ -8243,7 +8641,7 @@ pub extern "C" fn main() -> i32 {
         tzc_sel: 0, tzc_first: 0, tz_search: Field::new(false),
         time_focus: 0, ntp_on: false, ntp_server: Field::new(false), ntp_preset: 0,
         dt_year: 2026, dt_month: 1, dt_day: 1, dt_hour: 0, dt_min: 0, dt_sec: 0,
-        dock_style: 0, appear_zone: 0,
+        dock_style: DOCK_XFCE_IDX, appear_zone: 0,
         // #745 task #15: apps_sel seeded to the compiled-in default here
         // (spec 6.1: "the defaults... unless the person has already visited
         // the page and gone Back", which just means never resetting it again
@@ -8285,6 +8683,18 @@ pub extern "C" fn main() -> i32 {
             while k < 32 { if t.slug[k] != slug[k] { same = false; break; } if slug[k] == 0 { break; } k += 1; }
             if same && slug[0] != 0 { if t.is_dark != 0 { app.p = &DARK; } break; }
             i += 1;
+        }
+        // (#wizdock) slug[0] == 0 means no THEME.CFG exists yet - a genuinely
+        // unconfigured machine, the ONLY case this may touch (an existing
+        // choice, found above, is left exactly as read). Default the
+        // Appearance page's pre-selected theme to Fluent Dark by NAME, since
+        // its THEMES[] index depends on what is on /THEMES this build (see
+        // default_theme_idx()'s own comment).
+        if slug[0] == 0 {
+            app.theme = default_theme_idx(unsafe { &*core::ptr::addr_of!(THEMES) }, app.nthemes);
+            if app.theme < app.nthemes && unsafe { &THEMES[app.theme] }.is_dark != 0 {
+                app.p = &DARK;
+            }
         }
     }
     app.nwalls  = unsafe { wp_enumerate(core::ptr::addr_of_mut!(WALLS) as *mut WpEntry, 96) }.max(0) as usize;
@@ -8378,6 +8788,12 @@ pub extern "C" fn main() -> i32 {
         // clock, and every syscall inside it returns immediately, so calling
         // it here cannot stall the wizard.
         if app.net_tick() { app.draw(); win_invalidate(win); }
+        // #198: service pwr_win's own event queue every iteration too,
+        // piggybacking on this same 250ms win_get_event(win, ...) cadence
+        // rather than adding a new loop (#426/#419/#420 class) - a SECOND
+        // win_get_event(pwr_win, ..., 0) is a non-blocking immediate poll,
+        // same as net_tick() just above it.
+        pwr_pump();
         if got == 0 { continue; }
         match ev.ty {
             EV_REDRAW => app.draw(),
@@ -8477,6 +8893,7 @@ pub extern "C" fn main() -> i32 {
         }
     }
 
+    pwr_destroy();   // #198: beside the existing win_destroy(win) below
     win_destroy(win);
     0
 }

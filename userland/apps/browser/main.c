@@ -261,6 +261,41 @@ static int  sb_drag_dy = 0;    // cursor offset within the thumb at grab
 
 // Status message.
 static char status_msg[160] = "Ready";
+
+// ---------------------------------------------------------------------------
+// #549 CONNECTIVITY BREAKER: WAIT FOR THE RE-PROBE WINDOW INSTEAD OF GIVING UP.
+// (browsenet, 2026-09-01. Owner report on golden 2317: "I can ping 1.1.1.1
+// from the terminal but the browser is failing to load example.com".)
+//
+// MEASURED on the owner's machine, from its own /BOOTLOG.TXT:
+//   [NETDIAG] drv=CDC-ECM carrier=1 state=FAULTY cfg=dhcp dhcp=BOUND
+//             ip=192.0.2.1 gw=192.0.2.1 gwarp=RESOLVED dns=192.0.2.1
+// Link up, lease held, gateway ARP resolved, resolver known - and the kernel's
+// connectivity breaker had marked the interface FAULTY. While FAULTY,
+// sys_http_fetch_start() refuses every request with NET_ERR_FAULTY (-3) except
+// ONE re-probe per 30 SECONDS, shared by every process on the machine. ICMP is
+// not gated at all, which is exactly why ping to a literal IP kept working and
+// made this look like a DNS fault.
+//
+// WHAT THIS BROWSER USED TO DO WITH THAT. http_fetch_start() returned -3, the
+// code below fell through to two SYNCHRONOUS fetch_page() calls, and those are
+// gated on the same breaker, so all three were refused within microseconds of
+// each other and the page reported a bare "Fetch failed". The user therefore
+// had a window of a few microseconds every 30 seconds in which to click Go, and
+// was competing for it with the App Repo and the update service, which take the
+// same token. In practice the browser could never load anything again.
+//
+// A single click is not a retry storm - the storm #549 exists to stop was
+// background pollers retrying continuously - so waiting out one 30s window is
+// both correct and cheap: one syscall every 2s for at most ~35s, and it stops
+// the moment the request is admitted, the page loads, or the user hits Stop.
+// It does NOT widen the wire budget: the kernel still admits at most one
+// request per 30s. It only stops us throwing away our turn.
+#define BR_FAULTY_RETRY_MS   2000    // ask again this often
+#define BR_FAULTY_WINDOW_MS  35000   // one full 30s probe interval, plus slack
+static unsigned long g_faulty_next_ms;    // when to retry http_fetch_start
+static unsigned long g_faulty_until_ms;   // give up after this
+static int           g_faulty_wait;       // 1 = waiting out the breaker
 static int  is_loading = 0;
 static int  last_was_error = 0;
 
@@ -1286,6 +1321,40 @@ static int fetch_progress_text(char *out, int cap) {
 }
 
 static void poll_fetch(void) {
+    // Waiting out the #549 breaker's 30s re-probe interval (see the note by
+    // g_faulty_wait). One syscall every BR_FAULTY_RETRY_MS, bounded.
+    if (g_faulty_wait) {
+        unsigned long now = uptime_ms();
+        if (now < g_faulty_next_ms) return;
+        g_faulty_next_ms = now + BR_FAULTY_RETRY_MS;
+        int id = http_fetch_start(url_buffer);
+        if (id >= 0) {                     // admitted: resume the normal path
+            g_faulty_wait = 0;
+            g_fetch_id = id;
+            g_fetch_phase = HTTP_PHASE_IDLE;
+            g_fetch_bytes = 0; g_fetch_content_len = 0;
+            str_cpy(status_msg, "Loading...");
+            redraw();
+            return;
+        }
+        if (id == NET_ERR_FAULTY && now < g_faulty_until_ms) return;   // keep waiting
+        // Either a different failure, or the window expired with the interface
+        // still faulty. Report the REAL reason: "Fetch failed" sent a previous
+        // investigation after DNS.
+        g_faulty_wait = 0;
+        is_loading = 0;
+        g_fetch_phase = HTTP_PHASE_ERROR;
+        str_cpy(status_msg,
+                id == NET_ERR_FAULTY
+                    ? "Network disabled by the connectivity breaker (NET_FAULTY). "
+                      "Try Settings > Network > reconnect, or run nslookup."
+                    : "Fetch failed");
+        last_was_error = 1;
+        str_cpy(display_buffer, status_msg);
+        display_length = str_len(display_buffer);
+        redraw();
+        return;
+    }
     if (!is_loading || g_fetch_id < 0) return;
     int status = 0;
     int st = http_fetch_poll(g_fetch_id, &status, 0);
@@ -1348,6 +1417,17 @@ static void poll_fetch(void) {
             g_fetch_phase = HTTP_PHASE_IDLE; g_fetch_bytes = 0; g_fetch_content_len = 0;
             g_fetch_id = http_fetch_start(url_buffer);
             if (g_fetch_id >= 0) return;
+            if (g_fetch_id == NET_ERR_FAULTY) {   // breaker tripped mid-load
+                g_fetch_id = -1;
+                g_faulty_wait     = 1;
+                g_faulty_next_ms  = uptime_ms() + BR_FAULTY_RETRY_MS;
+                g_faulty_until_ms = uptime_ms() + BR_FAULTY_WINDOW_MS;
+                str_cpy(status_msg,
+                        "Network disabled after repeated failures; retrying...");
+                redraw();
+                return;
+            }
+            g_fetch_id = -1;
         }
         is_loading = 0;
         g_fetch_phase = HTTP_PHASE_ERROR;
@@ -1407,6 +1487,22 @@ static void navigate(int record_history) {
     g_fetch_retry = 0;
     g_fetch_phase = HTTP_PHASE_IDLE; g_fetch_bytes = 0; g_fetch_content_len = 0;   // #25
     g_fetch_id = http_fetch_start(url_buffer);
+    if (g_fetch_id == NET_ERR_FAULTY) {
+        // The breaker refused this request. Do NOT fall through to the two
+        // synchronous fetch_page() calls below: they are gated on the same
+        // breaker and would be refused in the same instant, turning a
+        // recoverable wait into a hard failure. Wait for the re-probe window.
+        g_fetch_id       = -1;   // -3 is not a job id; do not leave it in the slot
+        g_faulty_wait    = 1;
+        g_faulty_next_ms = uptime_ms() + BR_FAULTY_RETRY_MS;
+        g_faulty_until_ms = uptime_ms() + BR_FAULTY_WINDOW_MS;
+        is_loading = 1;
+        last_was_error = 0;
+        str_cpy(status_msg,
+                "Network disabled after repeated failures; retrying...");
+        redraw();
+        return;
+    }
     if (g_fetch_id < 0) {
         // Fallback: no free job slot / worker spawn failed -> do it inline.
         int ret = fetch_page(url_buffer);
@@ -1624,6 +1720,7 @@ static void go_home(void) {
 // already existed (#277) but had no caller anywhere in the browser - progress
 // without a way to interrupt it is only half the feature.
 static void stop_load(void) {
+    g_faulty_wait = 0;   // browsenet: Stop also cancels a breaker re-probe wait
     if (g_fetch_id >= 0) { http_fetch_cancel(g_fetch_id); g_fetch_id = -1; }
     is_loading = 0;
     g_fetch_phase = HTTP_PHASE_IDLE; g_fetch_bytes = 0; g_fetch_content_len = 0;

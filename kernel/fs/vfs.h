@@ -284,6 +284,13 @@ int     file_has_poll(file_t *f);
 // #745 (local 82). ops->poll_wq, or NULL. See the op comment above.
 struct wait_queue_head *file_poll_wq(file_t *f, int events);
 
+// #SMPGLOBALS: the two fd-table primitives, split so a harness can drive the
+// REAL locked bodies against a chosen PCB rather than a copy of the logic.
+// Everything else in this section is proc_current() only.
+struct process;
+int fd_alloc_install_on(struct process *p, struct file *f);
+int fd_close_on(struct process *p, int fd);
+
 // ---- per-process fd table (operates on current_proc->fds[]) ----
 
 // Find the lowest free fd >= min, or -1 if the table is full.

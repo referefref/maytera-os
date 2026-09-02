@@ -216,6 +216,42 @@ int io_thumb(const char *path, uint32_t *out, int tw, int th) {
     return 0;
 }
 
+// Splash art (ui.c ui_splash, #472/no-ticket): decode /STUDIO.BMP and fit it
+// into the caller's (x,y,boxw,boxh) box, fit-by-width then centre-cropped
+// vertically. Reuses SYS_DECODE_IMAGE - the same decoder io_load()'s
+// PNG/JPEG branch above already goes through - rather than a second bespoke
+// image path. Never upscales: if the source is narrower or shorter than the
+// box after the fit, it is centred and the caller's own background (drawn
+// first) shows through the gap. Does not touch g_doc, matching io_thumb()'s
+// contract. Returns 1 if art was drawn, 0 on any failure (file missing,
+// corrupt/undecodable BMP, OOM) so the caller can fall back to its own
+// procedural art - this must never be the reason the app fails to start.
+int io_splash_art(int win, int x, int y, int boxw, int boxh) {
+    if (boxw < 1 || boxh < 1) return 0;
+    long len = 0;
+    unsigned char *f = read_whole("/STUDIO.BMP", &len);
+    if (!f) return 0;
+    unsigned long cap = (unsigned long)STUDIO_MAX_W * STUDIO_MAX_H * 4u;
+    uint32_t *out = (uint32_t *)malloc((size_t)cap);
+    if (!out) { free(f); return 0; }
+    int dims[2] = {0, 0};
+    // th=0xFFFF: fit by width only. We crop to boxh ourselves below rather
+    // than letting the kernel's downscale also constrain height, which would
+    // throw away resolution unnecessarily whenever the box is wider (relative
+    // to its own height) than the source image - the normal case for a
+    // maritime splash band over a near-square photo.
+    int n = decode_image(f, (unsigned)len, boxw, 0xFFFF, out, (unsigned)cap, dims);
+    free(f);
+    int dw = dims[0], dh = dims[1];
+    if (n <= 0 || dw < 1 || dh < 1) { free(out); return 0; }
+    int cropTop = 0, drawH = dh;
+    if (dh > boxh) { cropTop = (dh - boxh) / 2; drawH = boxh; }
+    int dx = x + (boxw - dw) / 2;   // centred; dw<=boxw always (never upscaled)
+    win_draw_image(win, dx, y, dw, drawH, out + (long)cropTop * dw);
+    free(out);
+    return 1;
+}
+
 // Classic 24-bit BGR, bottom-up, 4-byte aligned rows (BITMAPINFOHEADER).
 static int bmp_save_bgr24(int fd, const uint32_t *src, int w, int h) {
     long stride = ((long)w * 3 + 3) & ~3L;

@@ -1,5 +1,6 @@
 // process.c - Process and task management implementation
 #include "process.h"
+#include "affinity.h"   // #affinity: the persistent per-process CPU mask
 #include "../fs/bootlog.h"   // #134: persistent process-exit record (owning header)
 #include "schedrace.h"   // #75: SMP context-corruption reproducer
 #include "syscall.h"
@@ -27,6 +28,22 @@
 
 // Process table
 static process_t proc_table[MAX_PROCESSES];
+
+#ifdef SIGFRAME_DIFF
+// #SMPGLOBALS differential ONLY (make SIGFRAMEDIFF=1). Name the task whose
+// ring-0 syscall frame a given address is, so the [SIGFRAME] report can say
+// WHOSE registers the deleted global would have had rt_sigreturn rewrite,
+// rather than only that the address was wrong.
+process_t *sigframe_owner_of(uint64_t frame_addr, uint64_t frame_bytes) {
+    for (int i = 0; i < MAX_PROCESSES; i++) {
+        process_t *p = &proc_table[i];
+        if (p->state == PROC_STATE_UNUSED || !p->stack_base) continue;
+        if ((uint64_t)p->stack_base + p->stack_size - frame_bytes == frame_addr)
+            return p;
+    }
+    return 0;
+}
+#endif
 
 // #230: the child-exit wait queue. Declared up here because proc_init() (which
 // initialises it) runs long before proc_wait() (which is defined further down
@@ -146,6 +163,26 @@ int proc_get_cpu_usage(void) { return g_cpu_pct; }
 
 // Forward declarations
 static void idle_process(void *arg);
+// #pid0desk: set once the GUI session runs as its own process, so the BSP idle
+// loop stops pumping the kernel desktop's input behind its back.
+int g_desktop_owns_tick = 0;
+
+// #pid0desk: HOW MANY WAKE-UPS THE #130 GUARD HAS THROWN AWAY, and who asked.
+//
+// This is the instrument for the starvation bug, and it is deliberately ALWAYS
+// ON, in the golden, not behind a debug flag. add_to_ready_queue() refusing an
+// idle process is CORRECT, but it is only harmless if nothing that actually
+// needs to run is an idle process. While desktop_run() executed on pid 0 that
+// was false, and every refusal counted here was one dropped desktop frame --
+// silently, with no log line anywhere in the tree.
+//
+// EXPECTED VALUE AFTER THE FIX: 0, and it staying 0 is the machine-checkable
+// statement that no live code path is trying to wake an idle process any more.
+// A NON-ZERO value on a fixed build means something new sleeps on an idle
+// process and is being starved exactly as the desktop was. Reported on the
+// [SCHEDCORE] line as idleq=<n>@<ra>.
+unsigned long g_idle_enq_refused = 0;
+void *g_idle_enq_refused_ra = 0;
 static void proc_wrapper(void);
 static void add_to_ready_queue(process_t *proc);
 static process_t *remove_from_ready_queue(void);
@@ -1258,6 +1295,131 @@ volatile uint32_t g_sweep_left    = 0;   // sleepers left asleep, last pass
 int g_wake_defer_fix = 1;
 
 // ===========================================================================
+// #wakelag: A TIMED SLEEP COULD ONLY BE NOTICED ONCE PER TIME SLICE, NOT ONCE
+// PER TICK.
+//
+// THE MECHANISM, read off this file. wake_sleeping_procs() is the ONLY code
+// that ends a proc_sleep(), and it is called from exactly ONE place:
+// sched_schedule(). sched_tick() - which runs at g_timer_hz (250 Hz, 4 ms) -
+// does NOT call it. The tick reaches sched_schedule() only when the RUNNING
+// task's slice runs out, and TIME_SLICE_TICKS is 10, i.e. 40 ms at 250 Hz.
+// (Its comment still says "~100ms at 100Hz timer", from before the tick rate
+// changed.) The BSP idle loop is `sti; hlt` and its own comment says it
+// "relied on sched_tick() to preempt the core into work" - which sched_tick
+// does, once every 40 ms.
+//
+// So the resolution of every sleep in the system was ONE TIME SLICE, not one
+// tick. sys_sleep(8) on an otherwise idle machine returned after ~40 ms,
+// because after the sleeper blocked, NOTHING looked at its deadline until the
+// idle process had burned its whole slice. The clock was never wrong and the
+// deadline arithmetic was never wrong: nobody read them.
+//
+// This is the shape this project keeps producing - a mechanism that exists,
+// compiles, is called, and cannot fire at the rate it must. wq_ms_to_ticks()
+// rounds a millisecond timeout UP to the nearest tick "so a wait never returns
+// EARLY", with a 4 ms tick as the stated resolution (waitq.h, #227). That
+// stated resolution was never achievable: the sweep behind it ran at 25 Hz.
+//
+// THE FIX. sched_tick() now consumes the sweep's OWN published minimum,
+// g_sweep_minleft (the earliest deadline the last sweep chose not to wake -
+// #167 added it for hung-guest forensics and it is exactly the O(1) predicate
+// wanted here), and expires the current slice when that deadline has passed.
+// The reschedule then happens through the one piece of code that already knows
+// how to do it - the same technique the #67 pass-7 cross-core preemption block
+// immediately above uses, for the same reason. Cost on the hot path: one
+// volatile load, and a monotonic-clock read only when a sleeper is actually
+// armed.
+//
+// It does NOT sweep from the tick. Walking MAX_PROCESSES and calling
+// add_to_ready_queue()/sig_raise() from the timer ISR at 250 Hz would be both
+// more expensive and a much wider change than expiring a slice.
+//
+// GATE, one binary and both arms (the /NOWAKEFIX.TXT design, reused): an empty
+// /NOWAKELAG.TXT on the ESP clears this and restores the 40 ms behaviour, so
+// the negative control is a FILE, not a second build.
+int g_wakelag_fix = 1;
+
+// #wakelag INSTRUMENT. Two stages, deliberately separate:
+//   stage 1  deadline -> READY   (how late the sweep NOTICED; the defect above)
+//   stage 2  READY   -> RUNNING  (how late the scheduler DISPATCHED it)
+// A single end-to-end "the sleep was 45 ms" cannot distinguish them, and they
+// have different fixes. Both are sampled in milliseconds off the same
+// monotonic clock the deadlines use, so no second clock can disagree.
+//
+// Sums are 64-bit and per-boot; the max is kept because a mean hides a tail.
+// The 8-bucket histograms are power-of-two ms so the shape survives when the
+// mean does not (the #compceiling [INPUTLAT] lesson: coarse buckets cannot
+// resolve a small injection, so the SHAPE is what is reported, next to a mean).
+volatile uint64_t g_wl_wake_n = 0, g_wl_wake_sum = 0, g_wl_wake_max = 0;
+volatile uint64_t g_wl_disp_n = 0, g_wl_disp_sum = 0, g_wl_disp_max = 0;
+volatile uint32_t g_wl_wake_hist[8];   // 0,1,2-3,4-7,8-15,16-31,32-63,64+ ms
+volatile uint32_t g_wl_disp_hist[8];
+// How many times the new tick check actually expired a slice. If this is 0 the
+// fix did not run, whatever the mean says - the counter is what proves the code
+// path is reached, and it is read in BOTH arms (it must be 0 with the gate
+// file present, and non-zero without it, or the gate is not doing what the
+// experiment claims).
+volatile uint64_t g_wl_forced = 0;
+
+static inline uint32_t wl_bucket(uint64_t ms) {
+    if (ms == 0) return 0;
+    if (ms == 1) return 1;
+    if (ms < 4)  return 2;
+    if (ms < 8)  return 3;
+    if (ms < 16) return 4;
+    if (ms < 32) return 5;
+    if (ms < 64) return 6;
+    return 7;
+}
+
+// Called from the wake site in wake_sleeping_procs(). `now` and `deadline` are
+// both absolute mono_ms() values; the sweep samples `now` once per pass, which
+// is what makes this a measure of the SWEEP's lateness and not of clock jitter.
+static inline void wl_note_wake(uint64_t now, uint64_t deadline) {
+    uint64_t lag = (int64_t)(now - deadline) > 0 ? (now - deadline) : 0;
+    g_wl_wake_n++; g_wl_wake_sum += lag;
+    if (lag > g_wl_wake_max) g_wl_wake_max = lag;
+    g_wl_wake_hist[wl_bucket(lag)]++;
+}
+
+static inline void wl_note_dispatch(uint64_t now, uint64_t ready_ms) {
+    uint64_t lag = (int64_t)(now - ready_ms) > 0 ? (now - ready_ms) : 0;
+    g_wl_disp_n++; g_wl_disp_sum += lag;
+    if (lag > g_wl_disp_max) g_wl_disp_max = lag;
+    g_wl_disp_hist[wl_bucket(lag)]++;
+}
+
+// ~4 s heartbeat, printed from sched_tick() on cpu0 only (its statics are then
+// not shared state - the #67 pass-2 rule). No gate file: an instrument behind a
+// gate is an instrument the person with the fault does not have (idleprof.c's
+// own justification, reused).
+static void sleeplag_report(void) {
+    static uint64_t last_n = 0, last_sum = 0, last_dn = 0, last_dsum = 0;
+    uint64_t n = g_wl_wake_n, sum = g_wl_wake_sum;
+    uint64_t dn = g_wl_disp_n, dsum = g_wl_disp_sum;
+    uint64_t wn = n - last_n, ws = sum - last_sum;
+    uint64_t xn = dn - last_dn, xs = dsum - last_dsum;
+    last_n = n; last_sum = sum; last_dn = dn; last_dsum = dsum;
+    kprintf("[SLEEPLAG] fix=%d forced=%llu | wake n=%llu win_n=%llu "
+            "win_mean=%llums max=%llums h=%u/%u/%u/%u/%u/%u/%u/%u | "
+            "disp n=%llu win_mean=%llums max=%llums "
+            "h=%u/%u/%u/%u/%u/%u/%u/%u\n",
+            g_wakelag_fix, (unsigned long long)g_wl_forced,
+            (unsigned long long)n, (unsigned long long)wn,
+            (unsigned long long)(wn ? ws / wn : 0),
+            (unsigned long long)g_wl_wake_max,
+            g_wl_wake_hist[0], g_wl_wake_hist[1], g_wl_wake_hist[2],
+            g_wl_wake_hist[3], g_wl_wake_hist[4], g_wl_wake_hist[5],
+            g_wl_wake_hist[6], g_wl_wake_hist[7],
+            (unsigned long long)dn,
+            (unsigned long long)(xn ? xs / xn : 0),
+            (unsigned long long)g_wl_disp_max,
+            g_wl_disp_hist[0], g_wl_disp_hist[1], g_wl_disp_hist[2],
+            g_wl_disp_hist[3], g_wl_disp_hist[4], g_wl_disp_hist[5],
+            g_wl_disp_hist[6], g_wl_disp_hist[7]);
+}
+
+// ===========================================================================
 // #75 (enqrace75): THE SELECTION PIN GUARDS AGAINST EXIT BUT NOT AGAINST
 // ENQUEUE.
 //
@@ -1823,6 +1985,38 @@ _Static_assert(sizeof(sched_core_state_t) == 16,
 
 extern int sched_place_rs(const sched_core_state_t *cores, uint32_t ncpu,
                           int32_t prio, uint32_t prev_cpu);
+
+// #affinity: placement WITH a per-process CPU mask. The unmasked form above is
+// now a thin wrapper passing all-ones, so there is ONE placement policy and not
+// two that can drift (rustkern/schedwatch.rs).
+extern int sched_place_masked_rs(const sched_core_state_t *cores, uint32_t ncpu,
+                                 int32_t prio, uint32_t prev_cpu,
+                                 uint64_t allowed);
+
+// #affinity: HOW LONG A TASK MAY BE HELD BACK to honour its affinity mask
+// before the mask is ignored and it is taken by whichever core is asking.
+// In scheduler ticks, the same clock the #254/#601 aging sweep uses.
+//
+// This is a CEILING, not a target: a preference must never be able to starve a
+// task. 25 ticks at the 4 ms tick is 100 ms, long enough that a task normally
+// waits for its own core rather than being stolen on the first idle tick, short
+// enough that the worst case is invisible to a user. Every timeout value is
+// wrong at some load (#227), which is exactly why the mask is DROPPED when this
+// expires rather than the deadline being extended.
+#define SCHED_AFF_STARVE_TICKS 25u
+
+// #affinity: pops REFUSED to honour a mask, and pops that took a task ANYWAY
+// because the starvation escape fired. Two counters, not one, because they mean
+// opposite things: skips rising with migrations falling is the feature working;
+// escapes rising is the mask fighting the placement rather than agreeing with
+// it, which is a tuning fault and is invisible if only the total is recorded.
+volatile uint64_t g_aff_skips = 0;
+volatile uint64_t g_aff_escapes = 0;
+// Of those skips, the ones that refused a CROSS-QUEUE STEAL specifically. The
+// steal path is the one with no affinity of any kind before this change, so
+// this is the counter that says whether the fix reached the thing it was aimed
+// at rather than only tightening the local pop.
+volatile uint64_t g_aff_steal_skips = 0;
 extern int sched_steal_rs(const sched_core_state_t *cores, uint32_t ncpu,
                           uint32_t self_cpu, const int32_t *top_prios);
 extern int sched_core_pct_rs(const uint64_t *busy, uint32_t ncpu, uint64_t total,
@@ -2023,6 +2217,67 @@ static process_t *sched_rq_pop_locked(uint32_t cpu) {
                         c->name, c->pid, (uint32_t)c->state);
             }
             prev = c; c = c->next; continue;
+        }
+        // #affinity: DOES THIS TASK WANT THIS CORE? Soft, with a starvation
+        // escape, and the escape is the only reason this is safe to do here.
+        //
+        // Placement decides where a task is QUEUED. Stealing moves it anyway:
+        // sched_rq_pop() lets an idle core take the highest-priority head off
+        // ANY queue, and cpu/smp.c already says that path "STEALS ACROSS CORES
+        // with no affinity of any kind". Without this test the mask would be
+        // undone on the very path that generates the migrations it exists to
+        // prevent.
+        //
+        // WHY A HARD SKIP HERE WOULD BE A BUG, NOT A FEATURE. This core may be
+        // the only one that ever looks at this queue, so a task whose mask
+        // excludes it would sit here for ever while the core idles. That is
+        // strictly worse than the migration the mask avoids, and it is exactly
+        // how an affinity feature earns a reputation for causing hangs. So the
+        // preference is honoured only while the task has NOT waited long; past
+        // SCHED_AFF_STARVE_TICKS the mask is ignored and the task is taken.
+        //
+        // ready_since is set by sched_rq_push() and is the same field the
+        // #254/#601 aging sweep uses, so this adds no second notion of "how
+        // long has this waited".
+        //
+        // NOTE the deliberate asymmetry with the placement call in
+        // sched_rq_push(): placement can afford to be strict because it always
+        // has another core to choose; this cannot, because it is looking at one
+        // queue. Same mask, two strictnesses, for that reason and no other.
+        // #affinity CORRECTION, and it is the #75 TRAP RECURRING IN THE SAME
+        // FUNCTION. The parameter `cpu` is the QUEUE THIS ENTRY IS BEING TAKEN
+        // FROM, not the core that is about to run the task: sched_rq_pop()
+        // calls this as sched_rq_pop_locked(victim) on the steal path. The
+        // affinity question is "may this task run on the core that is TAKING
+        // it", so it must be asked about sched_rq_cpu(), exactly as the
+        // sched_pinned stamp forty lines below had to be corrected from `cpu`
+        // to sched_rq_cpu() for the same reason.
+        //
+        // Getting this wrong is not a subtle mis-accounting, it silently
+        // DEFEATS THE FEATURE on the one path it exists for: a compositor
+        // pinned to cpu0 and sitting in queue 0 would be asked "do you allow
+        // cpu0", answer yes, and be stolen onto core 3 anyway. Placement would
+        // still work, so the mask would look half-alive and the measured
+        // improvement would be quietly smaller than it should be, which is the
+        // worst kind of wrong: a number that moves in the right direction for
+        // the wrong reason. Caught by re-reading this function against its own
+        // #75 comment before any number from it was quoted.
+        uint32_t taking_cpu = sched_rq_cpu();
+        if (!affinity_allows_rs(c->pid, taking_cpu)) {
+            if ((sched_ticks - c->ready_since) < SCHED_AFF_STARVE_TICKS) {
+                g_aff_skips++;
+                // Was this a STEAL being refused, or a local pop? They are
+                // different mechanisms and only one of them is the reason this
+                // check exists. Recording them apart is what lets a result be
+                // attributed instead of assumed: if migrations fall while
+                // stealskip stays 0, the steal path is not what did it.
+                if (taking_cpu != cpu) g_aff_steal_skips++;
+                prev = c; c = c->next; continue;
+            }
+            // Starved past the ceiling: take it anyway, and SAY SO. Counted
+            // here, at the one place the escape can fire, so the number cannot
+            // be inflated by repeated scans of an entry that is never taken.
+            g_aff_escapes++;
         }
         if (c->sched_on_cpu == 0) {
             if (prev) prev->next = c->next; else q->head = c->next;
@@ -2312,7 +2567,25 @@ static void sched_rq_push(process_t *proc) {
     // so the live running_cpu would be -1 here every time and the hint would be
     // dead code. This line is why last_cpu has to exist separately.
     uint32_t prev_cpu = (proc->last_cpu >= 0) ? (uint32_t)proc->last_cpu : n;
-    int r = sched_place_rs(cs, n, prio, prev_cpu);
+    // #affinity: the PERSISTENT MASK, which is a different thing from the
+    // prev_cpu HINT on the line above. prev_cpu says "it ran there last"; the
+    // mask says "it asked to run there". Both are advisory; neither outranks
+    // priority.
+    //
+    // THIS LINE IS WHERE THE PREEMPTION GAP CLOSES. sched_place_rs() honours
+    // prev_cpu when choosing among IDLE cores and when QUEUEING, but its
+    // preempt step picks the core running the weakest victim with no affinity
+    // term at all. On this machine the compositor is the only PRIO_HIGH
+    // process, so preemption is the step it takes on almost every wake, which
+    // means the pre-existing hint was being bypassed on the single most
+    // latency-sensitive path in the system. The masked form applies the mask
+    // inside its own eligibility test, so all three steps are covered at once.
+    //
+    // SOFT: if no allowed core is a scheduler consumer the mask is DROPPED and
+    // placement proceeds over every consumer, so no mask value can strand a
+    // task here. schedwatch's self-test has an arm for exactly that.
+    int r = sched_place_masked_rs(cs, n, prio, prev_cpu,
+                                  affinity_get_rs(proc->pid));
     int target_was_idle = 0;
     int preempt = 0;
     uint32_t target;
@@ -2437,9 +2710,125 @@ static process_t *sched_rq_pop(void) {
 // (cleared inside the switch asm), which is a different field with a different
 // job, and nothing keys a correctness decision on running_cpu.
 // ===========================================================================
+
+// ===========================================================================
+// #smpfix (#75): CATCH A BAD KERNEL rsp AT THE MOMENT IT IS SAVED, NOT WHEN
+// THE NEXT CORE TRIES TO RESUME IT.
+// ===========================================================================
+//
+// The open fault reads, at the far end (rakbd2 baseline, golden 2300, 2 vCPU,
+// 141 s in):
+//
+//   [SCHEDRACE] reason 1: rsp outside the incoming task's kernel stack
+//   incoming: 'COMPOSIT' pid=26 rsp=0xbffee748 stack=[0x112cb4d0,0x112db4d0)
+//   USERRSP  rsp=0xbffee748 user_rsp=0xbffeffa0 delta=6232
+//
+// i.e. a Ring-3 task whose SAVED KERNEL rsp is an address inside its own USER
+// stack. For that value to exist, some core must have been executing kernel
+// code ON THE USER STACK at the instant it switched that task out, because the
+// only writer of process_t::rsp on the switch path is the switch asm storing
+// the live stack pointer. The [SCHEDRACE] detector runs on a DIFFERENT core, a
+// switch later, and structurally cannot name the writer - three campaigns have
+// now read that dump without being able to.
+//
+// This validator runs on the WRITING core at the WRITING instant, against the
+// live stack pointer that is about to be stored. Two compares on the switch
+// path. It is a pure function so it can be PROVEN at boot rather than trusted
+// (stacksave_selftest()): a detector that has only ever been observed silent is
+// not evidence of anything, which is the lesson this tree keeps re-learning.
+static inline int stacksave_live_is_bad(uint64_t live, uint64_t lo, uint64_t hi) {
+    if (!lo || hi <= lo) return 0;          // no stack recorded: nothing to say
+    return (live < lo || live >= hi) ? 1 : 0;
+}
+
+volatile uint64_t g_stacksave_bad = 0;       // saves refused by the invariant
+// cpu/idt.c: interrupts taken at CPL 0 while RSP was a user address.
+extern volatile uint64_t g_irq_on_user_stack;
+// Return address of sched_schedule()'s own caller, per core, stamped at entry.
+// Written with IF=0 inside sched_schedule()'s cli region, so it names the path
+// this core is currently on and not a stale one.
+volatile uint64_t g_sched_entry_ra[MAYTERA_MAX_CPUS];
+// Context switches PERFORMED by this core. The existing g_ctx_switches is a
+// single machine-wide counter, so it cannot answer "did MY last entry into the
+// scheduler achieve anything", which is exactly the question the AP idle loop
+// has to ask. Incremented at the same committed point running_cpu is published.
+volatile uint64_t g_cpu_switches[MAYTERA_MAX_CPUS];
+
+// #smpfix: AP IDLE-LOOP ACCOUNTING. See the loop in sched_ap_enter().
+volatile uint64_t g_apidle_pass[MAYTERA_MAX_CPUS];    // loop iterations
+volatile uint64_t g_apidle_sched[MAYTERA_MAX_CPUS];   // entries into sched_schedule
+volatile uint64_t g_apidle_noprog[MAYTERA_MAX_CPUS];  // ... that switched nothing
+volatile uint64_t g_apidle_halt[MAYTERA_MAX_CPUS];    // iterations that reached hlt
+volatile uint64_t g_sched_nopreempt[MAYTERA_MAX_CPUS];// sched_schedule early-returns
+                                                      // because preemption is off
+
+// #smpfix GATE. An empty /NOAPIDLEBACKOFF.TXT on the FAT ESP restores the old
+// behaviour (re-enter the scheduler immediately after a pass that achieved
+// nothing) so the control and fix arms are the SAME kernel.elf and one file.
+int g_apidle_backoff = 1;
+
+static void stacksave_note(process_t *prev, uint64_t live, uint32_t cpu) {
+    uint64_t lo = (uint64_t)prev->stack_base;
+    uint64_t hi = lo + prev->stack_size;
+    if (!stacksave_live_is_bad(live, lo, hi)) return;
+    g_stacksave_bad++;
+    static int printed = 0;
+    if (printed < 4) {
+        printed++;
+        kprintf("[STACKSAVE] #75: cpu %u is about to save rsp=0x%lx for '%s' "
+                "pid=%u priv=%u, OUTSIDE its kernel stack [0x%lx,0x%lx). "
+                "user_rsp=0x%lx sched_ra=0x%lx saves=%lu. The kernel is running "
+                "on the WRONG STACK; this is where reason-1 corruption is made.\n",
+                cpu, (unsigned long)live, prev->name, prev->pid,
+                (unsigned)prev->privilege, (unsigned long)lo, (unsigned long)hi,
+                (unsigned long)prev->user_rsp,
+                (unsigned long)g_sched_entry_ra[cpu < MAYTERA_MAX_CPUS ? cpu : 0],
+                (unsigned long)prev->rsp_save_n);
+    }
+}
+
+// Boot proof that the validator accepts a good stack pointer and rejects the
+// exact shape of the open fault. Asserts the "no stack recorded" case stays
+// SILENT too: a validator that fired on every early-boot task would exhaust its
+// print budget before the real event, which is how #130's shared-stack detector
+// was silenced by its own false positives.
+void stacksave_selftest(void) {
+    uint32_t fail = 0;
+    if (stacksave_live_is_bad(0x1000, 0x1000, 0x2000) != 0) fail |= 1u << 0;
+    if (stacksave_live_is_bad(0x1ff8, 0x1000, 0x2000) != 0) fail |= 1u << 1;
+    if (stacksave_live_is_bad(0x2000, 0x1000, 0x2000) != 1) fail |= 1u << 2;
+    if (stacksave_live_is_bad(0x0ff8, 0x1000, 0x2000) != 1) fail |= 1u << 3;
+    // The MEASURED fault, verbatim from the rakbd2 baseline capture.
+    if (stacksave_live_is_bad(0xbffee748ull, 0x112cb4d0ull, 0x112db4d0ull) != 1)
+        fail |= 1u << 4;
+    if (stacksave_live_is_bad(0x1500, 0, 0) != 0) fail |= 1u << 5;
+    if (stacksave_live_is_bad(0x1500, 0x2000, 0x1000) != 0) fail |= 1u << 6;
+    if (fail)
+        kprintf("[STACKSAVE] SELFTEST FAILED mask=0x%x - the wrong-stack "
+                "detector is WRONG on this build; do not read its silence as "
+                "evidence.\n", fail);
+    else
+        kprintf("[STACKSAVE] selftest OK: accepts in-range, rejects at-end, "
+                "below-base and the measured 0xbffee748-in-0x112cb4d0 case, "
+                "stays silent with no stack recorded\n");
+}
+
 extern void sched_cpuobs_note_rs(uint32_t pid, int32_t from_cpu, uint32_t to_cpu);
 
 static inline void sched_publish_cpu(process_t *prev, process_t *next, uint32_t cpu) {
+    // #smpfix: this core is committed to the switch, and the switch asm is
+    // about to store the live stack pointer into prev->rsp. Record what it is
+    // about to store, and refuse to let a wrong-stack save go unreported.
+    if (cpu < MAYTERA_MAX_CPUS) g_cpu_switches[cpu]++;
+    if (prev) {
+        uint64_t __live;
+        __asm__ volatile("mov %%rsp, %0" : "=r"(__live));
+        prev->rsp_save_live = __live;
+        prev->rsp_save_ra   = g_sched_entry_ra[cpu < MAYTERA_MAX_CPUS ? cpu : 0];
+        prev->rsp_save_cpu  = (int32_t)cpu;
+        prev->rsp_save_n++;
+        stacksave_note(prev, __live, cpu);
+    }
     if (prev) prev->running_cpu = -1;
     if (next) {
         int32_t from = (int32_t)next->last_cpu;
@@ -2509,6 +2898,24 @@ static void sched_storm_note(uint32_t cpu, const process_t *cur, const process_t
 // against the table's real extent by the Rust side (bklsite_top rejects n > MAX).
 #define BKLSITE_REPORT_N 48u
 
+// #75/#67 (bklmap): HOW MANY of those sites to actually print.
+//
+// This was the literal 3 at each bklsite_top() call. Three is enough to see
+// THAT one site dominates and useless for deciding whether narrowing the lock
+// is worth doing, because it cannot distinguish "three fat sites" from "three
+// fat sites plus a long tail of forty cheap ones". Those are different
+// engineering problems with different answers, and the narrowing roadmap (#168)
+// is exactly the question of which one this is. The table already holds 48
+// entries; only the printer was throwing them away.
+//
+// 8 rather than 48: the report is polled-UART serial at ~87 us per character,
+// and each line is ~90 characters, so every extra line costs ~8 ms of console
+// time per 4 s window. The BKL is dropped across the whole print
+// (bkl_release_all() above), so this does NOT inflate held=, but it is still
+// CPU taken from the workload being measured. 8 covers the tail if there is
+// one; the idx[] array below is sized to match.
+#define BKLSITE_SHOW_N 8u
+
 // #169: PROOF THE AP PREEMPTION TICK IS LIVE, printed by the BSP.
 //
 // Reported separately from [SCHEDCORE] rather than folded into it: that line is
@@ -2546,6 +2953,29 @@ static void sched_aptick_report(uint64_t window) {
                       " *** NO AP TOOK A TICK: preemption on the APs is "
                       "COOPERATIVE ONLY (#169) ***");
     kprintf("%s\n", line);
+}
+
+// (rakbd) THE LIVE PER-CORE BUSY COUNTER, exposed because the meter the UI
+// reads was wired to a DIFFERENT and effectively dead one.
+//
+// g_core_busy[] is credited by BOTH tick paths: the BSP's sched_tick() and each
+// AP's own sched_tick_ap() (vector 0x42), which tick_ap_arm() deliberately arms
+// at the SAME rate as the BSP so a busy count can be divided by a window
+// measured in BSP ticks. It is what [SCHEDCORE] has always reported and it is
+// correct for a core that is a scheduler consumer.
+//
+// cpu/smp.c's g_core_busy_ticks[] is NOT that. It is credited in exactly one
+// place, the AP kernel-JOB loop in ap_entry(), which an AP leaves for good the
+// first time the job ring is empty and /SMPSCHED.TXT is set: sched_ap_enter()
+// never returns. So on precisely the configuration where AP scheduling is
+// switched ON, every AP's counter freezes at its start-up value, the window
+// delta is zero forever, and the smoothed percentage decays to 0 and stays
+// there for the rest of the boot no matter how busy the core is.
+//
+// The two counters cover disjoint residencies (a core is either in the job loop
+// or inside sched_ap_enter()), so the caller sums them rather than choosing.
+uint64_t sched_core_busy_ticks(uint32_t cpu) {
+    return (cpu < MAYTERA_MAX_CPUS) ? g_core_busy[cpu] : 0;
 }
 
 static void sched_smp_report(void) {
@@ -2616,6 +3046,7 @@ static void sched_smp_report(void) {
     // at all, because a caller that cannot state a count cannot state a wrong
     // one. The window arithmetic and the invariants are in
     // rustkern/bklstat.rs.
+    extern uint64_t g_syscall_kstack_null;   // proc/syscall.asm (#75)
     bkl_totals_t bt;
     bkl_stat_totals(&bt);
     static uint64_t lb_bkl_us;
@@ -2674,14 +3105,23 @@ static void sched_smp_report(void) {
     // maximum at any point since boot - the exact defect #83 found in
     // running_cpu. Same for sw%u.
     kprintf("%s consumers=0x%llx storms=%lu bkl=%lu/%luc/%lus rec=%lu held=%luus "
-              "maxhold=%luus@0x%x/cpu%u/sw%u long=%lu pin=%lu/%luto bklcpus=%u\n",
+              "maxhold=%luus@0x%x/cpu%u/sw%u long=%lu pin=%lu/%luto bklcpus=%u "
+              "idleq=%lu@0x%lx kstacknull=%lu\n",
               line, (unsigned long long)g_rq_consumers,
               (unsigned long)g_sched_storms, (unsigned long)d_acq,
               (unsigned long)d_con, (unsigned long)d_spin,
               (unsigned long)bw.recursive,
               (unsigned long)d_hsum, (unsigned long)hmax, hres,
               bw.max_cpu, bw.max_from_switch, (unsigned long)d_long,
-              (unsigned long)d_pw, (unsigned long)d_pt, bw.ncpu);
+              (unsigned long)d_pw, (unsigned long)d_pt, bw.ncpu,
+              // #pid0desk: dropped wake-ups. MUST be 0 on a fixed build.
+              g_idle_enq_refused, (unsigned long)(uint64_t)g_idle_enq_refused_ra,
+              // #75: syscall_entry ran on the USER stack because this core's
+              // gs:0 was null. MUST be 0. Any non-zero value is the mechanism
+              // that puts a user rsp into process_t::rsp.
+              (unsigned long)g_syscall_kstack_null);
+    // #SMPGLOBALS: per-task syscall-frame guard counters, on the same window.
+    { extern void sigframe_report(void); sigframe_report(); }
     // #166: THE VERDICT, ON ITS OWN LINE, WITH THE RAW NUMBERS BESIDE IT.
     //
     // Not a clamp. A clamped display of a broken counter is strictly worse than
@@ -2833,7 +3273,7 @@ static void sched_smp_report(void) {
     { typedef struct { uint64_t ra, count, total_us, max_us, max_gap_us, worst_syscall; } bklsite_t;
       extern bklsite_t g_bkl_sites[]; extern volatile uint64_t g_bklsite_drops;
       extern uint32_t bklsite_top(const bklsite_t *, uint32_t, int, uint32_t *, uint32_t);
-      uint32_t idx[3], k;
+      uint32_t idx[BKLSITE_SHOW_N], k;
       // There is deliberately no single "[BKLMAX] ra=..." line. The first pass
       // had one, reading a global recorded at max-hold time, and it was WRONG in
       // a way worth writing down: sched_smp_report() zeroes g_bkl_hold_max[] and
@@ -2843,14 +3283,14 @@ static void sched_smp_report(void) {
       // site. It printed isr_handler, gap=0, every single time, which looks like
       // a finding rather than like an instrument eating itself. The per-site
       // table below cannot have that bug: each site keeps its own maximum.
-      k = bklsite_top(g_bkl_sites, BKLSITE_REPORT_N, 0, idx, 3);
+      k = bklsite_top(g_bkl_sites, BKLSITE_REPORT_N, 0, idx, BKLSITE_SHOW_N);
       for (uint32_t i = 0; i < k; i++) { bklsite_t *e = &g_bkl_sites[idx[i]];
         if (!e->total_us) break;
         kprintf("[BKLSITE-TOTAL] #%u ra=0x%lx n=%lu total=%luus max=%luus gap=%luus sc=%lu\n",
                 i, (unsigned long)e->ra, (unsigned long)e->count,
                 (unsigned long)e->total_us, (unsigned long)e->max_us,
                 (unsigned long)e->max_gap_us, (unsigned long)e->worst_syscall); }
-      k = bklsite_top(g_bkl_sites, BKLSITE_REPORT_N, 1, idx, 3);
+      k = bklsite_top(g_bkl_sites, BKLSITE_REPORT_N, 1, idx, BKLSITE_SHOW_N);
       for (uint32_t i = 0; i < k; i++) { bklsite_t *e = &g_bkl_sites[idx[i]];
         if (!e->max_us) break;
         kprintf("[BKLSITE-MAX] #%u ra=0x%lx n=%lu total=%luus max=%luus gap=%luus sc=%lu\n",
@@ -2876,7 +3316,7 @@ static void sched_smp_report(void) {
     // like [BKLSITE-TOTAL], so a late reader gets the whole run and not a window.
     { extern bklsite_t g_bkl_pids[]; extern volatile uint64_t g_bklpid_drops;
       extern const char *sched_pid_name_for_report(uint32_t);
-      k = bklsite_top(g_bkl_pids, BKLSITE_REPORT_N, 0, idx, 3);
+      k = bklsite_top(g_bkl_pids, BKLSITE_REPORT_N, 0, idx, BKLSITE_SHOW_N);
       for (uint32_t i = 0; i < k; i++) { bklsite_t *e = &g_bkl_pids[idx[i]];
         if (!e->total_us) break;
         uint32_t pid = (uint32_t)(e->ra - 1);       // key was pid + 1
@@ -2918,6 +3358,94 @@ static void sched_smp_report(void) {
               (unsigned long)g_haltbkl[1], (unsigned long)(g_haltbkl[1] + g_haltbkl_ok[1]),
               (unsigned long)g_haltbkl[2], (unsigned long)(g_haltbkl[2] + g_haltbkl_ok[2]),
               (unsigned long)g_haltbkl[3], (unsigned long)(g_haltbkl[3] + g_haltbkl_ok[3])); }
+    // #smpfix (#75): the SYSRET-tail window, counted. `enters` is the number
+    // of interrupts taken at CPL 0 on a user stack; `saves` is the number of
+    // those that went on to store a user rsp into a process_t. rip is the last
+    // offending instruction pointer, which resolves to the sysret tail.
+    { extern volatile uint64_t g_irq_on_user_stack, g_irq_on_user_stack_rip,
+                               g_irq_on_user_stack_vec;
+      extern int g_sysret_cli; extern volatile uint8_t g_sysret_widen;
+      extern volatile uint64_t g_irq_on_user_stack_rsp;
+      kprintf("[IRQUSTACK] enters=%lu saves=%lu lastrip=0x%lx lastvec=%lu "
+              "lastrsp=0x%lx cli=%d widen=%u\n",
+              (unsigned long)g_irq_on_user_stack,
+              (unsigned long)g_stacksave_bad,
+              (unsigned long)g_irq_on_user_stack_rip,
+              (unsigned long)g_irq_on_user_stack_vec,
+              (unsigned long)g_irq_on_user_stack_rsp,
+              g_sysret_cli, (unsigned)g_sysret_widen); }
+    // #smpfix: is the contended BKL waiter parking, and are its wakes being
+    // delivered? parks advancing with wake_ipis flat is a wedge; a non-empty
+    // waitmask while the lock is free is a lost wake that only the 250 Hz
+    // backstop will clear.
+    { extern int g_bkl_park;
+      extern volatile uint32_t g_bkl_waitmask;
+      extern volatile uint64_t g_bkl_parks, g_bkl_wake_ipis, g_bkl_wakes_taken,
+                               g_bkl_park_late, g_bkl_park_stuck;
+      uint32_t __bw = 0, __bkd = 0; int32_t __bo = -1;
+      bkl_snapshot(&__bw, &__bo, &__bkd);
+      if (g_bkl_waitmask && __bw == 0) g_bkl_park_stuck++;
+      kprintf("[BKLPARK] park=%d parks=%lu late=%lu wake_ipis=%lu wakes=%lu "
+              "stuck=%lu waitmask=0x%x word=%u owner=%d\n",
+              g_bkl_park, (unsigned long)g_bkl_parks,
+              (unsigned long)g_bkl_park_late, (unsigned long)g_bkl_wake_ipis,
+              (unsigned long)g_bkl_wakes_taken,
+              (unsigned long)g_bkl_park_stuck, g_bkl_waitmask,
+              (unsigned)__bw, __bo);
+      // #wakeipi: the per-core breakdown that says WHAT ENDED EACH HLT. The
+      // sent/received ratio on the line above cannot answer that; see the long
+      // comment on bkl_wd_t in cpu/smp.c. Silent unless parking is armed.
+      { extern void bkl_wake_diag_report(void); bkl_wake_diag_report(); } }
+    // #bklfair (#168): the per-core CONTENDED WAIT distribution, and the
+    // ticket-lock self-heal counters. Printed in BOTH arms, because an
+    // instrument that only exists in the arm you want to win is not an
+    // instrument. The defect this ticket fixes is a SPREAD, not a total: with
+    // the unfair lock the core doing real work has a wait_max orders of
+    // magnitude above the cores that only tick.
+    { extern void bkl_fair_report(void); bkl_fair_report(); }
+    // #blitnarrow (#168 step 3): how much of the BKL's hold time the blit
+    // narrowing actually removed, and what it cost in dropped frames. Printed
+    // in BOTH arms. `unlocked` is the negative control: it MUST be 0 with the
+    // gate off and large with it on, or the gate is a no-op and the two arms
+    // are the same experiment. `stale`+`gone` are frames dropped because
+    // another core changed the window under the unlocked loop; if they are a
+    // large fraction of `unlocked` the narrowing is buying speed by throwing
+    // away work, which is not a win.
+    { extern int g_blit_narrow;
+      extern volatile uint64_t g_blitnarrow_unlocked, g_blitnarrow_locked,
+                               g_blitnarrow_nested, g_blitnarrow_stale,
+                               g_blitnarrow_gone, g_blitnarrow_deferred,
+                               g_blitnarrow_us;
+      if (g_blit_narrow || g_blitnarrow_locked)
+          kprintf("[BLITNARROW] on=%d unlocked=%lu locked=%lu nested=%lu "
+                  "stale=%lu gone=%lu deferred=%lu unlocked_us=%lu\n",
+                  g_blit_narrow,
+                  (unsigned long)g_blitnarrow_unlocked,
+                  (unsigned long)g_blitnarrow_locked,
+                  (unsigned long)g_blitnarrow_nested,
+                  (unsigned long)g_blitnarrow_stale,
+                  (unsigned long)g_blitnarrow_gone,
+                  (unsigned long)g_blitnarrow_deferred,
+                  (unsigned long)g_blitnarrow_us); }
+    // #smpfix: what the AP idle loop actually did this boot. `noprog` is the
+    // number of times entering the scheduler switched nothing; `halt` is the
+    // number of passes that reached the hlt. Before the backoff, noprog and
+    // pass were the same number and halt was near zero.
+    { uint32_t __n = sched_rq_ncpu(); if (__n > MAYTERA_MAX_CPUS) __n = MAYTERA_MAX_CPUS;
+      for (uint32_t __i = 1; __i < __n; __i++) {
+          if (!g_apidle_pass[__i]) continue;
+          kprintf("[APIDLE] cpu%u pass=%lu sched=%lu noprog=%lu halt=%lu "
+                  "nopreempt=%lu csw=%lu backoff=%d stacksave_bad=%lu "
+                  "irqustack=%lu\n",
+                  __i, (unsigned long)g_apidle_pass[__i],
+                  (unsigned long)g_apidle_sched[__i],
+                  (unsigned long)g_apidle_noprog[__i],
+                  (unsigned long)g_apidle_halt[__i],
+                  (unsigned long)g_sched_nopreempt[__i],
+                  (unsigned long)g_cpu_switches[__i], g_apidle_backoff,
+                  (unsigned long)g_stacksave_bad,
+                  (unsigned long)g_irq_on_user_stack);
+      } }
       bkl_reacquire(__d); }
 }
 
@@ -2946,6 +3474,49 @@ static const char *haltbkl_site(uint32_t s) {
 }
 
 // may_print: 0 at sites reached with IF=0, where a kprintf would only queue.
+// ===========================================================================
+// #75 2026-08-29: SERIALISE THE SCHEDULER'S SELECT-AND-PUBLISH REGION.
+// ===========================================================================
+//
+// MEASURED, 4/4 reproductions on a 4-vCPU guest with the #67 gate ON and a DOS
+// guest (BATS.EXE) as the load, from the [SCHEDRACE] STATE line added the same
+// day:
+//
+//   [SCHEDRACE] reason 2: incoming task still marked on-cpu
+//   [SCHEDRACE] STATE 'dos' pid=32: rq_queued=0 rq_wanted=1 running_cpu=-1
+//               last_cpu=1 migratable=0 | bkl word=1 owner=0 depth=1 thiscpu=2
+//
+// `bkl owner=0 depth=1 thiscpu=2`. CPU 0 held the Big Kernel Lock while CPU 2
+// was inside sched_schedule(), had already POPPED and PINNED the task CPU 0 was
+// descheduling, and was about to switch to it. The two cores' scheduler
+// critical sections were not mutually exclusive at all.
+//
+// WHY: every other entry into the kernel takes the BKL (syscall.asm, idt.c's
+// ISR wrapper, proc_wrapper), but sched_ap_enter()'s idle loop CALLS
+// sched_schedule() directly, holding nothing. sched_on_cpu and sched_pinned
+// close the narrow half-saved-context window inside one core's switch; they
+// were never able to make two cores' SELECTIONS exclusive, and the code's own
+// comments say so ("sched_on_cpu covers only the mid-switch window, not 'is
+// running right now'").
+//
+// THE FIX: the AP idle loop takes the BKL around its sched_schedule() call, so
+// selection and publication happen under the same lock on every core. The
+// switch itself is unchanged: sched_schedule() already drops the whole lock
+// (bkl_release_all) across context_switch/context_start and restores the depth
+// afterwards, so no core holds it while another runs.
+//
+// THE PART THAT MAKES IT SAFE, and which a naive version gets fatally wrong:
+// sched_schedule() can HALT the core (sti; hlt) on its no-work paths. Halting
+// while owning the BKL wedges every other core, which is precisely what
+// sched_halt_bkl_note() below was written to detect. Every such halt now drops
+// the lock first and restores its depth afterwards, using the same
+// bkl_release_all()/bkl_reacquire() pair the switch sites already use.
+//
+// GATED so the same binary can be measured both ways, as /SMPSCHED.TXT already
+// gates AP scheduling itself: an empty /NOSCHEDBKL.TXT on the FAT ESP restores
+// the old, unserialised behaviour for that boot.
+int g_sched_bkl_serialize = 1;
+
 static void sched_halt_bkl_note(uint32_t site, int may_print) {
     void *ra[4] = {0,0,0,0}; uint8_t via[4] = {0,0,0,0};
     uint32_t d = bkl_self_forensics(ra, via, 4);
@@ -3087,13 +3658,61 @@ void sched_ap_enter(uint32_t cpu) {
     // workers (#168 Job 1). It also warned that the fix must not double-count
     // timer_ticks; it does not - sched_tick_ap() touches no global tick state
     // at all, which is the whole reason it is a separate function.
+    // #smpfix: DID THE LAST ENTRY INTO THE SCHEDULER ACHIEVE ANYTHING?
+    //
+    // sched_rq_has_work() is a hint about the WORLD ("some queue somewhere is
+    // non-empty"), not about THIS CORE ("there is something I may run"). The
+    // two differ whenever the scheduler cannot act: preemption held off by
+    // another core, a steal the policy refuses, a selection abandoned. On every
+    // one of those paths sched_schedule() returns WITHOUT halting the core, the
+    // hint is still true, and this loop calls it again immediately.
+    //
+    // MEASURED, golden 2302, 2 vCPU, SMP gate on, no DOS guest: 7,796,246 loop
+    // passes in the 6.7 s after the AP came online, 1.16 MILLION per second,
+    // each one a Big Kernel Lock acquire and release, while [SCHEDCORE] read
+    // "cpu0=0%/0csw/3q cpu1=0%/0csw/0q" - three tasks queued, zero context
+    // switches on either core. The AP was burning a whole host core and taking
+    // the lock away from the core that needed it, 10 million pause-spins in one
+    // 4-second window. After the desktop settled the same loop ran at ~260
+    // passes/second, which is what it looks like when it is working.
+    //
+    // So the halt condition needs a term the hint cannot supply: whether the
+    // last pass MOVED anything. If it did not, halt and wait for an interrupt.
+    // Nothing is lost by waiting: this core's own LAPIC preemption tick is
+    // armed at 250 Hz and always re-arms (cpu/isr.c tick_ap_arm), so the retry
+    // is bounded at 4 ms even if every other wake is missed, and a genuine
+    // enqueue still sends the directed wake IPI from sched_rq_push(). That is
+    // the redundant always-armed wake source the project asks for, not a
+    // timeout standing in for a wake somebody forgot to arm.
+    int may_sched = 1;
     while (me && !me->should_halt) {
+        if (cpu < MAYTERA_MAX_CPUS) g_apidle_pass[cpu]++;
         // Keep the #279 role: drain kernel jobs first, so making this core a
         // scheduler does not cost the parallel work ring.
-        { extern int smp_work_run_one(void); if (smp_work_run_one()) continue; }
+        { extern int smp_work_run_one(void);
+          if (smp_work_run_one()) { may_sched = 1; continue; } }
         // #67 pass 4: only enter the scheduler when there is plausibly work.
         // See sched_rq_has_work() for why an unlocked hint is sound here.
-        if (sched_rq_has_work(cpu)) sched_schedule();
+        if (may_sched && sched_rq_has_work(cpu)) {
+            // #75: under the BKL, so this core's pop/pin/publish cannot run
+            // concurrently with another core's. See the block comment above
+            // sched_halt_bkl_note().
+            extern void bkl_acquire(void);
+            extern void bkl_release(void);
+            uint64_t __sw0 = (cpu < MAYTERA_MAX_CPUS) ? g_cpu_switches[cpu] : 0;
+            if (cpu < MAYTERA_MAX_CPUS) g_apidle_sched[cpu]++;
+            if (g_sched_bkl_serialize) {
+                bkl_acquire();
+                sched_schedule();
+                bkl_release();
+            } else {
+                sched_schedule();
+            }
+            if (cpu < MAYTERA_MAX_CPUS && g_cpu_switches[cpu] == __sw0) {
+                g_apidle_noprog[cpu]++;
+                if (g_apidle_backoff) may_sched = 0;
+            }
+        }
         // #75: about to halt. Checked HERE, with IF still set, so the report can
         // reach the wire; nothing between this point and the hlt below takes the
         // BKL, and the count at the hlt itself (site 0, silent) confirms it.
@@ -3118,11 +3737,16 @@ void sched_ap_enter(uint32_t cpu) {
         // arrives before the cli is caught by the re-check; one that arrives
         // after is delivered by the sti and taken after the hlt.
         __asm__ volatile("cli");
-        if (!sched_rq_has_work(cpu) && !me->should_halt) {
+        if ((!may_sched || !sched_rq_has_work(cpu)) && !me->should_halt) {
+            if (cpu < MAYTERA_MAX_CPUS) g_apidle_halt[cpu]++;
             __asm__ volatile("sti; hlt");
         } else {
             __asm__ volatile("sti");
         }
+        // An interrupt has been taken (or the halt was skipped because there is
+        // real work): either way this core knows something new, so the next
+        // pass is allowed into the scheduler again.
+        may_sched = 1;
     }
     kprintf("[SCHED] cpu %u leaving the scheduler (halt requested)\n", cpu);
     sched_rq_set_consumer(cpu, 0);
@@ -3215,7 +3839,40 @@ static void add_to_ready_queue(process_t *proc) {
     // every present and future caller. Idle procs are never reached through the
     // queue anyway - they are dispatched directly via g_cpu_idle[] and the
     // empty-queue fallback - so refusing them here removes nothing.
-    if (proc && proc->is_idle) return;
+    if (proc && proc->is_idle) {
+        // #pid0desk: COUNT IT. See g_idle_enq_refused for why a silent refusal
+        // here was able to starve the desktop for 175 seconds without leaving
+        // a single trace in any log.
+        g_idle_enq_refused++;
+        g_idle_enq_refused_ra = __builtin_return_address(0);
+#ifndef GUARD130_DISABLE
+        return;
+#else
+        // ------------------------------------------------------------------
+        // `make GUARD130_DISABLE=1` -- THE #130 REPRODUCER. NEVER in a golden.
+        // ------------------------------------------------------------------
+        // A regression test you cannot make fail is not a regression test. The
+        // #130 guard is one `return` protecting against a corruption whose
+        // forensics are quoted above it, and nothing in the tree could ever
+        // demonstrate that the corruption is still there. This flag deletes the
+        // guard so it can.
+        //
+        // TO REPRODUCE #130 you need BOTH halves, because the recorded crash is
+        // "pid 0 was popped by ANOTHER CORE":
+        //   1. this flag, so an idle process can enter the shared queue, AND
+        //   2. more than one scheduling core -- an empty /SMPSCHED.TXT on the
+        //      FAT ESP, which sets g_smp_user_sched (cpu/smp.c) without a
+        //      rebuild, on a VM with several vCPUs.
+        // With only one of the two the machine will look fine, which is exactly
+        // why the guard's necessity was never re-demonstrated after #130.
+        //
+        // Expect [SCHEDRACE] "CORRUPT CONTEXT DETECTED" and/or a wild-RIP
+        // panic whose faulting RSP lies inside pid 0's stack range.
+        //
+        // No `return` here: fall through into the ordinary enqueue below, which
+        // is precisely the pre-#130 behaviour.
+#endif
+    }
 
     // #75: capture the state the caller handed us, BEFORE anything below
     // overwrites it to READY, plus who the caller was. If a task is ever queued
@@ -3497,7 +4154,15 @@ static void idle_process(void *arg) {
         // Under the userland compositor (it grabs input + owns the screen) the
         // kernel desktop tick is redundant; skipping it lets the core actually
         // HLT instead of polling input every tick (#102 host-CPU).
-        if (fb_owner_pid() == 0) desktop_process_tick();
+        // #pid0desk: ONLY while nothing else owns the tick. Once the GUI
+        // session has a process of its own (sched_bsp_idle_enter), desktop_run()
+        // pumps the keyboard itself, and a second consumer here would race it
+        // for the same queue: keyboard_get_char() is destructive, so whichever
+        // context read a scancode first would swallow it. Harmless under the
+        // userland compositor (desktop_process_tick early-returns on
+        // g_compositor_launched) but NOT harmless in the window before it
+        // launches, which is exactly when login and the boot UI need keys.
+        if (!g_desktop_owns_tick && fb_owner_pid() == 0) desktop_process_tick();
         // Atomically enable interrupts and HALT the core. sti has a 1-instr
         // delay so hlt executes before any IRQ fires - this guarantees the vCPU
         // actually halts until the next interrupt (the old hlt();proc_yield()
@@ -3507,6 +4172,47 @@ static void idle_process(void *arg) {
         sched_halt_bkl_note(3, 1);   // #75
         __asm__ volatile("sti; hlt");
     }
+}
+
+// ===========================================================================
+// #pid0desk (2026-08-29): LET THE BOOT THREAD BECOME THE IDLE PROCESS.
+// ===========================================================================
+//
+// Until now kernel_main never reached an idle loop at all. It called
+// desktop_run() inline, and pid 0 -- which is ALSO g_cpu_idle[0], the BSP idle
+// process -- spent the entire rest of the boot inside the GUI. Two consequences
+// followed, and both were real:
+//
+//  1. THE SYNTHETIC FRAME WAS DEAD. proc_init() builds a switch frame pointing
+//     at idle_process() for pid 0; the "#446 MEASURED" note there records that
+//     it is never popped, because pid 0 is not started, it IS the boot thread.
+//     So on a single-core golden idle_process() ABOVE WAS DEAD CODE on the BSP.
+//     It ran only on the AP idles, and no AP is started (g_smp_user_sched
+//     defaults to 0, cpu/smp.c). This function is what finally reaches it.
+//
+//  2. EVERY proc_sleep() IN desktop_run() WAS A SLEEP TAKEN BY THE IDLE
+//     PROCESS, and add_to_ready_queue() refuses to queue an idle process
+//     (the #130 guard). The wake was therefore DROPPED every time, and the
+//     desktop only ran again when sched_schedule() happened to find the ready
+//     queue completely empty and fell back to g_cpu_idle[]. That is the
+//     starvation this change exists to remove; see CHANGELOG.
+//
+// Now that the GUI session has a process of its own, the boot thread has
+// somewhere correct to go: the idle loop it was always supposed to be. From
+// here pid 0 does what an idle process is contracted to do and nothing else --
+// it never sleeps, so it can never present itself to add_to_ready_queue() in
+// the first place.
+//
+// Does not return.
+void sched_bsp_idle_enter(void) {
+    // The session process pumps input from here on; see the note in
+    // idle_process() for why a second consumer would be wrong.
+    g_desktop_owns_tick = 1;
+    process_t *me = proc_current();
+    kprintf("[PROC] boot thread entering the BSP idle loop as pid %u "
+            "(is_idle=%u)\n",
+            me ? me->pid : 0xffffffffu, me ? (unsigned)me->is_idle : 0u);
+    idle_process(NULL);   // never returns
 }
 
 /**
@@ -3925,8 +4631,18 @@ void proc_exit(int exit_code) {
     // not an edge case: without this the next track would hit EBUSY until the
     // pump's backstop expired. Only sets flags and wakes the pump (safe under
     // cli(); the pump thread does the actual teardown and frees the ring).
-    extern void audio_pcm_proc_exit(uint32_t pid);
-    audio_pcm_proc_exit(me->pid);
+    //
+    // #181: GROUP LEADER ONLY, AND BY tgid. A stream is owned by the thread
+    // GROUP (pcm_lookup() was widened to the group in #181 so an app may open
+    // on one thread and write from another), so a worker thread exiting must
+    // release nothing, and a stream opened by a worker thread must still be
+    // released when the process dies. Passing me->pid did the opposite of both.
+    // Same gate and same cli()-safe contract as fdown_proc_exit() and
+    // async_http_proc_exit() below.
+    extern void audio_pcm_proc_exit(uint32_t owner_tgid);
+    if (!me->shares_vm) {
+        audio_pcm_proc_exit(me->tgid ? me->tgid : me->pid);
+    }
 
     // #205: if THIS was the DOS OPL2 synthesiser (/APPS/FMSYNTH), let the DOS
     // layer know so it stops reporting an FM chip it can no longer sound. The
@@ -4647,6 +5363,12 @@ static void wake_sleeping_procs(void) {
                       g_wake_cand_busy++;
                   else
                       g_wake_cand_free++; }
+                // #wakelag: how late was the NOTICING? `now` is this sweep's
+                // single sample and wake_time is the deadline it just passed,
+                // so this is the sweep's own lateness, measured before the
+                // deadline is disturbed.
+                wl_note_wake(now, proc_table[i].wake_time);
+                proc_table[i].wl_ready_ms = now;   // stage 2 starts here
                 proc_table[i].state = PROC_STATE_READY;
                 add_to_ready_queue(&proc_table[i]);
                 __swoke++;
@@ -4798,6 +5520,12 @@ void sched_schedule(void) {
     // that matters: pop -> switch.
     SCHED_SEL_CLEAR();
 
+    // #smpfix: name the path this core came in on, with IF=0, so a later
+    // wrong-stack report can be resolved with addr2line instead of guessed at.
+    { uint32_t __era = sched_rq_cpu();
+      if (__era < MAYTERA_MAX_CPUS)
+          g_sched_entry_ra[__era] = (uint64_t)(uintptr_t)__builtin_return_address(0); }
+
     process_t *cur = sched_cpu_current();
     // #75: ARM OWNERSHIP BEFORE ANYTHING CAN ENQUEUE US. sched_on_cpu used to be
     // set further down, after sched_tick() had already enqueued this task - the
@@ -4818,7 +5546,14 @@ void sched_schedule(void) {
     sched_drain_deferred(sched_rq_cpu());   // #421 p7: per-cpu, NOT global
     if (!preemption_enabled && cur &&
         cur->state == PROC_STATE_RUNNING) {
-        // Preemption disabled and current process still running
+        // Preemption disabled and current process still running.
+        // #smpfix: COUNTED. This is a scheduler call that cannot achieve
+        // anything, and it does not halt the core on the way out. An AP idle
+        // loop whose halt condition is "does any queue have an entry" therefore
+        // re-enters it immediately and spins at full speed for as long as some
+        // other core holds preemption off. MEASURED at 1.16M passes/second.
+        { uint32_t __nc = sched_rq_cpu();
+          if (__nc < MAYTERA_MAX_CPUS) g_sched_nopreempt[__nc]++; }
         SCHED_SEL_CLEAR();   // #75: no selection is live on this core
         if (cur) cur->sched_on_cpu = 0;   /* #75: no switch happened */ 
         sti();
@@ -4919,7 +5654,12 @@ void sched_schedule(void) {
                 SCHED_SEL_CLEAR();   // #75
                 if (cur) cur->sched_on_cpu = 0;   /* #75: no switch happened */ 
                 sched_halt_bkl_note(1, 0);        // #75
-                __asm__ volatile("sti; hlt");
+                // #75: NEVER HALT OWNING THE BKL. With the AP idle loop now
+                // holding it across this call, a bare hlt here would stop every
+                // other core dead.
+                { uint32_t __hd = bkl_release_all();
+                  __asm__ volatile("sti; hlt");
+                  bkl_reacquire(__hd); }
                 return;
             }
             SCHED_SEL_CLEAR();   // #75
@@ -4942,7 +5682,10 @@ void sched_schedule(void) {
             // instead of busy-returning. pid 0 doubles as the desktop/idle
             // context, so without this the CPU spun at ~100% whenever every
             // process was sleeping (#180). sti;hlt is atomic (sti 1-instr delay).
-            __asm__ volatile("sti; hlt");
+            // #75: and it drops the BKL first, for the reason at site 1.
+            { uint32_t __hd = bkl_release_all();
+              __asm__ volatile("sti; hlt");
+              bkl_reacquire(__hd); }
         } else {
             sti();
         }
@@ -4986,6 +5729,14 @@ void sched_schedule(void) {
           current_proc = next;
           current_process = next;
       } }
+    // #wakelag stage 2: this is the commit point of the switch, so it is the
+    // first instant `next` is genuinely running again. Latched and cleared, so
+    // one wake is sampled exactly once however many times the task is later
+    // rescheduled for other reasons.
+    if (next->wl_ready_ms) {
+        wl_note_dispatch(sched_now_ms(), next->wl_ready_ms);
+        next->wl_ready_ms = 0;
+    }
     next->state = PROC_STATE_RUNNING;
     next->time_slice = TIME_SLICE_TICKS;
 
@@ -5043,6 +5794,7 @@ void sched_schedule(void) {
         uint32_t __sc = sched_rq_cpu();
         schedrace_delay(SR_SITE_AFTER_PUBLISH);
         schedrace_note(__sc, prev, next);
+        schedrace_inject(next);   // no-op unless SCHEDRACE_INJECT=1
         schedrace_check(__sc, prev, next, "pre-switch");
     }
 
@@ -5176,6 +5928,8 @@ void sched_tick(void) {
       if (cur && !cur->is_idle && __c < MAYTERA_MAX_CPUS) g_core_busy[__c]++; }
     // #67 pass 2: one core owns the report; its statics are not shared state.
     if (sched_rq_cpu() == 0) sched_smp_report();
+    // #wakelag: same ownership rule, same reason.
+    if (sched_rq_cpu() == 0 && (sched_ticks % 1000) == 0) sleeplag_report();
 
     // #67 pass 2: consume a cross-core preemption request. Placement asks for
     // this when a process lands on a core that is running something it
@@ -5199,6 +5953,35 @@ void sched_tick(void) {
           g_need_resched[__rc] = 0;
           if (cur && !cur->is_idle) cur->time_slice = 0;   // expire it now
       } }
+
+    // #wakelag: A SLEEPER WHOSE DEADLINE HAS PASSED IS WORK, SO EXPIRE THE
+    // SLICE AND LET sched_schedule() DO ITS JOB.
+    //
+    // Same technique as the block immediately above, for the same stated
+    // reason: the preemption happens through the one piece of code that
+    // already knows how to do it correctly. Without this, the only route from
+    // a 4 ms tick to the sweep was `cur->time_slice` reaching 0, i.e. once
+    // every TIME_SLICE_TICKS (40 ms at 250 Hz), which set the resolution of
+    // every timed sleep in the kernel.
+    //
+    // AND THE IDLE PROCESS IS INCLUDED, unlike the cross-core block above.
+    // On an idle machine the idle process IS `cur`, so excluding it would
+    // leave the exact case this fixes untouched: the BSP idle loop is
+    // `sti; hlt` and has no other way back into the scheduler.
+    //
+    // g_sweep_minleft is the sweep's own published minimum. It is UINT64_MAX
+    // when the last pass left nothing asleep, so the common idle case costs a
+    // load and a compare and never reads the clock. A new sleeper cannot be
+    // missed: proc_sleep() sets its state to SLEEPING before calling
+    // sched_schedule(), whose sweep therefore sees it and republishes the
+    // minimum on the very same pass that put it to sleep.
+    if (g_wakelag_fix && cur) {
+        uint64_t __ml = g_sweep_minleft;
+        if (__ml != 0 && __ml != ~0ULL &&
+            (int64_t)(sched_now_ms() - __ml) >= 0) {
+            if (cur->time_slice != 0) { cur->time_slice = 0; g_wl_forced++; }
+        }
+    }
     if (g_cpu_total_acc >= 250) {            // ~1s window at 250 Hz
         int sample = 100 - (int)(g_cpu_idle_acc * 100 / g_cpu_total_acc);
         if (sample < 0) sample = 0;
@@ -5833,7 +6616,41 @@ int proc_create_user_as(const char *name, void *elf_data, uint64_t elf_size,
     (void)g_smp_user_sched;
     g_next_user_migratable = 0;  // one-shot
     if (__mig) { proc->migratable=1; smp_migq_push(proc); }
-    else { proc->migratable=0; add_to_ready_queue(proc); }
+    else { proc->migratable=0;
+        // #affinity: CONSUME A PENDING SYS_RUN_NEXT_ON_AP REQUEST.
+        //
+        // This is the line whose absence made that syscall a lie. It set
+        // g_next_user_migratable, which is zeroed three lines above without ever
+        // being read (`int __mig = 0;` is a literal, so the branch that would
+        // have read it is unreachable), and the syscall returned SUCCESS for the
+        // discarded request on every call since #67 pass 2. `runap` in msh and
+        // `launchap` in the RC file have both been no-ops reporting success.
+        //
+        // The old mechanism was smp_migq_push(), and #67 removed it from this
+        // path for a good reason: that queue bypassed the scheduler entirely, so
+        // anything on it was out of reach of preemption, aging and stealing.
+        // Reviving it would be a regression. An affinity MASK expresses the same
+        // intent, "prefer an application processor", without leaving the
+        // scheduler, so the request is consumed as a mask instead.
+        //
+        // OWNER-CHECKED and one-shot: the request records the requesting pid, so
+        // a stale request cannot be consumed by a spawn from an unrelated
+        // process, which is the obvious failure of a bare global flag.
+        {
+            process_t *spawner = proc_current();
+            if (spawner) {
+                uint64_t apmask = affinity_next_spawn_take_rs(spawner->pid);
+                if (apmask) {
+                    int ar = affinity_set_rs(proc->pid, apmask);
+                    kprintf("[AFFINITY] '%s' pid=%u spawned with AP affinity "
+                            "mask=0x%llx (requested by pid=%u via "
+                            "SYS_RUN_NEXT_ON_AP) rc=%d\n",
+                            name, proc->pid, (unsigned long long)apmask,
+                            spawner->pid, ar);
+                }
+            }
+        }
+        add_to_ready_queue(proc); }
 
     kprintf("[PROC] Created user process '%s' (PID %u) CR3=0x%lx uid=%u gid=%u\n",
             name, proc->pid, proc->cr3, proc->uid, proc->gid);
@@ -5976,9 +6793,18 @@ int proc_fork(void) {
     // the CLOEXEC fds). The fd_cloexec bitmap was already copied by the
     // memcpy above.
     extern void file_get(struct file *f);
-    for (int __fd = 0; __fd < MAX_FDS; __fd++) {
+    // #SMPGLOBALS: the memcpy above copied the PARENT's fd_lock word into the
+    // child. Re-initialise it: a lock is a piece of state about one table, and
+    // a copied "held" would wedge the child's first close forever. It also
+    // copied the parent's published syscall frame, which names the PARENT's
+    // ring-0 stack; the child has its own, so clear it.
+    spinlock_init(&child->fd_lock);
+    child->syscall_frame = 0;
+    { uint64_t __fl = spinlock_acquire_irqsave(&child->fd_lock);
+      for (int __fd = 0; __fd < MAX_FDS; __fd++) {
         if (child->fds[__fd]) file_get(child->fds[__fd]);
-    }
+      }
+      spinlock_release_irqrestore(&child->fd_lock, __fl); }
 
     // Phase D1: POSIX fork() inherits signal handlers and the blocked-signal
     // mask, but clears pending signals and any return-work state in the
@@ -6193,9 +7019,18 @@ int proc_clone(uint32_t flags, void *user_stack, uint32_t *parent_tid,
     // Bump refcounts on inherited fds (CLONE_FILES sharing is approximated as
     // fork-style inheritance; adequate for the current libc).
     extern void file_get(struct file *f);
-    for (int __fd = 0; __fd < MAX_FDS; __fd++) {
+    // #SMPGLOBALS: the memcpy above copied the PARENT's fd_lock word into the
+    // child. Re-initialise it: a lock is a piece of state about one table, and
+    // a copied "held" would wedge the child's first close forever. It also
+    // copied the parent's published syscall frame, which names the PARENT's
+    // ring-0 stack; the child has its own, so clear it.
+    spinlock_init(&child->fd_lock);
+    child->syscall_frame = 0;
+    { uint64_t __fl = spinlock_acquire_irqsave(&child->fd_lock);
+      for (int __fd = 0; __fd < MAX_FDS; __fd++) {
         if (child->fds[__fd]) file_get(child->fds[__fd]);
-    }
+      }
+      spinlock_release_irqrestore(&child->fd_lock, __fl); }
 
     // (1) SHARE the address space - do NOT clone it. Mark the child so its
     // cleanup never destroys the shared cr3 or frees the shared user stack.
@@ -6459,6 +7294,11 @@ void proc_execve_finalize(void *user_frame) {
     if (old_cr3 && old_cr3 != new_cr3) {
         vmm_destroy_user_space(old_cr3);
     }
+
+    // #SMPGLOBALS: the new image is a different PIE mapping, so the trampoline
+    // address latched for the OLD one is now an address in nothing. Clear it;
+    // the new image's libc re-registers on its first sigaction.
+    p->sig_trampoline = 0;
 
     // POSIX: execve resets all signal handlers to SIG_DFL unless they were
     // SIG_IGN, in which case they stay ignored. Pending signals are cleared.

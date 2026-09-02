@@ -6,6 +6,21 @@
 #include "../types.h"
 
 // ============================================================================
+// (no-ticket) "THE SCREEN HAS BEEN UPDATED" WAKE SOURCE
+// ============================================================================
+// sys_fb_flip() wakes this after every present, outside the interrupts-off
+// window, so any subsystem that needs to know its pixels actually reached the
+// glass can wait for the present counter to advance instead of sleeping for a
+// guessed number of milliseconds. The first caller is the DOS guest's
+// post-exit linger (dos/dosexec.c), which used to be a fixed proc_sleep(2000).
+//
+// Declared with a forward struct tag rather than by including sync/waitq.h:
+// this header is included by userland-facing compositor code and has never
+// pulled in the scheduler's headers.
+struct wait_queue_head;                       /* sync/waitq.h */
+extern struct wait_queue_head g_fb_flip_wq;
+
+// ============================================================================
 // Syscall Numbers for Compositor Support
 // ============================================================================
 
@@ -83,6 +98,17 @@ int64_t sys_fb_info(fb_info_user_t *info);
 int64_t sys_fb_flip(void);
 
 /**
+ * (#flipfix) Read the monotonic framebuffer present counter.
+ *
+ * The same g_fb_flip_count the kernel's own [FLIPPROF] line and the DOS
+ * frame gate read; this only hands it to Ring 3, where the DOS host cannot
+ * reach a kernel variable. Read-only, no arguments, no side effects.
+ *
+ * @return  presents since boot, as a non-negative int64_t.
+ */
+int64_t sys_fb_flip_count(void);
+
+/**
  * Mark a region of the screen as damaged (needs hardware update)
  * Used with smart update hardware
  * @param x, y, w, h    Damaged region
@@ -125,6 +151,13 @@ int64_t sys_set_mouse_buttons(uint32_t mask);
  * @return          0 if event returned, -1 if queue empty
  */
 int64_t sys_get_key(key_event_t *event);
+
+// #DOSRING3 Stage 1: focus-scoped RAW set-1 scancodes for a Ring-3 DOS host.
+// Requires the caller to OWN `handle` AND that window to HAVE FOCUS; both are
+// re-checked on every call. Returns bytes written, 0 if not focused (the
+// subscription is dropped and the ring flushed), -1 if not entitled.
+// See the contract block above the definition in fb_syscall.c.
+int64_t sys_win_get_scancodes(int handle, uint8_t *buf, int cap);
 
 /**
  * Grab exclusive input access

@@ -63,6 +63,46 @@
 #define IMGF_CACHE_SLOTS 32
 #define IMGF_CACHE_BLK   8192u
 
+// [no-ticket] READAHEAD. A miss used to fetch exactly ONE block, so a
+// sequential stream off a mounted disc paid one USB round trip per 8 KiB: 128
+// commands per megabyte. On a real USB mass-storage device a command costs a
+// FIXED ~121-148 us whatever its size (measured; see rustkern/imgra.rs), so the
+// round-trip count was the entire cost and the block layer was 99% device.
+//
+// On a detected sequential stream the miss now fetches up to IMGF_RA_MAX
+// CONSECUTIVE blocks into a CONSECUTIVE run of slots, which is ONE contiguous
+// buffer and therefore one backing read. 8 blocks = 64 KiB per fetch.
+// fs/blockdev.c splits that into 32 KB SCSI commands (BLK_USB_CHUNK), which is
+// exactly where the measured device curve saturates, so a larger window would
+// buy nothing on the device while widening the kmalloc-contiguity exposure the
+// #614 note warns about. 8 of 32 slots is a quarter of the cache, leaving 24
+// for the directory walk and any second stream.
+#define IMGF_RA_MAX      8u
+
+// rustkern/imgra.rs owns the policy. The struct is shared by value; the width
+// lock is in imgfile.c.
+//
+// Several independent stream positions, not one, because a drive letter is ONE
+// imgfile handle: the file being streamed, the ISO directory walk that resolved
+// it and any second open file all share this state. With a single last-position
+// variable ANY interleaving resets the window on every other miss and readahead
+// never engages. See the module header for why that is the normal case.
+#define IMGRA_STREAMS 4
+typedef struct imgra_stream {
+    uint64_t next_seq;
+    uint32_t win;
+    uint32_t lru;
+} imgra_stream_t;
+typedef struct imgra {
+    imgra_stream_t st[IMGRA_STREAMS];
+    uint32_t clock;
+    uint32_t _pad;
+    uint64_t n_seq;
+    uint64_t n_rand;
+    uint64_t n_fetch;
+    uint64_t n_blocks;
+} imgra_t;
+
 #define IMGF_KIND_NONE   0
 #define IMGF_KIND_EXT2   1
 #define IMGF_KIND_FAT    2
@@ -107,6 +147,8 @@ typedef struct imgfile {
     uint32_t clock;             // monotonic stamp source
     uint64_t hits;              // cache hits, in blocks
     uint64_t misses;            // backing reads, in blocks
+    uint8_t *cache_raw;         // the kmalloc() pointer; `cache` is it aligned up
+    imgra_t  ra;                // [no-ticket] readahead state (rustkern/imgra.rs)
 } imgfile_t;
 
 #define IMGF_TAG_EMPTY 0xFFFFFFFFFFFFFFFFULL
@@ -125,6 +167,11 @@ void imgfile_close(imgfile_t *f);
 // clamped to the image size, so an out-of-range request reads 0, never past the
 // end of the file and never past `dst`.
 int64_t imgfile_read(imgfile_t *f, uint64_t off, uint64_t len, void *dst);
+
+// [no-ticket] Force readahead off (window pinned to 1 block, the pre-change
+// behaviour). Set from /CONFIG/CDRAOFF.CFG and by dos/cdbench.c's control arm.
+void imgfile_readahead_set_disabled(int off);
+int  imgfile_readahead_disabled(void);
 
 // Image size in bytes (0 if not open).
 uint64_t imgfile_size(const imgfile_t *f);

@@ -89,17 +89,17 @@
 # dataflow, which this tool states plainly that it does not do. That is the
 # textbook case for this section: safe for a documented reason the regex cannot
 # model.
-proc/fdlayer.c:607: if (path && path[0]
+proc/fdlayer.c:608: if (path && path[0]
 proc/fdlayer.c:753: { int z = 0; while (path[z] && z < 259)
 proc/fdlayer.c:789: { int z = 0; while (path[z] && z < 259)
 proc/fdlayer.c:833: if (g_root_ext2 && path && path[0]
 proc/fdlayer.c:836: while (path[z] && z < 258)
 proc/fdlayer.c:848: { int z = 0; while (rel[z] && z < 255)
-proc/syscall.c:5214: if (net_fetch_blocked()) { if (status_out)
-proc/syscall.c:5215: int https = (url[0]
-proc/syscall.c:5220: if (r < 0) { if (rbody) kfree(rbody);
-proc/syscall.c:5222: if (rbody && n) memcpy(kbuf, rbody, n);
-proc/syscall.c:5214: if (status_out) *status_out = status;
+proc/syscall.c:5503: if (net_fetch_blocked()) { if (status_out)
+proc/syscall.c:5504: int https = (url[0]
+proc/syscall.c:5509: if (r < 0) { if (rbody) kfree(rbody);
+proc/syscall.c:5511: if (rbody && n) memcpy(kbuf, rbody, n);
+proc/syscall.c:5502: if (status_out) *status_out = status;
 
 # --- proc/procinfo.c : c_cstr_into() is the tail of the ROW BUILDERS, and the
 # AC window for those is opened by the CALLER, around the whole builder call
@@ -115,23 +115,23 @@ proc/procinfo.c:28: dst[i] = 0;
 # --- proc/process.c : a DECLARATION, not a dereference. Rule B3's pointer
 # pattern matches the declaration itself. The store two lines below is a
 # copy_to_user() now, matching thread.c's already-converted twin.
-proc/process.c:3881: uint32_t *ctid = me->clear_child_tid;
+proc/process.c:4587: uint32_t *ctid = me->clear_child_tid;
 
 # --- proc/signal.c : a DECLARATION, not a dereference. Every field store that
 # used to go through `frame` is built in a kernel-local sigframe_t and handed
 # over with ONE copy_to_user().
-proc/signal.c:139: sigframe_t *frame = (sigframe_t *)user_rsp;
+proc/signal.c:198: sigframe_t *frame = (sigframe_t *)user_rsp;
 
 # --- proc/syscall.c sys_list_users : `t` is the KERNEL user table returned by
 # users_all(). B3 attributes it to the user side because the same function calls
 # copy_to_user() on its (genuinely user) output buffer. Reading a kernel table
 # is not a user access, and the one user write here is already a copy_to_user().
-proc/syscall.c:427: user_entry_t *t = users_all(&n);
-proc/syscall.c:430: if (!t[i].active) continue;
-proc/syscall.c:436: for (k = 0; k < 63 && t[i].username[k]; k++) ke.username[k] = t[i].use
-proc/syscall.c:438: for (k = 0; k < 63 && t[i].display_name[k]; k++) ke.display_name[k] =
-proc/syscall.c:440: ke.uid = t[i].uid;
-proc/syscall.c:441: ke.gid = t[i].gid;
+proc/syscall.c:489: user_entry_t *t = users_all(&n);
+proc/syscall.c:492: if (!t[i].active) continue;
+proc/syscall.c:498: for (k = 0; k < 63 && t[i].username[k]; k++) ke.username[k] = t[i].use
+proc/syscall.c:500: for (k = 0; k < 63 && t[i].display_name[k]; k++) ke.display_name[k] =
+proc/syscall.c:502: ke.uid = t[i].uid;
+proc/syscall.c:503: ke.gid = t[i].gid;
 
 # --- proc/syscall.c spawn_impl : `kargp` is the KERNEL array that
 # copy_from_user() just filled FROM argv. B3 marks a copy_from_user DESTINATION
@@ -139,8 +139,8 @@ proc/syscall.c:441: ke.gid = t[i].gid;
 # are flagged. The two genuine Ring-3 reads in this function (the argv pointer
 # array, and each argument string) are a copy_from_user() and a
 # strncpy_from_user() respectively.
-proc/syscall.c:3461: char *kargp[64];
-proc/syscall.c:3466: if (!kargp[i]) break;
+proc/syscall.c:3727: char *kargp[64];
+proc/syscall.c:3732: if (!kargp[i]) break;
 
 # --- #112 proc/syscall.c sys_spawn_env : the same B3 attribution artefact as
 # `kargp` directly above, in the same function's new sibling.
@@ -151,11 +151,11 @@ proc/syscall.c:3466: if (!kargp[i]) break;
 # function are all wrapped: copy_from_user() for the request struct,
 # copy_from_user() for the envp pointer array, and validate_user_string() +
 # strncpy_from_user() for each entry string.
-proc/syscall.c:3738: char *kenvp[SC_ENV_MAX_ENTRIES + 1];
-proc/syscall.c:3749: char *uenv[SC_ENV_MAX_ENTRIES];
-proc/syscall.c:3757: if (!uenv[i]) break;
-proc/syscall.c:3769: kenvp[kenvc] = ebuf[kenvc];
-proc/syscall.c:3773: kenvp[kenvc] = NULL;
+proc/syscall.c:4024: char *kenvp[SC_ENV_MAX_ENTRIES + 1];
+proc/syscall.c:4035: char *uenv[SC_ENV_MAX_ENTRIES];
+proc/syscall.c:4043: if (!uenv[i]) break;
+proc/syscall.c:4055: kenvp[kenvc] = ebuf[kenvc];
+proc/syscall.c:4059: kenvp[kenvc] = NULL;
 
 # --- #112 proc/syscall.c spawn_impl / open_redir_file : `path`, `infile` and
 # `outfile` became VISIBLE to B3 for the first time at #112, and the reason is
@@ -177,32 +177,32 @@ proc/syscall.c:3773: kenvp[kenvc] = NULL;
 # This is EXEMPT rather than KNOWN_GAP because the safety is a property of the
 # code, not an outstanding fault: the reassignment is what the lint cannot see,
 # which is the documented limit of a tool that states it does no dataflow.
-proc/syscall.c:3568: if (outfile && outfile[0]) {
-proc/syscall.c:3573: if (infile && infile[0]) {
-proc/syscall.c:3312: if (!path || !path[0]) return NULL;
+proc/syscall.c:3834: if (outfile && outfile[0]) {
+proc/syscall.c:3839: if (infile && infile[0]) {
+proc/syscall.c:3578: if (!path || !path[0]) return NULL;
 
 # --- proc/syscall.c sys_brk / sys_mmap / sys_munmap : `p` is proc_current(),
 # a KERNEL process_t. Same B3 attribution artefact: these take a user ADDRESS as
 # a scalar and never dereference it, they only hand it to the VMM. Nothing here
 # reads or writes user memory.
-proc/syscall.c:5572: process_t *p = proc_current();
-proc/syscall.c:5605: if (!p || p->privilege != PRIV_USER) {
-proc/syscall.c:5609: if (p->brk == 0) {
-proc/syscall.c:5610: p->brk = DEFAULT_BRK_START;
-proc/syscall.c:5614: return (int64_t)p->brk;
-proc/syscall.c:5618: uint64_t old_brk = p->brk;
-proc/syscall.c:5624: if (vmm_alloc_user_pages(p->cr3, old_brk, pages, VMM_USER_RW) != 0) {
-proc/syscall.c:5630: vmm_free_user_pages(p->cr3, new_brk, pages);
-proc/syscall.c:5633: p->brk = new_brk;
-proc/syscall.c:5572: process_t *p = proc_current();
-proc/syscall.c:5605: if (!p || p->privilege != PRIV_USER) return -1;
-proc/syscall.c:5660: if (!p->mm) p->mm = mm_create();
-proc/syscall.c:5661: if (!p->mm) return -1;
-proc/syscall.c:5687: uint64_t r = do_mmap((mm_struct_t *)p->mm, addr, len,
-proc/syscall.c:5660: process_t *p = proc_current();
-proc/syscall.c:5661: if (!p || p->privilege != PRIV_USER) {
-proc/syscall.c:5719: if (p->mm) return do_munmap((mm_struct_t *)p->mm, addr, len);
-proc/syscall.c:5722: vmm_free_user_pages(p->cr3, addr, pages);
+proc/syscall.c:5861: process_t *p = proc_current();
+proc/syscall.c:5894: if (!p || p->privilege != PRIV_USER) {
+proc/syscall.c:5898: if (p->brk == 0) {
+proc/syscall.c:5899: p->brk = DEFAULT_BRK_START;
+proc/syscall.c:5903: return (int64_t)p->brk;
+proc/syscall.c:5907: uint64_t old_brk = p->brk;
+proc/syscall.c:5913: if (vmm_alloc_user_pages(p->cr3, old_brk, pages, VMM_USER_RW) != 0) {
+proc/syscall.c:5919: vmm_free_user_pages(p->cr3, new_brk, pages);
+proc/syscall.c:5922: p->brk = new_brk;
+proc/syscall.c:5861: process_t *p = proc_current();
+proc/syscall.c:5946: if (!p || p->privilege != PRIV_USER) return -1;
+proc/syscall.c:5949: if (!p->mm) p->mm = mm_create();
+proc/syscall.c:5950: if (!p->mm) return -1;
+proc/syscall.c:5976: uint64_t r = do_mmap((mm_struct_t *)p->mm, addr, len,
+proc/syscall.c:5945: process_t *p = proc_current();
+proc/syscall.c:5983: if (!p || p->privilege != PRIV_USER) {
+proc/syscall.c:6008: if (p->mm) return do_munmap((mm_struct_t *)p->mm, addr, len);
+proc/syscall.c:6011: vmm_free_user_pages(p->cr3, addr, pages);
 
 [KNOWN_GAP]
 # ONE entry, and it is a CLASS, not a site. Do not add anything else here to
@@ -242,7 +242,7 @@ proc/syscall.c:5722: vmm_free_user_pages(p->cr3, addr, pages);
 # entry in rustkern/argtab.rs for write-direction use, and should keep the
 # `make SMAPTEST=1` negative control armed while doing it.
 proc/syscall_path.h:47: return p && p[0]=='/' && p[1]=='e' && p[2]=='x' && p[3]=='t'
-fs/fat.c:2519: if (path && (path[0]=='/') &&
+fs/fat.c:2560: if (path && (path[0]=='/') &&
 
 # ---------------------------------------------------------------------------
 # CONVERTED, and still UNDETECTABLE BY THIS LINT - hand-maintained

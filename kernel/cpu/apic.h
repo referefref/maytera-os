@@ -159,6 +159,10 @@ uint32_t lapic_get_id(void);
 
 // Read from a Local APIC register
 uint32_t lapic_read(uint32_t offset);
+// #wakeipi: delivery diagnostics. A vector v can be delivered to this core only
+// if (v >> 4) > (lapic_ppr() >> 4); lapic_isr_highest() names what is blocking.
+uint32_t lapic_ppr(void);
+uint32_t lapic_isr_highest(void);
 
 // Write to a Local APIC register
 void lapic_write(uint32_t offset, uint32_t value);
@@ -171,10 +175,13 @@ void lapic_eoi(void);
 // ============================================================================
 
 // Send IPI to a specific CPU (by APIC ID)
-void lapic_send_ipi(uint32_t apic_id, uint32_t vector);
+// #wakeipi: 0 = issued, -1 = declined (LAPIC unusable or ICR never went idle).
+int  lapic_send_ipi(uint32_t apic_id, uint32_t vector);
 
 // Send IPI to all CPUs except self
 void lapic_send_ipi_all_excluding_self(uint32_t vector);
+void lapic_send_nmi_all_excluding_self(void);   // #75 panic stop-the-world
+int  lapic_send_nmi(uint32_t apic_id);          // #75 directed NMI
 
 // Send IPI to all CPUs including self
 void lapic_send_ipi_all(uint32_t vector);

@@ -5872,13 +5872,29 @@ static void draw_about_panel(void) {
             copy_str(disp_line, "Unknown", sizeof(disp_line));
         }
     }
-    // Logical core count (real, from SYS_SYSINFO cpu_count).
-    char cores_line[24];
+    // Logical core count, and HOW MANY OF THEM ARE ACTUALLY EXECUTING.
+    //
+    // cpu_count is the MADT count (proc/devinfo.c: smp_get_cpu_count()). It is
+    // what the firmware says the machine has, NOT what this kernel runs on:
+    // g_smp_user_sched ships at 0 and main.c only calls smp_start_aps() when it
+    // is set, so on every shipping build one core runs threads and the rest are
+    // never started. Printing cpu_count alone told the owner his laptop had 8
+    // cores while 1 executed, which is the kind of number someone reasonably
+    // uses to decide a machine is fine and the software is slow. cpu_online is
+    // published beside it and is the honest half; devmgr has always shown both.
+    char cores_line[40];
     {
-        int nc = g_sysinfo_ok ? (int)g_sysinfo.cpu_count : 1;
+        int nc = g_sysinfo_ok ? (int)g_sysinfo.cpu_count  : 1;
+        int no = g_sysinfo_ok ? (int)g_sysinfo.cpu_online : 1;
         char cb[8]; gui_itoa(nc, cb, sizeof(cb));
         cores_line[0] = 0; hw_append(cores_line, sizeof(cores_line), cb);
         hw_append(cores_line, sizeof(cores_line), nc == 1 ? " core" : " cores");
+        if (no > 0 && no != nc) {
+            char ob[8]; gui_itoa(no, ob, sizeof(ob));
+            hw_append(cores_line, sizeof(cores_line), " (");
+            hw_append(cores_line, sizeof(cores_line), ob);
+            hw_append(cores_line, sizeof(cores_line), " active)");
+        }
     }
     // Storage: real primary disk model + capacity (filled at startup from the kernel).
     char storage_line[56];

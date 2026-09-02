@@ -1,5 +1,6 @@
 // window.c - Window manager implementation for MayteraOS GUI
 #include "window.h"
+#include "uiscale.h"   // #dosowner: ui_px() for the titlebar icon, see window_draw()
 #include "widget.h"
 #include "themes.h"
 #include "../types.h"
@@ -14,6 +15,15 @@
 #include "desktop.h"   // (#745) TASKBAR_HEIGHT: the kernel-mode dock's own reserve
 #include "../security/uaccess_smap.h"  // #19/#645: AC brackets for Ring-3 out-params
 #include "../proc/process.h"  // #41: proc_current()/proc_get() for window owner identity
+#include "../cpu/mono.h"  // #resizelag: mono_us()/mono_ready() to throttle the
+                          // per-sample resize content commit (TSC-backed real
+                          // elapsed time, never timer_ticks - see mono.h)
+#include "../fs/bootlog.h"  // #resizescale: persisted real-hardware diagnostic
+// #resizescale: defined in proc/syscall.c (gated on /RESIZELOG.TXT, same
+// convention as /TESTINPUT.TXT). Checked here too so a real-hardware capture
+// can see wall-clock drag start/end alongside the content-commit timeline
+// logged on the syscall.c side (uw_commit_content()/user_window_handle_resize()).
+extern int g_resizelog_enabled;
 
 // #165: window transparency/options context menu state + forward decls. The
 // state lives here so wm_handle_mouse_down (above the menu helpers) can see it.
@@ -55,6 +65,10 @@ static struct {
     int32_t resize_orig_w;      // Original window width
     int32_t resize_orig_h;      // Original window height
     uint32_t resize_edge;       // Which edge(s) are being resized
+    // #resizelag: mono_us() timestamp of the last time the EXPENSIVE
+    // per-window content realloc+notify actually ran during a live resize
+    // drag. See RESIZE_COMMIT_INTERVAL_US below for why this exists.
+    uint64_t resize_last_commit_us;
 
     // Event queue for centralized event handling
     event_queue_t event_queue;
@@ -295,6 +309,7 @@ void wm_init(void) {
     wm_state.resize_orig_w = 0;
     wm_state.resize_orig_h = 0;
     wm_state.resize_edge = 0;
+    wm_state.resize_last_commit_us = 0;
 
     // Initialize event queue
     wm_state.event_queue.head = 0;
@@ -531,7 +546,25 @@ window_t *window_create(const char *title, int32_t x, int32_t y, int32_t width, 
     // properties.c) or any other caller with no current process gets 0,
     // which sys_wm_get_windows() below treats as "no identity" on purpose -
     // 0 is also idle's pid, and idle is never a real window owner.
-    win->owner_pid = proc_current() ? proc_current()->pid : 0;
+    //
+    // #pid0desk (2026-08-29): SAY WHAT WAS MEANT, DO NOT RELY ON PID 0.
+    // The paragraph above describes the intent correctly ("no Ring-3 owner"),
+    // but the code below only achieved it BY ACCIDENT: the kernel-desktop
+    // fallback windows were created from desktop_run(), which ran on pid 0, so
+    // proc_current()->pid happened to be 0. desktop_run() now runs as an
+    // ordinary kernel process ("session"), so that coincidence is gone and this
+    // line would have started stamping a live, non-idle pid onto windows that
+    // have no Ring-3 owner at all -- which sys_wm_get_windows() (below),
+    // window.c:907 and window.c:1947 would then have treated as a real owner.
+    //
+    // The property that actually matters is the RING, so test the ring. A
+    // Ring-0 creator is not a window owner no matter what its pid is, and a
+    // Ring-3 creator is one no matter which kernel thread spawned it.
+    {
+        process_t *creator = proc_current();
+        win->owner_pid = (creator && creator->privilege == PRIV_USER)
+                             ? creator->pid : 0;
+    }
 
     // Add to window list (sorted by z-order, highest first)
     if (!wm_state.window_list) {
@@ -861,6 +894,38 @@ void window_fullscreen_exit(window_t *win) {
 // Self-healing getter: see the contract in window.h. Called on every
 // composite (wm_draw_all/wm_draw_apps/wm_draw_winmenu) and every fast-path
 // render, so a stale claim can never survive more than one frame.
+//
+// #appsdirty (no-ticket): THIS was the sixth, UNDOCUMENTED "way back", and
+// the only one of the six that got it wrong. The block comment above
+// window_fullscreen_enter() names FIVE triggers (F11, window_set_focus,
+// window_destroy, wm_force_exit_fullscreen, the compositor watchdog) and
+// every one of them restores the window through window_fullscreen_exit(),
+// which puts win->bounds back to win->fs_stored_bounds. This getter used to
+// hand-roll its own clear (flags &= ~WINDOW_FLAG_FULLSCREEN; g_fullscreen_win
+// = NULL) WITHOUT that restore, so a window that lost "ok" status here (its
+// owner died, or WINDOW_FLAG_VISIBLE cleared under it) kept win->bounds ==
+// the full framebuffer FOREVER: WINDOW_FLAG_FULLSCREEN and g_fullscreen_win
+// both went false/NULL (so SYS_WM_FULLSCREEN_STATUS correctly reports "not
+// fullscreen" and the compositor's own native-fullscreen fast path correctly
+// stops), but the userland compositor's SEPARATE fullscreen_in_list()
+// predicate (main.c, #596) is a PURE BOUNDS check with no idea any of that
+// kernel state exists - it just asks "is there a visible, non-minimized
+// window whose rect covers the whole screen", and a stale-bounds zombie
+// answers yes forever. That pins the taskbar/chrome hidden
+// (fullscreen_app_on_top() suppresses it), forces the compositor onto its
+// full-composite path every tick (both quiet_tick and cursor_only explicitly
+// exclude fullscreen_in_list()), and - because that full path always calls
+// compositor_render_windows(), which reads the window list fresh and keeps
+// finding the same full-screen rect - keeps wm_is_dirty() legitimately true
+// on every single composite even though NOTHING is calling win_invalidate()
+// any more. Exactly the owner-reported "apps_dirty pinned true,
+// wdg=tb=ntf=menu=drag=rdrw=lock=anim=0" #COMPIDLE shape: a stale latch, not
+// a live setter - see CHANGELOG.md and blame.md.
+//
+// Fix: call the SAME restore every other trigger uses. window_fullscreen_exit()
+// is idempotent (no-ops if the flag is already clear) and touches only kernel
+// memory (window bounds, the content buffer via user_window_handle_resize()),
+// so it is safe to call here even when w->owner_pid names a zombie process.
 window_t *wm_fullscreen_active(void) {
     if (!g_fullscreen_win) return NULL;
     window_t *w = g_fullscreen_win;
@@ -877,9 +942,7 @@ window_t *wm_fullscreen_active(void) {
                       owner->state != PROC_STATE_UNUSED;
     }
     if (!ok) {
-        w->flags &= ~WINDOW_FLAG_FULLSCREEN;
-        g_fullscreen_win = NULL;
-        wm_invalidate_all();
+        window_fullscreen_exit(w);   // #appsdirty: proper restore, not a bare flag clear
         return NULL;
     }
     return w;
@@ -984,27 +1047,51 @@ void window_send_to_back(window_t *win) {
 //
 // The corner treatment is a THEME PROPERTY, not a switch on a theme name and
 // not a global toggle: `radius.window` (TM_RADIUS_WINDOW) is the extent, in
-// pixels, of the 45 degree chamfer cut out of each of a window's four outer
+// pixels, of the ARC rounding cut into each of a window's four outer
 // corners. 0 = square. retro_unix, Classic (Win95) and High Contrast ship 0
 // and keep their hard edges; every other shipped theme ships 4. A theme file
 // that says nothing gets its answer from style= (see theme_fill_v2_defaults),
 // so a new theme can never silently inherit the wrong shape from a hardcoded
 // list of names in here.
 //
-// The cut is a CHAMFER (a flat 45 degree bevel), not a quarter circle. That is
-// what "slightly beveled" means, and it lands exactly on the pixel grid, so
-// there is nothing to smooth. WE DO NOT ANTIALIAS IT: this framebuffer has no
-// per-pixel alpha, and blending the edge against anything other than the real
-// pixel behind the window is what produces a halo.
+// #winchrome (2026-08-28): this was a CHAMFER (a flat 45 degree bevel), not a
+// quarter circle, on the theory that "this framebuffer has no per-pixel
+// alpha, and blending the edge against anything other than the real pixel
+// behind the window is what produces a halo." That theory is only half
+// right: blending the edge against the wrong partner (the window's OWN
+// frame colour, as decor_fill_rounded_rect's solid fill would) does halo.
+// Blending it against the REAL captured background - which
+// wm_capture_corners() below has snapshotted since #27 shipped - is exactly
+// the correct anti-aliasing operation, not a halo source. The owner
+// compared this chamfer against a design mock and, independently, this
+// mechanism's own capture/restore step was found to leave the corner
+// looking wrong in a way "poorly rounded corners" undersells - see blame.md
+// #winchrome for the measured before/after. Fixed by porting the technique
+// this codebase ALREADY has, one file over: userland/apps/compositor/
+// draw.c's draw_round_corners_capture()/draw_round_corners_restore() (built
+// for the glass work, generalising the dock's 2-corner AA technique to all
+// four). That code runs in the userland compositor process against its own
+// software-blended surface and cannot be called from here (different
+// address space, different pixel-write primitive); this is the SAME
+// technique - capture the true background once per composite, then
+// alpha-composite it back over the window's own straight-rectangle fill at
+// a coverage fraction computed from distance to the arc - ported to the
+// kernel's fb_blend_pixel() and to integer fixed-point (the kernel target
+// is soft-float with SSE disabled, see version.h, so no sqrtf: see
+// win_isqrt_u32() below). Two implementations of one idea, not two
+// competing ones: the userland one draws AA corners on compositor-owned
+// panels (glass modals, the dock), this one draws AA corners on the kernel-
+// owned per-window frame. Do not add a third if this needs to change.
 //
-// window_point_is_cut() is the ONE definition of the shape. The renderer
-// (window_punch_corners) and the hit test (window_get_at_point) both call it,
-// so drawing and input cannot disagree about where the window is.
+// win_corner_dist_sq()/win_corner_restore_alpha() are the ONE definition of
+// the shape: window_point_is_cut() (hit test), win_covered_above() (corner
+// occlusion) and window_punch_corners() (the actual paint) all derive from
+// the same distance-to-arc-centre calculation, so drawing and input cannot
+// disagree about where the window is - same discipline as titlebar_btn_x()
+// elsewhere in this file.
 // ============================================================================
 
-#define WIN_BEVEL_MAX   6                                   /* clamp: sanity, and bounds the snapshot */
-#define WIN_BEVEL_PX    (WIN_BEVEL_MAX * (WIN_BEVEL_MAX + 1) / 2)   /* cut pixels per corner */
-#define WIN_EDGE_PX     (WIN_BEVEL_MAX + 1)                 /* border pixels per corner */
+#define WIN_BEVEL_MAX   6    /* clamp: sanity, and bounds the snapshot/restore box */
 
 int32_t window_corner_bevel(const window_t *win) {
     if (!win) return 0;
@@ -1060,6 +1147,44 @@ bool window_wants_shadow(const window_t *win) {
     return theme_metric_i(TM_RADIUS_WINDOW) > 0;
 }
 
+// The rounding circle of radius b is centred b pixels in from the corner on
+// both axes; di, dj (each 0..b-1, 0 = on the edge) are a pixel's distance
+// from the nearest vertical/horizontal edge, so its distance from that
+// centre is (b-di, b-dj). Shared by the hit test below, win_covered_above()
+// and window_punch_corners()'s AA coverage - the ONE definition of the arc.
+static inline int32_t win_corner_dist_sq(int32_t di, int32_t dj, int32_t b) {
+    int32_t fdx = b - di, fdy = b - dj;
+    return fdx * fdx + fdy * fdy;
+}
+
+// floor(sqrt(n)), plain bit-by-bit integer square root (no division, no
+// float/libgcc soft-float libcall - the kernel target is soft-float with
+// SSE disabled, see version.h). n never exceeds (2*WIN_BEVEL_MAX)^2 << 16
+// here, comfortably inside uint32_t.
+static uint32_t win_isqrt_u32(uint32_t n) {
+    uint32_t res = 0;
+    uint32_t bitmask = 1u << 30;
+    while (bitmask > n) bitmask >>= 2;
+    while (bitmask != 0) {
+        if (n >= res + bitmask) {
+            n -= res + bitmask;
+            res = (res >> 1) + bitmask;
+        } else {
+            res >>= 1;
+        }
+        bitmask >>= 2;
+    }
+    return res;
+}
+
+// Q8 (x256) distance from the corner's rounding-circle centre:
+// sqrt(dist_sq * 65536) == sqrt(dist_sq) * 256, so one integer sqrt gives
+// sub-pixel precision with no float anywhere in this path.
+static inline int32_t win_corner_dist_q8(int32_t di, int32_t dj, int32_t b) {
+    uint32_t dist_sq = (uint32_t)win_corner_dist_sq(di, dj, b);
+    return (int32_t)win_isqrt_u32(dist_sq << 16);
+}
+
 bool window_point_is_cut(const window_t *win, int32_t x, int32_t y) {
     int32_t b = window_corner_bevel(win);
     if (b <= 0) return false;
@@ -1070,7 +1195,11 @@ bool window_point_is_cut(const window_t *win, int32_t x, int32_t y) {
     if (j >= b && j < h - b) return false;      /* not near a top/bottom edge */
     int32_t di = (i < b) ? i : (w - 1 - i);
     int32_t dj = (j < b) ? j : (h - 1 - j);
-    return (di + dj) < b;
+    // A true circular arc (was a 45-degree chamfer, (di+dj) < b). Cut iff the
+    // pixel CENTRE is outside the rounding circle - the same boundary
+    // win_corner_restore_alpha() below treats as 50% coverage, so the hit
+    // test agrees with what is actually painted there.
+    return win_corner_dist_sq(di, dj, b) > b * b;
 }
 
 // Get window at point (returns topmost window)
@@ -1092,6 +1221,12 @@ window_t *window_get_at_point(int32_t x, int32_t y) {
 
 // Set focus to window
 void window_set_focus(window_t *win) {
+    // #198v2: WINDOW_FLAG_NO_FOCUS is a hard refusal, checked BEFORE the
+    // fdg_pulse()/early-return below, at the single chokepoint every focus
+    // change already passes through (see the flag's own comment in
+    // window.h). A no-op here, not an error: the caller (wm_handle_mouse_down,
+    // alt-tab, a taskbar click) does not need special-case code per site.
+    if (win && (win->flags & WINDOW_FLAG_NO_FOCUS)) return;
     fdg_pulse();                                  // (local 79) before the early return
     if (wm_state.focused_window == win) return;
     fdg_change(wm_state.focused_window, win, __builtin_return_address(0));
@@ -1240,6 +1375,30 @@ int wm_get_default_opacity(void) {
 #define RESIZE_EDGE_BL      (RESIZE_EDGE_BOTTOM | RESIZE_EDGE_LEFT)
 #define RESIZE_EDGE_BR      (RESIZE_EDGE_BOTTOM | RESIZE_EDGE_RIGHT)
 
+// #resizelag: how often the EXPENSIVE per-window content realloc+notify
+// (user_window_handle_resize(), called from window_resize()) is allowed to
+// run during a live resize drag. MEASURED (blame.md #resizelag, VM <vmid>,
+// build 2320): kmalloc + O(cw*ch) background fill + memcpy costs
+// ~2.2-3.5 ns/pixel, so roughly 4.5-13ms per call at the composite
+// resolutions this OS actually ships at (1920x1080 / 2560x1600) - large
+// enough that paying it on EVERY relayed mouse-move sample (already the
+// compositor's own tick rate, ~43-46Hz) synchronously blocked the
+// compositor's own sys_inject_mouse() call for a real fraction of its
+// frame budget on every single sample of a resize drag, while the
+// equivalent window MOVE drag costs nothing (window_move() is O(1)).
+//
+// 33ms (~30Hz) is a deliberate "smooth to the eye" live-resize content
+// refresh choice, not a value tuned to the compositor's current tick rate:
+// it stays correct independent of whatever the injection cadence is today
+// or becomes after future compositor work (#compthread raising tick rate
+// would otherwise re-expose the same synchronous-stall shape at a higher
+// frequency). The window's OUTER FRAME still tracks the cursor at full
+// sample rate (window_move() and the bounds update below are unthrottled);
+// only the heavy content commit is bounded. See wm_handle_mouse_up() for
+// the unconditional final flush that guarantees a throttled sample is
+// deferred, never lost.
+#define RESIZE_COMMIT_INTERVAL_US   33000
+
 // Check if point is on any resize grip (all 4 corners)
 // Returns the edge flags for which edge(s) to resize, or 0 if not on a grip
 static uint32_t get_resize_edge(window_t *win, int32_t x, int32_t y) {
@@ -1365,9 +1524,30 @@ void wm_handle_mouse_move(int32_t x, int32_t y) {
         // Invalidate old window area
         wm_invalidate_rect(&win->bounds);
 
-        // Apply new position and size
+        // Apply new position immediately - O(1), same as an ordinary
+        // window drag, so the frame outline always tracks the cursor with
+        // no perceptible lag regardless of the content throttle below.
         window_move(win, new_x, new_y);
-        window_resize(win, new_width, new_height);
+
+        // #resizelag: window_resize() does two things - set win->bounds.
+        // width/height (cheap), then call user_window_handle_resize()
+        // (EXPENSIVE: kmalloc + O(cw*ch) fill + memcpy of the content
+        // buffer - see RESIZE_COMMIT_INTERVAL_US above for the measured
+        // cost). Inlined here so the two can be decoupled: bounds update
+        // every sample (the outline must never lag), the heavy commit at
+        // most once per RESIZE_COMMIT_INTERVAL_US. A commit skipped here
+        // is deferred, not dropped - wm_handle_mouse_up() unconditionally
+        // forces one final commit when the drag ends.
+        win->bounds.width = new_width;
+        win->bounds.height = new_height;
+        {
+            uint64_t _rz_now = mono_ready() ? mono_us() : 0;
+            if (!mono_ready() ||
+                _rz_now - wm_state.resize_last_commit_us >= RESIZE_COMMIT_INTERVAL_US) {
+                user_window_handle_resize(win);
+                wm_state.resize_last_commit_us = _rz_now;
+            }
+        }
 
         // Invalidate new window area
         wm_invalidate_rect(&win->bounds);
@@ -1574,6 +1754,20 @@ void wm_handle_mouse_down(int32_t x, int32_t y, uint32_t button) {
         wm_state.resize_orig_y = win->bounds.y;
         wm_state.resize_orig_w = win->bounds.width;
         wm_state.resize_orig_h = win->bounds.height;
+        // #resizelag: force the FIRST move of this drag to commit
+        // immediately - there is no prior in-drag commit to rate-limit
+        // against yet.
+        wm_state.resize_last_commit_us = 0;
+        // #resizescale: PERSISTED. Marks the WALL-CLOCK moment the physical
+        // (or injected) button-down on a resize grip was processed, so a
+        // real-hardware /BOOTLOG.TXT capture can measure elapsed time from
+        // here to the drag_end marker below, and compare that against how
+        // long the content-commit timeline (syscall.c) took to catch up.
+        if (g_resizelog_enabled) {
+            bootlog_write("[RESIZELOG] drag_start win=%p edge=%u t_us=%llu",
+                          (void *)win, (unsigned)resize_edge,
+                          (unsigned long long)(mono_ready() ? mono_us() : 0));
+        }
         return;
     }
 
@@ -1662,8 +1856,34 @@ void wm_handle_mouse_up(int32_t x, int32_t y, uint32_t button) {
 
     // Stop resizing
     if (wm_state.resizing_window) {
-        wm_state.resizing_window->flags &= ~WINDOW_FLAG_RESIZING;
-        wm_state.resizing_window->resize_edge = 0;
+        window_t *_rz_win = wm_state.resizing_window;
+        // #resizelag: UNCONDITIONAL final commit. wm_handle_mouse_move()'s
+        // RESIZE_COMMIT_INTERVAL_US throttle can leave the drag's LAST
+        // sample uncommitted (bounds already at the final size, content_
+        // buffer still at an earlier, smaller/stale size). This call is
+        // what guarantees that never survives past mouse-up: there is no
+        // time check here, so it cannot be skipped by the throttle, and it
+        // fires on the SAME compositor-sampled button-up edge that already
+        // reliably ends every drag today (move included) - it adds no new
+        // way for a drag to fail to end. user_window_handle_resize()'s own
+        // "cw==content_width && ch==content_height" early-return makes
+        // this a cheap no-op on the common case where the last in-drag
+        // commit already matches the final bounds.
+        user_window_handle_resize(_rz_win);
+        // #resizescale: PERSISTED. The unconditional final commit above has
+        // just returned, so this marks the moment the KERNEL considers the
+        // drag over and the window's content caught up to its final bounds.
+        // If a real-hardware capture shows the window still visibly growing
+        // well after this line's timestamp, the cause is downstream of the
+        // kernel WM (the app's own redraw/reflow, or compositor recomposition
+        // pacing) - not this throttle/commit mechanism.
+        if (g_resizelog_enabled) {
+            bootlog_write("[RESIZELOG] drag_end win=%p w=%d h=%d t_us=%llu",
+                          (void *)_rz_win, _rz_win->bounds.width, _rz_win->bounds.height,
+                          (unsigned long long)(mono_ready() ? mono_us() : 0));
+        }
+        _rz_win->flags &= ~WINDOW_FLAG_RESIZING;
+        _rz_win->resize_edge = 0;
         wm_state.resizing_window = NULL;
         wm_state.resize_edge = 0;
         wm_invalidate_all();
@@ -1846,12 +2066,33 @@ static int win_modern_style(void) {
 // icon set) is the correct generic answer - adding a dedicated DOS-specific
 // bitmap to this set is a reasonable follow-up but is new pixel art, out of
 // scope for this fix (see blame.md).
+//
+// (#dosowner, 2026-09-01) THE BLOCK BELOW HAD NEVER EXECUTED ONCE, AND FIXING
+// THAT EXPOSED A SECOND, INDEPENDENT REASON IT STILL WOULD NOT HAVE FIRED.
+//
+//  1. win->owner_pid was ALWAYS 0 for an in-kernel DOS window, so the whole
+//     block was skipped. window_create() stamps owner_pid only for a PRIV_USER
+//     creator (#pid0desk) and the interpreter is a Ring-0 worker. Fixed at the
+//     one site that knows a window belongs to DOS:
+//     win16_host_route_close_to_dos() in proc/syscall.c, which now stamps it.
+//     See that function for why the ring test itself must NOT be weakened.
+//
+//  2. "dos"/"dosrun" are the IN-KERNEL names only. The Ring-3 DOS host
+//     (/APPS/DOSUSER, the path /CONFIG/DOSROUTE.CFG default=ring3 selects)
+//     always HAD a correct owner_pid - it creates its window with an ordinary
+//     SYS_WIN_CREATE from Ring 3 - and reported owner->name "DOSUSER", which
+//     this list did not contain. So even a correct owner_pid would have left
+//     the Ring-3 path with the wrong icon. Both names are checked now.
+//
+// Nothing here caught either problem, because a strcmp against a name nobody
+// ever printed looks exactly like a strcmp that works.
 static icon_id_t window_title_icon(window_t *win) {
     const char *t = win->title;
     if (win->owner_pid != 0) {
         process_t *owner = proc_get(win->owner_pid);
         if (owner && (strcmp(owner->name, "dos") == 0 ||
-                      strcmp(owner->name, "dosrun") == 0)) {
+                      strcmp(owner->name, "dosrun") == 0 ||
+                      strcmp(owner->name, "DOSUSER") == 0)) {
             return ICON_GAME;
         }
     }
@@ -1962,6 +2203,53 @@ static inline int32_t titlebar_glyph_off(void) {
 static inline int32_t titlebar_glyph_half(int32_t num) {
     int32_t v = CLOSE_BUTTON_SIZE * num / 16;
     return (v < 2) ? 2 : v;
+}
+
+// #winchrome (2026-08-28): minimize/maximize/close redrawn to match the
+// approved design mock (editor-uplift design-pass artifact "Editor Uplift",
+// 15594ca8-c778-4581-9ca4-8a97a3203cf8), which the owner compared against
+// the shipped Maytera Dark buttons and explicitly preferred. The mock draws
+// each glyph inside a 16x16 SVG viewBox scaled to 56% of the button box and
+// centred in it (`.tbtn svg{width:56%;height:56%}`), so every literal below
+// is the mock's OWN inline SVG coordinate (kept as tenths - 3.5 -> 35 - so
+// no float arithmetic runs in the kernel), mapped through that same 56%
+// inset. This is reproduction of a read value, not a redesign: every
+// literal here appears verbatim in the mock's markup. Deliberately separate
+// from titlebar_glyph_size()/titlebar_glyph_off() above (which still size
+// the Zest-icon FULLSCREEN/FILTER buttons, untouched by this ticket) so
+// this change cannot shift those two buttons' icon size as a side effect.
+#define MMCLOSE_ICON_PCT 56   /* .tbtn svg { width:56%; height:56% } */
+
+static inline int32_t mmclose_icon_size(void) {
+    int32_t g = (CLOSE_BUTTON_SIZE * MMCLOSE_ICON_PCT + 50) / 100;
+    return (g < 8) ? 8 : g;
+}
+static inline int32_t mmclose_icon_off(void) {
+    return (CLOSE_BUTTON_SIZE - mmclose_icon_size()) / 2;
+}
+// Maps one of the mock's SVG coordinates (0-16 space, passed as coord*10,
+// e.g. 3.5 -> 35) onto a pixel offset inside the icon box.
+static inline int32_t mmclose_pt(int32_t coord_x10) {
+    return (mmclose_icon_size() * coord_x10 + 80) / 160;   /* /(16*10), rounded */
+}
+// Same mapping for a stroke width/length: never collapses to 0 on a small
+// button, so the stroke stays a crisp 1px hairline at 100% and thickens at
+// 200% instead of vanishing.
+static inline int32_t mmclose_stroke(int32_t coord_x10) {
+    int32_t s = mmclose_pt(coord_x10);
+    return (s < 1) ? 1 : s;
+}
+// A `thickness`-px 45-degree diagonal, built as `thickness` adjacent 1px
+// Bresenham lines. fb_draw_line has no width parameter, and this
+// framebuffer has no per-pixel alpha (see the no-AA rule on window corners
+// above) - a stepped stroke is the same deliberate hard-edge style, not a
+// shortcut.
+static void mmclose_thick_diag(int32_t x1, int32_t y1, int32_t x2, int32_t y2,
+                                int32_t thickness, uint32_t color) {
+    int32_t lo = -(thickness / 2);
+    int32_t hi = thickness - 1 + lo;
+    for (int32_t k = lo; k <= hi; k++)
+        fb_draw_line(x1 + k, y1, x2 + k, y2, color);
 }
 
 // ---- Window decorator popup (#165, Task A redesign) ----------------------
@@ -2150,66 +2438,46 @@ static int winmenu_handle_click(int32_t x, int32_t y) {
 // window_point_is_cut() too, so if the higher window's own corner is cut
 // there, the lower window's background is correctly restored.
 //
-// Cost per composite, per window, for a 4px chamfer: 40 pixel reads in the
-// capture pass, then at most 40 pixel writes + 20 border pixels in the punch,
-// each guarded by at most (windows above) integer rect tests. There is NO
-// per-frame mask computation and NO per-pixel work proportional to window
-// area. For a square theme window_corner_bevel() returns 0 and the whole
-// thing collapses to one integer metric read per window per frame.
+// #winchrome: the restore step is now a true anti-aliased arc (see the
+// header comment on window_corner_bevel() above), not a stair-step chamfer,
+// which means every cell of the corner box is visited, not just a
+// triangular subset - at the theme-shipped radius.window=4, that is 4*16=64
+// cells captured and up to 64 blended + up to 64 border-ring writes per
+// window per composite (measured against the actual per-theme radius, not
+// the b<=6 sanity clamp, which bounds it at 4*36=144). Still O(1) per
+// window - NOT proportional to window or screen area - and it runs ONLY
+// inside window_punch_corners()/wm_capture_corners(), i.e. only on a
+// composite the compositor's own dirty gate (SYS_WM_APPS_DIRTY, #379/#564/
+// #745) already decided to run for some other reason (move/resize/focus/
+// create/close/invalidate). This adds per-pixel work to an already-gated
+// call; it does not add a new per-tick call. For a square theme
+// window_corner_bevel() returns 0 and the whole thing collapses to one
+// integer metric read per window per composite, same as before.
 // ============================================================================
 
 static struct {
     window_t *win;
     int32_t   b;
-    int       n;
-    uint32_t  px[4 * WIN_BEVEL_PX];
+    uint32_t  px[4][WIN_BEVEL_MAX][WIN_BEVEL_MAX];   // [corner][dj][di], addressed not enumerated
 } s_corner_snap[MAX_WINDOWS];
 static int s_corner_snap_n = 0;
 static int s_corner_snap_fresh = 0;
 
-// Enumerate the cut pixels of `win` in a FIXED order. Capture and punch both
-// call this, so entry k of the snapshot always means the same pixel.
-static int win_corner_pixels(const window_t *win, int32_t b,
-                             int32_t *ox, int32_t *oy, int max) {
-    int n = 0;
+// The absolute screen pixel for corner `c` (0=TL,1=TR,2=BL,3=BR - matches the
+// bx/by/sx/sy convention below), cell (di, dj) in from that corner. Capture
+// and restore both call this with the SAME (c, di, dj), so - unlike the old
+// linear enumeration, which relied on capture and restore producing entries
+// in the same ORDER - the two sides can never address different pixels.
+static inline void win_corner_px_py(const window_t *win, int c, int32_t di, int32_t dj,
+                                    int32_t *out_x, int32_t *out_y) {
     int32_t x = win->bounds.x, y = win->bounds.y;
     int32_t w = win->bounds.width, h = win->bounds.height;
-    for (int c = 0; c < 4; c++) {
-        int32_t bx = (c & 1) ? x + w - 1 : x;
-        int32_t by = (c & 2) ? y + h - 1 : y;
-        int32_t sx = (c & 1) ? -1 : 1;
-        int32_t sy = (c & 2) ? -1 : 1;
-        for (int32_t dj = 0; dj < b; dj++)
-            for (int32_t di = 0; di + dj < b; di++) {
-                if (n >= max) return n;
-                ox[n] = bx + sx * di;
-                oy[n] = by + sy * dj;
-                n++;
-            }
-    }
-    return n;
-}
-
-// The border pixels that run ALONG the chamfer (di + dj == b), so the frame
-// follows the cut instead of stopping dead at a nibbled corner.
-static int win_corner_edge_pixels(const window_t *win, int32_t b,
-                                  int32_t *ox, int32_t *oy, int max) {
-    int n = 0;
-    int32_t x = win->bounds.x, y = win->bounds.y;
-    int32_t w = win->bounds.width, h = win->bounds.height;
-    for (int c = 0; c < 4; c++) {
-        int32_t bx = (c & 1) ? x + w - 1 : x;
-        int32_t by = (c & 2) ? y + h - 1 : y;
-        int32_t sx = (c & 1) ? -1 : 1;
-        int32_t sy = (c & 2) ? -1 : 1;
-        for (int32_t dj = 0; dj <= b; dj++) {
-            if (n >= max) return n;
-            ox[n] = bx + sx * (b - dj);
-            oy[n] = by + sy * dj;
-            n++;
-        }
-    }
-    return n;
+    int32_t bx = (c & 1) ? x + w - 1 : x;
+    int32_t by = (c & 2) ? y + h - 1 : y;
+    int32_t sx = (c & 1) ? -1 : 1;
+    int32_t sy = (c & 2) ? -1 : 1;
+    *out_x = bx + sx * di;
+    *out_y = by + sy * dj;
 }
 
 // wm_state.window_list is front-first, so everything before `win` is above it.
@@ -2223,12 +2491,30 @@ static bool win_covered_above(const window_t *win, int32_t x, int32_t y) {
     return false;
 }
 
-// The frame colour, in ONE place, so the chamfer's border and the rectangular
+// The frame colour, in ONE place, so the corner ring and the rectangular
 // border drawn by window_draw() can never end up different colours.
 static uint32_t win_border_color(const window_t *win) {
     if (win->theme_override == 1) return 0x00485058;   /* force Dark */
     if (win->theme_override == 2) return 0x00A8B0BA;   /* force Light */
     return theme_get_current()->c_border_strong;
+}
+
+// How much of this corner cell should show the CAPTURED BACKGROUND rather
+// than whatever window_draw()'s plain rectangle fill already painted there.
+// 0 = fully kept (deep inside the arc), 255 = fully replaced (outside it),
+// and a short antialiased ramp at the boundary - the same over-compositing
+// coverage formula as the userland compositor's draw_round_corners_restore()
+// (draw.c corner_coverage_aa()), in Q8 integer fixed point instead of float.
+static int32_t win_corner_restore_alpha(int32_t di, int32_t dj, int32_t b) {
+    int32_t dist_q8 = win_corner_dist_q8(di, dj, b);
+    int32_t b_q8 = b << 8;
+    int32_t cov_q8 = 128 + b_q8 - dist_q8;   /* 128 = 0.5 in Q8: pixel-centre offset */
+    if (cov_q8 < 0) cov_q8 = 0;
+    if (cov_q8 > 256) cov_q8 = 256;
+    int32_t alpha = 255 - (cov_q8 * 255) / 256;
+    if (alpha < 0) alpha = 0;
+    if (alpha > 255) alpha = 255;
+    return alpha;
 }
 
 void wm_capture_corners(void) {
@@ -2239,40 +2525,77 @@ void wm_capture_corners(void) {
         if (!(win->flags & WINDOW_FLAG_VISIBLE)) continue;
         int32_t b = window_corner_bevel(win);
         if (b <= 0) continue;
-        int32_t xs[4 * WIN_BEVEL_PX], ys[4 * WIN_BEVEL_PX];
-        int n = win_corner_pixels(win, b, xs, ys, 4 * WIN_BEVEL_PX);
         int s = s_corner_snap_n++;
         s_corner_snap[s].win = win;
         s_corner_snap[s].b   = b;
-        s_corner_snap[s].n   = n;
-        for (int k = 0; k < n; k++)
-            s_corner_snap[s].px[k] = fb_get_pixel((uint32_t)xs[k], (uint32_t)ys[k]);
+        for (int c = 0; c < 4; c++) {
+            for (int32_t dj = 0; dj < b; dj++) {
+                for (int32_t di = 0; di < b; di++) {
+                    int32_t px, py;
+                    win_corner_px_py(win, c, di, dj, &px, &py);
+                    s_corner_snap[s].px[c][dj][di] =
+                        (px >= 0 && py >= 0) ? fb_get_pixel((uint32_t)px, (uint32_t)py) : 0;
+                }
+            }
+        }
     }
 }
 
+// #winchrome: full r x r box, every cell visited every composite (was: a
+// triangular "cut" subset restored from background, plus a separate 1px
+// diagonal "edge" subset painted in border colour - two enumerations that
+// between them still had to account for every pixel correctly, and a
+// restore that could bail out of an ENTIRE corner via "geometry moved: skip"
+// if the two sides' pixel counts disagreed). Addressing every cell directly
+// by (corner, di, dj) - capture and restore computing the same absolute
+// pixel from the same formula, never comparing counts - removes that class
+// of gap rather than shrinking it. This is O(4 * b^2) per window
+// (<=144 cells at the b=6 clamp), NOT proportional to window or screen area,
+// and it only runs when window_punch_corners() runs - i.e. on the same
+// dirty composite that already repainted this window's frame, not on every
+// idle tick (see kernel/gui/window.h sys_wm_apps_dirty() / #379/#564/#745
+// and the compositor's apps_dirty gate in userland/apps/compositor/main.c).
 void window_punch_corners(window_t *win) {
     int32_t b = window_corner_bevel(win);
     if (b <= 0) return;
-    int32_t xs[4 * WIN_BEVEL_PX], ys[4 * WIN_BEVEL_PX];
 
-    // 1. show-through: put back what was behind the window.
+    int snap = -1;
     for (int s = 0; s < s_corner_snap_n; s++) {
-        if (s_corner_snap[s].win != win || s_corner_snap[s].b != b) continue;
-        int n = win_corner_pixels(win, b, xs, ys, 4 * WIN_BEVEL_PX);
-        if (n != s_corner_snap[s].n) break;     /* geometry moved: skip, next composite fixes it */
-        for (int k = 0; k < n; k++) {
-            if (win_covered_above(win, xs[k], ys[k])) continue;
-            fb_put_pixel((uint32_t)xs[k], (uint32_t)ys[k], s_corner_snap[s].px[k]);
-        }
-        break;
+        if (s_corner_snap[s].win == win && s_corner_snap[s].b == b) { snap = s; break; }
     }
+    if (snap < 0) return;   /* no snapshot this composite: next one fixes it */
 
-    // 2. run the border down the chamfer.
-    uint32_t col = win_border_color(win);
-    int n = win_corner_edge_pixels(win, b, xs, ys, 4 * WIN_EDGE_PX);
-    for (int k = 0; k < n; k++) {
-        if (win_covered_above(win, xs[k], ys[k])) continue;
-        fb_put_pixel((uint32_t)xs[k], (uint32_t)ys[k], col);
+    uint32_t border = win_border_color(win);
+    int32_t border_w = BORDER_WIDTH;
+    if (border_w > b) border_w = b;      /* never let the ring eat the whole radius */
+    int32_t inner_b = b - border_w;      /* radius at which the ring meets the interior fill */
+    int32_t inner_b_sq = inner_b * inner_b;
+
+    for (int c = 0; c < 4; c++) {
+        for (int32_t dj = 0; dj < b; dj++) {
+            for (int32_t di = 0; di < b; di++) {
+                int32_t px, py;
+                win_corner_px_py(win, c, di, dj, &px, &py);
+                if (px < 0 || py < 0) continue;
+                if (win_covered_above(win, px, py)) continue;
+
+                // Ring: cells between inner_b and b belong to the frame
+                // BORDER, not the title bar/body fill window_draw() already
+                // put here - paint it before the AA blend below so that
+                // blend composites background over the RIGHT colour. Every
+                // cell in the box is visited unconditionally (this branch,
+                // or left alone because it is well inside the arc), so
+                // there is no cell this loop can skip.
+                if (win_corner_dist_sq(di, dj, b) > inner_b_sq)
+                    fb_put_pixel((uint32_t)px, (uint32_t)py, border);
+
+                int32_t alpha = win_corner_restore_alpha(di, dj, b);
+                if (alpha > 0) {
+                    uint32_t bg = s_corner_snap[snap].px[c][dj][di];
+                    fb_blend_pixel((uint32_t)px, (uint32_t)py, bg, (uint8_t)alpha);
+                }
+            }
+        }
     }
 }
 
@@ -2334,7 +2657,24 @@ void window_draw(window_t *win) {
         // this erase-then-reblit sequence is safe again exactly the way it
         // was before #131 existed: both this fill and the reblit happen
         // before fb_flip() presents anything to the real screen.
-        if (win->opacity >= 255)
+        //
+        // #198v2: ALSO skip this fill for a WINDOW_FLAG_ALPHA_CONTENT window,
+        // for the exact same reason opacity<255 already skips it below - an
+        // opaque ov_bg rect painted here, UNDER the content blit, defeats
+        // per-pixel transparency just as completely as it would defeat
+        // uniform opacity: user_window_draw_handler's "alpha==0, skip this
+        // pixel" (kernel/proc/syscall.c) is a promise to leave whatever is
+        // ALREADY on fb_back untouched, but if THIS fill just painted ov_bg
+        // there a moment ago, "untouched" means "still ov_bg", not "still
+        // the wallpaper/desktop underneath". Measured: the wizard's power-
+        // corner icons (#198v2, docs/WIZARD_POWER_CORNER.html revision 2)
+        // rendered as a solid ov_bg-coloured box no matter what alpha the
+        // app's content_buffer carried, because this exact fill ran first
+        // and the per-pixel skip could only preserve IT. A window that opts
+        // into ALPHA_CONTENT is declaring "my content_buffer's alpha byte is
+        // the complete transparency story", the same declaration opacity<255
+        // already makes; both must bypass this opaque pre-fill the same way.
+        if (win->opacity >= 255 && !(win->flags & WINDOW_FLAG_ALPHA_CONTENT))
             fb_fill_rect(cx, cy, cw, ch, ov_bg);
         widget_t *wd = win->widgets;
         while (wd) { widget_draw(wd); wd = wd->next; }
@@ -2416,10 +2756,29 @@ void window_draw(window_t *win) {
     int32_t title_x = x + BORDER_WIDTH + title_inset;
     int32_t title_y = y + BORDER_WIDTH + (TITLEBAR_HEIGHT - FONT_HEIGHT) / 2;
     {
-        int32_t isz = 16;
+        // (#dosowner, 2026-09-01) ui_px(), NOT A BARE 16. MEASURED at 200% on a
+        // 2560x1600 framebuffer (KEEN5, build 2323): TITLEBAR_HEIGHT and
+        // title_px just below are THEME METRICS, and theme_get_metric_by_id()
+        // applies the global UI scale at read time - "THE GLOBAL UI SCALE
+        // FACTOR IS APPLIED HERE AND ONLY HERE", gui/themes.c. So the bar and
+        // its text both doubled and this literal did not: a 16px icon sat in a
+        // ~40px bar beside 28px text, on the exact configuration the owner runs
+        // (a 4K panel above 100%). The scale at which the DOS icon fix landed
+        // was the scale at which it was least legible.
+        //
+        // THIS IS NOT THE DOUBLE-MULTIPLY TRAP, which is the thing to get wrong
+        // here. 16 is a bare literal that has never been through the theme
+        // path, so it is a LOGICAL length converted to physical exactly once,
+        // by the same primitive theme_get_metric_by_id() itself calls. ui_px()
+        // is the IDENTITY at 100%, so every window titlebar at the default
+        // scale is byte-for-byte unchanged under every one of the 14 shipped
+        // themes; this can only move the icon above (or below) 100%, where it
+        // was wrong for EVERY window and not only a DOS one.
+        int32_t isz = ui_px(16);
+        if (isz < 8) isz = 8;      // never scale a titlebar icon out of legibility
         int32_t iy = y + BORDER_WIDTH + (TITLEBAR_HEIGHT - isz) / 2;
         icon_draw_scaled(window_title_icon(win), title_x, iy, isz, tb_ink);
-        title_x += isz + 3;
+        title_x += isz + ui_px(3);
     }
     // #162: crisp TTF title (smaller/lighter than the chunky bitmap font), with a
     // bitmap fallback if TTF is not ready.
@@ -2489,18 +2848,21 @@ void window_draw(window_t *win) {
         }
     }
 
-    // #165: minimize button (Zest minus icon).
+    // #winchrome: minimize button. The mock's bar sits LOW in the glyph box
+    // (<rect x="3" y="11" width="10" height="1.6"/> in its 16x16 SVG), not
+    // dead-centre like a plain minus sign - that low placement is part of
+    // what the owner was reacting to, so it is reproduced exactly rather
+    // than kept as a centred dash.
     {
         int32_t btn_x = titlebar_btn_x(x, w, TITLEBAR_SLOT_MINIMIZE);
         uint32_t fill = (win->tb_hover_btn == 2) ? btn_hover_bg : tb_col;
         fb_fill_rect(btn_x, btn_y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, fill);
-        int32_t gsz = titlebar_glyph_size(), goff = titlebar_glyph_off();
-        if (!kicon_blit("MINUS", btn_x + goff, btn_y + goff, gsz, tb_ink, fill)) {
-            int32_t cx = btn_x + CLOSE_BUTTON_SIZE / 2;
-            int32_t cy = btn_y + CLOSE_BUTTON_SIZE / 2;
-            int32_t half = titlebar_glyph_half(4);
-            for (int i = -half; i <= half; i++) fb_put_pixel(cx + i, cy, tb_ink);
-        }
+        int32_t off = mmclose_icon_off();
+        int32_t rx = btn_x + off + mmclose_pt(30);    /* x=3 */
+        int32_t ry = btn_y + off + mmclose_pt(110);   /* y=11 */
+        int32_t rw = mmclose_pt(100);                 /* width=10 */
+        int32_t rh = mmclose_stroke(16);              /* height=1.6 */
+        fb_fill_rect(rx, ry, rw, rh, tb_ink);
     }
 
     // Draw maximize button - middle
@@ -2509,19 +2871,20 @@ void window_draw(window_t *win) {
         uint32_t fill = (win->tb_hover_btn == 3) ? btn_hover_bg : tb_col;
         fb_fill_rect(btn_x, btn_y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, fill);
 
-        // Draw square outline on maximize button. #uiscale: no icon file
-        // backs this one (unlike its four siblings above) - it is ALWAYS
-        // this hand-drawn shape, so a fixed half-side made it the single
-        // most visible "box grew, glyph did not" case in the whole titlebar.
-        int32_t cx = btn_x + CLOSE_BUTTON_SIZE / 2;
-        int32_t cy = btn_y + CLOSE_BUTTON_SIZE / 2;
-        int32_t half = titlebar_glyph_half(3);
-        for (int i = -half; i <= half; i++) {
-            fb_put_pixel(cx + i, cy - half, tb_ink);  // Top
-            fb_put_pixel(cx + i, cy + half, tb_ink);  // Bottom
-            fb_put_pixel(cx - half, cy + i, tb_ink);  // Left
-            fb_put_pixel(cx + half, cy + i, tb_ink);  // Right
-        }
+        // #winchrome: outlined square matching the mock (<rect x="3.2"
+        // y="3.2" width="9.6" height="9.6" fill="none" stroke-width="1.4"/>
+        // in its 16x16 SVG) - bigger and better-proportioned (60% of the
+        // icon box) than the old fixed 7px square, which did not grow with
+        // the button and read as visually undersized next to its siblings.
+        int32_t off = mmclose_icon_off();
+        int32_t sx  = btn_x + off + mmclose_pt(32);   /* x=3.2 */
+        int32_t sy  = btn_y + off + mmclose_pt(32);   /* y=3.2 */
+        int32_t ss  = mmclose_pt(96);                 /* side=9.6 */
+        int32_t st  = mmclose_stroke(14);             /* stroke=1.4 */
+        fb_fill_rect(sx,           sy,           ss, st, tb_ink);  // top
+        fb_fill_rect(sx,           sy + ss - st, ss, st, tb_ink);  // bottom
+        fb_fill_rect(sx,           sy,           st, ss, tb_ink);  // left
+        fb_fill_rect(sx + ss - st, sy,           st, ss, tb_ink);  // right
     }
 
     // Draw close button - rightmost
@@ -2532,17 +2895,21 @@ void window_draw(window_t *win) {
         // read anywhere. This is its first consumer.
         uint32_t close_bg = (win->tb_hover_btn == 4) ? THEME_CLOSE_BUTTON_HOVER : THEME_CLOSE_BUTTON;
         fb_fill_rect(btn_x, btn_y, CLOSE_BUTTON_SIZE, CLOSE_BUTTON_SIZE, close_bg);
-        // #165: Zest X (xmark) icon, tinted white over the red close button.
-        int32_t gsz = titlebar_glyph_size(), goff = titlebar_glyph_off();
-        if (!kicon_blit("XMARK", btn_x + goff, btn_y + goff, gsz, 0x00FFFFFF, close_bg)) {
-            int32_t cx = btn_x + CLOSE_BUTTON_SIZE / 2;
-            int32_t cy = btn_y + CLOSE_BUTTON_SIZE / 2;
-            int32_t half = titlebar_glyph_half(4);
-            for (int i = -half; i <= half; i++) {
-                fb_put_pixel(cx + i, cy + i, tb_ink);
-                fb_put_pixel(cx + i, cy - i, tb_ink);
-            }
-        }
+        // #winchrome: X matching the mock (two lines, (3.5,3.5)-(12.5,12.5)
+        // and (12.5,3.5)-(3.5,12.5), stroke-width 1.6, in its 16x16 SVG).
+        // Drawn in tb_ink like its two siblings above: the mock's icon uses
+        // stroke="currentColor" (the titlebar text colour), not a hardcoded
+        // white. Every shipped theme's titlebar text is white/near-white
+        // already, so this is a correctness fix with no visible change
+        // today, not a new look.
+        int32_t off = mmclose_icon_off();
+        int32_t st  = mmclose_stroke(16);             /* stroke=1.6 */
+        int32_t p0  = mmclose_pt(35);                 /* 3.5 */
+        int32_t p1  = mmclose_pt(125);                /* 12.5 */
+        mmclose_thick_diag(btn_x + off + p0, btn_y + off + p0,
+                            btn_x + off + p1, btn_y + off + p1, st, tb_ink);
+        mmclose_thick_diag(btn_x + off + p1, btn_y + off + p0,
+                            btn_x + off + p0, btn_y + off + p1, st, tb_ink);
     }
 
     // Draw window content area

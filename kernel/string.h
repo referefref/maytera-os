@@ -46,6 +46,13 @@ unsigned long long strtoull(const char *nptr, char **endptr, int base);
 // Formatted output
 int snprintf(char *buf, size_t size, const char *fmt, ...);
 int vsnprintf(char *buf, size_t size, const char *fmt, __builtin_va_list ap);
+// deadport: same as vsnprintf(), but also reports how many characters did not
+// fit. THIS IS THE ONLY WAY TO DETECT TRUNCATION HERE: vsnprintf() returns the
+// bytes actually WRITTEN (capped at size-1), not the C99 "would have written",
+// so the standard `if (n >= size)` test can never be true and every copy of it
+// in this tree is dead code. *dropped is 0 when the whole line fitted.
+int vsnprintf_dropped(char *buf, size_t size, const char *fmt,
+                      __builtin_va_list ap, size_t *dropped);
 
 // #672: THE shared format parser. One definition of the printf format language
 // for the whole kernel; the DESTINATION is the caller's, supplied as a sink.

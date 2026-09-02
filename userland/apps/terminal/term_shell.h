@@ -30,4 +30,13 @@ void add_to_history(const char *cmd);
 void setenv_local(const char *name, const char *value);
 const char *getenv_local(const char *name);
 
+// [tabcomp]: Tab completion for input_line, called from main.c's
+// EVENT_KEY_DOWN handler on GUI_KEY_TAB. Operates on the current input_line/
+// input_pos in place (same editing model as history recall / backspace: it
+// echoes what it inserts and never touches anything before the cursor
+// except when it must retroactively open a quote around an unquoted token -
+// see term_shell.c for why that is the only case that rewrites already-
+// echoed text). No-op if there is nothing to complete or nothing matches.
+void term_shell_complete(void);
+
 #endif // TERM_SHELL_H

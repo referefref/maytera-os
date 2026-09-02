@@ -6,6 +6,14 @@
 *.efi
 *.EFI
 *.bin
+# ...but pwbreach.bin is SOURCE, not a build output. It is a generated table of
+# FNV-1a hashes of breached passwords, include_bytes!-ed by
+# kernel/rustkern/pwpolicy.rs and named in kernel/Makefile RUST_BLOBS, so a
+# clean clone CANNOT BUILD THE RUST KERNEL LIBRARY without it. The 2026-08-28
+# public push shipped without it: the release gate had cleared the file, then
+# 'git add -A' skipped it silently on this very line and nothing warned. A
+# gate proves nothing about a push if .gitignore sits between them.
+!kernel/rustkern/pwbreach.bin
 kernel/kernel.elf
 boot/uefi/BOOTX64.EFI
 userland/libc/libc.a

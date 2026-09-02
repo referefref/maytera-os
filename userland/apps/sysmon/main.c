@@ -255,7 +255,15 @@ static void draw(void) {
     unsigned int cink = lum_ink(C_CARD), cdim = dim_ink(C_CARD);
     win_draw_text_ttf(win, cx + 12, cy + 8, "System Monitor", 15, cink);
     if (g_sys_ok) {
-        snprintf(buf, sizeof(buf), "%s  -  %u cores", g_sys.cpu_brand, g_sys.cpu_count);
+        // cpu_count is the MADT count, cpu_online is how many cores this
+        // kernel actually started. They differ on every shipping build (the
+        // #67 AP-scheduling gate ships off), so showing only the first one
+        // overstates the machine. See the note in settings/main.c.
+        if (g_sys.cpu_online && g_sys.cpu_online != g_sys.cpu_count)
+            snprintf(buf, sizeof(buf), "%s  -  %u cores (%u active)",
+                     g_sys.cpu_brand, g_sys.cpu_count, g_sys.cpu_online);
+        else
+            snprintf(buf, sizeof(buf), "%s  -  %u cores", g_sys.cpu_brand, g_sys.cpu_count);
         const char *bp = buf; while (*bp == ' ') bp++;
         int bw = gui_ttf_width(bp, 11);
         win_draw_text_ttf(win, cx + cw - 12 - bw, cy + 10, bp, 11, cdim);
@@ -319,7 +327,18 @@ static void draw(void) {
         win_draw_text_ttf(win, cName, ry + 3, procs[i].name, 12, tx);
         snprintf(buf, sizeof(buf), "%u", procs[i].pid);
         win_draw_text_ttf(win, cPid, ry + 3, buf, 12, tx);
-        if (procs[i].running_cpu < 1) snprintf(buf, sizeof(buf), "-");
+        // (smpstatus) THREE STATES, NOT TWO. This was `< 1 -> -`, which is
+        // the identical defect blame.md records against the Task Manager under
+        // #780 and which was fixed there and not here: it renders "running on
+        // the BSP right now" (running_cpu == 0) and "not running anywhere"
+        // (running_cpu == -1) as the SAME dash. The scheduler publishes 0 for
+        // every process the BSP is executing, and with /SMPSCHED.TXT absent the
+        // BSP is the ONLY core that executes anything, so this column could
+        // never show a value at all - it read as permanently empty, which is
+        // indistinguishable from "the core field is not populated".
+        // A sentinel and a real value must never share a glyph.
+        if (procs[i].running_cpu < 0) snprintf(buf, sizeof(buf), "-");
+        else if (procs[i].running_cpu == 0) snprintf(buf, sizeof(buf), "CPU0");
         else snprintf(buf, sizeof(buf), "AP%d", procs[i].running_cpu);
         win_draw_text_ttf(win, cCore, ry + 3, buf, 11, td);
         win_draw_text_ttf(win, cState, ry + 3, state_name(procs[i].state), 11, td);

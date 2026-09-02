@@ -149,10 +149,33 @@ int audio_pcm_wait_below_kernel(int handle, uint32_t max_used, uint32_t ms);
 // source. Returns WAIT_OK / WAIT_TIMEOUT.
 int audio_pcm_wait_consumed_kernel(int handle, uint32_t target, uint32_t ms);
 
+// ---------------------------------------------------------------------------
+// (#181 Ring-3 audio) SYS_AUDIO_PCM_CTL ops. The Ring-3 door to the counters
+// and the two #426 waits above, for a stream the CALLING process owns.
+// Scalar-only, so no argtab descriptor is needed.
+#define AUDIO_PCM_CTL_CONSUMED      0   // -> frames consumed since open
+#define AUDIO_PCM_CTL_QUEUED        1   // -> frames written but not consumed
+#define AUDIO_PCM_CTL_UNDERRUNS     2   // -> mixer fills this stream was late for
+#define AUDIO_PCM_CTL_WAIT_BELOW    3   // a=max_used frames, b=ms -> WAIT_OK/TIMEOUT
+#define AUDIO_PCM_CTL_WAIT_CONSUMED 4   // a=target frames,   b=ms -> WAIT_OK/TIMEOUT
+// AVAIL takes no handle: 1 when a real output device exists (codec or USB DAC),
+// 0 otherwise. This is what the Ring-3 DOS host asks before it advertises a
+// Sound Blaster to a guest, so it must be the KERNEL answering.
+#define AUDIO_PCM_CTL_AVAIL         5
+
+int64_t audio_pcm_ctl(int handle, uint32_t op, uint32_t a, uint32_t b);
+
 // Called from proc_exit(): tear down any stream owned by `pid` whose owner died
 // without calling close (the music player force-kills its --play helper with
 // SIGKILL on a manual track switch, so this is a NORMAL path, not an edge case).
-void audio_pcm_proc_exit(uint32_t pid);
+// (#181) `owner_tgid` is the exiting process's THREAD GROUP, and proc_exit()
+// calls this only on a group-leader exit, exactly as it calls fdown_proc_exit()
+// and async_http_proc_exit(). A stream is owned by the group (see pcm_lookup),
+// so one thread of a live process exiting must NOT take its audio with it, and
+// a stream opened by a worker thread must still be released when the process
+// dies. A pid-exact match got both of those wrong; see the block comment on the
+// definition in audio_pcm.c.
+void audio_pcm_proc_exit(uint32_t owner_tgid);
 
 
 // (#231r) The 5-band graphic EQ. The state and the DSP are in

@@ -596,7 +596,44 @@ const char *fat_ext2_vol_path(const char *path) {
     return path;
 }
 
+// ===========================================================================
+// #VOLAPI: READ-ONLY MEDIA IS ENFORCED, NOT ASSUMED.
+//
+// ISO 9660 has no write path and diskimg_query() has always reported
+// DISKIMG_F_READONLY, so a write beneath a mounted disc's subtree "cannot"
+// happen. That is an argument about the format, not a check, and the failure it
+// leaves open is the interesting one: fat_open()'s image branch OWNS the
+// subtree for READS, but every write entry point below fell through to the FAT
+// ESP, where /WINDIR/DRIVE_E/FOO.DAT is simply a path that does not exist yet.
+// So a write to a read-only disc did not fail as a read-only violation; it
+// CREATED A DIFFERENT FILE on the ESP, which a later read would never return
+// (the image branch answers first). Two files, one path, and the wrong one
+// silently wins - the same two-answers-for-one-path shape #193 fixed at the
+// predicate.
+//
+// Refusing here rather than at the syscall layer is deliberate: these six
+// functions are what the syscall layer, the VFS adapter, the DOS INT 21h path
+// and the Win16 KERNEL file APIs all reach, so one guard covers every caller
+// including the ones not yet written. That is the same argument #725 used for
+// putting the ext2 redirect in fat_open() rather than in its callers.
+//
+// It is a MEDIA property, not a permission: it applies to root and to Ring 0
+// exactly as it applies to uid 1000, because the disc is physically read-only
+// for all of them. perms_check() answers "may this caller write here"; this
+// answers "is there anywhere here to write at all", and the second question has
+// to be asked even when the first says yes.
+//
+// -30 is EROFS, chosen so a caller can tell "read-only medium" from "-13, you
+// lack permission" and from "-1, it did not work". Fail closed on a NULL path.
+// ===========================================================================
+#define FAT_EROFS (-30)
+static int img_ro_refuse(const char *path) {
+    if (!path) return 0;
+    return path_img_shadows(path) ? 1 : 0;
+}
+
 int fat_create(fat_fs_t *fs, const char *path) {
+    if (img_ro_refuse(path)) return FAT_EROFS;   // #VOLAPI
     // Create an (empty) file on ext2 when it is root; ext2 has no standalone
     // create, so an empty write produces a zero-length file.
     if (fat_path_on_ext2(fs, path)) return (ext2_write_file(fat_ext2_vol_path(path), "", 0) == 0) ? 0 : -1;
@@ -604,6 +641,7 @@ int fat_create(fat_fs_t *fs, const char *path) {
     int r = fat_create_inner(fs, path); fat_unlock(); return r;
 }
 int fat_mkdir(fat_fs_t *fs, const char *path) {
+    if (img_ro_refuse(path)) return FAT_EROFS;   // #VOLAPI
     // task #578: preserve ext2_mkdir()'s distinct "-2 == already exists"
     // return instead of collapsing every non-zero result to a generic -1.
     // Callers up the stack (sys_mkdir -> userland mkdir() -> errno) rely on
@@ -623,6 +661,7 @@ int fat_mkdir(fat_fs_t *fs, const char *path) {
     int r = fat_mkdir_inner(fs, path); fat_unlock(); return r;
 }
 int fat_delete(fat_fs_t *fs, const char *path) {
+    if (img_ro_refuse(path)) return FAT_EROFS;   // #VOLAPI
     if (fat_path_on_ext2(fs, path)) {
         int er = ext2_unlink(fat_ext2_vol_path(path));
         if (er == 0) return 0;
@@ -643,6 +682,7 @@ int fat_delete(fat_fs_t *fs, const char *path) {
     int r = fat_delete_inner(fs, path); fat_unlock(); return r;
 }
 int fat_rename(fat_fs_t *fs, const char *old_path, const char *new_path) {
+    if (img_ro_refuse(old_path) || img_ro_refuse(new_path)) return FAT_EROFS;   // #VOLAPI
     // #746: ext2 DOES have an in-place rename now (ext2_rename), and this used
     // to be fat_copy + fat_delete: it read and rewrote every byte, so a failure
     // half way left the destination TRUNCATED. That is precisely why
@@ -806,6 +846,7 @@ int fat_move(fat_fs_t *fs, const char *src_path, const char *dst_path) {
     int r = fat_move_inner(fs, src_path, dst_path); fat_unlock(); return r;
 }
 int fat_write_file(fat_fs_t *fs, const char *path, const void *data, uint32_t size) {
+    if (img_ro_refuse(path)) return FAT_EROFS;   // #VOLAPI
     // (#133) Complete the ext2-root cutover: "/" writes must land on the ext2
     // root, matching fat_read_file (which already serves "/" from ext2). Without
     // this, writes went to the FAT ESP while reads came from ext2 - so a written

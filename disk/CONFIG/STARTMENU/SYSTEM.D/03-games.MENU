@@ -135,7 +135,52 @@ item: SkyRoads | /DOS/SKYROADS/SKYROADS.EXE | icon=dosapp | type=dos
 item: The Secret of Monkey Island | /DOS/MONKEY/MONKEY.EXE | icon=dosapp | type=dos
 item: Stunts | /DOS/STUNTS/LOAD.EXE /u MCGA | icon=dosapp | type=dos
 item: Joust | /DOS/JOUST/JOUST.COM | icon=dosapp | type=dos
-item: Commander Keen 7 (Keen 4 mod) | /DOS/KEEN7/KEEN4E.EXE | icon=dosapp | type=dos
+# 2026-08-28 (dosplay): THIS ENTRY HAD BEEN LAUNCHING THE UNPATCHED BINARY SINCE
+# THE DAY IT WAS ADDED, and the owner reported it as "Keen 7 exits when I press
+# space on the first screen".
+#
+# Commander Keen 7 is not a game, it is a PATCH. /DOS/KEEN7 ships CK4PATCH.EXE
+# ("Commander Keen Patch-Loading Utility v0.9.0 beta"), KEEN7.PAT, CK4LOAD.BIN
+# and a vanilla-layout KEEN4E.EXE, and its own Read Me says "To play, run
+# Keen7.bat", whose entire 19-byte contents are `ck4patch KEEN7.PAT`. The
+# patcher loads the executable itself, applies the mod's patches to the loaded
+# image and runs it. Launching KEEN4E.EXE directly runs a VANILLA Keen 4 engine
+# against Keen 7's MODDED data files.
+#
+# MEASURED, golden 2267, one run each, dosharness:
+#   /DOS/KEEN7/KEEN4E.EXE          69 INT 21h calls, 0 unimplemented. It opens
+#     GAMEMAPS.CK4, EGAGRAPH.CK4 and AUDIO.CK4 out of the KEEN7 directory, reads
+#     the first EGAGRAPH chunks (to offset 150,144), and then
+#     `[dos] DERAIL: zeros at cs:ip=048d:76ae ... dx=03ce insns=960000` - it
+#     executes a run of 0x00 with the EGA graphics-controller port still in DX
+#     and the guest exits 0 with only mode 03 ever set. It is not our input path
+#     and it is not an INT 21h AH=4Ch quit: the engine jumps into nothing,
+#     because a vanilla chunk table cannot decode a modded EGAGRAPH. Commander
+#     Keen 4 (/GAMES/KEEN4) is the same engine and is fine, which is what
+#     narrowed this to the mod rather than to the emulator.
+#   /DOS/KEEN7/CK4PATCH.EXE KEEN7.PAT   98 INT 21h calls, and the launch line
+#     below is CORRECT as far as it goes: the guest's CWD is seeded from the
+#     executable's directory, so `4Eh findfirst dir='/DOS/KEEN7' pat='KEEN7.PAT'
+#     -> hit` and `pat='KEEN4*.EXE' -> hit`, and it opens KEEN4E.EXE and reads
+#     its MZ header. Then:
+#         [int21:dos] AH=4b (unimplemented) ax=4b01 bx=062e cx=0000 dx=06c4
+#     and it exits 0.
+#
+# SO THE REMAINING BLOCKER IS INT 21h AX=4B01h, "load program, do not execute" -
+# the EXEC subfunction a patch-loader exists to use. It is unimplemented in this
+# tree (a sibling established the same thing on The Dig and deliberately did not
+# build it). Until it exists, NEITHER line runs the game; this one is the one
+# that will run it the moment 4B01h lands, and it fails as a single named MISS
+# instead of as an interpreter derail, which is the difference between a
+# diagnosable gap and something that looks like an emulator bug.
+#
+# The entry is kept rather than removed because the Start menu is the ONLY
+# launcher for a DOS binary in the shipping system (see the /GAMES.CFG note
+# above): deleting the line would make the game unreachable by any means and
+# would delete this explanation with it. The window title comes from the
+# DIRECTORY, not from this label (dos_guest_title() takes seg[nseg-2]), so it
+# shows as "KEEN7 (DOS)" either way.
+item: Commander Keen 7 (Keen 4 mod) | /DOS/KEEN7/CK4PATCH.EXE KEEN7.PAT | icon=dosapp | type=dos
 item: NetHack | /DOS/NETHACK/NETHACK.EXE | icon=dosapp | type=dos
 
 # 2026-08-25 (#234f): SIMCITY CLASSIC. A plain 16-bit real-mode MZ, so it takes

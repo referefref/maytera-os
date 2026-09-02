@@ -53,11 +53,26 @@ use core::sync::atomic::{AtomicU64, Ordering};
 // Left-button bit, in the PS/2 packet convention drivers/mouse.c stores
 // (bit0=left, bit1=right, bit2=middle) and the compositor tests.
 const LEFT: u32 = 1;
+// Right-button bit, same convention. (#speedcap) Added because the ONLY way to
+// reach a per-window dock/taskbar context menu, and therefore the #778 Speed
+// dialog, is a RIGHT click, and nothing in this tree could inject one: the
+// whole ledger below was left-only, so a right click could be driven but never
+// PROVEN delivered. A feature reachable only through a menu nobody can open
+// under test is a feature that ships unverified, which is exactly what happened
+// to #778.
+const RIGHT: u32 = 2;
 
 static INJ_DOWN: AtomicU64 = AtomicU64::new(0);
 static INJ_UP: AtomicU64 = AtomicU64::new(0);
 static SMP_DOWN: AtomicU64 = AtomicU64::new(0);
 static SMP_UP: AtomicU64 = AtomicU64::new(0);
+// (#speedcap) The RIGHT-button half of SAMPLED. Deliberately separate counters
+// rather than a widened LEFT pair: a harness asserting "the compositor saw my
+// right click" must not be satisfiable by an unrelated left click, and vice
+// versa. INJECTED/ROUTED/HIT stay left-only, as their doc comments already say;
+// SAMPLED is the leg that proves delivery, so it is the leg that needed both.
+static SMP_RDOWN: AtomicU64 = AtomicU64::new(0);
+static SMP_RUP: AtomicU64 = AtomicU64::new(0);
 static ROUTED: AtomicU64 = AtomicU64::new(0);
 static HIT: AtomicU64 = AtomicU64::new(0);
 static POLLS: AtomicU64 = AtomicU64::new(0);
@@ -75,6 +90,8 @@ pub const CA_SMP_UP: u32 = 3;
 pub const CA_ROUTED: u32 = 4;
 pub const CA_HIT: u32 = 5;
 pub const CA_POLLS: u32 = 6;
+pub const CA_SMP_RDOWN: u32 = 7;
+pub const CA_SMP_RUP: u32 = 8;
 
 /// Record that the test channel drove the physical button level.
 /// `down` != 0 for press, 0 for release.
@@ -88,12 +105,14 @@ pub extern "C" fn clickacct_note_inject_rs(down: i32) {
 }
 
 /// Record one compositor sample of the physical button state, and report
-/// whether this sample carries a left-button EDGE.
+/// whether this sample carries a button EDGE.
 ///
-/// Return value: 0 = no edge, 1 = press edge (0 -> 1), 2 = release edge
-/// (1 -> 0). The caller uses a non-zero return to wake the test channel's wait
-/// queue; edges are rare (only real button transitions), so the wake costs
-/// nothing on the poll-every-frame hot path.
+/// Return value: 0 = no edge, 1 = left press edge (0 -> 1), 2 = left release
+/// edge (1 -> 0), 3 = right press edge, 4 = right release edge (#speedcap; a
+/// left edge is reported in preference to a simultaneous right one, which no
+/// injected click produces). The caller uses a non-zero return to wake the test
+/// channel's wait queue; edges are rare (only real button transitions), so the
+/// wake costs nothing on the poll-every-frame hot path.
 ///
 /// Sequencing note: this must be called with the value that is ACTUALLY being
 /// returned to the compositor on this call, at the point of return, or the
@@ -106,17 +125,32 @@ pub extern "C" fn clickacct_note_sample_rs(buttons: u32) -> i32 {
     if prev == 0xFFFF_FFFF {
         return 0;
     }
-    let was = (prev as u32) & LEFT;
+    let prevb = prev as u32;
+    // (#speedcap) BOTH buttons are examined on every sample, and the return is
+    // "an edge happened", not "a left edge happened". The caller uses it only
+    // to wake the test channel's wait queue, and the queue's wait CONDITION is a
+    // specific counter, so a wake for the other button costs one re-check and
+    // can never satisfy the wrong wait.
+    let mut edge = 0;
+    let was = prevb & LEFT;
     let now = buttons & LEFT;
     if now != 0 && was == 0 {
         SMP_DOWN.fetch_add(1, Ordering::Relaxed);
-        1
+        edge = 1;
     } else if now == 0 && was != 0 {
         SMP_UP.fetch_add(1, Ordering::Relaxed);
-        2
-    } else {
-        0
+        edge = 2;
     }
+    let rwas = prevb & RIGHT;
+    let rnow = buttons & RIGHT;
+    if rnow != 0 && rwas == 0 {
+        SMP_RDOWN.fetch_add(1, Ordering::Relaxed);
+        if edge == 0 { edge = 3; }
+    } else if rnow == 0 && rwas != 0 {
+        SMP_RUP.fetch_add(1, Ordering::Relaxed);
+        if edge == 0 { edge = 4; }
+    }
+    edge
 }
 
 /// Record a compositor -> kernel-WM relay of a left DOWN, and whether it landed
@@ -142,6 +176,8 @@ pub extern "C" fn clickacct_get_rs(which: u32) -> u64 {
         CA_ROUTED => ROUTED.load(Ordering::Relaxed),
         CA_HIT => HIT.load(Ordering::Relaxed),
         CA_POLLS => POLLS.load(Ordering::Relaxed),
+        CA_SMP_RDOWN => SMP_RDOWN.load(Ordering::Relaxed),
+        CA_SMP_RUP => SMP_RUP.load(Ordering::Relaxed),
         _ => 0,
     }
 }

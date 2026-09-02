@@ -1183,19 +1183,37 @@ void mouse_get_state_and_clear(mouse_state_t *state) {
 // The compositor polls mouse_get_state() every frame and replays it through the
 // real input path (sys_inject_mouse), so this produces a genuine click. Used by
 // the RemoteCtrl `click x y` command for headless click testing.
-void mouse_inject_button(int32_t x, int32_t y, int down) {
-    // #197: the INJECTED leg of the click ledger (rustkern/clickacct.rs). One
-    // relaxed atomic add; it is outside the cli/sti window below so the
-    // critical section stays exactly as short as it was.
-    extern void clickacct_note_inject_rs(int down);
-    clickacct_note_inject_rs(down);
+// (#speedcap) THE ONE PLACE the synthetic button LEVEL is written. Split out of
+// mouse_inject_button() below rather than copied, because the left-only version
+// could not express a RIGHT click and every per-window context menu in this tree
+// (the taskbar tile popup, contextmenu.c's CTX_MODE_DOCK, and therefore the #778
+// DOS Speed dialog) opens on one. A second copy of this five-line critical
+// section is exactly the fork CLAUDE.md's reuse rule exists to prevent, so
+// mouse_inject_button() is now a wrapper and there is still one implementation.
+//
+// The mask argument is the PS/2 packet convention drivers/mouse.c already stores, and the
+// compositor already tests: bit0 = left, bit1 = right, bit2 = middle. It is the
+// WHOLE new level, not a set/clear, so releasing is mask 0 for either button.
+void mouse_inject_button_mask(int32_t x, int32_t y, uint32_t mask) {
     __asm__ volatile("cli");
     g_mouse.prev_buttons = g_mouse.buttons;
     g_mouse.x = x; g_mouse.y = y;
-    g_mouse.buttons = down ? 1u : 0u;
+    g_mouse.buttons = mask & 7u;
     mouse_x = x; mouse_y = y; mouse_buttons = g_mouse.buttons;
     g_mouse_synth_until = timer_ticks + 60;   /* ~240ms at 250Hz */
     __asm__ volatile("sti");
+}
+
+void mouse_inject_button(int32_t x, int32_t y, int down) {
+    // #197: the INJECTED leg of the click ledger (rustkern/clickacct.rs). One
+    // relaxed atomic add; it is outside the cli/sti window below so the
+    // critical section stays exactly as short as it was. It stays LEFT-only, as
+    // its own doc comment in clickacct.rs says: the right button is not part of
+    // the inject/routed/hit ledger, only of the SAMPLED leg that proves
+    // delivery.
+    extern void clickacct_note_inject_rs(int down);
+    clickacct_note_inject_rs(down);
+    mouse_inject_button_mask(x, y, down ? 1u : 0u);
 }
 
 // (Win16 SkiFree idle-freeze repro, #200-follow-on) Test/automation hook: move

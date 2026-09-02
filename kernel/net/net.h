@@ -88,6 +88,25 @@ void net_report_reach_ok(void);
 // intervening success, trips NET_STATE_FAULTY.
 void net_report_reach_fail(void);
 
+// browsenet 2026-09-01: same, but records WHICH remote failed, so a trip names
+// its cause. Prefer this at any call site that has the URL in scope.
+void net_report_reach_fail_url(const char *url);
+
+// Same, plus the transport's own return code, so a trip can say WHICH failure
+// class completed the streak. See net.c for why the class matters.
+void net_report_reach_fail_rc(const char *url, int rc);
+
+// #549 breaker observability. Read by net_diag_line() (the [NETDIAG] line,
+// which main.c already persists to /BOOTLOG.TXT), so these reach a machine
+// with no serial port.
+uint32_t    net_fault_fail_total(void);
+uint32_t    net_fault_trip_count(void);
+uint32_t    net_fault_recover_count(void);
+uint32_t    net_fault_probe_grants(void);
+uint32_t    net_fault_probe_refused(void);
+int         net_fault_trip_rc(void);
+const char *net_fault_trip_host(void);
+
 // Current connectivity state (for the tray icon + Settings Network tab).
 net_conn_state_t net_get_conn_state(void);
 int  net_is_faulty(void);   // convenience: net_get_conn_state()==NET_STATE_FAULTY
@@ -147,5 +166,14 @@ int net_persist_netcfg(void);
 // #381: start the background net worker (USB carrier polling + async DHCP/DAD).
 // Call once after preemption is enabled. See net.c.
 void net_start_worker(void);
+
+// Hot-plug NIC attach (no ticket, 2026-08-28). net_has_nic() is the single
+// definition of "a NIC is bound", asked by the USB probe path before it arms an
+// attach for the background net worker. netattach_log_stats() writes the attach
+// census to the DURABLE bootlog.
+int  net_has_nic(void);
+void netattach_log_stats(const char *why);
+// Boot self-test for the attach handoff (durable [NETATTACH-SELFTEST] line).
+void netattach_selftest(void);
 
 #endif // NET_H

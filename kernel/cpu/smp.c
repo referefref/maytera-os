@@ -21,7 +21,190 @@ extern uint8_t ap_trampoline_end[];
 // IDT vector used to wake idle (HLT'd) APs when new work is submitted (defined
 // here so smp_init can register the handler before the work-pool section).
 #define SMP_WAKE_VECTOR 240
+
+// ===========================================================================
+// #smpfix (#67/#168): A CONTENDED BKL WAITER PARKS, IT DOES NOT PAUSE-LOOP.
+// ===========================================================================
+//
+// MEASURED, golden 2302 + this build's instrumentation, 4 vCPU, BATS.EXE as an
+// in-kernel DOS guest, steady state (one [SCHEDCORE] window of 3990 ms):
+//
+//   bkl=48935/3913c/348479092s   held=3854082us
+//   [BKLPID-TOTAL] pid=33 name=dos n=5909 total=220600981us max=40088us
+//
+// That is 96.6% BKL occupancy, one process (the DOS guest) holding the lock
+// for 220 of the run's 260 seconds with individual holds up to 40 ms, and
+// 348 MILLION pause iterations per 4-second window - 87 million per second -
+// burned by the three cores that are waiting. Host cost was 3.25 cores for a
+// workload one core actually performs.
+//
+// A pause-loop is the right answer for a hold measured in hundreds of
+// nanoseconds and the wrong answer for one measured in tens of milliseconds,
+// and this lock has both: COMPOSIT's mean hold is 8.4 us, the DOS guest's is
+// 37 ms. So the wait is ADAPTIVE. Spin briefly, which covers every short hold
+// with no IPI at all; then park in HLT, which costs the host nothing, and be
+// woken by the release.
+//
+// WAKE LOSS IS THE FAILURE MODE THAT MATTERS, and there are three arms:
+//   1. The parked core sets its bit and RE-TESTS bkl_word with interrupts
+//      masked before halting, so a release that lands between the spin test
+//      and the park cannot be missed.
+//   2. The releaser reads the mask after clearing bkl_word and sends
+//      BKL_WAKE_VECTOR to every core in it. `sti; hlt` is atomic, so an IPI
+//      that arrives at the sti still ends the halt.
+//   3. BACKSTOP: every core already takes an unconditional 250 Hz timer
+//      interrupt (the BSP from the PIT, each AP from its own LAPIC via
+//      tick_ap_arm), and any interrupt ends a HLT. So even if arms 1 and 2
+//      both failed, a parked waiter re-tests within 4 ms. This is the
+//      redundant always-armed source CLAUDE.md asks for, not a timeout
+//      standing in for a wake nobody armed.
+//
+// AND IT STAYS DIAGNOSABLE. blame.md records that a core spinning in
+// bkl_take_locked with HLT=0 is the NORMAL state under an in-kernel DOS guest,
+// which reads exactly like a livelock. A parked waiter now reads HLT=1, which
+// looks exactly like a wedge instead. So both are counted: g_bkl_parks says
+// "waiting correctly" and g_bkl_wake_ipis says the wakes are being delivered.
+// A wedge is parks advancing with wakes flat, or a non-empty g_bkl_waitmask
+// while bkl_word is 0 - which sched_smp_report() now prints.
+#define BKL_WAKE_VECTOR 0xF4
+
+// How many pause iterations to burn before parking. One pause is roughly
+// 30-140 cycles, so this is on the order of 10-25 us: comfortably longer than
+// the 8.4 us mean uncontended hold measured above, and three orders of
+// magnitude shorter than the DOS guest's 37 ms.
+#define BKL_SPIN_BEFORE_PARK 256
+
+// DEFAULT ON SINCE 2026-09-02, AND HERE IS THE A/B IT WAS WAITING FOR.
+//
+// The first implementation of this WEDGED THE MACHINE, measured, and the
+// capture is still worth keeping: 4 vCPU + BATS, all four vCPUs HLT=1, the BSP
+// parked at bkl_take_locked and the three APs correctly idle in
+// sched_ap_enter, with [BKLPARK] reporting word=0 owner=-1 - the lock was FREE
+// and the BSP never woke. Two independent reasons, both fixed below: the
+// release-side store/load reordering, and the BSP's backstop tick sitting
+// behind the 8259. #wakeipi then found and fixed the third (a core deaf to its
+// own wake because a class-15 vector was in service). It correctly stayed off
+// until an A/B proved it, and this is that A/B.
+//
+// MEASURED, 12 park boots on golden 2332 across two VMs with the arms swapped,
+// SMP ON in every arm, against the same configurations unparked:
+//
+//   4 vCPU, blit under the BKL:   host 3.61 -> 2.27 cores   (-37%)
+//   4 vCPU, blit NARROWED:        host 2.79 -> 2.07 cores   (-26%)
+//   pause-spin volume:            8.0e7 -> 3.5e7 /s, and 4.7e7 -> 2.2e7 /s
+//   present rate: UNCHANGED in both (8.5 -> 9.75, 30.5 -> 31.5)
+//
+// So it costs nothing and returns a quarter to a third of the host CPU, and it
+// composes with the blit narrowing rather than overlapping it: parking removes
+// the COST of waiting, narrowing removes the waiting.
+//
+// THE WEDGE DETECTOR, HONESTLY. [BKLPARK] stuck= was 1 in 5 of the 12 boots and
+// NEVER 2. It is sampled once a second by sched_smp_report() and fires when the
+// wait mask is non-empty while the lock is free, which that counter's own
+// comment says can be a single legitimate instant - a waiter that has not
+// re-tested yet. One sample in roughly 230 per boot, never accumulating, with
+// parks advancing to 113k-155k and a live desktop at the end of every one, is
+// a sampling artifact and not a wedge; a wedge climbs every second. It is
+// reported rather than smoothed away because the shape that WOULD be a wedge
+// is exactly this counter climbing, and the next person needs to know the
+// baseline is "occasionally 1", not "always 0".
+//
+// /NOBKLPARK.TXT restores pause-looping for the whole hold (the control arm).
+int g_bkl_park = 1;                       // /NOBKLPARK.TXT disarms it
+volatile uint32_t g_bkl_waitmask = 0;     // cores parked waiting for the BKL
+volatile uint64_t g_bkl_parks = 0;        // times a waiter parked in HLT
+volatile uint64_t g_bkl_wake_ipis = 0;    // wake IPIs sent by a release
+volatile uint64_t g_bkl_wakes_taken = 0;  // wake IPIs received
+volatile uint64_t g_bkl_park_late = 0;    // parks avoided by the masked re-test
+// WEDGE DETECTOR. Sampled once a second by sched_smp_report(): a core is in the
+// wait mask while the lock is free. One sample can be a legitimate instant
+// (the waiter has not re-tested yet); the same non-empty mask over consecutive
+// samples with no wake IPIs in between is the lost-wake wedge, and blame.md
+// records that a busy AP and a wedged AP look identical from outside.
+volatile uint64_t g_bkl_park_stuck = 0;
+
+// ===========================================================================
+// #wakeipi: WHY THE SEND/RECEIVE RATIO COULD NOT BE READ, AND WHAT REPLACES IT
+//
+// The two counters above are the whole of the old wake accounting, and they
+// measured 408,816 sent against 633 received - 0.15% - which was read as "the
+// wake IPI is not being delivered and the 250 Hz tick is carrying the wake
+// path". Neither counter can support that reading, for four independent
+// reasons, and all four are fixed here rather than argued about:
+//
+//  1. THEY ARE NOT ATOMIC. `volatile uint64_t x++` is a read-modify-write, and
+//     both are incremented by every core at once. Concurrent increments are
+//     lost silently, in an amount that depends on contention - which is the
+//     very thing being varied between the two arms.
+//  2. THEY SHARE A CACHELINE. #67 pass 9 measured a BKL spin counter in this
+//     same file that was 93 percent of its own reading. Every slot below is
+//     padded to its own two cachelines and written only by one core.
+//  3. A SEND IS NOT AN ATTEMPT TO WAKE A PARKED CORE. The wait-mask bit is set
+//     BEFORE the HLT and cleared AFTER it, so it is set over a strictly longer
+//     window than the HLT. Sends issued while the target is awake cost an ICR
+//     write and wake nothing, and were counted identically to real ones.
+//     `sent_armed` is the part of the send count that could have woken
+//     anything; sent_to - sent_armed is accounting inflation, not lost wakes.
+//  4. AND A RECEIVE IS NOT A WAKE. The Local APIC has ONE IRR BIT PER VECTOR
+//     PER CORE, so N sends of 0xF4 to a core that has not yet taken the first
+//     one COLLAPSE INTO ONE delivered interrupt. That is architecturally
+//     correct and harmless - one wake is all a parked core needs - but it
+//     makes sent/received a ratio that was never 1:1 and cannot be read as a
+//     delivery rate.
+//
+// So the ratio is abandoned and the question is asked directly instead:
+// WHAT ENDED THE HLT? `ipi_seen` is cleared with interrupts off immediately
+// before `sti; hlt` and set by the 0xF4 handler. After the HLT returns, its
+// value is the answer, per park, with no ratio and no shared counter in it:
+// end_ipi means the primary wake arm worked, end_other means the HLT was ended
+// by something else, which in this kernel means the per-core tick backstop.
+// That single bit is what this ticket turns on.
+// ===========================================================================
+typedef struct {
+    volatile uint64_t sent_to;     // wake IPIs aimed AT this core
+    volatile uint64_t sent_armed;  //   ...of those, issued while it WAS in HLT
+    volatile uint64_t sent_drop;   //   ...of those, declined by the Local APIC
+    volatile uint64_t taken;       // 0xF4 handler entries ON this core
+    volatile uint64_t end_ipi;     // HLTs ended with a 0xF4 seen since arming
+    volatile uint64_t end_other;   // HLTs ended by anything else (the tick)
+    volatile uint64_t lat_sum;     // park -> wake, microseconds, summed
+    volatile uint64_t lat_max;     // worst single park -> wake, microseconds
+    volatile uint64_t migrated;    // resumed on a core it did not park on
+    // THE DELIVERABILITY MEASUREMENT. Read from the Local APIC at the moment of
+    // parking, with interrupts already masked, so it describes the exact state
+    // the core is about to HLT in.
+    volatile uint64_t park_blocked; // parks entered where PPR class >= 0xF4's,
+                                    // i.e. the wake IPI is ARCHITECTURALLY
+                                    // undeliverable to this core for the whole
+                                    // park and only the tick can end it
+    volatile uint64_t park_ppr_nz;  // parks with a lower but non-zero priority
+    volatile uint64_t isr_hi;       // highest vector seen IN SERVICE at a park
+    // Counted per park rather than maxed, so "the blocked vector is the AP's own
+    // preemption tick" is a MEASUREMENT and not an inference from isr_hi.
+    volatile uint64_t park_isr42;   // parks with vector 0x42 (the AP 250 Hz
+                                    // preemption tick) IN SERVICE: the core
+                                    // cannot receive its OWN next tick, because
+                                    // 0x42's priority class is not strictly
+                                    // greater than 0x42's
+    volatile uint8_t  armed;       // 1 while this core is in (or entering) HLT
+    volatile uint8_t  ipi_seen;    // set by the 0xF4 handler; read after the HLT
+    uint8_t _pad[22];
+} __attribute__((aligned(64))) bkl_wd_t;
+_Static_assert(sizeof(bkl_wd_t) == 128,
+    "#wakeipi: a diagnostic slot must stay a whole number of cachelines wide, "
+    "or two cores share one and the counters measure their own false sharing - "
+    "which is exactly the #67 pass 9 defect this padding exists to avoid.");
+static bkl_wd_t g_wd[MAYTERA_MAX_CPUS];
+
+// #wakeipi NEGATIVE CONTROL, armed by /BKLWAKEOFF.TXT (cpu is read in main.c).
+// With this set the release path still COUNTS every wake it would have sent and
+// issues NONE of them, so end_ipi must fall to ZERO on every core. If it does
+// not, the discriminator above is not measuring what it claims and no number it
+// prints may be quoted. Same kernel.elf, one file, and it goes red.
+int g_bkl_wake_off = 0;
+
 static void smp_wake_handler(interrupt_frame_t *frame);
+static void smp_stop_handler(interrupt_frame_t *frame);
 
 // ============================================================================
 // Global State
@@ -370,6 +553,9 @@ int smp_init(void) {
     // Register the AP wake-IPI handler so idle APs can HLT and be kicked awake
     // when work is submitted (vector SMP_WAKE_VECTOR in the shared IDT).
     idt_register_handler(SMP_WAKE_VECTOR, smp_wake_handler);
+    // #75: the panic stop-IPI finally has a receiver. Without this gate, any
+    // broadcast of IPI_VECTOR_STOP raises #GP on every AP that takes it.
+    idt_register_handler(IPI_VECTOR_STOP, smp_stop_handler);
 
     // Initialize AP per-CPU data
     uint32_t bsp_apic = madt_get_bsp_apic_id();
@@ -655,6 +841,10 @@ static int g_core_pct[MAYTERA_MAX_CPUS];                        // smoothed 0-10
 // Called from sched_tick once per CPU% window (BSP). bsp_pct = aggregate CPU%.
 void smp_account_core_usage(int bsp_pct) {
     extern volatile uint64_t timer_ticks;
+    // (rakbd) Declared here in this file s own idiom (see sched_ap_enter below);
+    // cpu/smp.c does not include proc/process.h. Definition and matching
+    // prototype live in proc/process.c and proc/process.h.
+    extern uint64_t sched_core_busy_ticks(uint32_t cpu);
     uint64_t now = timer_ticks;
     uint64_t win = now - g_core_win_last;
     g_core_win_last = now;
@@ -662,7 +852,16 @@ void smp_account_core_usage(int bsp_pct) {
 
     g_core_pct[0] = bsp_pct;   // BSP measured by the existing aggregate meter
     for (uint32_t i = 1; i < cpu_count && i < MAYTERA_MAX_CPUS; i++) {
-        uint64_t cur = g_core_busy_ticks[i];
+        // (rakbd) SUM OF BOTH RESIDENCIES, and the second term is the one
+        // that was missing. g_core_busy_ticks[] is credited only by the
+        // kernel-job loop below, which an AP abandons permanently the first
+        // time it becomes a scheduler consumer (sched_ap_enter() never
+        // returns). With /SMPSCHED.TXT set - i.e. with AP scheduling ON, the
+        // very case this meter exists to show - that made every AP bar read 0
+        // for the whole boot regardless of load. sched_core_busy_ticks()
+        // returns g_core_busy[], which the AP's own vector-0x42 tick credits
+        // at the same rate the window is measured in.
+        uint64_t cur = g_core_busy_ticks[i] + sched_core_busy_ticks(i);
         uint64_t db = cur - g_core_busy_last[i];
         g_core_busy_last[i] = cur;
         int pct = (int)(db * 100 / win);
@@ -977,18 +1176,194 @@ void smp_send_reschedule_all(void) {
 // INVALIDATION OF ANY KIND. That is a hard prerequisite for flipping
 // g_smp_user_sched, and single-CPU correctness today rests on
 // vmm_space_is_live() + vmm_invlpg() in mm/vmm.c, which are BSP-local.
+// #404 RESOLVED 2026-08-30. This is now a thin forwarder to the real
+// implementation in mm/tlbflush.c, kept because cpu/smp.h has always declared
+// it and callers may reasonably reach for the name. It is no longer the
+// mechanism; tlb_flush_page() is.
 void smp_tlb_shootdown(uint64_t virt_addr) {
-    // For full implementation, we would:
-    // 1. Set up TLB shootdown request structure
-    // 2. Send IPI to all other CPUs
-    // 3. Each CPU invalidates the page
-    // 4. Wait for acknowledgment
-    
-    // Simple version: just send IPI
-    lapic_send_ipi_all_excluding_self(IPI_VECTOR_TLB);
-    
-    // Invalidate locally
-    vmm_invlpg(virt_addr);
+    extern void tlb_flush_page(uint64_t);
+    tlb_flush_page(virt_addr);
+}
+
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// #404 TLB SHOOTDOWN TRANSPORT. per_cpu_data[] and cpus_online are static to
+// this file, so mm/tlbflush.c reaches them through these two accessors rather
+// than by having them exported (which would let anything write them).
+// ---------------------------------------------------------------------------
+
+// One bit per online CPU, minus the caller. Bit N is CPU N, matching the
+// wait-mask in mm/tlbflush.c. Capped at 32 because that mask is a uint32_t;
+// MAYTERA_MAX_CPUS is 32, so the cap is exact rather than a truncation.
+uint32_t smp_online_mask_excluding_self(void) {
+    uint32_t me = smp_this_cpu();
+    uint32_t n = cpus_online;
+    if (n > 32) n = 32;
+    uint32_t mask = 0;
+    for (uint32_t c = 0; c < n; c++)
+        if (c != me) mask |= (1u << c);
+    return mask;
+}
+
+// DIRECTED sends, one per target, NOT the "all excluding self" shorthand.
+// MEASURED at #75 on a 4-vCPU KVM guest: the broadcast shorthand reached
+// exactly ONE other core per attempt however many times it was re-issued,
+// while a directed send per core is also the only form that can distinguish
+// "the LAPIC refused the send" from "the send went out and the core ignored
+// it". A shootdown that silently reaches one of three cores is worse than none
+// because it looks like it worked.
+void smp_send_tlb_ipi_mask(uint32_t mask) {
+    uint32_t me = smp_this_cpu();
+    for (uint32_t c = 0; c < MAYTERA_MAX_CPUS && c < cpus_online; c++) {
+        if (c == me) continue;
+        if (!(mask & (1u << c))) continue;
+        lapic_send_ipi(per_cpu_data[c].apic_id, IPI_VECTOR_TLB);
+    }
+}
+// #75 STOP THE WORLD ON A PANIC. Measured 2026-08-29, not inherited.
+// ---------------------------------------------------------------------------
+// kpanic() halted THE CALLING CPU and nothing else, and said so ("Halting
+// CPU."). On the single-core shipping configuration that is a stop-the-world by
+// accident. With the #67 gate ON it is not: a deliberately injected corrupt
+// context on cpu2 produced the full [SCHEDRACE] dump, the [PANIC] banner, and
+// then THREE CORES CARRIED ON SCHEDULING, with the corrupt task still selected
+// on the dead core. The campaign harness recorded VERDICT=OK for that boot.
+// A panic that leaves the machine running is not a panic, it is a log line.
+//
+// smp_halt_all() below was supposed to be the answer and could not have been:
+// IPI_VECTOR_STOP has never had an IDT gate (see the audit comment above
+// smp_tlb_shootdown), so the broadcast would have raised #GP on every AP that
+// received it. It also had zero callers. Both halves are fixed here: a real
+// handler, and a caller in the one place every terminal path already reaches.
+//
+// HONEST LIMIT, stated because it decides how to read a campaign log: a normal
+// IPI is not delivered to a core running with IF=0 (inside an irqsave spinlock,
+// or in an ISR). Such a core keeps running until it re-enables interrupts, and
+// if it never does, it never stops. That is why this reports how many cores
+// actually acknowledged rather than assuming they all did. An NMI would reach
+// them, but vector 2 on this kernel is on the IST1 double-fault stack shared
+// with the exception path and is not safe to repurpose from a panic tail
+// without more work than this change is.
+static volatile uint32_t g_panic_stopped;   // cores that took the stop IPI
+static volatile int      g_panic_stopping;  // set before the broadcast
+// Defined next to the Big Kernel Lock's own state, further down this file.
+// DO NOT forward-declare the bkl_* variables here instead: `static volatile
+// int32_t bkl_owner;` is a tentative definition that zero-initialises, and the
+// real one is `= -1`. Writing the declaration here silently changed "nobody
+// owns the lock" into "cpu 0 owns the lock", which makes every cpu-0 acquire
+// look recursive and removes mutual exclusion from the whole kernel. That
+// mistake was made here on 2026-08-29 and cost a six-boot campaign.
+static void bkl_force_break(void);
+
+static volatile uint32_t g_panic_ack_mask;  // one bit per core that has acked
+
+// Terminal ack, reached from BOTH the fixed stop IPI and (via cpu/idt.c) the
+// NMI escalation. Counted once per core: an NMI is not blocked by cli, so a
+// core already parked in the hlt loop below can be woken by a later NMI and
+// would otherwise be counted twice.
+void smp_panic_stop_ack(void) {
+    uint32_t c = smp_this_cpu();
+    uint32_t bit = (c < 32) ? (1u << c) : 0;
+    if (bit && !(g_panic_ack_mask & bit)) {
+        g_panic_ack_mask |= bit;
+        atomic_inc32(&g_panic_stopped);
+        // Print this core's OWN bit, not the shared mask: the mask is being
+        // ORed by other cores at the same moment and a snapshot of it in this
+        // line reads as though the wrong core stopped.
+        kprintf("[PANIC-STOP] cpu%u stopped (bit=0x%x, %u stopped so far)\n",
+                c, bit, g_panic_stopped);
+    }
+    // Terminal. Not a busy-wait (#426): hlt parks the core until an interrupt
+    // that can never be enabled again, so this consumes no cycles.
+    __asm__ volatile("cli");
+    for (;;) __asm__ volatile("hlt");
+}
+
+int smp_panic_stopping(void) { return g_panic_stopping; }
+
+static void smp_stop_handler(interrupt_frame_t *frame) {
+    (void)frame;
+    lapic_eoi();
+    smp_panic_stop_ack();
+}
+
+// Called from kpanic_halt() (fs/panic.c) with interrupts already off. Returns
+// the number of OTHER cores that acknowledged, and writes the number expected
+// through *expected, so the caller can print both and the reader can tell
+// "everything stopped" from "one core is still live and this log is a
+// snapshot of a machine that is still changing".
+uint32_t smp_panic_stop_others(uint32_t *expected) {
+    uint32_t others = (cpus_online > 1) ? (cpus_online - 1) : 0;
+    if (expected) *expected = others;
+    if (!others) return 0;
+    g_panic_stopping = 1;
+    // #75: BREAK THE BIG KERNEL LOCK FIRST. A core that panics while another
+    // core holds the BKL leaves every remaining core spinning in
+    // bkl_take_locked() for a lock nobody will release, and the panicking core
+    // is about to stop the world anyway. Measured on this rig: two cores sat in
+    // that spin for the whole capture. Forcing the word free costs nothing at a
+    // panic (the machine is being stopped) and removes the one place a core can
+    // be wedged where it can do nothing else.
+    bkl_force_break();
+    // Bounded waits, monotonic-clock based, on the terminal panic path with
+    // interrupts off. wait_event() is not available here by construction
+    // (wq_assert_may_block() correctly refuses an interrupts-off context, and
+    // there is no scheduler left to wake us), and the bound is what stops these
+    // from being the unbounded poll #426 bans.
+    //
+    // TWO STAGES, because the polite one is not sufficient and the sufficient
+    // one is not polite. The fixed-vector IPI lets a core stop at an
+    // instruction boundary with its own EOI done; a core with IF=0 never takes
+    // it. The NMI reaches that core regardless, at the cost of stopping it
+    // wherever it is. Measured on this rig: stage 1 alone reached 1 of 3.
+    uint64_t T = mono_us();
+    {   // Is the SEND even happening? A silent return from lapic_write() (LAPIC
+        // marked unusable) and a delivered-but-ignored IPI look identical from
+        // the ack counter alone.
+        extern int lapic_wait_ipi_idle(void);
+        extern uint32_t lapic_read(uint32_t offset);
+        int rc = lapic_wait_ipi_idle();
+        kprintf("[PANIC-STOP] cpu%u sending: idle_rc=%d ICR_LOW=0x%x others=%u\n",
+                smp_this_cpu(), rc, lapic_read(0x300), others);
+    }
+    lapic_send_ipi_all_excluding_self(IPI_VECTOR_STOP);
+    uint64_t t0 = mono_us();
+    while (g_panic_stopped < others && (mono_us() - t0) < 100000ull)
+        __asm__ volatile("pause");
+    kprintf("[PANIC-STOP] stage1 fixed-IPI: ack=%u/%u mask=0x%x after %lluus\n",
+            g_panic_stopped, others, g_panic_ack_mask,
+            (unsigned long long)(mono_us() - T));
+    if (g_panic_stopped < others) {
+        // Re-broadcast rather than send once: a core that was inside an NMI
+        // window, or whose LAPIC had a send still in flight, misses a single
+        // shot, and one missed shot is indistinguishable from "the mechanism
+        // does not work" in a log.
+        for (int round = 0; round < 3 && g_panic_stopped < others; round++) {
+            // DIRECTED, not broadcast. Measured: the "all excluding self"
+            // shorthand reached exactly one other core per panic on a 4-vCPU
+            // KVM guest, however many times it was re-issued. A per-core send
+            // also makes "the send was refused" (idle_rc) distinguishable from
+            // "the send went out and the core ignored it", which the broadcast
+            // could never separate.
+            uint32_t me = smp_this_cpu();
+            for (uint32_t c = 0; c < cpus_online && c < MAYTERA_MAX_CPUS; c++) {
+                if (c == me) continue;
+                if (g_panic_ack_mask & (1u << c)) continue;
+                int rc = lapic_send_nmi(per_cpu_data[c].apic_id);
+                if (round == 0)
+                    kprintf("[PANIC-STOP] directed NMI -> cpu%u apic=%u rc=%d\n",
+                            c, per_cpu_data[c].apic_id, rc);
+            }
+            t0 = mono_us();
+            while (g_panic_stopped < others && (mono_us() - t0) < 200000ull)
+                __asm__ volatile("pause");
+            kprintf("[PANIC-STOP] stage2 NMI round %d: ack=%u/%u mask=0x%x "
+                    "after %lluus\n", round, g_panic_stopped, others,
+                    g_panic_ack_mask, (unsigned long long)(mono_us() - T));
+        }
+    }
+    return g_panic_stopped;
 }
 
 void smp_halt_all(void) {
@@ -1014,6 +1389,20 @@ void smp_halt_all(void) {
 static volatile uint32_t bkl_word = 0;     // 0 = free, 1 = held
 static volatile int32_t  bkl_owner = -1;   // owning cpu id, -1 = none
 static volatile uint32_t bkl_depth = 0;    // recursion depth
+
+// #75: force the lock free from a panic. See smp_panic_stop_others().
+static void bkl_force_break(void) { bkl_word = 0; bkl_owner = -1; bkl_depth = 0; }
+
+// #75: read the Big Kernel Lock's state for a fault dump. The one question the
+// #75 forensics could never answer is whether the two cores involved were
+// serialised by the BKL at all: sched_schedule() runs both WITH it held (every
+// syscall and ISR path) and WITHOUT it (the AP idle loop calls it directly),
+// and those are different bugs with different fixes.
+void bkl_snapshot(uint32_t *word, int32_t *owner, uint32_t *depth) {
+    if (word)  *word  = bkl_word;
+    if (owner) *owner = bkl_owner;
+    if (depth) *depth = bkl_depth;
+}
 
 // #67 pass 3: BKL CONTENTION INSTRUMENTATION.
 //
@@ -1438,11 +1827,383 @@ volatile int      g_bkl_inv_cpu  = -1;
 volatile int      g_bkl_inv_line = 0;
 volatile uint64_t g_bkl_inv_n    = 0;
 
+// #smpfix: the BKL_WAKE_VECTOR receiver. Reached from cpu/idt.asm's
+// irq_bkl_wake stub, which deliberately does NOT route through isr_handler, so
+// nothing in here may take a lock. Acknowledging the Local APIC is all a wake
+// needs; the work is done by the HLT ending.
+void bkl_wake_ipi_handler(void) {
+    lapic_eoi();
+    g_bkl_wakes_taken++;
+    // #wakeipi: GS_BASE is set permanently to this core's block with no swapgs
+    // anywhere in the tree (see smp_cpu_local_init), so this one instruction is
+    // valid from a bare IPI stub that has not switched any state, including one
+    // taken while the core was in Ring 3.
+    uint32_t c = smp_this_cpu();
+    if (c < MAYTERA_MAX_CPUS) {
+        g_wd[c].taken++;
+        // The ONLY write that answers "what ended the HLT". Ordinary store: the
+        // parked core reads it after an interrupt return, which is a
+        // serializing event, so no fence is owed here.
+        g_wd[c].ipi_seen = 1;
+    }
+}
+
+// #smpfix: wake every core parked on the lock this core has just released.
+// Called with interrupts masked from bkl_release()/bkl_release_all(), AFTER
+// bkl_word is 0, so a waiter woken by it always re-tests a genuinely free lock.
+static void bkl_wake_send(int honor_gate) {
+    // #smpfix WAKE-LOSS FIX 1, and the reason the first attempt wedged.
+    //
+    // The releaser does `store bkl_word = 0` then `load g_bkl_waitmask`, and
+    // the waiter does `lock-or its bit into g_bkl_waitmask` then
+    // `load bkl_word`. x86 is TSO, which permits exactly ONE reordering: a
+    // store followed by a load to a DIFFERENT address may be observed out of
+    // order, because the store sits in the store buffer while the load is
+    // satisfied early. That is precisely this pair. Both sides can therefore
+    // miss each other: the releaser reads a mask that does not yet have the
+    // bit, and the waiter reads a word that is not yet zero, and the waiter
+    // halts with the lock free and nobody to wake it. MEASURED: all four vCPUs
+    // HLT=1, the BSP parked in bkl_take_locked, [BKLPARK] word=0 owner=-1.
+    //
+    // The waiter's side is already fenced: __atomic_or_fetch(SEQ_CST) compiles
+    // to a LOCK OR, which drains the store buffer. This is the other side.
+    __asm__ volatile("mfence" ::: "memory");
+    uint32_t m = g_bkl_waitmask;
+    if (!m) return;
+    uint32_t self = smp_this_cpu();
+    for (uint32_t c = 0; c < cpu_count && c < 32; c++) {
+        if (c == self || !(m & (1u << c))) continue;
+        g_bkl_wake_ipis++;
+        if (c < MAYTERA_MAX_CPUS) {
+            g_wd[c].sent_to++;
+            // SEQ_CST load pairs with the SEQ_CST store the parking core makes
+            // before its `sti; hlt`: if that store is visible, the target is in
+            // or entering the HLT and this send can actually wake something.
+            if (__atomic_load_n(&g_wd[c].armed, __ATOMIC_SEQ_CST))
+                g_wd[c].sent_armed++;
+        }
+        // #wakeipi NEGATIVE CONTROL, and note it suppresses the RELEASE arm
+        // ONLY. The rescue arm below passes honor_gate=0, so /BKLWAKEOFF.TXT
+        // asks exactly the question worth asking: with the release-side wake
+        // gone, does the second arm keep the machine alive? Before the rescue
+        // arm existed the answer was measured and it was NO - three APs parked
+        // and never woke, and the machine wedged at t=38.8 s.
+        if (honor_gate && g_bkl_wake_off) continue;
+        if (lapic_send_ipi(per_cpu_data[c].apic_id, BKL_WAKE_VECTOR) != 0 &&
+            c < MAYTERA_MAX_CPUS)
+            g_wd[c].sent_drop++;               // the Local APIC refused it
+    }
+}
+
+volatile uint64_t g_bkl_wake_rescues = 0;
+
+// ===========================================================================
+// #wakeipi (#67/#168): THE SECOND WAKE ARM, AND WHY ONE WAS MISSING.
+//
+// The parking design rested on two independent wakes. The first is the 0xF4 IPI
+// from bkl_release(). The second was stated as "every core takes an
+// unconditional 250 Hz tick, and any interrupt ends a HLT". MEASURED, THE
+// SECOND ONE DOES NOT EXIST FOR AN AP THAT PARKS.
+//
+// An AP reaches bkl_take_locked() from its own 250 Hz preemption tick (LAPIC
+// timer, vector 0x42 - see isr.c's ap_preempt_tick_handler). isr_handler()
+// calls bkl_acquire() BEFORE it dispatches to any registered C handler, so a
+// core that contends never reaches ap_preempt_tick_handler(), whose lapic_eoi()
+// is correctly the first statement in that function and is simply unreachable
+// from a contended acquire. Vector 0x42 therefore stays IN SERVICE for the
+// entire wait. The Local APIC will not deliver an interrupt whose priority
+// class is not STRICTLY GREATER than the current processor priority, and
+// 0x42's class is 4, so THE CORE'S NEXT TICK IS BLOCKED BY ITS PREVIOUS ONE.
+// Measured at essentially every park: pprnz is ~100% of parks, with isrhi=0x42.
+//
+// This is the same defect smpfix already found and fixed for the BSP (its 8259
+// EOI is at the END of the handler while bkl_acquire() is at the START), and
+// the AP was exempted from that reasoning on the strength of the EOI being
+// first inside the handler BODY. The body is not where the acquire is.
+//
+// So the wake was SINGLE-ARMED, and the negative control proves the single arm
+// was load-bearing rather than an optimisation: with the release-side 0xF4 send
+// suppressed and nothing else changed, all three APs parked and NEVER woke
+// (end_ipi=0, end_other=0, waitmask=0xe while bkl_word=0) and the machine
+// wedged at t=38.8 s. Had a tick backstop existed, that arm would have been
+// slow, not dead.
+//
+// THIS IS THE MISSING ARM, in the shape CLAUDE.md names as best: redundant and
+// always armed, so no wake can be lost for long. It runs at the TOP of every
+// interrupt on every core, BEFORE isr_handler() takes the BKL, so BKL
+// contention cannot starve it - which is exactly how the tick arm was starved.
+//
+// IT CANNOT STORM, and that is what the condition buys. It fires only when a
+// core is in the wait mask AND THE LOCK IS FREE. That pair is by definition a
+// lost wake: somebody is asleep waiting for a lock nobody holds. It is false in
+// every healthy state, so the steady-state cost is ONE load of an already-hot
+// word per interrupt and no ICR write at all. As soon as a woken core clears
+// its bit the condition clears itself, so it is self-limiting by construction
+// rather than by a rate limit somebody has to tune.
+// ===========================================================================
+void bkl_wake_rescue(void) {
+    if (!g_bkl_park) return;                 // experiment not armed: no-op
+    if (!g_bkl_waitmask || bkl_word) return; // healthy: nothing is stranded
+    g_bkl_wake_rescues++;
+    bkl_wake_send(0);                        // never gated: this is the backstop
+}
+
+// #wakeipi: printed once a second beside [BKLPARK], and ONLY when the parking
+// experiment is armed, so the default arm's serial output is byte-for-byte
+// unchanged. Cores that never parked and were never targeted print nothing.
+void bkl_wake_diag_report(void) {
+    extern volatile uint64_t g_lapic_ipi_dropped;
+    if (!g_bkl_park) return;
+    uint32_t n = cpu_count; if (n > MAYTERA_MAX_CPUS) n = MAYTERA_MAX_CPUS;
+    for (uint32_t c = 0; c < n; c++) {
+        if (!g_wd[c].sent_to && !g_wd[c].end_ipi && !g_wd[c].end_other) continue;
+        uint64_t ends = g_wd[c].end_ipi + g_wd[c].end_other;
+        kprintf("[WAKEDIAG] cpu%u sent=%llu armed=%llu drop=%llu taken=%llu "
+                "end_ipi=%llu end_other=%llu mig=%llu avg_us=%llu max_us=%llu "
+                "blocked=%llu pprnz=%llu isr42=%llu isrhi=0x%llx\n",
+                c, g_wd[c].sent_to, g_wd[c].sent_armed, g_wd[c].sent_drop,
+                g_wd[c].taken, g_wd[c].end_ipi, g_wd[c].end_other,
+                g_wd[c].migrated,
+                ends ? (g_wd[c].lat_sum / ends) : 0ull, g_wd[c].lat_max,
+                g_wd[c].park_blocked, g_wd[c].park_ppr_nz,
+                g_wd[c].park_isr42, g_wd[c].isr_hi);
+    }
+    kprintf("[WAKEDIAG] wake_off=%d lapic_dropped_total=%llu rescues=%llu\n",
+            g_bkl_wake_off, g_lapic_ipi_dropped, g_bkl_wake_rescues);
+}
+
+
+// ===========================================================================
+// #bklfair (#168 step 1): THE BKL IS FAIR NOW. WHY IT HAD TO BE.
+//
+// MEASURED across 29 boots on golden 2325, one kernel.elf, arms bound to two
+// VMs and swapped: the compositor's present rate falls MONOTONICALLY with core
+// count - 46 / 15 / 10 / 7 per second at 1 / 2 / 4 / 8 vCPU - while BKL
+// contention rises 0 / 12 / 39 / 48% and host CPU goes 1.0 -> 3.5 cores FOR
+// LESS WORK. PLE directed-yield, KVM halt-polling and vCPU pinning were each
+// eliminated by measurement, not by argument, so the loss is guest-intrinsic.
+//
+// THE MECHANISM. bkl_take_locked() was a plain test-and-test-and-set: on every
+// release, every waiter races, and the winner is whoever's cacheline arrives
+// first. That is not a lottery with equal tickets. A core doing REAL WORK has
+// to execute that work between its release and its next acquire; a core that
+// only wants the lock to service its own 250 Hz tick is already sitting in the
+// spin loop with nothing else to do. So the idle-ish cores are ALWAYS at the
+// starting line and the working core arrives late, every single time. Adding
+// cores adds more permanently-queued competitors, which is exactly the
+// monotonic curve above. At 72.8% BKL occupancy Amdahl caps SMP at 1.25x on 4
+// cores; measured was 0.23x. The gap is not Amdahl, it is starvation.
+//
+// THE FIX IS A TICKET LOCK, and the whole of the difficulty is that a STRICT
+// ticket lock would WEDGE THIS KERNEL. Three properties of this wait make FIFO
+// unsafe if it is taken literally:
+//
+//   (a) THE WAIT RUNS WITH INTERRUPTS ENABLED (it must: see #279 above), so an
+//       ISR can land on a core that is already waiting, and idt.c wraps every
+//       ISR in bkl_acquire(). The inner frame would take a LATER ticket than
+//       the outer frame it is stacked on top of. When the outer frame's turn
+//       came, nobody would claim it: the outer frame is suspended beneath the
+//       inner one on the same stack and cannot run until the inner one
+//       finishes, and the inner one can never be served first. Strict FIFO
+//       turns a nested acquire into a permanent deadlock of the whole machine.
+//   (b) A WAITER CAN CHANGE CORE. #130 measured it (g_bkl_mig_n) - the wait
+//       re-enables interrupts, so the context can be preempted and resumed
+//       elsewhere. A ticket parked on a stack that is not currently running is
+//       a turn nobody will take.
+//   (c) A WAITER CAN BE DESCHEDULED ENTIRELY across its own tick.
+//
+// So fairness here is "the oldest waiter goes first, WITH A BOUNDED ESCAPE
+// HATCH", and both halves are load-bearing:
+//
+//   TICKET INHERITANCE answers (a) exactly, with no timeout at all. A core
+//   that already has an outstanding ticket does not take a second one: the
+//   nested frame INHERITS the outer frame's ticket. At most one context per
+//   core is ever RUNNING, so a per-core slot is claimed by whichever frame is
+//   actually executing, and the turn is always claimable by the core it was
+//   granted to. The outer frame, when it resumes, finds itself OVERTAKEN and
+//   re-queues at the back. That is a fairness loss for one waiter, never a
+//   correctness loss for the machine.
+//
+//   THE STALE-TURN BYPASS answers (b) and (c). If the entitled ticket has not
+//   been claimed for BKL_TURN_STALE_US, its owner is not running, and any
+//   waiter may bypass and take the lock - which advances the turn past the
+//   dead ticket and heals the queue. It is COUNTED (g_bkl_fair_bypass), so
+//   "the escape hatch is rare" is a measurement rather than a hope.
+//
+//   AND A LAST-DITCH LOCAL GIVEUP (g_bkl_fair_giveup) drops THIS waiter back
+//   to the old free-for-all after BKL_FAIR_GIVEUP_SPINS. Nothing should ever
+//   reach it; it exists so that no bug in the two mechanisms above can express
+//   itself as a wedged machine rather than as a counter.
+//
+// THE FAST PATH RESPECTS THE QUEUE, and this is the part that actually fixes
+// the starvation. If the uncontended CAS still ran first, a core returning
+// from a short hold would barge past waiters that had not yet noticed the
+// release - which IS the starvation mechanism, not a detail of it. So when
+// g_bkl_next != g_bkl_turn (a queue exists) the fast CAS is skipped and the
+// arriver takes a ticket. Cost when there is no queue: two loads of one
+// already-hot cacheline.
+//
+// PLE LANDMINE, deliberately not stepped on: the prior measurement established
+// that PLE directed-yield NEVER fires here (directed_yield_attempted=0) because
+// the spin body tests g_panic_stopping and calls tlb_service_local() between
+// PAUSEs, exceeding the 128-cycle ple_gap. The turn logic below is ADDED to
+// that body, never substituted for it, so the PAUSE-to-PAUSE distance only
+// grows. Do not "optimise" this loop into a bare pause: it changes what the
+// hypervisor does, silently, and the old numbers stop being comparable.
+//
+// ===========================================================================
+// AND THEN IT WAS MEASURED, AND IT IS **DEFAULT OFF**. SAY WHY.
+//
+// 29 boots on golden 2330, one kernel.elf, one gate file, every configuration
+// on two VMs with the roles swapped, two liveness gates, 27 arms usable.
+//
+// THE LOCK IS GENUINELY FAIRER. Per-core contended-wait spread at 4 vCPU:
+// 1.91x unfair (1.63 / 1.92 / 2.45 / 1.63) against 1.49x fair (1.43 / 1.59 /
+// 1.47 / 1.48). The variance between arms collapses too, which is what a queue
+// is supposed to do. The counters say the mechanism ran: 305k-370k tickets per
+// boot, 6% stale-turn bypasses, 0-2 last-ditch giveups, and ZERO tickets in
+// every control arm, so the gate is not a no-op.
+//
+// AND IT BUYS NOTHING THE USER CAN SEE, AND COSTS ABOUT 12%.
+//
+//   present/s   1 vCPU   2 vCPU   4 vCPU   8 vCPU
+//   fair          40       16.5     8.75      7.0
+//   unfair        42       16.0    10.0       7.5
+//
+// Input-to-photon is identical in both arms to the resolution of the histogram
+// (p50 32768 us, p95 65536 us, n=1492 every arm). The monotonic collapse with
+// core count - the SIGNATURE of the defect - is completely unchanged.
+//
+// WHY FAIRNESS CANNOT BE THE MECHANISM, from this same tree's own instrument:
+// BKL occupancy is 96% at 4 vCPU, and the [BKLSITE] split says 85-88% of ALL
+// hold time is ONE site, `syscall_entry` - the giant lock wrapped around the
+// whole body of every syscall. Per process, ONE process (the load generator,
+// an unpaced SYS_WIN_BLIT loop) holds the lock for 157 of a 230-second boot in
+// 41,722 acquires: a mean of 3.8 MILLISECONDS PER ACQUIRE. The compositor
+// itself holds it 8.7 s across 596,698 acquires, 14.6 us each.
+//
+// Ordering a queue redistributes grants. It cannot create free lock time, and
+// at 96% occupancy with one holder owning two thirds of the wall clock there is
+// almost none to redistribute. Fairness was the right thing to try, it was
+// tried properly, and it is not where the 4x is.
+//
+// THE COST IS REAL AND SMALL AND VISIBLE AT 1 vCPU, where no contention is even
+// possible: 40 present/s against 42, and 15,066 acquires/s against 15,440
+// (-2.4%), across four arms. That is the two extra loads the fast path now does
+// to check for a queue. It is the right price for fairness and the wrong price
+// for nothing.
+//
+// SO THE CODE STAYS AND THE DEFAULT INVERTS. It stays because the defect it
+// fixes is real and will matter the moment the lock is NARROWED (#168 step 3):
+// once occupancy is low enough that grants are contended rather than queued
+// behind one giant holder, ordering starts to decide who runs. Deleting it
+// would mean re-deriving the interrupts-enabled/nesting/migration hazards from
+// scratch, which is the expensive half. Turning it on is one file.
+//
+// A/B BY ONE FILE, ONE BINARY: /BKLFAIR.TXT arms the ticket lock.
+// ===========================================================================
+
+// DEFAULT OFF, on the measurement above. This is NOT a statement that SMP
+// should be off - SMP is ON in every arm of that campaign and stays on. It is a
+// statement that THIS PARTICULAR FIX did not pay, measured, and that the next
+// one to try is named in the comment above.
+int g_bkl_fair = 0;                        // /BKLFAIR.TXT arms it
+
+// How long a FREE lock may sit unclaimed by the waiter whose turn it is before
+// any other waiter may bypass it. This is a SELF-HEAL for a waiter that is not
+// running, not a wait policy: every microsecond of it is dead time for the
+// whole machine, so it is short. An entitled waiter that IS running re-tests
+// every pause iteration, on the order of 100 ns, so 100 us is a thousand
+// chances to claim.
+//
+// MEASURED WRONG THE FIRST TIME, and the mistake is worth keeping written down
+// because it is the easy one to make. The first version timed staleness from
+// `g_bkl_turn_us`, the moment the turn last ADVANCED. That is the wrong clock:
+// a turn cannot be claimed while the lock is HELD, and this lock is held 96% of
+// the time with holds in milliseconds. So on every release the turn was already
+// "stale" by construction, every waiter bypassed at once, and FIFO was barely in
+// force at all: on the first 4-vCPU boot, 64246 bypasses and 91055 overtakes
+// against 320077 tickets - about half of all waiters not getting FIFO service.
+// The clock must measure THE LOCK HAS BEEN FREE AND MY PREDECESSOR HAS NOT
+// TAKEN IT, which is a per-waiter observation, so it is a LOCAL variable and
+// costs no shared state at all.
+#define BKL_TURN_STALE_US 100ull
+
+// Last-ditch: this waiter abandons FIFO and joins the free-for-all. One pause
+// is 30-140 cycles, so 1<<22 is on the order of 50-200 ms. Reaching it means a
+// bug, and the counter is the bug report.
+#define BKL_FAIR_GIVEUP_SPINS (1ull << 22)
+
+// next/turn share a cacheline ON PURPOSE: they are read together by every
+// arriver on the fast path, so one line fill answers both.
+static volatile uint32_t g_bkl_next = 0;   // next ticket to issue
+static volatile uint32_t g_bkl_turn = 0;   // ticket currently entitled to win
+
+// Per-core outstanding ticket, for INHERITANCE. Written and read only with
+// IF=0, only by the core it names (plus one clear from the finishing core when
+// a waiter migrated, which can at worst cost a future frame its inheritance).
+static volatile uint32_t g_bkl_ct[BKL_STAT_CPUS];
+static volatile uint8_t  g_bkl_ct_valid[BKL_STAT_CPUS];
+
+volatile uint64_t g_bkl_fair_tickets   = 0;  // tickets issued
+volatile uint64_t g_bkl_fair_inherit   = 0;  // nested frames that inherited one
+volatile uint64_t g_bkl_fair_bypass    = 0;  // stale-turn bypasses (self-heal)
+volatile uint64_t g_bkl_fair_overtaken = 0;  // frames that had to re-queue
+volatile uint64_t g_bkl_fair_giveup    = 0;  // last-ditch escapes (should be 0)
+
+// THE FAIRNESS INSTRUMENT ITSELF, and it runs IDENTICALLY IN BOTH ARMS - an
+// instrument that only exists in the arm you want to win is not a measurement.
+// Per core: how long contended acquires actually waited. The starvation shows
+// up as a per-core SPREAD in wait_max, not in the totals.
+static volatile uint64_t g_bkl_wait_sum[BKL_STAT_CPUS];
+static volatile uint64_t g_bkl_wait_max[BKL_STAT_CPUS];
+static volatile uint64_t g_bkl_wait_n[BKL_STAT_CPUS];
+
+void bkl_fair_report(void) {
+    _Static_assert(sizeof(g_bkl_wait_sum) == sizeof(g_bkl_wait_max) &&
+                   sizeof(g_bkl_wait_sum) == sizeof(g_bkl_wait_n)   &&
+                   sizeof(g_bkl_wait_sum) / sizeof(g_bkl_wait_sum[0]) == BKL_STAT_CPUS,
+        "#bklfair: the per-core wait arrays must all have BKL_STAT_CPUS entries; "
+        "the loop below is bounded by that constant, not by sizeof.");
+    uint32_t n = cpu_count; if (n > BKL_STAT_CPUS) n = BKL_STAT_CPUS;
+    // The whole point is the SPREAD, so print per core and let the reader see
+    // which core is being starved. A total would hide exactly the defect.
+    for (uint32_t c = 0; c < n; c++) {
+        if (!g_bkl_wait_n[c]) continue;
+        kprintf("[BKLFAIR] cpu%u waits=%llu avg_us=%llu max_us=%llu\n",
+                c, (unsigned long long)g_bkl_wait_n[c],
+                (unsigned long long)(g_bkl_wait_sum[c] / g_bkl_wait_n[c]),
+                (unsigned long long)g_bkl_wait_max[c]);
+        g_bkl_wait_max[c] = 0;                 // per-window maximum, reset IN RANGE
+    }
+    // bypass and overtaken are the ones to watch: they are the FIFO order NOT
+    // being honoured, and if they are a large fraction of tickets then the lock
+    // is only nominally fair. That is not hypothetical, it is what the first
+    // boot of this code measured (see BKL_TURN_STALE_US).
+    kprintf("[BKLFAIR] fair=%d tickets=%llu inherit=%llu bypass=%llu "
+            "overtaken=%llu giveup=%llu next=%u turn=%u\n",
+            g_bkl_fair,
+            (unsigned long long)g_bkl_fair_tickets,
+            (unsigned long long)g_bkl_fair_inherit,
+            (unsigned long long)g_bkl_fair_bypass,
+            (unsigned long long)g_bkl_fair_overtaken,
+            (unsigned long long)g_bkl_fair_giveup,
+            (unsigned)g_bkl_next, (unsigned)g_bkl_turn);
+}
+
 static void bkl_take_locked(uint32_t depth, uint8_t from_switch,
                             void *ra, uint8_t via) {
     int cpu;                    // #130: read below, with IF=0. Never earlier.
     int was_contended = 0;      // #166: counted with the acquire, at the bottom
-    if (atomic_cas32(&bkl_word, 0, 1) != 0) {
+    // #bklfair: THE FAST PATH RESPECTS THE QUEUE. If any ticket is outstanding,
+    // do not run the uncontended CAS at all - barging past waiters that have
+    // not yet observed the release IS the starvation this ticket fixes, and it
+    // is precisely the core with real work to do that arrives late. Two loads
+    // of one already-hot line when the queue is empty, which is the case that
+    // has to stay cheap.
+    int fair = g_bkl_fair;
+    int queued = fair && (g_bkl_next != g_bkl_turn);
+    if (queued || atomic_cas32(&bkl_word, 0, 1) != 0) {
         was_contended = 1;
         // Contended. CRITICAL (#279): we may have been entered from interrupt
         // context (idt.c wraps every ISR in bkl_acquire) with IF=0, or from a
@@ -1490,16 +2251,272 @@ static void bkl_take_locked(uint32_t depth, uint8_t from_switch,
                 g_bkl_inv_n++;
             }
         }
+        // #bklfair: TAKE A TICKET, OR INHERIT THIS CORE'S. Both branches run
+        // with IF=0 (bkl_acquire/bkl_reacquire masked before calling us and
+        // nothing has re-enabled yet), so entry_cpu is valid here and the slot
+        // cannot be read on one core and written on another.
+        uint32_t myticket = 0;
+        if (fair) {
+            uint32_t c0 = (uint32_t)entry_cpu;
+            if (c0 < BKL_STAT_CPUS && g_bkl_ct_valid[c0]) {
+                myticket = g_bkl_ct[c0];         // nested frame: inherit (a)
+                g_bkl_fair_inherit++;
+            } else {
+                myticket = __atomic_fetch_add(&g_bkl_next, 1u, __ATOMIC_ACQ_REL);
+                g_bkl_fair_tickets++;
+                if (c0 < BKL_STAT_CPUS) {
+                    g_bkl_ct[c0] = myticket;
+                    g_bkl_ct_valid[c0] = 1;
+                }
+            }
+        }
+        // Timed in BOTH arms, with the same clock, from the same place.
+        uint64_t wait_t0 = mono_us();
         uint64_t spins = 0;                      // LOCAL: a shared counter here
         for (;;) {                               // would be most of its own cost
             __asm__ volatile("sti");
-            while (bkl_word) { pause(); spins++; }
+            // #75 COOPERATIVE PANIC STOP. Measured on a 4-vCPU KVM guest: a
+            // core spinning here takes neither a fixed stop IPI nor a directed
+            // NMI, however many are issued (the sends are made, rc=0, and the
+            // core never enters the handler). Whatever the reason, an
+            // interrupt-based stop cannot be relied on to reach this loop, and
+            // this loop is exactly where the cores that fail to stop are.
+            // Reading one already-hot word per spin iteration costs nothing and
+            // does not need the core to accept an interrupt at all.
+            uint64_t parkspins = 0;
+            // #bklfair: when did THIS waiter first see the lock free while it
+            // was somebody else's turn? Purely local: no shared state, and no
+            // rdtsc at all on the hot (lock-held) path.
+            uint64_t freewait_t0 = 0;
+            for (;;) {
+                // #bklfair: ELIGIBILITY, evaluated only when the lock is FREE.
+                // With fair off this reduces to the original `while (bkl_word)`
+                // exactly: busy -> spin, free -> break. The rdtsc in the stale
+                // check is reached only on the free-but-not-our-turn path, so
+                // the hot spin body is one extra load of the next/turn line.
+                int busy = (bkl_word != 0);
+                if (!busy) {
+                    if (!fair) break;
+                    int32_t d = (int32_t)(g_bkl_turn - myticket);
+                    if (d == 0) break;                       // our turn
+                    if (d > 0) {
+                        // OVERTAKEN. Our turn came and went while this frame
+                        // was not the one running on its core (nested, or
+                        // preempted, or migrated). Waiting for it to come round
+                        // again is waiting for something that cannot happen, so
+                        // re-queue at the back. The per-core slot is NOT
+                        // rewritten: it can only be touched with IF=0 and we
+                        // are running with IF=1 here. A stale slot costs a
+                        // future nested frame its inheritance and nothing else.
+                        g_bkl_fair_overtaken++;
+                        myticket = __atomic_fetch_add(&g_bkl_next, 1u,
+                                                      __ATOMIC_ACQ_REL);
+                        freewait_t0 = 0;
+                    } else {
+                        // Somebody ahead of us, and the lock is FREE. Start the
+                        // stale clock. If the entitled waiter still has not
+                        // taken a lock nobody holds after BKL_TURN_STALE_US, it
+                        // is not running: bypass, which advances the turn past
+                        // the dead ticket below and heals the queue.
+                        uint64_t now = mono_us();
+                        if (!freewait_t0) freewait_t0 = now;
+                        else if (now - freewait_t0 > BKL_TURN_STALE_US) {
+                            g_bkl_fair_bypass++;
+                            break;
+                        }
+                    }
+                } else {
+                    // The lock is HELD. The waiter ahead of us is not being
+                    // slow, it simply cannot take a lock somebody else owns, so
+                    // the stale clock must not run. Timing staleness from the
+                    // last GRANT instead of from "free and unclaimed" is the
+                    // bug this line exists to prevent; see BKL_TURN_STALE_US.
+                    freewait_t0 = 0;
+                }
+                if (g_panic_stopping) smp_panic_stop_ack();   // never returns
+                // #404: the second cooperative TLB-shootdown poll point. IF is
+                // 1 here (the sti above), so this loop CAN take the 0xF2 IPI
+                // and normally will. It is polled anyway for the same reason
+                // the panic check above is: #75 measured that a core in this
+                // exact loop took neither a fixed-vector IPI nor a directed
+                // NMI, and a shootdown whose acknowledgement never arrives is
+                // not a slow shootdown, it is a wedged machine. Redundant,
+                // always-armed delivery is the project rule; this is the second
+                // arm. One load of an already-hot word per iteration.
+                { extern void tlb_service_local(void); tlb_service_local(); }
+                pause(); spins++;
+                // #bklfair LAST DITCH. Nothing should reach this; the counter
+                // is the bug report if anything does. A fair lock must not be
+                // able to express a bug as a wedged machine.
+                if (fair && spins > BKL_FAIR_GIVEUP_SPINS) {
+                    fair = 0; g_bkl_fair_giveup++;
+                }
+                // #bklfair: the lock is FREE and it is simply not our turn yet.
+                // Never park in that state: the wake is sent by a RELEASE, and
+                // there is no release coming for a lock nobody holds.
+                if (!busy) { parkspins = 0; continue; }
+                // #smpfix: the hold is long. Stop burning the host and park.
+                if (!g_bkl_park || ++parkspins < BKL_SPIN_BEFORE_PARK) continue;
+                parkspins = 0;
+                {
+                    // The core id must be read with interrupts masked (#130):
+                    // this loop runs with IF=1 and the context can migrate.
+                    __asm__ volatile("cli");
+                    uint32_t me = smp_this_cpu();
+                    // #smpfix WAKE-LOSS FIX 2: NEVER PARK THE BSP.
+                    //
+                    // The third wake arm is "every core takes an unconditional
+                    // 250 Hz tick and any interrupt ends a HLT". That is true
+                    // for an AP, whose tick is the Local APIC timer and whose
+                    // handler calls lapic_eoi() FIRST (cpu/isr.c), so an AP
+                    // parked inside its own tick handler still receives the
+                    // next one. It is NOT true for the BSP: its tick is IRQ0
+                    // from the 8259, the EOI is sent at the END of the handler,
+                    // and bkl_acquire() is taken at the START of it. A BSP that
+                    // parks inside its own timer interrupt has masked its only
+                    // backstop, which is how the first attempt produced a
+                    // machine with all four vCPUs at HLT=1 and a free lock.
+                    //
+                    // The measured cost is on the APs anyway: with an in-kernel
+                    // DOS guest one core runs the guest and the OTHER THREE
+                    // burn 348M pause iterations per 4 s window.
+                    if (me == 0) { __asm__ volatile("sti"); continue; }
+                    // ===========================================================
+                    // #wakeipi (#67/#168) THE FIX: NEVER PARK WHERE THE WAKE
+                    // CANNOT BE DELIVERED. This is a one-line guard and it is
+                    // the whole of the wedge.
+                    //
+                    // The Local APIC delivers an interrupt only when its
+                    // priority class (vector >> 4) is STRICTLY GREATER than the
+                    // core's current processor priority. BKL_WAKE_VECTOR is
+                    // 0xF4, priority class 15, and 15 IS THE TOP CLASS - so if
+                    // ANY class-15 vector is already in service on this core,
+                    // NO fixed vector can reach it at all. Not the 0xF4 wake,
+                    // and not the core's own 250 Hz tick either. A core that
+                    // HLTs in that state is deaf to everything short of an NMI
+                    // and NEVER WAKES.
+                    //
+                    // It happens because isr_handler() calls bkl_acquire()
+                    // BEFORE it dispatches to any registered C handler, so a
+                    // core that takes the class-15 AP-wake IPI (0xF0) and then
+                    // contends for the BKL is sitting in this loop with 0xF0
+                    // still in service - its EOI is at the end of a handler
+                    // body this core will never reach.
+                    //
+                    // MEASURED, and it is rare and catastrophic rather than
+                    // common and slow: about 1 park in 15,000 enters this state,
+                    // and that ONE park never ends. The core's wait-mask bit
+                    // then stays set for the rest of the boot, so every
+                    // subsequent release fires a wake IPI at a core that can
+                    // never take one. The Local APIC has ONE IRR BIT PER VECTOR,
+                    // so all of them collapse into a single pending interrupt
+                    // that is never serviced. THAT is where "408,816 sent, 633
+                    // received" came from: the denominator is one dead core
+                    // being shouted at, not a delivery failure. On the same
+                    // runs, cores that were NOT in this state took 45-74% of
+                    // the IPIs aimed at them.
+                    //
+                    // Spinning is always correct here and parking is not, so
+                    // the guard is unconditional rather than gated: a core that
+                    // cannot be woken must not sleep.
+                    // ===========================================================
+                    if ((lapic_ppr() >> 4) >= (BKL_WAKE_VECTOR >> 4)) {
+                        if (me < MAYTERA_MAX_CPUS) g_wd[me].park_blocked++;
+                        __asm__ volatile("sti");
+                        continue;              // spin: this core is deaf to 0xF4
+                    }
+                    if (me < 32) __atomic_or_fetch(&g_bkl_waitmask, 1u << me,
+                                                   __ATOMIC_SEQ_CST);
+                    // RE-TEST UNDER THE MASK. A release between the loop test
+                    // above and this point published bkl_word = 0 before it
+                    // could have seen our bit, so without this the wake is
+                    // lost and only the 250 Hz backstop would find it.
+                    if (bkl_word) {
+                        g_bkl_parks++;
+                        // #wakeipi ARM THE DISCRIMINATOR. Both writes happen
+                        // with IF=0 and AFTER the re-test above, so a release
+                        // that slips in here has its 0xF4 latched in the IRR
+                        // and delivered the instant the `sti` below retires -
+                        // ending the HLT and being correctly credited.
+                        // ipi_seen is cleared FIRST so a wake belonging to a
+                        // PREVIOUS park can never be miscredited to this one.
+                        uint64_t t0 = 0;
+                        if (me < MAYTERA_MAX_CPUS) {
+                            // Asked BEFORE the HLT, with IF already 0: can a
+                            // 0xF4 even reach this core from here? Priority
+                            // class 15 is the top class, so an in-service
+                            // class-15 vector blocks the wake outright.
+                            // The deafness guard above already refused every
+                            // park whose PPR class could block the wake, so
+                            // anything reaching here has a DELIVERABLE wake.
+                            // What is recorded now is which lower-priority
+                            // vector the core is holding in service, because
+                            // that is what tells us the core cannot take its
+                            // OWN next tick either (0x42 blocks 0x42), which is
+                            // why the tick was never the backstop it was
+                            // believed to be.
+                            uint32_t ppr = lapic_ppr();
+                            uint32_t isv = lapic_isr_highest();
+                            if (isv > g_wd[me].isr_hi) g_wd[me].isr_hi = isv;
+                            if (isv == 0x42) g_wd[me].park_isr42++;
+                            if (ppr) g_wd[me].park_ppr_nz++;
+                            g_wd[me].ipi_seen = 0;
+                            __atomic_store_n(&g_wd[me].armed, (uint8_t)1,
+                                             __ATOMIC_SEQ_CST);
+                            t0 = mono_us();   // TSC-backed; valid with IF=0
+                        }
+                        __asm__ volatile("sti; hlt");
+                        if (me < MAYTERA_MAX_CPUS) {
+                            uint64_t d = mono_us() - t0;
+                            __atomic_store_n(&g_wd[me].armed, (uint8_t)0,
+                                             __ATOMIC_SEQ_CST);
+                            if (g_wd[me].ipi_seen) g_wd[me].end_ipi++;
+                            else                   g_wd[me].end_other++;
+                            g_wd[me].lat_sum += d;
+                            if (d > g_wd[me].lat_max) g_wd[me].lat_max = d;
+                            // #130's hazard, counted rather than assumed: the
+                            // scheduler can resume this thread on a DIFFERENT
+                            // core, after which the wait-mask bit cleared below
+                            // is the bit of a core this thread no longer runs
+                            // on. If this is ever non-zero the per-CORE wait
+                            // mask is the wrong shape for a per-THREAD waiter.
+                            if (smp_this_cpu() != me) g_wd[me].migrated++;
+                        }
+                    } else {
+                        g_bkl_park_late++;
+                        __asm__ volatile("sti");
+                    }
+                    if (me < 32) __atomic_and_fetch(&g_bkl_waitmask, ~(1u << me),
+                                                    __ATOMIC_SEQ_CST);
+                }
+                // A parked core takes no interrupts, so the cooperative panic
+                // stop is re-tested the moment it wakes.
+                if (g_panic_stopping) smp_panic_stop_ack();
+            }
             __asm__ volatile("cli");
             if (atomic_cas32(&bkl_word, 0, 1) == 0) break;
         }
         // #130: WE HOLD THE LOCK AND IF IS 0, so this core cannot change under
         // the read. This is the only id that may be published.
         cpu = (int)smp_this_cpu();
+        // #bklfair: HAND THE TURN ON. Only a core that has just won the CAS
+        // writes g_bkl_turn, so these stores are serialised by the lock itself
+        // and need no atomic. The max is what makes a bypass safe: a waiter
+        // that skipped a dead ticket must not rewind the turn behind a live one.
+        if (fair) {
+            uint32_t t = myticket + 1u;
+            if ((int32_t)(t - g_bkl_turn) > 0) g_bkl_turn = t;
+            if ((uint32_t)cpu < BKL_STAT_CPUS) g_bkl_ct_valid[cpu] = 0;
+            if ((uint32_t)entry_cpu < BKL_STAT_CPUS) g_bkl_ct_valid[entry_cpu] = 0;
+        }
+        {   // The wait is timed in both arms; see g_bkl_wait_* above.
+            uint64_t w = mono_us() - wait_t0;
+            if ((uint32_t)cpu < BKL_STAT_CPUS) {
+                g_bkl_wait_sum[cpu] += w;
+                g_bkl_wait_n[cpu]++;
+                if (w > g_bkl_wait_max[cpu]) g_bkl_wait_max[cpu] = w;
+            }
+        }
         if ((uint32_t)cpu < BKL_STAT_CPUS) g_bkl_spin_pc[cpu] += spins;
         if (cpu != entry_cpu) {
             // Handled correctly now, and counted so that "the fix is exercised"
@@ -1621,6 +2638,7 @@ void bkl_release(void) {
         bkl_hold_account(cpu);          // #118: one implementation, was inline here
         bkl_owner = -1;
         atomic_store32(&bkl_word, 0);
+        bkl_wake_send(1);               // #smpfix: after the store, never before
     }
     if (fl & (1UL << 9)) __asm__ volatile("sti");
 }
@@ -1638,6 +2656,7 @@ uint32_t bkl_release_all(void) {
     bkl_hold_account(cpu);              // #118: one implementation, was inline here
     bkl_depth = 0; bkl_owner = -1;
     atomic_store32(&bkl_word, 0);
+    bkl_wake_send(1);                   // #smpfix: after the store, never before
     if (fl & (1UL << 9)) __asm__ volatile("sti");
     return d;
 }
@@ -1734,6 +2753,70 @@ void bkl_probe_selftest(void) {
                 "this build.\n", (unsigned long)want, (unsigned long)got);
     }
     g_bkl_hold_max[c] = save_max;
+
+    /* #75/#67 (bklmap) THE NEGATIVE CONTROL, and it is the arm that matters.
+     *
+     * Everything above validates g_bkl_hold_max, which is what maxhold= prints.
+     * It does NOT validate g_bkl_hold_sum, which is what held= prints, and
+     * held= is the quantity the whole SMP ceiling argument is sized from:
+     * held/win is the serial fraction, and 1/that is the Amdahl ceiling.
+     *
+     * A positive arm ALONE cannot tell a hold timer apart from a wall clock.
+     * An instrument that simply accumulated elapsed time would pass the 5 ms
+     * check above and still be wrong by two orders of magnitude on an idle
+     * desktop. This tree has shipped exactly that shape of un-failable check
+     * more than once (a truncation detector structurally unable to fire, a
+     * panic regex that matched nothing, a concurrency lint that could not run),
+     * so the rule is that a check must be SHOWN to go red.
+     *
+     * Two arms against the SAME counter, back to back, on the BSP before any AP
+     * schedules, so neither can contend and nothing else is taking the lock:
+     *
+     *   POSITIVE: busy for nwant us WHILE HOLDING the BKL.
+     *             g_bkl_hold_sum must advance by about nwant.
+     *   NEGATIVE: busy for nwant us NOT holding the BKL.
+     *             g_bkl_hold_sum must advance by about NOTHING.
+     *
+     * If the negative arm advances by ~nwant, held= is measuring wall clock and
+     * every fraction derived from it is meaningless. Printed either way, never
+     * only on failure: a check that is silent when healthy cannot be told apart
+     * from one that is not running.
+     */
+    {
+        const uint64_t nwant = 5000;
+        uint64_t s0, s1, s2, pos, neg;
+
+        s0 = g_bkl_hold_sum[c];
+        bkl_acquire();
+        { uint64_t t0 = mono_us(); while (mono_us() - t0 < nwant) { } }
+        bkl_release();
+        s1 = g_bkl_hold_sum[c];
+
+        /* identical busy loop, identical clock, lock NOT held */
+        { uint64_t t0 = mono_us(); while (mono_us() - t0 < nwant) { } }
+        s2 = g_bkl_hold_sum[c];
+
+        pos = s1 - s0;
+        neg = s2 - s1;
+
+        /* The positive band is deliberately wide (a correctness check, not a
+         * benchmark). The negative band is deliberately TIGHT: a few
+         * microseconds of genuine hold can land in the negative window from a
+         * timer ISR, but nothing legitimate can put thousands there. */
+        if (pos >= (nwant * 8) / 10 && pos <= nwant * 3 && neg < nwant / 10) {
+            kprintf("[BKLPROBE] held-sum OK: held-arm +%lu us, not-held-arm "
+                    "+%lu us (asked %lu us each). held= measures HOLD time, "
+                    "not wall time.\n",
+                    (unsigned long)pos, (unsigned long)neg,
+                    (unsigned long)nwant);
+        } else {
+            kprintf("[BKLPROBE] held-sum FAILED: held-arm +%lu us, not-held-arm "
+                    "+%lu us (asked %lu us each). g_bkl_hold_sum is WRONG; do "
+                    "NOT size anything from held= on this build.\n",
+                    (unsigned long)pos, (unsigned long)neg,
+                    (unsigned long)nwant);
+        }
+    }
 }
 
 // ============================================================================

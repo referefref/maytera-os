@@ -16,6 +16,7 @@
 #include "../cpu/apic.h"    // #139: lapic_eoi / lapic_get_id
 #include "../sync/waitq.h"
 #include "usb_hid.h"            // #134: HID slot teardown on disconnect
+#include "usbport.h"            // #307/#433: when to STOP retrying a root port (Rust governor)
 #include "../sync/noblock.h"   // #614: g_xhci_evt_wq, the event-ring wait queue   // #433: proc_create/PRIO_* for the re-scan worker
 
 // #62: budget for the endpoint-recovery COMMANDS issued after a failed
@@ -247,6 +248,11 @@ static uint16_t g_port_orphan[MAX_XHCI_CONTROLLERS][256];     // #134: consecuti
 static uint32_t g_port_last_devid[MAX_XHCI_CONTROLLERS][256]; // (vid<<16)|pid
 static uint32_t g_legsup_off[MAX_XHCI_CONTROLLERS];           // MMIO byte offset, 0=none
 static uint32_t g_portsc_log_lines = 0;
+// #134: forces one heartbeat line on the next re-scan, so "alive, nothing
+// changed" and "stopped right here" are distinguishable. Declared here rather
+// than beside the worker because #307/#433's give-up path (which runs during
+// boot enumeration, long before the worker exists) also sets it.
+static int g_rescan_hb_force = 0;
 
 static inline int xhci_ctrl_index(xhci_controller_t *xhc) {
     int idx = (int)(xhc - xhci_controllers);
@@ -2239,6 +2245,15 @@ int xhci_disable_slot(xhci_controller_t *xhc, int slot_id) {
     // entries, which is every non-HID caller of this function.
     usb_hid_detach_slot(xhc, slot_id);
 
+    // ...and the USB NIC, for exactly the same reason and at the same one site.
+    // A NIC whose slot is freed but whose driver state still says "active" makes
+    // a REPLUG a no-op (usb_net_probe returns early on g_usbnet.active) and
+    // leaves net/net.c transmitting into a disabled slot.
+    {
+        extern void usb_net_detach_slot(int slot_id);
+        usb_net_detach_slot(slot_id);
+    }
+
     // #134 (2026-08-18): and the SAME argument applies to g_slot_root_port[].
     // It is the only record of which root port a slot hangs off, it is written
     // at exactly one site (xhci_address_device_ex) and it was cleared at
@@ -3624,13 +3639,47 @@ static int xhci_enumerate_port(xhci_controller_t *xhc, uint32_t port, int speed)
         return 0;
     }
 
+    // #307/#433 DESTRUCTIVE TEST ARM, never in a golden. Built only with
+    // `make XHCIFAILPORT=<n>`, which makes root port <n> fail Address Device
+    // ALWAYS, on every attempt, reproducing the owner's faulty port exactly:
+    // a port that reports a device connected and can never address it. It fails
+    // AFTER Enable Slot on purpose, because burning a device slot per attempt is
+    // half of what the fault costs and a test that skipped it would not
+    // reproduce the thing being fixed. Other ports are untouched, so the same
+    // boot proves working devices still enumerate.
+    //   `make XHCIFAILPORT=<n> XHCINOGOVERNOR=1` is the RED arm: same injected
+    // fault, governor removed, i.e. the pre-fix behaviour. If both arms behave
+    // the same the test is worthless and the result must be discarded.
+#ifdef XHCI_FAILPORT
+    if ((int)port + 1 == XHCI_FAILPORT) {
+        bootlog_write("[FAILTEST] Port %u slot %d: FORCING address device failure",
+                      port + 1, slot_id);
+        bootlog_write("[xHCI] Port %u slot %d: address device FAILED", port + 1, slot_id);
+        xhci_disable_slot(xhc, slot_id);
+        return 0;
+    }
+#endif
+
     // Address Device on the root port (route 0, no TT).
     if (xhci_address_device_ex(xhc, slot_id, (int)port, 0, speed, 0, 0) < 0) {
         snprintf(el, sizeof(el), "[USB] P%u enum: slot=%d Address Device FAILED",
                  port + 1, slot_id);
         gfx_boot_log(el); kprintf("[xHCI] %s\n", el);
         bootlog_write("[xHCI] Port %u slot %d: address device FAILED", port + 1, slot_id);
-        xhci_disable_slot(xhc, slot_id);
+        // #307/#433: CHECK THE DISABLE. A failed Address Device is the one path
+        // this driver walks thousands of times on a faulty port, and it is the
+        // only thing returning those device slots. MEASURED on the owner's ASUS
+        // (max_slots 32): the ids cycle 1..32 and are reused, skipping the slots
+        // held by the three working devices, so the controller IS reclaiming
+        // them and there is no leak there. But the return code was DISCARDED,
+        // so if a Disable Slot ever did fail the leak would be silent and the
+        // controller would run out of slots with nothing saying why. It costs
+        // one branch to make that loud instead.
+        if (xhci_disable_slot(xhc, slot_id) < 0)
+            bootlog_write("[xHCI] Port %u: Disable Slot %d FAILED after a failed "
+                          "Address Device - THIS SLOT IS LEAKED (cc=%d timeout=%d)",
+                          port + 1, slot_id, g_xhci_last_cmd_cc,
+                          g_xhci_last_cmd_timeout);
         return 0;
     }
 
@@ -3667,6 +3716,7 @@ static int xhci_try_enumerate_port(xhci_controller_t *xhc, uint32_t port,
                 port + 1, attempt, XHCI_ENUM_RETRIES, r ? "SUCCESS" : "failed");
         if (r) {
             g_port_enumerated[idx][port] = 1;
+            usbport_enum_ok_rs(idx, (int32_t)port);   // clears the burned-budget count
             return 1;
         }
         // Backoff, then re-reset the still-connected port and retry with its
@@ -3682,8 +3732,84 @@ static int xhci_try_enumerate_port(xhci_controller_t *xhc, uint32_t port,
             speed = (xhci_portsc_read(xhc, port) & XHCI_PORTSC_SPEED_MASK) >> 10;
         }
     }
-    bootlog_write("[xHCI] Port %u: enumeration FAILED after retries; left eligible "
-                  "for re-scan", port + 1);
+    // #307/#433 (2026-08-28): "LEFT ELIGIBLE FOR RE-SCAN" WAS AN UNBOUNDED LOOP.
+    //
+    // That sentence was true and it was the bug. The owner's ASUS (golden 2250)
+    // has a faulty root port that asserts a phantom Low-Speed connect with
+    // nothing plugged into it: CCS reads 1 in all 180 PORTSC samples of the
+    // capture and NEVER transitions, so #135's flap governor - which keys on
+    // confirmed DISCONNECTS - can never arm, and this path re-armed the port
+    // every ~4 s forever. MEASURED from his /BOOTLOG.TXT: re-scan #1 at
+    // t=36678 ms, #500 at t=2024232 ms (3983 ms/cycle), 2046 Address Device
+    // attempts in 34 minutes, roughly one per second, on a port with nothing
+    // on it, each one an Enable Slot + Address Device + Disable Slot round trip
+    // on the command ring plus a port reset.
+    //
+    // The budget is still generous and a port is still ALWAYS allowed to retry
+    // (#433's lesson: real xHCI enumeration is racy and a port that fails once
+    // may succeed moments later). What changed is that "always" now has an
+    // upper bound. See rustkern/usbport.rs for the state machine and why the
+    // rule is behavioural rather than positional.
+    {
+        uint32_t vnow = xhci_portsc_read(xhc, port);
+        int connected = (vnow & XHCI_PORTSC_CCS) ? 1 : 0;
+        int verdict = usbport_budget_failed_rs(idx, (int32_t)port, connected);
+        if (verdict == USBPORT_GIVEUP_NOW || verdict == USBPORT_GIVEUP_FINAL) {
+            // ONE verdict, but SEVERAL lines, and that is the fix (deadport).
+            //
+            // This used to be a single ~700-character bootlog_write(). Every
+            // line in fs/bootlog.c is formatted into a 256-byte buffer, so on
+            // the owner's golden-2277 boot it was cut mid-word at
+            // "...(unplug/replug). Thi" and the ENTIRE second half was lost -
+            // including the /USBPORT.CFG syntax that the comment above says is
+            // spelled out on purpose "so an operator can act on this line
+            // without reading any source". The instruction existed, was
+            // correct, and never reached him. The clamp now stamps "~CUT n~"
+            // when it shortens a line, but the real fix is to not write a line
+            // that cannot fit: each of these is comfortably under the cap.
+            int retires = usbport_retires_rs(idx, (int32_t)port);
+            bootlog_write("[xHCI] *** ROOT PORT %u GIVEN UP ON (controller %d, "
+                          "give-up %d of %d). ***", port + 1, idx,
+                          retires, USBPORT_MAX_RETIRES);
+            bootlog_write("[xHCI] port %u: it reported a device CONNECTED but "
+                          "failed to address it %d times running (%d Address "
+                          "Device attempts).", port + 1, USBPORT_GIVEUP_BUDGETS,
+                          USBPORT_GIVEUP_BUDGETS * XHCI_ENUM_RETRIES);
+            bootlog_write("[xHCI] port %u: ports with working devices are "
+                          "UNAFFECTED. This only stops a port that enumerates "
+                          "nothing from burning a device slot and a command "
+                          "round trip every few seconds.", port + 1);
+            if (verdict == USBPORT_GIVEUP_FINAL) {
+                bootlog_write("[xHCI] port %u: that was give-up %d, the LAST. A "
+                              "connect-status change will NOT re-arm this port "
+                              "again for the rest of this boot. Nothing about "
+                              "the decision is written to disk, so a REBOOT "
+                              "re-arms it.", port + 1, USBPORT_MAX_RETIRES);
+            } else {
+                bootlog_write("[xHCI] port %u: it will NOT be retried until the "
+                              "hardware reports a connect-status change "
+                              "(unplug/replug). After %d such rounds a "
+                              "connect-status change stops re-arming it too.",
+                              port + 1, USBPORT_MAX_RETIRES);
+            }
+            bootlog_write("[xHCI] port %u: to pin this decision yourself, put a "
+                          "line 'disable %u' (or 'disable %d:%u' for this "
+                          "controller only) in /USBPORT.CFG or "
+                          "/CONFIG/USBPORT.CFG on the boot volume.",
+                          port + 1, port + 1, idx, port + 1);
+            kprintf("[xHCI] *** port %u GIVEN UP ON after %d budgets (give-up "
+                    "%d/%d)%s ***\n", port + 1, USBPORT_GIVEUP_BUDGETS,
+                    retires, USBPORT_MAX_RETIRES,
+                    verdict == USBPORT_GIVEUP_FINAL ? ", FINAL" : "");
+            g_rescan_hb_force = 1;   // make the next heartbeat show the new state
+        } else if (verdict == USBPORT_GIVEUP_NO) {
+            bootlog_write("[xHCI] Port %u: enumeration FAILED after retries "
+                          "(budget %d/%d burned%s); still eligible for re-scan",
+                          port + 1, usbport_budgets_rs(idx, (int32_t)port),
+                          USBPORT_GIVEUP_BUDGETS,
+                          connected ? "" : ", device gone so NOT counted");
+        }
+    }
     return 0;
 }
 
@@ -4431,6 +4557,35 @@ static int xhci_teardown_port_slots(xhci_controller_t *xhc, uint32_t port) {
             }
         }
 
+        // THE USB NIC. This branch DID NOT EXIST, and its absence is why an
+        // unplugged adapter was never released: this loop dispatches per CLASS,
+        // it had a branch for mass storage and a branch for HID, and a slot that
+        // is neither hit the `continue` below and was skipped. The slot was
+        // therefore never disabled, so the detach hook inside xhci_disable_slot()
+        // could not fire, so usb_net_probe() went on refusing the REPLUGGED
+        // device on `g_usbnet.active` while net/net.c still reported a live
+        // lease on a slot the controller had already forgotten. MEASURED on a
+        // VM before this branch was added.
+        //
+        // Ordered next to the MSC branch and BEFORE the HID test for the same
+        // reason that one gives: a slot is one class or another, and a matching
+        // branch must not fall through into the next one's test.
+        {
+            extern int  usb_net_owns_slot(int slot_id);
+            extern void usb_net_detach_slot(int slot_id);
+            if (usb_net_owns_slot(slot)) {
+                usb_net_detach_slot(slot);
+                for (int dci = 1; dci < XHCI_MAX_ENDPOINTS; dci++)
+                    xhc->transfer_rings[slot - 1][dci] = 0;   // unlink, do not free
+                xhci_disable_slot(xhc, slot);
+                g_slot_root_port[slot - 1] = 0;
+                torn++;
+                bootlog_write("[xHCI] re-scan: port %u disconnect: slot %d torn down "
+                              "(USB NIC released, slot disabled)", port + 1, slot);
+                continue;
+            }
+        }
+
         if (!usb_hid_slot_has_device(xhc, slot)) continue;   // HID slots only
         usb_hid_detach_slot(xhc, slot);
         for (int dci = 1; dci < XHCI_MAX_ENDPOINTS; dci++)
@@ -4600,37 +4755,95 @@ static int xhci_port_has_live_slot(xhci_controller_t *xhc, uint32_t port) {
 // this one is deliberately periodic rather than per-event, which is what makes
 // it bounded no matter how badly a port misbehaves.
 #define XHCI_HB_SCANS 20              // ~60s at the 3000ms re-scan interval
+// Ports per heartbeat line, chosen so the formatted line cannot reach
+// bootlog.c's 256-byte cap.
+//
+// TEN, AND THE NUMBER WAS MEASURED RATHER THAN ESTIMATED, because estimating it
+// is exactly how this line came to be truncated in the first place. Formatting
+// a worst case (three-digit port numbers, a seven-digit scan counter, a
+// nine-digit uptime, six-digit contention counters) gives 241 characters at 10
+// ports per line, 256 at 11, and 271 at 12. ELEVEN ALREADY OVERFLOWS. The first
+// draft of this fix used 12, arrived at by hand-counting, and would have
+// reintroduced the very silent cut it was written to remove; a two-minute
+// snprintf harness caught it before it shipped.
+#define XHCI_HB_PORTS_PER_LINE 10
+#define XHCI_HB_MAX_PORTS      48
 static uint64_t g_rescan_scans    = 0;
-static int      g_rescan_hb_force = 0;
 
 static void xhci_rescan_heartbeat(void) {
     for (int i = 0; i < xhci_controller_count; i++) {
         xhci_controller_t *xhc = &xhci_controllers[i];
         if (!xhc->initialized) continue;
         int idx = xhci_ctrl_index(xhc);
+        // deadport: THE MAP USED TO BE CUT OFF BEFORE IT REACHED THE FAULTY
+        // PORTS. It was built into a 288-byte buffer and handed to
+        // bootlog_write(), whose line cap is 256. On the owner's 21-port
+        // controller every single heartbeat was truncated at port 14, so ports
+        // 15-21 never once showed their governor state - in a line whose own
+        // comment says "a state you cannot see is indistinguishable from the
+        // fault it replaced". It was, for a third of his ports. Chunk it
+        // instead, so the map is complete however many ports there are.
         uint32_t n = xhc->max_ports;
-        if (n > 16) n = 16;            // keep the line bounded; count is printed
-        char ports[288];
-        int o = 0;
-        ports[0] = 0;
-        for (uint32_t p = 0; p < n; p++) {
-            if (o > (int)sizeof(ports) - 20) break;
-            uint32_t v = xhci_portsc_read(xhc, p);
-            int w = snprintf(ports + o, sizeof(ports) - (size_t)o, "%sp%u=%08x%c",
-                             o ? " " : "", p + 1, v,
-                             g_port_enumerated[idx][p] ? 'E' : '-');
-            if (w <= 0) break;
-            o += w;
-            if (o >= (int)sizeof(ports)) { o = (int)sizeof(ports) - 1; break; }
+        if (n > XHCI_HB_MAX_PORTS) n = XHCI_HB_MAX_PORTS;
+        for (uint32_t base = 0; base < n; base += XHCI_HB_PORTS_PER_LINE) {
+            uint32_t end = base + XHCI_HB_PORTS_PER_LINE;
+            if (end > n) end = n;
+            char ports[240];
+            int o = 0;
+            ports[0] = 0;
+            for (uint32_t p = base; p < end; p++) {
+                if (o > (int)sizeof(ports) - 20) break;
+                uint32_t v = xhci_portsc_read(xhc, p);
+                // #307/#433: 'E' enumerated, 'X' given up on, 'H' given up on
+                // for the last time (a connect-status change will not re-arm
+                // it), 'O' off via /USBPORT.CFG, '-' idle. A retired port must
+                // be VISIBLE every scan.
+                int st = usbport_state_rs(idx, (int32_t)p);
+                char mark = g_port_enumerated[idx][p] ? 'E'
+                          : (st == USBPORT_ST_TERMINAL) ? 'X'
+                          : (st == USBPORT_ST_HARD)     ? 'H'
+                          : (st == USBPORT_ST_CFGOFF)   ? 'O' : '-';
+                int w = snprintf(ports + o, sizeof(ports) - (size_t)o, "%sp%u=%08x%c",
+                                 o ? " " : "", p + 1, v, mark);
+                if (w <= 0) break;
+                o += w;
+                if (o >= (int)sizeof(ports)) { o = (int)sizeof(ports) - 1; break; }
+            }
+            if (base == 0) {
+                bootlog_write("[xHCI-HB] ctrl%d ALIVE scan#%lu t=%lums ports=%u "
+                              "cmd(contend=%lu,noblk=%lu) %s",
+                              i, (unsigned long)g_rescan_scans,
+                              (unsigned long)(mono_ready() ? mono_ms() : 0),
+                              xhc->max_ports,
+                              (unsigned long)g_xhci_cmd_contended,
+                              (unsigned long)g_xhci_cmd_noblock_refused,
+                              ports);
+            } else {
+                bootlog_write("[xHCI-HB] ctrl%d scan#%lu ports %u-%u: %s",
+                              i, (unsigned long)g_rescan_scans,
+                              base + 1, end, ports);
+            }
         }
-        bootlog_write("[xHCI-HB] ctrl%d ALIVE scan#%lu t=%lums ports=%u "
-                      "cmd(contend=%lu,noblk=%lu) %s",
-                      i, (unsigned long)g_rescan_scans,
-                      (unsigned long)(mono_ready() ? mono_ms() : 0),
-                      xhc->max_ports,
-                      (unsigned long)g_xhci_cmd_contended,
-                      (unsigned long)g_xhci_cmd_noblock_refused,
-                      ports);
+    }
+
+    // deadport: report bootlog truncation HERE, periodically, rather than once
+    // at boot. The obvious place was beside the [USBPORT] self-test in main.c,
+    // and it is the wrong place: that runs before almost anything has been
+    // logged, so it would report a confident 0 on a boot that goes on to cut
+    // fourteen lines, which is exactly the kind of reassuring-but-untrue
+    // diagnostic this whole change is about. This runs about once a minute for
+    // the life of the boot, and only speaks when the number has MOVED, so a
+    // clean boot stays silent and a regression announces itself.
+    {
+        static uint32_t last_trunc = 0;
+        uint32_t tl = bootlog_truncated_lines();
+        if (tl != last_trunc) {
+            last_trunc = tl;
+            bootlog_write("[BOOTLOG] line-length audit: %u line(s) TRUNCATED, %u "
+                          "byte(s) lost. A cut line carries a ~CUT n~ stamp at its "
+                          "end; find those. This should be 0.",
+                          tl, bootlog_truncated_bytes());
+        }
     }
 }
 
@@ -4653,12 +4866,71 @@ int xhci_rescan_ports(xhci_controller_t *xhc) {
                 xhci_portsc_log(xhc, port, g_portsc_prev[idx][port], "was");
                 xhci_portsc_log(xhc, port, v, "now CCS-CHANGED");
                 xhci_portctx_log(xhc, "on-CCS-change");
+                // #307/#433: a REAL connect-status change is the ONLY thing that
+                // revives a port we gave up on. Not a timer: a timed retry is
+                // the same churn with a longer period, and it would re-arm the
+                // owner's faulty port (whose phantom CCS never moves) forever.
+                if (usbport_connect_changed_rs(idx, (int32_t)port)) {
+                    bootlog_write("[xHCI] port %u: connect-status CHANGED, so the "
+                                  "earlier give-up verdict is stale. Re-arming it "
+                                  "for enumeration.", port + 1);
+                    g_rescan_hb_force = 1;
+                }
             } else {
                 xhci_portsc_log(xhc, port, v, first ? "first-scan" : "changed");
             }
             g_portsc_prev[idx][port] = v;
             g_portsc_prev_valid[idx][port] = 1;
         }
+
+        // deadport DESTRUCTIVE TEST ARM, never in a golden. Built with
+        // `make XHCIFAILPORT=<n> XHCIFLAPEVERY=<k>`: every k-th re-scan, the
+        // fail-port is handed a SYNTHETIC connect-status change, reproducing
+        // the thing the owner's hardware actually does.
+        //
+        // WHY THIS ARM HAD TO EXIST. The plain XHCIFAILPORT arm makes a port
+        // fail Address Device forever, which proves the RETRY budget. It cannot
+        // reproduce the fault that actually bit, because that fault is a port
+        // that ALSO asserts real CCS edges on its own and so keeps being handed
+        // a fresh budget. MEASURED, 2026-08-28: two give-up lines in one boot,
+        // 48 attempts. No VM can produce a physically faulty port, so the edge
+        // is injected here rather than reproduced. LIMIT OF THE SIMULATION: it
+        // proves the GOVERNOR escalates and stops, not that real hardware
+        // presents the edge the same way; the evidence for the latter is the
+        // owner's PORTSC capture, not this arm.
+#ifdef XHCI_FAILPORT
+#ifdef XHCI_FLAPEVERY
+        if ((int)port + 1 == XHCI_FAILPORT && XHCI_FLAPEVERY > 0 &&
+            (g_rescan_scans % (uint64_t)XHCI_FLAPEVERY) == 0) {
+            bootlog_write("[FAILTEST] port %u: injecting a SYNTHETIC "
+                          "connect-status change (scan %lu)",
+                          port + 1, (unsigned long)g_rescan_scans);
+            if (usbport_connect_changed_rs(idx, (int32_t)port))
+                bootlog_write("[FAILTEST] port %u: the injected change RE-ARMED "
+                              "a retired port", port + 1);
+            else {
+                // TWO DIFFERENT REFUSALS, AND THEY MUST NOT SHARE A MESSAGE.
+                // The first round of this arm printed "the escalation bound is
+                // holding" for both, and the only thing distinguishing them was
+                // a raw state number in the text. An ACTIVE port refusing is the
+                // early return that declines to reset a part-burned budget; a
+                // HARD port refusing is the escalation bound itself. Reading the
+                // first as the second would mean concluding the bound had
+                // engaged when it had not, which is precisely the wrong
+                // conclusion this arm exists to prevent.
+                int st = usbport_state_rs(idx, (int32_t)port);
+                bootlog_write("[FAILTEST] port %u: injected change REFUSED "
+                              "(state=%d retires=%d) - %s", port + 1, st,
+                              usbport_retires_rs(idx, (int32_t)port),
+                              st == USBPORT_ST_HARD
+                                ? "port is HARD-retired; the escalation bound is holding"
+                                : "port is still ACTIVE; the part-burned budget was "
+                                  "preserved rather than reset (this is what lets "
+                                  "the budget reach its threshold under flapping)");
+            }
+        }
+#endif
+#endif
 
         int connected = (v & XHCI_PORTSC_CCS) ? 1 : 0;
         if (!connected) {
@@ -4769,6 +5041,14 @@ int xhci_rescan_ports(xhci_controller_t *xhc) {
             g_port_cooldown[idx][port]--;
             continue;   // flap governor: not this scan
         }
+        // #307/#433: has this port been retired (budget exhausted, or listed in
+        // /USBPORT.CFG)? Silent by design - the give-up was announced loudly and
+        // durably once, and the heartbeat line carries the state every scan, so
+        // repeating it here would just be the old flood in a new wording.
+#ifndef XHCI_NOGOVERNOR
+        if (!usbport_should_enumerate_rs(idx, (int32_t)port)) continue;
+#endif
+
         // Connected but not yet enumerated: reset then bounded-retry enumerate.
         bootlog_write("[xHCI] re-scan: port %u connected but not enumerated; "
                       "resetting + enumerating", port + 1);
@@ -4843,6 +5123,86 @@ static void xhci_ep0_recovery_selftest(void) {
 // rule). A generous multi-second interval keeps this pure background hotplug/
 // retry maintenance, not a poll loop.
 #define XHCI_RESCAN_INTERVAL_MS 3000
+
+// #307/#433: THE EXPLICIT OPERATOR OVERRIDE.
+//
+// The owner asked, in as many words, to "disable those ports". The automatic
+// give-up above answers that behaviourally, but a behavioural rule is a
+// judgement and he is entitled to a deterministic one, so this is the escape
+// hatch for when the governor misjudges in either direction.
+//
+// WHY IT IS READ HERE AND NOT AT usb_init(). usb_init() runs at main.c:1330,
+// with interrupts off and no filesystem mounted; the root volume is not
+// readable until much later. So the file cannot gate the BOOT enumeration pass,
+// and that is the correct behaviour rather than a limitation: the config file
+// lives on the boot volume, the boot volume arrives over USB, and a config file
+// that could stop its own storage device from enumerating would be a way to
+// brick the machine with a typo. The boot pass is bounded anyway (at most
+// USBPORT_GIVEUP_BUDGETS budgets), and this file suppresses the ONGOING churn,
+// which is the whole complaint.
+//
+// It also cannot take a working device away: the re-scan only ever considers
+// ports with no enumerated device, so a port listed here that DID come up at
+// boot keeps working. /USBPORT.CFG stops retries; it does not disconnect.
+#define XHCI_CFG_MAX_ENTRIES 32
+static void xhci_load_port_config(void) {
+    extern fat_fs_t g_fat_fs;
+    if (!g_fat_fs.mounted) return;
+
+    static const char *paths[] = { "/USBPORT.CFG", "/CONFIG/USBPORT.CFG" };
+    for (unsigned pi = 0; pi < sizeof(paths) / sizeof(paths[0]); pi++) {
+        uint32_t sz = 0;
+        char *buf = (char *)fat_read_file(&g_fat_fs, paths[pi], &sz);
+        if (!buf) continue;
+        if (sz > 8192) sz = 8192;   // an operator note, not a data file
+
+        int32_t oc[XHCI_CFG_MAX_ENTRIES], op[XHCI_CFG_MAX_ENTRIES];
+        int32_t n = usbport_parse_cfg_rs((const uint8_t *)buf, (int32_t)sz,
+                                         oc, op, XHCI_CFG_MAX_ENTRIES);
+        kfree(buf);
+        if (n < 0) {
+            bootlog_write("[xHCI] %s: unreadable, ignored", paths[pi]);
+            continue;
+        }
+        bootlog_write("[xHCI] %s: %d byte(s), %d valid 'disable' directive(s). "
+                      "Format: one per line, 'disable <port>' (1-based, matching "
+                      "the [xHCI] Port N numbering in this log) for every "
+                      "controller, or 'disable <ctrl>:<port>' for one. '#' starts "
+                      "a comment. Anything else is ignored rather than guessed at.",
+                      paths[pi], (int)sz, (int)n);
+        for (int32_t k = 0; k < n; k++) {
+            for (int c = 0; c < xhci_controller_count; c++) {
+                if (oc[k] >= 0 && oc[k] != c) continue;
+                if (op[k] >= (int32_t)xhci_controllers[c].max_ports) {
+                    bootlog_write("[xHCI] %s: 'disable %d' names port %d, but "
+                                  "controller %d has only %u - ignored",
+                                  paths[pi], (int)op[k] + 1, (int)op[k] + 1, c,
+                                  xhci_controllers[c].max_ports);
+                    continue;
+                }
+                // A port that already has a live device is NEVER retired here.
+                // The owner boots from USB; a config file must not be able to
+                // take his root filesystem away.
+                if (g_port_enumerated[c][op[k]]) {
+                    bootlog_write("[xHCI] %s: port %d on controller %d has a "
+                                  "WORKING enumerated device - NOT disabling it. "
+                                  "This file stops retries; it never disconnects "
+                                  "a device that came up.",
+                                  paths[pi], (int)op[k] + 1, c);
+                    continue;
+                }
+                if (usbport_config_disable_rs(c, op[k]))
+                    bootlog_write("[xHCI] %s: controller %d port %d DISABLED by "
+                                  "operator config; it will not be enumerated or "
+                                  "re-scanned (a replug does not re-arm it; remove "
+                                  "the line and reboot to undo).",
+                                  paths[pi], c, (int)op[k] + 1);
+            }
+        }
+        g_rescan_hb_force = 1;
+    }
+}
+
 static void xhci_rescan_worker(void *arg) {
     (void)arg;
     bootlog_write("[xHCI] port re-scan worker started (~%dms interval)",
@@ -4855,6 +5215,9 @@ static void xhci_rescan_worker(void *arg) {
                                        // so "the worker never started" and "the
                                        // worker started and stopped later" are
                                        // distinguishable from the artifact.
+    // #307/#433: the root volume is mounted by now, so this is the first point
+    // the override file can be read at all. Once, not per scan.
+    xhci_load_port_config();
     for (;;) {
         proc_sleep(XHCI_RESCAN_INTERVAL_MS);
         g_rescan_scans++;

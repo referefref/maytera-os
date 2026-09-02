@@ -453,7 +453,7 @@
 // I/O, inode/bitmap allocation and i_size stay in C. Live under
 // -DRUST_EXT2_DIRADD, C kept as ext2_dirblock_insert_c for one-line rollback.
 // Build numbers 944..951 were burned by the #446 FPU differential builds.
-#define MAYTERA_BUILD_NUMBER 2213
+#define MAYTERA_BUILD_NUMBER 2285
 
 // Version string helper macros
 #define STRINGIFY(x) STRINGIFY_HELPER(x)

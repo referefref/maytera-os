@@ -56,7 +56,25 @@ extern uint32_t gui_ensure_contrast(uint32_t fg, uint32_t bg, int min_x100);
 #define FOCUS_W       2
 #define FOCUS_GAP     2
 
-static int card_h(int n_lines) { return 157 + n_lines * BODY_LH; }
+// #uiscale (#shutdlg fix): the 157 baseline (title + rule + BODY_Y gap +
+// FOOTER_H + a little padding, measured AT 100%) was left as a bare literal
+// when every other constituent of this file (CARD_W, TITLE_X/Y, RULE_*,
+// BODY_X/Y/W, FOOTER_H...) was wrapped in ui_px() for #uiscale (dcc38360).
+// So at 200% (the owner's own 3840x2160 panel, auto-selected) the card came
+// out roughly HALF the height it needed: a 2-line Shut Down body computed
+// ph=237 physical px against a correctly-scaled requirement of ~394, so
+// footer_y (ph-FOOTER_H=117) landed ABOVE BODY_Y (146) - the footer band
+// and both buttons painted directly through the body paragraph and each
+// other. The glass card WAS rendering (draw_round_corners_capture/
+// glass_render/restore all ran, see caf70025) but on top of a garbled,
+// overlapping layout that reads as broken/old rather than as the intended
+// design - this, not a missing glass call, is why the owner reported "the
+// shutdown dialog is still the old one" on a 4K/200% golden. Fix: ui_px(157),
+// matching every sibling constant in this file - identical to the old
+// literal at 100% (ui_px is an identity there) and linear at any other
+// factor, so it tracks BODY_Y/FOOTER_H/the padding they were summed from
+// instead of drifting from them again the next time one of those moves.
+static int card_h(int n_lines) { return ui_px(157) + n_lines * BODY_LH; }
 
 // theme_color() returns 0x00RRGGBB (see userland/libc/theme.h); every fill
 // primitive in this file's draw.c neighbors (CLR_MENU_BG et al, main.c's own

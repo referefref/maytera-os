@@ -83,6 +83,12 @@ MUST_CHECK int blk_write_aux(int usb_index, uint64_t lba, uint32_t count, const 
 // root device; it is a measurement, not an error.
 uint64_t blk_stale_skips(void);
 
+// [no-ticket] I/O totals for charging one operation with what it cost the
+// device: calls, sectors, device transfers, device microseconds. Snapshot
+// before and after and subtract. Same counters [BLK122] prints.
+void blk_census_io(uint64_t *calls, uint64_t *sectors,
+                   uint64_t *n_dev, uint64_t *t_dev);
+
 
 // ===========================================================================
 // #SB: WRITE-STAGING OWNERSHIP. See rustkern/blkstage.rs for the full defect
